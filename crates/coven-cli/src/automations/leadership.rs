@@ -58,7 +58,7 @@ impl SchedulerLeadership {
         conn: &Connection,
         now: DateTime<Utc>,
     ) -> Result<Self> {
-        crate::daemon::ensure_private_coven_home(coven_home)?;
+        crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?;
         let lock_path = scheduler_lock_path(coven_home);
         let lock = crate::state_lock::open_lock_file(&lock_path)?;
         match lock.try_lock_exclusive() {

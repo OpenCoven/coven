@@ -74,7 +74,10 @@
 //! rustix. Windows retains non-share-delete directory handles, opens entries
 //! without following reparse points, and moves exact source handles with
 //! `SetFileInformationByHandle`; the stable absolute destination spelling is
-//! safe because the retained handles prevent ancestor renames.
+//! safe because the retained handles prevent ancestor renames. Windows cleanup
+//! validates and disposes the captured object through one handle that excludes
+//! write and delete sharing. Concurrent writers or deleters therefore block
+//! cleanup instead of changing what it removes.
 //! Linux and macOS exchange the staged and target entries. Windows moves the
 //! target to a randomized backup and installs the staged entry with no-replace
 //! semantics.
@@ -333,11 +336,9 @@ impl WardConfig {
         }
         let config = Self::from_toml_str(&raw)
             .with_context(|| format!("invalid ward config at {}", path.display()))?;
-        if config.identity_invariants.is_empty()
-            && backup_carries_compiled_identity_invariants(home)?
-        {
+        if config.identity_invariants.is_empty() && backup_carries_identity_invariants(home)? {
             bail!(
-                "ward.toml.v01.bak carries compilable identity invariants but active ward.toml has none; rerun migration or add [[identity_invariant]] entries"
+                "ward.toml.v01.bak carries identity invariant declarations but active ward.toml has none; review the backup and migrate supported [[identity_invariant]] entries"
             );
         }
         Ok(Some(config))
@@ -451,7 +452,7 @@ fn legacy_invariant_remnants(raw: &str) -> Option<String> {
     })
 }
 
-fn backup_carries_compiled_identity_invariants(home: &Path) -> Result<bool> {
+fn backup_carries_identity_invariants(home: &Path) -> Result<bool> {
     let backup = home.join(LEGACY_WARD_BACKUP_FILE);
     let raw = match std::fs::read_to_string(&backup) {
         Ok(raw) => raw,
@@ -461,25 +462,12 @@ fn backup_carries_compiled_identity_invariants(home: &Path) -> Result<bool> {
                 .with_context(|| format!("reading legacy Ward backup {}", backup.display()))
         }
     };
-    let value: toml::Value = match toml::from_str(&raw) {
-        Ok(value) => value,
-        Err(_) => return Ok(false),
-    };
-    let declarations = match value
+    let value: toml::Value = toml::from_str(&raw)
+        .with_context(|| format!("parsing legacy Ward backup {}", backup.display()))?;
+    let declarations = value
         .get("protected")
-        .and_then(|protected| protected.get("invariants"))
-        .and_then(toml::Value::as_array)
-    {
-        Some(declarations) => declarations
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .collect::<Vec<_>>(),
-        None => return Ok(false),
-    };
-    if declarations.is_empty() {
-        return Ok(false);
-    }
-    Ok(IdentityInvariantSet::compile(declarations).is_ok())
+        .and_then(|protected| protected.get("invariants"));
+    Ok(declarations.is_some_and(|value| value.as_array().is_none_or(|array| !array.is_empty())))
 }
 
 /// Whether a proposal carries principal authorization for Tier 0 changes.
@@ -1177,6 +1165,13 @@ impl Ward {
         self.evaluate_with_home(proposal, None)
     }
 
+    pub(crate) fn declares_protected_target(&self, target: &str) -> bool {
+        lexical_join(Path::new(""), target).is_some_and(|normalized| {
+            let normalized = to_forward_slashes(&normalized);
+            self.classify(&normalized) == Tier::Protected || self.protected_ci.is_match(&normalized)
+        })
+    }
+
     fn evaluate_with_home(&self, proposal: &Proposal, canonical_home: Option<&Path>) -> Outcome {
         record_evaluate_call();
         let decisions = proposal
@@ -1279,7 +1274,7 @@ impl Ward {
     ///
     /// Returns the resolved path (forward-slashed, relative to home) or a
     /// [`BlockReason`] if the target cannot be safely confined to the home.
-    fn materialize(&self, target: &str) -> std::result::Result<String, BlockReason> {
+    pub(crate) fn materialize(&self, target: &str) -> std::result::Result<String, BlockReason> {
         let canonical_home = self
             .home
             .canonicalize()
@@ -2956,8 +2951,13 @@ fn remove_owned_regular_artifact(
     {
         return Err(restore_unowned_cleanup_capture(artifact, &captured, error));
     }
-    if let Err(error) = remove_anchored_file(&captured)
-        .with_context(|| format!("removing captured {description} {}", captured.display()))
+    if let Err(error) = remove_verified_owned_regular_artifact(
+        &captured,
+        retained_identity,
+        expected_contents,
+        description,
+    )
+    .with_context(|| format!("removing captured {description} {}", captured.display()))
     {
         return Err(restore_unowned_cleanup_capture(artifact, &captured, error));
     }
@@ -3021,22 +3021,98 @@ fn anchored_entry_exists(path: &AnchoredEntry) -> Result<bool> {
     }
 }
 
-fn remove_anchored_file(path: &AnchoredEntry) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsFd;
+#[cfg(unix)]
+fn remove_verified_owned_regular_artifact(
+    path: &AnchoredEntry,
+    _retained_identity: &std::fs::File,
+    _expected_contents: Option<&[u8]>,
+    _description: &str,
+) -> Result<()> {
+    use std::os::fd::AsFd;
 
-        rustix::fs::unlinkat(
-            path.parent.as_fd(),
-            &path.name,
-            rustix::fs::AtFlags::empty(),
-        )
-        .map_err(Into::into)
+    rustix::fs::unlinkat(
+        path.parent.as_fd(),
+        &path.name,
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn remove_verified_owned_regular_artifact(
+    path: &AnchoredEntry,
+    retained_identity: &std::fs::File,
+    expected_contents: Option<&[u8]>,
+    description: &str,
+) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+
+    reject_known_non_regular_entry(path)?;
+    let mut options = CapOpenOptions::new();
+    options
+        .access_mode(GENERIC_READ_ACCESS | DELETE_ACCESS)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .follow(FollowSymlinks::No);
+    let mut current = path
+        .parent
+        .open_with(&path.name, &options)
+        .with_context(|| format!("opening captured {description} for identity-bound disposal"))?
+        .into_std();
+    let metadata = current
+        .metadata()
+        .with_context(|| format!("reading captured {description} metadata"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("captured {description} is not a regular file");
     }
-    #[cfg(not(unix))]
+    if windows_file_identity_from_open_file(retained_identity)?
+        != windows_file_identity_from_open_file(&current)?
     {
-        path.parent.remove_file(&path.name).map_err(Into::into)
+        bail!("{description} identity changed before final disposal");
     }
+    if let Some(expected) = expected_contents {
+        if stream_regular_file_matches_and_sha256(&mut current, expected)?.is_none() {
+            bail!("{description} bytes changed before final disposal");
+        }
+    }
+
+    maybe_replace_windows_locked_cleanup_capture(&path.absolute)?;
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: `current` remains live and identifies the exact object validated
+    // above; `disposition` has the layout and size required by Win32.
+    let result = unsafe {
+        SetFileInformationByHandle(
+            current.as_raw_handle() as _,
+            FileDispositionInfo,
+            std::ptr::addr_of!(disposition).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                .context("Windows disposition buffer is too large")?,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error()).context("disposing exact captured file handle")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_verified_owned_regular_artifact(
+    path: &AnchoredEntry,
+    _retained_identity: &std::fs::File,
+    _expected_contents: Option<&[u8]>,
+    _description: &str,
+) -> Result<()> {
+    path.parent.remove_file(&path.name).map_err(Into::into)
 }
 
 #[derive(Clone, Copy)]
@@ -3764,7 +3840,7 @@ fn stage_contents(
         Ok(())
     })();
     if let Err(error) = result {
-        let cleanup = remove_owned_regular_artifact(&staged, &file, None, "failed staging write");
+        let cleanup = remove_staging_artifact(&staged, file, None, "failed staging write");
         return match cleanup {
             Ok(()) => Err(error),
             Err(cleanup_error) => Err(staging_cleanup_error(
@@ -3773,6 +3849,16 @@ fn stage_contents(
             )),
         };
     }
+    #[cfg(windows)]
+    let file = into_staged_read_identity(&staged, file).map_err(|error| {
+        staging_cleanup_error(
+            path,
+            error.context(format!(
+                "staging write remains preserved at {}",
+                staged.display()
+            )),
+        )
+    })?;
     match ApprovedWritePaths::new(path, staged.clone()) {
         Ok(paths) => Ok((paths, file)),
         Err(error) => {
@@ -3792,6 +3878,42 @@ fn stage_contents(
                 )),
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn into_staged_read_identity(
+    staged: &AnchoredEntry,
+    writer: std::fs::File,
+) -> Result<std::fs::File> {
+    let retained = open_regular_file_handle_without_following_links(staged)?
+        .with_context(|| format!("staged write {} unexpectedly disappeared", staged.display()))?;
+    if windows_file_identity_from_open_file(&writer)?
+        != windows_file_identity_from_open_file(&retained)?
+    {
+        bail!(
+            "staged write identity changed before retaining {}",
+            staged.display()
+        );
+    }
+    drop(writer);
+    Ok(retained)
+}
+
+fn remove_staging_artifact(
+    staged: &AnchoredEntry,
+    writer: std::fs::File,
+    expected_contents: Option<&[u8]>,
+    description: &str,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let retained = into_staged_read_identity(staged, writer)?;
+        remove_owned_regular_artifact(staged, &retained, expected_contents, description)
+    }
+    #[cfg(not(windows))]
+    {
+        remove_owned_regular_artifact(staged, &writer, expected_contents, description)
     }
 }
 
@@ -3843,6 +3965,9 @@ type CleanupArtifactReplacementHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>
 
 #[cfg(test)]
 type VerifiedCleanupCaptureReplacementHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>;
+
+#[cfg(all(test, windows))]
+type WindowsLockedCleanupCaptureReplacementHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>;
 
 #[cfg(test)]
 type EarlyStagingMoveHook = std::sync::Mutex<BTreeSet<PathBuf>>;
@@ -3922,6 +4047,14 @@ fn verified_cleanup_capture_replacement_hook() -> &'static VerifiedCleanupCaptur
     HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
+#[cfg(all(test, windows))]
+fn windows_locked_cleanup_capture_replacement_hook(
+) -> &'static WindowsLockedCleanupCaptureReplacementHook {
+    static HOOK: std::sync::OnceLock<WindowsLockedCleanupCaptureReplacementHook> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
 #[cfg(test)]
 fn early_staging_move_hook() -> &'static EarlyStagingMoveHook {
     static HOOK: std::sync::OnceLock<EarlyStagingMoveHook> = std::sync::OnceLock::new();
@@ -3993,6 +4126,14 @@ fn set_verified_cleanup_capture_replacement(parent: PathBuf, replacement: Vec<u8
     verified_cleanup_capture_replacement_hook()
         .lock()
         .expect("verified cleanup capture replacement hook lock poisoned")
+        .insert(parent, replacement);
+}
+
+#[cfg(all(test, windows))]
+fn set_windows_locked_cleanup_capture_replacement(parent: PathBuf, replacement: Vec<u8>) {
+    windows_locked_cleanup_capture_replacement_hook()
+        .lock()
+        .expect("Windows locked cleanup replacement hook lock poisoned")
         .insert(parent, replacement);
 }
 
@@ -4265,6 +4406,71 @@ fn maybe_replace_verified_cleanup_capture(captured: &Path) -> Result<()> {
 
 #[cfg(not(test))]
 fn maybe_replace_verified_cleanup_capture(_captured: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+fn maybe_replace_windows_locked_cleanup_capture(captured: &Path) -> Result<()> {
+    const ERROR_SHARING_VIOLATION_CODE: i32 = 32;
+
+    let parent = captured
+        .parent()
+        .context("Windows locked cleanup capture has no parent")?;
+    let Some(replacement) = windows_locked_cleanup_capture_replacement_hook()
+        .lock()
+        .expect("Windows locked cleanup replacement hook lock poisoned")
+        .remove(parent)
+    else {
+        return Ok(());
+    };
+    match std::fs::OpenOptions::new().write(true).open(captured) {
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION_CODE) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "attempting final-boundary write to locked cleanup capture {}",
+                    captured.display()
+                )
+            });
+        }
+        Ok(mut file) => {
+            file.write_all(&replacement).with_context(|| {
+                format!(
+                    "writing replacement after Windows cleanup write lock failed for {}",
+                    captured.display()
+                )
+            })?;
+            bail!(
+                "Windows retained identity handle did not exclude writes to {}",
+                captured.display()
+            );
+        }
+    }
+    match std::fs::remove_file(captured) {
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION_CODE) => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "attempting final-boundary replacement of locked cleanup capture {}",
+                captured.display()
+            )
+        }),
+        Ok(()) => {
+            std::fs::write(captured, replacement).with_context(|| {
+                format!(
+                    "installing replacement after Windows cleanup lock failed for {}",
+                    captured.display()
+                )
+            })?;
+            bail!(
+                "Windows cleanup handle did not exclude replacement of {}",
+                captured.display()
+            )
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn maybe_replace_windows_locked_cleanup_capture(_captured: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -4658,7 +4864,23 @@ fn create_staging_file(path: &AnchoredEntry) -> Result<(AnchoredEntry, std::fs::
             )
             .map(std::fs::File::from)
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let opened = {
+            use cap_std::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+            let mut options = CapOpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+                .follow(FollowSymlinks::No);
+            staged
+                .parent
+                .open_with(&staged.name, &options)
+                .map(cap_std::fs::File::into_std)
+        };
+        #[cfg(not(any(unix, windows)))]
         let opened = {
             let mut options = CapOpenOptions::new();
             options
@@ -4871,7 +5093,7 @@ fn compile_glob(pattern: &str, case_insensitive: bool) -> Result<Glob> {
 
 /// Lexically join `base` and a relative `target`, folding `.`/`..` without
 /// touching the filesystem. Returns `None` if the result would escape `base`.
-fn lexical_join(base: &Path, target: &str) -> Option<PathBuf> {
+pub(crate) fn lexical_join(base: &Path, target: &str) -> Option<PathBuf> {
     // An absolute target is never allowed; the surface is home-relative.
     let target_path = Path::new(target);
     if target_path.is_absolute() {
@@ -5403,6 +5625,22 @@ tier = 0
     }
 
     #[test]
+    fn identity_predicate_load_does_not_discard_unsupported_backup_declarations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join(WARD_CONFIG_FILE),
+            "principal_key_fingerprint = \"SHA256:abc\"\nprotected_surface = []\n",
+        )
+        .expect("write ward");
+        std::fs::write(
+            temp.path().join(LEGACY_WARD_BACKUP_FILE),
+            "[protected]\ninvariants = [\"familiar.unsupported == 'value'\"]\n",
+        )
+        .expect("write backup");
+        assert!(WardConfig::load(temp.path()).is_err());
+    }
+
+    #[test]
     fn identity_predicate_load_rejects_backup_only_invariants() {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -5431,7 +5669,7 @@ invariants = [
         let error = WardConfig::load(temp.path()).expect_err("must reject");
         assert!(error
             .to_string()
-            .contains("ward.toml.v01.bak carries compilable identity invariants"));
+            .contains("ward.toml.v01.bak carries identity invariant declarations"));
     }
 
     #[test]
@@ -7477,6 +7715,37 @@ formatter = "lenient"
         assert_eq!(
             staging_artifact_contents(&home.join("scratch")),
             vec![b"post-verification replacement".to_vec()]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_final_cleanup_handles_block_post_verification_writes_and_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let target = home.join("scratch/output.txt");
+        let parent = home.join("scratch");
+        set_windows_locked_cleanup_capture_replacement(
+            parent.clone(),
+            b"final-boundary replacement".to_vec(),
+        );
+
+        ward.apply(
+            &[FileEdit::new("scratch/output.txt", b"new output".to_vec())],
+            &Authorization::unsigned(),
+        )
+        .expect("the locked exact handle must survive a replacement attempt");
+
+        assert_eq!(fs::read(&target).unwrap(), b"new output");
+        assert!(staging_artifact_contents(&parent).is_empty());
+        assert!(
+            !windows_locked_cleanup_capture_replacement_hook()
+                .lock()
+                .unwrap()
+                .contains_key(&parent),
+            "final-boundary replacement hook was not exercised"
         );
     }
 

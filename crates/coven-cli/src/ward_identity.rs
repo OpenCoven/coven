@@ -9,6 +9,46 @@ use serde::Serialize;
 use crate::cockpit_sources;
 use crate::ward;
 
+pub(crate) fn candidate_binding(
+    config: &ward::WardConfig,
+    context: Option<&CandidateIdentityContext>,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    let Some(invariants) = config.identity_invariant_set()? else {
+        return Ok(None);
+    };
+    let context =
+        context.ok_or_else(|| anyhow::anyhow!("candidate identity evidence unavailable"))?;
+    let declarations = serde_json::to_vec(&invariants)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"coven:ward-identity-evidence:v1");
+    hasher.update(&(declarations.len() as u64).to_be_bytes());
+    hasher.update(&declarations);
+    hasher.update(&context.candidate_commitment);
+    Ok(Some(*hasher.finalize().as_bytes()))
+}
+
+pub(crate) fn candidate_rejection(
+    config: &ward::WardConfig,
+    context: Option<&CandidateIdentityContext>,
+) -> anyhow::Result<Option<coven_threads_core::Verdict>> {
+    let Some(invariants) = config.identity_invariant_set()? else {
+        return Ok(None);
+    };
+    let coherence = invariants.evaluate(
+        context.map_or([0; 32], |context| context.candidate_commitment),
+        context.map(|context| &context.facts),
+    );
+    Ok(match coherence {
+        coven_threads_core::WeaveCoherence::Coherent => None,
+        coven_threads_core::WeaveCoherence::Broken { reason }
+        | coven_threads_core::WeaveCoherence::Degraded { reason, .. } => {
+            Some(coven_threads_core::Verdict::Reject {
+                reason: coven_threads_core::RejectReason::WeaveBroken { reason },
+            })
+        }
+    })
+}
+
 pub(crate) fn candidate_identity_context(
     coven_home: &Path,
     familiar_id: &str,
@@ -30,7 +70,7 @@ pub(crate) fn candidate_identity_context(
         edits,
         authorization,
         resolved_decisions,
-    );
+    )?;
     let roster = relevant_roster_source(coven_home, familiar_id, &required_facts);
     let soul = relevant_surface_source(
         workspace,
@@ -90,11 +130,12 @@ fn materialized_candidate_overrides(
     edits: &[ward::FileEdit],
     authorization: &ward::Authorization,
     resolved_decisions: Option<&[ward::Decision]>,
-) -> BTreeMap<String, Vec<u8>> {
+) -> Option<BTreeMap<String, Vec<u8>>> {
     let resolved_by_target = resolved_decisions
         .map(|decisions| {
             decisions
                 .iter()
+                .filter(|decision| !decision.verdict.is_blocked())
                 .map(|decision| (decision.target.clone(), decision.resolved.clone()))
                 .collect::<BTreeMap<_, _>>()
         })
@@ -108,19 +149,22 @@ fn materialized_candidate_overrides(
                 ward.evaluate(&proposal)
                     .decisions
                     .into_iter()
+                    .filter(|decision| !decision.verdict.is_blocked())
                     .map(|decision| (decision.target, decision.resolved))
                     .collect::<BTreeMap<_, _>>(),
             )
-        });
+        })?;
     let mut overrides = BTreeMap::new();
     for edit in edits {
-        let resolved = resolved_by_target
-            .as_ref()
-            .and_then(|decisions| decisions.get(edit.target.as_str()).cloned())
-            .unwrap_or_else(|| edit.target.clone());
-        overrides.insert(resolved, edit.new_contents.clone());
+        let resolved = resolved_by_target.get(edit.target.as_str())?;
+        if overrides
+            .insert(resolved.clone(), edit.new_contents.clone())
+            .is_some()
+        {
+            return None;
+        }
     }
-    overrides
+    Some(overrides)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -290,11 +334,15 @@ fn parse_soul(text: &str) -> ParsedSoul {
             name.consider(normalize_inline(rest));
         } else if let Some(rest) = line.strip_prefix("# I am ") {
             name.consider(normalize_inline(rest));
+        } else if matches!(line, "## I am" | "# I am") {
+            name.consider(None);
         }
         if let Some(rest) = line.strip_prefix("My purpose is ") {
             purpose.consider(normalize_inline(rest));
         } else if line.eq_ignore_ascii_case("## Purpose") {
             purpose.consider(collect_markdown_section(&lines, index + 1));
+        } else if line == "My purpose is" {
+            purpose.consider(None);
         }
         index += 1;
     }
@@ -315,12 +363,12 @@ fn parse_identity(text: &str) -> ParsedIdentity {
     let mut pronouns = ParsedValue::default();
     for raw_line in text.lines() {
         let line = raw_line.trim();
-        if let Some(rest) = line.strip_prefix("# IDENTITY.md - ") {
+        if let Some(rest) = line.strip_prefix("# IDENTITY.md -") {
             name.consider(normalize_inline(rest));
-        } else if let Some(rest) = line.strip_prefix("- **Name:** ") {
+        } else if let Some(rest) = line.strip_prefix("- **Name:**") {
             name.consider(normalize_inline(rest));
         }
-        if let Some(rest) = line.strip_prefix("- **Pronouns:** ") {
+        if let Some(rest) = line.strip_prefix("- **Pronouns:**") {
             pronouns.consider(normalize_inline(rest));
         }
     }
@@ -334,7 +382,7 @@ fn collect_markdown_section(lines: &[&str], start: usize) -> Option<String> {
     let mut collected = Vec::new();
     for line in &lines[start..] {
         let trimmed = line.trim();
-        if trimmed.starts_with('#') && !trimmed.eq_ignore_ascii_case("## Purpose") {
+        if trimmed.starts_with('#') {
             break;
         }
         if !trimmed.is_empty() {
@@ -345,11 +393,7 @@ fn collect_markdown_section(lines: &[&str], start: usize) -> Option<String> {
 }
 
 fn normalize_inline(value: &str) -> Option<String> {
-    let stripped = value
-        .trim()
-        .trim_matches(|character| matches!(character, '*' | '`' | '"' | '\\'))
-        .trim_end_matches(['.', ';', ':']);
-    let normalized = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         None
     } else {
@@ -379,6 +423,8 @@ struct ParsedValue {
 impl ParsedValue {
     fn consider(&mut self, candidate: Option<String>) {
         let Some(candidate) = candidate else {
+            self.value = None;
+            self.ambiguous = true;
             return;
         };
         if self.ambiguous {
@@ -422,4 +468,15 @@ fn candidate_commitment<const N: usize>(sources: [CandidateSource; N]) -> [u8; 3
         }
     }
     *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_declared_name_makes_identity_extraction_ambiguous() {
+        let identity = parse_identity("# IDENTITY.md - Sage\n- **Name:**\n");
+        assert!(identity.name.is_none());
+    }
 }

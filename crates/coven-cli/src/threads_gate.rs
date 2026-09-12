@@ -148,8 +148,8 @@ pub struct GateRequest<'a> {
     pub edits: &'a [ward::FileEdit],
     /// Gate-2 *resolved* home-relative paths of the proposal's unblocked
     /// Tier-0 targets. Blocked targets are already refused by the Ward
-    /// downstream. Empty means no protected target: the gate is a no-op
-    /// `Permitted` — editable-tier writes are the Ward tiers' lane.
+    /// downstream. Empty leaves structural authority to the Ward tiers;
+    /// configured identity predicates still constrain the complete candidate.
     pub gated_targets: &'a [String],
     /// The proposal's authorization.
     pub authorization: &'a ward::Authorization,
@@ -173,7 +173,18 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         authorization,
     } = *req;
     ward::validate_file_edit_budget(edits)?;
-    if gated_targets.is_empty() {
+    let identity_context = crate::ward_identity::candidate_identity_context(
+        coven_home,
+        familiar_id,
+        workspace,
+        config,
+        edits,
+        authorization,
+        None,
+    );
+    let identity_rejection =
+        crate::ward_identity::candidate_rejection(config, identity_context.as_ref())?;
+    if gated_targets.is_empty() && identity_rejection.is_none() {
         return Ok(GateReport {
             verdicts: Vec::new(),
             outcome: GateOutcome::Permitted,
@@ -184,19 +195,43 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
         None => threads::WriterId::new("client:unsigned"),
     };
-    let now = time::OffsetDateTime::now_utc();
-    let state = build_weave_state(conn, familiar_id, workspace, config, gated_targets, true)?;
-    let familiar_uuid = state.familiar_uuid;
-    let weave = state.weave;
-    let identity_context = crate::ward_identity::candidate_identity_context(
-        coven_home,
+    let now = crate::threads_clock::now(coven_home)?;
+    let state = build_weave_state_at(
+        conn,
         familiar_id,
         workspace,
         config,
-        edits,
-        authorization,
-        None,
-    );
+        gated_targets,
+        identity_rejection.is_none(),
+        now,
+    )?;
+    let familiar_uuid = state.familiar_uuid;
+    let weave = state.weave;
+    if let Some(verdict) = identity_rejection {
+        let mut verdicts = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let request = threads::MutationRequest {
+                surface: threads::SurfaceId::new(edit.target.clone()),
+                writer: request_writer.clone(),
+                channel: threads::Channel::Mutation,
+                identity_context: identity_context.clone(),
+            };
+            append_audit_row(
+                conn,
+                familiar_id,
+                &familiar_uuid,
+                weave.weave_hash(),
+                &request,
+                &verdict,
+                now,
+            )?;
+            verdicts.push((edit.target.clone(), verdict.clone()));
+        }
+        return Ok(GateReport {
+            verdicts,
+            outcome: GateOutcome::Rejected,
+        });
+    }
 
     // Validate every gated target; audit every verdict (RFC-0001 §5.6).
     let mut verdicts = Vec::with_capacity(gated_targets.len());
@@ -246,6 +281,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             edits,
             now,
             StagingProbeContext {
+                familiar_id,
                 workspace,
                 config,
                 authorization,
@@ -275,42 +311,48 @@ pub(crate) fn build_weave_state(
     extra_targets: &[String],
     bootstrap_missing_baselines: bool,
 ) -> Result<WeaveState> {
-    build_weave_state_for_writer(
+    build_weave_state_at(
         conn,
         familiar_id,
         workspace,
         config,
         extra_targets,
         bootstrap_missing_baselines,
-        None,
+        time::OffsetDateTime::now_utc(),
     )
 }
 
-fn build_read_only_weave_state(
-    conn: &Connection,
-    familiar_id: &str,
-    workspace: &Path,
-    config: &ward::WardConfig,
-    extra_targets: &[String],
-) -> Result<WeaveState> {
-    build_weave_state_for_writer(
-        conn,
-        familiar_id,
-        workspace,
-        config,
-        extra_targets,
-        false,
-        None,
-    )
-}
-
-pub(crate) fn build_weave_state_for_writer(
+pub(crate) fn build_weave_state_at(
     conn: &Connection,
     familiar_id: &str,
     workspace: &Path,
     config: &ward::WardConfig,
     extra_targets: &[String],
     bootstrap_missing_baselines: bool,
+    now: time::OffsetDateTime,
+) -> Result<WeaveState> {
+    build_weave_state_for_writer_at(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        extra_targets,
+        bootstrap_missing_baselines,
+        now,
+        None,
+    )
+}
+
+// All surfaces share one captured time alongside the existing writer-specific weave inputs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_weave_state_for_writer_at(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    extra_targets: &[String],
+    bootstrap_missing_baselines: bool,
+    now: time::OffsetDateTime,
     writer: Option<&threads::WriterId>,
 ) -> Result<WeaveState> {
     let familiar_uuid = familiar_weave_id(familiar_id);
@@ -334,7 +376,6 @@ pub(crate) fn build_weave_state_for_writer(
     surfaces.sort();
 
     let manifest_id = load_or_create_manifest_id(conn, familiar_id)?;
-    let now = time::OffsetDateTime::now_utc();
     let mut woven = Vec::with_capacity(surfaces.len());
     for surface in &surfaces {
         let surface_id = threads::SurfaceId::new(surface.clone());
@@ -788,7 +829,14 @@ pub fn persist_apply_audit_records(
     config: &ward::WardConfig,
     report: &ward::ApplyReport,
 ) -> Result<()> {
-    persist_apply_audit_records_on_connection(conn, familiar_id, workspace, config, report)
+    persist_apply_audit_records_on_connection(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        report,
+        time::OffsetDateTime::now_utc(),
+    )
 }
 
 pub(crate) fn persist_apply_audit_records_on_connection(
@@ -797,6 +845,7 @@ pub(crate) fn persist_apply_audit_records_on_connection(
     workspace: &Path,
     config: &ward::WardConfig,
     report: &ward::ApplyReport,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     if report.audit_records().next().is_none() {
         return Ok(());
@@ -807,14 +856,15 @@ pub(crate) fn persist_apply_audit_records_on_connection(
             .context("starting apply-audit batch transaction")?;
     }
     let result = (|| -> Result<()> {
-        let state = build_read_only_weave_state(conn, familiar_id, workspace, config, &[])?;
-        append_apply_audit_records(
+        let state = build_weave_state_at(conn, familiar_id, workspace, config, &[], false, now)?;
+        append_apply_audit_records_at(
             conn,
             None,
             familiar_id,
             state.weave.weave_hash(),
             report,
             threads::Channel::Mutation,
+            now,
         )?;
         if owns_transaction {
             conn.execute_batch("COMMIT")
@@ -834,17 +884,17 @@ pub(crate) fn persist_apply_audit_records_on_connection(
 /// proposal event commit as one unit. Direct writes use
 /// [`persist_apply_audit_records_on_connection`] to append within the existing
 /// transaction when present, or a dedicated transaction otherwise.
-pub(crate) fn append_apply_audit_records(
+pub(crate) fn append_apply_audit_records_at(
     conn: &Connection,
     proposal_id: Option<&str>,
     familiar_id: &str,
     ward_hash: &[u8],
     report: &ward::ApplyReport,
     channel: threads::Channel,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let records = report.audit_records();
     let familiar_uuid = familiar_weave_id(familiar_id);
-    let now = time::OffsetDateTime::now_utc();
     let format = time::format_description::well_known::Rfc3339;
     let now_text = now.format(&format)?;
     {
@@ -945,9 +995,9 @@ pub fn stage_coherence_proposal(
         Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
         None => threads::WriterId::new("client:unsigned"),
     };
-    let now = time::OffsetDateTime::now_utc();
+    let now = crate::threads_clock::now(coven_home)?;
     // Read-only weave view: coherence staging must not bootstrap baselines.
-    let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
+    let state = build_weave_state_at(conn, familiar_id, workspace, config, &[], false, now)?;
     let thread_id = threads::ThreadId::new();
     let (pending_path, proposal_id) = stage_pending_proposal(
         coven_home,
@@ -963,6 +1013,7 @@ pub fn stage_coherence_proposal(
         edits,
         now,
         StagingProbeContext {
+            familiar_id,
             workspace,
             config,
             authorization,
@@ -1012,6 +1063,7 @@ struct StagingLane {
 }
 
 struct StagingProbeContext<'a> {
+    familiar_id: &'a str,
     workspace: &'a Path,
     config: &'a ward::WardConfig,
     authorization: &'a ward::Authorization,
@@ -1027,6 +1079,22 @@ fn stage_pending_proposal(
     probe_context: StagingProbeContext<'_>,
 ) -> Result<(PathBuf, String)> {
     ward::validate_file_edit_budget(edits)?;
+    let identity_context = crate::ward_identity::candidate_identity_context(
+        coven_home,
+        probe_context.familiar_id,
+        probe_context.workspace,
+        probe_context.config,
+        edits,
+        probe_context.authorization,
+        None,
+    );
+    if let Some(verdict) =
+        crate::ward_identity::candidate_rejection(probe_context.config, identity_context.as_ref())?
+    {
+        anyhow::bail!("identity predicates refuse proposal staging: {verdict:?}");
+    }
+    let identity_evidence =
+        crate::ward_identity::candidate_binding(probe_context.config, identity_context.as_ref())?;
     let proposal = threads::PendingProposal {
         id: threads::ProposalId::new(),
         familiar_id: *familiar_uuid,
@@ -1065,11 +1133,14 @@ fn stage_pending_proposal(
             proposal: &'a threads::PendingProposal,
             #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
             review_kind: Option<&'static str>,
+            #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
+            identity_evidence: Option<[u8; 32]>,
             probes: &'a [crate::ward_probes::SurfaceProbeReport],
         }
         serde_json::to_vec_pretty(&StagedProposalFile {
             proposal: &proposal,
             review_kind: lane.review_kind,
+            identity_evidence,
             probes: &probes,
         })
         .context("serializing pending proposal")?
@@ -1316,8 +1387,15 @@ coven = "OpenCoven"
             .unwrap();
 
         f.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        persist_apply_audit_records_on_connection(&f.conn, "sage", &f.workspace, &config, &report)
-            .unwrap();
+        persist_apply_audit_records_on_connection(
+            &f.conn,
+            "sage",
+            &f.workspace,
+            &config,
+            &report,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         let count_in_transaction: i64 = f
             .conn
             .query_row(

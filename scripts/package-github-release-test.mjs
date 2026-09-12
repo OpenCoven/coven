@@ -12,12 +12,15 @@ import {
   captureCommandOutputToFile,
   canonicalReleaseAssetNames,
   packageGitHubRelease,
+  resolveReleaseSourceAcceptance,
   resolveReleaseSource,
   syncGitHubRelease,
   verifyAnnotatedTag,
   verifyNpmRegistrySignatures,
   verifyPackageProvenance,
   verifyReleaseSource,
+  verifySourceAcceptanceJobs,
+  verifySourceAcceptanceWorkflowRun,
   verifySourceRun
 } from './package-github-release.mjs';
 
@@ -35,6 +38,9 @@ const NPM_VERSION = '0.4.4';
 const HEAD_SHA = '0000000000000000000000000000000000000000';
 const SOURCE_RUN_ID = '31993572717';
 const SOURCE_RUN_ATTEMPT = 1;
+const CI_RUN_ID = '34064159812';
+const CI_RUN_ATTEMPT = 1;
+const PR_GATE_JOB_ID = '101569906999';
 const CHECKOUT_ACTION_SHA = ['3d3c42e5aac5ba805825da76', '410c181273ba90b1'].join('');
 const SETUP_NODE_ACTION_SHA = ['820762786026740c76f36085', 'b0efc47a31fe5020'].join('');
 const DOWNLOAD_ARTIFACT_ACTION_SHA = ['3e5f45b2cfb9172054b4087a', '40e8e0b5a5461e7c'].join('');
@@ -186,6 +192,36 @@ function baseValidSourceRun() {
     head_branch: RELEASE_TAG,
     head_sha: HEAD_SHA,
     run_attempt: SOURCE_RUN_ATTEMPT
+  };
+}
+
+function baseValidCiWorkflowRun() {
+  return {
+    id: Number(CI_RUN_ID),
+    name: 'CI',
+    path: '.github/workflows/ci.yml',
+    event: 'push',
+    status: 'completed',
+    conclusion: 'success',
+    head_branch: 'main',
+    head_sha: HEAD_SHA,
+    run_attempt: CI_RUN_ATTEMPT,
+    html_url: `https://github.com/OpenCoven/coven/actions/runs/${CI_RUN_ID}`
+  };
+}
+
+function baseValidCiJobs() {
+  return {
+    total_count: 1,
+    jobs: [
+      {
+        id: Number(PR_GATE_JOB_ID),
+        name: 'PR gate',
+        status: 'completed',
+        conclusion: 'success',
+        html_url: `https://github.com/OpenCoven/coven/actions/runs/${CI_RUN_ID}/job/${PR_GATE_JOB_ID}`
+      }
+    ]
   };
 }
 
@@ -826,6 +862,368 @@ test('verifyReleaseSource requires the tagged commit to stay on origin/main and 
       }),
     /SOURCE_DATE_EPOCH/
   );
+});
+
+test('exact-source acceptance requires the canonical main push run and stable gate', () => {
+  const workflow = verifySourceAcceptanceWorkflowRun(
+    { workflow_runs: [baseValidCiWorkflowRun()] },
+    { headSha: HEAD_SHA }
+  );
+  assert.deepEqual(workflow, {
+    name: 'CI',
+    path: '.github/workflows/ci.yml',
+    runId: CI_RUN_ID,
+    runAttempt: CI_RUN_ATTEMPT,
+    event: 'push',
+    headBranch: 'main',
+    headSha: HEAD_SHA,
+    status: 'completed',
+    conclusion: 'success',
+    htmlUrl: `https://github.com/OpenCoven/coven/actions/runs/${CI_RUN_ID}`
+  });
+  assert.deepEqual(
+    verifySourceAcceptanceJobs(baseValidCiJobs(), { runId: CI_RUN_ID }),
+    [
+      {
+        name: 'PR gate',
+        jobId: PR_GATE_JOB_ID,
+        status: 'completed',
+        conclusion: 'success',
+        htmlUrl: `https://github.com/OpenCoven/coven/actions/runs/${CI_RUN_ID}/job/${PR_GATE_JOB_ID}`
+      }
+    ]
+  );
+});
+
+test('exact-source acceptance rejects missing, stale, failed, skipped, and ambiguous evidence', () => {
+  assert.throws(
+    () => verifySourceAcceptanceWorkflowRun({ workflow_runs: [] }, { headSha: HEAD_SHA }),
+    /no push run on main for exact source commit/
+  );
+  assert.throws(
+    () =>
+      verifySourceAcceptanceWorkflowRun(
+        {
+          workflow_runs: [
+            { ...baseValidCiWorkflowRun(), head_sha: 'f'.repeat(40) }
+          ]
+        },
+        { headSha: HEAD_SHA }
+      ),
+    /no push run on main for exact source commit/
+  );
+  for (const conclusion of ['failure', 'cancelled', 'skipped', 'timed_out']) {
+    assert.throws(
+      () =>
+        verifySourceAcceptanceWorkflowRun(
+          {
+            workflow_runs: [
+              { ...baseValidCiWorkflowRun(), conclusion }
+            ]
+          },
+          { headSha: HEAD_SHA }
+        ),
+      /must have completed successfully/
+    );
+  }
+  assert.throws(
+    () => verifySourceAcceptanceJobs({ jobs: [] }, { runId: CI_RUN_ID }),
+    /missing required check "PR gate"/
+  );
+  for (const conclusion of ['failure', 'cancelled', 'skipped', 'timed_out']) {
+    assert.throws(
+      () =>
+        verifySourceAcceptanceJobs(
+          {
+            jobs: [
+              { ...baseValidCiJobs().jobs[0], conclusion }
+            ]
+          },
+          { runId: CI_RUN_ID }
+        ),
+      /must have completed successfully/
+    );
+  }
+  assert.throws(
+    () =>
+      verifySourceAcceptanceJobs(
+        {
+          jobs: [
+            baseValidCiJobs().jobs[0],
+            { ...baseValidCiJobs().jobs[0], id: Number(PR_GATE_JOB_ID) + 1 }
+          ]
+        },
+        { runId: CI_RUN_ID }
+      ),
+    /required-check identity is ambiguous/
+  );
+});
+
+test('exact-source acceptance rejects unrelated green workflows and duplicate exact runs', () => {
+  for (const mismatch of [
+    { event: 'pull_request' },
+    { path: '.github/workflows/release-npm.yml' },
+    { name: 'Release npm packages' },
+    { head_branch: 'release-candidate' }
+  ]) {
+    assert.throws(
+      () => verifySourceAcceptanceWorkflowRun(
+        { workflow_runs: [{ ...baseValidCiWorkflowRun(), ...mismatch }] },
+        { headSha: HEAD_SHA }
+      ),
+      /no push run on main for exact source commit/,
+      JSON.stringify(mismatch)
+    );
+  }
+  assert.throws(
+    () => verifySourceAcceptanceWorkflowRun(
+      {
+        workflow_runs: [
+          baseValidCiWorkflowRun(),
+          { ...baseValidCiWorkflowRun(), id: Number(CI_RUN_ID) + 1, conclusion: 'failure' }
+        ]
+      },
+      { headSha: HEAD_SHA }
+    ),
+    /source acceptance is ambiguous/
+  );
+});
+
+test('exact-source acceptance requires completed results even when a payload says success', () => {
+  for (const status of ['queued', 'in_progress']) {
+    assert.throws(
+      () => verifySourceAcceptanceWorkflowRun(
+        { workflow_runs: [{ ...baseValidCiWorkflowRun(), status }] },
+        { headSha: HEAD_SHA }
+      ),
+      /must have completed successfully/
+    );
+    assert.throws(
+      () => verifySourceAcceptanceJobs(
+        { jobs: [{ ...baseValidCiJobs().jobs[0], status }] },
+        { runId: CI_RUN_ID }
+      ),
+      /must have completed successfully/
+    );
+  }
+});
+
+test('exact-source acceptance rejects malformed evidence arrays', () => {
+  for (const payload of [null, {}, { workflow_runs: null }, { workflow_runs: {} }]) {
+    assert.throws(
+      () => verifySourceAcceptanceWorkflowRun(payload, { headSha: HEAD_SHA }),
+      /missing workflow_runs/
+    );
+  }
+  for (const payload of [null, {}, { jobs: null }, { jobs: {} }]) {
+    assert.throws(
+      () => verifySourceAcceptanceJobs(payload, { runId: CI_RUN_ID }),
+      /missing jobs/
+    );
+  }
+});
+
+test('resolveReleaseSourceAcceptance propagates API failures without returning a receipt', async () => {
+  for (const failureCall of [1, 2]) {
+    let calls = 0;
+    const apiError = new Error(`GitHub API unavailable at call ${failureCall}`);
+    await assert.rejects(
+      resolveReleaseSourceAcceptance({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        headSha: HEAD_SHA,
+        tagObjectSha: '1'.repeat(40),
+        ghApi: async () => {
+          calls += 1;
+          if (calls === failureCall) throw apiError;
+          return { total_count: 1, workflow_runs: [baseValidCiWorkflowRun()] };
+        },
+        now: () => { throw new Error('must not construct a receipt after an API failure'); }
+      }),
+      (error) => error === apiError
+    );
+    assert.equal(calls, failureCall);
+  }
+});
+
+test('resolveReleaseSourceAcceptance rejects duplicate runs and gates hidden on later pages', async () => {
+  const repository = 'OpenCoven/coven';
+  for (const hiddenDuplicate of ['workflow run', 'PR gate']) {
+    await assert.rejects(
+      resolveReleaseSourceAcceptance({
+        repository,
+        releaseTag: RELEASE_TAG,
+        headSha: HEAD_SHA,
+        tagObjectSha: '1'.repeat(40),
+        ghApi: async (endpoint) => {
+          const url = new URL(`https://api.github.test${endpoint}`);
+          const page = Number(url.searchParams.get('page') ?? '1');
+          if (url.pathname === `/repos/${repository}/actions/runs`) {
+            if (hiddenDuplicate === 'workflow run') {
+              if (page === 1) {
+                return {
+                  total_count: 101,
+                  workflow_runs: [
+                    baseValidCiWorkflowRun(),
+                    ...Array.from({ length: 99 }, (_, index) => ({
+                      ...baseValidCiWorkflowRun(),
+                      id: Number(CI_RUN_ID) + index + 10,
+                      name: 'Unrelated workflow'
+                    }))
+                  ]
+                };
+              }
+              return {
+                total_count: 101,
+                workflow_runs: [
+                  { ...baseValidCiWorkflowRun(), id: Number(CI_RUN_ID) + 1 }
+                ]
+              };
+            }
+            return { total_count: 1, workflow_runs: [baseValidCiWorkflowRun()] };
+          }
+          if (url.pathname.endsWith(`/attempts/${CI_RUN_ATTEMPT}/jobs`)) {
+            if (hiddenDuplicate === 'PR gate') {
+              if (page === 1) {
+                return {
+                  total_count: 101,
+                  jobs: [
+                    baseValidCiJobs().jobs[0],
+                    ...Array.from({ length: 99 }, (_, index) => ({
+                      ...baseValidCiJobs().jobs[0],
+                      id: Number(PR_GATE_JOB_ID) + index + 10,
+                      name: 'Unrelated job'
+                    }))
+                  ]
+                };
+              }
+              return {
+                total_count: 101,
+                jobs: [
+                  { ...baseValidCiJobs().jobs[0], id: Number(PR_GATE_JOB_ID) + 1 }
+                ]
+              };
+            }
+            return { total_count: 1, jobs: baseValidCiJobs().jobs };
+          }
+          throw new Error(`unexpected endpoint ${endpoint}`);
+        }
+      }),
+      /ambiguous/,
+      hiddenDuplicate
+    );
+  }
+});
+
+test('resolveReleaseSourceAcceptance rejects missing or inconsistent pagination metadata', async () => {
+  for (const workflowPayload of [
+    { workflow_runs: [baseValidCiWorkflowRun()] },
+    { total_count: 2, workflow_runs: [baseValidCiWorkflowRun()] }
+  ]) {
+    await assert.rejects(
+      resolveReleaseSourceAcceptance({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        headSha: HEAD_SHA,
+        tagObjectSha: '1'.repeat(40),
+        ghApi: async () => workflowPayload
+      }),
+      /pagination|total_count/i
+    );
+  }
+});
+
+test('resolveReleaseSourceAcceptance reads the selected rerun attempt instead of old jobs', async () => {
+  const selectedAttempt = 3;
+  await assert.rejects(
+    resolveReleaseSourceAcceptance({
+      repository: 'OpenCoven/coven',
+      releaseTag: RELEASE_TAG,
+      headSha: HEAD_SHA,
+      tagObjectSha: '1'.repeat(40),
+      ghApi: async (endpoint) => {
+        if (endpoint.includes('/actions/runs?')) {
+          return {
+            total_count: 1,
+            workflow_runs: [{ ...baseValidCiWorkflowRun(), run_attempt: selectedAttempt }]
+          };
+        }
+        assert.equal(
+          endpoint,
+          `/repos/OpenCoven/coven/actions/runs/${CI_RUN_ID}/attempts/${selectedAttempt}/jobs?per_page=100&page=1`
+        );
+        return {
+          total_count: 1,
+          jobs: [{ ...baseValidCiJobs().jobs[0], conclusion: 'failure' }]
+        };
+      }
+    }),
+    /required check PR gate.*must have completed successfully/
+  );
+});
+
+test('resolveReleaseSourceAcceptance records exact workflow and required-check evidence', async () => {
+  const repository = 'OpenCoven/coven';
+  const tagObjectSha = '1'.repeat(40);
+  const calls = [];
+  const result = await resolveReleaseSourceAcceptance({
+    repository,
+    releaseTag: RELEASE_TAG,
+    headSha: HEAD_SHA,
+    tagObjectSha,
+    ghApi: async (endpoint) => {
+      calls.push(endpoint);
+      if (
+        endpoint ===
+        `/repos/${repository}/actions/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100&page=1`
+      ) {
+        return { total_count: 1, workflow_runs: [baseValidCiWorkflowRun()] };
+      }
+      if (
+        endpoint ===
+        `/repos/${repository}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100&page=1`
+      ) {
+        return baseValidCiJobs();
+      }
+      throw new Error(`unexpected endpoint ${endpoint}`);
+    },
+    now: () => new Date('2026-09-07T00:00:00.000Z')
+  });
+  assert.deepEqual(result, {
+    schemaVersion: 1,
+    kind: 'coven.release-source-acceptance',
+    repository,
+    releaseTag: RELEASE_TAG,
+    tagObjectSha,
+    candidateSha: HEAD_SHA,
+    defaultBranch: 'main',
+    workflow: {
+      name: 'CI',
+      path: '.github/workflows/ci.yml',
+      runId: CI_RUN_ID,
+      runAttempt: CI_RUN_ATTEMPT,
+      event: 'push',
+      headBranch: 'main',
+      headSha: HEAD_SHA,
+      status: 'completed',
+      conclusion: 'success',
+      htmlUrl: `https://github.com/OpenCoven/coven/actions/runs/${CI_RUN_ID}`
+    },
+    requiredChecks: [
+      {
+        name: 'PR gate',
+        jobId: PR_GATE_JOB_ID,
+        status: 'completed',
+        conclusion: 'success',
+        htmlUrl: `https://github.com/OpenCoven/coven/actions/runs/${CI_RUN_ID}/job/${PR_GATE_JOB_ID}`
+      }
+    ],
+    observedAt: '2026-09-07T00:00:00.000Z'
+  });
+  assert.deepEqual(calls, [
+    `/repos/${repository}/actions/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100&page=1`,
+    `/repos/${repository}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100&page=1`
+  ]);
 });
 
 test('resolveReleaseSource uses the selected run attempt metadata and preserves the verified tag identity', async () => {

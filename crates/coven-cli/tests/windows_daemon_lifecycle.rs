@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -84,6 +84,13 @@ impl Drop for DaemonGuard {
     fn drop(&mut self) {
         terminate_recorded_daemon(&self.coven_home);
     }
+}
+
+fn real_daemon_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn assert_success(label: &str, output: &Output) {
@@ -424,6 +431,7 @@ fn send_launch_request(
 
 #[test]
 fn inherited_legacy_status_with_dead_pid_does_not_wedge_lifecycle_commands() -> Result<()> {
+    let _real_daemon = real_daemon_test_lock();
     let temp = tempfile::tempdir()?;
     let coven_home = temp.path().join("coven-home");
     std::fs::create_dir_all(&coven_home)?;
@@ -574,6 +582,7 @@ fn inherited_legacy_status_rejects_cross_profile_and_arbitrary_records() -> Resu
 
 #[test]
 fn abrupt_daemon_stop_kills_child_stalled_before_per_session_job_attachment() -> Result<()> {
+    let _real_daemon = real_daemon_test_lock();
     eprintln!("[windows-daemon-lifecycle] preparing fixture");
     let temp = tempfile::tempdir()?;
     let coven_home = temp.path().join("coven-home");
@@ -644,6 +653,7 @@ fn abrupt_daemon_stop_kills_child_stalled_before_per_session_job_attachment() ->
 
 #[test]
 fn abrupt_daemon_stop_kills_live_piped_descendants() -> Result<()> {
+    let _real_daemon = real_daemon_test_lock();
     let temp = tempfile::tempdir()?;
     let coven_home = temp.path().join("coven-home");
     let project = temp.path().join("project");

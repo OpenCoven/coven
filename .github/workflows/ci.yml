@@ -115,7 +115,16 @@ jobs:
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/package-automations-protocol.test.mjs
       - run: node --test scripts/package-automations-authority-profile.test.mjs
+      - run: node --test conformance/automations/runner/conformance.test.mjs
       - run: node --test scripts/release-stress-test.mjs
+      # The benchmark harness tests also run inside `performance-baseline`,
+      # but that job is push-only, so until this step existed a pull request
+      # could break `benchmark-cli.mjs` and still show every check green -
+      # the failure only appeared after the merge landed on main. These are
+      # pure Node with no daemon or built binary involved (they pass
+      # `--binary=$(node)` with `--session-counts=none`), so they cost about a
+      # second here rather than gating behind the expensive baseline job.
+      - run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
       - run: scripts/check-workflows.sh
 
   automations-protocol-bundle:
@@ -244,13 +253,18 @@ jobs:
       - name: Install native link dependencies
         run: bash scripts/install-native-link-dependencies.sh
       - run: cargo test --workspace --locked
+      - name: Exercise isolated Threads clock feature
+        run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
 
   rust-test-windows:
     name: Rust tests (Windows)
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
-    timeout-minutes: 20
+    # A healthy cached run is already about 15-16 minutes. Keep enough
+    # shared-runner headroom for the suite to report failures instead of being
+    # cancelled by the job cap while tests are still progressing.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -264,6 +278,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
+      - name: Exercise isolated Threads clock feature
+        run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
 
   # macOS runners bill at roughly ten times the Linux rate, so this follows the
   # npm-onboarding split: a cheap matrix on pull requests, the full one on main.
@@ -290,6 +306,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
+      - name: Exercise isolated Threads clock feature
+        run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
 
   afs-mount-linux:
     name: AFS mount backend (Linux)
@@ -627,7 +645,10 @@ jobs:
 
   pr-gate:
     name: PR gate
-    if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}
+    # Keep the branch-protection context stable while also producing an
+    # exact-commit acceptance result for main that release publication can
+    # verify independently.
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:

@@ -1,0 +1,62 @@
+{
+  "schemaVersion": "coven.automations.occurrence-fence-uniqueness-vectors.v1",
+  "cases": [
+    {
+      "caseId": "same-automation-same-slot-is-refused",
+      "scenario": "duplicate_slot",
+      "first": {
+        "occurrenceId": "daily-notes-slot-first",
+        "automationId": "daily-notes",
+        "scheduledFor": "2026-08-30T09:00:00.000Z"
+      },
+      "second": {
+        "occurrenceId": "daily-notes-slot-duplicate",
+        "automationId": "daily-notes",
+        "scheduledFor": "2026-08-30T09:00:00.000Z"
+      },
+      "expected": {
+        "firstPreserved": true,
+        "secondCommitted": false,
+        "rowCount": 1
+      }
+    },
+    {
+      "caseId": "different-automations-may-share-slot",
+      "scenario": "different_automation",
+      "first": {
+        "occurrenceId": "daily-notes-shared-slot",
+        "automationId": "daily-notes",
+        "scheduledFor": "2026-08-30T09:00:00.000Z"
+      },
+      "second": {
+        "occurrenceId": "weekly-review-shared-slot",
+        "automationId": "weekly-review",
+        "scheduledFor": "2026-08-30T09:00:00.000Z"
+      },
+      "expected": {
+        "firstPreserved": true,
+        "secondCommitted": true,
+        "rowCount": 2
+      }
+    },
+    {
+      "caseId": "same-automation-may-use-different-slot",
+      "scenario": "different_slot",
+      "first": {
+        "occurrenceId": "daily-notes-first-slot",
+        "automationId": "daily-notes",
+        "scheduledFor": "2026-08-30T09:00:00.000Z"
+      },
+      "second": {
+        "occurrenceId": "daily-notes-next-slot",
+        "automationId": "daily-notes",
+        "scheduledFor": "2026-08-31T09:00:00.000Z"
+      },
+      "expected": {
+        "firstPreserved": true,
+        "secondCommitted": true,
+        "rowCount": 2
+      }
+    }
+  ]
+}
