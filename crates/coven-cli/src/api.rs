@@ -36867,8 +36867,10 @@ tier = 0
         for failure in [
             "missing-familiar",
             "invalid-familiar",
+            "invalid-familiar-utf8",
             "missing-ward",
             "invalid-ward",
+            "invalid-ward-utf8",
             "invalid-ward-glob",
         ] {
             let temp = tempfile::tempdir()?;
@@ -36898,8 +36900,10 @@ tier = 0
             match failure {
                 "missing-familiar" => std::fs::write(home.join("familiars.toml"), "")?,
                 "invalid-familiar" => std::fs::write(home.join("familiars.toml"), "invalid = [")?,
+                "invalid-familiar-utf8" => std::fs::write(home.join("familiars.toml"), [0xff])?,
                 "missing-ward" => std::fs::remove_file(&ward_path)?,
                 "invalid-ward" => std::fs::write(&ward_path, "invalid = [")?,
+                "invalid-ward-utf8" => std::fs::write(&ward_path, [0xff])?,
                 "invalid-ward-glob" => {
                     let config = std::fs::read_to_string(&ward_path)?
                         .replace("path = \"reviewed/\"", "path = \"[\"");
@@ -37164,9 +37168,11 @@ tier = 0
         for failure in [
             "missing-ward",
             "invalid-ward",
+            "invalid-ward-utf8",
             "invalid-ward-glob",
             "missing-familiar",
             "invalid-familiar",
+            "invalid-familiar-utf8",
             "invalid-protected-baseline",
         ] {
             let temp = tempfile::tempdir()?;
@@ -37195,6 +37201,7 @@ tier = 0
             match failure {
                 "missing-ward" => std::fs::remove_file(&ward_path)?,
                 "invalid-ward" => std::fs::write(&ward_path, "invalid = [")?,
+                "invalid-ward-utf8" => std::fs::write(&ward_path, [0xff])?,
                 "invalid-ward-glob" => {
                     let config = std::fs::read_to_string(&ward_path)?
                         .replace("path = \"reviewed/\"", "path = \"[\"");
@@ -37202,6 +37209,7 @@ tier = 0
                 }
                 "missing-familiar" => std::fs::write(home.join("familiars.toml"), "")?,
                 "invalid-familiar" => std::fs::write(home.join("familiars.toml"), "invalid = [")?,
+                "invalid-familiar-utf8" => std::fs::write(home.join("familiars.toml"), [0xff])?,
                 "invalid-protected-baseline" => {
                     std::fs::remove_file(home.join("familiars/sage/SOUL.md"))?;
                     std::fs::create_dir(home.join("familiars/sage/SOUL.md"))?;
