@@ -174,12 +174,10 @@ fn request_with_peer(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    if !(path.starts_with("/api/v1/") || (method == "GET" && path == "/health"))
-        || !path.starts_with('/')
-        || path.starts_with("//")
-    {
+    let _ = method;
+    if !valid_request_target(path) {
         return Err(ClientError::InvalidHttpResponse(
-            "attempted request outside /api/v1 or exact GET /health".to_owned(),
+            "attempted request outside /api/v1 or exact /health".to_owned(),
         ));
     }
     if let Some(body) = body {
@@ -226,6 +224,16 @@ pub use windows::{
     probe_windows_daemon_health_with_identity, probe_windows_daemon_health_with_identity_until,
     windows_process_creation_time, WindowsDaemonHealthProbe, WindowsDaemonProcess,
 };
+
+fn valid_request_target(path: &str) -> bool {
+    (path.starts_with("/api/v1/") || path == "/health")
+        && path.starts_with('/')
+        && !path.starts_with("//")
+        && path.is_ascii()
+        && !path
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'#')
+}
 
 #[cfg(test)]
 mod tests {
@@ -313,5 +321,21 @@ mod tests {
             .expect("an interrupted write must be retried under the same deadline");
 
         assert_eq!(stream.bytes, b"payload");
+    }
+
+    #[test]
+    fn request_target_guard_rejects_non_origin_or_injected_targets() {
+        for path in [
+            "http://evil.example/api/v1/health",
+            "//evil.example/api/v1/health",
+            "/api/v1/health HTTP/1.1",
+            "/api/v1/health\r\nX: injected",
+            "/api/v1/health#fragment",
+        ] {
+            assert!(
+                !super::valid_request_target(path),
+                "unsafe request target was accepted: {path:?}"
+            );
+        }
     }
 }
