@@ -125,6 +125,17 @@ read uses at most 16 KiB and a one-second caller guard, preserves the original
 command result, and reports missing or delayed data explicitly. Its five helper
 tests are diagnostic coverage, not additional CLI or authority journeys.
 
+Startup retains the initialized, runtime-guarded SQLite connection through
+hub/cache setup, avoiding an intermediate last-connection checkpoint and
+reopen. Its one explicit final close still completes before readiness. There
+is no lifetime-long keeper connection or deferred shutdown checkpoint.
+`store-close-begin` marks that final close. `prior_observer_ms` counts completed
+prior checkpoint append attempts, including scheduling inside them; it is not
+pure disk time and excludes the current append. A visible line does not prove
+its own append returned. The new `store-initialize-end` marks the retained
+connection, so its timing is not directly comparable with the older
+post-close boundary.
+
 Windows authority journeys serialize admission and retain an owned
 `coven daemon serve` child, using the same native helper as the smaller Threads
 fixtures. Their fixed 15-second readiness budget starts before process spawn,

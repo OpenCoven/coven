@@ -562,20 +562,19 @@ fn initialization_count(path: &Path) -> usize {
 
 /// Opens a writable store for a standalone CLI caller. The first open for a
 /// path in this process initializes or upgrades it; later opens only configure
-/// the connection. Daemon startup calls [`initialize_store`] explicitly before
-/// it starts accepting requests, so its request paths always take the latter.
+/// the connection. Daemon startup explicitly initializes before accepting
+/// requests, so its request paths always take the latter.
 pub fn open_store(path: &Path) -> Result<Connection> {
     if !store_was_initialized(path) {
-        initialize_store(path)?;
+        return open_store_with_initialization_observer(path, |_| {});
     }
     open_initialized_store(path)
 }
 
-/// Performs the idempotent, write-capable store initialization and migration
-/// sequence. Call this before serving requests; ordinary request connections
-/// should use [`open_initialized_store`] after this succeeds.
+/// Initialization-only entry for schema and migration regressions.
+#[cfg(test)]
 pub fn initialize_store(path: &Path) -> Result<()> {
-    initialize_store_with_observer(path, |_| {})
+    initialize_store_connection(path, |_| {}).map(drop)
 }
 
 #[derive(Clone, Copy)]
@@ -588,10 +587,21 @@ pub(crate) enum StoreInitializationPhase {
     CommitComplete,
 }
 
-pub(crate) fn initialize_store_with_observer(
+/// Returns the initialized connection with the same guards as a runtime open,
+/// avoiding a last-connection WAL checkpoint followed by an immediate reopen.
+pub(crate) fn open_store_with_initialization_observer(
+    path: &Path,
+    observe: impl FnMut(StoreInitializationPhase),
+) -> Result<Connection> {
+    let conn = initialize_store_connection(path, observe)?;
+    configure_runtime_writable_connection(&conn)?;
+    Ok(conn)
+}
+
+fn initialize_store_connection(
     path: &Path,
     mut observe: impl FnMut(StoreInitializationPhase),
-) -> Result<()> {
+) -> Result<Connection> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -629,10 +639,10 @@ pub(crate) fn initialize_store_with_observer(
         }
     }
     remember_initialized_store(path);
-    Ok(())
+    Ok(conn)
 }
 
-/// Opens a writable connection after [`initialize_store`] has completed. This
+/// Opens a writable connection after schema initialization has completed. This
 /// deliberately omits schema DDL, compatibility checks, FTS backfill, and WAL
 /// changes so it is safe for per-request use on the daemon hot path.
 pub fn open_initialized_store(path: &Path) -> Result<Connection> {
@@ -7443,6 +7453,108 @@ END;
         initialize_store(&path)?;
         let conn = open_initialized_store(&path)?;
         assert!(list_sessions(&conn)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn open_store_retains_initialization_wal_without_close_and_reopen() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        let wal = wal_path(&path);
+        let wal_bytes = std::fs::metadata(&wal)?.len();
+        assert!(
+            wal_bytes > 32,
+            "initialization WAL was checkpointed and reopened before returning the connection: {wal_bytes} bytes"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "initialization left a transaction open"
+        );
+        for pragma in ["foreign_keys", "recursive_triggers"] {
+            assert_eq!(
+                conn.pragma_query_value(None, pragma, |row| row.get::<_, i64>(0))?,
+                1
+            );
+        }
+        assert!(conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))? >= 2);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE type = 'trigger' AND name = ?1",
+                [WARD_AUDIT_CAPACITY_TRIGGER],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1,
+            "the retained connection must have runtime audit-capacity enforcement"
+        );
+        let reader = open_initialized_store(&path)?;
+        assert!(list_sessions(&reader)?.is_empty());
+        let busy = reader.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        assert_eq!(
+            busy, 0,
+            "the retained connection must not pin a read transaction"
+        );
+        drop(reader);
+        drop(conn);
+        assert!(
+            !wal.exists(),
+            "normal final close must still clean up the WAL"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_store_recovers_retained_initialization_wal_after_process_exit() -> Result<()> {
+        const CHILD_STORE_ENV: &str = "COVEN_TEST_STARTUP_WAL_RECOVERY_PATH";
+        if let Some(path) = std::env::var_os(CHILD_STORE_ENV) {
+            let path = PathBuf::from(path);
+            let conn = open_store(&path)?;
+            assert!(std::fs::metadata(wal_path(&path))?.len() > 32);
+            assert!(conn.is_autocommit());
+            conn.execute(
+                "INSERT INTO store_meta(key, value) VALUES ('synthetic-startup-recovery', 'committed')",
+                [],
+            )?;
+            // Exit without SQLite connection destructors: recovery must use WAL.
+            std::process::exit(0);
+        }
+
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("coven.sqlite3");
+        let child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "store::tests::open_store_recovers_retained_initialization_wal_after_process_exit",
+                "--nocapture",
+            ])
+            .env(CHILD_STORE_ENV, &path)
+            .output()?;
+        assert!(
+            child.status.success(),
+            "startup WAL subprocess failed:\n{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(std::fs::metadata(wal_path(&path))?.len() > 32);
+        let recovered = open_store(&path)?;
+        assert_eq!(
+            recovered.query_row(
+                "SELECT value FROM store_meta WHERE key = 'synthetic-startup-recovery'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "committed"
+        );
+        assert_eq!(
+            recovered.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?,
+            "ok"
+        );
+        assert_ward_audit_schema_state(
+            &recovered,
+            coven_threads_core::WARD_AUDIT_SCHEMA_STATE_CURRENT_V020,
+        )?;
         Ok(())
     }
 

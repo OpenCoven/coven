@@ -76,6 +76,7 @@ fn startup_observation(line: &str) -> Option<String> {
     let kind = fields.next()?;
     let phase = fields.next()?.strip_prefix("phase=")?;
     let (measurement, value) = fields.next()?.split_once('=')?;
+    let observer = fields.next();
     if fields.next().is_some() {
         return None;
     }
@@ -93,6 +94,7 @@ fn startup_observation(line: &str) -> Option<String> {
                 | "store-main-schema-complete"
                 | "store-commit-complete"
                 | "store-initialize-end"
+                | "store-close-begin"
                 | "daemon-store-end"
                 | "status-publication-begin"
                 | "status-publication-end"
@@ -100,7 +102,18 @@ fn startup_observation(line: &str) -> Option<String> {
         _ => false,
     };
     let value = value.parse::<u128>().ok()?;
-    recognized.then(|| format!("{kind} phase={phase} {measurement}={value}"))
+    let mut record = recognized.then(|| format!("{kind} phase={phase} {measurement}={value}"))?;
+    if let Some(observer) = observer {
+        let observer = observer
+            .strip_prefix("prior_observer_ms=")?
+            .parse::<u128>()
+            .ok()?;
+        if kind != "startup_checkpoint" || observer > value {
+            return None;
+        }
+        record.push_str(&format!(" prior_observer_ms={observer}"));
+    }
+    Some(record)
 }
 
 #[cfg(test)]
@@ -117,6 +130,11 @@ mod tests {
                 "[synthetic] startup_budget phase=before-spawn remaining_ms=4900\n\
                  [synthetic] startup_budget phase=after-spawn remaining_ms=4800\n\
                  [synthetic] startup_checkpoint phase=store-runtime-complete elapsed_ms=3011\n\
+                 [synthetic] startup_checkpoint phase=store-close-begin elapsed_ms=3012\n\
+                 [synthetic] startup_checkpoint phase=store-initialize-end elapsed_ms=5300 prior_observer_ms=5100\n\
+                 [synthetic] startup_checkpoint phase=store-close-begin elapsed_ms=500 prior_observer_ms=999999\n\
+                 [synthetic] startup_checkpoint phase=store-close-begin elapsed_ms=500 prior_observer_ms=synthetic-private-value\n\
+                 [synthetic] startup_checkpoint phase=store-close-begin elapsed_ms=500 prior_observer_ms=100 extra=synthetic-private-value\n\
                  [synthetic] private fixture path={} synthetic-private-value\n\
                  [synthetic] startup_checkpoint phase=synthetic-private-value elapsed_ms=1\n\
                  [synthetic] startup_budget phase=before-spawn remaining_ms=synthetic-private-value\n\
@@ -130,6 +148,11 @@ mod tests {
         assert!(
             captured.contains("startup_checkpoint phase=store-runtime-complete elapsed_ms=3011")
         );
+        assert!(captured.contains("startup_checkpoint phase=store-close-begin elapsed_ms=3012"));
+        assert!(captured.contains(
+            "startup_checkpoint phase=store-initialize-end elapsed_ms=5300 prior_observer_ms=5100"
+        ));
+        assert!(!captured.contains("prior_observer_ms=999999"), "{captured}");
         assert!(!captured.contains("synthetic-private-value"), "{captured}");
         assert!(
             !captured.contains(&home.path().display().to_string()),

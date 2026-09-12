@@ -4920,6 +4920,7 @@ enum StartupCheckpoint {
     DaemonStoreBegin,
     StoreInitializeBegin,
     StoreInitializeEnd,
+    StoreCloseBegin,
     DaemonStoreEnd,
     StatusPublicationBegin,
     StatusPublicationEnd,
@@ -4945,6 +4946,7 @@ impl StartupCheckpoint {
             Self::DaemonStoreBegin => "daemon-store-begin",
             Self::StoreInitializeBegin => "store-initialize-begin",
             Self::StoreInitializeEnd => "store-initialize-end",
+            Self::StoreCloseBegin => "store-close-begin",
             Self::DaemonStoreEnd => "daemon-store-end",
             Self::StatusPublicationBegin => "status-publication-begin",
             Self::StatusPublicationEnd => "status-publication-end",
@@ -4952,40 +4954,70 @@ impl StartupCheckpoint {
     }
 }
 
-fn append_startup_checkpoint(coven_home: &Path, phase: StartupCheckpoint, started: Instant) {
-    // Store initialization and status publication each have their own elapsed-time origin.
-    append_daemon_recovery_log(
-        coven_home,
-        &format!(
-            "startup_checkpoint phase={} elapsed_ms={}",
+struct StartupCheckpointObserver {
+    started: Instant,
+    completed_appends: Duration,
+}
+
+impl StartupCheckpointObserver {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            completed_appends: Duration::ZERO,
+        }
+    }
+
+    fn append(&mut self, coven_home: &Path, phase: StartupCheckpoint) {
+        self.append_with(phase, Instant::now, |message| {
+            append_daemon_recovery_log(coven_home, message);
+        });
+    }
+
+    fn append_with(
+        &mut self,
+        phase: StartupCheckpoint,
+        mut now: impl FnMut() -> Instant,
+        write: impl FnOnce(&str),
+    ) {
+        let observed = now();
+        write(&format!(
+            "startup_checkpoint phase={} elapsed_ms={} prior_observer_ms={}",
             phase.label(),
-            started.elapsed().as_millis()
-        ),
-    );
+            observed.saturating_duration_since(self.started).as_millis(),
+            self.completed_appends.as_millis(),
+        ));
+        // Includes formatting, lock/file operations, and scheduling during prior
+        // checkpoint appends. A visible line does not prove its own append returned.
+        self.completed_appends += now().saturating_duration_since(observed);
+    }
 }
 
 fn write_startup_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
-    let started = Instant::now();
-    append_startup_checkpoint(
-        coven_home,
-        StartupCheckpoint::StatusPublicationBegin,
-        started,
-    );
+    let mut observer = StartupCheckpointObserver::new(Instant::now());
+    observer.append(coven_home, StartupCheckpoint::StatusPublicationBegin);
     write_status(coven_home, status)?;
-    append_startup_checkpoint(coven_home, StartupCheckpoint::StatusPublicationEnd, started);
+    observer.append(coven_home, StartupCheckpoint::StatusPublicationEnd);
     Ok(())
 }
 
 fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
-    let started = Instant::now();
-    append_startup_checkpoint(coven_home, StartupCheckpoint::DaemonStoreBegin, started);
+    let mut observer = StartupCheckpointObserver::new(Instant::now());
+    initialize_daemon_store_with_observer(coven_home, |phase| {
+        observer.append(coven_home, phase);
+    })
+}
+
+fn initialize_daemon_store_with_observer(
+    coven_home: &Path,
+    mut observe: impl FnMut(StartupCheckpoint),
+) -> Result<()> {
+    observe(StartupCheckpoint::DaemonStoreBegin);
     let store_path = coven_home.join("coven.sqlite3");
-    append_startup_checkpoint(coven_home, StartupCheckpoint::StoreInitializeBegin, started);
-    crate::store::initialize_store_with_observer(&store_path, |phase| {
-        append_startup_checkpoint(coven_home, StartupCheckpoint::StorePhase(phase), started);
+    observe(StartupCheckpoint::StoreInitializeBegin);
+    let conn = crate::store::open_store_with_initialization_observer(&store_path, |phase| {
+        observe(StartupCheckpoint::StorePhase(phase));
     })?;
-    append_startup_checkpoint(coven_home, StartupCheckpoint::StoreInitializeEnd, started);
-    let conn = crate::store::open_initialized_store(&store_path)?;
+    observe(StartupCheckpoint::StoreInitializeEnd);
     crate::hub::initialize_hub_identity(&conn)
         .context("failed to initialize hub identity during daemon startup")?;
     if let Err(error) = crate::hub::refresh_status_snapshot_from_connection(coven_home, &conn) {
@@ -5011,7 +5043,12 @@ fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
             );
         }
     }
-    append_startup_checkpoint(coven_home, StartupCheckpoint::DaemonStoreEnd, started);
+    // Finish the one normal last-connection checkpoint before publishing readiness.
+    observe(StartupCheckpoint::StoreCloseBegin);
+    conn.close()
+        .map_err(|(_, error)| error)
+        .context("failed to close Coven startup store")?;
+    observe(StartupCheckpoint::DaemonStoreEnd);
     Ok(())
 }
 
@@ -13784,6 +13821,93 @@ mod tests {
     }
 
     #[test]
+    fn startup_checkpoint_observer_separates_prior_append_cost_without_extra_writes() {
+        let started = Instant::now();
+        let clock = std::cell::Cell::new(started);
+        let mut observer = StartupCheckpointObserver::new(started);
+        let mut records = Vec::new();
+        for (phase, work_ms, append_ms) in [
+            (StartupCheckpoint::StoreInitializeBegin, 100, 5000),
+            (StartupCheckpoint::StoreInitializeEnd, 8, 17),
+            (StartupCheckpoint::DaemonStoreEnd, 12, 7),
+        ] {
+            clock.set(clock.get() + Duration::from_millis(work_ms));
+            observer.append_with(
+                phase,
+                || clock.get(),
+                |record| {
+                    records.push(record.to_owned());
+                    clock.set(clock.get() + Duration::from_millis(append_ms));
+                },
+            );
+        }
+        assert_eq!(
+            records,
+            [
+                "startup_checkpoint phase=store-initialize-begin elapsed_ms=100 prior_observer_ms=0",
+                "startup_checkpoint phase=store-initialize-end elapsed_ms=5108 prior_observer_ms=5000",
+                "startup_checkpoint phase=daemon-store-end elapsed_ms=5137 prior_observer_ms=5017",
+            ]
+        );
+        // The last line cannot report the cost of its own still-in-progress append.
+        assert_eq!(clock.get(), started + Duration::from_millis(5144));
+
+        // The same legacy elapsed values can instead come from work outside logging.
+        let mut other_observer = StartupCheckpointObserver::new(started);
+        let mut other_records = Vec::new();
+        for (phase, elapsed_ms) in [
+            (StartupCheckpoint::StoreInitializeBegin, 100),
+            (StartupCheckpoint::StoreInitializeEnd, 5108),
+            (StartupCheckpoint::DaemonStoreEnd, 5137),
+        ] {
+            other_observer.append_with(
+                phase,
+                || started + Duration::from_millis(elapsed_ms),
+                |record| other_records.push(record.to_owned()),
+            );
+        }
+        for (record, other_record) in records.iter().zip(&other_records) {
+            assert_eq!(
+                record.split_once(" prior_observer_ms=").unwrap().0,
+                other_record.split_once(" prior_observer_ms=").unwrap().0
+            );
+            assert!(other_record.ends_with("prior_observer_ms=0"));
+        }
+    }
+
+    #[test]
+    fn startup_keeps_initialization_connection_open_through_snapshot_setup() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let wal = home.path().join("coven.sqlite3-wal");
+        let mut observed = 0;
+        initialize_daemon_store_with_observer(home.path(), |phase| {
+            if matches!(
+                phase,
+                StartupCheckpoint::StoreInitializeEnd | StartupCheckpoint::StoreCloseBegin
+            ) {
+                observed += 1;
+                assert!(
+                    wal.exists(),
+                    "daemon startup closed and checkpointed initialization before snapshot setup"
+                );
+                assert!(
+                    std::fs::metadata(&wal).unwrap().len() > 32,
+                    "daemon startup reopened an empty WAL instead of retaining initialization"
+                );
+            }
+        })?;
+        assert_eq!(
+            observed, 2,
+            "both live-connection boundaries must be observed"
+        );
+        assert!(
+            !wal.exists(),
+            "startup's final close must retain normal WAL cleanup"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn startup_checkpoints_report_fixed_phases_and_monotonic_elapsed() -> Result<()> {
         let home = tempfile::tempdir()?;
         initialize_daemon_store(home.path())?;
@@ -13794,6 +13918,7 @@ mod tests {
             .map(|(_, checkpoint)| checkpoint)
             .collect();
         let mut previous = 0;
+        let mut previous_observer = 0;
         let phases = [
             "daemon-store-begin",
             "store-initialize-begin",
@@ -13804,16 +13929,23 @@ mod tests {
             "store-main-schema-complete",
             "store-commit-complete",
             "store-initialize-end",
+            "store-close-begin",
             "daemon-store-end",
         ];
         assert_eq!(checkpoints.len(), phases.len());
         for (checkpoint, phase) in checkpoints.iter().zip(phases) {
             let elapsed = checkpoint
                 .strip_prefix(&format!("phase={phase} elapsed_ms="))
-                .context("unexpected checkpoint fields")?
-                .parse::<u128>()?;
+                .context("unexpected checkpoint fields")?;
+            let (elapsed, observer) = elapsed
+                .split_once(" prior_observer_ms=")
+                .context("missing checkpoint observer accounting")?;
+            let elapsed = elapsed.parse::<u128>()?;
+            let observer = observer.parse::<u128>()?;
             assert!(elapsed >= previous);
+            assert!(observer >= previous_observer && observer <= elapsed);
             previous = elapsed;
+            previous_observer = observer;
         }
         Ok(())
     }
@@ -13838,13 +13970,20 @@ mod tests {
             let entries: Vec<_> = log.lines().collect();
             assert_eq!(entries.len(), if fail_publication { 1 } else { 2 });
             let mut previous = 0;
+            let mut previous_observer = 0;
             for (entry, phase) in entries.iter().zip(phases) {
                 let (_, elapsed) = entry
                     .split_once(&format!("startup_checkpoint phase={phase} elapsed_ms="))
                     .context("unexpected status checkpoint")?;
+                let (elapsed, observer) = elapsed
+                    .split_once(" prior_observer_ms=")
+                    .context("missing status checkpoint observer accounting")?;
                 let elapsed = elapsed.parse::<u128>()?;
+                let observer = observer.parse::<u128>()?;
                 assert!(elapsed >= previous);
+                assert!(observer >= previous_observer && observer <= elapsed);
                 previous = elapsed;
+                previous_observer = observer;
             }
         }
         Ok(())
