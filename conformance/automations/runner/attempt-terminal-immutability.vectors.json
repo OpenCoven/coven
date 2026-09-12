@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "coven.automations.attempt-terminal-immutability-vectors.v1",
+  "cases": [
+    {
+      "caseId": "succeeded-attempt-is-immutable",
+      "firstState": "succeeded",
+      "attemptedState": "failed",
+      "expected": {
+        "updateCommitted": false,
+        "deleteCommitted": false,
+        "finalState": "succeeded"
+      }
+    },
+    {
+      "caseId": "failed-attempt-is-immutable",
+      "firstState": "failed",
+      "attemptedState": "observing",
+      "expected": {
+        "updateCommitted": false,
+        "deleteCommitted": false,
+        "finalState": "failed"
+      }
+    },
+    {
+      "caseId": "cancelled-attempt-is-immutable",
+      "firstState": "cancelled",
+      "attemptedState": "dispatching",
+      "expected": {
+        "updateCommitted": false,
+        "deleteCommitted": false,
+        "finalState": "cancelled"
+      }
+    },
+    {
+      "caseId": "timed-out-attempt-is-immutable",
+      "firstState": "timed_out",
+      "attemptedState": "started",
+      "expected": {
+        "updateCommitted": false,
+        "deleteCommitted": false,
+        "finalState": "timed_out"
+      }
+    },
+    {
+      "caseId": "ambiguous-attempt-is-immutable",
+      "firstState": "ambiguous",
+      "attemptedState": "adopted",
+      "expected": {
+        "updateCommitted": false,
+        "deleteCommitted": false,
+        "finalState": "ambiguous"
+      }
+    }
+  ]
+}

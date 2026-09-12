@@ -221,7 +221,7 @@ pub(crate) fn validate_private_file(path: &Path) -> Result<()> {
     validate_owner_and_mode(path, &metadata, 0o600)
 }
 
-fn validate_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn validate_private_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if metadata.file_type().is_symlink()

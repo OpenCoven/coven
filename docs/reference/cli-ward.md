@@ -10,10 +10,18 @@ description: "Reference for coven ward: inspect, approve, or reject pending Ward
 source_adjacent_reason: "Tracks the Ward CLI and security contracts implemented in this repository."
 ---
 
-`coven ward` groups the Ward's principal-facing lifecycle verbs. Held writes
-into a familiar home never dead-end: the daemon stages them at
+`coven ward` groups the Ward's principal-facing lifecycle verbs. Held Tier-1 writes
+into a familiar home enter a review lifecycle: the daemon stages them at
 `~/.coven/pending/` for the principal's decision, and `coven ward pending`
 is the supported way to see what is waiting.
+
+Tier-0 protected targets and `ward.toml` cannot enter this lifecycle. Generic
+edit intake returns `403 protected_proposal_forbidden` without staging or
+echoing proposed content; a supplied fingerprint or approval reference does
+not grant protected-write authority. Approval and recovery reclassify live
+targets, rejecting pending protected edits and quarantining interrupted
+applying claims rather than resuming them. A separate authenticated,
+operation-bound protected-write path remains disabled.
 
 ```sh
 coven ward pending             # bounded table of staged proposals
@@ -28,8 +36,8 @@ coven ward migrate --apply     # migrate v0.1 ward.toml files to Phase-2
 ## Ward apply resource limits
 
 Every submitted Ward request accepts at most 32 edits. The cap includes
-Tier-0/Tier-1 edits that will be held or staged as well as Tier-2/Tier-3 edits
-eligible for direct apply. It runs on the borrowed request array before content
+Tier-0 edits that will be refused, Tier-1 edits eligible for staging, and
+Tier-2/Tier-3 edits eligible for direct apply. It runs on the borrowed request array before content
 cloning, Ward/Gate-2 evaluation, probe execution, target preparation, proposal
 staging, or mutation. Each existing edit can retain three file descriptors
 through finalization: its before-image, installed staging inode, and displaced
