@@ -336,11 +336,7 @@ impl WardConfig {
         }
         let config = Self::from_toml_str(&raw)
             .with_context(|| format!("invalid ward config at {}", path.display()))?;
-        if config.identity_invariants.is_empty() && backup_carries_identity_invariants(home)? {
-            bail!(
-                "ward.toml.v01.bak carries identity invariant declarations but active ward.toml has none; review the backup and migrate supported [[identity_invariant]] entries"
-            );
-        }
+        validate_backup_identity_invariants(home, &config)?;
         Ok(Some(config))
     }
 
@@ -452,11 +448,11 @@ fn legacy_invariant_remnants(raw: &str) -> Option<String> {
     })
 }
 
-fn backup_carries_identity_invariants(home: &Path) -> Result<bool> {
+fn validate_backup_identity_invariants(home: &Path, config: &WardConfig) -> Result<()> {
     let backup = home.join(LEGACY_WARD_BACKUP_FILE);
     let raw = match std::fs::read_to_string(&backup) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("reading legacy Ward backup {}", backup.display()))
@@ -466,8 +462,44 @@ fn backup_carries_identity_invariants(home: &Path) -> Result<bool> {
         .with_context(|| format!("parsing legacy Ward backup {}", backup.display()))?;
     let declarations = value
         .get("protected")
-        .and_then(|protected| protected.get("invariants"));
-    Ok(declarations.is_some_and(|value| value.as_array().is_none_or(|array| !array.is_empty())))
+        .and_then(|protected| protected.get("invariants"))
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| anyhow!("must be an array of strings"))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow!("must contain only strings"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
+        .with_context(|| {
+            format!(
+                "legacy Ward backup {} has invalid identity invariant declarations; review the backup",
+                backup.display()
+            )
+        })?
+        .unwrap_or_default();
+    if declarations.is_empty() {
+        return Ok(());
+    }
+    let compiled = IdentityInvariantSet::compile(&declarations).map_err(|errors| {
+        anyhow!(
+            "legacy Ward backup {} has unsupported identity invariant declarations; review the backup: {}",
+            backup.display(),
+            errors.join("; ")
+        )
+    })?;
+    if compiled.declarations() != config.identity_invariants.as_slice() {
+        bail!(
+            "ward.toml.v01.bak identity invariant declarations differ from active ward.toml; review the backup and migrate supported [[identity_invariant]] entries"
+        );
+    }
+    Ok(())
 }
 
 /// Whether a proposal carries principal authorization for Tier 0 changes.
@@ -5669,7 +5701,46 @@ invariants = [
         let error = WardConfig::load(temp.path()).expect_err("must reject");
         assert!(error
             .to_string()
-            .contains("ward.toml.v01.bak carries identity invariant declarations"));
+            .contains("ward.toml.v01.bak identity invariant declarations differ"));
+    }
+
+    #[test]
+    fn identity_predicate_load_rejects_additional_backup_invariants() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join(WARD_CONFIG_FILE),
+            r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Sage"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Val"
+"#,
+        )
+        .expect("write ward.toml");
+        std::fs::write(
+            temp.path().join(LEGACY_WARD_BACKUP_FILE),
+            r#"[protected]
+invariants = [
+    "familiar.name == 'Sage'",
+    "familiar.person == 'Val'",
+    "familiar.purpose includes 'research'",
+]
+"#,
+        )
+        .expect("write backup");
+
+        let error = WardConfig::load(temp.path()).expect_err("must reject");
+        assert!(error
+            .to_string()
+            .contains("ward.toml.v01.bak identity invariant declarations differ"));
     }
 
     #[test]

@@ -163,6 +163,11 @@ fn changed_authoritative_roster_person_refuses_approval_after_restart() -> Resul
 }
 
 #[test]
+fn changed_authoritative_roster_workspace_refuses_approval_after_restart() -> Result<()> {
+    assert_approval_refused(IdentityChange::Workspace, true)
+}
+
+#[test]
 fn changed_identity_bytes_that_still_satisfy_predicates_refuse_approval() -> Result<()> {
     assert_approval_refused(IdentityChange::IdentityBytes, false)
 }
@@ -214,6 +219,7 @@ enum IdentityChange {
     Purpose,
     MissingIdentity,
     Person,
+    Workspace,
     IdentityBytes,
 }
 
@@ -224,6 +230,14 @@ impl IdentityChange {
             Self::Purpose => fs::write(fixture.workspace.join("SOUL.md"), soul("sabotage"))?,
             Self::MissingIdentity => fs::remove_file(fixture.workspace.join("IDENTITY.md"))?,
             Self::Person => fs::write(fixture.coven_home.join("familiars.toml"), roster("Other"))?,
+            Self::Workspace => fs::write(
+                fixture.coven_home.join("familiars.toml"),
+                format!(
+                    "{}\nworkspace = {}\n",
+                    roster("Val"),
+                    serde_json::to_string(&fixture.workspace.to_string_lossy())?
+                ),
+            )?,
             Self::IdentityBytes => {
                 let path = fixture.workspace.join("IDENTITY.md");
                 let before = fs::read_to_string(&path)?;
@@ -238,13 +252,14 @@ impl IdentityChange {
             Self::Purpose => "Purpose identity invariant did not hold",
             Self::MissingIdentity => "identity fact unavailable",
             Self::Person => "Person identity invariant did not hold",
+            Self::Workspace => unreachable!("valid source drift is an approval-only case"),
             Self::IdentityBytes => unreachable!("valid source drift is an approval-only case"),
         }
     }
 
     fn approval_reason(self) -> &'static str {
         match self {
-            Self::IdentityBytes => "proposal-identity-evidence-diverged",
+            Self::Workspace | Self::IdentityBytes => "proposal-identity-evidence-diverged",
             _ => "proposal-revalidation-failed",
         }
     }
@@ -327,7 +342,10 @@ fn assert_approval_refused(change: IdentityChange, restart: bool) -> Result<()> 
         assert_eq!(refused.status, 409, "{refused:?}");
         assert_eq!(refused.body["blocked"], true, "{refused:?}");
         assert_eq!(refused.body["why"], change.approval_reason(), "{refused:?}");
-        if matches!(change, IdentityChange::IdentityBytes) {
+        if matches!(
+            change,
+            IdentityChange::Workspace | IdentityChange::IdentityBytes
+        ) {
             assert_eq!(
                 refused.body.get("verdict"),
                 Some(&Value::Null),
