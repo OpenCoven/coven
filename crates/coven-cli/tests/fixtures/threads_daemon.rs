@@ -147,7 +147,7 @@ forbidden = ["(?i)ignore previous"]
         self.owned_daemon
             .as_mut()
             .context("owned fixture process")?
-            .wait_for_health(&self.coven_home)
+            .admit(|child| child.wait_for_health(&self.coven_home))
             .with_context(|| {
                 format!(
                     "foreground fixture daemon {pid} failed readiness; stdout: {:?}; stderr: {:?}",

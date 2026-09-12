@@ -66,6 +66,9 @@ Two real-process artifact regressions cover failed-request response pairing and
 failed-restart CLI evidence. Two foreground-process regressions cover owned
 replacement/crash cleanup and failed-child evidence; two readiness regressions
 cover process/endpoint matching and the narrow pending-transport error set.
+Another real-process regression injects fatal pipe error 109 before observing
+the invalid-store child's natural exit, checking the causal error and final
+exit evidence together.
 Shared admission regressions also cover launch selection, fixed readiness
 budgets, owned-child cleanup, and readiness failure before status publication.
 These fixture regressions add no authority-journey coverage or native Windows
@@ -90,6 +93,15 @@ lifecycle journey and failed-restart artifact regression still use production
 `daemon start`/`restart`; no production lifecycle deadline is changed.
 Unix authority journeys also retain their CLI launch path, while the explicit
 foreground regressions exercise owned-child lifecycle behavior on every platform.
+After fatal admission failure, health probing stops. Before publishing failure
+artifacts, the fixture observes only its owned child's exit, using the remainder
+of the original 15-second readiness budget, not a new readiness timeout. If the
+child remains alive, exact-handle termination and the existing bounded reap
+guard perform cleanup. Lifecycle `owned_exit` records the observed status and
+whether termination was requested; that flag is conservative if exit races
+with the kill request. `command_status` records a natural foreground exit,
+never a cleanup kill's possibly identical Windows exit code. Cleanup errors
+retain the original admission error as their cause.
 Foreground crash injection terminates the retained owned handle; detached
 Windows daemon termination still authenticates the pipe server PID and
 creation time. The dedicated native `windows_daemon_lifecycle` CLI deadline

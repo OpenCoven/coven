@@ -32,17 +32,32 @@ pub fn acquire_windows_admission() -> std::sync::MutexGuard<'static, ()> {
 /// Retain the process handle even when status publication/readiness fails.
 pub struct OwnedDaemon {
     child: Child,
+    started: Instant,
     exit_status: Option<ExitStatus>,
+    termination_requested: bool,
     ready: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExitObservation {
+    pub status: ExitStatus,
+    pub termination_requested: bool,
 }
 
 impl OwnedDaemon {
     pub fn spawn(command: &mut Command) -> Result<Self> {
+        let started = Instant::now();
         Ok(Self {
             child: command.spawn().context("spawning owned fixture daemon")?,
+            started,
             exit_status: None,
+            termination_requested: false,
             ready: false,
         })
+    }
+
+    pub fn started(&self) -> Instant {
+        self.started
     }
 
     pub fn id(&self) -> u32 {
@@ -55,6 +70,41 @@ impl OwnedDaemon {
 
     pub fn exit_status(&self) -> Option<ExitStatus> {
         self.exit_status
+    }
+
+    pub fn exit_observation(&self) -> Option<ExitObservation> {
+        self.exit_status.map(|status| ExitObservation {
+            status,
+            termination_requested: self.termination_requested,
+        })
+    }
+
+    pub fn admit(&mut self, readiness: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let Err(cause) = readiness(self) else {
+            return Ok(());
+        };
+        // A fatal pipe/protocol error can precede process exit. Never retry admission:
+        // observe only the child, using what remains of the original readiness budget.
+        let settlement = (|| {
+            if wait_for_exit_until(
+                self.started + LIFECYCLE_TIMEOUT,
+                || self.observe_exit(),
+                Instant::now,
+                thread::sleep,
+            )?
+            .is_none()
+            {
+                self.reap(true)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })();
+        match settlement {
+            Ok(()) => Err(cause),
+            Err(error) => Err(cause.context(format!(
+                "failed settling owned daemon {} after admission failure: {error:#}",
+                self.id()
+            ))),
+        }
     }
 
     fn observe_exit(&mut self) -> Result<Option<ExitStatus>> {
@@ -85,6 +135,7 @@ impl OwnedDaemon {
         wait_for_readiness(
             pid,
             &pipe,
+            self.started(),
             || self.ensure_running(),
             |deadline| {
                 coven_client::probe_windows_daemon_health_with_identity_until(&pipe, deadline).map(
@@ -108,21 +159,43 @@ impl OwnedDaemon {
             return Ok(());
         }
         if terminate {
+            self.termination_requested = true;
             self.child
                 .kill()
                 .context("terminating owned fixture daemon")?;
         }
         let started = Instant::now();
-        while self.observe_exit()?.is_none() {
-            anyhow::ensure!(
-                started.elapsed() < LIFECYCLE_TIMEOUT,
-                "owned fixture daemon {} was not reaped after {:?}",
-                self.id(),
-                started.elapsed(),
-            );
-            thread::sleep(Duration::from_millis(25));
-        }
+        anyhow::ensure!(
+            wait_for_exit_until(
+                started + LIFECYCLE_TIMEOUT,
+                || self.observe_exit(),
+                Instant::now,
+                thread::sleep,
+            )?
+            .is_some(),
+            "owned fixture daemon {} was not reaped after {:?}",
+            self.id(),
+            started.elapsed(),
+        );
         Ok(())
+    }
+}
+
+fn wait_for_exit_until(
+    deadline: Instant,
+    mut observe: impl FnMut() -> Result<Option<ExitStatus>>,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(Duration),
+) -> Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = observe()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        pause(Duration::from_millis(25).min(remaining));
     }
 }
 
@@ -148,12 +221,12 @@ struct HealthProbe {
 fn wait_for_readiness(
     pid: u32,
     pipe: &str,
+    started: Instant,
     mut check_child: impl FnMut() -> Result<()>,
     mut probe: impl FnMut(Instant) -> Result<Option<HealthProbe>, ClientError>,
     mut now: impl FnMut() -> Instant,
     mut pause: impl FnMut(Duration),
 ) -> Result<()> {
-    let started = now();
     let deadline = started + LIFECYCLE_TIMEOUT;
     let mut last_pending = None;
     loop {
@@ -275,6 +348,120 @@ mod tests {
     }
 
     #[test]
+    fn failed_admission_retains_cause_and_later_natural_exit() -> Result<()> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_coven"));
+        command
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = OwnedDaemon::spawn(&mut command)?;
+        let started = child.started();
+        let error = child
+            .admit(|child| {
+                assert!(child.exit_status().is_none());
+                Err(ClientError::Io {
+                    operation: "failed to read Coven daemon response",
+                    source: std::io::Error::from_raw_os_error(109),
+                }
+                .into())
+            })
+            .expect_err("natural exit must not turn failed admission into success");
+        assert!(matches!(
+            error.downcast_ref::<ClientError>(),
+            Some(ClientError::Io { source, .. }) if source.raw_os_error() == Some(109)
+        ));
+        let exit = child.exit_observation().context("settled natural exit")?;
+        assert_eq!(exit.status.code(), Some(0));
+        assert!(!exit.termination_requested);
+        assert!(!child.is_ready());
+        assert_eq!(child.started(), started, "admission budget was reset");
+        child.reap(true)?;
+        assert!(!child.exit_observation().unwrap().termination_requested);
+        Ok(())
+    }
+
+    #[test]
+    fn fatal_probe_is_not_retried_while_observing_a_later_exit() -> Result<()> {
+        let start = Instant::now();
+        let deadline = start + LIFECYCLE_TIMEOUT;
+        let clock = Cell::new(deadline - Duration::from_millis(50));
+        let child_checks = Cell::new(0);
+        let probes = Cell::new(0);
+        let error = wait_for_readiness(
+            42,
+            "fixture-pipe",
+            start,
+            || {
+                child_checks.set(child_checks.get() + 1);
+                Ok(())
+            },
+            |_| {
+                probes.set(probes.get() + 1);
+                Err(ClientError::Io {
+                    operation: "failed to read Coven daemon response",
+                    source: std::io::Error::from_raw_os_error(109),
+                })
+            },
+            || clock.get(),
+            |_| panic!("a fatal probe must stop admission immediately"),
+        )
+        .unwrap_err();
+        let observations = Cell::new(0);
+        let status = wait_for_exit_until(
+            deadline,
+            || {
+                observations.set(observations.get() + 1);
+                Ok((observations.get() == 3).then(ExitStatus::default))
+            },
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay),
+        )?;
+        assert_eq!(status.and_then(|status| status.code()), Some(0));
+        assert_eq!(clock.get(), deadline);
+        assert_eq!(probes.get(), 1);
+        assert_eq!(child_checks.get(), 1);
+        assert_eq!(observations.get(), 3);
+        assert!(matches!(
+            error.downcast_ref::<ClientError>(),
+            Some(ClientError::Io { source, .. }) if source.raw_os_error() == Some(109)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn exit_observation_uses_only_the_remaining_admission_budget() -> Result<()> {
+        let deadline = Instant::now() + LIFECYCLE_TIMEOUT;
+        for remaining in [Duration::ZERO, Duration::from_millis(10)] {
+            let clock = Cell::new(deadline - remaining);
+            let paused = Cell::new(Duration::ZERO);
+            assert!(wait_for_exit_until(
+                deadline,
+                || Ok(None),
+                || clock.get(),
+                |delay| {
+                    clock.set(clock.get() + delay);
+                    paused.set(paused.get() + delay);
+                },
+            )?
+            .is_none());
+            assert_eq!(clock.get(), deadline);
+            assert_eq!(paused.get(), remaining);
+        }
+        let error = wait_for_exit_until(
+            deadline,
+            || anyhow::bail!("child exit observation unavailable"),
+            Instant::now,
+            |_| panic!("exit observation errors must not be retried"),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("child exit observation unavailable"));
+        Ok(())
+    }
+
+    #[test]
     fn admission_handles_recorded_cold_store_delay_without_relaunch() -> Result<()> {
         let start = Instant::now();
         let clock = Cell::new(start);
@@ -282,6 +469,7 @@ mod tests {
         wait_for_readiness(
             42,
             "fixture-pipe",
+            start,
             || Ok(()),
             |deadline| {
                 polls.set(polls.get() + 1);
@@ -311,6 +499,7 @@ mod tests {
         let error = wait_for_readiness(
             42,
             "fixture-pipe",
+            start,
             || Ok(()),
             |deadline| {
                 assert!(deadline <= start + LIFECYCLE_TIMEOUT);
@@ -350,6 +539,7 @@ mod tests {
                 wait_for_readiness(
                     42,
                     "fixture-pipe",
+                    Instant::now(),
                     || Ok(()),
                     |_| Ok(Some(probe.take().expect("must not retry invalid health"))),
                     Instant::now,
@@ -368,6 +558,7 @@ mod tests {
             let error = wait_for_readiness(
                 42,
                 "fixture-pipe",
+                Instant::now(),
                 || {
                     checks += 1;
                     anyhow::ensure!(checks != fail_on, "child identity unavailable");
@@ -389,6 +580,7 @@ mod tests {
         let error = wait_for_readiness(
             42,
             "fixture-pipe",
+            start,
             || Ok(()),
             |_| {
                 clock.set(start + LIFECYCLE_TIMEOUT);
@@ -418,12 +610,17 @@ mod tests {
                 operation: coven_client::WINDOWS_CONNECT_OPERATION,
                 source: std::io::ErrorKind::PermissionDenied.into(),
             },
+            ClientError::Io {
+                operation: "failed to read Coven daemon response",
+                source: std::io::Error::from_raw_os_error(109),
+            },
         ] {
             assert!(!is_pending_windows_startup_error(&error), "{error}");
             let mut error = Some(error);
             assert!(wait_for_readiness(
                 42,
                 "fixture-pipe",
+                Instant::now(),
                 || Ok(()),
                 |_| Err(error.take().expect("must not retry fatal probe")),
                 Instant::now,
