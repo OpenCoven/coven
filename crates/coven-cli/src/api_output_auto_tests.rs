@@ -51,6 +51,78 @@ pub(crate) fn run_ordinary_admission_hook() {
 
 #[cfg(unix)]
 #[test]
+fn ordinary_admission_broken_output_chain_keeps_structured_refusal() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    for human in [false, true] {
+        for contents in ["malformed formatting must not apply", AFTER] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_supported_output_auto(home)?;
+            if human {
+                let path = workspace.join("ward.toml");
+                let policy = std::fs::read_to_string(&path)?
+                    .replace("[approval_tiers.auto]", "[approval_tiers.human_review]")
+                    .replace("gate='regression_suite'", "gate='human_approval'");
+                std::fs::write(path, policy)?;
+            }
+            std::fs::remove_file(workspace.join("output-format.json"))?;
+            symlink("notes.json", workspace.join("output-format.json"))?;
+            symlink("output-format.json", workspace.join("format-alias.json"))?;
+            std::fs::write(workspace.join("unrelated.txt"), "original unrelated")?;
+
+            let response = post_edits(
+                home,
+                &json!({"edits":[
+                    {"target":"format-alias.json","contents":contents},
+                    {"target":"unrelated.txt","contents":"must not change"}
+                ]}).to_string(),
+            );
+            assert!(
+                response.is_ok(),
+                "unsupported output routing must return its structured refusal: {response:?}"
+            );
+            let response = response?;
+            assert_eq!(response.status, 409, "{}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "scheduled_publication_invalid");
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("unrelated.txt"))?,
+                "original unrelated"
+            );
+            assert!(!workspace.join("notes.json").exists());
+            assert!(!home.join("pending").exists());
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type IN
+                 ('proposal_submitted','apply_audit','proposal_approved')",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(rows, 0);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_admission_failure_without_output_opt_in_is_not_publication_failure() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = seed_warded_familiar(temp.path())?;
+    std::os::unix::fs::symlink("missing.json", workspace.join("alias.json"))?;
+    let response = post_edits(
+        temp.path(),
+        &json!({"edits":[{"target":"alias.json","contents":"must not apply"}]}).to_string(),
+    );
+    assert!(response.is_err(), "ordinary admission failure was reclassified");
+    assert!(!workspace.join("missing.json").exists());
+    assert!(!temp.path().join("pending").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn ordinary_admission_retarget_before_apply_refuses_whole_batch() -> Result<()> {
     use std::os::unix::fs::symlink;
     use std::sync::mpsc;

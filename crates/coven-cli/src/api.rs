@@ -5928,10 +5928,33 @@ fn apply_familiar_edits(
     // Resolve and classify every target before opening the store or publishing
     // a proposal. Tier-0 writes require a distinct daemon-owned authority
     // operation; client-supplied fingerprint text is not such authority.
-    let admission = ward.admit_direct(&ward::Proposal {
+    let proposal = ward::Proposal {
         targets: edits.iter().map(|e| e.target.clone()).collect(),
         authorization: authorization.clone(),
-    })?;
+    };
+    let admission = match ward.admit_direct(&proposal) {
+        Ok(admission) => admission,
+        Err(error) => {
+            // Classify only the refusal; a failed admission is never retried
+            // or converted into permission to stage or apply.
+            let refused = ward.evaluate(&proposal);
+            let reason = match crate::output_format_auto::intercepts(
+                &workspace,
+                &config,
+                &refused.decisions,
+            ) {
+                Ok(false) => return Err(error),
+                Ok(true) => format!("{error:#}"),
+                Err(routing_error) => format!("{routing_error:#}"),
+            };
+            return api_error(
+                409,
+                "scheduled_publication_invalid",
+                "Output-format routing could not establish a supported target.",
+                Some(json!({ "reason": reason })),
+            );
+        }
+    };
     let adjudication = &admission.outcome;
     let protected_targets = protected_proposal_targets(adjudication, &ward)?;
     if !protected_targets.is_empty() {
