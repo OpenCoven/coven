@@ -64,6 +64,12 @@ different from an unapplied proposal. Recovery quarantines that evidence rather
 than asserting that no write occurred. Quarantine does **not** satisfy the typed
 terminal invariant and requires separate resolution.
 
+If the familiar or Ward authority disappears, becomes unreadable, or cannot be
+constructed, an interrupted apply leaves the automatic retry queue. Its claim
+bytes and recorded apply intent remain available for manual recovery. The
+response reports `terminal = false` and `manualRecoveryRequired = true`; simply
+restoring the configuration does not automatically resume a quarantined apply.
+
 Do not delete quarantined intent or classify it as a completed rejection to
 make the terminal count balance. This checkpoint also does not repair arbitrary
 historical database corruption or infer missing close evidence for past writes.

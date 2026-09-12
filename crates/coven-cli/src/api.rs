@@ -9962,9 +9962,20 @@ fn decide_threads_proposal_inner(
     let approval_path_label = scheduled
         .map(|proposal| proposal.classification().approval_path.display_label())
         .unwrap_or("human_review");
-    let opened_window = proposal_window_context(&conn, proposal_id)?;
+    let mut opened_window = proposal_window_context(&conn, proposal_id)?;
     let familiar_id = match human_familiar_id_for_weave(coven_home, pending.familiar_id) {
         Ok(Some(familiar_id)) => familiar_id,
+        Ok(None) | Err(_) if applying_state.is_some() => {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "familiar-unavailable",
+                "proposal-recovery-familiar-unavailable",
+                "interrupted apply has no readable live familiar authority",
+            );
+        }
         Ok(None) | Err(_) if opened_window.is_some() && applying_state.is_none() => {
             claim.preserve();
             append_open_window_revalidation_failure(
@@ -10002,6 +10013,17 @@ fn decide_threads_proposal_inner(
     let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
     let config = match ward::WardConfig::load(&workspace) {
         Ok(Some(config)) => config,
+        Ok(None) | Err(_) if applying_state.is_some() => {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "ward-unavailable",
+                "proposal-recovery-ward-unavailable",
+                "interrupted apply has no readable live Ward authority",
+            );
+        }
         Ok(None) | Err(_) if opened_window.is_some() && applying_state.is_none() => {
             claim.preserve();
             append_open_window_revalidation_failure(
@@ -10044,6 +10066,7 @@ fn decide_threads_proposal_inner(
                 scheduled.expect("guard established scheduled proposal"),
                 decision_now,
             )?;
+            opened_window = proposal_window_context(&conn, proposal_id)?;
         }
     } else if applying_state.is_some() && opened_window.is_some() {
         return quarantine_proposal_recovery_claim(
@@ -10089,6 +10112,17 @@ fn decide_threads_proposal_inner(
     let targets: Vec<String> = edits.iter().map(|edit| edit.target.clone()).collect();
     let ward = match ward::Ward::new(&workspace, config.clone()) {
         Ok(ward) => ward,
+        Err(error) if applying_state.is_some() => {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "ward-invalid",
+                "proposal-recovery-ward-invalid",
+                &format!("interrupted apply cannot reconstruct live Ward authority: {error:#}"),
+            );
+        }
         Err(_error) if opened_window.is_some() && applying_state.is_none() => {
             claim.preserve();
             append_open_window_revalidation_failure(
@@ -32573,6 +32607,138 @@ tier = 0
     }
 
     #[test]
+    fn threads_decision_closes_new_window_when_live_ward_construction_fails() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence {
+                veto: coven_threads_core::VetoWindow::new(
+                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(60),
+                ),
+            },
+            crate::threads_clock::now(home)? - time::Duration::minutes(10),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        let ward_path = home.join("familiars/sage/ward.toml");
+        let config =
+            std::fs::read_to_string(&ward_path)?.replace("path = \"reviewed/\"", "path = \"[\"");
+        std::fs::write(ward_path, config)?;
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.body)?["terminal"],
+            true
+        );
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        assert!(proposal_window_opened(&conn, &proposal_id)?);
+        let detail: String = conn.query_row(
+            "SELECT detail FROM ward_audit WHERE proposal_id = ?1
+             AND event_type = 'proposal_rejected'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        let close: coven_threads_core::ProposalWindowCloseAuditDetail =
+            serde_json::from_str(&detail)?;
+        assert_eq!(
+            close.reason,
+            coven_threads_core::WindowCloseReason::RevalidationFailed
+        );
+        assert_eq!(close.replay_hash_matched, Some(false));
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_quarantines_applied_claim_with_unavailable_authority() -> Result<()> {
+        for failure in [
+            "missing-familiar",
+            "invalid-familiar",
+            "missing-ward",
+            "invalid-ward",
+            "invalid-ward-glob",
+        ] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (_, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                crate::threads_clock::now(home)?,
+            )?;
+            let body = scheduled_decision_body(home, &proposal_id, None)?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ApplyBeforeAudit,
+                proposal_id.clone(),
+            )));
+            assert!(handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some(&body),
+            )
+            .is_err());
+            let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+                .context("durable interrupted claim")?;
+            let original_claim = std::fs::read(&claim)?;
+            let ward_path = home.join("familiars/sage/ward.toml");
+            match failure {
+                "missing-familiar" => std::fs::write(home.join("familiars.toml"), "")?,
+                "invalid-familiar" => std::fs::write(home.join("familiars.toml"), "invalid = [")?,
+                "missing-ward" => std::fs::remove_file(&ward_path)?,
+                "invalid-ward" => std::fs::write(&ward_path, "invalid = [")?,
+                "invalid-ward-glob" => {
+                    let config = std::fs::read_to_string(&ward_path)?
+                        .replace("path = \"reviewed/\"", "path = \"[\"");
+                    std::fs::write(&ward_path, config)?;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{failure}");
+            assert!(
+                !claim.exists(),
+                "{failure}: unrecoverable claim must stop hot-looping"
+            );
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{failure}");
+            let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(quarantined.len(), 1, "{failure}");
+            assert_eq!(
+                std::fs::read(quarantined[0].path())?,
+                original_claim,
+                "{failure}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                "after",
+                "{failure}"
+            );
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            assert!(
+                proposal_terminal_event(&conn, &proposal_id)?.is_none(),
+                "{failure}"
+            );
+            assert!(
+                load_proposal_apply_intent(&conn, &proposal_id)?.is_some(),
+                "{failure}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn threads_scheduled_deadline_replay_refuses_diverged_before_image() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -35254,7 +35420,7 @@ tier = 0
     }
 
     #[test]
-    fn threads_approve_recovery_preserves_claim_if_ward_disappears() -> Result<()> {
+    fn threads_approve_recovery_quarantines_claim_if_ward_disappears() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         let (_, proposal_id) = stage_pending_protected_edit(home)?;
@@ -35274,6 +35440,7 @@ tier = 0
         assert!(interrupted.is_err());
         let claim = find_pending_decision_claim(home, &proposal_id, "approve")
             .expect("interrupted approval leaves a recovery claim");
+        let claim_bytes = std::fs::read(&claim)?;
         std::fs::remove_file(workspace.join("ward.toml"))?;
 
         let retry = handle_request_with_body(
@@ -35286,11 +35453,17 @@ tier = 0
 
         assert_eq!(retry.status, 409, "got {}", retry.body);
         let body: Value = serde_json::from_str(&retry.body)?;
-        assert_eq!(body["why"], "ward-not-configured");
+        assert_eq!(body["why"], "proposal-recovery-ward-unavailable");
+        assert_eq!(body["terminal"], false);
+        assert_eq!(body["manualRecoveryRequired"], true);
         assert!(
-            claim.exists(),
-            "recovery claim must not downgrade to pending"
+            !claim.exists(),
+            "unverifiable claim must leave the retry queue"
         );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(std::fs::read(quarantined[0].path())?, claim_bytes);
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
         let terminal_count: i64 = conn.query_row(
             "SELECT COUNT(*)
@@ -35308,7 +35481,7 @@ tier = 0
     }
 
     #[test]
-    fn threads_approve_recovery_preserves_claim_if_familiar_disappears() -> Result<()> {
+    fn threads_approve_recovery_quarantines_claim_if_familiar_disappears() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         let (_, proposal_id) = stage_pending_protected_edit(home)?;
@@ -35328,6 +35501,7 @@ tier = 0
         assert!(interrupted.is_err());
         let claim = find_pending_decision_claim(home, &proposal_id, "approve")
             .expect("interrupted approval leaves a recovery claim");
+        let claim_bytes = std::fs::read(&claim)?;
         std::fs::remove_file(home.join("familiars.toml"))?;
 
         let retry = handle_request_with_body(
@@ -35340,11 +35514,17 @@ tier = 0
 
         assert_eq!(retry.status, 409, "got {}", retry.body);
         let body: Value = serde_json::from_str(&retry.body)?;
-        assert_eq!(body["why"], "proposal-familiar-missing");
+        assert_eq!(body["why"], "proposal-recovery-familiar-unavailable");
+        assert_eq!(body["terminal"], false);
+        assert_eq!(body["manualRecoveryRequired"], true);
         assert!(
-            claim.exists(),
-            "missing familiar must leave the recovery claim intact"
+            !claim.exists(),
+            "unverifiable claim must leave the retry queue"
         );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(std::fs::read(quarantined[0].path())?, claim_bytes);
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
         let terminal_count: i64 = conn.query_row(
             "SELECT COUNT(*)
