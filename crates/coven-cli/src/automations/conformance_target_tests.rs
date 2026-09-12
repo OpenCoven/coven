@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 
 use super::conformance_target::{
     capability, evaluate, evaluate_run_terminal_monotonicity_case_counts, TargetSuiteStatus,
-    CAPABILITY_NEGOTIATION_SUITE, RUN_TERMINAL_MONOTONICITY_SUITE,
+    CAPABILITY_NEGOTIATION_SUITE, MISFIRE_LATEST_PLANNING_SUITE, RUN_TERMINAL_MONOTONICITY_SUITE,
 };
 
 const ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS: &str = include_str!(
@@ -19,6 +19,8 @@ const DEFINITION_VALIDATION_VECTORS: &str =
 const EVENT_REDUCER_DETERMINISM_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/event-reducer-determinism.vectors.json"
 );
+const MISFIRE_LATEST_PLANNING_VECTORS: &str =
+    include_str!("../../../../conformance/automations/runner/misfire-latest-planning.vectors.json");
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
@@ -28,10 +30,10 @@ const RECEIPT_INTEGRITY_VALIDATION_VECTORS: &str = include_str!(
 const RRULE_VOCABULARY_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/rrule-vocabulary.vectors.json");
 
-fn request_for(suite_id: &str, vector: Value) -> Value {
+fn request_for_profile(profile: &str, suite_id: &str, vector: Value) -> Value {
     json!({
         "schemaVersion": "coven.automations.conformance-suite-request.v1",
-        "profile": "structural",
+        "profile": profile,
         "suiteId": suite_id,
         "protocolArtifact": {
             "bundleSchemaVersion": "coven.automations.bundle.v1",
@@ -53,6 +55,10 @@ fn request_for(suite_id: &str, vector: Value) -> Value {
     })
 }
 
+fn request_for(suite_id: &str, vector: Value) -> Value {
+    request_for_profile("structural", suite_id, vector)
+}
+
 fn request(vector: Value) -> Value {
     request_for(CAPABILITY_NEGOTIATION_SUITE, vector)
 }
@@ -63,22 +69,126 @@ fn capability_advertises_the_native_structural_suites() {
         serde_json::to_value(capability()).unwrap(),
         json!({
             "schemaVersion": "coven.automations.conformance-target-capability.v1",
-            "profiles": [{
-                "profile": "structural",
-                "suites": [
-                    "attempt-terminal-immutability",
-                    CAPABILITY_NEGOTIATION_SUITE,
-                    "command-adoption-idempotency",
-                    "definition-lifecycle-transitions",
-                    "definition-validation",
-                    "event-reducer-determinism",
-                    "occurrence-fence-uniqueness",
-                    "receipt-integrity-validation",
-                    "rrule-vocabulary",
-                    RUN_TERMINAL_MONOTONICITY_SUITE
-                ]
-            }]
+            "profiles": [
+                {
+                    "profile": "structural",
+                    "suites": [
+                        "attempt-terminal-immutability",
+                        CAPABILITY_NEGOTIATION_SUITE,
+                        "command-adoption-idempotency",
+                        "definition-lifecycle-transitions",
+                        "definition-validation",
+                        "event-reducer-determinism",
+                        "occurrence-fence-uniqueness",
+                        "receipt-integrity-validation",
+                        "rrule-vocabulary",
+                        RUN_TERMINAL_MONOTONICITY_SUITE
+                    ]
+                },
+                {
+                    "profile": "scheduler_reliability",
+                    "suites": [MISFIRE_LATEST_PLANNING_SUITE]
+                }
+            ]
         })
+    );
+}
+
+#[test]
+fn misfire_latest_planning_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(MISFIRE_LATEST_PLANNING_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        MISFIRE_LATEST_PLANNING_SUITE,
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 4);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 4);
+}
+
+#[test]
+fn misfire_latest_planning_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(MISFIRE_LATEST_PLANNING_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["scheduledSlots"] = json!(["2026-09-03T09:00:00.000Z"]);
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        MISFIRE_LATEST_PLANNING_SUITE,
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn misfire_latest_planning_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 8] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
+        |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
+        |vectors| vectors["cases"][0]["createdAt"] = json!("not-a-time"),
+        |vectors| vectors["cases"][0]["definition"]["status"] = json!("PAUSED"),
+        |vectors| vectors["cases"][1]["existingScheduledFor"] = Value::Null,
+        |vectors| vectors["cases"][2]["expected"]["firstOutcome"] = json!("planned"),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(MISFIRE_LATEST_PLANNING_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                MISFIRE_LATEST_PLANNING_SUITE,
+                vectors,
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn misfire_latest_planning_suite_rejects_vacuous_timing_scenarios() {
+    let invalid_mutations: [fn(&mut Value); 5] = [
+        |vectors| vectors["cases"][0]["createdAt"] = json!("2026-09-03T10:00:00.000Z"),
+        |vectors| vectors["cases"][1]["observedAt"] = json!("2026-09-04T08:00:00.000Z"),
+        |vectors| vectors["cases"][2]["createdAt"] = json!("2026-09-03T13:00:00.000Z"),
+        |vectors| {
+            vectors["cases"][2]["createdAt"] = json!("2026-09-03T08:00:00.000Z");
+            vectors["cases"][2]["observedAt"] = json!("2026-09-03T08:30:00.000Z");
+            vectors["cases"][2]["existingScheduledFor"] = json!("2026-09-03T09:00:00.000Z");
+            vectors["cases"][2]["expected"]["scheduledSlots"] = json!(["2026-09-03T09:00:00.000Z"]);
+        },
+        |vectors| vectors["cases"][3]["observedAt"] = json!("2026-09-01T08:30:00.000Z"),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(MISFIRE_LATEST_PLANNING_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                MISFIRE_LATEST_PLANNING_SUITE,
+                vectors,
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn misfire_latest_planning_suite_requires_scheduler_profile() {
+    let vectors: Value = serde_json::from_str(MISFIRE_LATEST_PLANNING_VECTORS).unwrap();
+    assert_eq!(
+        evaluate(&request_for(MISFIRE_LATEST_PLANNING_SUITE, vectors)).unwrap_err(),
+        "conformance suite is unsupported"
     );
 }
 

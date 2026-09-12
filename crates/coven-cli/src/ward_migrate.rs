@@ -37,6 +37,7 @@ pub struct MigrationEntry {
     pub status: MigrationStatus,
     pub protected_files: Vec<String>,
     pub editable_paths: Vec<String>,
+    pub editable_tier: Option<Tier>,
     pub translated_globs: Vec<(String, String)>,
     /// Fidelity records for v0.1 `[protected].invariants`: each entry is
     /// either a compiled typed-fact disposition or an explicit rejection
@@ -143,6 +144,7 @@ fn migrate_one(
                 status: MigrationStatus::NoWard,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -168,6 +170,7 @@ fn migrate_one(
                     status: MigrationStatus::Unmigratable,
                     protected_files: Vec::new(),
                     editable_paths: Vec::new(),
+                    editable_tier: None,
                     translated_globs: Vec::new(),
                     invariant_dispositions: Vec::new(),
                     generated_toml: None,
@@ -188,6 +191,7 @@ fn migrate_one(
                     status: MigrationStatus::Unmigratable,
                     protected_files: Vec::new(),
                     editable_paths: Vec::new(),
+                    editable_tier: None,
                     translated_globs: Vec::new(),
                     invariant_dispositions: Vec::new(),
                     generated_toml: None,
@@ -202,6 +206,7 @@ fn migrate_one(
                 status: MigrationStatus::AlreadyMigrated,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -220,6 +225,7 @@ fn migrate_one(
                 status: MigrationStatus::Unmigratable,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -236,6 +242,7 @@ fn migrate_one(
             status: MigrationStatus::Unmigratable,
             protected_files: Vec::new(),
             editable_paths: Vec::new(),
+            editable_tier: None,
             translated_globs: Vec::new(),
             invariant_dispositions: Vec::new(),
             generated_toml: None,
@@ -254,6 +261,7 @@ fn migrate_one(
                 status: MigrationStatus::Unmigratable,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -295,6 +303,7 @@ fn migrate_one(
             status: MigrationStatus::Unmigratable,
             protected_files,
             editable_paths,
+            editable_tier: None,
             translated_globs: Vec::new(),
             invariant_dispositions,
             generated_toml: None,
@@ -326,12 +335,15 @@ fn migrate_one(
     } else {
         Tier::Logged
     };
+    let migrated_editable_tier = (!editable_paths.is_empty()).then_some(editable_tier);
 
     let config = WardConfig {
         principal_key_fingerprint: fingerprint.to_string(),
         protected_surface: protected_files.clone(),
         default_tier: Tier::Logged,
-        editable: (!harness_blocks.is_empty()).then_some(EditableConfig { harness_blocks }),
+        editable: approval_tiers
+            .as_ref()
+            .map(|_| EditableConfig { harness_blocks }),
         approval_tiers,
         surface: protected_files
             .iter()
@@ -361,6 +373,7 @@ fn migrate_one(
             status: MigrationStatus::ValidationFailed,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -375,6 +388,7 @@ fn migrate_one(
             status: MigrationStatus::WouldMigrate,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -400,6 +414,7 @@ fn migrate_one(
             status: MigrationStatus::BackupExists,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -416,6 +431,7 @@ fn migrate_one(
             status: MigrationStatus::ValidationFailed,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -429,6 +445,7 @@ fn migrate_one(
         status: MigrationStatus::Migrated,
         protected_files,
         editable_paths,
+        editable_tier: migrated_editable_tier,
         translated_globs,
         invariant_dispositions: invariant_dispositions.clone(),
         generated_toml: Some(generated_toml),
@@ -593,12 +610,7 @@ pub fn print_report(report: &MigrationReport) {
 }
 
 fn migrated_editable_tier(entry: &MigrationEntry) -> u8 {
-    entry
-        .generated_toml
-        .as_deref()
-        .filter(|generated| generated.contains("[approval_tiers."))
-        .map(|_| 1)
-        .unwrap_or(2)
+    entry.editable_tier.map(u8::from).unwrap_or(2)
 }
 
 #[cfg(test)]
@@ -723,6 +735,9 @@ append_only = true
             .as_deref()
             .expect("dry run includes generated toml");
         assert!(generated.contains("Migrated from Ward v0.1"));
+        assert!(generated.contains("harness_blocks"));
+        assert!(generated.contains("[approval_tiers.familiar_review]"));
+        assert!(generated.contains("min_visible_seconds = 900"));
         assert!(generated.contains("[[identity_invariant]]"));
         assert!(generated.contains("fact = \"name\""));
         assert!(generated.contains("operator = \"equals\""));
@@ -798,6 +813,98 @@ append_only = true
     }
 
     #[test]
+    fn migration_without_approval_tiers_keeps_legacy_harness_blocks_at_tier2() -> Result<()> {
+        for apply in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let workspace = seed_familiars(temp.path())?;
+            let original = r#"[meta]
+version = "0.1"
+owner = "nova"
+
+[editable]
+paths = ["TOOLS.md"]
+harness_blocks = ["legacy_unbound_block"]
+"#;
+            fs::write(workspace.join("ward.toml"), original)?;
+            let report = run_migration(
+                temp.path(),
+                WardMigrateOptions {
+                    familiar: Some("nova".to_string()),
+                    fingerprint: "SHA256:test-principal".to_string(),
+                    apply,
+                },
+            )?;
+            assert!(!report.has_errors(), "{report:?}");
+            let entry = &report.entries[0];
+            assert_eq!(
+                entry.status,
+                if apply {
+                    MigrationStatus::Migrated
+                } else {
+                    MigrationStatus::WouldMigrate
+                }
+            );
+            let generated = entry.generated_toml.as_deref().expect("generated config");
+            let config = WardConfig::from_toml_str(generated)?;
+            assert!(config.editable.is_none());
+            assert!(config.compiled_approval_tiers()?.is_none());
+            assert_eq!(config.classify_resolved_path("TOOLS.md")?, Tier::Logged);
+            assert_eq!(migrated_editable_tier(entry), 2);
+            if apply {
+                assert_eq!(
+                    fs::read_to_string(workspace.join("ward.toml.v01.bak"))?,
+                    original
+                );
+                assert_eq!(load_migrated_config(&workspace)?, config);
+            } else {
+                assert_eq!(fs::read_to_string(workspace.join("ward.toml"))?, original);
+                assert!(!workspace.join("ward.toml.v01.bak").exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_refuses_approval_tiers_without_harness_blocks_without_writing() -> Result<()> {
+        for editable in [
+            "",
+            "[editable]\npaths = [\"TOOLS.md\"]\n",
+            "[editable]\nharness_blocks = []\n",
+        ] {
+            let temp = tempfile::tempdir()?;
+            let workspace = seed_familiars(temp.path())?;
+            let original = format!(
+                r#"[meta]
+version = "0.1"
+owner = "nova"
+
+{editable}
+[approval_tiers.human_review]
+blocks = ["tool_defaults"]
+gate = "human_approval"
+"#
+            );
+            fs::write(workspace.join("ward.toml"), &original)?;
+            let report = run_migration(
+                temp.path(),
+                WardMigrateOptions {
+                    familiar: Some("nova".to_string()),
+                    fingerprint: "SHA256:test-principal".to_string(),
+                    apply: true,
+                },
+            )?;
+            assert!(report.has_errors());
+            assert_eq!(report.entries[0].status, MigrationStatus::ValidationFailed);
+            assert!(report.entries[0]
+                .message
+                .contains("harness_blocks must not be empty"));
+            assert_eq!(fs::read_to_string(workspace.join("ward.toml"))?, original);
+            assert!(!workspace.join("ward.toml.v01.bak").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn migration_refuses_veto_without_explicit_minimum_without_writing() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = seed_familiars(temp.path())?;
@@ -851,6 +958,7 @@ human_veto_window_hours = 1
             status: MigrationStatus::Migrated,
             protected_files: Vec::new(),
             editable_paths: vec!["TOOLS.md".to_string()],
+            editable_tier: Some(Tier::Reviewed),
             translated_globs: Vec::new(),
             invariant_dispositions: Vec::new(),
             generated_toml: Some(
@@ -859,6 +967,7 @@ human_veto_window_hours = 1
             message: "ok".to_string(),
         };
         let logged = MigrationEntry {
+            editable_tier: Some(Tier::Logged),
             generated_toml: Some("[surface]\npath = \"notes/\"\ntier = 2\n".to_string()),
             ..reviewed.clone()
         };

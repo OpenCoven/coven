@@ -291,9 +291,10 @@ that exceeded the reported limit.
 
 ## Ward proposals (threads)
 
-Held Ward writes stage at `~/.coven/pending/` for the principal. Tier-0
-authority degradations remain legacy pending proposals distinguished by
-`reviewKind: "authority"`. Tier-1 reviewed holds either keep the legacy
+Eligible held Ward writes stage at `~/.coven/pending/` for the principal.
+Tier-0 targets are refused with `protected_proposal_forbidden`; neither new
+intake nor historical authority-proposal records grant protected-write
+permission. Tier-1 reviewed holds either keep the legacy
 `reviewKind: "coherence"` shape or, when retired-Ward approval metadata binds
 the diff to typed regions, stage as canonical `phase5_v1` scheduled proposals
 whose authority lives in `classification.approval_path`, not in `reviewKind`.
@@ -302,8 +303,11 @@ explicit `min_visible_seconds` value; Coven validates both through the
 scheduled-publication veto-window contract and does not infer a default minimum
 from example fixtures. `min_visible_seconds` is invalid without a veto window
 and on human approval paths.
-See
-[cli-ward](cli-ward.md) and `docs/design/ward-gate3-coherence.md`.
+Replay compares the committed regional approval path with the live compiled
+policy. Changed, removed, or unbound approval policy rejects the proposal;
+an opened window closes once with `revalidation_failed`. Existing unclassified
+envelopes without regional policy retain their legacy handling.
+See [cli-ward](cli-ward.md) and `docs/design/ward-gate3-coherence.md`.
 
 | Method | Path | Purpose | Success | Errors |
 |---|---|---|---|---|
@@ -311,7 +315,7 @@ See
 | GET | `/api/v1/threads/proposals` | Owner-local cursor-paginated pending proposals with compact `probeSummary` evidence. `limit` defaults to and is capped at 64; pass the opaque `nextCursor` as `cursor`. Invalid files are reported once as `degraded` and quarantined. | `{ proposals, limit, hasMore, nextCursor }` | `400 invalid_request`, `403 transport_forbidden` |
 | GET | `/api/v1/threads/proposals/:id` | Owner-local detail for one pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request`, `403 transport_forbidden`, `404 proposal_not_found` |
 | POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. `HumanApprovalWithRationale` paths require a non-empty `note`. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `413 ward_apply_too_large`, `413 proposal_quota_exceeded`, `507 ward_audit_capacity_exceeded` |
-| POST | `/api/v1/threads/proposals/:id/reject` | Reject/veto and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `507 ward_audit_capacity_exceeded` |
+| POST | `/api/v1/threads/proposals/:id/reject` | Reject/veto and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. To explicitly supersede this proposal with a newer matching pending replacement, also pass `{ replacementProposalId, replacementProposalRevision }` from that replacement proposal's detail/list response. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `507 ward_audit_capacity_exceeded` |
 
 Proposal metadata includes familiar identity, target paths, writer
 fingerprints, hashes, and probe diagnostics, so reads and mutations both
@@ -322,6 +326,44 @@ request under `/api/v1/threads/proposals` fails with stable
 creation, target access, or audit append. The response includes
 `details: { requiredAuthority: "owner_local_ipc", writeApplied: false }`.
 Host/Origin allowlists do not elevate TCP authority.
+
+Explicit supersession stays opt-in: ordinary proposal submission does not
+cancel earlier proposals. On `POST /api/v1/threads/proposals/:id/reject`, Coven
+derives supersession only after it revalidates a newer durable pending
+replacement with matching familiar, writer/approval lane, channel, and exact
+affected-surface scope. Veto-window proposals audit that outcome as
+`proposal_rejected` with `detail.reason = "superseded"` and
+`detail.replay_hash_matched = null`; human approval paths remain ordinary
+`proposal_rejected` rows with no close detail.
+
+Coven persists replacement intent in the decision claim and revalidates it
+after restart. Incomplete or invalid persisted intent is rejected, not
+reinterpreted as an ordinary veto. Preserve in-flight claims when rolling back:
+a daemon predating this extension cannot recover their added fields.
+
+Decision origins are bound to the durable reservation and request. Automatic
+work never acquires a human approver. Historical requests written before
+origin binding can resume only with matching append-only apply intent and
+version-specific recovery evidence. Their terminal approval uses
+`approver: "unknown:historical"` and `detail.decisionOrigin.kind:
+"historical_unknown"`; this is an explicit unknown-origin sentinel required by
+the audit schema, not a human or the proposal writer. Insufficient historical
+proof returns `409` with `why: "proposal-decision-review-required"` without
+labeling the record corrupt. Unapplied claims return to pending for renewed
+review; unresolved applying evidence remains preserved.
+
+Historical v2 recovery uses its exact original Ward encoding. Current claims
+continue to use v3 baseline-snapshot commitments; they cannot fall back to v2.
+Changed live policy or baseline evidence invalidates either version.
+An older scheduled submission receipt that predates identity binding is
+accepted for apply recovery only when its missing binding is proven by the
+matching historical v3 intent. Otherwise it requires a new proposal; current
+decision origins cannot use this compatibility path.
+An undecided historical proposal can still reach its normal retention expiry:
+only proven-unapplied work may enter the server-owned rejection transition,
+which validates the full submission receipt before terminalizing. Missing
+approval identity proof never authorizes an apply, and malformed or mismatched
+receipts do not become trusted historical data.
 
 ### Pending-proposal capacity and bounded maintenance
 
@@ -366,6 +408,10 @@ Pending proposals expire after **30 days**. Expiry follows the durable decision
 path: Coven records a `proposal_rejected` audit row with decision `expired`,
 removes the active file, and never applies its target. An interrupted expiry
 persists an internal decision request and resumes safely on a later tick.
+If expiry has already superseded an unapplied approval reservation, restart
+recognizes that bound transition before trying to resume the old approval.
+Capacity refusal preserves the transition for retry; changed or unproven
+apply evidence never becomes an unapplied terminal rejection.
 
 ### Durable audit capacity
 

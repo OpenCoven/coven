@@ -29,7 +29,7 @@
 //! layers fail closed; neither can be skipped on the daemon's only
 //! arbitrary-file write path into familiar homes (`POST /familiars/{id}/edits`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -318,6 +318,7 @@ pub struct GateRequest<'a> {
 pub(crate) struct WeaveState {
     pub familiar_uuid: threads::FamiliarId,
     pub weave: threads::Weave,
+    pub baseline_snapshot: BTreeMap<String, Option<Vec<u8>>>,
 }
 
 /// Gate a proposal's protected targets through the coven-threads weave.
@@ -520,9 +521,12 @@ pub(crate) fn build_weave_state_for_writer_at(
     writer: Option<&threads::WriterId>,
 ) -> Result<WeaveState> {
     let familiar_uuid = familiar_weave_id(familiar_id);
-    let principal_writer = writer.cloned().unwrap_or_else(|| {
-        threads::WriterId::new(format!("principal:{}", config.principal_key_fingerprint))
-    });
+    let principal_writer =
+        threads::WriterId::new(format!("principal:{}", config.principal_key_fingerprint));
+    // A pending principal label cannot rebind a rotated Ward principal.
+    let review_writer = writer
+        .filter(|writer| !writer.as_str().starts_with("principal:"))
+        .unwrap_or(&principal_writer);
 
     // Weave one thread per protected surface: the literal (non-glob) tier-0
     // declarations plus any resolved protected targets being replayed.
@@ -541,12 +545,18 @@ pub(crate) fn build_weave_state_for_writer_at(
 
     let manifest_id = load_or_create_manifest_id(conn, familiar_id)?;
     let mut woven = Vec::with_capacity(surfaces.len());
+    let mut baseline_snapshot = BTreeMap::new();
     for surface in &surfaces {
         let surface_id = threads::SurfaceId::new(surface.clone());
         let disk = read_surface(workspace, surface)?;
         let current_hash = threads::manifest_entry_hash(&surface_id, &disk);
 
         let baseline = load_baseline(conn, familiar_id, surface)?;
+        let validated_baseline = match &baseline {
+            Some(recorded) => Some(recorded.clone()),
+            None if bootstrap_missing_baselines => Some(current_hash.to_vec()),
+            None => None,
+        };
         let (entry_hash, drifted) = match baseline {
             Some(recorded) => {
                 let drifted = recorded.as_slice() != current_hash.as_slice();
@@ -561,11 +571,18 @@ pub(crate) fn build_weave_state_for_writer_at(
             }
             None => (current_hash.to_vec(), false),
         };
+        baseline_snapshot.insert(surface.clone(), validated_baseline);
 
         let mut thread = threads::Thread {
             id: threads::ThreadId::new(),
             surface: surface_id.clone(),
-            writer: principal_writer.clone(),
+            writer: if review_writer == &principal_writer
+                || config.classify_resolved_path(surface)? == ward::Tier::Protected
+            {
+                principal_writer.clone()
+            } else {
+                review_writer.clone()
+            },
             strands: vec![
                 threads::Strand::ContentHash {
                     id: threads::StrandId::new(),
@@ -626,6 +643,7 @@ pub(crate) fn build_weave_state_for_writer_at(
     Ok(WeaveState {
         familiar_uuid,
         weave,
+        baseline_snapshot,
     })
 }
 
@@ -1312,6 +1330,7 @@ fn stage_pending_proposal(
         })
         .context("serializing pending proposal")?
     };
+    crate::api::validate_proposal_envelope_preflight(&body)?;
     crate::proposal_store::publish_new(coven_home, &path, &body)?;
     Ok(path)
 }
@@ -1349,22 +1368,7 @@ fn stage_legacy_pending_proposal(
     probe_context: StagingProbeContext<'_>,
 ) -> Result<(PathBuf, String)> {
     ward::validate_file_edit_budget(edits)?;
-    let identity_context = crate::ward_identity::candidate_identity_context(
-        coven_home,
-        probe_context.familiar_id,
-        probe_context.workspace,
-        probe_context.config,
-        edits,
-        probe_context.authorization,
-        None,
-    );
-    if let Some(verdict) =
-        crate::ward_identity::candidate_rejection(probe_context.config, identity_context.as_ref())?
-    {
-        anyhow::bail!("identity predicates refuse proposal staging: {verdict:?}");
-    }
-    let identity_evidence =
-        crate::ward_identity::candidate_binding(probe_context.config, identity_context.as_ref())?;
+    let identity_evidence = staging_identity_evidence(coven_home, edits, &probe_context)?;
     let probes = crate::ward_probes::run_at_staging(
         probe_context.workspace,
         probe_context.config,
@@ -1382,16 +1386,11 @@ fn stage_legacy_pending_proposal(
     Ok((path, pending.id.0.to_string()))
 }
 
-fn stage_scheduled_coherence_proposal(
-    submission: ScheduledSubmissionContext<'_, '_>,
+fn staging_identity_evidence(
     coven_home: &Path,
-    pending: threads::PendingProposal,
     edits: &[ward::FileEdit],
-    bindings: &ward::CompiledApprovalTiers,
-    now: time::OffsetDateTime,
-    probe_context: StagingProbeContext<'_>,
-) -> Result<StagedCoherenceProposal> {
-    let mut budget = ward::validate_file_edit_budget(edits)?;
+    probe_context: &StagingProbeContext<'_>,
+) -> Result<Option<[u8; 32]>> {
     let identity_context = crate::ward_identity::candidate_identity_context(
         coven_home,
         probe_context.familiar_id,
@@ -1404,10 +1403,22 @@ fn stage_scheduled_coherence_proposal(
     if let Some(verdict) =
         crate::ward_identity::candidate_rejection(probe_context.config, identity_context.as_ref())?
     {
-        anyhow::bail!("identity predicates refuse scheduled proposal staging: {verdict:?}");
+        anyhow::bail!("identity predicates refuse proposal staging: {verdict:?}");
     }
-    let identity_evidence =
-        crate::ward_identity::candidate_binding(probe_context.config, identity_context.as_ref())?;
+    crate::ward_identity::candidate_binding(probe_context.config, identity_context.as_ref())
+}
+
+fn stage_scheduled_coherence_proposal(
+    submission: ScheduledSubmissionContext<'_, '_>,
+    coven_home: &Path,
+    pending: threads::PendingProposal,
+    edits: &[ward::FileEdit],
+    bindings: &ward::CompiledApprovalTiers,
+    now: time::OffsetDateTime,
+    probe_context: StagingProbeContext<'_>,
+) -> Result<StagedCoherenceProposal> {
+    let mut budget = ward::validate_file_edit_budget(edits)?;
+    let identity_evidence = staging_identity_evidence(coven_home, edits, &probe_context)?;
     let diff = materialize_diff(probe_context.workspace, edits, &mut budget)?;
     let region_evidence = threads::SurfaceRegionRegistry::default_registry().classify_all(&diff);
     if region_evidence.is_empty() {
@@ -1638,6 +1649,64 @@ fn materialize_diff(
 mod tests {
     use super::*;
     use crate::store;
+
+    #[test]
+    fn scheduled_weave_uses_live_principal_binding_and_preserves_protected_writer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path();
+        std::fs::write(workspace.join("SOUL.md"), "# Synthetic identity\n")?;
+        std::fs::write(workspace.join("TOOLS.md"), "Synthetic tools\n")?;
+        let config = ward::WardConfig::from_toml_str(
+            r#"principal_key_fingerprint = "synthetic-current"
+protected_surface = ["SOUL.md"]
+[[surface]]
+path = "SOUL.md"
+tier = 0
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#,
+        )?;
+        let conn = store::open_store(&workspace.join("coven.sqlite3"))?;
+        let stale = threads::WriterId::new("principal:synthetic-retired");
+        let anonymous = threads::WriterId::new("anonymous");
+        for candidate in [&stale, &anonymous] {
+            let state = build_weave_state_for_writer_at(
+                &conn,
+                "synthetic",
+                workspace,
+                &config,
+                &["TOOLS.md".to_string()],
+                false,
+                time::OffsetDateTime::UNIX_EPOCH,
+                Some(candidate),
+            )?;
+            let request = |surface: &str, writer: &threads::WriterId| threads::MutationRequest {
+                surface: threads::SurfaceId::new(surface),
+                writer: writer.clone(),
+                channel: threads::Channel::Mutation,
+                identity_context: None,
+            };
+            assert!(
+                !threads::validate_fail_closed(&state.weave, &request("SOUL.md", candidate))
+                    .permits_write()
+            );
+            assert_eq!(
+                threads::validate_fail_closed(&state.weave, &request("TOOLS.md", candidate))
+                    .permits_write(),
+                candidate == &anonymous,
+            );
+            assert!(threads::validate_fail_closed(
+                &state.weave,
+                &request(
+                    "SOUL.md",
+                    &threads::WriterId::new("principal:synthetic-current")
+                ),
+            )
+            .permits_write());
+        }
+        Ok(())
+    }
 
     fn ward_config() -> ward::WardConfig {
         ward::WardConfig::from_toml_str(
@@ -2040,6 +2109,8 @@ coven = "OpenCoven"
         assert_eq!(value["probes"][0]["surface"], "SOUL.md");
         assert_eq!(value["probes"][0]["status"], "unscored");
         assert_eq!(value["probes"][0]["results"], serde_json::json!([]));
+        crate::api::validate_proposal_envelope_preflight(&raw)
+            .expect("legacy staged proposal must pass envelope preflight");
         assert_eq!(
             value["probes"][0]["baselineSha256"].as_str().map(str::len),
             Some(64)

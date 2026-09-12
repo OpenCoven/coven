@@ -38,6 +38,8 @@ const DEFINITION_VALIDATION_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.definition-validation-vectors.v1";
 const EVENT_REDUCER_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.event-reducer-determinism-vectors.v1";
+const MISFIRE_LATEST_PLANNING_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.misfire-latest-planning-vectors.v1";
 const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
@@ -47,6 +49,7 @@ const RRULE_VOCABULARY_VECTOR_SCHEMA_VERSION: &str =
 const RUN_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.run-terminal-monotonicity-vectors.v1";
 const STRUCTURAL_PROFILE: &str = "structural";
+const SCHEDULER_RELIABILITY_PROFILE: &str = "scheduler_reliability";
 const MAX_CASES: usize = 128;
 
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
@@ -55,6 +58,7 @@ pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempoten
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
+pub const MISFIRE_LATEST_PLANNING_SUITE: &str = "misfire-latest-planning";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -430,6 +434,55 @@ struct OccurrenceFenceVectorSet {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MisfireLatestPlanningVectorSet {
+    schema_version: String,
+    cases: Vec<MisfireLatestPlanningVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MisfireLatestPlanningVectorCase {
+    case_id: String,
+    scenario: MisfireLatestPlanningScenario,
+    definition: Value,
+    created_at: String,
+    observed_at: String,
+    #[serde(default)]
+    existing_scheduled_for: Option<String>,
+    expected: ExpectedMisfireLatestPlanning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MisfireLatestPlanningScenario {
+    RestartCollapseLatest,
+    ExistingFenceReplay,
+    ClockRollbackNoOlderFence,
+    PausedDefinition,
+}
+
+impl MisfireLatestPlanningScenario {
+    const COUNT: usize = 4;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedPlanOutcome {
+    Planned,
+    NotDue,
+    AlreadyFenced,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedMisfireLatestPlanning {
+    first_outcome: ExpectedPlanOutcome,
+    second_outcome: ExpectedPlanOutcome,
+    scheduled_slots: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OccurrenceFenceVectorCase {
     case_id: String,
     scenario: OccurrenceFenceScenario,
@@ -629,55 +682,72 @@ struct ExpectedRunTerminal {
 pub fn capability() -> TargetCapability {
     TargetCapability {
         schema_version: TARGET_CAPABILITY_SCHEMA_VERSION,
-        profiles: vec![TargetProfileCapability {
-            profile: STRUCTURAL_PROFILE,
-            suites: vec![
-                ATTEMPT_TERMINAL_IMMUTABILITY_SUITE,
-                CAPABILITY_NEGOTIATION_SUITE,
-                COMMAND_ADOPTION_IDEMPOTENCY_SUITE,
-                DEFINITION_LIFECYCLE_TRANSITIONS_SUITE,
-                DEFINITION_VALIDATION_SUITE,
-                EVENT_REDUCER_DETERMINISM_SUITE,
-                OCCURRENCE_FENCE_UNIQUENESS_SUITE,
-                RECEIPT_INTEGRITY_VALIDATION_SUITE,
-                RRULE_VOCABULARY_SUITE,
-                RUN_TERMINAL_MONOTONICITY_SUITE,
-            ],
-        }],
+        profiles: vec![
+            TargetProfileCapability {
+                profile: STRUCTURAL_PROFILE,
+                suites: vec![
+                    ATTEMPT_TERMINAL_IMMUTABILITY_SUITE,
+                    CAPABILITY_NEGOTIATION_SUITE,
+                    COMMAND_ADOPTION_IDEMPOTENCY_SUITE,
+                    DEFINITION_LIFECYCLE_TRANSITIONS_SUITE,
+                    DEFINITION_VALIDATION_SUITE,
+                    EVENT_REDUCER_DETERMINISM_SUITE,
+                    OCCURRENCE_FENCE_UNIQUENESS_SUITE,
+                    RECEIPT_INTEGRITY_VALIDATION_SUITE,
+                    RRULE_VOCABULARY_SUITE,
+                    RUN_TERMINAL_MONOTONICITY_SUITE,
+                ],
+            },
+            TargetProfileCapability {
+                profile: SCHEDULER_RELIABILITY_PROFILE,
+                suites: vec![MISFIRE_LATEST_PLANNING_SUITE],
+            },
+        ],
     }
 }
 
 pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
     let request: TargetSuiteRequest =
         serde_json::from_value(request.clone()).map_err(|_| "conformance request is invalid")?;
-    if request.schema_version != SUITE_REQUEST_SCHEMA_VERSION
-        || request.profile != STRUCTURAL_PROFILE
-    {
+    if request.schema_version != SUITE_REQUEST_SCHEMA_VERSION {
         return Err("conformance suite is unsupported");
     }
     if !request.protocol_artifact.is_object() || !request.subject_artifact.is_object() {
         return Err("conformance request is invalid");
     }
 
-    let all_passed = match request.suite_id.as_str() {
-        ATTEMPT_TERMINAL_IMMUTABILITY_SUITE => {
+    let all_passed = match (request.profile.as_str(), request.suite_id.as_str()) {
+        (STRUCTURAL_PROFILE, ATTEMPT_TERMINAL_IMMUTABILITY_SUITE) => {
             evaluate_attempt_terminal_immutability(&request.vector)?
         }
-        CAPABILITY_NEGOTIATION_SUITE => evaluate_capability_negotiation(&request.vector)?,
-        COMMAND_ADOPTION_IDEMPOTENCY_SUITE => {
+        (STRUCTURAL_PROFILE, CAPABILITY_NEGOTIATION_SUITE) => {
+            evaluate_capability_negotiation(&request.vector)?
+        }
+        (STRUCTURAL_PROFILE, COMMAND_ADOPTION_IDEMPOTENCY_SUITE) => {
             evaluate_command_adoption_idempotency(&request.vector)?
         }
-        DEFINITION_LIFECYCLE_TRANSITIONS_SUITE => {
+        (STRUCTURAL_PROFILE, DEFINITION_LIFECYCLE_TRANSITIONS_SUITE) => {
             evaluate_definition_lifecycle_transitions(&request.vector)?
         }
-        DEFINITION_VALIDATION_SUITE => evaluate_definition_validation(&request.vector)?,
-        EVENT_REDUCER_DETERMINISM_SUITE => evaluate_event_reducer_determinism(&request.vector)?,
-        OCCURRENCE_FENCE_UNIQUENESS_SUITE => evaluate_occurrence_fence_uniqueness(&request.vector)?,
-        RECEIPT_INTEGRITY_VALIDATION_SUITE => {
+        (STRUCTURAL_PROFILE, DEFINITION_VALIDATION_SUITE) => {
+            evaluate_definition_validation(&request.vector)?
+        }
+        (STRUCTURAL_PROFILE, EVENT_REDUCER_DETERMINISM_SUITE) => {
+            evaluate_event_reducer_determinism(&request.vector)?
+        }
+        (STRUCTURAL_PROFILE, OCCURRENCE_FENCE_UNIQUENESS_SUITE) => {
+            evaluate_occurrence_fence_uniqueness(&request.vector)?
+        }
+        (STRUCTURAL_PROFILE, RECEIPT_INTEGRITY_VALIDATION_SUITE) => {
             evaluate_receipt_integrity_validation(&request.vector)?
         }
-        RRULE_VOCABULARY_SUITE => evaluate_rrule_vocabulary(&request.vector)?,
-        RUN_TERMINAL_MONOTONICITY_SUITE => evaluate_run_terminal_monotonicity(&request.vector)?,
+        (STRUCTURAL_PROFILE, RRULE_VOCABULARY_SUITE) => evaluate_rrule_vocabulary(&request.vector)?,
+        (STRUCTURAL_PROFILE, RUN_TERMINAL_MONOTONICITY_SUITE) => {
+            evaluate_run_terminal_monotonicity(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, MISFIRE_LATEST_PLANNING_SUITE) => {
+            evaluate_misfire_latest_planning(&request.vector)?
+        }
         _ => return Err("conformance suite is unsupported"),
     };
     result_for(&request.suite_id, &request.vector, all_passed)
@@ -1203,6 +1273,247 @@ fn event_reducer_case_matches(case: &EventReducerVectorCase) -> Result<bool, &'s
         canonicalize(canonical.state()).map_err(|_| "conformance suite execution failed")?;
     let observed_digest = format!("sha256:{}", sha256_hex(&canonical_state));
     Ok(canonical.state() == duplicated.state() && observed_digest == case.expected_state_digest)
+}
+
+fn evaluate_misfire_latest_planning(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: MisfireLatestPlanningVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != MISFIRE_LATEST_PLANNING_VECTOR_SCHEMA_VERSION
+        || vectors.cases.is_empty()
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || !misfire_latest_planning_case_is_valid(case)
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != MisfireLatestPlanningScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut all_passed = true;
+    for case in &vectors.cases {
+        all_passed &= misfire_latest_planning_case_matches(case)?;
+    }
+    Ok(all_passed)
+}
+
+fn misfire_latest_planning_case_is_valid(case: &MisfireLatestPlanningVectorCase) -> bool {
+    let Ok(definition) = super::definition::RoutineDefinition::from_json(&case.definition) else {
+        return false;
+    };
+    let Some(created_at) = canonical_timestamp(&case.created_at) else {
+        return false;
+    };
+    let Some(observed_at) = canonical_timestamp(&case.observed_at) else {
+        return false;
+    };
+    let existing = match case.existing_scheduled_for.as_deref() {
+        Some(value) => {
+            let Some(timestamp) = canonical_timestamp(value) else {
+                return false;
+            };
+            Some(timestamp)
+        }
+        None => None,
+    };
+    let scheduled_slots = case
+        .expected
+        .scheduled_slots
+        .iter()
+        .map(|slot| canonical_timestamp(slot))
+        .collect::<Option<Vec<_>>>();
+    let Some(scheduled_slots) = scheduled_slots else {
+        return false;
+    };
+    if scheduled_slots.windows(2).any(|slots| slots[0] >= slots[1])
+        || definition.rrule != "FREQ=DAILY;BYHOUR=9"
+        || definition.timezone != super::definition::RoutineTimezone::Utc
+        || definition.misfire != super::definition::RoutineMisfire::Latest
+        || definition.overlap != super::definition::RoutineOverlap::Forbid
+    {
+        return false;
+    }
+
+    let first_due = scheduled_after(&definition, created_at);
+    let second_due = first_due.and_then(|slot| scheduled_after(&definition, slot));
+    let latest_due = latest_scheduled_at_or_before(&definition, created_at, observed_at);
+    let next_after_observation = scheduled_after(&definition, observed_at);
+
+    match case.scenario {
+        MisfireLatestPlanningScenario::RestartCollapseLatest => {
+            definition.status == super::definition::RoutineStatus::Active
+                && created_at < observed_at
+                && second_due.is_some_and(|slot| slot <= observed_at)
+                && existing.is_none()
+                && case.expected.first_outcome == ExpectedPlanOutcome::Planned
+                && case.expected.second_outcome == ExpectedPlanOutcome::AlreadyFenced
+                && scheduled_slots.len() == 1
+        }
+        MisfireLatestPlanningScenario::ExistingFenceReplay => {
+            definition.status == super::definition::RoutineStatus::Active
+                && created_at < observed_at
+                && existing.is_some_and(|slot| {
+                    latest_due == Some(slot) && scheduled_slots.as_slice() == [slot]
+                })
+                && case.expected.first_outcome == ExpectedPlanOutcome::AlreadyFenced
+                && case.expected.second_outcome == ExpectedPlanOutcome::AlreadyFenced
+        }
+        MisfireLatestPlanningScenario::ClockRollbackNoOlderFence => {
+            definition.status == super::definition::RoutineStatus::Active
+                && created_at < observed_at
+                && first_due.is_some_and(|slot| slot <= observed_at)
+                && existing.is_some_and(|slot| {
+                    next_after_observation == Some(slot) && scheduled_slots.as_slice() == [slot]
+                })
+                && case.expected.first_outcome == ExpectedPlanOutcome::NotDue
+                && case.expected.second_outcome == ExpectedPlanOutcome::NotDue
+        }
+        MisfireLatestPlanningScenario::PausedDefinition => {
+            definition.status == super::definition::RoutineStatus::Paused
+                && created_at < observed_at
+                && first_due.is_some_and(|slot| slot <= observed_at)
+                && existing.is_none()
+                && case.expected.first_outcome == ExpectedPlanOutcome::NotDue
+                && case.expected.second_outcome == ExpectedPlanOutcome::NotDue
+                && scheduled_slots.is_empty()
+        }
+    }
+}
+
+fn scheduled_after(
+    definition: &super::definition::RoutineDefinition,
+    instant: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    super::schedule::next_due(&definition.rrule, definition.timezone, instant)
+        .ok()
+        .flatten()
+}
+
+fn latest_scheduled_at_or_before(
+    definition: &super::definition::RoutineDefinition,
+    created_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let bounded_start = observed_at.checked_sub_signed(Duration::days(15))?;
+    let mut cursor = created_at.max(bounded_start);
+    let mut latest = None;
+
+    for _ in 0..=16 {
+        let next = scheduled_after(definition, cursor)?;
+        if next > observed_at {
+            return latest;
+        }
+        latest = Some(next);
+        cursor = next;
+    }
+
+    None
+}
+
+fn misfire_latest_planning_case_matches(
+    case: &MisfireLatestPlanningVectorCase,
+) -> Result<bool, &'static str> {
+    let definition = super::definition::RoutineDefinition::from_json(&case.definition)
+        .map_err(|_| "conformance vector is invalid")?;
+    let created_at =
+        canonical_timestamp(&case.created_at).ok_or("conformance vector is invalid")?;
+    let observed_at =
+        canonical_timestamp(&case.observed_at).ok_or("conformance vector is invalid")?;
+    let conn = Connection::open_in_memory().map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    let record = super::store::insert_definition(&conn, &definition)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute(
+        "UPDATE automation_definitions
+         SET created_at = ?2, updated_at = ?2
+         WHERE id = ?1",
+        params![definition.id, case.created_at],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+
+    if let Some(existing) = case.existing_scheduled_for.as_deref() {
+        let scheduled_at = canonical_timestamp(existing).ok_or("conformance vector is invalid")?;
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+                 state, attempt, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'scheduled', 'planned', 0, ?6, ?6)",
+            params![
+                format!("{}-{}", definition.id, scheduled_at.timestamp_millis()),
+                definition.id,
+                i64::try_from(record.revision).map_err(|_| "conformance suite execution failed")?,
+                record
+                    .definition_digest
+                    .as_deref()
+                    .ok_or("conformance suite execution failed")?,
+                existing,
+                case.created_at,
+            ],
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+    }
+
+    let first =
+        super::occurrences::plan_latest_due_occurrence(&conn, &definition, created_at, observed_at)
+            .map_err(|_| "conformance suite execution failed")?;
+    let second =
+        super::occurrences::plan_latest_due_occurrence(&conn, &definition, created_at, observed_at)
+            .map_err(|_| "conformance suite execution failed")?;
+    let scheduled_slots = conn
+        .prepare(
+            "SELECT scheduled_for
+             FROM automation_occurrences
+             WHERE automation_id = ?1
+             ORDER BY scheduled_for ASC",
+        )
+        .map_err(|_| "conformance suite execution failed")?
+        .query_map([&definition.id], |row| row.get::<_, String>(0))
+        .map_err(|_| "conformance suite execution failed")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| "conformance suite execution failed")?;
+
+    Ok(plan_outcome_matches(&first, case.expected.first_outcome)
+        && plan_outcome_matches(&second, case.expected.second_outcome)
+        && scheduled_slots == case.expected.scheduled_slots)
+}
+
+fn plan_outcome_matches(
+    observed: &super::occurrences::PlanOutcome,
+    expected: ExpectedPlanOutcome,
+) -> bool {
+    matches!(
+        (observed, expected),
+        (
+            super::occurrences::PlanOutcome::Planned(_),
+            ExpectedPlanOutcome::Planned
+        ) | (
+            super::occurrences::PlanOutcome::NotDue,
+            ExpectedPlanOutcome::NotDue
+        ) | (
+            super::occurrences::PlanOutcome::AlreadyFenced,
+            ExpectedPlanOutcome::AlreadyFenced
+        )
+    )
+}
+
+fn canonical_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .filter(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true) == value)
 }
 
 fn evaluate_occurrence_fence_uniqueness(vector: &Value) -> Result<bool, &'static str> {

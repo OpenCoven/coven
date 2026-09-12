@@ -386,19 +386,21 @@ impl WardConfig {
     /// ignored: a malformed Ward must not degrade into "no Ward".
     pub fn load(home: &Path) -> Result<Option<Self>> {
         let path = home.join(WARD_CONFIG_FILE);
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => {
                 return Err(err).with_context(|| format!("reading ward config {}", path.display()));
             }
         };
-        if let Some(remnants) = legacy_invariant_remnants(&raw) {
+        let raw = std::str::from_utf8(&bytes)
+            .with_context(|| format!("decoding ward config {}", path.display()))?;
+        if let Some(remnants) = legacy_invariant_remnants(raw) {
             bail!(
                 "ward.toml still carries a retired [protected].invariants remnant ({remnants}); move these declarations into [[identity_invariant]] tables"
             );
         }
-        let config = Self::from_toml_str(&raw)
+        let config = Self::from_toml_str(raw)
             .with_context(|| format!("invalid ward config at {}", path.display()))?;
         // The archive detects lost activation, not policy changes after migration.
         if config.identity_invariants.is_empty() && backup_carries_identity_invariants(home)? {
@@ -502,6 +504,35 @@ impl WardConfig {
             .map(Some)
             .map_err(|error| anyhow!(error))
     }
+
+    pub(crate) fn historical_recovery_v2_bytes(&self) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            self.editable.is_none() && self.approval_tiers.is_none(),
+            "historical v2 Ward encoding cannot represent regional approval policy"
+        );
+        // Recovery v2 committed raw serde bytes in this exact pre-publication
+        // order. Keep it separate from TOML layout and the current v3 encoder.
+        #[derive(Serialize)]
+        struct HistoricalWardConfig<'a> {
+            principal_key_fingerprint: &'a str,
+            surface: &'a [SurfaceEntry],
+            protected_surface: &'a [String],
+            default_tier: Tier,
+            #[serde(rename = "identity_invariant", skip_serializing_if = "<[_]>::is_empty")]
+            identity_invariants: &'a [IdentityInvariantDeclaration],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            probe: &'a [ProbeConfig],
+        }
+        serde_json::to_vec(&HistoricalWardConfig {
+            principal_key_fingerprint: &self.principal_key_fingerprint,
+            surface: &self.surface,
+            protected_surface: &self.protected_surface,
+            default_tier: self.default_tier,
+            identity_invariants: &self.identity_invariants,
+            probe: &self.probe,
+        })
+        .context("serializing historical v2 Ward config")
+    }
 }
 
 fn legacy_invariant_remnants(raw: &str) -> Option<String> {
@@ -521,15 +552,17 @@ fn legacy_invariant_remnants(raw: &str) -> Option<String> {
 
 fn backup_carries_identity_invariants(home: &Path) -> Result<bool> {
     let backup = home.join(LEGACY_WARD_BACKUP_FILE);
-    let raw = match std::fs::read_to_string(&backup) {
-        Ok(raw) => raw,
+    let bytes = match std::fs::read(&backup) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("reading legacy Ward backup {}", backup.display()))
         }
     };
-    let value: toml::Value = toml::from_str(&raw)
+    let raw = std::str::from_utf8(&bytes)
+        .with_context(|| format!("decoding legacy Ward backup {}", backup.display()))?;
+    let value: toml::Value = toml::from_str(raw)
         .with_context(|| format!("parsing legacy Ward backup {}", backup.display()))?;
     let declarations = value
         .get("protected")
@@ -1004,6 +1037,15 @@ pub enum Disposition {
 pub(crate) enum ApprovedApplyMode {
     Initial,
     Recovery,
+}
+
+pub(crate) type ApprovedCommitCheck<'a> = Option<&'a mut dyn FnMut() -> Result<()>>;
+
+fn run_approved_commit_check(check: &mut ApprovedCommitCheck<'_>) -> Result<()> {
+    if let Some(check) = check.as_deref_mut() {
+        check()?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1647,6 +1689,25 @@ impl Ward {
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
     ) -> Result<ApplyReport> {
+        self.apply_after_threads_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_threads_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Vec<u8>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
+    ) -> Result<ApplyReport> {
         (|| -> Result<()> {
             let mut budget = validate_file_edit_budget(edits)?;
             WardEditBudget::for_edit_count(expected_before.len())?;
@@ -1702,6 +1763,7 @@ impl Ward {
             outcome.decisions,
             &expected_before,
             mode,
+            final_authority_check,
             None,
         )?;
         Ok(ApplyReport { changes })
@@ -1722,6 +1784,25 @@ impl Ward {
         expected_before: &BTreeMap<String, Option<Vec<u8>>>,
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
+    ) -> Result<ApplyReport> {
+        self.apply_after_coherence_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_coherence_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
     ) -> Result<ApplyReport> {
         validate_approved_edit_budget(edits, expected_before)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -1768,6 +1849,7 @@ impl Ward {
             outcome.decisions,
             expected_before,
             mode,
+            final_authority_check,
             None,
         )?;
         Ok(ApplyReport { changes })
@@ -1785,6 +1867,25 @@ impl Ward {
         expected_before: &BTreeMap<String, Option<Vec<u8>>>,
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
+    ) -> Result<ApplyReport> {
+        self.apply_after_scheduled_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_scheduled_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
     ) -> Result<ApplyReport> {
         validate_approved_edit_budget(edits, expected_before)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -1828,6 +1929,7 @@ impl Ward {
             outcome.decisions,
             expected_before,
             mode,
+            final_authority_check,
             Some(&ward_config),
         )?;
         Ok(ApplyReport { changes })
@@ -2703,6 +2805,7 @@ fn write_atomically_if_unchanged(
     decisions: Vec<Decision>,
     expected_before: &BTreeMap<String, Option<Vec<u8>>>,
     mode: ApprovedApplyMode,
+    mut final_authority_check: ApprovedCommitCheck<'_>,
     expected_control: Option<&ExpectedControlFile>,
 ) -> Result<Vec<AppliedChange>> {
     validate_approved_edit_budget(edits, expected_before)
@@ -2791,6 +2894,9 @@ fn write_atomically_if_unchanged(
     }
 
     let mut swapped = Vec::new();
+    if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
+        return fail_after_conditional_rollback(&prepared, &swapped, error);
+    }
     for index in 0..prepared.len() {
         if prepared[index].already_applied {
             continue;
@@ -2802,6 +2908,9 @@ fn write_atomically_if_unchanged(
                 .as_ref()
                 .context("prepared approved write has no staging paths")?;
             if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
+                return fail_after_conditional_rollback(&prepared, &swapped, error);
+            }
+            if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
                 return fail_after_conditional_rollback(&prepared, &swapped, error);
             }
             if write.expected_before.is_some() {
@@ -2899,6 +3008,9 @@ fn write_atomically_if_unchanged(
         if let Err(error) = verification {
             return fail_after_conditional_rollback(&prepared, &swapped, error);
         }
+        if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
+            return fail_after_conditional_rollback(&prepared, &swapped, error);
+        }
     }
 
     let final_verification = (|| -> Result<()> {
@@ -2948,6 +3060,7 @@ fn write_atomically_if_unchanged(
                 &changed,
             )?;
         }
+        run_approved_commit_check(&mut final_authority_check)?;
         Ok(())
     })();
     if let Err(error) = final_verification {
@@ -3114,10 +3227,9 @@ fn fail_after_conditional_rollback(
                 ApprovedApplyFailure::RolledBack,
             )),
             Err(cleanup_error) => Err(approved_apply_error(
-                anyhow!(
-                    "{error:#}; approved proposal was rolled back but cleanup failed: \
-                     {cleanup_error:#}"
-                ),
+                error.context(format!(
+                    "approved proposal was rolled back but cleanup failed: {cleanup_error:#}"
+                )),
                 ApprovedApplyFailure::RolledBackCleanupFailed {
                     targets: prepared
                         .iter()
@@ -4836,7 +4948,7 @@ pub(crate) fn set_conditional_write_hook(path: PathBuf, replacement: Vec<u8>) {
 }
 
 #[cfg(test)]
-fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8>)>) {
+pub(crate) fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8>)>) {
     set_conditional_write_test_actions(
         trigger,
         actions
@@ -5971,7 +6083,7 @@ protected_surface = ["SOUL.md"]
 [[identity_invariant]]
 fact = "name"
 operator = "equals"
-expected = "Sage"
+expected = "Synthetic-identity"
 
 [[surface]]
 path = "SOUL.md"
@@ -6019,8 +6131,8 @@ tier = 0
             temp.path().join(LEGACY_WARD_BACKUP_FILE),
             r#"[protected]
 invariants = [
-    "familiar.name == 'Sage'",
-    "familiar.person == 'Val'",
+    "familiar.name == 'Synthetic-identity'",
+    "familiar.person == 'Example principal'",
 ]
 "#,
         )
@@ -8716,6 +8828,7 @@ tier = 1
             vec![decision],
             &BTreeMap::from([(edit.target.clone(), Some(b"before".to_vec()))]),
             ApprovedApplyMode::Initial,
+            None,
             None,
         );
 

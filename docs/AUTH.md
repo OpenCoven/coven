@@ -135,9 +135,17 @@ patterns in [Remote access](/daemon/remote-access) are the only supported remote
 
 The TypeScript OpenClaw plugin client already performs strict socket trust-anchor validation.
 
-The Rust daemon currently owns request enforcement and local IPC API behavior, but Rust-side private `COVEN_HOME` ownership and permission checks before creating, binding, or removing daemon state are still a hardening priority. Until that is implemented, client-side socket validation should be treated as defense in depth for cooperating clients, not as a complete daemon-side auth boundary.
+The Rust daemon owns request enforcement and local IPC behavior. Unix socket
+binding verifies the selected `COVEN_HOME` owner, rejects a symlinked home, and
+hardens its mode to `0700`. It binds a temporary socket inside that private
+directory, sets mode `0600`, then publishes `coven.sock` with a no-clobber hard
+link. Readiness probes never need to accept a publicly accessible socket while
+permissions are being installed. A raced destination is preserved and startup
+fails closed.
 
-Before broad distribution, Rust should fail closed when:
+These bind-path checks are not a claim that every daemon-state operation has
+been audited. Client validation remains defense in depth. Every creation,
+binding, and cleanup path must preserve the following fail-closed conditions:
 
 - `COVEN_HOME` is not owned by the current user;
 - `COVEN_HOME` is group or world accessible;

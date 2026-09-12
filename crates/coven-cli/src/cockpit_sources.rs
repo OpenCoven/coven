@@ -147,13 +147,15 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
 
 pub(crate) fn read_familiar_entries(coven_home: &Path) -> Result<Vec<FamiliarEntry>> {
     let path = coven_home.join(FAMILIARS_CONFIG_FILE);
-    let raw = match fs::read_to_string(&path) {
-        Ok(raw) => raw,
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
+    let raw = std::str::from_utf8(&bytes)
+        .with_context(|| format!("failed to decode {}", path.display()))?;
     let parsed: FamiliarsFile =
-        toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        toml::from_str(raw).with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(parsed.familiar)
 }
 

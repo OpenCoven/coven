@@ -5932,9 +5932,11 @@ mod tests {
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
+        // Root cleanup can win either before dispatch or during the writer wait.
         assert!(
             diagnostic.contains("failed writing harness prompt to stdin")
-                || diagnostic.contains("terminated before its stdin prompt could be delivered"),
+                || diagnostic.contains("terminated before its stdin prompt could be delivered")
+                || diagnostic.contains("terminated while writing its stdin prompt"),
             "{diagnostic}"
         );
         let result = exit_rx.recv_timeout(Duration::from_secs(2))?;

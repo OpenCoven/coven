@@ -12,6 +12,13 @@ const HEALTH_PATH: &str = "/api/v1/health";
 const RESERVED_SESSION_DETAIL_ROUTE_ERROR: &str =
     "ReadEndpoint::Session id collides with a reserved BASE v1 nested route";
 
+/// A complete, framed daemon response, including non-success HTTP statuses.
+#[derive(Debug)]
+pub struct DaemonHttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
 pub struct DaemonClient {
     endpoint: DaemonEndpoint,
     negotiated: Option<NegotiatedDaemon>,
@@ -55,6 +62,31 @@ impl DaemonClient {
             peer_identity: transport.peer_identity,
         });
         Ok(health)
+    }
+
+    /// Send JSON to a v1 route or exact `GET /health`, preserving response bytes.
+    ///
+    /// Negotiates health and binds the request to that authenticated peer. HTTP
+    /// rejections are returned unchanged; transport and identity failures remain
+    /// errors and requests are never automatically replayed. Unlike typed methods,
+    /// this does not infer route-specific capabilities or validate lifecycle fields.
+    pub fn request_json(
+        &mut self,
+        method: &'static str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<DaemonHttpResponse, ClientError> {
+        validate_raw_request(method, path)?;
+        let body = body
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(ClientError::InvalidJson)?;
+        self.ensure_health()?;
+        let response = self.send_bound(method, path, body.as_deref())?;
+        Ok(DaemonHttpResponse {
+            status: response.status,
+            body: response.body,
+        })
     }
 
     pub fn get_json<T: DeserializeOwned>(
@@ -193,6 +225,10 @@ impl DaemonClient {
         }
         serde_json::from_slice(&response.body).map_err(ClientError::InvalidJson)
     }
+}
+
+fn validate_raw_request(method: &str, path: &str) -> Result<(), ClientError> {
+    transport::validate_request_line(method, path)
 }
 
 fn daemon_error(status: u16, body: Vec<u8>) -> Result<ClientError, ClientError> {
@@ -343,7 +379,7 @@ fn validate_session_request_target_data(value: &str) -> Result<(), ClientError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{read_path, write_path, RESERVED_SESSION_DETAIL_ROUTE_ERROR};
+    use super::{read_path, validate_raw_request, write_path, RESERVED_SESSION_DETAIL_ROUTE_ERROR};
     use crate::models::{ReadEndpoint, WriteEndpoint};
     use crate::ClientError;
 
@@ -445,6 +481,26 @@ mod tests {
             assert!(
                 matches!(error, ClientError::InvalidRouteParameter(_)),
                 "unexpected error for {cursor:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_requests_reject_non_origin_form_targets_before_io() {
+        for path in [
+            "http://evil.example/api/v1/health",
+            "https://evil.example/api/v1/sessions",
+            "//evil.example/api/v1/health",
+            "//evil.example/health",
+        ] {
+            let error =
+                validate_raw_request("GET", path).expect_err("non-origin-form target was accepted");
+            assert!(
+                matches!(
+                    error,
+                    ClientError::InvalidRouteParameter("HTTP request target")
+                ),
+                "unexpected error for {path:?}: {error}"
             );
         }
     }

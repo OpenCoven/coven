@@ -1,5 +1,5 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -502,16 +502,16 @@ fn canonicalize_profile_binding(
     let reported = Path::new(&status.socket);
     let socket_identity = peer.map(|peer| (peer.socket_device, peer.socket_inode));
     let matches_selected = if reported.is_absolute() {
-        same_filesystem_object(endpoint.socket(), reported, socket_identity)
+        same_socket_binding(endpoint.socket(), reported, socket_identity)
     } else {
-        same_filesystem_object(endpoint.socket(), reported, socket_identity)
+        same_socket_binding(endpoint.socket(), reported, socket_identity)
             || endpoint
                 .socket()
                 .parent()
                 .into_iter()
                 .flat_map(Path::ancestors)
                 .any(|base| {
-                    same_filesystem_object(endpoint.socket(), &base.join(reported), socket_identity)
+                    same_socket_binding(endpoint.socket(), &base.join(reported), socket_identity)
                 })
     };
     if !matches_selected {
@@ -533,16 +533,28 @@ fn canonicalize_profile_binding(
     Ok(())
 }
 
-fn same_filesystem_object(
+fn canonicalize_socket_path(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let parent = path.parent()?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    // Darwin can resolve a hard-linked socket leaf to a stale staging name.
+    Some(std::fs::canonicalize(parent).ok()?.join(name))
+}
+
+fn same_socket_binding(
     selected: &Path,
     candidate: &Path,
     expected_identity: Option<(u64, u64)>,
 ) -> bool {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-    let (Ok(selected_path), Ok(candidate_path)) = (
-        std::fs::canonicalize(selected),
-        std::fs::canonicalize(candidate),
+    let (Some(selected_path), Some(candidate_path)) = (
+        canonicalize_socket_path(selected),
+        canonicalize_socket_path(candidate),
     ) else {
         return false;
     };
@@ -550,12 +562,14 @@ fn same_filesystem_object(
         return false;
     }
     let (Ok(selected), Ok(candidate)) = (
-        std::fs::metadata(selected_path),
-        std::fs::metadata(candidate_path),
+        std::fs::symlink_metadata(selected),
+        std::fs::symlink_metadata(candidate),
     ) else {
         return false;
     };
-    selected.dev() == candidate.dev()
+    selected.file_type().is_socket()
+        && candidate.file_type().is_socket()
+        && selected.dev() == candidate.dev()
         && selected.ino() == candidate.ino()
         && expected_identity
             .is_none_or(|(device, inode)| selected.dev() == device && selected.ino() == inode)
@@ -754,11 +768,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_tmp_spellings_have_the_same_canonical_filesystem_identity() {
-        assert!(super::same_filesystem_object(
-            std::path::Path::new("/private/tmp"),
-            std::path::Path::new("/tmp"),
-            None,
-        ));
+    fn macos_tmp_spellings_have_the_same_canonical_socket_path() {
+        let expected = Some(std::path::PathBuf::from("/private/tmp/coven.sock"));
+        assert_eq!(
+            super::canonicalize_socket_path(std::path::Path::new("/private/tmp/coven.sock")),
+            expected,
+        );
+        assert_eq!(
+            super::canonicalize_socket_path(std::path::Path::new("/tmp/coven.sock")),
+            expected,
+        );
     }
 }

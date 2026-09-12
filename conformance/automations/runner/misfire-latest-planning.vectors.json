@@ -1,0 +1,113 @@
+{
+  "schemaVersion": "coven.automations.misfire-latest-planning-vectors.v1",
+  "cases": [
+    {
+      "caseId": "restart-collapses-to-latest-due-slot",
+      "scenario": "restart_collapse_latest",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "restart-collapse",
+        "name": "Restart collapse",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the restart collapse probe.",
+        "tags": []
+      },
+      "createdAt": "2026-09-01T08:00:00.000Z",
+      "observedAt": "2026-09-04T12:00:00.000Z",
+      "expected": {
+        "firstOutcome": "planned",
+        "secondOutcome": "already_fenced",
+        "scheduledSlots": [
+          "2026-09-04T09:00:00.000Z"
+        ]
+      }
+    },
+    {
+      "caseId": "existing-latest-fence-replays-idempotently",
+      "scenario": "existing_fence_replay",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "existing-fence",
+        "name": "Existing fence",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the existing fence probe.",
+        "tags": []
+      },
+      "createdAt": "2026-09-01T08:00:00.000Z",
+      "observedAt": "2026-09-04T12:00:00.000Z",
+      "existingScheduledFor": "2026-09-04T09:00:00.000Z",
+      "expected": {
+        "firstOutcome": "already_fenced",
+        "secondOutcome": "already_fenced",
+        "scheduledSlots": [
+          "2026-09-04T09:00:00.000Z"
+        ]
+      }
+    },
+    {
+      "caseId": "clock-rollback-adds-no-older-fence",
+      "scenario": "clock_rollback_no_older_fence",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "clock-rollback",
+        "name": "Clock rollback",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the clock rollback probe.",
+        "tags": []
+      },
+      "createdAt": "2026-09-01T08:00:00.000Z",
+      "observedAt": "2026-09-03T12:00:00.000Z",
+      "existingScheduledFor": "2026-09-04T09:00:00.000Z",
+      "expected": {
+        "firstOutcome": "not_due",
+        "secondOutcome": "not_due",
+        "scheduledSlots": [
+          "2026-09-04T09:00:00.000Z"
+        ]
+      }
+    },
+    {
+      "caseId": "paused-definition-never-plans",
+      "scenario": "paused_definition",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "paused-definition",
+        "name": "Paused definition",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the paused definition probe.",
+        "tags": []
+      },
+      "createdAt": "2026-09-01T08:00:00.000Z",
+      "observedAt": "2026-09-04T12:00:00.000Z",
+      "expected": {
+        "firstOutcome": "not_due",
+        "secondOutcome": "not_due",
+        "scheduledSlots": []
+      }
+    }
+  ]
+}
