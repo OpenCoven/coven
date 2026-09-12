@@ -174,7 +174,10 @@ fn request_with_peer(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    if !(path.starts_with("/api/v1/") || (method == "GET" && path == "/health")) {
+    if !(path.starts_with("/api/v1/") || (method == "GET" && path == "/health"))
+        || !path.starts_with('/')
+        || path.starts_with("//")
+    {
         return Err(ClientError::InvalidHttpResponse(
             "attempted request outside /api/v1 or exact GET /health".to_owned(),
         ));
