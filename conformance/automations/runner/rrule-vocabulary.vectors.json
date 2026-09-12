@@ -1,0 +1,193 @@
+{
+  "schemaVersion": "coven.automations.rrule-vocabulary-vectors.v1",
+  "cases": [
+    {
+      "caseId": "daily-defaults",
+      "scenario": "daily_defaults",
+      "rrule": "FREQ=DAILY",
+      "expected": {
+        "outcome": "accepted",
+        "frequency": "daily",
+        "byHour": [9],
+        "byDay": []
+      }
+    },
+    {
+      "caseId": "daily-hour-normalization",
+      "scenario": "daily_hour_normalization",
+      "rrule": "freq=daily;byhour=17,9",
+      "expected": {
+        "outcome": "accepted",
+        "frequency": "daily",
+        "byHour": [9, 17],
+        "byDay": []
+      }
+    },
+    {
+      "caseId": "weekly-defaults",
+      "scenario": "weekly_defaults",
+      "rrule": "FREQ=WEEKLY",
+      "expected": {
+        "outcome": "accepted",
+        "frequency": "weekly",
+        "byHour": [9],
+        "byDay": ["MO"]
+      }
+    },
+    {
+      "caseId": "weekly-day-normalization",
+      "scenario": "weekly_day_normalization",
+      "rrule": "freq=weekly;byday=wed,MO,fr;byhour=8",
+      "expected": {
+        "outcome": "accepted",
+        "frequency": "weekly",
+        "byHour": [8],
+        "byDay": ["FR", "MO", "WE"]
+      }
+    },
+    {
+      "caseId": "unsupported-frequency",
+      "scenario": "unsupported_frequency",
+      "rrule": "FREQ=HOURLY",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "unsupported-key",
+      "scenario": "unsupported_key",
+      "rrule": "FREQ=DAILY;COUNT=3",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "daily-byday",
+      "scenario": "daily_by_day",
+      "rrule": "FREQ=DAILY;BYDAY=MO",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "duplicate-frequency",
+      "scenario": "duplicate_frequency",
+      "rrule": "FREQ=DAILY;FREQ=WEEKLY",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "duplicate-byhour",
+      "scenario": "duplicate_by_hour",
+      "rrule": "FREQ=DAILY;BYHOUR=9;BYHOUR=17",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "duplicate-byday",
+      "scenario": "duplicate_by_day",
+      "rrule": "FREQ=WEEKLY;BYDAY=MO;BYDAY=TU",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "out-of-range-hour",
+      "scenario": "out_of_range_hour",
+      "rrule": "FREQ=DAILY;BYHOUR=24",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "duplicate-hour",
+      "scenario": "duplicate_hour",
+      "rrule": "FREQ=DAILY;BYHOUR=9,9",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "duplicate-weekday",
+      "scenario": "duplicate_weekday",
+      "rrule": "FREQ=WEEKLY;BYDAY=MO,MO",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "duplicate-weekday-alias",
+      "scenario": "duplicate_weekday_alias",
+      "rrule": "FREQ=WEEKLY;BYDAY=MO,MON",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "empty-hour-entry",
+      "scenario": "empty_hour_entry",
+      "rrule": "FREQ=DAILY;BYHOUR=9,,17",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "empty-weekday-entry",
+      "scenario": "empty_weekday_entry",
+      "rrule": "FREQ=WEEKLY;BYDAY=MO,,TU",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "unknown-weekday",
+      "scenario": "unknown_weekday",
+      "rrule": "FREQ=WEEKLY;BYDAY=XX",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "missing-frequency",
+      "scenario": "missing_frequency",
+      "rrule": "BYHOUR=9",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "malformed-part",
+      "scenario": "malformed_part",
+      "rrule": "FREQ=DAILY;BYHOUR",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "trailing-separator",
+      "scenario": "trailing_separator",
+      "rrule": "FREQ=DAILY;",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "empty-segment",
+      "scenario": "empty_segment",
+      "rrule": "FREQ=DAILY;;BYHOUR=9",
+      "expected": {
+        "outcome": "rejected"
+      }
+    },
+    {
+      "caseId": "empty-value",
+      "scenario": "empty_value",
+      "rrule": "FREQ=",
+      "expected": {
+        "outcome": "rejected"
+      }
+    }
+  ]
+}

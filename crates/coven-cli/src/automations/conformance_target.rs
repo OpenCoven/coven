@@ -18,6 +18,7 @@ use super::contract::{
     canonicalize, canonicalize_without_integrity, sha256_hex, AutomationDefinition,
     AutomationReceipt, EventEnvelope,
 };
+use super::rrule::{parse_rrule, RruleFrequency};
 use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
 };
@@ -39,6 +40,8 @@ const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.receipt-integrity-validation-vectors.v1";
+const RRULE_VOCABULARY_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.rrule-vocabulary-vectors.v1";
 const RUN_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.run-terminal-monotonicity-vectors.v1";
 const STRUCTURAL_PROFILE: &str = "structural";
@@ -51,6 +54,7 @@ pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
+pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
 pub const RUN_TERMINAL_MONOTONICITY_SUITE: &str = "run-terminal-monotonicity";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -328,6 +332,100 @@ enum ExpectedReceiptIntegrity {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RruleVocabularyVectorSet {
+    schema_version: String,
+    cases: Vec<RruleVocabularyVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RruleVocabularyVectorCase {
+    case_id: String,
+    scenario: RruleVocabularyScenario,
+    rrule: String,
+    expected: ExpectedRruleVocabulary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RruleVocabularyScenario {
+    DailyDefaults,
+    DailyHourNormalization,
+    WeeklyDefaults,
+    WeeklyDayNormalization,
+    UnsupportedFrequency,
+    UnsupportedKey,
+    DailyByDay,
+    DuplicateFrequency,
+    DuplicateByHour,
+    DuplicateByDay,
+    OutOfRangeHour,
+    DuplicateHour,
+    DuplicateWeekday,
+    DuplicateWeekdayAlias,
+    EmptyHourEntry,
+    EmptyWeekdayEntry,
+    UnknownWeekday,
+    MissingFrequency,
+    MalformedPart,
+    TrailingSeparator,
+    EmptySegment,
+    EmptyValue,
+}
+
+impl RruleVocabularyScenario {
+    const COUNT: usize = 22;
+
+    const fn rule(self) -> &'static str {
+        match self {
+            Self::DailyDefaults => "FREQ=DAILY",
+            Self::DailyHourNormalization => "freq=daily;byhour=17,9",
+            Self::WeeklyDefaults => "FREQ=WEEKLY",
+            Self::WeeklyDayNormalization => "freq=weekly;byday=wed,MO,fr;byhour=8",
+            Self::UnsupportedFrequency => "FREQ=HOURLY",
+            Self::UnsupportedKey => "FREQ=DAILY;COUNT=3",
+            Self::DailyByDay => "FREQ=DAILY;BYDAY=MO",
+            Self::DuplicateFrequency => "FREQ=DAILY;FREQ=WEEKLY",
+            Self::DuplicateByHour => "FREQ=DAILY;BYHOUR=9;BYHOUR=17",
+            Self::DuplicateByDay => "FREQ=WEEKLY;BYDAY=MO;BYDAY=TU",
+            Self::OutOfRangeHour => "FREQ=DAILY;BYHOUR=24",
+            Self::DuplicateHour => "FREQ=DAILY;BYHOUR=9,9",
+            Self::DuplicateWeekday => "FREQ=WEEKLY;BYDAY=MO,MO",
+            Self::DuplicateWeekdayAlias => "FREQ=WEEKLY;BYDAY=MO,MON",
+            Self::EmptyHourEntry => "FREQ=DAILY;BYHOUR=9,,17",
+            Self::EmptyWeekdayEntry => "FREQ=WEEKLY;BYDAY=MO,,TU",
+            Self::UnknownWeekday => "FREQ=WEEKLY;BYDAY=XX",
+            Self::MissingFrequency => "BYHOUR=9",
+            Self::MalformedPart => "FREQ=DAILY;BYHOUR",
+            Self::TrailingSeparator => "FREQ=DAILY;",
+            Self::EmptySegment => "FREQ=DAILY;;BYHOUR=9",
+            Self::EmptyValue => "FREQ=",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedRruleFrequency {
+    Daily,
+    Weekly,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedRruleVocabulary {
+    Accepted {
+        frequency: ExpectedRruleFrequency,
+        #[serde(rename = "byHour")]
+        by_hour: Vec<u8>,
+        #[serde(rename = "byDay")]
+        by_day: Vec<String>,
+    },
+    Rejected,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RunTerminalVectorSet {
     schema_version: String,
     cases: Vec<RunTerminalVectorCase>,
@@ -384,6 +482,7 @@ pub fn capability() -> TargetCapability {
                 EVENT_REDUCER_DETERMINISM_SUITE,
                 OCCURRENCE_FENCE_UNIQUENESS_SUITE,
                 RECEIPT_INTEGRITY_VALIDATION_SUITE,
+                RRULE_VOCABULARY_SUITE,
                 RUN_TERMINAL_MONOTONICITY_SUITE,
             ],
         }],
@@ -416,6 +515,7 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         RECEIPT_INTEGRITY_VALIDATION_SUITE => {
             evaluate_receipt_integrity_validation(&request.vector)?
         }
+        RRULE_VOCABULARY_SUITE => evaluate_rrule_vocabulary(&request.vector)?,
         RUN_TERMINAL_MONOTONICITY_SUITE => evaluate_run_terminal_monotonicity(&request.vector)?,
         _ => return Err("conformance suite is unsupported"),
     };
@@ -1136,6 +1236,84 @@ fn receipt_integrity_case_matches(case: &ReceiptIntegrityVectorCase) -> bool {
                 .is_some_and(|observed| observed == *normalized_digest)
         }
         (ExpectedReceiptIntegrity::Rejected, Err(_)) => true,
+        _ => false,
+    }
+}
+
+fn evaluate_rrule_vocabulary(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: RruleVocabularyVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != RRULE_VOCABULARY_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != RruleVocabularyScenario::COUNT
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    let mut rules = BTreeSet::new();
+    for case in &vectors.cases {
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || case.rrule.is_empty()
+            || case.rrule.len() > 1024
+            || !rules.insert(&case.rrule)
+            || case.rrule != case.scenario.rule()
+            || !valid_rrule_expectation(&case.expected)
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+
+    Ok(vectors.cases.iter().all(rrule_vocabulary_case_matches))
+}
+
+fn valid_rrule_expectation(expected: &ExpectedRruleVocabulary) -> bool {
+    let ExpectedRruleVocabulary::Accepted {
+        frequency,
+        by_hour,
+        by_day,
+    } = expected
+    else {
+        return true;
+    };
+    let hours_valid = !by_hour.is_empty()
+        && by_hour.iter().all(|hour| *hour <= 23)
+        && by_hour.windows(2).all(|pair| pair[0] < pair[1]);
+    let days_valid = by_day
+        .iter()
+        .all(|day| matches!(day.as_str(), "FR" | "MO" | "SA" | "SU" | "TH" | "TU" | "WE"))
+        && by_day.windows(2).all(|pair| pair[0] < pair[1]);
+    hours_valid
+        && days_valid
+        && match frequency {
+            ExpectedRruleFrequency::Daily => by_day.is_empty(),
+            ExpectedRruleFrequency::Weekly => !by_day.is_empty(),
+        }
+}
+
+fn rrule_vocabulary_case_matches(case: &RruleVocabularyVectorCase) -> bool {
+    match (&case.expected, parse_rrule(&case.rrule)) {
+        (
+            ExpectedRruleVocabulary::Accepted {
+                frequency,
+                by_hour,
+                by_day,
+            },
+            Ok(parsed),
+        ) => {
+            let frequency_matches = matches!(
+                (frequency, parsed.frequency),
+                (ExpectedRruleFrequency::Daily, RruleFrequency::Daily)
+                    | (ExpectedRruleFrequency::Weekly, RruleFrequency::Weekly)
+            );
+            frequency_matches
+                && parsed.by_hour.as_slice() == by_hour.as_slice()
+                && parsed.by_day.as_slice() == by_day.as_slice()
+        }
+        (ExpectedRruleVocabulary::Rejected, Err(_)) => true,
         _ => false,
     }
 }
