@@ -54,6 +54,26 @@ pub(crate) fn run_ordinary_admission_hook() {
     }
 }
 
+fn install_ordinary_mutation(
+    phase: &str,
+    target: &str,
+    mutate: impl FnOnce() -> std::io::Result<()> + 'static,
+) -> std::rc::Rc<std::cell::Cell<Option<std::io::Result<()>>>> {
+    let result = std::rc::Rc::new(std::cell::Cell::new(None));
+    let observed = result.clone();
+    // Fixture I/O is asserted after the API releases its global authority lock.
+    let callback = move || observed.set(Some(mutate()));
+    match phase {
+        "admission" => ORDINARY_ADMISSION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(callback));
+        }),
+        "first-commit" => ward::set_direct_commit_hook("other.json", callback),
+        "second-commit" => ward::set_direct_commit_hook(target, callback),
+        _ => panic!("unknown ordinary mutation phase"),
+    }
+    result
+}
+
 #[cfg(unix)]
 #[test]
 fn ordinary_admission_broken_output_chain_keeps_structured_refusal() -> Result<()> {
@@ -220,6 +240,7 @@ fn ordinary_admission_changes_through_commit_refuse_whole_batch() -> Result<()> 
             "alias",
             "same-bytes-inode",
             "target-hardlink",
+            #[cfg(unix)]
             "parent",
             #[cfg(unix)]
             "parent-symlink",
@@ -241,72 +262,59 @@ fn ordinary_admission_changes_through_commit_refuse_whole_batch() -> Result<()> 
             #[cfg(not(unix))]
             let target = "ordinary/notes.json";
             let changed_workspace = workspace.clone();
-            let mutate = move || {
+            let mutation = install_ordinary_mutation(phase, target, move || {
                 let workspace = changed_workspace;
                 match change {
                     #[cfg(unix)]
                     "alias" => {
-                        std::fs::remove_file(workspace.join("alias.json")).unwrap();
-                        symlink("output-format.json", workspace.join("alias.json")).unwrap();
+                        std::fs::remove_file(workspace.join("alias.json"))?;
+                        symlink("output-format.json", workspace.join("alias.json"))?;
                     }
                     "same-bytes-inode" => {
                         std::fs::rename(
                             workspace.join("ordinary/notes.json"),
                             workspace.join("original.json"),
-                        )
-                        .unwrap();
-                        std::fs::write(workspace.join("ordinary/notes.json"), BEFORE).unwrap();
+                        )?;
+                        std::fs::write(workspace.join("ordinary/notes.json"), BEFORE)?;
                     }
                     "target-hardlink" => {
-                        std::fs::remove_file(workspace.join("ordinary/notes.json")).unwrap();
+                        std::fs::remove_file(workspace.join("ordinary/notes.json"))?;
                         std::fs::hard_link(
                             workspace.join("output-format.json"),
                             workspace.join("ordinary/notes.json"),
-                        )
-                        .unwrap();
+                        )?;
                     }
+                    #[cfg(unix)]
                     "parent" => {
-                        std::fs::rename(workspace.join("ordinary"), workspace.join("moved"))
-                            .unwrap();
-                        std::fs::create_dir(workspace.join("ordinary")).unwrap();
+                        std::fs::rename(workspace.join("ordinary"), workspace.join("moved"))?;
+                        std::fs::create_dir(workspace.join("ordinary"))?;
                         // Keep the leaf inode unchanged: the ancestor identity must matter.
                         std::fs::hard_link(
                             workspace.join("moved/notes.json"),
                             workspace.join("ordinary/notes.json"),
-                        )
-                        .unwrap();
+                        )?;
                     }
                     #[cfg(unix)]
                     "parent-symlink" => {
-                        std::fs::rename(workspace.join("ordinary"), workspace.join("moved"))
-                            .unwrap();
-                        symlink("moved", workspace.join("ordinary")).unwrap();
+                        std::fs::rename(workspace.join("ordinary"), workspace.join("moved"))?;
+                        symlink("moved", workspace.join("ordinary"))?;
                     }
                     #[cfg(unix)]
                     "canonical-symlink" => {
-                        std::fs::remove_file(workspace.join("output-format.json")).unwrap();
-                        symlink("ordinary/notes.json", workspace.join("output-format.json"))
-                            .unwrap();
+                        std::fs::remove_file(workspace.join("output-format.json"))?;
+                        symlink("ordinary/notes.json", workspace.join("output-format.json"))?;
                     }
                     "canonical-hardlink" => {
-                        std::fs::remove_file(workspace.join("output-format.json")).unwrap();
+                        std::fs::remove_file(workspace.join("output-format.json"))?;
                         std::fs::hard_link(
                             workspace.join("ordinary/notes.json"),
                             workspace.join("output-format.json"),
-                        )
-                        .unwrap();
+                        )?;
                     }
                     _ => unreachable!(),
                 }
-            };
-            match phase {
-                "admission" => ORDINARY_ADMISSION_HOOK.with(|hook| {
-                    *hook.borrow_mut() = Some(Box::new(mutate));
-                }),
-                "first-commit" => ward::set_direct_commit_hook("other.json", mutate),
-                "second-commit" => ward::set_direct_commit_hook(target, mutate),
-                _ => unreachable!(),
-            }
+                Ok(())
+            });
             let response = post_edits(
                 home,
                 &json!({"edits":[
@@ -314,7 +322,12 @@ fn ordinary_admission_changes_through_commit_refuse_whole_batch() -> Result<()> 
                     {"target":target,"contents":AFTER}
                 ]})
                 .to_string(),
-            )?;
+            );
+            mutation
+                .take()
+                .with_context(|| format!("{phase}/{change}: mutation was not attempted"))?
+                .with_context(|| format!("{phase}/{change}: fixture mutation failed"))?;
+            let response = response?;
             assert_eq!(
                 std::fs::read_to_string(workspace.join("output-format.json"))?,
                 BEFORE,
@@ -344,6 +357,103 @@ fn ordinary_admission_changes_through_commit_refuse_whole_batch() -> Result<()> 
                 response.body
             );
         }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn ordinary_admission_retained_windows_parent_blocks_mutation_until_released() -> Result<()> {
+    for phase in ["admission", "first-commit", "second-commit"] {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_supported_output_auto(home)?;
+        std::fs::create_dir(workspace.join("ordinary"))?;
+        std::fs::write(workspace.join("ordinary/notes.json"), BEFORE)?;
+        std::fs::write(workspace.join("other.json"), "ordinary before")?;
+        let changed_workspace = workspace.clone();
+        let mutation = install_ordinary_mutation(phase, "ordinary/notes.json", move || {
+            std::fs::rename(
+                changed_workspace.join("ordinary"),
+                changed_workspace.join("moved"),
+            )
+        });
+        let response = post_edits(
+            home,
+            &json!({"edits":[
+                {"target":"other.json","contents":"ordinary after"},
+                {"target":"ordinary/notes.json","contents":AFTER}
+            ]})
+            .to_string(),
+        );
+        let error = mutation
+            .take()
+            .context("parent mutation was not attempted")?
+            .expect_err("retained Windows directory must deny rename");
+        assert_eq!(error.raw_os_error(), Some(32), "{phase}: {error}");
+        assert!(!workspace.join("moved").exists());
+        let response = response?;
+        // A blocked adversarial mutation did not change authority: this is a
+        // legitimate ordinary commit, not detection of a successful retarget.
+        assert_eq!(response.status, 200, "{phase}: {}", response.body);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("output-format.json"))?,
+            BEFORE
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("ordinary/notes.json"))?,
+            AFTER
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("other.json"))?,
+            "ordinary after"
+        );
+        assert!(!home.join("pending").exists());
+        std::fs::rename(workspace.join("ordinary"), workspace.join("moved"))
+            .with_context(|| format!("{phase}: API retained a parent handle after return"))?;
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("moved/notes.json"))?,
+            AFTER
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_admission_fixture_io_failure_does_not_poison_authority_lock() -> Result<()> {
+    for phase in ["admission", "first-commit", "second-commit"] {
+        let temp = tempfile::tempdir()?;
+        let workspace = seed_supported_output_auto(temp.path())?;
+        std::fs::write(workspace.join("other.json"), "ordinary before")?;
+        std::fs::write(workspace.join("notes.json"), BEFORE)?;
+        let changed_workspace = workspace.clone();
+        let mutation = install_ordinary_mutation(phase, "notes.json", move || {
+            std::fs::rename(
+                changed_workspace.join("absent-parent"),
+                changed_workspace.join("moved"),
+            )
+        });
+        let body = json!({"edits":[
+            {"target":"other.json","contents":"ordinary after"},
+            {"target":"notes.json","contents":AFTER}
+        ]})
+        .to_string();
+        let response = post_edits(temp.path(), &body);
+        let error = mutation
+            .take()
+            .context("mutation was not attempted")?
+            .expect_err("absent fixture parent cannot be renamed");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "{phase}: {error}"
+        );
+        assert_eq!(response?.status, 200);
+        assert_eq!(post_edits(temp.path(), &body)?.status, 200);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("output-format.json"))?,
+            BEFORE
+        );
     }
     Ok(())
 }

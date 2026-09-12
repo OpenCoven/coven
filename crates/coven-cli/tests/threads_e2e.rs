@@ -1129,6 +1129,38 @@ fn foreground_daemon_lifecycle_retains_owned_replacements_and_evidence() -> Resu
 }
 
 #[test]
+fn request_observation_precedes_owned_child_cleanup() -> Result<()> {
+    let mut evidence = EvidenceContext::new("request-observation-before-cleanup");
+    evidence.foreground_daemon = true;
+    let mut fixture = ThreadsFixture::start(&evidence)?;
+    let journey = (|| {
+        for fail in [false, true] {
+            let response =
+                fixture.request("GET", if fail { "/invalid\npath" } else { "/health" }, None);
+            anyhow::ensure!(response.is_err() == fail);
+            fixture.write_run_provenance(None)?;
+            let manifest: Value =
+                serde_json::from_slice(&fs::read(fixture.artifact_dir.join("manifest.json"))?)?;
+            let observation = &manifest["last_rpc_observation"];
+            anyhow::ensure!(
+                observation["elapsed_us"].is_u64(),
+                "missing measured client elapsed time: {observation}"
+            );
+            anyhow::ensure!(observation["failed"] == fail);
+            anyhow::ensure!(observation["owned_child"]["state"] == "running");
+            anyhow::ensure!(observation["status_present"] == true);
+            anyhow::ensure!(observation["owned_child"]["exit_code"].is_null());
+            anyhow::ensure!(
+                observation.as_object().context("observation")?.len() == 5,
+                "request observation must contain only the fixed numeric/status fields"
+            );
+        }
+        Ok(())
+    })();
+    finalize_journey(&mut fixture, journey)
+}
+
+#[test]
 fn foreground_daemon_startup_failure_retains_exit_and_output() -> Result<()> {
     let artifacts = tempfile::tempdir()?;
     let mut evidence = EvidenceContext::new("foreground-startup-failure");
@@ -2092,6 +2124,7 @@ struct ThreadsFixture {
     local_threads_override_active: bool,
     last_request: Option<Value>,
     last_response: Option<Value>,
+    last_rpc_observation: Option<Value>,
     daemon_events: Vec<DaemonLifecycleEvent>,
     daemon_pid: Option<u32>,
     stopped: bool,
@@ -2173,6 +2206,7 @@ impl ThreadsFixture {
             local_threads_override_active,
             last_request: None,
             last_response: None,
+            last_rpc_observation: None,
             daemon_events: Vec::new(),
             daemon_pid: None,
             stopped: true,
@@ -2218,7 +2252,30 @@ impl ThreadsFixture {
             "body": request,
         }));
         self.last_response = None;
-        let (status, response) = daemon_http_request(&self.coven_home, method, path, body)?;
+        let started = Instant::now();
+        let result = daemon_http_request(&self.coven_home, method, path, body);
+        let elapsed_us = started.elapsed().as_micros();
+        let owned_child = match self.owned_daemon.as_mut().map(|child| child.observe_exit()) {
+            Some(Ok(None)) => json!({"state": "running", "exit_code": null}),
+            Some(Ok(Some(status))) => json!({"state": "exited", "exit_code": status.code()}),
+            Some(Err(error)) => json!({"state": "probe-error", "os_error": error.raw_os_error()}),
+            None => json!({"state": "unowned", "exit_code": null}),
+        };
+        // Capture before propagating a client error or invoking any cleanup.
+        // Do not issue another RPC or copy endpoint/path fields into diagnostics.
+        let status_present = match fs::symlink_metadata(self.coven_home.join("daemon.json")) {
+            Ok(metadata) => json!(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!(false),
+            Err(error) => json!({"state": "probe-error", "os_error": error.raw_os_error()}),
+        };
+        self.last_rpc_observation = Some(json!({
+            "elapsed_us": elapsed_us,
+            "failed": result.is_err(),
+            "http_status": result.as_ref().ok().map(|(status, _)| *status),
+            "owned_child": owned_child,
+            "status_present": status_present,
+        }));
+        let (status, response) = result?;
         let parsed: Value = serde_json::from_str(&response)
             .with_context(|| format!("daemon returned non-JSON response: {response}"))?;
         self.last_response = Some(json!({
@@ -2564,6 +2621,7 @@ impl ThreadsFixture {
             "local_threads_override_active": self.local_threads_override_active,
             "authorization_limitation": "synthetic principal fingerprint uses the strongest current daemon-owned Ward path; signed principal proof is not yet available",
             "daemon_lifecycle": self.daemon_events.iter().map(DaemonLifecycleEvent::as_json).collect::<Vec<_>>(),
+            "last_rpc_observation": self.last_rpc_observation,
             "failure": error.map(|error| self.sanitize_fixture_text(&format!("{error:#}"))),
         });
         fs::write(

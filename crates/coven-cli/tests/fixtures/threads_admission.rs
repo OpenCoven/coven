@@ -127,13 +127,17 @@ impl OwnedDaemon {
     }
 
     fn ensure_running(&mut self) -> Result<()> {
-        if self.exit.status.is_none() {
-            self.exit.status = self.child.try_wait()?;
-        }
-        if let Some(status) = self.exit.status {
+        if let Some(status) = self.observe_exit()? {
             anyhow::bail!("fixture daemon exited before readiness: {status}");
         }
         Ok(())
+    }
+
+    pub fn observe_exit(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.exit.status.is_none() {
+            self.exit.status = self.child.try_wait()?;
+        }
+        Ok(self.exit.status)
     }
 
     pub fn mark_ready(&mut self) -> Result<()> {

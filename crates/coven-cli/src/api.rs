@@ -5817,8 +5817,10 @@ fn apply_familiar_edits(
     familiar_id: &str,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
+    use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
     use crate::ward;
 
+    checkpoint(Phase::Intake);
     if familiar_id.is_empty() || familiar_id.contains('/') {
         return api_error(
             400,
@@ -5916,9 +5918,11 @@ fn apply_familiar_edits(
     };
 
     maybe_probe_direct_apply_lock(coven_home, familiar_id);
+    checkpoint(Phase::LockWait);
     let _direct_apply_guard = ward_write_audit_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("Ward write/audit lock is poisoned"))?;
+    checkpoint(Phase::LockAcquired);
     let workspace = crate::cockpit_sources::familiar_workspace(coven_home, familiar_id);
     let config = match ward::WardConfig::load(&workspace) {
         Ok(Some(config)) => config,
@@ -6071,7 +6075,10 @@ fn apply_familiar_edits(
         );
     }
     let store_path = store_path(coven_home);
+    checkpoint(Phase::StoreOpen);
     let conn = store::open_store(&store_path)?;
+    checkpoint(Phase::StoreReady);
+    checkpoint(Phase::ReservationBegin);
     let reservation_bytes = direct_ward_audit_reservation_bytes(
         &conn,
         body.map(str::len).unwrap_or_default(),
@@ -6092,6 +6099,7 @@ fn apply_familiar_edits(
         }
         Err(error) => return Err(error),
     };
+    checkpoint(Phase::ReservationReady);
     let gate_report = match crate::threads_gate::gate_protected_edits(
         audit_reservation.connection(),
         &crate::threads_gate::GateRequest {
@@ -6122,6 +6130,7 @@ fn apply_familiar_edits(
             );
         }
     };
+    checkpoint(Phase::GateReady);
     match &gate_report.outcome {
         crate::threads_gate::GateOutcome::Rejected => {
             audit_reservation.finish()?;
@@ -6210,7 +6219,9 @@ fn apply_familiar_edits(
             }
             Err(error) => return Err(error),
         };
+        checkpoint(Phase::FinalizeBegin);
         audit_reservation.finish()?;
+        checkpoint(Phase::FinalizeReady);
         return json_response(
             202,
             &json!({

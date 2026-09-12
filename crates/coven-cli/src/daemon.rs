@@ -5460,6 +5460,7 @@ where
     R: Read,
     W: Write,
 {
+    use crate::threads_clock::request_diagnostics::{self, Phase};
     let HttpStreamPolicy {
         host_guard: guard,
         lifecycle,
@@ -5536,7 +5537,9 @@ where
         write_payload_too_large(&mut write, MAX_LIFECYCLE_REQUEST_BODY_BYTES)?;
         return Ok(HttpStreamOutcome::Complete);
     }
+    let _request_trace = request_diagnostics::begin(coven_home, method, path);
     let body = read_http_body(&mut reader, headers.content_length)?;
+    request_diagnostics::checkpoint(Phase::BodyRead);
     let lifecycle_response = if lifecycle == LifecycleControl::OwnerLocal
         && method == "POST"
         && path == "/api/v1/internal/lifecycle/shutdown"
@@ -5583,7 +5586,10 @@ where
         };
         (response, false)
     };
+    request_diagnostics::checkpoint(Phase::HandlerReturned);
+    request_diagnostics::checkpoint(Phase::ResponseBegin);
     write_api_response(&mut write, &response)?;
+    request_diagnostics::checkpoint(Phase::ResponseReady);
     if hold_for_shutdown {
         Ok(HttpStreamOutcome::HoldForShutdown)
     } else {

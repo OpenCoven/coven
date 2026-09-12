@@ -11,6 +11,9 @@ use anyhow::Context;
 use anyhow::Result;
 use time::OffsetDateTime;
 
+#[path = "threads_request_diagnostics.rs"]
+pub(crate) mod request_diagnostics;
+
 #[cfg(feature = "threads-test-clock")]
 const FIXTURE_ROOT_DIRECTORY: &str = "test-fixtures";
 #[cfg(feature = "threads-test-clock")]

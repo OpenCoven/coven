@@ -171,6 +171,33 @@ they do not use wall-clock sleeps as authority evidence. Requests are never
 retried automatically; a response timeout does not prove a mutation did not
 commit.
 
+### Fixture request timing
+
+With `threads-test-clock` and an active private clock fixture, familiar-edit
+POSTs emit `threads_request_checkpoint` records to the existing bounded daemon
+recovery log. The records contain only a process-local numeric request counter,
+an allowlisted phase name, `elapsed_us`, and `prior_observer_us`. They separate
+body receipt, authority-lock wait, store opening, reservation, gate/identity
+work, probes, exact-body submission binding, pending publication, submission
+receipt, reservation finalization, handler return, and response writing.
+`finalize-ready` precedes response serialization and scope cleanup;
+`handler-returned` follows them, including connection disposal. These are
+diagnostic boundaries, not new durability acknowledgements.
+
+As with startup checkpoints, prior observer time includes activation checking
+and completed prior log append attempts, not pure disk time. A visible line
+does not prove its own append returned. Missing later phases can mean work is
+still running, logging failed, or the process was terminated; they do not alone
+prove a crash or identify a latency cause.
+
+The native fixture's `last_rpc_observation` captures client elapsed time
+(including discovery), client failure/HTTP status, owned-child nonblocking exit
+observation, and status-file presence immediately after the request and before
+cleanup. It contains no request body, capability, endpoint, or private path.
+Post-cleanup child exit evidence is separate and must not be interpreted as an
+exit during the failed request. Neither diagnostic changes the five-second
+Windows RPC budget, lifecycle/readiness deadlines, or request retry policy.
+
 The shared `admission_rejects_unowned_or_invalid_health_without_retry` regression
 subsumes the foreground process/endpoint/health matching cases and additionally
 rejects an incorrect authenticated Windows server PID and malformed JSON.

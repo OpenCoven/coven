@@ -1416,8 +1416,11 @@ fn stage_scheduled_coherence_proposal(
     now: time::OffsetDateTime,
     probe_context: StagingProbeContext<'_>,
 ) -> Result<StagedCoherenceProposal> {
+    use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
     let mut budget = ward::validate_file_edit_budget(edits)?;
+    checkpoint(Phase::IdentityBegin);
     let identity_evidence = staging_identity_evidence(coven_home, edits, &probe_context)?;
+    checkpoint(Phase::IdentityReady);
     let diff = materialize_diff(probe_context.workspace, edits, &mut budget)?;
     if diff.surfaces().iter().any(|surface| {
         ward::portable_surface_key(surface.surface.as_str())
@@ -1498,6 +1501,7 @@ fn stage_scheduled_coherence_proposal(
                     reason: error.to_string(),
                 })
             })?;
+    checkpoint(Phase::ProbesBegin);
     let (auto_regression_evidence, probes) = if matches!(
         scheduled.classification().approval_path,
         threads::ApprovalPath::AutoRegression { .. }
@@ -1534,6 +1538,7 @@ fn stage_scheduled_coherence_proposal(
         )
     };
 
+    checkpoint(Phase::ProbesReady);
     let pending_dir = coven_home.join("pending");
     std::fs::create_dir_all(&pending_dir)
         .with_context(|| format!("creating {}", pending_dir.display()))?;
@@ -1567,12 +1572,17 @@ fn stage_scheduled_coherence_proposal(
         submission.weave_hash,
         &body,
     )?;
+    checkpoint(Phase::SubmissionBindingBegin);
     submission
         .audit_reservation
         .replace_purpose(&recovery.purpose()?)?;
     submission.audit_reservation.preserve_if_unfinished();
+    checkpoint(Phase::SubmissionBindingReady);
+    checkpoint(Phase::StageBegin);
     crate::proposal_store::publish_new(coven_home, &path, &body)?;
+    checkpoint(Phase::StageReady);
     maybe_fail_scheduled_submission_after_publish(coven_home)?;
+    checkpoint(Phase::ReceiptBegin);
     append_scheduled_submission_audit(
         submission.audit_reservation.connection(),
         &scheduled,
@@ -1581,6 +1591,7 @@ fn stage_scheduled_coherence_proposal(
         submission.familiar_id,
         submission.weave_hash,
     )?;
+    checkpoint(Phase::ReceiptReady);
     Ok(StagedCoherenceProposal {
         pending_path: path,
         proposal_id: scheduled.pending().id.0.to_string(),

@@ -108,6 +108,43 @@ fn submit_output_auto(fixture: &mut ThreadsFixture) -> Result<Value> {
 }
 
 #[test]
+fn output_auto_submission_records_bounded_request_phases() -> Result<()> {
+    run_clocked_journey(
+        "output-auto-request-phases",
+        |home, workspace| seed_output_auto(home, workspace, false),
+        |fixture, _| {
+            submit_output_auto(fixture)?;
+            let log = fs::read_to_string(fixture.coven_home.join("daemon-recovery.log"))?;
+            let records: Vec<_> = log.lines()
+                .filter_map(|line| line.split_once("threads_request_checkpoint ").map(|(_, line)| line))
+                .collect();
+            let mut phases = Vec::new();
+            for record in records {
+                let fields: Vec<_> = record.split_whitespace().collect();
+                anyhow::ensure!(fields.len() == 4, "unexpected diagnostic fields: {record}");
+                for (field, prefix) in [(fields[0], "request="), (fields[2], "elapsed_us="), (fields[3], "prior_observer_us=")] {
+                    field.strip_prefix(prefix).context("numeric diagnostic field")?.parse::<u128>()?;
+                }
+                phases.push(fields[1].strip_prefix("phase=").context("diagnostic phase")?);
+            }
+            for phase in [
+                "request-begin", "body-read", "intake", "lock-wait", "lock-acquired",
+                "store-open", "store-ready", "reservation-begin", "reservation-ready",
+                "gate-ready", "identity-begin", "identity-ready", "probes-begin",
+                "probes-ready", "submission-binding-begin", "submission-binding-ready",
+                "stage-begin", "stage-ready", "receipt-begin", "receipt-ready",
+                "finalize-begin", "finalize-ready", "handler-returned", "response-begin",
+            ] {
+                anyhow::ensure!(phases.first() == Some(&phase), "missing/out-of-order {phase}: {phases:?}");
+                phases.remove(0);
+            }
+            anyhow::ensure!(phases.iter().all(|phase| ["response-ready", "request-end"].contains(phase)));
+            Ok(())
+        },
+    )
+}
+
+#[test]
 fn output_auto_veto_survives_restart_and_applies_once() -> Result<()> {
     run_clocked_journey(
         "output-auto-veto",
