@@ -366,6 +366,7 @@ fn maybe_pause_direct_apply_before_audit(_coven_home: &Path, _familiar_id: &str)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalDecisionFailpoint {
     ClaimBeforeValidation,
+    ApplyIntentBeforeWrite,
     ApplyBeforeAudit,
     AuditBeforeCleanup,
 }
@@ -11318,7 +11319,7 @@ fn decide_threads_proposal_inner(
         &conn,
         proposal_id,
         &familiar_id,
-        &pending.writer,
+        decision_approver,
         &targets,
         &applying,
         pending.channel,
@@ -11336,6 +11337,10 @@ fn decide_threads_proposal_inner(
         return Err(error);
     }
     claim.preserve();
+    maybe_fail_proposal_decision(
+        ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+        proposal_id,
+    )?;
     match ward_config_is_unchanged(&workspace, &config) {
         Ok(true) => {}
         Ok(false) => {
@@ -12800,7 +12805,7 @@ fn append_proposal_apply_intent(
     conn: &rusqlite::Connection,
     proposal_id: &str,
     familiar_id: &str,
-    approver: &coven_threads_core::WriterId,
+    approver: Option<&coven_threads_core::WriterId>,
     files_touched: &[String],
     state: &ProposalApplyingState,
     channel: coven_threads_core::Channel,
@@ -12822,7 +12827,7 @@ fn append_proposal_apply_intent(
             proposal_id,
             familiar_id,
             state.weave_hash,
-            approver.as_str(),
+            approver.map(coven_threads_core::WriterId::as_str),
             detail,
             files_touched,
             format!("{channel:?}").to_lowercase(),
@@ -37501,13 +37506,18 @@ tier = 0
             std::fs::read_to_string(workspace.join("HEARTBEAT.md"))?,
             "after heartbeat\n"
         );
-        let approver: Option<String> = conn.query_row(
-            "SELECT approver FROM ward_audit
-             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+        let attributed_decisions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND decision IN ('proposal-apply-intent', 'approved')
+               AND approver IS NOT NULL",
             [proposal_id],
             |row| row.get(0),
         )?;
-        assert_eq!(approver, None, "automatic apply has no human approver");
+        assert_eq!(
+            attributed_decisions, 0,
+            "automatic apply has no human approver"
+        );
         assert!(!pending_path.exists(), "replayed proposal must be consumed");
         Ok(())
     }
@@ -37657,6 +37667,85 @@ tier = 0
             "before tools\n"
         );
         assert!(pending.exists(), "rolled-back proposal remains retryable");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_recovery_rolls_back_concurrent_approval_policy_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        retime_scheduled_proposal(
+            &pending,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+        )?;
+        let decision_body = scheduled_decision_body(home, proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+            proposal_id.to_string(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let claim = find_pending_decision_claim(home, proposal_id, "approve")
+            .context("interrupted apply leaves a durable claim")?;
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+
+        let ward_path = workspace.join("ward.toml");
+        let ward = std::fs::read_to_string(&ward_path)?
+            .replace(
+                "[approval_tiers.familiar_review]",
+                "[approval_tiers.human_review]",
+            )
+            .replace(
+                "gate = \"familiar_coherence_check\"",
+                "gate = \"human_approval\"",
+            );
+        let strengthened = ward
+            .lines()
+            .filter(|line| {
+                !line.starts_with("human_veto_window_hours")
+                    && !line.starts_with("min_visible_seconds")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let canonical_workspace = workspace.canonicalize()?;
+        ward::set_conditional_atomic_replacement(
+            canonical_workspace.join("TOOLS.md"),
+            canonical_workspace.join("ward.toml"),
+            format!("{strengthened}\n").into_bytes(),
+        );
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        assert!(!claim.exists(), "rolled-back recovery claim is released");
+        assert!(pending.exists(), "rolled-back proposal remains pending");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        assert!(proposal_terminal_event(&conn, proposal_id)?.is_none());
         Ok(())
     }
 

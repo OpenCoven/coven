@@ -1788,14 +1788,8 @@ impl Ward {
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let anchored_home = AnchoredHome::open(&self.home)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
-        let ward_config = if mode == ApprovedApplyMode::Initial {
-            Some(
-                open_expected_ward_config(&anchored_home, &self.config)
-                    .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?,
-            )
-        } else {
-            None
-        };
+        let ward_config = open_expected_ward_config(&anchored_home, &self.config)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let proposal = Proposal {
             targets: edits.iter().map(|edit| edit.target.clone()).collect(),
             authorization: authorization.clone(),
@@ -1832,7 +1826,7 @@ impl Ward {
             outcome.decisions,
             expected_before,
             mode,
-            ward_config.as_ref(),
+            Some(&ward_config),
         )?;
         Ok(ApplyReport { changes })
     }
