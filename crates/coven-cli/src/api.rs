@@ -32861,118 +32861,119 @@ tier = 0
 
     #[test]
     fn threads_scheduler_closes_rejected_window_when_replay_is_unavailable() -> Result<()> {
-        for failure in [
-            "protected-promotion",
-            #[cfg(unix)]
-            "blocked-symlink",
-        ] {
-            let temp = tempfile::tempdir()?;
-            #[cfg(unix)]
-            let outside = tempfile::tempdir()?;
-            let home = temp.path();
-            let now = crate::threads_clock::now(home)?;
-            let (pending, proposal_id) = stage_scheduled_reviewed_edit(
-                home,
-                coven_threads_core::ApprovalPath::FamiliarCoherence {
-                    veto: coven_threads_core::VetoWindow::new(
-                        std::time::Duration::from_secs(300),
-                        std::time::Duration::from_secs(60),
-                    ),
-                },
-                now - time::Duration::minutes(10),
-            )?;
-            let document = read_pending_proposal_document(&pending)?;
-            ensure_proposal_window_opened_audit(
-                home,
-                document.scheduled().context("scheduled fixture")?,
-                now,
-            )?;
-            let workspace = home.join("familiars/sage");
-            let original = match failure {
-                "protected-promotion" => {
-                    let ward_path = workspace.join("ward.toml");
-                    let config = std::fs::read_to_string(&ward_path)?
-                        .replace(
-                            "protected_surface = [\"SOUL.md\"]",
-                            "protected_surface = [\"SOUL.md\", \"reviewed/skill.md\"]",
-                        )
-                        .replace(
-                            "path = \"reviewed/\"\ntier = 1",
-                            "path = \"reviewed/skill.md\"\ntier = 0",
-                        );
-                    std::fs::write(&ward_path, config)?;
-                    workspace.join("reviewed/skill.md")
-                }
-                #[cfg(unix)]
-                "blocked-symlink" => {
-                    std::fs::rename(
-                        workspace.join("reviewed"),
-                        workspace.join("reviewed-before"),
-                    )?;
-                    std::os::unix::fs::symlink(outside.path(), workspace.join("reviewed"))?;
-                    workspace.join("reviewed-before/skill.md")
-                }
-                _ => unreachable!(),
-            };
-            let config = ward::WardConfig::load(&workspace)?.context("valid changed Ward")?;
-            let ward = ward::Ward::new(&workspace, config)?;
-            let adjudication = ward.evaluate(&ward::Proposal {
-                targets: vec!["reviewed/skill.md".to_string()],
-                authorization: authorization_from_writer(&document.pending().writer),
-            });
-            match failure {
-                "protected-promotion" => {
-                    assert!(!protected_proposal_targets(&adjudication, &ward)?.is_empty());
-                }
-                #[cfg(unix)]
-                "blocked-symlink" => {
-                    assert!(adjudication.is_blocked());
-                    assert!(protected_proposal_targets(&adjudication, &ward)?.is_empty());
-                }
-                _ => unreachable!(),
-            }
-            std::fs::remove_file(workspace.join("SOUL.md"))?;
-            std::fs::create_dir(workspace.join("SOUL.md"))?;
+        assert_rejected_window_with_unavailable_replay("protected-promotion")?;
+        #[cfg(unix)]
+        assert_rejected_window_with_unavailable_replay("blocked-symlink")?;
+        Ok(())
+    }
 
-            assert_eq!(
-                process_due_threads_proposals(home)?,
-                1,
-                "{failure}: {}",
-                std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(home))
-                    .unwrap_or_default()
-            );
-            assert!(!pending.exists(), "{failure}");
-            assert_eq!(process_due_threads_proposals(home)?, 0, "{failure}");
-            assert_eq!(std::fs::read_to_string(original)?, "before", "{failure}");
-            let conn = store::open_store(&home.join("coven.sqlite3"))?;
-            let detail: String = conn.query_row(
-                "SELECT detail FROM ward_audit WHERE proposal_id = ?1
-                 AND event_type = 'proposal_rejected'",
-                [&proposal_id],
-                |row| row.get(0),
-            )?;
-            let close: coven_threads_core::ProposalWindowCloseAuditDetail =
-                serde_json::from_str(&detail)?;
-            assert_eq!(
-                close.reason,
-                coven_threads_core::WindowCloseReason::RevalidationFailed,
-                "{failure}"
-            );
-            assert_eq!(close.replay_hash_matched, Some(false), "{failure}");
-            let terminal_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
-                 AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
-                [&proposal_id],
-                |row| row.get(0),
-            )?;
-            assert_eq!(terminal_count, 1, "{failure}");
-            let reservations: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM coven_ward_audit_reservations",
-                [],
-                |row| row.get(0),
-            )?;
-            assert_eq!(reservations, 0, "{failure}");
+    fn assert_rejected_window_with_unavailable_replay(failure: &str) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        #[cfg(unix)]
+        let outside = tempfile::tempdir()?;
+        let home = temp.path();
+        let now = crate::threads_clock::now(home)?;
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence {
+                veto: coven_threads_core::VetoWindow::new(
+                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(60),
+                ),
+            },
+            now - time::Duration::minutes(10),
+        )?;
+        let document = read_pending_proposal_document(&pending)?;
+        ensure_proposal_window_opened_audit(
+            home,
+            document.scheduled().context("scheduled fixture")?,
+            now,
+        )?;
+        let workspace = home.join("familiars/sage");
+        let original = match failure {
+            "protected-promotion" => {
+                let ward_path = workspace.join("ward.toml");
+                let config = std::fs::read_to_string(&ward_path)?
+                    .replace(
+                        "protected_surface = [\"SOUL.md\"]",
+                        "protected_surface = [\"SOUL.md\", \"reviewed/skill.md\"]",
+                    )
+                    .replace(
+                        "path = \"reviewed/\"\ntier = 1",
+                        "path = \"reviewed/skill.md\"\ntier = 0",
+                    );
+                std::fs::write(&ward_path, config)?;
+                workspace.join("reviewed/skill.md")
+            }
+            #[cfg(unix)]
+            "blocked-symlink" => {
+                std::fs::rename(
+                    workspace.join("reviewed"),
+                    workspace.join("reviewed-before"),
+                )?;
+                std::os::unix::fs::symlink(outside.path(), workspace.join("reviewed"))?;
+                workspace.join("reviewed-before/skill.md")
+            }
+            _ => unreachable!(),
+        };
+        let config = ward::WardConfig::load(&workspace)?.context("valid changed Ward")?;
+        let ward = ward::Ward::new(&workspace, config)?;
+        let adjudication = ward.evaluate(&ward::Proposal {
+            targets: vec!["reviewed/skill.md".to_string()],
+            authorization: authorization_from_writer(&document.pending().writer),
+        });
+        match failure {
+            "protected-promotion" => {
+                assert!(!protected_proposal_targets(&adjudication, &ward)?.is_empty());
+            }
+            #[cfg(unix)]
+            "blocked-symlink" => {
+                assert!(adjudication.is_blocked());
+                assert!(protected_proposal_targets(&adjudication, &ward)?.is_empty());
+            }
+            _ => unreachable!(),
         }
+        std::fs::remove_file(workspace.join("SOUL.md"))?;
+        std::fs::create_dir(workspace.join("SOUL.md"))?;
+
+        assert_eq!(
+            process_due_threads_proposals(home)?,
+            1,
+            "{failure}: {}",
+            std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(home))
+                .unwrap_or_default()
+        );
+        assert!(!pending.exists(), "{failure}");
+        assert_eq!(process_due_threads_proposals(home)?, 0, "{failure}");
+        assert_eq!(std::fs::read_to_string(original)?, "before", "{failure}");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let detail: String = conn.query_row(
+            "SELECT detail FROM ward_audit WHERE proposal_id = ?1
+                 AND event_type = 'proposal_rejected'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        let close: coven_threads_core::ProposalWindowCloseAuditDetail =
+            serde_json::from_str(&detail)?;
+        assert_eq!(
+            close.reason,
+            coven_threads_core::WindowCloseReason::RevalidationFailed,
+            "{failure}"
+        );
+        assert_eq!(close.replay_hash_matched, Some(false), "{failure}");
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
+                 AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_count, 1, "{failure}");
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0, "{failure}");
         Ok(())
     }
 
