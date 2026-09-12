@@ -10139,7 +10139,7 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
-        let state = crate::threads_gate::build_weave_state_for_writer_at(
+        let state_result = crate::threads_gate::build_weave_state_for_writer_at(
             &conn,
             &familiar_id,
             &workspace,
@@ -10148,6 +10148,12 @@ fn decide_threads_proposal_inner(
             false,
             decision_now,
             Some(&pending.writer),
+        );
+        let weave_hash = revalidation_failure_weave_hash(
+            coven_home,
+            proposal_id,
+            state_result,
+            opened_window.as_ref(),
         )?;
         let approval_path_label = scheduled
             .map(|proposal| {
@@ -10179,7 +10185,7 @@ fn decide_threads_proposal_inner(
                 event_type: coven_threads_core::AuditEventType::ProposalRejected,
                 proposal_id,
                 familiar_id: &familiar_id,
-                weave_hash: state.weave.weave_hash(),
+                weave_hash: &weave_hash,
                 approver: Some(&pending.writer),
                 files_touched: &targets,
                 decision: "protected-target-not-proposable",
@@ -10367,7 +10373,7 @@ fn decide_threads_proposal_inner(
                 )
             }));
     if coherence_revalidation_failed {
-        let state = crate::threads_gate::build_weave_state_at(
+        let state_result = crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
@@ -10375,6 +10381,12 @@ fn decide_threads_proposal_inner(
             &[],
             false,
             decision_now,
+        );
+        let weave_hash = revalidation_failure_weave_hash(
+            coven_home,
+            proposal_id,
+            state_result,
+            opened_window.as_ref().filter(|_| applying_state.is_none()),
         )?;
         if applying_state.is_none()
             && scheduled.is_some_and(|proposal| proposal.veto_deadline().is_some())
@@ -10392,7 +10404,7 @@ fn decide_threads_proposal_inner(
                     event_type: coven_threads_core::AuditEventType::ProposalRejected,
                     proposal_id,
                     familiar_id: &familiar_id,
-                    weave_hash: state.weave.weave_hash(),
+                    weave_hash: &weave_hash,
                     approver: Some(&pending.writer),
                     files_touched: &targets,
                     decision: coven_threads_core::WindowCloseReason::RevalidationFailed.tag(),
@@ -10410,7 +10422,7 @@ fn decide_threads_proposal_inner(
                 &conn,
                 proposal_id,
                 &familiar_id,
-                state.weave.weave_hash(),
+                &weave_hash,
                 &pending.writer,
                 &targets,
                 pending.channel,
@@ -10440,7 +10452,7 @@ fn decide_threads_proposal_inner(
         && adjudication.is_blocked()
         && !coherence_rejection
     {
-        let state = crate::threads_gate::build_weave_state_for_writer_at(
+        let state_result = crate::threads_gate::build_weave_state_for_writer_at(
             &conn,
             &familiar_id,
             &workspace,
@@ -10449,6 +10461,12 @@ fn decide_threads_proposal_inner(
             false,
             decision_now,
             Some(&pending.writer),
+        );
+        let weave_hash = revalidation_failure_weave_hash(
+            coven_home,
+            proposal_id,
+            state_result,
+            opened_window.as_ref(),
         )?;
         claim.preserve();
         let window_close = scheduled_rejection_window_close(
@@ -10463,7 +10481,7 @@ fn decide_threads_proposal_inner(
                 event_type: coven_threads_core::AuditEventType::ProposalRejected,
                 proposal_id,
                 familiar_id: &familiar_id,
-                weave_hash: state.weave.weave_hash(),
+                weave_hash: &weave_hash,
                 approver: Some(&pending.writer),
                 files_touched: &targets,
                 decision: window_close
@@ -12682,6 +12700,30 @@ fn proposal_window_opened_weave_hash(
     )
     .optional()
     .context("loading proposal window weave hash")
+}
+
+fn revalidation_failure_weave_hash(
+    coven_home: &Path,
+    proposal_id: &str,
+    state: Result<crate::threads_gate::WeaveState>,
+    opened: Option<&ProposalWindowContext>,
+) -> Result<Vec<u8>> {
+    match state {
+        Ok(state) => Ok(state.weave.weave_hash().to_vec()),
+        Err(error) => {
+            let Some(opened) = opened else {
+                return Err(error);
+            };
+            crate::daemon::append_daemon_recovery_log(
+                coven_home,
+                &format!(
+                    "threads proposal {proposal_id}: rejection replay failed: {error:#}; \
+                     closing against committed window evidence with replay_hash_matched=false"
+                ),
+            );
+            Ok(opened.weave_hash.clone())
+        }
+    }
 }
 
 fn append_open_window_revalidation_failure(
@@ -32787,6 +32829,123 @@ tier = 0
             assert_eq!(decided_at, now, "{failure}");
             #[cfg(not(feature = "threads-test-clock"))]
             assert!(decided_at >= now, "{failure}");
+            let terminal_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
+                 AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+                [&proposal_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(terminal_count, 1, "{failure}");
+            let reservations: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(reservations, 0, "{failure}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_closes_rejected_window_when_replay_is_unavailable() -> Result<()> {
+        for failure in [
+            "protected-promotion",
+            #[cfg(unix)]
+            "blocked-symlink",
+        ] {
+            let temp = tempfile::tempdir()?;
+            #[cfg(unix)]
+            let outside = tempfile::tempdir()?;
+            let home = temp.path();
+            let now = crate::threads_clock::now(home)?;
+            let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::FamiliarCoherence {
+                    veto: coven_threads_core::VetoWindow::new(
+                        std::time::Duration::from_secs(300),
+                        std::time::Duration::from_secs(60),
+                    ),
+                },
+                now - time::Duration::minutes(10),
+            )?;
+            let document = read_pending_proposal_document(&pending)?;
+            ensure_proposal_window_opened_audit(
+                home,
+                document.scheduled().context("scheduled fixture")?,
+                now,
+            )?;
+            let workspace = home.join("familiars/sage");
+            let original = match failure {
+                "protected-promotion" => {
+                    let ward_path = workspace.join("ward.toml");
+                    let config = std::fs::read_to_string(&ward_path)?
+                        .replace(
+                            "protected_surface = [\"SOUL.md\"]",
+                            "protected_surface = [\"SOUL.md\", \"reviewed/skill.md\"]",
+                        )
+                        .replace(
+                            "path = \"reviewed/\"\ntier = 1",
+                            "path = \"reviewed/skill.md\"\ntier = 0",
+                        );
+                    std::fs::write(&ward_path, config)?;
+                    workspace.join("reviewed/skill.md")
+                }
+                #[cfg(unix)]
+                "blocked-symlink" => {
+                    std::fs::rename(
+                        workspace.join("reviewed"),
+                        workspace.join("reviewed-before"),
+                    )?;
+                    std::os::unix::fs::symlink(outside.path(), workspace.join("reviewed"))?;
+                    workspace.join("reviewed-before/skill.md")
+                }
+                _ => unreachable!(),
+            };
+            let config = ward::WardConfig::load(&workspace)?.context("valid changed Ward")?;
+            let ward = ward::Ward::new(&workspace, config)?;
+            let adjudication = ward.evaluate(&ward::Proposal {
+                targets: vec!["reviewed/skill.md".to_string()],
+                authorization: authorization_from_writer(&document.pending().writer),
+            });
+            match failure {
+                "protected-promotion" => {
+                    assert!(!protected_proposal_targets(&adjudication, &ward)?.is_empty());
+                }
+                #[cfg(unix)]
+                "blocked-symlink" => {
+                    assert!(adjudication.is_blocked());
+                    assert!(protected_proposal_targets(&adjudication, &ward)?.is_empty());
+                }
+                _ => unreachable!(),
+            }
+            std::fs::remove_file(workspace.join("SOUL.md"))?;
+            std::fs::create_dir(workspace.join("SOUL.md"))?;
+
+            assert_eq!(
+                process_due_threads_proposals(home)?,
+                1,
+                "{failure}: {}",
+                std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(home))
+                    .unwrap_or_default()
+            );
+            assert!(!pending.exists(), "{failure}");
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{failure}");
+            assert_eq!(std::fs::read_to_string(original)?, "before", "{failure}");
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let detail: String = conn.query_row(
+                "SELECT detail FROM ward_audit WHERE proposal_id = ?1
+                 AND event_type = 'proposal_rejected'",
+                [&proposal_id],
+                |row| row.get(0),
+            )?;
+            let close: coven_threads_core::ProposalWindowCloseAuditDetail =
+                serde_json::from_str(&detail)?;
+            assert_eq!(
+                close.reason,
+                coven_threads_core::WindowCloseReason::RevalidationFailed,
+                "{failure}"
+            );
+            assert_eq!(close.replay_hash_matched, Some(false), "{failure}");
             let terminal_count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
                  AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
