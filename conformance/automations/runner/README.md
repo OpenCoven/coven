@@ -123,6 +123,7 @@ source metadata for the files and binary under test. `source.commit` must equal
 The checked-in
 [`attempt-terminal-immutability.vectors.json`](attempt-terminal-immutability.vectors.json),
 [`capability-negotiation.vectors.json`](capability-negotiation.vectors.json),
+[`calendar-schedule-resolution.vectors.json`](calendar-schedule-resolution.vectors.json),
 [`command-adoption-idempotency.vectors.json`](command-adoption-idempotency.vectors.json),
 [`definition-lifecycle-transitions.vectors.json`](definition-lifecycle-transitions.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
@@ -162,6 +163,7 @@ The runner invokes the target directly without a shell.
     {
       "profile": "scheduler_reliability",
       "suites": [
+        "calendar-schedule-resolution",
         "misfire-latest-planning"
       ]
     }
@@ -175,8 +177,8 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements ten structural suites and one
-scheduler-reliability suite.
+The native Coven target currently implements ten structural suites and two
+scheduler-reliability suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
@@ -197,6 +199,12 @@ normalized JCS digest matches and rejecting a tampered definition.
 `event-reducer-determinism` replays a portable event stream through the native
 Rust reducer both canonically and with an exact duplicate delivery, requiring
 the same normalized final state and expected digest.
+`calendar-schedule-resolution` executes fixed UTC and IANA-timezone cases
+through the production scheduler. It covers same-day and multi-hour daily
+schedules, weekly weekday selection, winter and summer offsets, skipped DST
+gaps, deterministic selection of the first DST-fold occurrence, leap-day,
+month, and year boundaries, and fail-closed refusal of unresolved `local`
+timezones.
 `misfire-latest-planning` executes fixed virtual-time cases through the
 production occurrence planner. It proves that downtime collapses daily work to
 the latest due slot, exact replay is idempotent, a clock rollback does not add

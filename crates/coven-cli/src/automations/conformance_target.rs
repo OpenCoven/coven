@@ -28,6 +28,8 @@ const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-
 const SUITE_RESULT_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-result.v1";
 const CAPABILITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.capability-negotiation-vectors.v1";
+const CALENDAR_SCHEDULE_RESOLUTION_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.calendar-schedule-resolution-vectors.v1";
 const COMMAND_ADOPTION_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.command-adoption-idempotency-vectors.v1";
 const DEFINITION_LIFECYCLE_VECTOR_SCHEMA_VERSION: &str =
@@ -53,6 +55,7 @@ const SCHEDULER_RELIABILITY_PROFILE: &str = "scheduler_reliability";
 const MAX_CASES: usize = 128;
 
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
+pub const CALENDAR_SCHEDULE_RESOLUTION_SUITE: &str = "calendar-schedule-resolution";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
@@ -434,6 +437,106 @@ struct OccurrenceFenceVectorSet {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CalendarScheduleResolutionVectorSet {
+    schema_version: String,
+    cases: Vec<CalendarScheduleResolutionVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CalendarScheduleResolutionVectorCase {
+    case_id: String,
+    scenario: CalendarScheduleResolutionScenario,
+    rrule: String,
+    timezone: String,
+    from: String,
+    expected: ExpectedCalendarScheduleResolution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CalendarScheduleResolutionScenario {
+    DailySameDay,
+    MultipleDailyHours,
+    WeeklyWeekday,
+    IanaWinterOffset,
+    IanaSummerOffset,
+    DstSpringGap,
+    DstFallFold,
+    LeapDayBoundary,
+    MonthBoundary,
+    YearBoundary,
+    LocalTimezoneRefused,
+}
+
+impl CalendarScheduleResolutionScenario {
+    const COUNT: usize = 11;
+
+    const fn input(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::DailySameDay => ("FREQ=DAILY;BYHOUR=9", "utc", "2026-08-28T08:00:00.000Z"),
+            Self::MultipleDailyHours => {
+                ("FREQ=DAILY;BYHOUR=9,17", "utc", "2026-08-28T12:00:00.000Z")
+            }
+            Self::WeeklyWeekday => (
+                "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8",
+                "utc",
+                "2026-08-28T09:00:00.000Z",
+            ),
+            Self::IanaWinterOffset => (
+                "FREQ=DAILY;BYHOUR=9",
+                "America/New_York",
+                "2026-01-15T13:00:00.000Z",
+            ),
+            Self::IanaSummerOffset => (
+                "FREQ=DAILY;BYHOUR=9",
+                "America/New_York",
+                "2026-07-15T12:00:00.000Z",
+            ),
+            Self::DstSpringGap => (
+                "FREQ=DAILY;BYHOUR=2",
+                "America/New_York",
+                "2026-03-07T08:00:00.000Z",
+            ),
+            Self::DstFallFold => (
+                "FREQ=DAILY;BYHOUR=1",
+                "America/New_York",
+                "2026-11-01T04:00:00.000Z",
+            ),
+            Self::LeapDayBoundary => ("FREQ=DAILY;BYHOUR=9", "utc", "2028-02-28T10:00:00.000Z"),
+            Self::MonthBoundary => ("FREQ=DAILY;BYHOUR=9", "utc", "2026-08-31T10:00:00.000Z"),
+            Self::YearBoundary => (
+                "FREQ=WEEKLY;BYDAY=FR;BYHOUR=8",
+                "utc",
+                "2026-12-31T12:00:00.000Z",
+            ),
+            Self::LocalTimezoneRefused => {
+                ("FREQ=DAILY;BYHOUR=9", "local", "2026-08-28T08:00:00.000Z")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedCalendarScheduleResolution {
+    Scheduled {
+        #[serde(rename = "nextDueAt")]
+        next_due_at: String,
+    },
+    Rejected {
+        reason: CalendarScheduleRejection,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CalendarScheduleRejection {
+    LocalTimezoneUnresolved,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MisfireLatestPlanningVectorSet {
     schema_version: String,
     cases: Vec<MisfireLatestPlanningVectorCase>,
@@ -700,7 +803,10 @@ pub fn capability() -> TargetCapability {
             },
             TargetProfileCapability {
                 profile: SCHEDULER_RELIABILITY_PROFILE,
-                suites: vec![MISFIRE_LATEST_PLANNING_SUITE],
+                suites: vec![
+                    CALENDAR_SCHEDULE_RESOLUTION_SUITE,
+                    MISFIRE_LATEST_PLANNING_SUITE,
+                ],
             },
         ],
     }
@@ -744,6 +850,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         (STRUCTURAL_PROFILE, RRULE_VOCABULARY_SUITE) => evaluate_rrule_vocabulary(&request.vector)?,
         (STRUCTURAL_PROFILE, RUN_TERMINAL_MONOTONICITY_SUITE) => {
             evaluate_run_terminal_monotonicity(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, CALENDAR_SCHEDULE_RESOLUTION_SUITE) => {
+            evaluate_calendar_schedule_resolution(&request.vector)?
         }
         (SCHEDULER_RELIABILITY_PROFILE, MISFIRE_LATEST_PLANNING_SUITE) => {
             evaluate_misfire_latest_planning(&request.vector)?
@@ -1273,6 +1382,101 @@ fn event_reducer_case_matches(case: &EventReducerVectorCase) -> Result<bool, &'s
         canonicalize(canonical.state()).map_err(|_| "conformance suite execution failed")?;
     let observed_digest = format!("sha256:{}", sha256_hex(&canonical_state));
     Ok(canonical.state() == duplicated.state() && observed_digest == case.expected_state_digest)
+}
+
+fn evaluate_calendar_schedule_resolution(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: CalendarScheduleResolutionVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != CALENDAR_SCHEDULE_RESOLUTION_VECTOR_SCHEMA_VERSION
+        || vectors.cases.is_empty()
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        let (rrule, timezone, from) = case.scenario.input();
+        let expected_shape_matches = match (&case.scenario, &case.expected) {
+            (
+                CalendarScheduleResolutionScenario::LocalTimezoneRefused,
+                ExpectedCalendarScheduleResolution::Rejected {
+                    reason: CalendarScheduleRejection::LocalTimezoneUnresolved,
+                },
+            ) => true,
+            (
+                CalendarScheduleResolutionScenario::LocalTimezoneRefused,
+                ExpectedCalendarScheduleResolution::Scheduled { .. },
+            )
+            | (
+                _,
+                ExpectedCalendarScheduleResolution::Rejected {
+                    reason: CalendarScheduleRejection::LocalTimezoneUnresolved,
+                },
+            ) => false,
+            (_, ExpectedCalendarScheduleResolution::Scheduled { next_due_at }) => {
+                canonical_timestamp(next_due_at).is_some()
+            }
+        };
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || case.rrule != rrule
+            || case.timezone != timezone
+            || case.from != from
+            || canonical_timestamp(&case.from).is_none()
+            || !expected_shape_matches
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != CalendarScheduleResolutionScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut all_passed = true;
+    for case in &vectors.cases {
+        all_passed &= calendar_schedule_resolution_case_matches(case)?;
+    }
+    Ok(all_passed)
+}
+
+fn calendar_schedule_resolution_case_matches(
+    case: &CalendarScheduleResolutionVectorCase,
+) -> Result<bool, &'static str> {
+    let definition = super::definition::RoutineDefinition::from_json(&json!({
+        "schemaVersion": 1,
+        "id": case.case_id,
+        "name": "Calendar schedule conformance",
+        "status": "ACTIVE",
+        "rrule": case.rrule,
+        "timezone": case.timezone,
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the calendar schedule conformance probe.",
+        "tags": []
+    }))
+    .map_err(|_| "conformance vector is invalid")?;
+    let from = canonical_timestamp(&case.from).ok_or("conformance vector is invalid")?;
+    let observed = super::schedule::next_due(&definition.rrule, definition.timezone, from);
+
+    Ok(match (&case.expected, observed) {
+        (ExpectedCalendarScheduleResolution::Scheduled { next_due_at }, Ok(Some(observed))) => {
+            canonical_timestamp(next_due_at).is_some_and(|expected| expected == observed)
+        }
+        (
+            ExpectedCalendarScheduleResolution::Rejected {
+                reason: CalendarScheduleRejection::LocalTimezoneUnresolved,
+            },
+            Err(error),
+        ) => {
+            error == "timezone `local` must be resolved to an exact IANA timezone before scheduling"
+        }
+        _ => false,
+    })
 }
 
 fn evaluate_misfire_latest_planning(vector: &Value) -> Result<bool, &'static str> {
