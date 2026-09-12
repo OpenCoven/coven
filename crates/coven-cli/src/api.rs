@@ -9606,6 +9606,7 @@ fn proposal_recovery_is_proven_unapplied(
                 request.decision.as_str()
             }),
         document.decision_request.as_ref(),
+        true,
     ) {
         Ok(origin) => origin,
         Err(_) => return false,
@@ -10120,6 +10121,7 @@ fn decide_threads_proposal_inner(
         proposal_id,
         &reservation_decision,
         durable_request.as_ref(),
+        applying_state.is_some(),
     ) {
         Ok(actor) => actor,
         Err(error) => {
@@ -12727,15 +12729,9 @@ fn trusted_decision_approver(
     proposal_id: &str,
     reservation_decision: &str,
     request: Option<&ProposalDecisionRequest>,
+    applying: bool,
 ) -> Result<(Option<coven_threads_core::WriterId>, bool)> {
-    let Some(request) = request else {
-        return Ok((None, false));
-    };
-    if request.expired {
-        anyhow::ensure!(
-            request.decision_actor.is_none(),
-            "automatic proposal expiry cannot carry a decision actor"
-        );
+    if request.is_none() && !applying {
         return Ok((None, false));
     }
     let purpose: String = conn
@@ -12747,6 +12743,29 @@ fn trusted_decision_approver(
             |row| row.get(0),
         )
         .context("loading proposal decision origin")?;
+    let Some(request) = request else {
+        let legacy_purpose = match reservation_decision {
+            "approve" => "proposal-approval",
+            "reject" => "proposal-rejection",
+            _ => anyhow::bail!("proposal decision reservation has an invalid decision"),
+        };
+        anyhow::ensure!(
+            purpose == legacy_purpose,
+            "applying proposal without a request lacks compatible legacy authority"
+        );
+        return Ok((None, false));
+    };
+    if request.expired {
+        anyhow::ensure!(
+            !applying,
+            "applying proposal cannot carry an expiry request"
+        );
+        anyhow::ensure!(
+            request.decision_actor.is_none(),
+            "automatic proposal expiry cannot carry a decision actor"
+        );
+        return Ok((None, false));
+    }
     let expected_purpose = match request.decision.as_str() {
         "approve" => (
             "proposal-approval-owner-local",
@@ -38447,6 +38466,70 @@ tier = 0
             |row| row.get(0),
         )?;
         assert_eq!(terminal_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_missing_or_forged_expiry_request() -> Result<()> {
+        for corruption in ["missing-request", "forged-expiry"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (_, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+                proposal_id.clone(),
+            )));
+            assert!(handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some(&decision_body),
+            )
+            .is_err());
+            let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+                .context("interrupted approval leaves a recovery claim")?;
+            let mut staged: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
+            match corruption {
+                "missing-request" => {
+                    staged
+                        .as_object_mut()
+                        .context("proposal claim is an object")?
+                        .remove("decisionRequest");
+                }
+                "forged-expiry" => {
+                    staged["decisionRequest"]["expired"] = json!(true);
+                    staged["decisionRequest"]["decisionActor"] = Value::Null;
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&claim, serde_json::to_vec_pretty(&staged)?)?;
+
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{corruption}");
+            assert!(!claim.exists(), "{corruption}");
+            assert_eq!(
+                std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                "before",
+                "{corruption}"
+            );
+            let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(quarantined.len(), 1, "{corruption}");
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let terminal_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit
+                 WHERE proposal_id = ?1
+                   AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+                [&proposal_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(terminal_count, 0, "{corruption}");
+        }
         Ok(())
     }
 
