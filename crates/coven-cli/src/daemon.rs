@@ -14160,7 +14160,12 @@ mod tests {
             None,
         )?;
         assert_eq!(degraded.status, "degraded");
-        assert_eq!(degraded.database_bytes, before.database_bytes);
+        // File sizes are sampled live; closing the retained initialization
+        // connection checkpoints WAL without refreshing cached maintenance data.
+        assert_eq!(
+            degraded.database_bytes,
+            std::fs::metadata(&store_path)?.len()
+        );
         assert_eq!(degraded.last_prune_at, before.last_prune_at);
         assert_eq!(degraded.last_checkpoint_at, before.last_checkpoint_at);
         assert_eq!(degraded.writer_backlog_events, 7);
