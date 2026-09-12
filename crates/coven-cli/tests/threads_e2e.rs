@@ -17,6 +17,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[path = "fixtures/threads_admission.rs"]
+mod threads_admission;
+
 const FAMILIAR_ID: &str = "sage";
 const PRINCIPAL_FINGERPRINT: &str = "fpr-e2e-synthetic";
 const REQUIRE_OVERRIDE_ENV: &str = "COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE";
@@ -30,6 +33,11 @@ const REPRODUCTION_COMMAND: &str = if cfg!(feature = "threads-test-clock") {
 #[cfg(feature = "threads-test-clock")]
 mod final_commit_cases {
     include!("support/threads_final_commit_cases.rs");
+}
+
+#[cfg(feature = "threads-test-clock")]
+mod identity_replay_cases {
+    include!("support/threads_identity_replay_cases.rs");
 }
 
 #[test]
@@ -994,19 +1002,34 @@ fn same_home_daemon_lifecycle_helpers_survive_restart_and_crash() -> Result<()> 
                     .context("daemon lifecycle entry is missing operation")
             })
             .collect::<Result<Vec<_>>>()?;
+        let expected = if cfg!(windows) {
+            vec![
+                "daemon serve",
+                "daemon stop",
+                "daemon serve",
+                "daemon stop",
+                "daemon serve",
+                "daemon stop",
+                "daemon serve",
+                "daemon crash",
+                "daemon serve",
+                "daemon stop",
+            ]
+        } else {
+            vec![
+                "daemon start",
+                "daemon restart",
+                "daemon stop",
+                "daemon start",
+                "daemon stop",
+                "daemon restart",
+                "daemon crash",
+                "daemon start",
+                "daemon stop",
+            ]
+        };
         anyhow::ensure!(
-            operations
-                == [
-                    "daemon start",
-                    "daemon restart",
-                    "daemon stop",
-                    "daemon start",
-                    "daemon stop",
-                    "daemon restart",
-                    "daemon crash",
-                    "daemon start",
-                    "daemon stop",
-                ],
+            operations == expected,
             "unexpected lifecycle sequence in success provenance: {operations:?}"
         );
 
@@ -1115,6 +1138,52 @@ fn startup_failure_retains_partial_fixture_evidence_before_cleanup() -> Result<(
         )?)?["pid"],
         0
     );
+    Ok(())
+}
+
+#[test]
+fn owned_serve_failure_retains_provenance_and_reaps_before_home_cleanup() -> Result<()> {
+    let artifacts = tempfile::tempdir()?;
+    let mut evidence = EvidenceContext::new("owned-serve-startup-retention");
+    evidence.artifact_dir = artifacts.path().to_path_buf();
+    let mut owned_pid = None;
+    let mut fixture_home = None;
+    let result = ThreadsFixture::start_with_setup_and_start(
+        &evidence,
+        |_, _| Ok(()),
+        |fixture| {
+            fixture_home = Some(fixture.coven_home.clone());
+            fixture.start_owned_daemon_with_readiness(|child, home| {
+                owned_pid = Some(child.id());
+                fs::write(
+                    home.join("fixture-serve.stderr.log"),
+                    format!("synthetic admission failure at {}\n", home.display()),
+                )?;
+                anyhow::bail!("synthetic owned readiness failure before status publication")
+            })
+        },
+    );
+    let error = result.err().context("owned admission must fail")?;
+    assert!(format!("{error:#}").contains("synthetic owned readiness failure"));
+    assert!(!pid_is_alive(owned_pid.context("owned pid")?));
+    assert!(!fixture_home.as_ref().context("fixture home")?.exists());
+    evidence.write_setup_failure(&error)?;
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(artifacts.path().join("manifest.json"))?)?;
+    assert_eq!(manifest["result"], "failed");
+    assert_eq!(manifest["setup_completed"], false);
+    assert!(manifest["coven_commit"].is_string());
+    assert_eq!(manifest["daemon_lifecycle"][0]["operation"], "daemon serve");
+    assert_eq!(
+        manifest["daemon_lifecycle"][0]["pid_after"],
+        owned_pid.unwrap()
+    );
+    assert!(manifest["daemon_lifecycle"][0]["command_status"].is_null());
+    let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
+    assert!(log.contains("synthetic owned readiness failure"));
+    assert!(log.contains("synthetic admission failure at <coven-home>"));
+    assert!(!log.contains(&fixture_home.unwrap().display().to_string()));
+    assert!(artifacts.path().join("state/daemon-status.json").exists());
     Ok(())
 }
 
@@ -1641,6 +1710,7 @@ impl DaemonLifecycleEvent {
 }
 
 struct ThreadsFixture {
+    owned_daemon: Option<threads_admission::OwnedDaemon>,
     _temp: tempfile::TempDir,
     coven: PathBuf,
     coven_home: PathBuf,
@@ -1662,6 +1732,8 @@ struct ThreadsFixture {
     daemon_events: Vec<DaemonLifecycleEvent>,
     daemon_pid: Option<u32>,
     stopped: bool,
+    #[cfg(windows)]
+    _admission: std::sync::MutexGuard<'static, ()>,
 }
 
 impl ThreadsFixture {
@@ -1681,6 +1753,9 @@ impl ThreadsFixture {
         prepare: impl FnOnce(&Path, &Path) -> Result<()>,
         start: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<Self> {
+        // Serialize whole native authority journeys, including restart and cleanup.
+        #[cfg(windows)]
+        let admission = threads_admission::acquire_windows_admission();
         let workspace_root = workspace_root();
         let dependency = threads_dependency(&workspace_root)?;
         if std::env::var_os(REQUIRE_OVERRIDE_ENV).is_some() {
@@ -1715,6 +1790,7 @@ impl ThreadsFixture {
         let coven = PathBuf::from(env!("CARGO_BIN_EXE_coven"));
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut fixture = Self {
+            owned_daemon: None,
             _temp: temp,
             coven,
             coven_home,
@@ -1735,7 +1811,9 @@ impl ThreadsFixture {
             last_response: None,
             daemon_events: Vec::new(),
             daemon_pid: None,
-            stopped: false,
+            stopped: true,
+            #[cfg(windows)]
+            _admission: admission,
         };
         if let Err(error) = start(&mut fixture) {
             let capture = (|| {
@@ -1786,6 +1864,9 @@ impl ThreadsFixture {
     }
 
     fn current_daemon_pid(&self) -> Option<u32> {
+        if let Some(child) = &self.owned_daemon {
+            return Some(child.id()).filter(|pid| pid_is_alive(*pid));
+        }
         self.daemon_pid
             .filter(|pid| pid_is_alive(*pid))
             .or_else(|| {
@@ -1800,10 +1881,83 @@ impl ThreadsFixture {
     }
 
     fn start_daemon(&mut self) -> Result<()> {
-        let pid_before = self.current_daemon_pid();
-        self.stopped = false;
-        let output = self.daemon_command(&["daemon", "start"])?;
-        self.complete_daemon_start(pid_before, output)
+        #[cfg(windows)]
+        {
+            self.start_owned_daemon_with_readiness(|child, home| child.wait_for_health(home))
+        }
+        #[cfg(unix)]
+        {
+            let pid_before = self.current_daemon_pid();
+            self.stopped = false;
+            let output = self
+                .daemon_command(&["daemon", threads_admission::start_operation(cfg!(windows))])?;
+            self.complete_daemon_start(pid_before, output)
+        }
+    }
+
+    fn start_owned_daemon_with_readiness(
+        &mut self,
+        readiness: impl FnOnce(&mut threads_admission::OwnedDaemon, &Path) -> Result<()>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.owned_daemon.is_none() && self.current_daemon_pid().is_none(),
+            "owned fixture daemon must be stopped before start"
+        );
+        #[cfg(windows)]
+        let endpoint = coven_client::owner_only_windows_pipe_name(&self.coven_home)?;
+        #[cfg(unix)]
+        let endpoint = self.coven_home.join("coven.sock").display().to_string();
+        self.daemon_events.push(DaemonLifecycleEvent::note(
+            "daemon serve",
+            None,
+            format!(
+                "owned authority fixture admission at {endpoint} (15-second readiness hang guard; not CLI start)"
+            ),
+        ));
+        let result = (|| {
+            let stdout = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.coven_home.join("fixture-serve.stdout.log"))?;
+            let stderr = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.coven_home.join("fixture-serve.stderr.log"))?;
+            let mut command = Command::new(&self.coven);
+            command
+                .args(["daemon", threads_admission::start_operation(true)])
+                .env("COVEN_HOME", &self.coven_home)
+                .env("PATH", &self.path)
+                .stdin(std::process::Stdio::null())
+                .stdout(stdout)
+                .stderr(stderr);
+            let child = threads_admission::OwnedDaemon::spawn(&mut command)?;
+            let pid = child.id();
+            self.owned_daemon = Some(child);
+            self.daemon_pid = Some(pid);
+            self.stopped = false;
+            self.daemon_events
+                .last_mut()
+                .context("serve event")?
+                .pid_after = Some(pid);
+            readiness(
+                self.owned_daemon.as_mut().context("owned fixture daemon")?,
+                &self.coven_home,
+            )
+        })();
+        if let Err(error) = &result {
+            self.daemon_events.last_mut().context("serve event")?.note =
+                Some(format!("owned daemon serve admission failed: {error:#}"));
+        }
+        result
+    }
+
+    fn reap_owned_daemon(&mut self, terminate: bool) -> Result<()> {
+        if let Some(child) = &mut self.owned_daemon {
+            child.reap(terminate)?;
+            self.owned_daemon = None;
+        }
+        Ok(())
     }
 
     fn complete_daemon_start(&mut self, pid_before: Option<u32>, output: Output) -> Result<()> {
@@ -1859,6 +2013,7 @@ impl ThreadsFixture {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        self.reap_owned_daemon(false)?;
         wait_for_daemon_shutdown(&self.coven_home, pid_before)?;
         self.daemon_pid = None;
         self.stopped = true;
@@ -1867,43 +2022,65 @@ impl ThreadsFixture {
 
     fn restart_daemon(&mut self) -> Result<()> {
         let pid_before = self.current_daemon_pid();
-        self.stopped = false;
-        let output = self.daemon_command(&["daemon", "restart"])?;
-        anyhow::ensure!(
-            output.status.success(),
-            "daemon restart failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let health_result = wait_for_daemon_health(&self.coven_home);
-        let pid_after = daemon_pid(&self.coven_home).ok();
-        self.daemon_events.push(DaemonLifecycleEvent::from_output(
-            "daemon restart",
-            pid_before,
-            pid_after,
-            &output,
-            health_result
+        #[cfg(windows)]
+        {
+            // This proves a real daemon replacement, not the CLI restart SLA.
+            self.stop_daemon()?;
+            self.start_daemon()?;
+            anyhow::ensure!(
+                pid_before.is_none() || pid_before != self.daemon_pid,
+                "fixture restart did not replace the running process {pid_before:?}"
+            );
+            Ok(())
+        }
+        #[cfg(unix)]
+        {
+            self.stopped = false;
+            let output = self.daemon_command(&["daemon", "restart"])?;
+            let pid_after = daemon_pid(&self.coven_home).ok();
+            self.daemon_events.push(DaemonLifecycleEvent::from_output(
+                "daemon restart",
+                pid_before,
+                pid_after,
+                &output,
+                (!output.status.success())
+                    .then(|| "CLI restart failed before fixture health check".to_owned()),
+            ));
+            anyhow::ensure!(
+                output.status.success(),
+                "daemon restart failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let health_result = wait_for_daemon_health(&self.coven_home);
+            let pid_after = daemon_pid(&self.coven_home).ok();
+            let event = self.daemon_events.last_mut().context("restart event")?;
+            event.pid_after = pid_after;
+            event.note = health_result
                 .as_ref()
                 .err()
-                .map(|error| format!("daemon health check failed after restart: {error:#}")),
-        ));
-        health_result?;
+                .map(|error| format!("daemon health check failed after restart: {error:#}"));
+            health_result?;
 
-        let pid_after = pid_after.context("daemon status is missing pid after restart")?;
-        self.daemon_pid = Some(pid_after);
-        anyhow::ensure!(
-            pid_before != Some(pid_after),
-            "daemon restart did not replace the running process {pid_after}"
-        );
-        Ok(())
+            let pid_after = pid_after.context("daemon status is missing pid after restart")?;
+            self.daemon_pid = Some(pid_after);
+            anyhow::ensure!(
+                pid_before != Some(pid_after),
+                "daemon restart did not replace the running process {pid_after}"
+            );
+            Ok(())
+        }
     }
 
     fn crash_daemon(&mut self) -> Result<()> {
         let pid = self
             .current_daemon_pid()
             .context("daemon crash requires a running daemon")?;
-        terminate_daemon_process(&self.coven_home, pid)?;
+        if self.owned_daemon.is_some() {
+            self.reap_owned_daemon(true)?;
+        } else {
+            terminate_daemon_process(&self.coven_home, pid)?;
+        }
         wait_for_process_exit(pid, "crashed daemon", Duration::from_secs(3))?;
         self.daemon_events.push(DaemonLifecycleEvent::note(
             "daemon crash",
@@ -2006,6 +2183,15 @@ impl ThreadsFixture {
         }
         daemon_log.push_str("daemon recovery log:\n");
         daemon_log.push_str(&String::from_utf8_lossy(&recovery_log));
+        for name in ["fixture-serve.stdout.log", "fixture-serve.stderr.log"] {
+            match fs::read_to_string(self.coven_home.join(name)) {
+                Ok(log) => {
+                    daemon_log.push_str(&format!("\n{name}:\n{log}"));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => daemon_log.push_str(&format!("\n{name}: <capture-error: {error}>\n")),
+            }
+        }
         fs::write(
             logs.join("daemon.log"),
             self.sanitize_fixture_text(&daemon_log),
@@ -2076,6 +2262,21 @@ impl ThreadsFixture {
 
 impl Drop for ThreadsFixture {
     fn drop(&mut self) {
+        if self.owned_daemon.is_some() {
+            if self
+                .owned_daemon
+                .as_ref()
+                .is_some_and(|child| child.is_ready())
+            {
+                if let Err(error) = self.stop_daemon() {
+                    eprintln!("threads E2E owned daemon graceful shutdown failed: {error:#}");
+                }
+            }
+            if let Err(error) = self.reap_owned_daemon(true) {
+                eprintln!("threads E2E owned daemon cleanup failed: {error:#}");
+            }
+            return;
+        }
         if self.stopped {
             return;
         }
