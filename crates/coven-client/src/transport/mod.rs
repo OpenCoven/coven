@@ -174,17 +174,7 @@ fn request_with_peer(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    if !valid_request_method(method) {
-        return Err(ClientError::InvalidRouteParameter("HTTP method"));
-    }
-    if !valid_request_target(path) {
-        return Err(ClientError::InvalidRouteParameter("HTTP request target"));
-    }
-    if !allowed_request_route(method, path) {
-        return Err(ClientError::InvalidHttpResponse(
-            "attempted request outside /api/v1 or exact GET /health".to_owned(),
-        ));
-    }
+    validate_request_line(method, path)?;
     if let Some(body) = body {
         if body.len() > MAX_REQUEST_BODY_BYTES {
             return Err(ClientError::RequestTooLarge {
@@ -229,6 +219,21 @@ pub use windows::{
     probe_windows_daemon_health_with_identity, probe_windows_daemon_health_with_identity_until,
     windows_process_creation_time, WindowsDaemonHealthProbe, WindowsDaemonProcess,
 };
+
+pub(crate) fn validate_request_line(method: &str, path: &str) -> Result<(), ClientError> {
+    if !valid_request_method(method) {
+        return Err(ClientError::InvalidRouteParameter("HTTP method"));
+    }
+    if !valid_request_target(path) {
+        return Err(ClientError::InvalidRouteParameter("HTTP request target"));
+    }
+    if !allowed_request_route(method, path) {
+        return Err(ClientError::InvalidHttpResponse(
+            "attempted request outside /api/v1 or exact GET /health".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 fn valid_request_method(method: &str) -> bool {
     !method.is_empty()
