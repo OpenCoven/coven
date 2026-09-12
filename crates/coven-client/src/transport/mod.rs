@@ -174,7 +174,7 @@ fn request_with_peer(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    if !valid_request_target(method, path) {
+    if !valid_request_method(method) || !valid_request_target(method, path) {
         return Err(ClientError::InvalidHttpResponse(
             "attempted request outside /api/v1 or exact GET /health".to_owned(),
         ));
@@ -223,6 +223,30 @@ pub use windows::{
     probe_windows_daemon_health_with_identity, probe_windows_daemon_health_with_identity_until,
     windows_process_creation_time, WindowsDaemonHealthProbe, WindowsDaemonProcess,
 };
+
+fn valid_request_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
 
 fn valid_request_target(method: &str, path: &str) -> bool {
     (path.starts_with("/api/v1/") || (method == "GET" && path == "/health"))
@@ -342,5 +366,15 @@ mod tests {
     fn request_target_guard_allows_health_only_for_get() {
         assert!(super::valid_request_target("GET", "/health"));
         assert!(!super::valid_request_target("POST", "/health"));
+    }
+
+    #[test]
+    fn request_method_guard_rejects_injected_or_blank_methods() {
+        for method in ["", "GE T", "GET\r\nX: injected", "GET\t"] {
+            assert!(
+                !super::valid_request_method(method),
+                "unsafe request method was accepted: {method:?}"
+            );
+        }
     }
 }
