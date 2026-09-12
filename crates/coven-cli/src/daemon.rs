@@ -4263,17 +4263,40 @@ fn serve_accepted_tcp_connection(
 }
 
 #[cfg(unix)]
-pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
+pub fn bind_api_socket(coven_home: &Path) -> Result<PublishedUnixListener> {
     bind_api_socket_with_publisher(coven_home, |staged, target| {
         std::fs::hard_link(staged, target)
     })
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+pub struct PublishedUnixListener {
+    listener: UnixListener,
+    _staged_path: tempfile::TempPath,
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for PublishedUnixListener {
+    type Target = UnixListener;
+
+    fn deref(&self) -> &Self::Target {
+        &self.listener
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for PublishedUnixListener {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.listener
+    }
+}
+
+#[cfg(unix)]
 fn bind_api_socket_with_publisher(
     coven_home: &Path,
     publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<UnixListener> {
+) -> Result<PublishedUnixListener> {
     ensure_private_coven_home(coven_home)?;
     let socket_path = daemon_socket_path(coven_home);
     // Fail closed if the socket path would resolve outside the trusted state
@@ -4337,7 +4360,9 @@ fn bind_api_socket_with_publisher(
             });
         }
     }
-    // Keep the temporary name no longer than coven.sock, preserving Unix path limits.
+    // Keep the temporary bound pathname alive for the listener's lifetime; coven.sock
+    // remains the public entry while the staged name preserves the inode the listener
+    // is actually bound to.
     let staged = tempfile::Builder::new()
         .prefix(".")
         .rand_bytes(8)
@@ -4357,10 +4382,10 @@ fn bind_api_socket_with_publisher(
     )?;
     // A hard link publishes the already-private socket without replacing a raced entry.
     publish(&staged, &socket_path).context("publishing private Coven API socket")?;
-    staged
-        .close()
-        .context("removing daemon socket staging path")?;
-    Ok(listener)
+    Ok(PublishedUnixListener {
+        listener,
+        _staged_path: staged,
+    })
 }
 
 pub fn daemon_recovery_log_path(coven_home: &Path) -> PathBuf {
@@ -10728,8 +10753,9 @@ mod tests {
         })?;
         let client = UnixStream::connect(daemon_socket_path(home.path()))?;
         let (server, _) = listener.accept()?;
-        assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
+        assert_eq!(std::fs::read_dir(home.path())?.count(), 2);
         drop((client, server, listener));
+        assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
         Ok(())
     }
 
