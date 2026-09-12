@@ -38,22 +38,46 @@ suite does not certify a signed principal-authorization profile, changed runtime
 bindings, every commit/recovery interleaving, or Cave acceptance. It is bounded
 process-boundary evidence, not complete closure of every assertion in
 [OpenCoven/coven#884](https://github.com/OpenCoven/coven/issues/884).
+Passing scheduled-intake journeys does not close the separately coordinated
+production scheduled-publication work in
+[OpenCoven/coven#888](https://github.com/OpenCoven/coven/issues/888).
 
 The clock feature is disabled in production builds. It uses a capability-gated
 fixture in each disposable home and explicit real-scheduler ticks, not sleeps
 or a mock scheduler. See [Threads test clock](../design/threads-test-clock.md).
 Without the feature, Cargo runs only the smaller smoke/lifecycle subset. CI
 executes the feature-enabled target on Linux, Windows, and the existing macOS
-push lane. All platforms run the same 15 daemon journeys through `coven-client`
+push lane. All platforms run the same 15 daemon journey tests through `coven-client`
 discovery and authenticated transport; Windows uses the owner-only named pipe.
 Three additional artifact regressions exercise startup-evidence retention;
 they are not extra daemon journeys.
 Two further regressions cover artifact-root isolation and the local default.
+Two real-process artifact regressions cover failed-request response pairing and
+failed-restart CLI evidence. Two foreground-process regressions cover owned
+replacement/crash cleanup and failed-child evidence; two readiness regressions
+cover process/endpoint matching and the narrow pending-transport error set.
+These bring the default target to 16 tests and the feature-enabled target to 26;
+the additional fixture regressions add no authority-journey coverage.
 HTTP framing regressions belong to the shared client's tests, not a separate
 harness parser. A cross-target compilation or Windows workspace run alone is
 not evidence that these journeys executed on Windows.
 
-Lifecycle commands still use the production CLI and its existing deadlines.
+Windows authority fixtures own a real `coven daemon serve` child, following the
+shared Threads fixture rather than testing the separate two-second launcher SLA
+on every authority scenario. Startup uses a fixed 15-second hang guard and the
+client's authenticated named-pipe health probe, matching the peer PID, health
+PID, and endpoint to the retained child. Only pending connection/empty-response
+timeouts are retried; identity and malformed-response failures remain terminal.
+Native Windows fixture lifetimes are serialized within this test executable.
+
+Foreground restarts perform a real production `daemon stop`, reap the old child,
+and launch a replacement against the same home. Startup failure and fallback
+cleanup retain the exact child handle. Foreground stdout/stderr and process
+exit status are included in the sanitized artifacts. The dedicated CLI
+lifecycle journey and failed-restart artifact regression still use production
+`daemon start`/`restart`; no production lifecycle deadline is changed.
+Unix authority journeys also retain their CLI launch path, while the explicit
+foreground regressions exercise owned-child lifecycle behavior on every platform.
 Windows crash injection binds the process handle to the authenticated pipe
 server PID and creation time before termination. Requests are never retried
 automatically; a response timeout does not prove a mutation did not commit.
@@ -114,10 +138,15 @@ inventories, SQLite schema, and a bounded, sanitized status snapshot. Startup
 failures retain the failed CLI event and available fixture evidence before
 cleanup; fallback markers do not overwrite captured files. A capture error in
 one state source is reported without discarding the others.
+Failed restart commands retain their exit status and CLI output even before a
+health probe can run. A request that fails before a JSON response is captured
+records a null response, never a response from an earlier request.
 
 For a constructed fixture, `manifest.json` includes exact Coven and Threads
 revisions and `local_threads_override_active`, even if daemon startup fails;
-earlier failures can record those fields as null. Windows readiness errors
+earlier failures can record those fields as null. Its `daemon_launch` field
+distinguishes `owned_foreground` from `detached_cli`; foreground success is not
+evidence of meeting the CLI startup deadline. Windows CLI readiness errors
 include a bounded last-probe category and observation of the retained child
 handle, without changing the startup deadline or identity checks.
 The existing recovery log also records fixed-category remaining-budget samples
