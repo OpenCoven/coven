@@ -44,6 +44,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use coven_threads_core as threads;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -64,6 +65,7 @@ const PROTECTED_CHANNELS: [threads::Channel; 3] = [
 const SERIALIZATION_CONTRACT: &[u8] = b"coven-threads:serialization-contract:v0.1.0";
 const SERIALIZATION_FORMAT_VERSION: &str = "0.1.0";
 const MAX_SURFACE_BYTES: u64 = crate::ward::WARD_FILE_CONTENT_MAX_BYTES;
+pub(crate) const SCHEDULED_SUBMISSION_RECOVERY_PREFIX: &str = "scheduled-proposal-submission:";
 
 /// What the gate decided about a proposal, as a unit.
 #[derive(Debug)]
@@ -125,7 +127,90 @@ pub(crate) struct StagedCoherenceProposal {
     pub pending_path: PathBuf,
     pub proposal_id: String,
     pub scheduled: Option<crate::proposal_scheduler::ScheduledProposal>,
-    pub identity_evidence: Option<[u8; 32]>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ScheduledSubmissionRecovery {
+    proposal_id: String,
+    familiar_id: String,
+    weave_hash: Vec<u8>,
+    body_sha256: String,
+}
+
+impl ScheduledSubmissionRecovery {
+    fn new(proposal_id: &str, familiar_id: &str, weave_hash: &[u8], body: &[u8]) -> Result<Self> {
+        anyhow::ensure!(
+            weave_hash.len() == 32,
+            "scheduled proposal weave hash is not a SHA-256 digest"
+        );
+        Ok(Self {
+            proposal_id: proposal_id.to_string(),
+            familiar_id: familiar_id.to_string(),
+            weave_hash: weave_hash.to_vec(),
+            body_sha256: sha256_hex(body),
+        })
+    }
+
+    pub(crate) fn proposal_id(&self) -> &str {
+        &self.proposal_id
+    }
+
+    pub(crate) fn familiar_id(&self) -> &str {
+        &self.familiar_id
+    }
+
+    pub(crate) fn weave_hash(&self) -> &[u8] {
+        &self.weave_hash
+    }
+
+    pub(crate) fn matches_body(&self, body: &[u8]) -> bool {
+        self.body_sha256 == sha256_hex(body)
+    }
+
+    fn purpose(&self) -> Result<String> {
+        Ok(format!(
+            "{SCHEDULED_SUBMISSION_RECOVERY_PREFIX}{}",
+            serde_json::to_string(self)
+                .context("serializing scheduled submission recovery authority")?
+        ))
+    }
+}
+
+pub(crate) fn parse_scheduled_submission_recovery(
+    purpose: &str,
+) -> Result<Option<ScheduledSubmissionRecovery>> {
+    let Some(encoded) = purpose.strip_prefix(SCHEDULED_SUBMISSION_RECOVERY_PREFIX) else {
+        return Ok(None);
+    };
+    let recovery: ScheduledSubmissionRecovery =
+        serde_json::from_str(encoded).context("parsing scheduled submission recovery authority")?;
+    uuid::Uuid::parse_str(&recovery.proposal_id)
+        .context("scheduled submission recovery proposal id is invalid")?;
+    anyhow::ensure!(
+        !recovery.familiar_id.is_empty(),
+        "scheduled submission recovery familiar id is empty"
+    );
+    anyhow::ensure!(
+        recovery.weave_hash.len() == 32,
+        "scheduled submission recovery weave hash is invalid"
+    );
+    anyhow::ensure!(
+        recovery.body_sha256.len() == 64
+            && recovery
+                .body_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "scheduled submission recovery body digest is invalid"
+    );
+    Ok(Some(recovery))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1061,7 +1146,7 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
 /// The decide path re-probes this sidecar, keeps Tier-1 outside the weave, and
 /// clears only `RequiresCoherenceReview` after an explicit principal approval.
 pub(crate) fn stage_coherence_proposal(
-    conn: &Connection,
+    audit_reservation: &mut crate::store::WardAuditReservation<'_>,
     coven_home: &Path,
     familiar_id: &str,
     workspace: &Path,
@@ -1076,7 +1161,16 @@ pub(crate) fn stage_coherence_proposal(
     };
     let now = crate::threads_clock::now(coven_home)?;
     // Read-only weave view: coherence staging must not bootstrap baselines.
-    let state = build_weave_state_at(conn, familiar_id, workspace, config, &[], false, now)?;
+    let state = build_weave_state_at(
+        audit_reservation.connection(),
+        familiar_id,
+        workspace,
+        config,
+        &[],
+        false,
+        now,
+    )?;
+    let weave_hash = state.weave.weave_hash().to_vec();
     let thread_id = threads::ThreadId::new();
     let lane = StagingLane {
         thread_id,
@@ -1088,6 +1182,11 @@ pub(crate) fn stage_coherence_proposal(
     let pending = pending_proposal(&state.familiar_uuid, &request_writer, &lane, edits, now);
     let staging = match config.compiled_approval_tiers()? {
         Some(bindings) => stage_scheduled_coherence_proposal(
+            ScheduledSubmissionContext {
+                audit_reservation,
+                familiar_id,
+                weave_hash: &weave_hash,
+            },
             coven_home,
             pending,
             edits,
@@ -1117,56 +1216,42 @@ pub(crate) fn stage_coherence_proposal(
                 pending_path,
                 proposal_id,
                 scheduled: None,
-                identity_evidence: None,
             }
         }
     };
 
-    let files_touched = serde_json::to_string(
-        &edits
-            .iter()
-            .map(|edit| edit.target.as_str())
-            .collect::<Vec<_>>(),
-    )?;
-    let format = time::format_description::well_known::Rfc3339;
-    let now_text = now.format(&format)?;
-    let detail = staging
-        .scheduled
-        .as_ref()
-        .map(|scheduled| {
-            serde_json::to_string(&json!({
-                "classification": scheduled.classification(),
-                "veto_deadline": scheduled.veto_deadline(),
-                "earliest_close": scheduled.earliest_close(),
-                "identity_evidence": staging.identity_evidence,
-            }))
-        })
-        .transpose()?;
-    conn.execute(
-        "INSERT INTO ward_audit (
-            event_type, proposal_id, familiar_id, ward_version, ward_hash,
-            tier, decision, approver, diff_hash, files_touched, channel,
-            thread_id, submitted_at, decided_at, detail
-        ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?10, ?9, ?9, ?11)",
-        rusqlite::params![
-            threads::AuditEventType::ProposalSubmitted.tag(),
-            staging.proposal_id.as_str(),
-            familiar_id,
-            state.weave.weave_hash(),
-            i64::from(u8::from(ward::Tier::Reviewed)),
-            if staging.scheduled.is_some() {
-                "staged:scheduled"
-            } else {
-                "staged:coherence"
-            },
-            files_touched,
-            format!("{:?}", threads::Channel::Mutation).to_lowercase(),
-            now_text,
-            thread_id.0.to_string(),
-            detail,
-        ],
-    )
-    .context("appending proposal_submitted audit for coherence staging")?;
+    if staging.scheduled.is_none() {
+        let files_touched = serde_json::to_string(
+            &edits
+                .iter()
+                .map(|edit| edit.target.as_str())
+                .collect::<Vec<_>>(),
+        )?;
+        let format = time::format_description::well_known::Rfc3339;
+        let now_text = now.format(&format)?;
+        audit_reservation
+            .connection()
+            .execute(
+                "INSERT INTO ward_audit (
+                event_type, proposal_id, familiar_id, ward_version, ward_hash,
+                tier, decision, approver, diff_hash, files_touched, channel,
+                thread_id, submitted_at, decided_at, detail
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?10, ?9, ?9, NULL)",
+                rusqlite::params![
+                    threads::AuditEventType::ProposalSubmitted.tag(),
+                    staging.proposal_id.as_str(),
+                    familiar_id,
+                    &weave_hash,
+                    i64::from(u8::from(ward::Tier::Reviewed)),
+                    "staged:coherence",
+                    files_touched,
+                    format!("{:?}", threads::Channel::Mutation).to_lowercase(),
+                    now_text,
+                    thread_id.0.to_string(),
+                ],
+            )
+            .context("appending proposal_submitted audit for coherence staging")?;
+    }
 
     Ok(staging)
 }
@@ -1186,6 +1271,12 @@ struct StagingProbeContext<'a> {
     workspace: &'a Path,
     config: &'a ward::WardConfig,
     authorization: &'a ward::Authorization,
+}
+
+struct ScheduledSubmissionContext<'a, 'conn> {
+    audit_reservation: &'a mut crate::store::WardAuditReservation<'conn>,
+    familiar_id: &'a str,
+    weave_hash: &'a [u8],
 }
 
 fn stage_pending_proposal(
@@ -1292,6 +1383,7 @@ fn stage_legacy_pending_proposal(
 }
 
 fn stage_scheduled_coherence_proposal(
+    submission: ScheduledSubmissionContext<'_, '_>,
     coven_home: &Path,
     pending: threads::PendingProposal,
     edits: &[ward::FileEdit],
@@ -1413,13 +1505,117 @@ fn stage_scheduled_coherence_proposal(
         .context("serializing scheduled proposal")?
     };
     crate::api::validate_proposal_envelope_preflight(&body)?;
+    let recovery = ScheduledSubmissionRecovery::new(
+        &scheduled.pending().id.0.to_string(),
+        submission.familiar_id,
+        submission.weave_hash,
+        &body,
+    )?;
+    submission
+        .audit_reservation
+        .replace_purpose(&recovery.purpose()?)?;
+    submission.audit_reservation.preserve_if_unfinished();
     crate::proposal_store::publish_new(coven_home, &path, &body)?;
+    maybe_fail_scheduled_submission_after_publish(coven_home)?;
+    append_scheduled_submission_audit(
+        submission.audit_reservation.connection(),
+        &scheduled,
+        identity_evidence,
+        submission.familiar_id,
+        submission.weave_hash,
+    )?;
     Ok(StagedCoherenceProposal {
         pending_path: path,
         proposal_id: scheduled.pending().id.0.to_string(),
         scheduled: Some(scheduled),
-        identity_evidence,
     })
+}
+
+pub(crate) fn append_scheduled_submission_audit(
+    conn: &Connection,
+    scheduled: &crate::proposal_scheduler::ScheduledProposal,
+    identity_evidence: Option<[u8; 32]>,
+    familiar_id: &str,
+    weave_hash: &[u8],
+) -> Result<()> {
+    anyhow::ensure!(
+        crate::threads_gate::familiar_weave_id(familiar_id) == scheduled.pending().familiar_id,
+        "scheduled proposal familiar does not match submission authority"
+    );
+    anyhow::ensure!(
+        weave_hash.len() == 32,
+        "scheduled proposal weave hash is not a SHA-256 digest"
+    );
+    let pending = scheduled.pending();
+    let files_touched = serde_json::to_string(
+        &pending
+            .edits
+            .iter()
+            .map(|edit| edit.surface.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    let submitted_at = pending
+        .staged_at
+        .format(&time::format_description::well_known::Rfc3339)?;
+    let detail = serde_json::to_string(&json!({
+        "classification": scheduled.classification(),
+        "veto_deadline": scheduled.veto_deadline(),
+        "earliest_close": scheduled.earliest_close(),
+        "identity_evidence": identity_evidence,
+    }))?;
+    conn.execute(
+        "INSERT INTO ward_audit (
+            event_type, proposal_id, familiar_id, ward_version, ward_hash,
+            tier, decision, approver, diff_hash, files_touched, channel,
+            thread_id, submitted_at, decided_at, detail
+        ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'staged:scheduled', NULL, NULL, ?6, ?7, ?8, ?9, ?9, ?10)",
+        rusqlite::params![
+            threads::AuditEventType::ProposalSubmitted.tag(),
+            pending.id.0.to_string(),
+            familiar_id,
+            weave_hash,
+            i64::from(u8::from(ward::Tier::Reviewed)),
+            files_touched,
+            format!("{:?}", pending.channel).to_lowercase(),
+            pending.thread_id.0.to_string(),
+            submitted_at,
+            detail,
+        ],
+    )
+    .context("appending scheduled proposal submission audit")?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn scheduled_submission_failpoints() -> &'static std::sync::Mutex<BTreeSet<PathBuf>> {
+    static FAILPOINTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    FAILPOINTS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_scheduled_submission_after_publish(coven_home: &Path) {
+    scheduled_submission_failpoints()
+        .lock()
+        .expect("scheduled submission failpoint lock poisoned")
+        .insert(coven_home.to_path_buf());
+}
+
+#[cfg(test)]
+fn maybe_fail_scheduled_submission_after_publish(coven_home: &Path) -> Result<()> {
+    if scheduled_submission_failpoints()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("scheduled submission failpoint lock poisoned"))?
+        .remove(coven_home)
+    {
+        anyhow::bail!("injected failure after scheduled proposal publication");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_scheduled_submission_after_publish(_coven_home: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn materialize_diff(
