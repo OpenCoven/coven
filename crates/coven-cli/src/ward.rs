@@ -386,19 +386,21 @@ impl WardConfig {
     /// ignored: a malformed Ward must not degrade into "no Ward".
     pub fn load(home: &Path) -> Result<Option<Self>> {
         let path = home.join(WARD_CONFIG_FILE);
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => {
-                return Err(anyhow!("reading ward config {}: {err}", path.display()));
+                return Err(err).with_context(|| format!("reading ward config {}", path.display()));
             }
         };
-        if let Some(remnants) = legacy_invariant_remnants(&raw) {
+        let raw = std::str::from_utf8(&bytes)
+            .with_context(|| format!("decoding ward config {}", path.display()))?;
+        if let Some(remnants) = legacy_invariant_remnants(raw) {
             bail!(
                 "ward.toml still carries a retired [protected].invariants remnant ({remnants}); move these declarations into [[identity_invariant]] tables"
             );
         }
-        let config = Self::from_toml_str(&raw)
+        let config = Self::from_toml_str(raw)
             .with_context(|| format!("invalid ward config at {}", path.display()))?;
         // The archive detects lost activation, not policy changes after migration.
         if config.identity_invariants.is_empty() && backup_carries_identity_invariants(home)? {
@@ -550,15 +552,17 @@ fn legacy_invariant_remnants(raw: &str) -> Option<String> {
 
 fn backup_carries_identity_invariants(home: &Path) -> Result<bool> {
     let backup = home.join(LEGACY_WARD_BACKUP_FILE);
-    let raw = match std::fs::read_to_string(&backup) {
-        Ok(raw) => raw,
+    let bytes = match std::fs::read(&backup) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("reading legacy Ward backup {}", backup.display()))
         }
     };
-    let value: toml::Value = toml::from_str(&raw)
+    let raw = std::str::from_utf8(&bytes)
+        .with_context(|| format!("decoding legacy Ward backup {}", backup.display()))?;
+    let value: toml::Value = toml::from_str(raw)
         .with_context(|| format!("parsing legacy Ward backup {}", backup.display()))?;
     let declarations = value
         .get("protected")

@@ -50,11 +50,31 @@ remains valid and does not fabricate close evidence.
 
 ## Recover without granting authority
 
+Scheduled publication binds the exact pending-file bytes, including identity and
+probe evidence, in a durable audit reservation before exposing the file. After
+an interruption, scheduler and decision entry can reconstruct a missing
+submission receipt only from that binding. Changed bytes cannot acquire a new
+receipt through recovery, and existing duplicate or inconsistent receipts still
+fail the ordinary receipt gate. Recoverable publication failures retain and log
+the binding for retry. The scheduler explicitly defers those proposal IDs and
+paths, so their missing receipts do not trigger quarantine and unrelated due
+work, terminal cleanup, and cursor progression continue. A direct decision for
+the affected proposal reports the reconstruction failure instead of claiming it.
+Global database failures still fail the pass rather than masquerading as partial
+recovery.
+
 An unapplied proposal with an existing window fails closed when its familiar,
-Ward configuration, or authoritative replay becomes unavailable. Its rejection
-uses `revalidation_failed` and `replay_hash_matched = false`. If live weave
-construction fails, recovery retains the committed window hash as audit
-context. That hash is not evidence that current bytes matched.
+Ward configuration, or authoritative replay is confirmed absent or invalid.
+Its rejection uses `revalidation_failed` and `replay_hash_matched = false`. If
+live weave construction fails, recovery retains the committed window hash as
+audit context. That hash is not evidence that current bytes matched.
+
+An I/O failure reading the familiar registry or Ward configuration is not proof
+of missing or invalid authority. Recovery retains the durable request, applying
+state, and reservation for retry rather than closing or quarantining solely
+because of that read failure. Byte reads are separate from UTF-8 decoding:
+invalid UTF-8, like invalid TOML, is invalid authority content rather than a
+transient I/O failure. This also applies when the legacy Ward backup is consulted.
 
 Live promotion to a protected target still rejects before mutation. An
 unavailable replay cannot turn that rejection into an indefinitely pending
