@@ -307,7 +307,9 @@ fn migrate_one(
         principal_key_fingerprint: fingerprint.to_string(),
         protected_surface: protected_files.clone(),
         default_tier: Tier::Logged,
-        editable: (!harness_blocks.is_empty()).then_some(EditableConfig { harness_blocks }),
+        editable: approval_tiers
+            .as_ref()
+            .map(|_| EditableConfig { harness_blocks }),
         approval_tiers,
         surface: protected_files
             .iter()
