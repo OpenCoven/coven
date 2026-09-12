@@ -6795,36 +6795,6 @@ mod tests {
 
     #[test]
     fn stop_cleanup_does_not_run_after_the_outer_lifecycle_deadline() -> Result<()> {
-        struct SlowVerifiedStop;
-        impl DaemonStopController for SlowVerifiedStop {
-            fn stop_verified_daemon(
-                &self,
-                _coven_home: &Path,
-                _status: &DaemonStatus,
-                deadline: LifecycleDeadline,
-            ) -> Result<VerifiedStopOutcome> {
-                let remaining = deadline.remaining("forcing the test stop deadline to expire")?;
-                std::thread::sleep(remaining.saturating_add(Duration::from_millis(10)));
-                Ok(VerifiedStopOutcome::Exited)
-            }
-
-            fn recorded_process_state(
-                &self,
-                _status: &DaemonStatus,
-            ) -> Result<RecordedProcessState> {
-                Ok(RecordedProcessState::Gone)
-            }
-
-            fn status_matches_running_daemon(
-                &self,
-                _coven_home: &Path,
-                _status: &DaemonStatus,
-                _deadline: LifecycleDeadline,
-            ) -> Result<bool> {
-                Ok(false)
-            }
-        }
-
         let temp_dir = tempfile::tempdir()?;
         let status = DaemonStatus {
             pid: 42,
@@ -6833,10 +6803,15 @@ mod tests {
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
-        let error = stop_background_server_with_controller_until(
+        let socket_path = daemon_socket_path(temp_dir.path());
+        let socket_marker = b"synthetic cleanup sentinel";
+        std::fs::write(&socket_path, socket_marker)?;
+
+        // Enter the actual cleanup phase with an expired deadline; status I/O
+        // and shared-runner scheduling must not decide which phase is tested.
+        let error = clear_status_and_socket_until(
             temp_dir.path(),
-            &SlowVerifiedStop,
-            LifecycleDeadline::after(Duration::from_millis(100))?,
+            LifecycleDeadline::from_instant(Instant::now()),
         )
         .expect_err("cleanup must not start after the original stop budget");
 
@@ -6846,6 +6821,44 @@ mod tests {
                 .contains("timed out cleaning up Coven daemon lifecycle state"),
             "unexpected timeout phase: {error:#}"
         );
+        assert_eq!(read_status(temp_dir.path())?, Some(status));
+        assert_eq!(std::fs::read(&socket_path)?, socket_marker);
+        clear_status_and_socket(temp_dir.path())?;
+        assert_eq!(read_status(temp_dir.path())?, None);
+        assert!(!socket_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn stop_with_expired_outer_deadline_preserves_status_without_signaling() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 42,
+            started_at: "2026-08-16T00:00:00Z".to_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
+        };
+        write_status(temp_dir.path(), &status)?;
+        let signaled = std::sync::Arc::default();
+        let controller = FakeStopController {
+            pid_alive: true,
+            exited_after_signal: true,
+            signal_error: None,
+            verified_daemon: true,
+            signaled: std::sync::Arc::clone(&signaled),
+        };
+        let error = stop_background_server_with_controller_until(
+            temp_dir.path(),
+            &controller,
+            LifecycleDeadline::from_instant(Instant::now()),
+        )
+        .expect_err("an expired outer deadline must stop before reading status");
+
+        assert_eq!(
+            error.to_string(),
+            "timed out reading Coven daemon lifecycle status"
+        );
+        assert_eq!(*signaled.lock().unwrap(), 0);
         assert_eq!(read_status(temp_dir.path())?, Some(status));
         Ok(())
     }
