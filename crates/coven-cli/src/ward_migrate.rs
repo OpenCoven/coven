@@ -341,7 +341,9 @@ fn migrate_one(
         principal_key_fingerprint: fingerprint.to_string(),
         protected_surface: protected_files.clone(),
         default_tier: Tier::Logged,
-        editable: (!harness_blocks.is_empty()).then_some(EditableConfig { harness_blocks }),
+        editable: approval_tiers
+            .as_ref()
+            .map(|_| EditableConfig { harness_blocks }),
         approval_tiers,
         surface: protected_files
             .iter()
@@ -807,6 +809,98 @@ append_only = true
         )?;
         assert!(!second.has_errors());
         assert_eq!(second.entries[0].status, MigrationStatus::AlreadyMigrated);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_without_approval_tiers_keeps_legacy_harness_blocks_at_tier2() -> Result<()> {
+        for apply in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let workspace = seed_familiars(temp.path())?;
+            let original = r#"[meta]
+version = "0.1"
+owner = "nova"
+
+[editable]
+paths = ["TOOLS.md"]
+harness_blocks = ["legacy_unbound_block"]
+"#;
+            fs::write(workspace.join("ward.toml"), original)?;
+            let report = run_migration(
+                temp.path(),
+                WardMigrateOptions {
+                    familiar: Some("nova".to_string()),
+                    fingerprint: "SHA256:test-principal".to_string(),
+                    apply,
+                },
+            )?;
+            assert!(!report.has_errors(), "{report:?}");
+            let entry = &report.entries[0];
+            assert_eq!(
+                entry.status,
+                if apply {
+                    MigrationStatus::Migrated
+                } else {
+                    MigrationStatus::WouldMigrate
+                }
+            );
+            let generated = entry.generated_toml.as_deref().expect("generated config");
+            let config = WardConfig::from_toml_str(generated)?;
+            assert!(config.editable.is_none());
+            assert!(config.compiled_approval_tiers()?.is_none());
+            assert_eq!(config.classify_resolved_path("TOOLS.md")?, Tier::Logged);
+            assert_eq!(migrated_editable_tier(entry), 2);
+            if apply {
+                assert_eq!(
+                    fs::read_to_string(workspace.join("ward.toml.v01.bak"))?,
+                    original
+                );
+                assert_eq!(load_migrated_config(&workspace)?, config);
+            } else {
+                assert_eq!(fs::read_to_string(workspace.join("ward.toml"))?, original);
+                assert!(!workspace.join("ward.toml.v01.bak").exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_refuses_approval_tiers_without_harness_blocks_without_writing() -> Result<()> {
+        for editable in [
+            "",
+            "[editable]\npaths = [\"TOOLS.md\"]\n",
+            "[editable]\nharness_blocks = []\n",
+        ] {
+            let temp = tempfile::tempdir()?;
+            let workspace = seed_familiars(temp.path())?;
+            let original = format!(
+                r#"[meta]
+version = "0.1"
+owner = "nova"
+
+{editable}
+[approval_tiers.human_review]
+blocks = ["tool_defaults"]
+gate = "human_approval"
+"#
+            );
+            fs::write(workspace.join("ward.toml"), &original)?;
+            let report = run_migration(
+                temp.path(),
+                WardMigrateOptions {
+                    familiar: Some("nova".to_string()),
+                    fingerprint: "SHA256:test-principal".to_string(),
+                    apply: true,
+                },
+            )?;
+            assert!(report.has_errors());
+            assert_eq!(report.entries[0].status, MigrationStatus::ValidationFailed);
+            assert!(report.entries[0]
+                .message
+                .contains("harness_blocks must not be empty"));
+            assert_eq!(fs::read_to_string(workspace.join("ward.toml"))?, original);
+            assert!(!workspace.join("ward.toml.v01.bak").exists());
+        }
         Ok(())
     }
 

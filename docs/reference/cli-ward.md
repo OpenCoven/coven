@@ -357,6 +357,11 @@ values and refuses ambiguous declarations without rewriting the source or
 creating a backup. A minimum is invalid without a veto window and on human
 approval paths. The command exits non-zero if any migration fails.
 
+Legacy harness-block names without approval tiers do not create scheduled
+approval policy: migrated editable paths remain Tier 2, and the original names
+remain in the backup. Approval tiers without nonempty harness blocks are
+rejected without rewriting the source or creating a backup.
+
 Accepted retired invariants become active `[[identity_invariant]]` entries,
 not backup-only annotations. You keep the original configuration in
 `ward.toml.v01.bak`.

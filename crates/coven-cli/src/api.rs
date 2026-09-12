@@ -41886,6 +41886,12 @@ tier = 0
             "heartbeat_behavior"
         );
         let document = ProposalEnvelopeDocument::parse_preflighted(raw.as_bytes())?;
+        assert!(document.identity_evidence.is_some());
+        let mut restored = parse_proposal_envelope(&document.authority_bytes()?)?;
+        assert_eq!(document.identity_evidence, restored.identity_evidence);
+        assert_eq!(document.revision()?, restored.revision()?);
+        restored.identity_evidence = None;
+        assert_ne!(document.revision()?, restored.revision()?);
         let scheduled = document
             .scheduled()
             .context("supported intake must stage a scheduled proposal")?;
@@ -41955,6 +41961,79 @@ tier = 0
             "after heartbeat\n"
         );
         assert!(!pending_path.exists(), "replayed proposal must be consumed");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_scheduled_identity_drift_closes_window_without_writing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = Path::new(body["pendingPath"].as_str().context("pending path")?);
+        let document = read_pending_proposal_document(pending)?;
+        std::fs::write(
+            workspace.join("SOUL.md"),
+            format!(
+                "{}\nAn additional source revision.\n",
+                valid_identity_soul()
+            ),
+        )?;
+        let config = ward::WardConfig::load(&workspace)?.context("active config")?;
+        let context = crate::ward_identity::candidate_identity_context(
+            home,
+            "sage",
+            &workspace,
+            &config,
+            &staged_edits_to_ward_edits(document.pending())?,
+            &authorization_from_writer(&document.pending().writer),
+            None,
+        );
+        assert!(crate::ward_identity::candidate_rejection(&config, context.as_ref())?.is_none());
+        assert_ne!(
+            crate::ward_identity::candidate_binding(&config, context.as_ref())?,
+            document.identity_evidence
+        );
+        crate::threads_clock::with_test_time(
+            home,
+            time::OffsetDateTime::now_utc() + time::Duration::hours(2),
+            || -> Result<()> {
+                assert_eq!(process_due_threads_proposals(home)?, 1);
+                Ok(())
+            },
+        )?;
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let detail: String = conn.query_row(
+            "SELECT detail FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        let close: coven_threads_core::ProposalWindowCloseAuditDetail =
+            serde_json::from_str(&detail)?;
+        assert_eq!(
+            close.reason,
+            coven_threads_core::WindowCloseReason::EvidenceDiverged
+        );
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        let terminals: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
+             AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminals, 1);
         Ok(())
     }
 
