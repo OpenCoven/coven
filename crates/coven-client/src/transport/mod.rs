@@ -175,11 +175,6 @@ fn request_with_peer(
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
     validate_request_line(method, path)?;
-    if !allowed_request_route(method, path) {
-        return Err(ClientError::InvalidHttpResponse(
-            "attempted request outside /api/v1 or exact GET /health".to_owned(),
-        ));
-    }
     if let Some(body) = body {
         if body.len() > MAX_REQUEST_BODY_BYTES {
             return Err(ClientError::RequestTooLarge {
@@ -232,6 +227,11 @@ pub(crate) fn validate_request_line(method: &str, path: &str) -> Result<(), Clie
     if !valid_request_target(path) {
         return Err(ClientError::InvalidRouteParameter("HTTP request target"));
     }
+    if !allowed_request_route(method, path) {
+        return Err(ClientError::InvalidRouteParameter(
+            "HTTP request target outside /api/v1 or exact GET /health",
+        ));
+    }
     Ok(())
 }
 
@@ -268,7 +268,7 @@ fn valid_request_target(path: &str) -> bool {
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'#')
 }
 
-pub(crate) fn allowed_request_route(method: &str, path: &str) -> bool {
+fn allowed_request_route(method: &str, path: &str) -> bool {
     path.starts_with("/api/v1/") || (method == "GET" && path == "/health")
 }
 
@@ -380,6 +380,18 @@ mod tests {
     fn request_target_guard_allows_health_only_for_get() {
         assert!(super::allowed_request_route("GET", "/health"));
         assert!(!super::allowed_request_route("POST", "/health"));
+    }
+
+    #[test]
+    fn request_line_reports_out_of_scope_routes_as_client_input_errors() {
+        let error = super::validate_request_line("POST", "/health")
+            .expect_err("POST /health must be rejected before any I/O");
+        assert!(matches!(
+            error,
+            ClientError::InvalidRouteParameter(
+                "HTTP request target outside /api/v1 or exact GET /health"
+            )
+        ));
     }
 
     #[test]

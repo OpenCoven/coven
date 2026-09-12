@@ -228,11 +228,7 @@ impl DaemonClient {
 }
 
 fn validate_raw_request(method: &str, path: &str) -> Result<(), ClientError> {
-    transport::validate_request_line(method, path)?;
-    if !transport::allowed_request_route(method, path) {
-        return Err(ClientError::InvalidRouteParameter("HTTP request target"));
-    }
-    Ok(())
+    transport::validate_request_line(method, path)
 }
 
 fn daemon_error(status: u16, body: Vec<u8>) -> Result<ClientError, ClientError> {
