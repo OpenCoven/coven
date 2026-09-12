@@ -254,6 +254,14 @@ mutation before proposal lookup or audit mutation; UUID secrecy is never an
 authorization control. Automatic expiry/apply and interrupted-decision
 recovery are internal daemon work and have no TCP route.
 
+On upgrade, an interrupted historical decision must match its original
+reservation, append-only apply intent, and versioned recovery evidence.
+An unknown historical decider stays explicitly unknown in the audit
+(`unknown:historical` with `decisionOrigin.kind = historical_unknown`), never
+the proposal writer or an invented human. Missing proof requires renewed
+review; potentially applied bytes and their evidence remain preserved rather
+than being mislabeled as corruption or silently approved.
+
 ```sh
 coven ward approve <id> --note "reviewed identity change"
 coven ward reject <id> --note "needs revision"

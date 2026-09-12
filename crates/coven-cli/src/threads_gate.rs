@@ -125,6 +125,7 @@ pub(crate) struct StagedCoherenceProposal {
     pub pending_path: PathBuf,
     pub proposal_id: String,
     pub scheduled: Option<crate::proposal_scheduler::ScheduledProposal>,
+    pub identity_evidence: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1134,6 +1135,7 @@ pub(crate) fn stage_coherence_proposal(
                 pending_path,
                 proposal_id,
                 scheduled: None,
+                identity_evidence: None,
             }
         }
     };
@@ -1154,6 +1156,7 @@ pub(crate) fn stage_coherence_proposal(
                 "classification": scheduled.classification(),
                 "veto_deadline": scheduled.veto_deadline(),
                 "earliest_close": scheduled.earliest_close(),
+                "identity_evidence": staging.identity_evidence,
             }))
         })
         .transpose()?;
@@ -1426,6 +1429,7 @@ fn stage_scheduled_coherence_proposal(
         pending_path: path,
         proposal_id: scheduled.pending().id.0.to_string(),
         scheduled: Some(scheduled),
+        identity_evidence,
     })
 }
 

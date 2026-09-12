@@ -1422,6 +1422,7 @@ pub struct WardAuditReservation<'a> {
     conn: &'a Connection,
     reservation_id: String,
     store_id: String,
+    reused_existing: bool,
     preserve_on_drop: bool,
     finished: bool,
 }
@@ -1664,9 +1665,35 @@ impl<'a> WardAuditReservation<'a> {
             conn,
             reservation_id: reservation_token,
             store_id,
+            reused_existing: previous_reserved_bytes.is_some(),
             preserve_on_drop: previous_reserved_bytes.is_some(),
             finished: false,
         })
+    }
+
+    pub fn reused_existing(&self) -> bool {
+        self.reused_existing
+    }
+
+    pub fn replace_purpose(&self, purpose: &str) -> Result<()> {
+        anyhow::ensure!(
+            !purpose.trim().is_empty(),
+            "Ward audit reservation purpose is empty"
+        );
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE coven_ward_audit_reservations
+                 SET purpose = ?2
+                 WHERE token = ?1",
+                params![&self.reservation_id, purpose],
+            )
+            .context("failed to replace Ward audit reservation purpose")?;
+        anyhow::ensure!(
+            updated == 1,
+            "active Ward audit reservation disappeared before purpose replacement"
+        );
+        Ok(())
     }
 
     pub fn connection(&self) -> &Connection {

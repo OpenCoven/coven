@@ -746,6 +746,9 @@ append_only = true
         assert!(generated.contains("operator = \"includes\""));
         assert!(generated.contains("expected = \"authority boundary\""));
         assert!(generated.contains("expected = \"OpenCoven\""));
+        assert!(generated.contains("harness_blocks"));
+        assert!(generated.contains("[approval_tiers.familiar_review]"));
+        assert!(generated.contains("min_visible_seconds = 900"));
         assert!(!generated.contains("[audit]"));
         let config = WardConfig::from_toml_str(generated)?;
         assert_eq!(config.principal_key_fingerprint, "SHA256:test-principal");

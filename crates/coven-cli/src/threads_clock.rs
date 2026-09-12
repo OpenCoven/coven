@@ -37,6 +37,8 @@ const FINAL_COMMIT_PAUSE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClockSource {
     WallClock,
+    #[cfg(test)]
+    UnitTest,
     #[cfg(feature = "threads-test-clock")]
     DeterministicFixture,
 }
@@ -46,6 +48,8 @@ impl ClockSource {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::WallClock => "wall_clock",
+            #[cfg(test)]
+            Self::UnitTest => "unit_test",
             Self::DeterministicFixture => "deterministic_fixture",
         }
     }
@@ -61,7 +65,40 @@ pub(crate) fn now(coven_home: &Path) -> Result<OffsetDateTime> {
     snapshot(coven_home).map(|snapshot| snapshot.now)
 }
 
+#[cfg(test)]
+thread_local! {
+    static UNIT_TEST_TIMES: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf, OffsetDateTime>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_time<T>(home: &Path, now: OffsetDateTime, action: impl FnOnce() -> T) -> T {
+    struct RestoreTime(std::path::PathBuf, Option<OffsetDateTime>);
+    impl Drop for RestoreTime {
+        fn drop(&mut self) {
+            UNIT_TEST_TIMES.with(|times| {
+                let mut times = times.borrow_mut();
+                if let Some(previous) = self.1 {
+                    times.insert(self.0.clone(), previous);
+                } else {
+                    times.remove(&self.0);
+                }
+            });
+        }
+    }
+    let previous = UNIT_TEST_TIMES.with(|times| times.borrow_mut().insert(home.to_path_buf(), now));
+    let _restore = RestoreTime(home.to_path_buf(), previous);
+    action()
+}
+
 pub(crate) fn snapshot(coven_home: &Path) -> Result<ClockSnapshot> {
+    #[cfg(test)]
+    if let Some(now) = UNIT_TEST_TIMES.with(|times| times.borrow().get(coven_home).copied()) {
+        return Ok(ClockSnapshot {
+            now,
+            source: ClockSource::UnitTest,
+        });
+    }
     #[cfg(feature = "threads-test-clock")]
     if let Some(fixture) = ActiveFixture::load(coven_home)? {
         return Ok(ClockSnapshot {
@@ -450,6 +487,33 @@ fn secure_fixture_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_test_time_is_scoped_to_home_and_restored() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("first");
+        let other = temp.path().join("second");
+        let earlier = OffsetDateTime::UNIX_EPOCH;
+        let later = earlier + time::Duration::days(1);
+        with_test_time(&home, earlier, || -> Result<()> {
+            assert_eq!(
+                snapshot(&home)?,
+                ClockSnapshot {
+                    now: earlier,
+                    source: ClockSource::UnitTest
+                }
+            );
+            assert_eq!(snapshot(&other)?.source, ClockSource::WallClock);
+            with_test_time(&home, later, || -> Result<()> {
+                assert_eq!(now(&home)?, later);
+                Ok(())
+            })?;
+            assert_eq!(now(&home)?, earlier);
+            Ok(())
+        })?;
+        assert_eq!(snapshot(&home)?.source, ClockSource::WallClock);
+        Ok(())
+    }
 
     #[test]
     fn default_snapshot_uses_wall_clock() -> Result<()> {

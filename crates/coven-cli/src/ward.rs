@@ -502,6 +502,35 @@ impl WardConfig {
             .map(Some)
             .map_err(|error| anyhow!(error))
     }
+
+    pub(crate) fn historical_recovery_v2_bytes(&self) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            self.editable.is_none() && self.approval_tiers.is_none(),
+            "historical v2 Ward encoding cannot represent regional approval policy"
+        );
+        // Recovery v2 committed raw serde bytes in this exact pre-publication
+        // order. Keep it separate from TOML layout and the current v3 encoder.
+        #[derive(Serialize)]
+        struct HistoricalWardConfig<'a> {
+            principal_key_fingerprint: &'a str,
+            surface: &'a [SurfaceEntry],
+            protected_surface: &'a [String],
+            default_tier: Tier,
+            #[serde(rename = "identity_invariant", skip_serializing_if = "<[_]>::is_empty")]
+            identity_invariants: &'a [IdentityInvariantDeclaration],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            probe: &'a [ProbeConfig],
+        }
+        serde_json::to_vec(&HistoricalWardConfig {
+            principal_key_fingerprint: &self.principal_key_fingerprint,
+            surface: &self.surface,
+            protected_surface: &self.protected_surface,
+            default_tier: self.default_tier,
+            identity_invariants: &self.identity_invariants,
+            probe: &self.probe,
+        })
+        .context("serializing historical v2 Ward config")
+    }
 }
 
 fn legacy_invariant_remnants(raw: &str) -> Option<String> {
@@ -539,16 +568,18 @@ fn backup_carries_identity_invariants(home: &Path) -> Result<bool> {
 
 impl WardConfig {
     pub(crate) fn classify_resolved_path(&self, resolved: &str) -> Result<Tier> {
-        let mut tier = self.default_tier;
+        let mut tier: Option<Tier> = None;
         for entry in &self.surface {
             let matcher = compile_glob(&entry.path, false)
                 .with_context(|| format!("invalid surface glob `{}`", entry.path))?
                 .compile_matcher();
-            if matcher.is_match(resolved) && entry.tier.as_u8() < tier.as_u8() {
-                tier = entry.tier;
+            if matcher.is_match(resolved)
+                && tier.is_none_or(|current| entry.tier.as_u8() < current.as_u8())
+            {
+                tier = Some(entry.tier);
             }
         }
-        Ok(tier)
+        Ok(tier.unwrap_or(self.default_tier))
     }
 
     pub(crate) fn compiled_approval_tiers(&self) -> Result<Option<CompiledApprovalTiers>> {
@@ -1729,6 +1760,7 @@ impl Ward {
             &expected_before,
             mode,
             final_authority_check,
+            None,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -1814,6 +1846,7 @@ impl Ward {
             expected_before,
             mode,
             final_authority_check,
+            None,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -1854,6 +1887,8 @@ impl Ward {
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let anchored_home = AnchoredHome::open(&self.home)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let ward_config = open_expected_ward_config(&anchored_home, &self.config)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let proposal = Proposal {
             targets: edits.iter().map(|edit| edit.target.clone()).collect(),
             authorization: authorization.clone(),
@@ -1891,6 +1926,7 @@ impl Ward {
             expected_before,
             mode,
             final_authority_check,
+            Some(&ward_config),
         )?;
         Ok(ApplyReport { changes })
     }
@@ -2115,6 +2151,25 @@ impl PartialEq<&Path> for AnchoredEntry {
     }
 }
 
+fn open_expected_ward_config(
+    home: &AnchoredHome,
+    expected: &WardConfig,
+) -> Result<ExpectedControlFile> {
+    let path = AnchoredEntry::new(
+        Arc::clone(&home.dir),
+        &home.absolute,
+        OsStr::new(WARD_CONFIG_FILE),
+    );
+    let observed = open_regular_file_without_following_links(&path)?
+        .context("Ward config disappeared before approved apply")?;
+    let raw = std::str::from_utf8(&observed.contents).context("Ward config is not UTF-8")?;
+    let current = WardConfig::from_toml_str(raw).context("Ward config became invalid")?;
+    if &current != expected {
+        bail!("Ward config changed before approved apply");
+    }
+    Ok(ExpectedControlFile { path, observed })
+}
+
 struct AnchoredParent {
     dir: Arc<Dir>,
     absolute: PathBuf,
@@ -2142,6 +2197,11 @@ impl ApprovedWritePaths {
 struct OpenRegularFile {
     file: std::fs::File,
     contents: Vec<u8>,
+}
+
+struct ExpectedControlFile {
+    path: AnchoredEntry,
+    observed: OpenRegularFile,
 }
 
 struct PreparedDirectWrite<'a> {
@@ -2742,6 +2802,7 @@ fn write_atomically_if_unchanged(
     expected_before: &BTreeMap<String, Option<Vec<u8>>>,
     mode: ApprovedApplyMode,
     mut final_authority_check: ApprovedCommitCheck<'_>,
+    expected_control: Option<&ExpectedControlFile>,
 ) -> Result<Vec<AppliedChange>> {
     validate_approved_edit_budget(edits, expected_before)
         .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -3000,6 +3061,17 @@ fn write_atomically_if_unchanged(
     })();
     if let Err(error) = final_verification {
         return fail_after_conditional_rollback(&prepared, &swapped, error);
+    }
+    if let Some(control) = expected_control {
+        if let Err(error) = verify_installed_regular_target(
+            &control.path,
+            &control.observed.contents,
+            &control.observed.file,
+            "Ward config disappeared during approved apply",
+            "Ward config changed during approved apply",
+        ) {
+            return fail_after_conditional_rollback(&prepared, &swapped, error);
+        }
     }
 
     let changes = approved_apply_changes(&prepared);
@@ -4707,7 +4779,11 @@ fn set_conditional_rollback_backup_replacement(
 }
 
 #[cfg(test)]
-fn set_conditional_atomic_replacement(trigger: PathBuf, target: PathBuf, replacement: Vec<u8>) {
+pub(crate) fn set_conditional_atomic_replacement(
+    trigger: PathBuf,
+    target: PathBuf,
+    replacement: Vec<u8>,
+) {
     conditional_atomic_replacement_hook()
         .lock()
         .expect("conditional atomic replacement hook lock poisoned")
@@ -6155,6 +6231,35 @@ tier = 1
             compiled.approval_path_for(&threads::SurfaceRegionId::new("heartbeat_behavior")),
             Some(threads::ApprovalPath::FamiliarCoherence { .. })
         ));
+    }
+
+    #[test]
+    fn explicit_surface_tier_overrides_restrictive_default_for_scheduled_classification() {
+        let config = WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+default_tier = 0
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#,
+        )
+        .expect("Ward config parses");
+
+        assert_eq!(
+            config
+                .classify_resolved_path("TOOLS.md")
+                .expect("surface classification succeeds"),
+            Tier::Reviewed
+        );
+        assert_eq!(
+            config
+                .classify_resolved_path("unknown.md")
+                .expect("default classification succeeds"),
+            Tier::Protected
+        );
     }
 
     #[test]
@@ -8719,6 +8824,7 @@ tier = 1
             vec![decision],
             &BTreeMap::from([(edit.target.clone(), Some(b"before".to_vec()))]),
             ApprovedApplyMode::Initial,
+            None,
             None,
         );
 

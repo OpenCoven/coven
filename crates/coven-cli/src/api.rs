@@ -52,6 +52,7 @@ const PROPOSAL_JSON_MAX_PROBE_RESULTS: usize = 256;
 const PROPOSAL_JSON_MAX_KEY_BYTES: usize = 128;
 const PROPOSAL_JSON_MAX_METADATA_STRING_BYTES: usize = 64 * 1024;
 const PROPOSAL_JSON_MAX_ESTIMATED_HEAP_BYTES: u64 = 128 * 1024 * 1024;
+const OWNER_LOCAL_DECISION_ACTOR: &str = "owner:local-ipc";
 fn ward_write_audit_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -365,6 +366,7 @@ fn maybe_pause_direct_apply_before_audit(_coven_home: &Path, _familiar_id: &str)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalDecisionFailpoint {
     ClaimBeforeValidation,
+    ApplyIntentBeforeWrite,
     ApplyBeforeAudit,
     AuditBeforeCleanup,
 }
@@ -5726,6 +5728,24 @@ fn proposal_decision_audit_reservation_bytes(
     store::ward_audit_reservation_bytes(conn, row_count, variable_payload)
 }
 
+fn proposal_decision_reservation_purpose(
+    decision: &str,
+    expired: bool,
+    decision_actor: Option<&str>,
+) -> &'static str {
+    if expired {
+        "proposal-expiry"
+    } else {
+        match (decision, decision_actor) {
+            ("approve", Some(OWNER_LOCAL_DECISION_ACTOR)) => "proposal-approval-owner-local",
+            ("reject", Some(OWNER_LOCAL_DECISION_ACTOR)) => "proposal-rejection-owner-local",
+            ("approve", _) => "proposal-approval-automatic",
+            ("reject", _) => "proposal-rejection-automatic",
+            _ => "proposal-decision-invalid",
+        }
+    }
+}
+
 fn protected_proposal_targets(
     adjudication: &ward::Outcome,
     ward: &ward::Ward,
@@ -7643,32 +7663,6 @@ fn scheduled_rejection_window_close(
         })
 }
 
-fn scheduled_approval_policy_matches(
-    config: &ward::WardConfig,
-    scheduled: &crate::proposal_scheduler::ScheduledProposal,
-) -> Result<bool> {
-    let regions = &scheduled.classification().affected_regions;
-    let bindings = config.compiled_approval_tiers()?;
-    if regions.is_empty() {
-        // Legacy unclassified envelopes predate explicit regional policy.
-        return Ok(bindings.is_none());
-    }
-    let Some(bindings) = bindings else {
-        return Ok(false);
-    };
-    let mut live_path: Option<coven_threads_core::ApprovalPath> = None;
-    for region in regions {
-        let Some(path) = bindings.approval_path_for(region) else {
-            return Ok(false);
-        };
-        live_path = Some(match live_path {
-            Some(existing) => existing.highest(path.clone()),
-            None => path.clone(),
-        });
-    }
-    Ok(live_path.as_ref() == Some(&scheduled.classification().approval_path))
-}
-
 fn revalidate_scheduled_materialized_before(
     workspace: &Path,
     scheduled: &crate::proposal_scheduler::ScheduledProposal,
@@ -7696,6 +7690,39 @@ fn revalidate_scheduled_materialized_before(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn revalidate_scheduled_approval_policy(
+    config: &ward::WardConfig,
+    scheduled: &crate::proposal_scheduler::ScheduledProposal,
+) -> std::result::Result<(), &'static str> {
+    let classification = scheduled.classification();
+    let bindings = config
+        .compiled_approval_tiers()
+        .map_err(|_| "proposal-live-approval-policy-invalid")?;
+    if classification.affected_regions.is_empty() {
+        return if bindings.is_none() {
+            Ok(())
+        } else {
+            Err("proposal-live-approval-policy-changed")
+        };
+    }
+    let bindings = bindings.ok_or("proposal-live-approval-policy-missing")?;
+    let mut live_path: Option<coven_threads_core::ApprovalPath> = None;
+    for region in &classification.affected_regions {
+        let path = bindings
+            .approval_path_for(region)
+            .cloned()
+            .ok_or("proposal-live-region-unbound")?;
+        live_path = Some(match live_path {
+            Some(existing) => existing.highest(path),
+            None => path,
+        });
+    }
+    if live_path.as_ref() != Some(&classification.approval_path) {
+        return Err("proposal-live-approval-policy-changed");
     }
     Ok(())
 }
@@ -8346,6 +8373,8 @@ struct ProposalDecisionRequestPreflight {
     replacement_proposal_id: Option<serde::de::IgnoredAny>,
     #[serde(rename = "replacementProposalRevision", default)]
     replacement_proposal_revision: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    decision_actor: Option<serde::de::IgnoredAny>,
 }
 
 #[allow(dead_code)]
@@ -9585,7 +9614,15 @@ pub(crate) fn decide_threads_proposal(
     decision: &str,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
-    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, true, false)
+    decide_threads_proposal_inner(
+        coven_home,
+        proposal_id,
+        decision,
+        body,
+        true,
+        false,
+        Some(OWNER_LOCAL_DECISION_ACTOR),
+    )
 }
 
 fn decide_threads_proposal_automatic(
@@ -9594,11 +9631,11 @@ fn decide_threads_proposal_automatic(
     decision: &str,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
-    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, false, false)
+    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, false, false, None)
 }
 
 fn expire_threads_proposal(coven_home: &Path, proposal_id: &str) -> Result<ApiResponse> {
-    decide_threads_proposal_inner(coven_home, proposal_id, "reject", None, false, true)
+    decide_threads_proposal_inner(coven_home, proposal_id, "reject", None, false, true, None)
 }
 
 fn scheduler_response_completed(response: &ApiResponse, path: &Path) -> bool {
@@ -9617,27 +9654,39 @@ fn proposal_retention_expired(
     conn: &rusqlite::Connection,
     document: &ProposalEnvelopeDocument,
     now: time::OffsetDateTime,
-) -> bool {
+) -> Result<bool> {
+    if bound_proposal_expiry_transition(coven_home, conn, document)?.is_some() {
+        return Ok(true);
+    }
     if document
         .scheduled()
         .is_some_and(|proposal| proposal.veto_deadline().is_some())
     {
-        return false;
+        return Ok(false);
     }
-    document
+    Ok(document
         .pending()
         .staged_at
         .checked_add(time::Duration::days(
             crate::proposal_store::PENDING_PROPOSAL_RETENTION_DAYS,
         ))
         .is_some_and(|deadline| now >= deadline)
-        && proposal_recovery_is_proven_unapplied(coven_home, conn, document)
+        && proposal_recovery_is_proven_unapplied(coven_home, conn, document))
 }
 
 fn proposal_recovery_is_proven_unapplied(
     coven_home: &Path,
     conn: &rusqlite::Connection,
     document: &ProposalEnvelopeDocument,
+) -> bool {
+    proposal_recovery_is_proven_unapplied_with_origin(coven_home, conn, document, None)
+}
+
+fn proposal_recovery_is_proven_unapplied_with_origin(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+    superseded_origin: Option<TrustedProposalDecisionOrigin>,
 ) -> bool {
     let Some(applying) = document.decision_state.as_ref() else {
         return true;
@@ -9657,18 +9706,43 @@ fn proposal_recovery_is_proven_unapplied(
         return false;
     };
     let proposal_id = pending.id.0.to_string();
-    if load_proposal_apply_intent(conn, &proposal_id)
+    let trusted_approver = match superseded_origin.map(Ok).unwrap_or_else(|| {
+        trusted_decision_approver(
+            conn,
+            &proposal_id,
+            document
+                .decision_request
+                .as_ref()
+                .map_or(applying.decision.as_str(), |request| {
+                    request.decision.as_str()
+                }),
+            document.decision_request.as_ref(),
+            true,
+        )
+    }) {
+        Ok(origin) => origin,
+        Err(_) => return false,
+    };
+    let Some(intent) = load_proposal_apply_intent(conn, &proposal_id)
         .ok()
         .flatten()
-        .as_ref()
-        != Some(applying)
+    else {
+        return false;
+    };
+    if intent.state != *applying
+        || (trusted_approver.verify_apply_intent_actor()
+            && intent.approver.as_deref()
+                != trusted_approver
+                    .approver()
+                    .map(coven_threads_core::WriterId::as_str))
     {
         return false;
     }
-    let Some(expected_baselines) = applying.baseline_snapshot.as_ref() else {
+    let Ok(version) = proposal_recovery_version(&trusted_approver, applying) else {
         return false;
     };
-    let Ok(live_baselines) = reload_proposal_baselines(conn, &familiar_id, expected_baselines)
+    let Ok(live_baselines) =
+        proposal_recovery_baselines(conn, &familiar_id, pending, applying, version)
     else {
         return false;
     };
@@ -9683,6 +9757,7 @@ fn proposal_recovery_is_proven_unapplied(
             baseline_snapshot: &live_baselines,
             identity_context: None,
             require_bound_identity_context: false,
+            version,
         },
     ) else {
         return false;
@@ -9730,7 +9805,7 @@ fn proposal_requires_terminal_expiry(
     conn: &rusqlite::Connection,
     proposal_id: Uuid,
     now: time::OffsetDateTime,
-) -> bool {
+) -> Result<bool> {
     let path = find_any_pending_decision_claim(coven_home, &proposal_id.to_string())
         .map(|(path, _)| path)
         .or_else(|| {
@@ -9739,13 +9814,15 @@ fn proposal_requires_terminal_expiry(
                 .flatten()
         });
     let Some(path) = path else {
-        return false;
+        return Ok(false);
     };
     let Ok(raw) = read_pending_proposal_file(&path) else {
-        return false;
+        return Ok(false);
     };
-    ProposalEnvelopeDocument::parse_preflighted(&raw)
-        .is_ok_and(|document| proposal_retention_expired(coven_home, conn, &document, now))
+    match ProposalEnvelopeDocument::parse_preflighted(&raw) {
+        Ok(document) => proposal_retention_expired(coven_home, conn, &document, now),
+        Err(_) => Ok(false),
+    }
 }
 
 fn decide_threads_proposal_inner(
@@ -9755,6 +9832,7 @@ fn decide_threads_proposal_inner(
     body: Option<&str>,
     revision_required: bool,
     expired: bool,
+    decision_actor: Option<&str>,
 ) -> Result<ApiResponse> {
     maybe_probe_proposal_write_lock(coven_home, proposal_id);
     let _decision_guard = ward_write_audit_lock()
@@ -9880,35 +9958,109 @@ fn decide_threads_proposal_inner(
     let mut effective_decision = decision;
     let mut effective_expired = expired;
     if !effective_expired
-        && proposal_requires_terminal_expiry(coven_home, &conn, proposal_uuid, decision_now)
+        && proposal_requires_terminal_expiry(coven_home, &conn, proposal_uuid, decision_now)?
     {
         effective_decision = "reject";
         effective_expired = true;
     }
-    let (mut audit_reservation, mut claim) = loop {
-        let write_applied_if_capacity_blocked =
-            if find_any_pending_decision_claim(coven_home, proposal_id).is_some() {
-                None
+    let (mut audit_reservation, mut claim, reservation_decision) = loop {
+        let (existing_claim, proposal_found, inspected_document) =
+            inspect_proposal_decision_document(coven_home, proposal_uuid);
+        let existing_request = inspected_document
+            .as_ref()
+            .and_then(|document| document.decision_request.as_ref());
+        let write_applied_if_capacity_blocked = (!existing_claim).then_some(false);
+        let planned_request = if effective_expired {
+            existing_request
+                .as_ref()
+                .filter(|request| request.expired)
+                .is_none()
+                .then(|| {
+                    inspected_document
+                        .as_ref()
+                        .map(proposal_expiry_request)
+                        .transpose()
+                })
+                .transpose()?
+                .flatten()
+        } else if proposal_found && !existing_claim && existing_request.is_none() {
+            Some(ProposalDecisionRequest {
+                decision: effective_decision.to_string(),
+                rationale: note.clone(),
+                claimed_at: decision_now,
+                expected_revision: expected_revision.clone(),
+                revision_required,
+                expired: false,
+                decision_actor: decision_actor.map(str::to_string),
+                replacement_proposal_id: requested_replacement
+                    .as_ref()
+                    .map(|intent| intent.proposal_id),
+                replacement_proposal_revision: requested_replacement
+                    .as_ref()
+                    .map(|intent| intent.proposal_revision.clone()),
+            })
+        } else {
+            None
+        };
+        let expiry_purpose = effective_expired
+            .then(|| {
+                planned_request
+                    .as_ref()
+                    .or(existing_request.filter(|request| request.expired))
+                    .map(|request| bound_proposal_decision_purpose("proposal-expiry", request))
+                    .transpose()
+            })
+            .transpose()?
+            .flatten();
+        let expiry_transition_prevalidated = inspected_document
+            .as_ref()
+            .map(|document| bound_proposal_expiry_transition(coven_home, &conn, document))
+            .transpose()?
+            .flatten()
+            .is_some();
+        let expiry_recovery_prevalidated = if effective_expired {
+            if expiry_transition_prevalidated {
+                true
             } else {
-                Some(false)
-            };
-        let reservation_decision = proposal_reservation_decision(
-            &conn,
-            proposal_id,
-            effective_decision,
-            effective_expired,
-        )?;
+                match inspected_document.as_ref() {
+                    Some(document) => {
+                        anyhow::ensure!(
+                            proposal_recovery_is_proven_unapplied(coven_home, &conn, document),
+                            "proposal apply recovery is not proven safe for terminal expiry"
+                        );
+                        true
+                    }
+                    None => false,
+                }
+            }
+        } else {
+            false
+        };
+        if let Some(expiry_purpose) = expiry_purpose
+            .as_deref()
+            .filter(|_| planned_request.is_some())
+        {
+            mark_proposal_reservations_superseded_by_expiry(&conn, proposal_id, expiry_purpose)?;
+        }
+        let reservation_decision =
+            proposal_reservation_decision(effective_decision, effective_expired);
         let reservation_bytes =
             proposal_decision_audit_reservation_bytes(&conn, effective_decision)?;
-        let audit_reservation = match store::WardAuditReservation::acquire(
+        let reservation_purpose = proposal_decision_reservation_purpose(
+            effective_decision,
+            effective_expired,
+            decision_actor,
+        );
+        let reservation_purpose = planned_request
+            .as_ref()
+            .map(|request| bound_proposal_decision_purpose(reservation_purpose, request))
+            .transpose()?
+            .unwrap_or_else(|| reservation_purpose.to_string());
+        let mut audit_reservation = match store::WardAuditReservation::acquire(
             &conn,
             &proposal_store_path,
             format!("proposal:{proposal_id}:{reservation_decision}"),
-            if effective_decision == "reject" {
-                "proposal-rejection"
-            } else {
-                "proposal-approval"
-            },
+            &reservation_purpose,
             reservation_bytes,
         ) {
             Ok(reservation) => reservation,
@@ -9922,18 +10074,19 @@ fn decide_threads_proposal_inner(
             }
             Err(error) => return Err(error),
         };
-        let claim = match PendingDecisionClaim::acquire(
+        if planned_request.is_some() {
+            audit_reservation.replace_purpose(&reservation_purpose)?;
+        }
+        let mut claim = match PendingDecisionClaim::acquire(
             coven_home,
             proposal_uuid,
             PendingDecisionClaimRequest {
                 audit_conn: &conn,
                 decision: effective_decision,
-                rationale: note.as_deref(),
-                expected_revision: expected_revision.as_deref(),
-                revision_required,
                 expired: effective_expired,
+                new_request: planned_request.as_ref(),
+                expiry_recovery_prevalidated,
                 now: decision_now,
-                replacement: requested_replacement.clone(),
             },
         ) {
             Ok(Some(claim)) => claim,
@@ -9943,6 +10096,22 @@ fn decide_threads_proposal_inner(
                     404,
                     &json!({ "blocked": true, "why": "proposal-not-found" }),
                 );
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<ProposalDecisionRequestPossiblyPersisted>()
+                    .is_some() =>
+            {
+                if let Some(limit) = crate::proposal_store::quota_failure(&error) {
+                    audit_reservation.finish()?;
+                    return proposal_quota_exceeded_response(limit);
+                }
+                if let Some(limit) = ward::ward_edit_budget_failure(&error) {
+                    audit_reservation.finish()?;
+                    return ward_apply_too_large_response(limit);
+                }
+                audit_reservation.preserve()?;
+                return Err(error);
             }
             Err(error)
                 if !effective_expired
@@ -9989,13 +10158,22 @@ fn decide_threads_proposal_inner(
             }
             Err(error) => return Err(error),
         };
-        break (audit_reservation, claim);
+        if effective_expired {
+            claim.preserve();
+            if !claim.request_preexisting || audit_reservation.reused_existing() {
+                audit_reservation.preserve_if_unfinished();
+                release_superseded_proposal_reservations(&conn, proposal_uuid)?;
+            }
+        }
+        break (audit_reservation, claim, reservation_decision);
     };
     let decision = effective_decision;
     let expired = effective_expired;
     if claim.recovery {
         claim.preserve();
-        audit_reservation.preserve_if_unfinished();
+        if audit_reservation.reused_existing() {
+            audit_reservation.preserve_if_unfinished();
+        }
     }
     let raw = match read_pending_proposal_file(&claim.path) {
         Ok(raw) => raw,
@@ -10041,6 +10219,64 @@ fn decide_threads_proposal_inner(
         audit_reservation.release_if_unneeded()?;
         return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
     }
+    if document.scheduled().is_some() {
+        match scheduled_submission_authority_for_document(coven_home, &conn, &document) {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<HistoricalDecisionReviewRequired>()
+                    .is_some() =>
+            {
+                if document.decision_state.is_none() {
+                    claim.restore_pending(&document)?;
+                    audit_reservation.finish()?;
+                } else {
+                    claim.preserve();
+                    audit_reservation.preserve()?;
+                }
+                return json_response(
+                    409,
+                    &json!({
+                        "blocked": true,
+                        "why": "proposal-decision-review-required",
+                        "proposalId": proposal_id,
+                        "terminal": false,
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+            Err(error) if invalid_scheduled_submission_authority(&error) => {
+                let claim_path = claim.path.clone();
+                claim.preserve();
+                audit_reservation.release_if_unneeded()?;
+                let quarantine = crate::proposal_store::quarantine(
+                    coven_home,
+                    &claim_path,
+                    "submission-receipt",
+                )?;
+                return json_response(
+                    409,
+                    &json!({
+                        "blocked": true,
+                        "why": "proposal-submission-receipt-invalid",
+                        "proposalId": proposal_id,
+                        "quarantined": true,
+                        "quarantinePath": quarantine.map(|path| path.display().to_string()),
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+            Err(error) => {
+                if !claim.recovery && !claim.request_preexisting {
+                    claim.restore_pending(&document)?;
+                    audit_reservation.finish()?;
+                } else {
+                    audit_reservation.preserve_if_unfinished();
+                }
+                return Err(error);
+            }
+        }
+    }
     let Some(review_kind) = PendingReviewKind::from_stored_value(document.review_kind.as_deref())
     else {
         let opened_window = proposal_window_context(&conn, proposal_id)?;
@@ -10062,10 +10298,10 @@ fn decide_threads_proposal_inner(
             claim.preserve();
             append_open_window_revalidation_failure(
                 &conn,
-                proposal_id,
                 document.pending(),
                 opened,
                 approval_path_label,
+                None,
                 None,
                 decision_now,
             )?;
@@ -10082,24 +10318,52 @@ fn decide_threads_proposal_inner(
             );
         } else {
             claim.restore_pending(&document)?;
+            audit_reservation.finish()?;
+            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
         }
-        audit_reservation.release_if_unneeded()?;
-        return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
     };
     let durable_request = document.decision_request.take();
-    maybe_fail_proposal_decision(
+    if let Err(error) = maybe_fail_proposal_decision(
         ProposalDecisionFailpoint::ClaimBeforeValidation,
         proposal_id,
-    )?;
+    ) {
+        audit_reservation.preserve_if_unfinished();
+        return Err(error);
+    }
     if durable_request
         .as_ref()
         .is_some_and(|request| request.decision != decision)
     {
+        if claim.recovery && decision_actor.is_none() {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "applying-request-conflict",
+                "proposal-recovery-corrupt",
+                "applying recovery request conflicts with its claimed decision",
+            );
+        }
         audit_reservation.release_if_unneeded()?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "proposal-decision-conflict" }),
         );
+    }
+    if claim.request_preexisting && !audit_reservation.reused_existing() {
+        return quarantine_proposal_recovery_claim(
+            coven_home,
+            &mut claim,
+            audit_reservation,
+            proposal_id,
+            "decision-origin",
+            "proposal-decision-origin-invalid",
+            "persisted decision request had no pre-existing durable authority",
+        );
+    }
+    if durable_request.is_some() {
+        audit_reservation.preserve_if_unfinished();
     }
     let request_is_expiry = expired
         || durable_request
@@ -10161,8 +10425,18 @@ fn decide_threads_proposal_inner(
         {
             if applying_state.is_none() {
                 claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            } else {
+                return quarantine_proposal_recovery_claim(
+                    coven_home,
+                    &mut claim,
+                    audit_reservation,
+                    proposal_id,
+                    "applying-revision-conflict",
+                    "proposal-recovery-corrupt",
+                    "applying recovery revision conflicts with its durable request",
+                );
             }
-            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-revision-mismatch" }),
@@ -10175,8 +10449,18 @@ fn decide_threads_proposal_inner(
         {
             if applying_state.is_none() {
                 claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            } else {
+                return quarantine_proposal_recovery_claim(
+                    coven_home,
+                    &mut claim,
+                    audit_reservation,
+                    proposal_id,
+                    "applying-revision-missing",
+                    "proposal-recovery-corrupt",
+                    "applying recovery request lacks its required revision",
+                );
             }
-            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-revision-required" }),
@@ -10196,7 +10480,7 @@ fn decide_threads_proposal_inner(
             Ok(()) => {}
             Err(why) => {
                 audit_reservation.release_if_unneeded()?;
-                if claim.existing_request {
+                if claim.request_preexisting {
                     claim.preserve();
                 } else if applying_state.is_none() {
                     claim.restore_pending(&document)?;
@@ -10215,35 +10499,127 @@ fn decide_threads_proposal_inner(
             }
         }
     }
+    let decision_origin = match trusted_decision_approver(
+        &conn,
+        proposal_id,
+        &reservation_decision,
+        durable_request.as_ref(),
+        applying_state.is_some(),
+    ) {
+        Ok(origin) => origin,
+        Err(error)
+            if error
+                .downcast_ref::<HistoricalDecisionReviewRequired>()
+                .is_some() =>
+        {
+            if applying_state.is_none() {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            } else {
+                claim.preserve();
+                audit_reservation.preserve()?;
+            }
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-decision-review-required",
+                    "proposalId": proposal_id,
+                    "terminal": false,
+                    "error": error.to_string(),
+                }),
+            );
+        }
+        Err(error) if invalid_proposal_decision_origin(&error) => {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "decision-origin",
+                "proposal-decision-origin-invalid",
+                &error.to_string(),
+            );
+        }
+        Err(error) => {
+            claim.preserve();
+            audit_reservation.preserve()?;
+            return Err(error);
+        }
+    };
+    if decision == "approve"
+        && matches!(&decision_origin, TrustedProposalDecisionOrigin::Automatic)
+        && scheduled.is_none_or(|proposal| {
+            matches!(
+                &proposal.classification().approval_path,
+                coven_threads_core::ApprovalPath::HumanApproval
+                    | coven_threads_core::ApprovalPath::HumanApprovalWithRationale
+            )
+        })
+    {
+        return quarantine_proposal_recovery_claim(
+            coven_home,
+            &mut claim,
+            audit_reservation,
+            proposal_id,
+            "decision-origin",
+            "proposal-decision-origin-invalid",
+            "automatic approval cannot satisfy a human-only approval path",
+        );
+    }
+    // The pinned audit contract requires a nonempty approver on human paths.
+    // This reserved sentinel records absence of historical attribution, not a
+    // human or the proposal writer; approval detail also marks it as unknown.
+    let historical_unknown_actor = matches!(
+        decision_origin,
+        TrustedProposalDecisionOrigin::Legacy | TrustedProposalDecisionOrigin::HistoricalRequest
+    )
+    .then(|| coven_threads_core::WriterId::new(HISTORICAL_UNKNOWN_DECISION_ACTOR));
+    let decision_approver = decision_origin
+        .approver()
+        .or(historical_unknown_actor.as_ref());
+    let verify_apply_intent_actor = decision_origin.verify_apply_intent_actor();
     if decision == "approve" {
         if let Err(error) = ward::validate_staged_edit_budget(&pending.edits) {
             if let Some(limit) = ward::ward_edit_budget_failure(&error) {
                 if applying_state.is_none() {
                     claim.restore_pending(&document)?;
+                    audit_reservation.finish()?;
+                } else {
+                    audit_reservation.release_if_unneeded()?;
                 }
-                audit_reservation.release_if_unneeded()?;
                 return ward_apply_too_large_response(limit);
             }
             if applying_state.is_none() {
                 claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            } else {
+                audit_reservation.release_if_unneeded()?;
             }
-            audit_reservation.release_if_unneeded()?;
             return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
         }
     }
     let note = if let Some(applying) = applying_state.as_ref() {
         if applying.decision != decision {
-            audit_reservation.release_if_unneeded()?;
-            return json_response(
-                409,
-                &json!({ "blocked": true, "why": "proposal-decision-conflict" }),
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "applying-decision-conflict",
+                "proposal-recovery-corrupt",
+                "applying recovery decision conflicts with its durable request",
             );
         }
         if note != applying.rationale {
-            audit_reservation.release_if_unneeded()?;
-            return json_response(
-                409,
-                &json!({ "blocked": true, "why": "proposal-recovery-request-conflict" }),
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "applying-rationale-conflict",
+                "proposal-recovery-corrupt",
+                "applying recovery rationale conflicts with its durable request",
             );
         }
         applying.rationale.clone()
@@ -10254,6 +10630,18 @@ fn decide_threads_proposal_inner(
         .map(|proposal| proposal.classification().approval_path.display_label())
         .unwrap_or("human_review");
     let mut opened_window = proposal_window_context(&conn, proposal_id)?;
+    if scheduled.is_some_and(|proposal| proposal.veto_deadline().is_some())
+        && opened_window.is_none()
+    {
+        ensure_proposal_window_opened_audit_with_conn(
+            coven_home,
+            &conn,
+            scheduled.expect("guard established scheduled proposal"),
+            document.identity_evidence,
+            decision_now,
+        )?;
+        opened_window = proposal_window_context(&conn, proposal_id)?;
+    }
     let familiar_id = match human_familiar_id_for_weave(coven_home, pending.familiar_id) {
         Ok(Some(familiar_id)) => familiar_id,
         Ok(None) | Err(_) if applying_state.is_some() => {
@@ -10271,12 +10659,12 @@ fn decide_threads_proposal_inner(
             claim.preserve();
             append_open_window_revalidation_failure(
                 &conn,
-                proposal_id,
                 pending,
                 opened_window
                     .as_ref()
                     .expect("guard established opened window context"),
                 approval_path_label,
+                decision_approver,
                 note.as_deref(),
                 decision_now,
             )?;
@@ -10293,13 +10681,26 @@ fn decide_threads_proposal_inner(
             );
         }
         Ok(None) => {
-            audit_reservation.release_if_unneeded()?;
+            if claim.request_preexisting {
+                audit_reservation.preserve_if_unfinished();
+            } else {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            }
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-familiar-missing" }),
             );
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            if claim.request_preexisting {
+                audit_reservation.preserve_if_unfinished();
+            } else {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            }
+            return Err(error);
+        }
     };
     let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
     let config = match ward::WardConfig::load(&workspace) {
@@ -10319,12 +10720,12 @@ fn decide_threads_proposal_inner(
             claim.preserve();
             append_open_window_revalidation_failure(
                 &conn,
-                proposal_id,
                 pending,
                 opened_window
                     .as_ref()
                     .expect("guard established opened window context"),
                 approval_path_label,
+                decision_approver,
                 note.as_deref(),
                 decision_now,
             )?;
@@ -10341,25 +10742,31 @@ fn decide_threads_proposal_inner(
             );
         }
         Ok(None) => {
-            audit_reservation.release_if_unneeded()?;
+            if claim.request_preexisting {
+                audit_reservation.preserve_if_unfinished();
+            } else {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            }
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "ward-not-configured" }),
             );
         }
-        Err(error) => return Err(error),
-    };
-    if scheduled.is_some_and(|proposal| proposal.veto_deadline().is_some()) {
-        if !proposal_window_opened(&conn, proposal_id)? {
-            ensure_proposal_window_opened_audit_with_conn(
-                coven_home,
-                &conn,
-                scheduled.expect("guard established scheduled proposal"),
-                decision_now,
-            )?;
-            opened_window = proposal_window_context(&conn, proposal_id)?;
+        Err(error) => {
+            if claim.request_preexisting {
+                audit_reservation.preserve_if_unfinished();
+            } else {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            }
+            return Err(error);
         }
-    } else if applying_state.is_some() && opened_window.is_some() {
+    };
+    if scheduled.is_none_or(|proposal| proposal.veto_deadline().is_none())
+        && applying_state.is_some()
+        && opened_window.is_some()
+    {
         return quarantine_proposal_recovery_claim(
             coven_home,
             &mut claim,
@@ -10369,28 +10776,30 @@ fn decide_threads_proposal_inner(
             "proposal-recovery-window-state-inconsistent",
             "applied recovery state conflicts with an opened veto window",
         );
-    } else if let Some(opened) = opened_window.as_ref() {
-        claim.preserve();
-        append_open_window_revalidation_failure(
-            &conn,
-            proposal_id,
-            pending,
-            opened,
-            approval_path_label,
-            note.as_deref(),
-            decision_now,
-        )?;
-        audit_reservation.finish()?;
-        claim.consume()?;
-        return json_response(
-            409,
-            &json!({
-                "blocked": true,
-                "why": "proposal-window-state-inconsistent",
-                "proposalId": proposal_id,
-                "terminal": true,
-            }),
-        );
+    } else if scheduled.is_none_or(|proposal| proposal.veto_deadline().is_none()) {
+        if let Some(opened) = opened_window.as_ref() {
+            claim.preserve();
+            append_open_window_revalidation_failure(
+                &conn,
+                pending,
+                opened,
+                approval_path_label,
+                decision_approver,
+                note.as_deref(),
+                decision_now,
+            )?;
+            audit_reservation.finish()?;
+            claim.consume()?;
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-window-state-inconsistent",
+                    "proposalId": proposal_id,
+                    "terminal": true,
+                }),
+            );
+        }
     }
     let authorization = authorization_from_writer(&pending.writer);
     let edits = match staged_edits_to_ward_edits(pending) {
@@ -10418,12 +10827,12 @@ fn decide_threads_proposal_inner(
             claim.preserve();
             append_open_window_revalidation_failure(
                 &conn,
-                proposal_id,
                 pending,
                 opened_window
                     .as_ref()
                     .expect("guard established opened window context"),
                 approval_path_label,
+                decision_approver,
                 note.as_deref(),
                 decision_now,
             )?;
@@ -10496,7 +10905,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 familiar_id: &familiar_id,
                 weave_hash: &weave_hash,
-                approver: Some(&pending.writer),
+                approver: decision_approver,
                 files_touched: &targets,
                 decision: "protected-target-not-proposable",
                 approval_rationale: note.as_deref(),
@@ -10547,8 +10956,10 @@ fn decide_threads_proposal_inner(
         Err(reason) => {
             if applying_state.is_none() {
                 claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            } else {
+                audit_reservation.release_if_unneeded()?;
             }
-            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({
@@ -10636,29 +11047,61 @@ fn decide_threads_proposal_inner(
             }),
         );
     }
-    if let Some(applying) = applying_state.as_ref() {
-        let recorded_intent = load_proposal_apply_intent(&conn, proposal_id)?;
-        if recorded_intent.as_ref() != Some(applying) {
-            return json_response(
-                409,
-                &json!({
-                    "blocked": true,
-                    "why": "proposal-recovery-intent-unverifiable",
-                    "proposalId": proposal_id,
-                }),
+    let verified_recovery = if let Some(applying) = applying_state.as_ref() {
+        let recorded_intent = match load_proposal_apply_intent(&conn, proposal_id) {
+            Ok(Some(intent)) => intent,
+            Ok(None) => {
+                return quarantine_proposal_recovery_claim(
+                    coven_home,
+                    &mut claim,
+                    audit_reservation,
+                    proposal_id,
+                    "apply-intent",
+                    "proposal-recovery-intent-unverifiable",
+                    "interrupted apply is missing its append-only intent",
+                );
+            }
+            Err(error) if invalid_proposal_apply_intent(&error) => {
+                return quarantine_proposal_recovery_claim(
+                    coven_home,
+                    &mut claim,
+                    audit_reservation,
+                    proposal_id,
+                    "apply-intent",
+                    "proposal-recovery-intent-unverifiable",
+                    "interrupted apply carries malformed append-only intent",
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        let actor_matches = !verify_apply_intent_actor
+            || recorded_intent.approver.as_deref()
+                == decision_approver.map(coven_threads_core::WriterId::as_str);
+        if !actor_matches {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "decision-actor",
+                "proposal-recovery-decision-actor-invalid",
+                "interrupted apply decision actor diverges from its durable intent",
             );
         }
-        let Some(expected_baselines) = applying.baseline_snapshot.as_ref() else {
-            return json_response(
-                409,
-                &json!({
-                    "blocked": true,
-                    "why": "proposal-recovery-intent-unverifiable",
-                    "proposalId": proposal_id,
-                }),
+        if recorded_intent.state != *applying {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "apply-intent",
+                "proposal-recovery-intent-unverifiable",
+                "interrupted apply state diverges from its append-only intent",
             );
-        };
-        let live_baselines = reload_proposal_baselines(&conn, &familiar_id, expected_baselines)?;
+        }
+        let version = proposal_recovery_version(&decision_origin, applying)?;
+        let live_baselines =
+            proposal_recovery_baselines(&conn, &familiar_id, pending, applying, version)?;
         let recovery_commitment = proposal_recovery_commitment(
             &config,
             &document,
@@ -10670,6 +11113,7 @@ fn decide_threads_proposal_inner(
                 baseline_snapshot: &live_baselines,
                 identity_context: None,
                 require_bound_identity_context: false,
+                version,
             },
         )?;
         if applying.recovery_commitment != recovery_commitment {
@@ -10692,7 +11136,10 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
-    }
+        Some((version, live_baselines))
+    } else {
+        None
+    };
     let coherence_rejection = review_kind == PendingReviewKind::Coherence && decision == "reject";
     let coherence_revalidation_failed =
         review_kind == PendingReviewKind::Coherence
@@ -10738,7 +11185,7 @@ fn decide_threads_proposal_inner(
                     proposal_id,
                     familiar_id: &familiar_id,
                     weave_hash: &weave_hash,
-                    approver: Some(&pending.writer),
+                    approver: decision_approver,
                     files_touched: &targets,
                     decision: coven_threads_core::WindowCloseReason::RevalidationFailed.tag(),
                     approval_rationale: note.as_deref(),
@@ -10756,16 +11203,17 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 &familiar_id,
                 &weave_hash,
-                &pending.writer,
+                decision_approver,
                 &targets,
                 pending.channel,
                 decision_now,
             )?;
-            audit_reservation.release_if_unneeded()?;
             if applying_state.is_none() {
                 claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
             } else {
                 claim.preserve();
+                audit_reservation.release_if_unneeded()?;
             }
         }
         return json_response(
@@ -10815,7 +11263,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 familiar_id: &familiar_id,
                 weave_hash: &weave_hash,
-                approver: Some(&pending.writer),
+                approver: decision_approver,
                 files_touched: &targets,
                 decision: window_close
                     .as_ref()
@@ -10856,7 +11304,7 @@ fn decide_threads_proposal_inner(
             proposal_id,
             &familiar_id,
             state.weave.weave_hash(),
-            &pending.writer,
+            decision_approver,
             &targets,
             pending.channel,
             decision_now,
@@ -10935,7 +11383,7 @@ fn decide_threads_proposal_inner(
                     proposal_id,
                     familiar_id: &familiar_id,
                     weave_hash: &weave_hash,
-                    approver: Some(&pending.writer),
+                    approver: decision_approver,
                     files_touched: &targets,
                     decision: coven_threads_core::WindowCloseReason::RevalidationFailed.tag(),
                     approval_rationale: note.as_deref(),
@@ -10978,7 +11426,7 @@ fn decide_threads_proposal_inner(
             proposal_id,
             &familiar_id,
             state.weave.weave_hash(),
-            &pending.writer,
+            decision_approver,
             &targets,
             pending.channel,
             decision_now,
@@ -11004,7 +11452,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 familiar_id: &familiar_id,
                 weave_hash: state.weave.weave_hash(),
-                approver: (!expired).then_some(&pending.writer),
+                approver: (!expired).then_some(decision_approver).flatten(),
                 files_touched: &targets,
                 decision: decision_semantics.rejection_decision,
                 approval_rationale: note.as_deref(),
@@ -11082,7 +11530,7 @@ fn decide_threads_proposal_inner(
                     proposal_id,
                     familiar_id: &familiar_id,
                     weave_hash: state.weave.weave_hash(),
-                    approver: Some(&pending.writer),
+                    approver: decision_approver,
                     files_touched: &targets,
                     decision: window_close
                         .as_ref()
@@ -11112,7 +11560,7 @@ fn decide_threads_proposal_inner(
             proposal_id,
             &familiar_id,
             state.weave.weave_hash(),
-            &pending.writer,
+            decision_approver,
             &targets,
             pending.channel,
             decision_now,
@@ -11146,10 +11594,8 @@ fn decide_threads_proposal_inner(
                 revalidate_scheduled_materialized_before(&workspace, scheduled)
             {
                 Some(reason)
-            } else if !scheduled_approval_policy_matches(&config, scheduled)? {
-                Some("proposal-approval-policy-changed")
             } else {
-                None
+                revalidate_scheduled_approval_policy(&config, scheduled).err()
             };
             if let Some(reason) = rejection {
                 claim.preserve();
@@ -11171,7 +11617,7 @@ fn decide_threads_proposal_inner(
                         proposal_id,
                         familiar_id: &familiar_id,
                         weave_hash: state.weave.weave_hash(),
-                        approver: Some(&pending.writer),
+                        approver: decision_approver,
                         files_touched: &targets,
                         decision: window_close
                             .as_ref()
@@ -11229,10 +11675,9 @@ fn decide_threads_proposal_inner(
             }
         };
         let expected_before = proposal_expected_before(&applying)?;
-        let expected_baselines = applying
-            .baseline_snapshot
+        let (version, expected_baselines) = verified_recovery
             .as_ref()
-            .context("verified recovery state lost its baseline snapshot")?;
+            .context("applying state lost its verified recovery evidence")?;
         let recovery_authorization = recovery_authorization(proposal_id, &authorization);
         if !ward_config_is_unchanged(&workspace, &config)? {
             return json_response(
@@ -11263,6 +11708,7 @@ fn decide_threads_proposal_inner(
                         baseline_snapshot: expected_baselines,
                         identity_context: None,
                         require_bound_identity_context: false,
+                        version: *version,
                     },
                     &applying.recovery_commitment,
                 )
@@ -11314,10 +11760,10 @@ fn decide_threads_proposal_inner(
                                 claim.preserve();
                                 append_open_window_revalidation_failure(
                                     &conn,
-                                    proposal_id,
                                     pending,
                                     opened,
                                     &decision_semantics.approval_path_label,
+                                    decision_approver,
                                     note.as_deref(),
                                     decision_now,
                                 )?;
@@ -11386,7 +11832,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 &familiar_id,
                 &applying.weave_hash,
-                &pending.writer,
+                decision_approver,
                 &targets,
                 pending.channel,
                 decision_now,
@@ -11414,7 +11860,7 @@ fn decide_threads_proposal_inner(
                 familiar_id: &familiar_id,
                 workspace: &workspace,
                 weave_hash: &applying.weave_hash,
-                approver: &pending.writer,
+                approver: decision_approver,
                 apply_report: &report,
                 gated_targets: &gated_targets,
                 approved_bytes: &approved_bytes,
@@ -11476,10 +11922,10 @@ fn decide_threads_proposal_inner(
                     claim.preserve();
                     append_open_window_revalidation_failure(
                         &conn,
-                        proposal_id,
                         pending,
                         opened,
                         &decision_semantics.approval_path_label,
+                        decision_approver,
                         note.as_deref(),
                         decision_now,
                     )?;
@@ -11501,7 +11947,7 @@ fn decide_threads_proposal_inner(
                     proposal_id,
                     &familiar_id,
                     state.weave.weave_hash(),
-                    &pending.writer,
+                    decision_approver,
                     &targets,
                     pending.channel,
                     decision_now,
@@ -11588,6 +12034,7 @@ fn decide_threads_proposal_inner(
             baseline_snapshot: &state.baseline_snapshot,
             identity_context: identity_context.as_ref(),
             require_bound_identity_context: true,
+            version: ProposalRecoveryVersion::V3,
         },
     )?;
     let applying = ProposalApplyingState {
@@ -11605,7 +12052,7 @@ fn decide_threads_proposal_inner(
         &conn,
         proposal_id,
         &familiar_id,
-        &pending.writer,
+        decision_approver,
         &targets,
         &applying,
         pending.channel,
@@ -11623,6 +12070,10 @@ fn decide_threads_proposal_inner(
         return Err(error);
     }
     claim.preserve();
+    maybe_fail_proposal_decision(
+        ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+        proposal_id,
+    )?;
     match ward_config_is_unchanged(&workspace, &config) {
         Ok(true) => {}
         Ok(false) => {
@@ -11666,6 +12117,7 @@ fn decide_threads_proposal_inner(
                         .expect("new applying state carries its validated baseline snapshot"),
                     identity_context: None,
                     require_bound_identity_context: false,
+                    version: ProposalRecoveryVersion::V3,
                 },
                 &applying.recovery_commitment,
             )
@@ -11703,10 +12155,10 @@ fn decide_threads_proposal_inner(
                             claim.preserve();
                             append_open_window_revalidation_failure(
                                 &conn,
-                                proposal_id,
                                 pending,
                                 opened,
                                 &decision_semantics.approval_path_label,
+                                decision_approver,
                                 note.as_deref(),
                                 decision_now,
                             )?;
@@ -11719,7 +12171,7 @@ fn decide_threads_proposal_inner(
                             proposal_id,
                             &familiar_id,
                             state.weave.weave_hash(),
-                            &pending.writer,
+                            decision_approver,
                             &targets,
                             pending.channel,
                             decision_now,
@@ -11763,7 +12215,7 @@ fn decide_threads_proposal_inner(
             proposal_id,
             &familiar_id,
             state.weave.weave_hash(),
-            &pending.writer,
+            decision_approver,
             &targets,
             pending.channel,
             decision_now,
@@ -11788,7 +12240,7 @@ fn decide_threads_proposal_inner(
             familiar_id: &familiar_id,
             workspace: &workspace,
             weave_hash: state.weave.weave_hash(),
-            approver: &pending.writer,
+            approver: decision_approver,
             apply_report: &report,
             gated_targets: &gated_targets,
             approved_bytes: &approved_bytes,
@@ -12117,6 +12569,11 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             continue;
         }
 
+        let mut proposal_guard = Some(
+            ward_write_audit_lock()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Ward write/audit lock is poisoned"))?,
+        );
         let document = match read_pending_proposal_document(&path) {
             Ok(document) => document,
             Err(error) => {
@@ -12124,13 +12581,71 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                 continue;
             }
         };
-        let (opened_window, retention_expired) = {
-            let conn = store::open_store(&store_path(coven_home))?;
-            (
-                proposal_window_opened(&conn, &document.pending().id.0.to_string())?,
-                proposal_retention_expired(coven_home, &conn, &document, now),
-            )
-        };
+        let conn = store::open_store(&store_path(coven_home))?;
+        if document.scheduled().is_some() {
+            match scheduled_submission_authority_for_document(coven_home, &conn, &document) {
+                Ok(_) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<HistoricalDecisionReviewRequired>()
+                        .is_some()
+                        && proposal_retention_expired(coven_home, &conn, &document, now)? =>
+                {
+                    // This admits only proven-unapplied expiry, not approval.
+                    // Its server-owned claim must still validate the full receipt.
+                }
+                Err(error) if invalid_scheduled_submission_authority(&error) => {
+                    drop(conn);
+                    quarantine_scheduler_candidate(coven_home, &path, &error);
+                    continue;
+                }
+                Err(error) => {
+                    drop(conn);
+                    crate::daemon::append_daemon_recovery_log(
+                        coven_home,
+                        &format!(
+                            "threads scheduler: submission receipt unavailable for {}: \
+                             {error:#}; retained for retry",
+                            path.display()
+                        ),
+                    );
+                    continue;
+                }
+            }
+        }
+        let mut opened_window =
+            proposal_window_opened(&conn, &document.pending().id.0.to_string())?;
+        let retention_expired = proposal_retention_expired(coven_home, &conn, &document, now)?;
+        drop(conn);
+        if document
+            .scheduled()
+            .is_some_and(|proposal| proposal.veto_deadline().is_some())
+            && !opened_window
+        {
+            if let Err(error) = ensure_proposal_window_opened_audit(
+                coven_home,
+                document
+                    .scheduled()
+                    .expect("guard established scheduled proposal"),
+                document.identity_evidence,
+                now,
+            ) {
+                if invalid_scheduled_submission_authority(&error) {
+                    quarantine_scheduler_candidate(coven_home, &path, &error);
+                } else {
+                    crate::daemon::append_daemon_recovery_log(
+                        coven_home,
+                        &format!(
+                            "threads scheduler: proposal window audit failed for {}: \
+                             {error:#}; retained for retry",
+                            path.display()
+                        ),
+                    );
+                }
+                continue;
+            }
+            opened_window = true;
+        }
         let mut revalidation_required = opened_window
             && document
                 .scheduled()
@@ -12173,7 +12688,12 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
         };
         if !protected_targets.is_empty() || revalidation_required {
             if let Some(proposal) = document.scheduled() {
-                if let Err(error) = ensure_proposal_window_opened_audit(coven_home, proposal, now) {
+                if let Err(error) = ensure_proposal_window_opened_audit(
+                    coven_home,
+                    proposal,
+                    document.identity_evidence,
+                    now,
+                ) {
                     crate::daemon::append_daemon_recovery_log(
                         coven_home,
                         &format!(
@@ -12193,6 +12713,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             let body = request
                 .and_then(|request| request.rationale.as_ref())
                 .map(|note| json!({ "note": note }).to_string());
+            drop(proposal_guard.take());
             match decide_threads_proposal_automatic(
                 coven_home,
                 &proposal_id,
@@ -12221,6 +12742,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             }
             continue;
         }
+        let scheduled_identity_evidence = document.identity_evidence;
         let (proposal_id, _staged_at, proposal, request) =
             match parse_scheduler_authority_document(&path, document) {
                 Ok(parsed) => parsed,
@@ -12234,6 +12756,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                 let body = request
                     .rationale
                     .map(|note| json!({ "note": note }).to_string());
+                drop(proposal_guard.take());
                 let response = decide_threads_proposal_automatic(
                     coven_home,
                     &proposal_id.to_string(),
@@ -12243,6 +12766,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                 return Ok(scheduler_response_completed(&response, &path));
             }
             if retention_expired {
+                drop(proposal_guard.take());
                 let response = expire_threads_proposal(coven_home, &proposal_id.to_string())?;
                 if scheduler_response_completed(&response, &path) {
                     return Ok(true);
@@ -12264,7 +12788,12 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             let Some(proposal) = proposal else {
                 return Ok(false);
             };
-            ensure_proposal_window_opened_audit(coven_home, &proposal, now)?;
+            ensure_proposal_window_opened_audit(
+                coven_home,
+                &proposal,
+                scheduled_identity_evidence,
+                now,
+            )?;
             let due = match &proposal.classification().approval_path {
                 coven_threads_core::ApprovalPath::AutoRegression { veto: None } => true,
                 coven_threads_core::ApprovalPath::AutoRegression { veto: Some(_) }
@@ -12277,6 +12806,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             if !due {
                 return Ok(false);
             }
+            drop(proposal_guard.take());
             let response = decide_threads_proposal_automatic(
                 coven_home,
                 &proposal_id.to_string(),
@@ -12345,9 +12875,9 @@ fn recover_proposal_claim_document(
     let proposal_id = document.pending().id.0;
     let applying = document.decision_state;
     let request = document.decision_request;
-    let body = applying
-        .and_then(|state| state.rationale)
-        .or_else(|| request.and_then(|request| request.rationale))
+    let body = request
+        .and_then(|request| request.rationale)
+        .or_else(|| applying.and_then(|state| state.rationale))
         .map(|note| json!({ "note": note }).to_string());
     let response = decide_threads_proposal_automatic(
         coven_home,
@@ -12361,16 +12891,24 @@ fn recover_proposal_claim_document(
 fn ensure_proposal_window_opened_audit(
     coven_home: &Path,
     proposal: &crate::proposal_scheduler::ScheduledProposal,
+    identity_evidence: Option<[u8; 32]>,
     now: time::OffsetDateTime,
 ) -> Result<()> {
     let conn = store::open_store(&store_path(coven_home))?;
-    ensure_proposal_window_opened_audit_with_conn(coven_home, &conn, proposal, now)
+    ensure_proposal_window_opened_audit_with_conn(
+        coven_home,
+        &conn,
+        proposal,
+        identity_evidence,
+        now,
+    )
 }
 
 fn ensure_proposal_window_opened_audit_with_conn(
-    coven_home: &Path,
+    _coven_home: &Path,
     conn: &rusqlite::Connection,
     proposal: &crate::proposal_scheduler::ScheduledProposal,
+    identity_evidence: Option<[u8; 32]>,
     now: time::OffsetDateTime,
 ) -> Result<()> {
     let (Some(deadline), Some(earliest_close)) =
@@ -12382,27 +12920,13 @@ fn ensure_proposal_window_opened_audit_with_conn(
     if proposal_window_opened(conn, &pending.id.0.to_string())? {
         return Ok(());
     }
-    let Some(familiar_id) = human_familiar_id_for_weave(coven_home, pending.familiar_id)? else {
-        anyhow::bail!("scheduled proposal familiar is missing");
-    };
-    let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
-    let config =
-        ward::WardConfig::load(&workspace)?.context("scheduled proposal Ward is not configured")?;
+    let (familiar_id, weave_hash) =
+        scheduled_submission_authority(conn, proposal, identity_evidence)?;
     let targets: Vec<String> = pending
         .edits
         .iter()
         .map(|edit| edit.surface.as_str().to_string())
         .collect();
-    let state = crate::threads_gate::build_weave_state_for_writer_at(
-        conn,
-        &familiar_id,
-        &workspace,
-        &config,
-        &targets,
-        false,
-        now,
-        Some(&pending.writer),
-    )?;
     let detail = coven_threads_core::ProposalWindowAuditDetail {
         approval_path_label: proposal
             .classification()
@@ -12443,9 +12967,9 @@ fn ensure_proposal_window_opened_audit_with_conn(
             coven_threads_core::AuditEventType::ProposalWindowOpened.tag(),
             pending.id.0.to_string(),
             familiar_id,
-            state.weave.weave_hash(),
+            weave_hash,
             "window-opened",
-            pending.writer.as_str(),
+            Option::<String>::None,
             detail,
             files_touched,
             format!("{:?}", pending.channel).to_lowercase(),
@@ -12457,23 +12981,273 @@ fn ensure_proposal_window_opened_audit_with_conn(
     Ok(())
 }
 
+#[derive(Debug)]
+struct InvalidScheduledSubmissionAuthority(String);
+
+impl std::fmt::Display for InvalidScheduledSubmissionAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidScheduledSubmissionAuthority {}
+
+fn invalid_submission_authority(message: impl Into<String>) -> anyhow::Error {
+    InvalidScheduledSubmissionAuthority(message.into()).into()
+}
+
+fn invalid_scheduled_submission_authority(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<InvalidScheduledSubmissionAuthority>()
+        .is_some()
+}
+
+fn scheduled_submission_authority(
+    conn: &rusqlite::Connection,
+    proposal: &crate::proposal_scheduler::ScheduledProposal,
+    identity_evidence: Option<[u8; 32]>,
+) -> Result<(String, Vec<u8>)> {
+    scheduled_submission_authority_inner(conn, proposal, identity_evidence, None)
+}
+
+fn scheduled_submission_authority_for_document(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+) -> Result<(String, Vec<u8>)> {
+    scheduled_submission_authority_inner(
+        conn,
+        document
+            .scheduled()
+            .context("submission receipt requires a scheduled proposal")?,
+        document.identity_evidence,
+        Some((coven_home, document)),
+    )
+}
+
+fn historical_submission_identity_is_bound(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+) -> Result<bool> {
+    let request = document.decision_request.as_ref();
+    let applying = document.decision_state.as_ref();
+    let Some(decision) = request
+        .map(|request| proposal_reservation_decision(&request.decision, request.expired))
+        .or_else(|| applying.map(|applying| applying.decision.clone()))
+    else {
+        return Ok(false);
+    };
+    let proposal_id = document.pending().id.to_string();
+    let origin =
+        match trusted_decision_approver(conn, &proposal_id, &decision, request, applying.is_some())
+        {
+            Ok(origin) => origin,
+            Err(error)
+                if invalid_proposal_decision_origin(&error)
+                    || error
+                        .downcast_ref::<HistoricalDecisionReviewRequired>()
+                        .is_some() =>
+            {
+                return Ok(false)
+            }
+            Err(error) => return Err(error),
+        };
+    if origin == TrustedProposalDecisionOrigin::Expiry {
+        return Ok(true);
+    }
+    if !matches!(
+        origin,
+        TrustedProposalDecisionOrigin::Legacy | TrustedProposalDecisionOrigin::HistoricalRequest
+    ) {
+        return Ok(false);
+    }
+    let Some(applying) = applying.filter(|applying| applying.baseline_snapshot.is_some()) else {
+        return Ok(false);
+    };
+    let Some(intent) = load_proposal_apply_intent(conn, &proposal_id)? else {
+        return Ok(false);
+    };
+    if intent.state != *applying {
+        return Ok(false);
+    }
+    let familiar_id = human_familiar_id_for_weave(coven_home, document.pending().familiar_id)?
+        .context("historical submission familiar is unavailable")?;
+    let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
+    let config =
+        ward::WardConfig::load(&workspace)?.context("historical submission Ward is unavailable")?;
+    let baselines = proposal_recovery_baselines(
+        conn,
+        &familiar_id,
+        document.pending(),
+        applying,
+        ProposalRecoveryVersion::V3,
+    )?;
+    let commitment = proposal_recovery_commitment(
+        &config,
+        document,
+        ProposalRecoveryContext {
+            coven_home,
+            workspace: &workspace,
+            familiar_id: &familiar_id,
+            authorization: &authorization_from_writer(&document.pending().writer),
+            baseline_snapshot: &baselines,
+            identity_context: None,
+            require_bound_identity_context: false,
+            version: ProposalRecoveryVersion::V3,
+        },
+    )?;
+    Ok(commitment == applying.recovery_commitment)
+}
+
+fn scheduled_submission_authority_inner(
+    conn: &rusqlite::Connection,
+    proposal: &crate::proposal_scheduler::ScheduledProposal,
+    identity_evidence: Option<[u8; 32]>,
+    recovery: Option<(&Path, &ProposalEnvelopeDocument)>,
+) -> Result<(String, Vec<u8>)> {
+    let pending = proposal.pending();
+    let targets: Vec<String> = pending
+        .edits
+        .iter()
+        .map(|edit| edit.surface.as_str().to_string())
+        .collect();
+    let submission_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ward_audit
+         WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+        [pending.id.0.to_string()],
+        |row| row.get(0),
+    )?;
+    if submission_count != 1 {
+        return Err(invalid_submission_authority(
+            "scheduled proposal must have exactly one submission receipt",
+        ));
+    }
+    let (familiar_id, weave_hash, detail, files_touched, channel, submitted_at): (
+        String,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+    ) = match conn.query_row(
+        "SELECT familiar_id, ward_hash, detail, files_touched, channel, submitted_at
+             FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'
+             LIMIT 1",
+        [pending.id.0.to_string()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    ) {
+        Ok(receipt) => receipt,
+        Err(
+            error @ (rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::QueryReturnedNoRows),
+        ) => {
+            return Err(invalid_submission_authority(format!(
+                "scheduled proposal submission receipt is invalid: {error}"
+            )));
+        }
+        Err(error) => {
+            return Err(error).context("loading scheduled proposal submission receipt");
+        }
+    };
+    if crate::threads_gate::familiar_weave_id(&familiar_id) != pending.familiar_id {
+        return Err(invalid_submission_authority(
+            "scheduled proposal submission familiar does not match its pending envelope",
+        ));
+    }
+    if weave_hash.len() != 32 {
+        return Err(invalid_submission_authority(
+            "scheduled proposal submission weave hash is not a SHA-256 digest",
+        ));
+    }
+    let expected_detail = json!({
+        "classification": proposal.classification(),
+        "veto_deadline": proposal.veto_deadline(),
+        "earliest_close": proposal.earliest_close(),
+        "identity_evidence": identity_evidence,
+    });
+    let recorded_detail: Value = serde_json::from_str(&detail).map_err(|error| {
+        invalid_submission_authority(format!(
+            "scheduled proposal submission detail is invalid: {error}"
+        ))
+    })?;
+    if recorded_detail != expected_detail {
+        let mut historical_detail = expected_detail.clone();
+        historical_detail
+            .as_object_mut()
+            .expect("submission detail is an object")
+            .remove("identity_evidence");
+        if recorded_detail != historical_detail {
+            return Err(invalid_submission_authority(
+                "scheduled proposal authority diverges from its submission receipt",
+            ));
+        }
+        let identity_bound = match recovery {
+            Some((home, document)) => {
+                historical_submission_identity_is_bound(home, conn, document)?
+            }
+            None => false,
+        };
+        if !identity_bound {
+            return Err(HistoricalDecisionReviewRequired(
+                "older submission receipt requires a bound v3 apply intent or a new proposal",
+            )
+            .into());
+        }
+    }
+    let recorded_targets: Vec<String> = serde_json::from_str(&files_touched).map_err(|error| {
+        invalid_submission_authority(format!(
+            "scheduled proposal submission targets are invalid: {error}"
+        ))
+    })?;
+    if recorded_targets != targets {
+        return Err(invalid_submission_authority(
+            "scheduled proposal targets diverge from its submission receipt",
+        ));
+    }
+    if channel != format!("{:?}", pending.channel).to_lowercase() {
+        return Err(invalid_submission_authority(
+            "scheduled proposal channel diverges from its submission receipt",
+        ));
+    }
+    let expected_submitted_at = pending
+        .staged_at
+        .format(&time::format_description::well_known::Rfc3339)?;
+    if submitted_at != expected_submitted_at {
+        return Err(invalid_submission_authority(
+            "scheduled proposal staged time diverges from its submission receipt",
+        ));
+    }
+    Ok((familiar_id, weave_hash))
+}
+
 struct PendingDecisionClaim {
     path: PathBuf,
     original_path: PathBuf,
     preserve: bool,
     recovery: bool,
-    existing_request: bool,
+    request_preexisting: bool,
 }
 
 struct PendingDecisionClaimRequest<'a> {
     audit_conn: &'a rusqlite::Connection,
     decision: &'a str,
-    rationale: Option<&'a str>,
-    expected_revision: Option<&'a str>,
-    revision_required: bool,
     expired: bool,
+    new_request: Option<&'a ProposalDecisionRequest>,
+    expiry_recovery_prevalidated: bool,
     now: time::OffsetDateTime,
-    replacement: Option<ProposalReplacementIntent>,
 }
 
 #[derive(Debug)]
@@ -12498,25 +13272,170 @@ impl std::fmt::Display for ProposalExpiredBeforeClaim {
 
 impl std::error::Error for ProposalExpiredBeforeClaim {}
 
-fn release_superseded_proposal_reservation(
+#[derive(Debug)]
+struct ProposalDecisionRequestPossiblyPersisted;
+
+impl std::fmt::Display for ProposalDecisionRequestPossiblyPersisted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("proposal decision request may already be durable")
+    }
+}
+
+impl std::error::Error for ProposalDecisionRequestPossiblyPersisted {}
+
+fn inspect_proposal_decision_document(
+    coven_home: &Path,
+    proposal_id: Uuid,
+) -> (bool, bool, Option<ProposalEnvelopeDocument>) {
+    let claim = find_any_pending_decision_claim(coven_home, &proposal_id.to_string());
+    let (is_claim, path) = match claim {
+        Some((path, _)) => (true, Some(path)),
+        None => (
+            false,
+            find_pending_proposal(coven_home, proposal_id)
+                .ok()
+                .flatten(),
+        ),
+    };
+    let found = path.is_some();
+    let document = path
+        .and_then(|path| read_pending_proposal_file(&path).ok())
+        .and_then(|raw| ProposalEnvelopeDocument::parse_preflighted(&raw).ok());
+    (is_claim, found, document)
+}
+
+fn release_superseded_proposal_reservations(
     conn: &rusqlite::Connection,
     proposal_id: Uuid,
-    decision: &str,
 ) -> Result<()> {
-    if decision == "reject" {
-        return Ok(());
+    for decision in ["approve", "reject"] {
+        conn.execute(
+            "DELETE FROM coven_ward_audit_reservations
+             WHERE token = ?1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM temp.coven_active_ward_audit_reservation
+                   WHERE token = ?1
+               )",
+            [format!("proposal:{proposal_id}:{decision}")],
+        )
+        .context("releasing superseded proposal audit reservation")?;
     }
-    conn.execute(
-        "DELETE FROM coven_ward_audit_reservations
-         WHERE token = ?1
-           AND NOT EXISTS (
-               SELECT 1
-               FROM temp.coven_active_ward_audit_reservation
-               WHERE token = ?1
-           )",
-        [format!("proposal:{proposal_id}:{decision}")],
+    Ok(())
+}
+
+fn proposal_expiry_request(document: &ProposalEnvelopeDocument) -> Result<ProposalDecisionRequest> {
+    Ok(ProposalDecisionRequest {
+        decision: "reject".to_string(),
+        rationale: None,
+        claimed_at: document
+            .pending()
+            .staged_at
+            .checked_add(time::Duration::days(
+                crate::proposal_store::PENDING_PROPOSAL_RETENTION_DAYS,
+            ))
+            .context("proposal retention deadline overflowed")?,
+        expected_revision: None,
+        revision_required: false,
+        expired: true,
+        replacement_proposal_id: None,
+        replacement_proposal_revision: None,
+        decision_actor: None,
+    })
+}
+
+fn bound_proposal_expiry_transition(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+) -> Result<Option<ProposalDecisionRequest>> {
+    use rusqlite::OptionalExtension;
+
+    let proposal_id = document.pending().id.to_string();
+    let expiry_request = proposal_expiry_request(document)?;
+    let expiry_purpose = bound_proposal_decision_purpose("proposal-expiry", &expiry_request)?;
+    if document.decision_request.as_ref() == Some(&expiry_request)
+        && document.decision_state.is_none()
+    {
+        let bound: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM coven_ward_audit_reservations
+             WHERE token = ?1 AND purpose = ?2)",
+            rusqlite::params![format!("proposal:{proposal_id}:expiry"), expiry_purpose],
+            |row| row.get(0),
+        )?;
+        return Ok(bound.then_some(expiry_request));
+    }
+    let request = document.decision_request.as_ref();
+    if request.is_some_and(|request| request.expired) {
+        return Ok(None);
+    }
+    let Some(decision) = request
+        .map(|request| request.decision.as_str())
+        .or_else(|| {
+            document
+                .decision_state
+                .as_ref()
+                .map(|state| state.decision.as_str())
+        })
+    else {
+        return Ok(None);
+    };
+    let marker = format!("|superseded-by:{expiry_purpose}");
+    let purpose: Option<String> = conn
+        .query_row(
+            "SELECT purpose FROM coven_ward_audit_reservations WHERE token = ?1",
+            [format!("proposal:{proposal_id}:{decision}")],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("loading superseded proposal authority")?;
+    let Some(original_purpose) = purpose
+        .as_deref()
+        .and_then(|purpose| purpose.strip_suffix(&marker))
+    else {
+        return Ok(None);
+    };
+    let origin = match trusted_decision_approver_for_purpose(
+        conn,
+        &proposal_id,
+        decision,
+        request,
+        document.decision_state.is_some(),
+        original_purpose,
+    ) {
+        Ok(origin) => origin,
+        Err(error) if invalid_proposal_decision_origin(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // The marker transfers terminal authority, never permission to resume the
+    // old write. Recheck the bound intent and before-images before consuming it.
+    Ok(
+        proposal_recovery_is_proven_unapplied_with_origin(coven_home, conn, document, Some(origin))
+            .then_some(expiry_request),
     )
-    .context("releasing superseded proposal audit reservation")?;
+}
+
+fn mark_proposal_reservations_superseded_by_expiry(
+    conn: &rusqlite::Connection,
+    proposal_id: &str,
+    expiry_purpose: &str,
+) -> Result<()> {
+    let marker = format!("|superseded-by:{expiry_purpose}");
+    conn.execute(
+        "UPDATE coven_ward_audit_reservations
+         SET reserved_bytes = 0,
+             purpose = CASE
+                 WHEN purpose LIKE '%' || ?3 THEN purpose
+                 ELSE purpose || ?3
+             END
+         WHERE token IN (?1, ?2)",
+        rusqlite::params![
+            format!("proposal:{proposal_id}:approve"),
+            format!("proposal:{proposal_id}:reject"),
+            marker,
+        ],
+    )
+    .context("marking superseded proposal reservation capacity for expiry")?;
     Ok(())
 }
 
@@ -12524,7 +13443,7 @@ fn release_terminal_proposal_reservations(
     conn: &rusqlite::Connection,
     proposal_id: Uuid,
 ) -> Result<()> {
-    for decision in ["approve", "reject"] {
+    for decision in ["approve", "reject", "expiry"] {
         conn.execute(
             "DELETE FROM coven_ward_audit_reservations
              WHERE token = ?1
@@ -12540,32 +13459,11 @@ fn release_terminal_proposal_reservations(
     Ok(())
 }
 
-fn proposal_reservation_decision(
-    conn: &rusqlite::Connection,
-    proposal_id: &str,
-    decision: &str,
-    expired: bool,
-) -> Result<String> {
+fn proposal_reservation_decision(decision: &str, expired: bool) -> String {
     if expired {
-        for candidate in ["reject", "approve"] {
-            let token = format!("proposal:{proposal_id}:{candidate}");
-            let exists: bool = conn
-                .query_row(
-                    "SELECT EXISTS (
-                         SELECT 1
-                         FROM coven_ward_audit_reservations
-                         WHERE token = ?1 AND reserved_bytes > 0
-                     )",
-                    [&token],
-                    |row| row.get(0),
-                )
-                .context("checking reusable proposal audit reservation")?;
-            if exists {
-                return Ok(candidate.to_string());
-            }
-        }
+        return "expiry".to_string();
     }
-    Ok(decision.to_string())
+    decision.to_string()
 }
 
 impl PendingDecisionClaim {
@@ -12577,25 +13475,11 @@ impl PendingDecisionClaim {
         let PendingDecisionClaimRequest {
             audit_conn,
             decision,
-            rationale,
-            expected_revision,
-            revision_required,
             expired,
+            new_request,
+            expiry_recovery_prevalidated,
             now,
-            replacement,
         } = request;
-        let expiry_request = |existing: Option<&ProposalDecisionRequest>| ProposalDecisionRequest {
-            decision: "reject".to_string(),
-            rationale: existing
-                .and_then(|request| request.rationale.clone())
-                .or_else(|| rationale.map(str::to_string)),
-            claimed_at: existing.map(|request| request.claimed_at).unwrap_or(now),
-            expected_revision: None,
-            revision_required: false,
-            expired: true,
-            replacement_proposal_id: None,
-            replacement_proposal_revision: None,
-        };
         if let Some((path, claimed_decision)) =
             find_any_pending_decision_claim(coven_home, &proposal_id.to_string())
         {
@@ -12613,45 +13497,54 @@ impl PendingDecisionClaim {
             let mut document = ProposalEnvelopeDocument::parse_preflighted(&raw)
                 .context("parsing pending proposal claim before decision recovery")?;
             drop(raw);
-            if !expired && proposal_retention_expired(coven_home, audit_conn, &document, now) {
+            if !expired && proposal_retention_expired(coven_home, audit_conn, &document, now)? {
                 return Err(ProposalExpiredBeforeClaim.into());
             }
             if expired {
+                let request_preexisting = document
+                    .decision_request
+                    .as_ref()
+                    .is_some_and(|request| request.expired);
                 anyhow::ensure!(
-                    proposal_recovery_is_proven_unapplied(coven_home, audit_conn, &document),
-                    "proposal apply recovery is not proven safe for terminal expiry"
+                    expiry_recovery_prevalidated,
+                    "proposal expiry recovery was not validated before authority supersession"
                 );
                 document.decision_state = None;
-                document.decision_request =
-                    Some(expiry_request(document.decision_request.as_ref()));
+                document.decision_request = Some(
+                    new_request
+                        .cloned()
+                        .or_else(|| {
+                            document
+                                .decision_request
+                                .clone()
+                                .filter(|request| request.expired)
+                        })
+                        .context("terminal expiry lacks a server-owned decision request")?,
+                );
                 let body = document.serialize_with_decision(
                     document.decision_request.as_ref(),
                     document.decision_state.as_ref(),
                 )?;
-                release_superseded_proposal_reservation(
-                    audit_conn,
-                    proposal_id,
-                    &claimed_decision,
-                )?;
-                crate::proposal_store::replace_existing_for_terminal_decision(&path, &body)?;
+                crate::proposal_store::replace_existing_for_terminal_decision(&path, &body)
+                    .context(ProposalDecisionRequestPossiblyPersisted)?;
                 let expiry_path =
                     original_path.with_file_name(format!("{original_name}.reject.deciding"));
                 if path != expiry_path {
-                    crate::proposal_store::rename_existing(&path, &expiry_path).with_context(
-                        || {
+                    crate::proposal_store::rename_existing(&path, &expiry_path)
+                        .with_context(|| {
                             format!(
                                 "reclaiming pending proposal {} for terminal expiry",
                                 path.display()
                             )
-                        },
-                    )?;
+                        })
+                        .context(ProposalDecisionRequestPossiblyPersisted)?;
                 }
                 return Ok(Some(Self {
                     path: expiry_path,
                     original_path,
                     preserve: false,
                     recovery: true,
-                    existing_request: true,
+                    request_preexisting,
                 }));
             }
             if claimed_decision != decision {
@@ -12662,7 +13555,7 @@ impl PendingDecisionClaim {
                 path,
                 preserve: false,
                 recovery: true,
-                existing_request: true,
+                request_preexisting: document.decision_request.is_some(),
             }));
         }
 
@@ -12679,69 +13572,66 @@ impl PendingDecisionClaim {
         let mut document = ProposalEnvelopeDocument::parse_preflighted(&raw)
             .context("parsing pending proposal before decision claim")?;
         drop(raw);
-        let existing_request = document.decision_request.is_some();
-        if !expired && proposal_retention_expired(coven_home, audit_conn, &document, now) {
+        let request_preexisting = document
+            .decision_request
+            .as_ref()
+            .is_some_and(|request| !expired || request.expired);
+        if !expired && proposal_retention_expired(coven_home, audit_conn, &document, now)? {
             return Err(ProposalExpiredBeforeClaim.into());
         }
-        let superseded_decision = expired
-            .then(|| {
-                document
-                    .decision_request
-                    .as_ref()
-                    .map(|request| request.decision.clone())
-            })
-            .flatten();
         if expired {
             anyhow::ensure!(
-                proposal_recovery_is_proven_unapplied(coven_home, audit_conn, &document),
-                "proposal apply recovery is not proven safe for terminal expiry"
+                expiry_recovery_prevalidated,
+                "proposal expiry recovery was not validated before authority supersession"
             );
             document.decision_state = None;
-            document.decision_request = Some(expiry_request(document.decision_request.as_ref()));
+            document.decision_request = Some(
+                new_request
+                    .cloned()
+                    .or_else(|| {
+                        document
+                            .decision_request
+                            .clone()
+                            .filter(|request| request.expired)
+                    })
+                    .context("terminal expiry lacks a server-owned decision request")?,
+            );
         } else if document.decision_request.is_none() {
-            if let Some(expected_revision) = expected_revision {
+            let new_request =
+                new_request.context("new proposal decision lacks its planned request")?;
+            if let Some(expected_revision) = new_request.expected_revision.as_deref() {
                 if document.revision()? != expected_revision {
                     return Err(ProposalRevisionMismatch.into());
                 }
             }
-            document.decision_request = Some(ProposalDecisionRequest {
-                decision: decision.to_string(),
-                rationale: rationale.map(str::to_string),
-                claimed_at: now,
-                expected_revision: expected_revision.map(str::to_string),
-                revision_required,
-                expired,
-                replacement_proposal_id: replacement.as_ref().map(|intent| intent.proposal_id),
-                replacement_proposal_revision: replacement
-                    .as_ref()
-                    .map(|intent| intent.proposal_revision.clone()),
-            });
+            document.decision_request = Some(new_request.clone());
         }
         let body = document.serialize_with_decision(
             document.decision_request.as_ref(),
             document.decision_state.as_ref(),
         )?;
-        if let Some(previous) = superseded_decision {
-            release_superseded_proposal_reservation(audit_conn, proposal_id, &previous)?;
-        }
         if decision == "reject" {
-            crate::proposal_store::replace_existing_for_terminal_decision(&original_path, &body)?;
+            crate::proposal_store::replace_existing_for_terminal_decision(&original_path, &body)
+                .context(ProposalDecisionRequestPossiblyPersisted)?;
         } else {
-            crate::proposal_store::replace_existing(&original_path, &body)?;
+            crate::proposal_store::replace_existing(&original_path, &body)
+                .context(ProposalDecisionRequestPossiblyPersisted)?;
         }
-        crate::proposal_store::rename_existing(&original_path, &path).with_context(|| {
-            format!(
-                "claiming pending proposal {} as {}",
-                original_path.display(),
-                path.display()
-            )
-        })?;
+        crate::proposal_store::rename_existing(&original_path, &path)
+            .with_context(|| {
+                format!(
+                    "claiming pending proposal {} as {}",
+                    original_path.display(),
+                    path.display()
+                )
+            })
+            .context(ProposalDecisionRequestPossiblyPersisted)?;
         Ok(Some(Self {
             path,
             original_path,
             preserve: false,
             recovery: false,
-            existing_request,
+            request_preexisting,
         }))
     }
 
@@ -12797,6 +13687,254 @@ struct ProposalDecisionRequest {
     replacement_proposal_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replacement_proposal_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision_actor: Option<String>,
+}
+
+#[derive(Debug)]
+struct InvalidProposalDecisionOrigin(String);
+
+impl std::fmt::Display for InvalidProposalDecisionOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidProposalDecisionOrigin {}
+
+fn invalid_proposal_decision_origin(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<InvalidProposalDecisionOrigin>()
+        .is_some()
+}
+
+fn invalid_decision_origin(message: impl Into<String>) -> anyhow::Error {
+    InvalidProposalDecisionOrigin(message.into()).into()
+}
+
+#[derive(Debug)]
+struct HistoricalDecisionReviewRequired(&'static str);
+
+impl std::fmt::Display for HistoricalDecisionReviewRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "historical decision requires renewed review: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for HistoricalDecisionReviewRequired {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustedProposalDecisionOrigin {
+    OwnerLocal(coven_threads_core::WriterId),
+    Automatic,
+    Expiry,
+    Legacy,
+    HistoricalRequest,
+}
+
+const HISTORICAL_UNKNOWN_DECISION_ACTOR: &str = "unknown:historical";
+
+impl TrustedProposalDecisionOrigin {
+    fn approver(&self) -> Option<&coven_threads_core::WriterId> {
+        match self {
+            Self::OwnerLocal(approver) => Some(approver),
+            Self::Automatic | Self::Expiry | Self::Legacy | Self::HistoricalRequest => None,
+        }
+    }
+
+    fn verify_apply_intent_actor(&self) -> bool {
+        matches!(self, Self::OwnerLocal(_) | Self::Automatic)
+    }
+}
+
+fn trusted_decision_approver(
+    conn: &rusqlite::Connection,
+    proposal_id: &str,
+    reservation_decision: &str,
+    request: Option<&ProposalDecisionRequest>,
+    applying: bool,
+) -> Result<TrustedProposalDecisionOrigin> {
+    use rusqlite::OptionalExtension;
+
+    let purpose: Option<String> = conn
+        .query_row(
+            "SELECT purpose
+             FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            [format!("proposal:{proposal_id}:{reservation_decision}")],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("loading proposal decision origin")?;
+    let Some(purpose) = purpose else {
+        return Err(invalid_decision_origin(
+            "proposal decision request has no durable reservation",
+        ));
+    };
+    trusted_decision_approver_for_purpose(
+        conn,
+        proposal_id,
+        reservation_decision,
+        request,
+        applying,
+        &purpose,
+    )
+}
+
+fn trusted_decision_approver_for_purpose(
+    conn: &rusqlite::Connection,
+    proposal_id: &str,
+    reservation_decision: &str,
+    request: Option<&ProposalDecisionRequest>,
+    applying: bool,
+    purpose: &str,
+) -> Result<TrustedProposalDecisionOrigin> {
+    let Some(request) = request else {
+        let legacy_purpose = match reservation_decision {
+            "approve" => "proposal-approval",
+            "reject" => "proposal-rejection",
+            _ => {
+                return Err(invalid_decision_origin(
+                    "proposal decision reservation has an invalid decision",
+                ))
+            }
+        };
+        if purpose != legacy_purpose {
+            return Err(invalid_decision_origin(
+                "applying proposal without a request lacks compatible legacy authority",
+            ));
+        }
+        if !applying {
+            return Err(HistoricalDecisionReviewRequired("no bound historical apply").into());
+        }
+        return Ok(TrustedProposalDecisionOrigin::Legacy);
+    };
+    if request.expired {
+        if applying {
+            return Err(invalid_decision_origin(
+                "applying proposal cannot carry an expiry request",
+            ));
+        }
+        let expected_purpose = bound_proposal_decision_purpose("proposal-expiry", request)?;
+        if request.decision != "reject"
+            || purpose != expected_purpose
+            || request.revision_required
+            || request.expected_revision.is_some()
+            || request.decision_actor.is_some()
+        {
+            return Err(invalid_decision_origin(
+                "proposal expiry does not match its server-owned durable reservation",
+            ));
+        }
+        return Ok(TrustedProposalDecisionOrigin::Expiry);
+    }
+    let historical_purpose = match reservation_decision {
+        "approve" => "proposal-approval",
+        "reject" => "proposal-rejection",
+        _ => "",
+    };
+    if purpose == historical_purpose
+        && request.decision_actor.is_none()
+        && request.replacement_proposal_id.is_none()
+        && request.replacement_proposal_revision.is_none()
+    {
+        // Main 0f861716 and the pre-publication v3 producer persisted requests
+        // before origin hashes existed. Their append-only apply intent, not
+        // the proposal writer, proves the historical operation being resumed.
+        if !applying || request.decision != "approve" || request.decision != reservation_decision {
+            return Err(HistoricalDecisionReviewRequired("no bound historical apply").into());
+        }
+        let intent = match load_proposal_apply_intent(conn, proposal_id) {
+            Ok(Some(intent)) => intent,
+            Ok(None) => return Err(HistoricalDecisionReviewRequired("missing apply intent").into()),
+            Err(error) if invalid_proposal_apply_intent(&error) => {
+                return Err(HistoricalDecisionReviewRequired("unverifiable apply intent").into());
+            }
+            Err(error) => return Err(error),
+        };
+        let decided_at: String = conn
+            .query_row(
+                "SELECT decided_at FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'validation_verdict'
+               AND decision = 'proposal-apply-intent' ORDER BY id DESC LIMIT 1",
+                [proposal_id],
+                |row| row.get(0),
+            )
+            .context("loading historical apply time")?;
+        let claimed_at = request
+            .claimed_at
+            .format(&time::format_description::well_known::Rfc3339)?;
+        if intent.state.decision != request.decision
+            || intent.state.rationale != request.rationale
+            || decided_at != claimed_at
+        {
+            return Err(HistoricalDecisionReviewRequired(
+                "request is not bound to the recorded apply",
+            )
+            .into());
+        }
+        return Ok(TrustedProposalDecisionOrigin::HistoricalRequest);
+    }
+    let expected_purpose = match request.decision.as_str() {
+        "approve" => (
+            "proposal-approval-owner-local",
+            "proposal-approval-automatic",
+        ),
+        "reject" => (
+            "proposal-rejection-owner-local",
+            "proposal-rejection-automatic",
+        ),
+        _ => {
+            return Err(invalid_decision_origin(
+                "proposal decision request has an invalid decision",
+            ))
+        }
+    };
+    let manual_purpose = bound_proposal_decision_purpose(expected_purpose.0, request)?;
+    let automatic_purpose = bound_proposal_decision_purpose(expected_purpose.1, request)?;
+    match purpose {
+        purpose if purpose == manual_purpose => {
+            if !request.revision_required
+                || request.decision_actor.as_deref() != Some(OWNER_LOCAL_DECISION_ACTOR)
+            {
+                return Err(invalid_decision_origin(
+                    "manual proposal decision origin does not match its durable reservation",
+                ));
+            }
+            Ok(TrustedProposalDecisionOrigin::OwnerLocal(
+                coven_threads_core::WriterId::new(OWNER_LOCAL_DECISION_ACTOR),
+            ))
+        }
+        purpose if purpose == automatic_purpose => {
+            if request.revision_required || request.decision_actor.is_some() {
+                return Err(invalid_decision_origin(
+                    "automatic proposal decision origin does not match its durable reservation",
+                ));
+            }
+            Ok(TrustedProposalDecisionOrigin::Automatic)
+        }
+        _ => Err(invalid_decision_origin(
+            "proposal decision reservation purpose is invalid",
+        )),
+    }
+}
+
+fn bound_proposal_decision_purpose(
+    purpose: &str,
+    request: &ProposalDecisionRequest,
+) -> Result<String> {
+    let request = serde_json::to_vec(request).context("serializing proposal decision request")?;
+    let digest = Sha256::digest(request);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(format!("{purpose}:{encoded}"))
 }
 
 fn bool_is_false(value: &bool) -> bool {
@@ -12891,6 +14029,60 @@ struct ProposalBeforeImage {
     contents: Option<coven_threads_core::StagedContents>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposalRecoveryVersion {
+    HistoricalV2,
+    V3,
+}
+
+fn proposal_recovery_version(
+    origin: &TrustedProposalDecisionOrigin,
+    applying: &ProposalApplyingState,
+) -> Result<ProposalRecoveryVersion> {
+    if applying.baseline_snapshot.is_some() {
+        return Ok(ProposalRecoveryVersion::V3);
+    }
+    anyhow::ensure!(
+        matches!(
+            origin,
+            TrustedProposalDecisionOrigin::Legacy
+                | TrustedProposalDecisionOrigin::HistoricalRequest
+        ),
+        "current decision cannot downgrade to a historical v2 recovery commitment"
+    );
+    Ok(ProposalRecoveryVersion::HistoricalV2)
+}
+
+fn proposal_recovery_baselines(
+    conn: &rusqlite::Connection,
+    familiar_id: &str,
+    pending: &coven_threads_core::PendingProposal,
+    applying: &ProposalApplyingState,
+    version: ProposalRecoveryVersion,
+) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
+    match version {
+        ProposalRecoveryVersion::V3 => reload_proposal_baselines(
+            conn,
+            familiar_id,
+            applying
+                .baseline_snapshot
+                .as_ref()
+                .context("v3 recovery requires its baseline snapshot")?,
+        ),
+        ProposalRecoveryVersion::HistoricalV2 => pending
+            .edits
+            .iter()
+            .map(|edit| {
+                let target = edit.surface.as_str();
+                Ok((
+                    target.to_string(),
+                    crate::threads_gate::load_baseline(conn, familiar_id, target)?,
+                ))
+            })
+            .collect(),
+    }
+}
+
 struct ProposalRecoveryContext<'a> {
     coven_home: &'a Path,
     workspace: &'a Path,
@@ -12899,6 +14091,7 @@ struct ProposalRecoveryContext<'a> {
     baseline_snapshot: &'a BTreeMap<String, Option<Vec<u8>>>,
     identity_context: Option<&'a coven_threads_core::CandidateIdentityContext>,
     require_bound_identity_context: bool,
+    version: ProposalRecoveryVersion,
 }
 
 fn proposal_recovery_commitment(
@@ -12914,10 +14107,19 @@ fn proposal_recovery_commitment(
         baseline_snapshot,
         identity_context,
         require_bound_identity_context,
+        version,
     } = context;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"coven:proposal-decision-recovery:v3");
-    let config_bytes = serde_json::to_vec(config).context("serializing Ward config")?;
+    let config_bytes = match version {
+        ProposalRecoveryVersion::HistoricalV2 => {
+            hasher.update(b"coven:proposal-decision-recovery:v2");
+            config.historical_recovery_v2_bytes()?
+        }
+        ProposalRecoveryVersion::V3 => {
+            hasher.update(b"coven:proposal-decision-recovery:v3");
+            serde_json::to_vec(config).context("serializing Ward config")?
+        }
+    };
     hasher.update(&(config_bytes.len() as u64).to_be_bytes());
     hasher.update(&config_bytes);
     let authority_bytes = document.authority_bytes()?;
@@ -13072,6 +14274,7 @@ fn ensure_proposal_final_authority_unchanged(
             baseline_snapshot: &live_baselines,
             identity_context: context.identity_context,
             require_bound_identity_context: context.require_bound_identity_context,
+            version: context.version,
         },
     )
     .map_err(|error| final_authority_drift("authority-evidence-unavailable", Some(error)))?;
@@ -13333,7 +14536,7 @@ fn append_proposal_apply_intent(
     conn: &rusqlite::Connection,
     proposal_id: &str,
     familiar_id: &str,
-    approver: &coven_threads_core::WriterId,
+    approver: Option<&coven_threads_core::WriterId>,
     files_touched: &[String],
     state: &ProposalApplyingState,
     channel: coven_threads_core::Channel,
@@ -13355,7 +14558,7 @@ fn append_proposal_apply_intent(
             proposal_id,
             familiar_id,
             state.weave_hash,
-            approver.as_str(),
+            approver.map(coven_threads_core::WriterId::as_str),
             detail,
             files_touched,
             format!("{channel:?}").to_lowercase(),
@@ -13366,15 +14569,36 @@ fn append_proposal_apply_intent(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RecordedProposalApplyIntent {
+    state: ProposalApplyingState,
+    approver: Option<String>,
+}
+
+#[derive(Debug)]
+struct InvalidProposalApplyIntent(String);
+
+impl std::fmt::Display for InvalidProposalApplyIntent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidProposalApplyIntent {}
+
+fn invalid_proposal_apply_intent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<InvalidProposalApplyIntent>().is_some()
+}
+
 fn load_proposal_apply_intent(
     conn: &rusqlite::Connection,
     proposal_id: &str,
-) -> Result<Option<ProposalApplyingState>> {
+) -> Result<Option<RecordedProposalApplyIntent>> {
     use rusqlite::OptionalExtension;
 
-    let detail: Option<String> = conn
+    let row: Option<(String, Option<String>)> = match conn
         .query_row(
-            "SELECT detail
+            "SELECT detail, approver
              FROM ward_audit
              WHERE proposal_id = ?1
                AND event_type = 'validation_verdict'
@@ -13382,13 +14606,34 @@ fn load_proposal_apply_intent(
              ORDER BY id DESC
              LIMIT 1",
             [proposal_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .context("loading proposal apply intent")?;
-    detail
-        .map(|detail| serde_json::from_str(&detail).context("invalid proposal apply intent"))
-        .transpose()
+    {
+        Ok(row) => row,
+        Err(
+            error @ (rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)),
+        ) => {
+            return Err(InvalidProposalApplyIntent(format!(
+                "proposal apply intent columns are invalid: {error}"
+            ))
+            .into());
+        }
+        Err(error) => return Err(error).context("loading proposal apply intent"),
+    };
+    row.map(|(detail, approver)| {
+        Ok(RecordedProposalApplyIntent {
+            state: serde_json::from_str(&detail).map_err(|error| {
+                InvalidProposalApplyIntent(format!(
+                    "proposal apply intent detail is invalid: {error}"
+                ))
+            })?,
+            approver,
+        })
+    })
+    .transpose()
 }
 
 fn proposal_expected_resolved_surfaces(
@@ -13822,13 +15067,14 @@ fn revalidation_failure_weave_hash(
 
 fn append_open_window_revalidation_failure(
     conn: &rusqlite::Connection,
-    proposal_id: &str,
     pending: &coven_threads_core::PendingProposal,
     opened: &ProposalWindowContext,
     approval_path_label: &str,
+    approver: Option<&coven_threads_core::WriterId>,
     rationale: Option<&str>,
     now: time::OffsetDateTime,
 ) -> Result<()> {
+    let proposal_id = pending.id.0.to_string();
     let files_touched: Vec<String> = pending
         .edits
         .iter()
@@ -13843,10 +15089,10 @@ fn append_open_window_revalidation_failure(
         conn,
         ProposalDecisionAudit {
             event_type: coven_threads_core::AuditEventType::ProposalRejected,
-            proposal_id,
+            proposal_id: &proposal_id,
             familiar_id: &opened.familiar_id,
             weave_hash: &opened.weave_hash,
-            approver: Some(&pending.writer),
+            approver,
             files_touched: &files_touched,
             decision: coven_threads_core::WindowCloseReason::RevalidationFailed.tag(),
             approval_rationale: rationale,
@@ -13997,7 +15243,7 @@ fn append_proposal_refusal_audit(
     proposal_id: &str,
     familiar_id: &str,
     weave_hash: &[u8],
-    approver: &coven_threads_core::WriterId,
+    approver: Option<&coven_threads_core::WriterId>,
     files_touched: &[String],
     channel: coven_threads_core::Channel,
     now: time::OffsetDateTime,
@@ -14009,7 +15255,7 @@ fn append_proposal_refusal_audit(
             proposal_id,
             familiar_id,
             weave_hash,
-            approver: Some(approver),
+            approver,
             files_touched,
             decision: "proposal-revalidation-failed",
             approval_rationale: None,
@@ -14040,7 +15286,7 @@ struct ApprovedProposalFinalization<'a> {
     familiar_id: &'a str,
     workspace: &'a Path,
     weave_hash: &'a [u8],
-    approver: &'a coven_threads_core::WriterId,
+    approver: Option<&'a coven_threads_core::WriterId>,
     apply_report: &'a ward::ApplyReport,
     gated_targets: &'a [String],
     approved_bytes: &'a BTreeMap<String, Vec<u8>>,
@@ -14089,7 +15335,7 @@ fn finalize_approved_proposal(
                 proposal_id: finalization.proposal_id,
                 familiar_id: finalization.familiar_id,
                 weave_hash: finalization.weave_hash,
-                approver: Some(finalization.approver),
+                approver: finalization.approver,
                 files_touched: finalization.files_touched,
                 decision: "approved",
                 approval_rationale: finalization.rationale,
@@ -14158,6 +15404,18 @@ fn append_proposal_decision_audit_with_probe_summary(
                     .as_object_mut()
                     .expect("proposal approval detail is an object")
                     .insert("probeSummary".to_string(), json!(probe_summary));
+            }
+            if audit
+                .approver
+                .is_some_and(|actor| actor.as_str() == HISTORICAL_UNKNOWN_DECISION_ACTOR)
+            {
+                detail
+                    .as_object_mut()
+                    .expect("proposal approval detail is an object")
+                    .insert(
+                        "decisionOrigin".to_string(),
+                        json!({"kind": "historical_unknown"}),
+                    );
             }
             Some(serde_json::to_string(&detail)?)
         }
@@ -28639,7 +29897,7 @@ id = "size-delta"
         let home = temp.path();
         let mut expected = std::collections::BTreeSet::new();
         for _ in 0..5 {
-            let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            let (_pending, proposal_id) = stage_scheduled_reviewed_edit(
                 home,
                 coven_threads_core::ApprovalPath::HumanApproval,
                 time::OffsetDateTime::now_utc(),
@@ -29364,6 +30622,28 @@ min_visible_seconds = 900
 "#
     }
 
+    fn human_review_retired_ward() -> &'static str {
+        r#"[meta]
+version = "0.1.0"
+owner = "sage"
+
+[protected]
+files = ["SOUL.md"]
+invariants = [
+  "familiar.name == 'Synthetic-identity'",
+  "familiar.person == 'Example principal'",
+]
+
+[editable]
+paths = ["TOOLS.md"]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.human_review]
+blocks = ["tool_defaults"]
+gate = "human_approval"
+"#
+    }
+
     fn unknown_region_retired_ward() -> &'static str {
         r#"[meta]
 version = "0.1.0"
@@ -29432,26 +30712,6 @@ harness_blocks = ["execution_prompt"]
 blocks = ["execution_prompt"]
 gate = "human_approval"
 "#
-    }
-
-    fn retime_scheduled_proposal(path: &Path, staged_at: time::OffsetDateTime) -> Result<()> {
-        let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-        let previous_staged_at: time::OffsetDateTime =
-            serde_json::from_value(value["staged_at"].clone())?;
-        let previous_deadline: time::OffsetDateTime =
-            serde_json::from_value(value["veto_deadline"].clone())?;
-        let previous_earliest_close: time::OffsetDateTime =
-            serde_json::from_value(value["earliest_close"].clone())?;
-        let deadline_offset = previous_deadline - previous_staged_at;
-        let earliest_close_offset = previous_earliest_close - previous_staged_at;
-
-        value["pending"]["staged_at"] = serde_json::to_value(staged_at)?;
-        value["classification"]["classified_at"] = serde_json::to_value(staged_at)?;
-        value["staged_at"] = serde_json::to_value(staged_at)?;
-        value["veto_deadline"] = serde_json::to_value(staged_at + deadline_offset)?;
-        value["earliest_close"] = serde_json::to_value(staged_at + earliest_close_offset)?;
-        std::fs::write(path, serde_json::to_vec_pretty(&value)?)?;
-        Ok(())
     }
 
     pub(crate) fn post_edits(home: &Path, body: &str) -> Result<ApiResponse> {
@@ -30867,6 +32127,14 @@ tier = 1
             "the original proposal must remain pending"
         );
         assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_none());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            [format!("proposal:{proposal_id}:approve")],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
         Ok(())
     }
 
@@ -32289,6 +33557,16 @@ tier = 0
             [&proposal_id],
             |row| row.get(0),
         )?;
+        let approver: Option<String> = conn.query_row(
+            "SELECT approver FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert!(
+            approver.is_none(),
+            "automatic identity rejection must not inherit proposer attribution"
+        );
         let close: coven_threads_core::ProposalWindowCloseAuditDetail =
             serde_json::from_str(&detail)?;
         assert_eq!(
@@ -32457,6 +33735,7 @@ tier = 0
                 baseline_snapshot: &BTreeMap::new(),
                 identity_context: None,
                 require_bound_identity_context: false,
+                version: ProposalRecoveryVersion::V3,
             },
         );
         assert!(commitment.is_err());
@@ -33723,6 +35002,42 @@ tier = 0
         std::fs::create_dir_all(&pending_dir)?;
         let path = pending_dir.join(format!("{familiar_id}-{proposal_id}.json"));
         std::fs::write(&path, serde_json::to_vec_pretty(&scheduled)?)?;
+        let config = ward::WardConfig::load(&workspace)?.context("fixture Ward is configured")?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let state = crate::threads_gate::build_weave_state_for_writer_at(
+            &conn,
+            "sage",
+            &workspace,
+            &config,
+            &[fixture.target.to_string()],
+            false,
+            staged_at,
+            Some(&scheduled.pending().writer),
+        )?;
+        let detail = serde_json::to_string(&json!({
+            "classification": scheduled.classification(),
+            "veto_deadline": scheduled.veto_deadline(),
+            "earliest_close": scheduled.earliest_close(),
+            "identity_evidence": Option::<[u8; 32]>::None,
+        }))?;
+        let submitted_at = staged_at.format(&time::format_description::well_known::Rfc3339)?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, proposal_id, familiar_id, ward_hash, decision, detail,
+                files_touched, channel, submitted_at, decided_at
+             ) VALUES (
+                'proposal_submitted', ?1, 'sage', ?2, 'staged:scheduled', ?3,
+                ?4, ?5, ?6, ?6
+             )",
+            rusqlite::params![
+                proposal_id.to_string(),
+                state.weave.weave_hash(),
+                detail,
+                serde_json::to_string(&vec![fixture.target])?,
+                format!("{:?}", fixture.channel).to_lowercase(),
+                submitted_at,
+            ],
+        )?;
         Ok((path, proposal_id.to_string()))
     }
 
@@ -33894,6 +35209,13 @@ tier = 0
             detail.rationale.as_deref(),
             Some("reviewed semantic change")
         );
+        let approver: Option<String> = conn.query_row(
+            "SELECT approver FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approver.as_deref(), Some("owner:local-ipc"));
         Ok(())
     }
 
@@ -35011,6 +36333,7 @@ tier = 0
             scheduled
                 .as_ref()
                 .context("fixture carries scheduled proposal")?,
+            None,
             crate::threads_clock::now(home)?,
         )?;
         let target = home.join("familiars/sage/reviewed/skill.md");
@@ -35066,6 +36389,41 @@ tier = 0
     }
 
     #[test]
+    fn threads_scheduled_deadline_rejects_deleted_empty_before_image() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_edit_with_images(
+            home,
+            ScheduledEditFixture {
+                target: "reviewed/empty.md",
+                path_tier_floor: 1,
+                channel: coven_threads_core::Channel::Mutation,
+                before: Some(b""),
+            },
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let target = home.join("familiars/sage/reviewed/empty.md");
+        std::fs::remove_file(&target)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-evidence-diverged");
+        assert!(!target.exists());
+        assert!(!pending.exists(), "failed replay is terminal");
+        Ok(())
+    }
+
+    #[test]
     fn threads_scheduled_deadline_replay_failure_closes_window() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -35085,6 +36443,7 @@ tier = 0
             scheduled
                 .as_ref()
                 .context("fixture carries scheduled proposal")?,
+            None,
             crate::threads_clock::now(home)?,
         )?;
         let target = home.join("familiars/sage/reviewed/skill.md");
@@ -35143,6 +36502,7 @@ tier = 0
             scheduled
                 .as_ref()
                 .context("fixture carries scheduled proposal")?,
+            None,
             crate::threads_clock::now(home)?,
         )?;
         std::fs::remove_file(home.join("familiars/sage/ward.toml"))?;
@@ -35202,6 +36562,7 @@ tier = 0
             ensure_proposal_window_opened_audit(
                 home,
                 document.scheduled().context("scheduled fixture")?,
+                None,
                 now,
             )?;
             let ward_path = home.join("familiars/sage/ward.toml");
@@ -35306,6 +36667,7 @@ tier = 0
         ensure_proposal_window_opened_audit(
             home,
             document.scheduled().context("scheduled fixture")?,
+            None,
             now,
         )?;
         let workspace = home.join("familiars/sage");
@@ -36083,39 +37445,6 @@ tier = 0
     }
 
     #[test]
-    fn threads_scheduled_deadline_rejects_deleted_empty_before_image() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let home = temp.path();
-        let (pending, proposal_id) = stage_scheduled_edit_with_images(
-            home,
-            ScheduledEditFixture {
-                target: "reviewed/empty.md",
-                path_tier_floor: 1,
-                channel: coven_threads_core::Channel::Mutation,
-                before: Some(b""),
-            },
-            coven_threads_core::ApprovalPath::HumanApproval,
-            time::OffsetDateTime::now_utc(),
-        )?;
-        let target = home.join("familiars/sage/reviewed/empty.md");
-        std::fs::remove_file(&target)?;
-        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
-        let response = handle_request_with_body(
-            "POST",
-            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
-            home,
-            None,
-            Some(&decision_body),
-        )?;
-        assert_eq!(response.status, 409, "got {}", response.body);
-        let body: Value = serde_json::from_str(&response.body)?;
-        assert_eq!(body["why"], "proposal-evidence-diverged");
-        assert!(!target.exists());
-        assert!(!pending.exists(), "failed replay is terminal");
-        Ok(())
-    }
-
-    #[test]
     fn threads_scheduled_rejects_live_promotion_to_protected_tier() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -36141,7 +37470,10 @@ tier = 0
             );
         std::fs::write(&ward_path, ward)?;
 
-        assert_eq!(process_due_threads_proposals(home)?, 1);
+        let completed = process_due_threads_proposals(home)?;
+        let recovery_log =
+            std::fs::read_to_string(home.join("daemon-recovery.log")).unwrap_or_default();
+        assert_eq!(completed, 1, "{recovery_log}");
         assert!(!pending.exists());
         assert_eq!(
             std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
@@ -36393,6 +37725,10 @@ tier = 0
         };
         assert_eq!(
             events.first().map(String::as_str),
+            Some("proposal_submitted")
+        );
+        assert_eq!(
+            events.get(1).map(String::as_str),
             Some("proposal_window_opened")
         );
         assert_eq!(events.last().map(String::as_str), Some("proposal_approved"));
@@ -36833,11 +38169,12 @@ tier = 0
                 .collect::<rusqlite::Result<_>>()?;
             rows
         };
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, "proposal_window_opened");
-        assert_eq!(rows[1].0, "proposal_rejected");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, "proposal_submitted");
+        assert_eq!(rows[1].0, "proposal_window_opened");
+        assert_eq!(rows[2].0, "proposal_rejected");
         let close: coven_threads_core::ProposalWindowCloseAuditDetail =
-            serde_json::from_str(rows[1].1.as_deref().context("terminal close detail")?)?;
+            serde_json::from_str(rows[2].1.as_deref().context("terminal close detail")?)?;
         assert_eq!(
             close.reason,
             coven_threads_core::WindowCloseReason::RevalidationFailed
@@ -37036,6 +38373,1102 @@ tier = 0
         Ok(())
     }
 
+    mod publication_reconcile {
+        use super::*;
+
+        fn interrupted_expiring_approval(home: &Path) -> Result<(PathBuf, String)> {
+            let staged_at = time::OffsetDateTime::now_utc() - time::Duration::days(31);
+            crate::threads_clock::with_test_time(home, staged_at, || {
+                let (_, id) = stage_scheduled_reviewed_edit(
+                    home,
+                    coven_threads_core::ApprovalPath::HumanApproval,
+                    staged_at,
+                )?;
+                set_proposal_decision_failpoint(Some((
+                    ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+                    id.clone(),
+                )));
+                let response = decide_threads_proposal(
+                    home,
+                    &id,
+                    "approve",
+                    Some(&scheduled_decision_body(home, &id, None)?),
+                );
+                assert!(
+                    response.is_err(),
+                    "approval must reach the pre-write crash seam"
+                );
+                let claim =
+                    find_pending_decision_claim(home, &id, "approve").context("apply claim")?;
+                Ok((claim, id))
+            })
+        }
+
+        #[test]
+        fn expiry_resumes_after_supersession_capacity_failure() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (claim, id) = interrupted_expiring_approval(home)?;
+            let original_claim = std::fs::read(&claim)?;
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            assert!(proposal_recovery_is_proven_unapplied(
+                home,
+                &conn,
+                &read_pending_proposal_document(&claim)?
+            ));
+            let limit: i64 = conn.query_row(
+                "SELECT limit_bytes FROM coven_ward_audit_capacity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE coven_ward_audit_capacity SET limit_bytes = used_bytes WHERE singleton = 1",
+                [],
+            )?;
+            drop(conn);
+            let response = expire_threads_proposal(home, &id)?;
+            assert_eq!(response.status, 507, "{}", response.body);
+            assert_eq!(std::fs::read(&claim)?, original_claim);
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let (purpose, reserved): (String, i64) = conn.query_row(
+                "SELECT purpose, reserved_bytes FROM coven_ward_audit_reservations WHERE token = ?1",
+                [format!("proposal:{id}:approve")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert!(purpose.contains("|superseded-by:proposal-expiry:"));
+            assert_eq!(reserved, 0);
+            conn.execute(
+                "UPDATE coven_ward_audit_capacity SET limit_bytes = ?1 WHERE singleton = 1",
+                [limit],
+            )?;
+            drop(conn);
+
+            assert_eq!(
+                process_due_threads_proposals(home)?,
+                1,
+                "bound expiry must resume"
+            );
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert_proposal_expired_without_apply(home, &id)?;
+            assert!(!claim.exists());
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let (intents, terminals): (i64, i64) = conn.query_row(
+                "SELECT SUM(decision = 'proposal-apply-intent'),
+                        SUM(event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed'))
+                 FROM ward_audit WHERE proposal_id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!((intents, terminals), (1, 1));
+            Ok(())
+        }
+
+        #[test]
+        fn expiry_resumes_every_durable_supersession_boundary() -> Result<()> {
+            for boundary in 0..5 {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let (mut claim, id) = interrupted_expiring_approval(home)?;
+                let document = read_pending_proposal_document(&claim)?;
+                let request = proposal_expiry_request(&document)?;
+                let purpose = bound_proposal_decision_purpose("proposal-expiry", &request)?;
+                let store_path = home.join("coven.sqlite3");
+                let conn = store::open_store(&store_path)?;
+                assert!(proposal_recovery_is_proven_unapplied(
+                    home, &conn, &document
+                ));
+                mark_proposal_reservations_superseded_by_expiry(&conn, &id, &purpose)?;
+                if boundary >= 1 {
+                    store::WardAuditReservation::acquire(
+                        &conn,
+                        &store_path,
+                        format!("proposal:{id}:expiry"),
+                        &purpose,
+                        proposal_decision_audit_reservation_bytes(&conn, "reject")?,
+                    )?
+                    .preserve()?;
+                }
+                if boundary >= 2 {
+                    crate::proposal_store::replace_existing_for_terminal_decision(
+                        &claim,
+                        &document.serialize_with_decision(Some(&request), None)?,
+                    )?;
+                }
+                if boundary >= 3 {
+                    let renamed = claim.with_file_name(
+                        claim
+                            .file_name()
+                            .context("claim name")?
+                            .to_string_lossy()
+                            .replace(".approve.deciding", ".reject.deciding"),
+                    );
+                    crate::proposal_store::rename_existing(&claim, &renamed)?;
+                    claim = renamed;
+                }
+                if boundary >= 4 {
+                    release_superseded_proposal_reservations(&conn, Uuid::parse_str(&id)?)?;
+                }
+                drop(conn);
+
+                assert_eq!(
+                    process_due_threads_proposals(home)?,
+                    1,
+                    "boundary {boundary}"
+                );
+                assert_eq!(
+                    process_due_threads_proposals(home)?,
+                    0,
+                    "boundary {boundary}"
+                );
+                assert_proposal_expired_without_apply(home, &id)?;
+                assert!(!claim.exists(), "boundary {boundary}");
+                let conn = store::open_store(&store_path)?;
+                let reservations: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE token LIKE ?1",
+                    [format!("proposal:{id}:%")],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(reservations, 0, "boundary {boundary}");
+                let (intents, terminals): (i64, i64) = conn.query_row(
+                    "SELECT SUM(decision = 'proposal-apply-intent'),
+                            SUM(event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed'))
+                     FROM ward_audit WHERE proposal_id = ?1",
+                    [&id], |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!((intents, terminals), (1, 1), "boundary {boundary}");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn expiry_marker_does_not_prove_changed_bytes_unapplied() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (claim, id) = interrupted_expiring_approval(home)?;
+            let document = read_pending_proposal_document(&claim)?;
+            let purpose = bound_proposal_decision_purpose(
+                "proposal-expiry",
+                &proposal_expiry_request(&document)?,
+            )?;
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            assert!(proposal_recovery_is_proven_unapplied(
+                home, &conn, &document
+            ));
+            mark_proposal_reservations_superseded_by_expiry(&conn, &id, &purpose)?;
+            drop(conn);
+            std::fs::write(home.join("familiars/sage/reviewed/skill.md"), b"after")?;
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(claim.exists());
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            assert!(proposal_terminal_event(&conn, &id)?.is_none());
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/reviewed/skill.md"))?,
+                b"after"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn expiry_resumes_superseded_legacy_apply_without_request_sidecar() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (claim, id) = crate::threads_clock::with_test_time(
+                home,
+                time::OffsetDateTime::now_utc() - time::Duration::days(31),
+                || historical_coherence_claim(home, 2, false),
+            )?;
+            let mut document = read_pending_proposal_document(&claim)?;
+            document.decision_request = None;
+            crate::proposal_store::replace_existing(
+                &claim,
+                &document.serialize_with_decision(None, document.decision_state.as_ref())?,
+            )?;
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            assert!(proposal_recovery_is_proven_unapplied(
+                home, &conn, &document
+            ));
+            let purpose = bound_proposal_decision_purpose(
+                "proposal-expiry",
+                &proposal_expiry_request(&document)?,
+            )?;
+            mark_proposal_reservations_superseded_by_expiry(&conn, &id, &purpose)?;
+            drop(conn);
+            assert_eq!(process_due_threads_proposals(home)?, 1);
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(!claim.exists());
+            assert_proposal_expired_without_apply(home, &id)?;
+            Ok(())
+        }
+
+        // Exact 0f861716 decision producer: no actor or replacement fields, a
+        // plain reservation purpose, and the writer (not a proven decider) in
+        // the append-only intent. Version 3 models the 8d48 baseline snapshot.
+        fn historical_coherence_claim(
+            home: &Path,
+            version: u8,
+            apply: bool,
+        ) -> Result<(PathBuf, String)> {
+            let workspace = seed_warded_familiar(home)?;
+            std::fs::create_dir_all(workspace.join("reviewed"))?;
+            std::fs::write(workspace.join("reviewed/skill.md"), b"before")?;
+            let staged = post_edits(
+                home,
+                r#"{"edits":[{"target":"reviewed/skill.md","contents":"after"}]}"#,
+            )?;
+            assert_eq!(staged.status, 202, "{}", staged.body);
+            let staged: Value = serde_json::from_str(&staged.body)?;
+            let path = PathBuf::from(staged["pendingPath"].as_str().context("pending path")?);
+            historical_claim_from_pending(home, &path, version, apply)
+        }
+
+        fn historical_claim_from_pending(
+            home: &Path,
+            path: &Path,
+            version: u8,
+            apply: bool,
+        ) -> Result<(PathBuf, String)> {
+            let workspace = home.join("familiars/sage");
+            let document = read_pending_proposal_document(path)?;
+            let pending = document.pending();
+            let scheduled = document.scheduled();
+            let review_kind = PendingReviewKind::from_stored_value(document.review_kind.as_deref())
+                .context("historical review kind")?;
+            let id = pending.id.to_string();
+            let now = time::OffsetDateTime::now_utc();
+            let request: ProposalDecisionRequest = serde_json::from_value(json!({
+                "decision": "approve",
+                "rationale": "historical approval",
+                "claimedAt": now,
+                "expectedRevision": scheduled.map(|_| document.revision()).transpose()?,
+                "revisionRequired": true,
+            }))?;
+            let config = ward::WardConfig::load(&workspace)?.context("Ward config")?;
+            let authorization = authorization_from_writer(&pending.writer);
+            let ward = ward::Ward::new(&workspace, config.clone())?;
+            let edits = staged_edits_to_ward_edits(pending)?;
+            let targets: Vec<String> = edits.iter().map(|edit| edit.target.clone()).collect();
+            let adjudication = ward.evaluate(&ward::Proposal {
+                targets: targets.clone(),
+                authorization: authorization.clone(),
+            });
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let state = if scheduled.is_some() {
+                crate::threads_gate::build_weave_state_for_writer_at(
+                    &conn,
+                    "sage",
+                    &workspace,
+                    &config,
+                    &targets,
+                    false,
+                    now,
+                    Some(&pending.writer),
+                )?
+            } else {
+                crate::threads_gate::build_weave_state_at(
+                    &conn,
+                    "sage",
+                    &workspace,
+                    &config,
+                    &[],
+                    false,
+                    now,
+                )?
+            };
+            let reports =
+                crate::ward_probes::run_at_staging(&workspace, &config, &edits, &authorization)?;
+            let before_images = proposal_before_images(
+                &workspace,
+                &adjudication.decisions,
+                scheduled,
+                review_kind,
+                (review_kind == PendingReviewKind::Coherence).then_some(reports.as_slice()),
+                &mut ward::validate_file_edit_budget(&edits)?,
+            )?;
+            let commitment = if version == 2 {
+                historical_v2_commitment(&conn, &config, &document, &targets)?
+            } else {
+                proposal_recovery_commitment(
+                    &config,
+                    &document,
+                    ProposalRecoveryContext {
+                        coven_home: home,
+                        workspace: &workspace,
+                        familiar_id: "sage",
+                        authorization: &authorization,
+                        baseline_snapshot: &state.baseline_snapshot,
+                        identity_context: None,
+                        require_bound_identity_context: false,
+                        version: ProposalRecoveryVersion::V3,
+                    },
+                )?
+            };
+            let applying = ProposalApplyingState {
+                decision: "approve".to_string(),
+                recovery_commitment: commitment,
+                baseline_snapshot: (version == 3).then_some(state.baseline_snapshot),
+                weave_hash: state.weave.weave_hash().to_vec(),
+                before_images,
+                rationale: request.rationale.clone(),
+                probe_summary: (review_kind == PendingReviewKind::Coherence).then(|| {
+                    coherence_decision_evidence(
+                        document.probes.as_deref(),
+                        &workspace,
+                        &config,
+                        pending,
+                    )
+                    .summary
+                }),
+            };
+            let reservation = store::WardAuditReservation::acquire(
+                &conn,
+                &home.join("coven.sqlite3"),
+                format!("proposal:{id}:approve"),
+                "proposal-approval",
+                proposal_decision_audit_reservation_bytes(&conn, "approve")?,
+            )?;
+            append_proposal_apply_intent(
+                &conn,
+                &id,
+                "sage",
+                Some(&pending.writer),
+                &targets,
+                &applying,
+                pending.channel,
+                now,
+            )?;
+            reservation.preserve()?;
+            let claim = path.with_file_name(format!(
+                "{}.approve.deciding",
+                path.file_name().context("filename")?.to_string_lossy()
+            ));
+            crate::proposal_store::rename_existing(path, &claim)?;
+            persist_proposal_applying_state(&claim, &document, Some(&request), &applying)?;
+            if apply {
+                let expected_before = proposal_expected_before(&applying)?;
+                let expected_resolved =
+                    proposal_expected_resolved_surfaces(&applying, &adjudication.decisions)?;
+                let report = apply_after_review_approval(
+                    &ward,
+                    review_kind,
+                    &edits,
+                    &authorization,
+                    ApprovedApplyContext {
+                        scheduled,
+                        expected_before: &expected_before,
+                        expected_resolved: &expected_resolved,
+                    },
+                    ward::ApprovedApplyMode::Initial,
+                    None,
+                )?;
+                assert!(report
+                    .changes
+                    .iter()
+                    .all(|change| change.disposition == ward::Disposition::Applied));
+            }
+            Ok((claim, id))
+        }
+
+        fn historical_v3_scheduled_pending(home: &Path) -> Result<(PathBuf, String)> {
+            historical_v3_scheduled_pending_with_receipt(home, |receipt| receipt)
+        }
+
+        fn historical_v3_scheduled_pending_with_receipt(
+            home: &Path,
+            receipt_fields: impl FnOnce(Value) -> Value,
+        ) -> Result<(PathBuf, String)> {
+            seed_retired_ward_familiar(home, human_review_retired_ward())?;
+            migrate_retired_ward(home)?;
+            let staged = post_edits(
+                home,
+                r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+            )?;
+            assert_eq!(staged.status, 202, "{}", staged.body);
+            let staged: Value = serde_json::from_str(&staged.body)?;
+            let original_path =
+                PathBuf::from(staged["pendingPath"].as_str().context("pending path")?);
+            let original_id = staged["proposalId"].as_str().context("proposal id")?;
+            let mut value: Value = serde_json::from_slice(&std::fs::read(&original_path)?)?;
+            let id = Uuid::new_v4();
+            value["pending"]["id"] = json!(id);
+            value["classification"]["proposal_id"] = json!(id);
+            let raw = serde_json::to_vec_pretty(&value)?;
+            let document = ProposalEnvelopeDocument::parse_preflighted(&raw)?;
+            let scheduled = document.scheduled().context("scheduled fixture")?;
+            assert!(document.identity_evidence.is_some());
+            let path = home.join("pending").join(document.pending().file_name());
+            crate::proposal_store::publish_new(home, &path, &raw)?;
+            crate::proposal_store::remove_existing(&original_path)?;
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            // The exact 8d48 submission detail predates identity_evidence.
+            // Insert its own receipt; never rewrite an append-only audit row.
+            let receipt = receipt_fields(json!({
+                "detail": {
+                    "classification": scheduled.classification(),
+                    "veto_deadline": scheduled.veto_deadline(),
+                    "earliest_close": scheduled.earliest_close(),
+                },
+                "files_touched": document.pending().edits.iter()
+                    .map(|edit| edit.surface.as_str()).collect::<Vec<_>>(),
+                "submitted_at": document.pending().staged_at
+                    .format(&time::format_description::well_known::Rfc3339)?,
+            }));
+            conn.execute(
+                "INSERT INTO ward_audit (
+                    event_type, proposal_id, familiar_id, ward_hash, tier, decision,
+                    detail, files_touched, channel, thread_id, submitted_at, decided_at
+                 ) SELECT event_type, ?1, familiar_id, ward_hash, tier, decision,
+                    ?2, ?4, channel, thread_id, ?5, decided_at
+                 FROM ward_audit WHERE proposal_id = ?3 AND event_type = 'proposal_submitted'",
+                rusqlite::params![
+                    id.to_string(),
+                    serde_json::to_string(&receipt["detail"])?,
+                    original_id,
+                    serde_json::to_string(&receipt["files_touched"])?,
+                    receipt["submitted_at"]
+                        .as_str()
+                        .context("receipt submitted time")?,
+                ],
+            )?;
+            drop(conn);
+            Ok((path, id.to_string()))
+        }
+
+        fn historical_v3_scheduled_claim(home: &Path) -> Result<(PathBuf, String)> {
+            let (path, _) = historical_v3_scheduled_pending(home)?;
+            historical_claim_from_pending(home, &path, 3, true)
+        }
+
+        #[test]
+        fn historical_pending_receipt_expires_without_apply_and_releases_quota() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let staged_at = time::OffsetDateTime::now_utc();
+            let (path, id) = crate::threads_clock::with_test_time(home, staged_at, || {
+                historical_v3_scheduled_pending(home)
+            })?;
+            let document = read_pending_proposal_document(&path)?;
+            assert!(document.decision_request.is_none());
+            assert!(document.decision_state.is_none());
+            assert!(matches!(
+                document
+                    .scheduled()
+                    .context("scheduled proposal")?
+                    .classification()
+                    .approval_path,
+                coven_threads_core::ApprovalPath::HumanApproval
+                    | coven_threads_core::ApprovalPath::HumanApprovalWithRationale
+            ));
+            let target = home.join("familiars/sage/TOOLS.md");
+            let before = std::fs::read(&target)?;
+            let modified = std::fs::metadata(&target)?.modified()?;
+            crate::threads_clock::with_test_time(
+                home,
+                staged_at + time::Duration::days(31),
+                || -> Result<()> {
+                    assert_eq!(
+                        process_due_threads_proposals(home)?,
+                        1,
+                        "an undecided historical receipt must not block retention expiry"
+                    );
+                    assert_eq!(process_due_threads_proposals(home)?, 0);
+                    Ok(())
+                },
+            )?;
+            crate::threads_clock::with_test_time(
+                home,
+                staged_at + time::Duration::days(32),
+                || -> Result<()> {
+                    assert_eq!(process_due_threads_proposals(home)?, 0);
+                    Ok(())
+                },
+            )?;
+            assert!(!path.exists());
+            let entries =
+                std::fs::read_dir(home.join("pending"))?.collect::<std::io::Result<Vec<_>>>()?;
+            assert!(!entries.iter().any(|entry| entry
+                .file_name()
+                .to_str()
+                .is_some_and(crate::proposal_store::is_active_proposal_file)));
+            assert_eq!(std::fs::read(&target)?, before);
+            assert_eq!(std::fs::metadata(&target)?.modified()?, modified);
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let (expired, other_terminals, intents): (i64, i64, i64) = conn.query_row(
+                "SELECT SUM(event_type = 'proposal_rejected' AND decision = 'expired'),
+                        SUM(event_type IN ('proposal_approved', 'proposal_vetoed')
+                            OR (event_type = 'proposal_rejected' AND decision != 'expired')),
+                        SUM(decision = 'proposal-apply-intent')
+                 FROM ward_audit WHERE proposal_id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!((expired, other_terminals, intents), (1, 0, 0));
+            Ok(())
+        }
+
+        #[test]
+        fn historical_pending_receipt_still_requires_review_before_retention() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let staged_at = time::OffsetDateTime::now_utc();
+            let (path, id) = crate::threads_clock::with_test_time(home, staged_at, || {
+                historical_v3_scheduled_pending(home)
+            })?;
+            let target = home.join("familiars/sage/TOOLS.md");
+            let before = std::fs::read(&target)?;
+            crate::threads_clock::with_test_time(
+                home,
+                staged_at + time::Duration::days(29),
+                || -> Result<()> {
+                    assert_eq!(process_due_threads_proposals(home)?, 0);
+                    let response = decide_threads_proposal_automatic(home, &id, "approve", None)?;
+                    assert_eq!(response.status, 409, "{}", response.body);
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&response.body)?["why"],
+                        "proposal-decision-review-required"
+                    );
+                    Ok(())
+                },
+            )?;
+            let document = read_pending_proposal_document(&path)?;
+            assert!(document.decision_request.is_none());
+            assert!(document.decision_state.is_none());
+            assert!(!home.join("pending/quarantine").exists());
+            assert_eq!(std::fs::read(&target)?, before);
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            assert!(proposal_terminal_event(&conn, &id)?.is_none());
+            Ok(())
+        }
+
+        #[test]
+        fn historical_pending_retention_does_not_trust_invalid_receipts() -> Result<()> {
+            for change in [
+                "malformed",
+                "current-identity",
+                "classification",
+                "targets",
+                "staged-at",
+            ] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let staged_at = time::OffsetDateTime::now_utc();
+                let mismatched_time = (staged_at - time::Duration::days(1))
+                    .format(&time::format_description::well_known::Rfc3339)?;
+                let (path, id) = crate::threads_clock::with_test_time(home, staged_at, || {
+                    historical_v3_scheduled_pending_with_receipt(home, |mut receipt| {
+                        match change {
+                            "malformed" => receipt["detail"] = json!("not a submission receipt"),
+                            "current-identity" => {
+                                receipt["detail"]["identity_evidence"] = json!(vec![0_u8; 32])
+                            }
+                            "classification" => {
+                                receipt["detail"]["classification"]["path_tier_floor"] = json!(4)
+                            }
+                            "targets" => receipt["files_touched"] = json!(["PROFILE.md"]),
+                            "staged-at" => receipt["submitted_at"] = json!(mismatched_time),
+                            _ => {}
+                        }
+                        receipt
+                    })
+                })?;
+                let target = home.join("familiars/sage/TOOLS.md");
+                let before = std::fs::read(&target)?;
+                crate::threads_clock::with_test_time(
+                    home,
+                    staged_at + time::Duration::days(31),
+                    || -> Result<()> {
+                        assert_eq!(process_due_threads_proposals(home)?, 0, "{change}");
+                        assert_eq!(process_due_threads_proposals(home)?, 0, "{change}");
+                        Ok(())
+                    },
+                )?;
+                assert!(!path.exists(), "{change} must be quarantined");
+                assert!(home.join("pending/quarantine").exists(), "{change}");
+                assert_eq!(std::fs::read(&target)?, before, "{change}");
+                let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                assert!(proposal_terminal_event(&conn, &id)?.is_none(), "{change}");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn historical_pending_retention_does_not_expire_unproven_applying_effects() -> Result<()> {
+            for pending_name in [false, true] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let staged_at = time::OffsetDateTime::now_utc();
+                let (claim, id) = crate::threads_clock::with_test_time(home, staged_at, || {
+                    historical_v3_scheduled_claim(home)
+                })?;
+                let mut document = read_pending_proposal_document(&claim)?;
+                document
+                    .decision_state
+                    .as_mut()
+                    .context("applying state")?
+                    .recovery_commitment[0] ^= 1;
+                let raw = document.serialize_with_decision(
+                    document.decision_request.as_ref(),
+                    document.decision_state.as_ref(),
+                )?;
+                crate::proposal_store::replace_existing(&claim, &raw)?;
+                let path = if pending_name {
+                    let pending = home.join("pending").join(document.pending().file_name());
+                    crate::proposal_store::rename_existing(&claim, &pending)?;
+                    pending
+                } else {
+                    claim
+                };
+                crate::threads_clock::with_test_time(
+                    home,
+                    staged_at + time::Duration::days(31),
+                    || -> Result<()> {
+                        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                        assert!(!proposal_retention_expired(
+                            home,
+                            &conn,
+                            &document,
+                            crate::threads_clock::now(home)?
+                        )?);
+                        drop(conn);
+                        assert_eq!(process_due_threads_proposals(home)?, 0);
+                        assert_eq!(process_due_threads_proposals(home)?, 0);
+                        Ok(())
+                    },
+                )?;
+                assert_eq!(std::fs::read(&path)?, raw);
+                assert_eq!(
+                    std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                    b"after tools\n"
+                );
+                let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                assert!(proposal_terminal_event(&conn, &id)?.is_none());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn historical_v3_scheduled_receipt_recovers_bound_identity() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (claim, id) = historical_v3_scheduled_claim(home)?;
+            let response = decide_threads_proposal_automatic(home, &id, "approve", None)?;
+            assert_eq!(response.status, 200, "{}", response.body);
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(!claim.exists());
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                b"after tools\n"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn historical_receipt_does_not_accept_changed_identity_or_current_origin() -> Result<()> {
+            for change in ["identity-binding", "current-origin"] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let (claim, id) = historical_v3_scheduled_claim(home)?;
+                let mut document = read_pending_proposal_document(&claim)?;
+                if change == "identity-binding" {
+                    document
+                        .identity_evidence
+                        .as_mut()
+                        .context("identity binding")?[0] ^= 1;
+                } else {
+                    let request = document
+                        .decision_request
+                        .as_mut()
+                        .context("historical request")?;
+                    request.decision_actor = Some(OWNER_LOCAL_DECISION_ACTOR.to_string());
+                    let purpose =
+                        bound_proposal_decision_purpose("proposal-approval-owner-local", request)?;
+                    let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                    conn.execute(
+                        "UPDATE coven_ward_audit_reservations SET purpose = ?1 WHERE token = ?2",
+                        rusqlite::params![purpose, format!("proposal:{id}:approve")],
+                    )?;
+                }
+                crate::proposal_store::replace_existing(
+                    &claim,
+                    &document.serialize_with_decision(
+                        document.decision_request.as_ref(),
+                        document.decision_state.as_ref(),
+                    )?,
+                )?;
+                let response = decide_threads_proposal_automatic(home, &id, "approve", None)?;
+                assert_eq!(response.status, 409, "{change}: {}", response.body);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&response.body)?["why"],
+                    "proposal-decision-review-required"
+                );
+                assert!(claim.exists());
+                assert_eq!(
+                    std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                    b"after tools\n"
+                );
+                let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                assert!(proposal_terminal_event(&conn, &id)?.is_none());
+            }
+            Ok(())
+        }
+
+        fn historical_v2_commitment(
+            conn: &rusqlite::Connection,
+            config: &ward::WardConfig,
+            document: &ProposalEnvelopeDocument,
+            targets: &[String],
+        ) -> Result<Vec<u8>> {
+            assert!(config.identity_invariants.is_empty());
+            assert!(config.editable.is_none() && config.approval_tiers.is_none());
+            // Literal field order from 0f861716's WardConfig, independent of
+            // the current Rust struct and the compatibility encoder under test.
+            let config_bytes = format!(
+                "{{\"principal_key_fingerprint\":{},\"surface\":{},\"protected_surface\":{},\"default_tier\":{},\"probe\":{}}}",
+                serde_json::to_string(&config.principal_key_fingerprint)?,
+                serde_json::to_string(&config.surface)?,
+                serde_json::to_string(&config.protected_surface)?,
+                serde_json::to_string(&config.default_tier)?,
+                serde_json::to_string(&config.probe)?,
+            ).into_bytes();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"coven:proposal-decision-recovery:v2");
+            hasher.update(&(config_bytes.len() as u64).to_be_bytes());
+            hasher.update(&config_bytes);
+            let authority = document.authority_bytes()?;
+            hasher.update(&(authority.len() as u64).to_be_bytes());
+            hasher.update(&authority);
+            let mut targets = targets.to_vec();
+            targets.sort();
+            for target in targets {
+                hasher.update(&(target.len() as u64).to_be_bytes());
+                hasher.update(target.as_bytes());
+                match crate::threads_gate::load_baseline(conn, "sage", &target)? {
+                    Some(bytes) => {
+                        hasher.update(&[1]);
+                        hasher.update(&(bytes.len() as u64).to_be_bytes());
+                        hasher.update(&bytes);
+                    }
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                }
+            }
+            Ok(hasher.finalize().as_bytes().to_vec())
+        }
+
+        #[test]
+        fn historical_v3_request_recovers_applied_bytes_without_inventing_actor() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (claim, id) = historical_coherence_claim(home, 3, true)?;
+            let response = decide_threads_proposal_automatic(home, &id, "approve", None)?;
+            assert_eq!(
+                response.status, 200,
+                "8d48 request is valid historical data: {}",
+                response.body
+            );
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(!claim.exists());
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/reviewed/skill.md"))?,
+                b"after"
+            );
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let (count, actor): (i64, Option<String>) = conn.query_row(
+                "SELECT COUNT(*), approver FROM ward_audit
+                 WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(count, 1);
+            assert_eq!(
+                actor.as_deref(),
+                Some(HISTORICAL_UNKNOWN_DECISION_ACTOR),
+                "historical writer must not be invented as the decision actor"
+            );
+            let detail: String = conn.query_row(
+                "SELECT detail FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+                [&id], |row| row.get(0),
+            )?;
+            assert_eq!(
+                serde_json::from_str::<Value>(&detail)?["decisionOrigin"]["kind"],
+                "historical_unknown"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn historical_v2_request_recovers_exact_main_commitment() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (claim, id) = historical_coherence_claim(home, 2, true)?;
+            let response = decide_threads_proposal_automatic(home, &id, "approve", None)?;
+            assert_eq!(
+                response.status, 200,
+                "0f861716 request and encoding must recover: {}",
+                response.body
+            );
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(!claim.exists());
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/reviewed/skill.md"))?,
+                b"after"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn historical_recovery_preserves_applied_file_identity_and_single_terminal() -> Result<()> {
+            for version in [2, 3] {
+                for applied in [false, true] {
+                    let temp = tempfile::tempdir()?;
+                    let home = temp.path();
+                    let (claim, id) = historical_coherence_claim(home, version, applied)?;
+                    let target = home.join("familiars/sage/reviewed/skill.md");
+                    let before = std::fs::metadata(&target)?;
+                    assert_eq!(
+                        process_due_threads_proposals(home)?,
+                        1,
+                        "v{version} applied={applied}"
+                    );
+                    assert_eq!(process_due_threads_proposals(home)?, 0);
+                    assert!(!claim.exists());
+                    assert_eq!(std::fs::read(&target)?, b"after");
+                    if applied {
+                        let after = std::fs::metadata(&target)?;
+                        assert_eq!(after.modified()?, before.modified()?);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+                        }
+                    }
+                    let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                    let (intents, terminals): (i64, i64) = conn.query_row(
+                        "SELECT SUM(decision = 'proposal-apply-intent'),
+                                SUM(event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed'))
+                         FROM ward_audit WHERE proposal_id = ?1",
+                        [&id], |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    assert_eq!((intents, terminals), (1, 1));
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn historical_recovery_rejects_changed_policy_and_baseline() -> Result<()> {
+            for version in [2, 3] {
+                for change in ["default-tier", "principal", "baseline"] {
+                    let temp = tempfile::tempdir()?;
+                    let home = temp.path();
+                    let (claim, id) = historical_coherence_claim(home, version, false)?;
+                    let workspace = home.join("familiars/sage");
+                    if change == "baseline" {
+                        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                        let document = read_pending_proposal_document(&claim)?;
+                        let target = if version == 2 {
+                            "reviewed/skill.md"
+                        } else {
+                            document
+                                .decision_state
+                                .as_ref()
+                                .context("applying")?
+                                .baseline_snapshot
+                                .as_ref()
+                                .context("v3 baselines")?
+                                .keys()
+                                .next()
+                                .context("v3 protected baseline")?
+                        };
+                        crate::threads_gate::advance_surface_baseline_from_bytes(
+                            &conn,
+                            "sage",
+                            &workspace,
+                            target,
+                            &std::fs::read(workspace.join(target))?,
+                        )?;
+                    } else {
+                        let path = workspace.join("ward.toml");
+                        let mut config: toml::Value =
+                            toml::from_str(&std::fs::read_to_string(&path)?)?;
+                        if change == "default-tier" {
+                            config
+                                .as_table_mut()
+                                .context("Ward table")?
+                                .insert("default_tier".to_string(), toml::Value::Integer(3));
+                        } else {
+                            config["principal_key_fingerprint"] =
+                                toml::Value::String("different-principal".to_string());
+                        }
+                        std::fs::write(path, toml::to_string(&config)?)?;
+                    }
+                    let response = decide_threads_proposal_automatic(home, &id, "approve", None)?;
+                    assert_eq!(
+                        response.status, 409,
+                        "v{version} {change}: {}",
+                        response.body
+                    );
+                    assert!(claim.exists());
+                    assert_eq!(
+                        std::fs::read(workspace.join("reviewed/skill.md"))?,
+                        b"before"
+                    );
+                    let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                    assert!(proposal_terminal_event(&conn, &id)?.is_none());
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn historical_request_without_apply_proof_requires_renewed_review() -> Result<()> {
+            for (decision, request_sidecar) in [
+                ("approve", true),
+                ("reject", true),
+                ("approve", false),
+                ("reject", false),
+            ] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                seed_warded_familiar(home)?;
+                let staged = post_edits(
+                    home,
+                    r#"{"edits":[{"target":"reviewed/skill.md","contents":"after"}]}"#,
+                )?;
+                let staged: Value = serde_json::from_str(&staged.body)?;
+                let pending = PathBuf::from(staged["pendingPath"].as_str().context("pending")?);
+                let document = read_pending_proposal_document(&pending)?;
+                let id = document.pending().id.to_string();
+                let request: ProposalDecisionRequest = serde_json::from_value(json!({
+                    "decision": decision,
+                    "rationale": null,
+                    "claimedAt": time::OffsetDateTime::now_utc(),
+                    "expectedRevision": null,
+                    "revisionRequired": true,
+                }))?;
+                let conn = store::open_store(&home.join("coven.sqlite3"))?;
+                store::WardAuditReservation::acquire(
+                    &conn,
+                    &home.join("coven.sqlite3"),
+                    format!("proposal:{id}:{decision}"),
+                    if decision == "approve" {
+                        "proposal-approval"
+                    } else {
+                        "proposal-rejection"
+                    },
+                    proposal_decision_audit_reservation_bytes(&conn, decision)?,
+                )?
+                .preserve()?;
+                drop(conn);
+                let claim = pending.with_file_name(format!(
+                    "{}.{decision}.deciding",
+                    pending.file_name().context("filename")?.to_string_lossy(),
+                ));
+                crate::proposal_store::replace_existing(
+                    &pending,
+                    &document.serialize_with_decision(request_sidecar.then_some(&request), None)?,
+                )?;
+                crate::proposal_store::rename_existing(&pending, &claim)?;
+
+                let response = decide_threads_proposal_automatic(home, &id, decision, None)?;
+                assert_eq!(response.status, 409, "{}", response.body);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&response.body)?["why"],
+                    "proposal-decision-review-required"
+                );
+                assert!(pending.exists());
+                assert!(!home.join("pending/quarantine").exists());
+                assert!(read_pending_proposal_document(&pending)?
+                    .decision_request
+                    .is_none());
+                let renewed = decide_threads_proposal(home, &id, decision, Some("{}"))?;
+                assert_eq!(renewed.status, 200, "{}", renewed.body);
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn historical_request_time_mismatch_is_not_labeled_corruption() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (claim, id) = historical_coherence_claim(home, 3, false)?;
+            let mut document = read_pending_proposal_document(&claim)?;
+            document
+                .decision_request
+                .as_mut()
+                .context("historical request")?
+                .claimed_at += time::Duration::seconds(1);
+            crate::proposal_store::replace_existing(
+                &claim,
+                &document.serialize_with_decision(
+                    document.decision_request.as_ref(),
+                    document.decision_state.as_ref(),
+                )?,
+            )?;
+            let response = decide_threads_proposal_automatic(home, &id, "approve", None)?;
+            assert_eq!(response.status, 409, "{}", response.body);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.body)?["why"],
+                "proposal-decision-review-required"
+            );
+            assert!(claim.exists());
+            assert!(!home.join("pending/quarantine").exists());
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/reviewed/skill.md"))?,
+                b"before"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn current_request_cannot_downgrade_to_historical_v2() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (_, id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+                id.clone(),
+            )));
+            assert!(decide_threads_proposal(
+                home,
+                &id,
+                "approve",
+                Some(&scheduled_decision_body(home, &id, None)?),
+            )
+            .is_err());
+            let claim = find_pending_decision_claim(home, &id, "approve").context("claim")?;
+            let mut document = read_pending_proposal_document(&claim)?;
+            let applying = document.decision_state.as_mut().context("applying state")?;
+            applying.baseline_snapshot = None;
+            let origin = TrustedProposalDecisionOrigin::OwnerLocal(
+                coven_threads_core::WriterId::new(OWNER_LOCAL_DECISION_ACTOR),
+            );
+            assert!(proposal_recovery_version(&origin, applying).is_err());
+            crate::proposal_store::replace_existing(
+                &claim,
+                &document.serialize_with_decision(
+                    document.decision_request.as_ref(),
+                    document.decision_state.as_ref(),
+                )?,
+            )?;
+            let response = decide_threads_proposal_automatic(home, &id, "approve", None)?;
+            assert_eq!(response.status, 409, "{}", response.body);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.body)?["quarantined"],
+                true
+            );
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/reviewed/skill.md"))?,
+                b"before"
+            );
+            Ok(())
+        }
+    }
+
     fn persist_stale_approval_request(path: &Path) -> Result<()> {
         let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
         let staged_at = value
@@ -37053,6 +39486,7 @@ tier = 0
             expired: false,
             replacement_proposal_id: None,
             replacement_proposal_revision: None,
+            decision_actor: Some(OWNER_LOCAL_DECISION_ACTOR.to_string()),
         };
         value
             .as_object_mut()
@@ -37281,7 +39715,7 @@ tier = 0
     }
 
     #[test]
-    fn threads_stale_unverifiable_recovery_intent_remains_claimed() -> Result<()> {
+    fn threads_stale_unverifiable_recovery_intent_is_quarantined() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         let (_, proposal_id) = stage_scheduled_reviewed_edit(
@@ -37312,11 +39746,16 @@ tier = 0
         value["staged_at"] = serde_json::to_value(stale)?;
         let revision = proposal_revision(&value)?;
         value["decisionRequest"]["expectedRevision"] = json!(revision);
-        std::fs::write(&claim, serde_json::to_vec_pretty(&value)?)?;
+        let corrupted_claim = serde_json::to_vec_pretty(&value)?;
+        std::fs::write(&claim, &corrupted_claim)?;
 
         assert_eq!(process_due_threads_proposals(home)?, 0);
 
-        assert!(claim.exists());
+        assert!(!claim.exists());
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(std::fs::read(quarantined[0].path())?, corrupted_claim);
         assert_eq!(std::fs::read_to_string(target)?, "before");
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
         let terminal: i64 = conn.query_row(
@@ -37443,7 +39882,9 @@ tier = 0
             coven_threads_core::ApprovalPath::HumanApproval,
             time::OffsetDateTime::now_utc() - time::Duration::days(31),
         )?;
-        std::fs::remove_file(home.join("familiars/sage/ward.toml"))?;
+        let ward_path = home.join("familiars/sage/ward.toml");
+        let ward = std::fs::read(&ward_path)?;
+        std::fs::remove_file(&ward_path)?;
 
         assert_eq!(process_due_threads_proposals(home)?, 0);
 
@@ -37465,6 +39906,12 @@ tier = 0
             |row| row.get(0),
         )?;
         assert_eq!(terminal, 0);
+        drop(conn);
+
+        std::fs::write(&ward_path, ward)?;
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert!(!expired.exists());
+        assert_proposal_expired_without_apply(home, &proposal_id)?;
         Ok(())
     }
 
@@ -37519,12 +39966,15 @@ tier = 0
         )));
 
         assert_eq!(process_due_threads_proposals(home)?, 0);
-        let interrupted: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let claim = find_pending_decision_claim(home, &proposal_id, "reject")
+            .context("interrupted expiry leaves a recovery claim")?;
+        let interrupted: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
         assert_eq!(interrupted["decisionRequest"]["decision"], "reject");
         assert_eq!(interrupted["decisionRequest"]["expired"], true);
 
         assert_eq!(process_due_threads_proposals(home)?, 1);
         assert!(!pending.exists());
+        assert!(!claim.exists());
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
         let decision: String = conn.query_row(
             "SELECT decision FROM ward_audit
@@ -37572,6 +40022,48 @@ tier = 0
         let detail: coven_threads_core::ProposalApprovalAuditDetail =
             serde_json::from_str(&detail)?;
         assert_eq!(detail.rationale.as_deref(), Some("scheduler recovery"));
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_quarantines_approval_claim_without_durable_request() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let file_name = pending
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("pending proposal filename")?;
+        let claim = pending.with_file_name(format!("{file_name}.approve.deciding"));
+        std::fs::rename(&pending, &claim)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(
+            !claim.exists(),
+            "{}",
+            std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(home))
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_count, 0);
         Ok(())
     }
 
@@ -37742,6 +40234,17 @@ tier = 0
                 serde_json::to_value(&request)?,
             );
         std::fs::write(&pending_path, serde_json::to_vec_pretty(&value)?)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "UPDATE coven_ward_audit_reservations
+             SET purpose = ?1
+             WHERE token = ?2",
+            rusqlite::params![
+                bound_proposal_decision_purpose("proposal-rejection-owner-local", &request)?,
+                format!("proposal:{proposal_id}:reject"),
+            ],
+        )?;
+        drop(conn);
 
         let recovered = process_due_threads_proposals(home)?;
         assert_eq!(recovered, 1);
@@ -39291,10 +41794,6 @@ tier = 0
             let body: Value = serde_json::from_str(&response.body)?;
             let pending = Path::new(body["pendingPath"].as_str().context("pending path")?);
             let id = body["proposalId"].as_str().context("proposal id")?;
-            retime_scheduled_proposal(
-                pending,
-                time::OffsetDateTime::now_utc() - time::Duration::hours(2),
-            )?;
             let path = workspace.join("ward.toml");
             let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
             if removed {
@@ -39306,8 +41805,15 @@ tier = 0
                     toml::Value::Integer(2);
             }
             std::fs::write(path, toml::to_string(&config)?)?;
-            assert_eq!(process_due_threads_proposals(home)?, 1);
-            assert_eq!(process_due_threads_proposals(home)?, 0);
+            crate::threads_clock::with_test_time(
+                home,
+                time::OffsetDateTime::now_utc() + time::Duration::hours(2),
+                || -> Result<()> {
+                    assert_eq!(process_due_threads_proposals(home)?, 1);
+                    assert_eq!(process_due_threads_proposals(home)?, 0);
+                    Ok(())
+                },
+            )?;
             assert!(!pending.exists());
             assert_eq!(
                 std::fs::read_to_string(workspace.join("TOOLS.md"))?,
@@ -39366,6 +41872,11 @@ tier = 0
         let staged: Value = serde_json::from_str(&raw)?;
         assert_eq!(staged["schema"], "phase5_v1");
         assert!(staged.get("reviewKind").is_none());
+        assert_eq!(
+            staged["identityEvidence"].as_array().map(Vec::len),
+            Some(32),
+            "scheduled staging must preserve the active identity-policy binding"
+        );
         assert_eq!(
             staged["classification"]["affected_regions"][0],
             "tool_defaults"
@@ -39427,11 +41938,14 @@ tier = 0
             "before heartbeat\n"
         );
 
-        retime_scheduled_proposal(
-            &pending_path,
-            time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+        crate::threads_clock::with_test_time(
+            home,
+            time::OffsetDateTime::now_utc() + time::Duration::hours(2),
+            || -> Result<()> {
+                assert_eq!(process_due_threads_proposals(home)?, 1);
+                Ok(())
+            },
         )?;
-        assert_eq!(process_due_threads_proposals(home)?, 1);
         assert_eq!(
             std::fs::read_to_string(workspace.join("TOOLS.md"))?,
             "after tools\n"
@@ -39441,6 +41955,1221 @@ tier = 0
             "after heartbeat\n"
         );
         assert!(!pending_path.exists(), "replayed proposal must be consumed");
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_scheduled_apply_has_no_human_approver() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence {
+                veto: coven_threads_core::VetoWindow::new(
+                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(60),
+                ),
+            },
+            time::OffsetDateTime::now_utc() - time::Duration::minutes(10),
+        )?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "after"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let attributed_decisions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND decision IN ('proposal-apply-intent', 'approved')
+               AND approver IS NOT NULL",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            attributed_decisions, 0,
+            "automatic apply has no human approver"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_rejects_live_approval_policy_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, human_review_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        let ward_path = workspace.join("ward.toml");
+        let ward = std::fs::read_to_string(&ward_path)?
+            .replace(
+                "[approval_tiers.human_review]",
+                "[approval_tiers.human_required]",
+            )
+            .replace(
+                "gate = \"human_approval\"",
+                "gate = \"human_approval_with_rationale\"",
+            );
+        let strengthened = ward
+            .lines()
+            .filter(|line| {
+                !line.starts_with("human_veto_window_hours")
+                    && !line.starts_with("min_visible_seconds")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&ward_path, format!("{strengthened}\n"))?;
+
+        let decision_body = scheduled_decision_body(home, proposal_id, None)?;
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-live-approval-policy-changed");
+        assert_eq!(body["terminal"], true);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        assert!(!pending.exists(), "stale-policy proposal must be terminal");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let (decision, detail): (String, Option<String>) = conn.query_row(
+            "SELECT decision, detail
+             FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [proposal_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(decision, "proposal-live-approval-policy-changed");
+        assert_eq!(detail, None, "human approval has no veto window to close");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_rolls_back_when_approval_policy_changes_during_apply() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, human_review_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        let decision_body = scheduled_decision_body(home, proposal_id, None)?;
+
+        let ward_path = workspace.join("ward.toml");
+        let ward = std::fs::read_to_string(&ward_path)?
+            .replace(
+                "[approval_tiers.human_review]",
+                "[approval_tiers.human_required]",
+            )
+            .replace(
+                "gate = \"human_approval\"",
+                "gate = \"human_approval_with_rationale\"",
+            );
+        let strengthened = ward
+            .lines()
+            .filter(|line| {
+                !line.starts_with("human_veto_window_hours")
+                    && !line.starts_with("min_visible_seconds")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let canonical_workspace = workspace.canonicalize()?;
+        ward::set_conditional_atomic_replacement(
+            canonical_workspace.join("TOOLS.md"),
+            canonical_workspace.join("ward.toml"),
+            format!("{strengthened}\n").into_bytes(),
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert_eq!(body["terminal"], false);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        assert!(pending.exists(), "rolled-back proposal remains retryable");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_recovery_rolls_back_concurrent_approval_policy_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, human_review_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        let decision_body = scheduled_decision_body(home, proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+            proposal_id.to_string(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let claim = find_pending_decision_claim(home, proposal_id, "approve")
+            .context("interrupted apply leaves a durable claim")?;
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+
+        let ward_path = workspace.join("ward.toml");
+        let ward = std::fs::read_to_string(&ward_path)?
+            .replace(
+                "[approval_tiers.human_review]",
+                "[approval_tiers.human_required]",
+            )
+            .replace(
+                "gate = \"human_approval\"",
+                "gate = \"human_approval_with_rationale\"",
+            );
+        let strengthened = ward
+            .lines()
+            .filter(|line| {
+                !line.starts_with("human_veto_window_hours")
+                    && !line.starts_with("min_visible_seconds")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let canonical_workspace = workspace.canonicalize()?;
+        ward::set_conditional_atomic_replacement(
+            canonical_workspace.join("TOOLS.md"),
+            canonical_workspace.join("ward.toml"),
+            format!("{strengthened}\n").into_bytes(),
+        );
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        assert!(!claim.exists(), "rolled-back recovery claim is released");
+        assert!(pending.exists(), "rolled-back proposal remains pending");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        assert!(proposal_terminal_event(&conn, proposal_id)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_closes_window_when_ward_breaks_before_first_pass() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        std::fs::write(workspace.join("ward.toml"), "invalid = [")?;
+
+        let completed = process_due_threads_proposals(home)?;
+        let recovery_log =
+            std::fs::read_to_string(home.join("daemon-recovery.log")).unwrap_or_default();
+        assert_eq!(completed, 1, "{recovery_log}");
+        assert!(!pending.exists(), "invalid live authority is terminal");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        for event_type in ["proposal_window_opened", "proposal_rejected"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit
+                 WHERE proposal_id = ?1 AND event_type = ?2",
+                rusqlite::params![proposal_id, event_type],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1, "{event_type}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_quarantines_schedule_that_diverges_from_submission_receipt() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let staged_at = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        staged["pending"]["staged_at"] = serde_json::to_value(staged_at)?;
+        staged["classification"]["classified_at"] = serde_json::to_value(staged_at)?;
+        staged["staged_at"] = serde_json::to_value(staged_at)?;
+        staged["earliest_close"] = serde_json::to_value(staged_at + time::Duration::minutes(15))?;
+        staged["veto_deadline"] = serde_json::to_value(staged_at + time::Duration::hours(1))?;
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!pending.exists(), "mismatched envelope leaves the hot path");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_quarantines_identity_binding_that_diverges_from_submission_receipt(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        staged["identityEvidence"] = json!(vec![0; 32]);
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(
+            !pending.exists(),
+            "mismatched identity binding leaves the hot path"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_quarantines_malformed_submission_weave_hash() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute_batch("DROP TRIGGER ward_audit_append_only_update")?;
+        conn.execute(
+            "UPDATE ward_audit SET ward_hash = X''
+             WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+            [&proposal_id],
+        )?;
+        drop(conn);
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!pending.exists());
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_checks_submission_receipt_before_corrupt_window_terminalization(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            time::OffsetDateTime::now_utc(),
+        )?;
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        staged["reviewKind"] = json!("automatic");
+        staged["pending"]["staged_at"] =
+            serde_json::to_value(time::OffsetDateTime::now_utc() - time::Duration::hours(2))?;
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!pending.exists());
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_count, 0,
+            "receipt corruption must not invent a terminal decision"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_retains_valid_window_when_audit_store_is_temporarily_full() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            time::OffsetDateTime::now_utc(),
+        )?;
+        saturate_ward_audit_capacity(home)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(
+            pending.exists(),
+            "transient audit failure remains retryable"
+        );
+        assert!(
+            !home.join("pending/quarantine").exists(),
+            "valid receipt evidence must not be quarantined"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let opened: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(opened, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_mutated_manual_decision_actor() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .context("interrupted approval leaves a recovery claim")?;
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
+        staged["decisionRequest"]["decisionActor"] = json!("principal:forged");
+        std::fs::write(&claim, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!claim.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_mutated_decision_claim_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        staged["decisionRequest"]["claimedAt"] =
+            serde_json::to_value(time::OffsetDateTime::now_utc() - time::Duration::days(1))?;
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_rejects_forged_automatic_human_approval_origin() -> Result<()> {
+        for origin in ["self-created", "pre-existing-automatic"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+            let request = ProposalDecisionRequest {
+                decision: "approve".to_string(),
+                rationale: None,
+                claimed_at: time::OffsetDateTime::now_utc() - time::Duration::days(1),
+                expected_revision: None,
+                revision_required: false,
+                expired: false,
+                decision_actor: None,
+                replacement_proposal_id: None,
+                replacement_proposal_revision: None,
+            };
+            staged["decisionRequest"] = serde_json::to_value(&request)?;
+            std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+            if origin == "pre-existing-automatic" {
+                let store_path = home.join("coven.sqlite3");
+                let conn = store::open_store(&store_path)?;
+                let required = proposal_decision_audit_reservation_bytes(&conn, "approve")?;
+                store::WardAuditReservation::acquire(
+                    &conn,
+                    &store_path,
+                    format!("proposal:{proposal_id}:approve"),
+                    &bound_proposal_decision_purpose("proposal-approval-automatic", &request)?,
+                    required,
+                )?
+                .preserve()?;
+            }
+
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{origin}");
+            assert!(!pending.exists(), "{origin}");
+            assert_eq!(
+                std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                "before",
+                "{origin}"
+            );
+            let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(quarantined.len(), 1, "{origin}");
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let terminal_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit
+                 WHERE proposal_id = ?1
+                   AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+                [&proposal_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(terminal_count, 0, "{origin}");
+            let reservations: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations
+                 WHERE token = ?1",
+                [format!("proposal:{proposal_id}:approve")],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                reservations,
+                i64::from(origin == "pre-existing-automatic"),
+                "{origin}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_releases_forged_expiry_reservation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        staged["decisionRequest"] = serde_json::to_value(ProposalDecisionRequest {
+            decision: "reject".to_string(),
+            rationale: None,
+            claimed_at: time::OffsetDateTime::now_utc() - time::Duration::days(1),
+            expected_revision: None,
+            revision_required: false,
+            expired: true,
+            decision_actor: None,
+            replacement_proposal_id: None,
+            replacement_proposal_revision: None,
+        })?;
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!pending.exists());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations
+             WHERE token LIKE ?1",
+            [format!("proposal:{proposal_id}:%")],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_releases_abandoned_recovery_reservation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::ZERO,
+        );
+        let (pending, proposal_id) = stage_scheduled_edit(
+            home,
+            "logged/skill.md",
+            2,
+            coven_threads_core::ApprovalPath::AutoRegression { veto: Some(veto) },
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+        assert!(decide_threads_proposal_automatic(home, &proposal_id, "approve", None).is_err());
+        assert!(pending.exists());
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        assert!(
+            staged.get("decisionRequest").is_none(),
+            "abandoned recovery must restore a clean pending proposal"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            [format!("proposal:{proposal_id}:approve")],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            reservations, 0,
+            "abandoned recovery must release its stale reservation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_releases_revision_mismatch_recovery_reservation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        staged["decisionRequest"]["expectedRevision"] = json!("0".repeat(64));
+        let request = proposal_decision_request(&staged)?.context("decision request")?;
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "UPDATE coven_ward_audit_reservations
+             SET purpose = ?1
+             WHERE token = ?2",
+            rusqlite::params![
+                bound_proposal_decision_purpose("proposal-approval-owner-local", &request)?,
+                format!("proposal:{proposal_id}:approve"),
+            ],
+        )?;
+        drop(conn);
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        assert!(staged.get("decisionRequest").is_none());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            [format!("proposal:{proposal_id}:approve")],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_request_and_claim_decision_conflict() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let claim = pending.with_file_name(format!(
+            "{}.approve.deciding",
+            pending
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("pending filename is UTF-8")?
+        ));
+        std::fs::rename(&pending, &claim)?;
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
+        staged["decisionRequest"]["decision"] = json!("reject");
+        std::fs::write(&claim, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!claim.exists());
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn opposite_retry_preserves_the_original_durable_decision() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+
+        let conflict = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+        assert_eq!(conflict.status, 409);
+        assert!(conflict.body.contains("proposal-decision-conflict"));
+        assert!(pending.exists());
+        assert!(!home.join("pending/quarantine").exists());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let (approval, rejection): (i64, i64) = conn.query_row(
+            "SELECT
+                 COUNT(*) FILTER (WHERE token = ?1),
+                 COUNT(*) FILTER (WHERE token = ?2)
+             FROM coven_ward_audit_reservations",
+            rusqlite::params![
+                format!("proposal:{proposal_id}:approve"),
+                format!("proposal:{proposal_id}:reject"),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((approval, rejection), (1, 0));
+        drop(conn);
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_manual_decision_survives_transient_ward_unavailability() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let ward_path = home.join("familiars/sage/ward.toml");
+        let ward = std::fs::read(&ward_path)?;
+        std::fs::remove_file(&ward_path)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        assert_eq!(staged["decisionRequest"]["decision"], "approve");
+        assert!(!home.join("pending/quarantine").exists());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            [format!("proposal:{proposal_id}:approve")],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 1);
+        drop(conn);
+
+        std::fs::write(&ward_path, ward)?;
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert!(!pending.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_applying_authority_conflicts() -> Result<()> {
+        for corruption in [
+            "request-decision",
+            "request-revision",
+            "missing-request-revision",
+            "state-decision",
+            "rationale",
+        ] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (_, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApprovalWithRationale,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let decision_body =
+                scheduled_decision_body(home, &proposal_id, Some("principal reviewed"))?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+                proposal_id.clone(),
+            )));
+            assert!(handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some(&decision_body),
+            )
+            .is_err());
+            let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+                .context("interrupted approval leaves a recovery claim")?;
+            let mut staged: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
+            match corruption {
+                "request-decision" => staged["decisionRequest"]["decision"] = json!("reject"),
+                "request-revision" => {
+                    staged["decisionRequest"]["expectedRevision"] = json!("0".repeat(64))
+                }
+                "missing-request-revision" => {
+                    staged["decisionRequest"]
+                        .as_object_mut()
+                        .context("decision request is an object")?
+                        .remove("expectedRevision");
+                }
+                "state-decision" => staged["decisionState"]["decision"] = json!("reject"),
+                "rationale" => staged["decisionState"]["rationale"] = json!("forged rationale"),
+                _ => unreachable!(),
+            }
+            std::fs::write(&claim, serde_json::to_vec_pretty(&staged)?)?;
+
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{corruption}");
+            assert!(
+                !claim.exists(),
+                "{corruption}: claim retained as {}; recovery log: {}",
+                std::fs::read_to_string(&claim).unwrap_or_default(),
+                std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(home))
+                    .unwrap_or_default()
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                "before",
+                "{corruption}"
+            );
+            let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(quarantined.len(), 1, "{corruption}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decision_origin_distinguishes_invalid_evidence_from_store_errors() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let request = ProposalDecisionRequest {
+            decision: "approve".to_string(),
+            rationale: None,
+            claimed_at: time::OffsetDateTime::now_utc(),
+            expected_revision: None,
+            revision_required: false,
+            expired: false,
+            decision_actor: None,
+            replacement_proposal_id: None,
+            replacement_proposal_revision: None,
+        };
+        let missing = trusted_decision_approver(&conn, "missing", "approve", Some(&request), false)
+            .expect_err("missing authority is invalid evidence");
+        assert!(invalid_proposal_decision_origin(&missing));
+
+        conn.execute_batch(
+            "ALTER TABLE coven_ward_audit_reservations
+             RENAME TO unavailable_ward_audit_reservations",
+        )?;
+        let operational =
+            trusted_decision_approver(&conn, "missing", "approve", Some(&request), false)
+                .expect_err("schema failure is operational");
+        assert!(
+            !invalid_proposal_decision_origin(&operational),
+            "operational SQLite failures must remain retryable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_mutated_apply_intent_approver() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .context("interrupted approval leaves a recovery claim")?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute_batch("DROP TRIGGER ward_audit_append_only_update")?;
+        conn.execute(
+            "UPDATE ward_audit SET approver = 'principal:forged'
+             WHERE proposal_id = ?1
+               AND event_type = 'validation_verdict'
+               AND decision = 'proposal-apply-intent'",
+            [&proposal_id],
+        )?;
+        drop(conn);
+        let document = read_pending_proposal_document(&claim)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        assert!(
+            !proposal_recovery_is_proven_unapplied(home, &conn, &document),
+            "corrupt apply-intent attribution must not qualify for terminal expiry"
+        );
+        drop(conn);
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!claim.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_missing_malformed_or_divergent_apply_intent() -> Result<()> {
+        for corruption in ["missing", "malformed", "divergent"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (_, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+                proposal_id.clone(),
+            )));
+            assert!(handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some(&decision_body),
+            )
+            .is_err());
+            let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+                .context("interrupted approval leaves a recovery claim")?;
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            match corruption {
+                "missing" => {
+                    conn.execute_batch("DROP TRIGGER ward_audit_append_only_delete")?;
+                    conn.execute(
+                        "DELETE FROM ward_audit
+                         WHERE proposal_id = ?1
+                           AND event_type = 'validation_verdict'
+                           AND decision = 'proposal-apply-intent'",
+                        [&proposal_id],
+                    )?;
+                }
+                "malformed" => {
+                    conn.execute_batch("DROP TRIGGER ward_audit_append_only_update")?;
+                    conn.execute(
+                        "UPDATE ward_audit SET detail = '{'
+                         WHERE proposal_id = ?1
+                           AND event_type = 'validation_verdict'
+                           AND decision = 'proposal-apply-intent'",
+                        [&proposal_id],
+                    )?;
+                }
+                "divergent" => {
+                    let detail: String = conn.query_row(
+                        "SELECT detail FROM ward_audit
+                         WHERE proposal_id = ?1
+                           AND event_type = 'validation_verdict'
+                           AND decision = 'proposal-apply-intent'",
+                        [&proposal_id],
+                        |row| row.get(0),
+                    )?;
+                    let mut detail: Value = serde_json::from_str(&detail)?;
+                    detail["decision"] = json!("reject");
+                    conn.execute_batch("DROP TRIGGER ward_audit_append_only_update")?;
+                    conn.execute(
+                        "UPDATE ward_audit SET detail = ?1
+                         WHERE proposal_id = ?2
+                           AND event_type = 'validation_verdict'
+                           AND decision = 'proposal-apply-intent'",
+                        rusqlite::params![serde_json::to_string(&detail)?, proposal_id],
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+            drop(conn);
+
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{corruption}");
+            assert!(!claim.exists(), "{corruption}");
+            assert_eq!(
+                std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                "before",
+                "{corruption}"
+            );
+            let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(quarantined.len(), 1, "{corruption}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_missing_or_forged_expiry_request() -> Result<()> {
+        for corruption in ["missing-request", "forged-expiry"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (_, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+                proposal_id.clone(),
+            )));
+            assert!(handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some(&decision_body),
+            )
+            .is_err());
+            let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+                .context("interrupted approval leaves a recovery claim")?;
+            let mut staged: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
+            match corruption {
+                "missing-request" => {
+                    staged
+                        .as_object_mut()
+                        .context("proposal claim is an object")?
+                        .remove("decisionRequest");
+                }
+                "forged-expiry" => {
+                    staged["decisionRequest"]["expired"] = json!(true);
+                    staged["decisionRequest"]["decisionActor"] = Value::Null;
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&claim, serde_json::to_vec_pretty(&staged)?)?;
+
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{corruption}");
+            assert!(!claim.exists(), "{corruption}");
+            assert_eq!(
+                std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                "before",
+                "{corruption}"
+            );
+            let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(quarantined.len(), 1, "{corruption}");
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let terminal_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit
+                 WHERE proposal_id = ?1
+                   AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+                [&proposal_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(terminal_count, 0, "{corruption}");
+        }
         Ok(())
     }
 
