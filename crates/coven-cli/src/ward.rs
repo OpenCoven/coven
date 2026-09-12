@@ -539,16 +539,18 @@ fn backup_carries_identity_invariants(home: &Path) -> Result<bool> {
 
 impl WardConfig {
     pub(crate) fn classify_resolved_path(&self, resolved: &str) -> Result<Tier> {
-        let mut tier = self.default_tier;
+        let mut tier: Option<Tier> = None;
         for entry in &self.surface {
             let matcher = compile_glob(&entry.path, false)
                 .with_context(|| format!("invalid surface glob `{}`", entry.path))?
                 .compile_matcher();
-            if matcher.is_match(resolved) && entry.tier.as_u8() < tier.as_u8() {
-                tier = entry.tier;
+            if matcher.is_match(resolved)
+                && tier.is_none_or(|current| entry.tier.as_u8() < current.as_u8())
+            {
+                tier = Some(entry.tier);
             }
         }
-        Ok(tier)
+        Ok(tier.unwrap_or(self.default_tier))
     }
 
     pub(crate) fn compiled_approval_tiers(&self) -> Result<Option<CompiledApprovalTiers>> {
@@ -6121,6 +6123,35 @@ tier = 1
             compiled.approval_path_for(&threads::SurfaceRegionId::new("heartbeat_behavior")),
             Some(threads::ApprovalPath::FamiliarCoherence { .. })
         ));
+    }
+
+    #[test]
+    fn explicit_surface_tier_overrides_restrictive_default_for_scheduled_classification() {
+        let config = WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+default_tier = 0
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#,
+        )
+        .expect("Ward config parses");
+
+        assert_eq!(
+            config
+                .classify_resolved_path("TOOLS.md")
+                .expect("surface classification succeeds"),
+            Tier::Reviewed
+        );
+        assert_eq!(
+            config
+                .classify_resolved_path("unknown.md")
+                .expect("default classification succeeds"),
+            Tier::Protected
+        );
     }
 
     #[test]
