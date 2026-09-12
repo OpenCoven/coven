@@ -4273,7 +4273,7 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<PublishedUnixListener> {
 #[derive(Debug)]
 pub struct PublishedUnixListener {
     listener: UnixListener,
-    _staged_path: tempfile::TempPath,
+    _staged_dir: tempfile::TempDir,
 }
 
 #[cfg(unix)]
@@ -4362,14 +4362,14 @@ fn bind_api_socket_with_publisher(
     }
     // Keep the temporary bound pathname alive for the listener's lifetime; coven.sock
     // remains the public entry while the staged name preserves the inode the listener
-    // is actually bound to.
-    let staged = tempfile::Builder::new()
+    // is actually bound to. Reserve a private staging directory first so bind()
+    // never races another writer for the same temporary socket pathname.
+    let staged_dir = tempfile::Builder::new()
         .prefix(".")
-        .rand_bytes(8)
-        .tempfile_in(coven_home)
-        .context("reserving private daemon socket staging path")?
-        .into_temp_path();
-    std::fs::remove_file(&staged).context("preparing reserved daemon socket staging path")?;
+        .rand_bytes(5)
+        .tempdir_in(coven_home)
+        .context("reserving private daemon socket staging directory")?;
+    let staged = staged_dir.path().join("s");
     let listener = UnixListener::bind(&staged)
         .with_context(|| format!("failed to bind Coven API socket {}", socket_path.display()))?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).with_context(
@@ -4384,7 +4384,7 @@ fn bind_api_socket_with_publisher(
     publish(&staged, &socket_path).context("publishing private Coven API socket")?;
     Ok(PublishedUnixListener {
         listener,
-        _staged_path: staged,
+        _staged_dir: staged_dir,
     })
 }
 
