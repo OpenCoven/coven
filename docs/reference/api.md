@@ -347,6 +347,30 @@ after restart. Incomplete or invalid persisted intent is rejected, not
 reinterpreted as an ordinary veto. Preserve in-flight claims when rolling back:
 a daemon predating this extension cannot recover their added fields.
 
+Decision origins are bound to the durable reservation and request. Automatic
+work never acquires a human approver. Historical requests written before
+origin binding can resume only with matching append-only apply intent and
+version-specific recovery evidence. Their terminal approval uses
+`approver: "unknown:historical"` and `detail.decisionOrigin.kind:
+"historical_unknown"`; this is an explicit unknown-origin sentinel required by
+the audit schema, not a human or the proposal writer. Insufficient historical
+proof returns `409` with `why: "proposal-decision-review-required"` without
+labeling the record corrupt. Unapplied claims return to pending for renewed
+review; unresolved applying evidence remains preserved.
+
+Historical v2 recovery uses its exact original Ward encoding. Current claims
+continue to use v3 baseline-snapshot commitments; they cannot fall back to v2.
+Changed live policy or baseline evidence invalidates either version.
+An older scheduled submission receipt that predates identity binding is
+accepted for apply recovery only when its missing binding is proven by the
+matching historical v3 intent. Otherwise it requires a new proposal; current
+decision origins cannot use this compatibility path.
+An undecided historical proposal can still reach its normal retention expiry:
+only proven-unapplied work may enter the server-owned rejection transition,
+which validates the full submission receipt before terminalizing. Missing
+approval identity proof never authorizes an apply, and malformed or mismatched
+receipts do not become trusted historical data.
+
 ### Pending-proposal capacity and bounded maintenance
 
 The active `~/.coven/pending/` store admits at most **64 proposals** totaling
@@ -390,6 +414,10 @@ Pending proposals expire after **30 days**. Expiry follows the durable decision
 path: Coven records a `proposal_rejected` audit row with decision `expired`,
 removes the active file, and never applies its target. An interrupted expiry
 persists an internal decision request and resumes safely on a later tick.
+If expiry has already superseded an unapplied approval reservation, restart
+recognizes that bound transition before trying to resume the old approval.
+Capacity refusal preserves the transition for retry; changed or unproven
+apply evidence never becomes an unapplied terminal rejection.
 
 ### Durable audit capacity
 

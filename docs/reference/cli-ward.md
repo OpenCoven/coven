@@ -346,6 +346,14 @@ mutation before proposal lookup or audit mutation; UUID secrecy is never an
 authorization control. Automatic expiry/apply and interrupted-decision
 recovery are internal daemon work and have no TCP route.
 
+On upgrade, an interrupted historical decision must match its original
+reservation, append-only apply intent, and versioned recovery evidence.
+An unknown historical decider stays explicitly unknown in the audit
+(`unknown:historical` with `decisionOrigin.kind = historical_unknown`), never
+the proposal writer or an invented human. Missing proof requires renewed
+review; potentially applied bytes and their evidence remain preserved rather
+than being mislabeled as corruption or silently approved.
+
 ```sh
 coven ward approve <id> --note "reviewed identity change"
 coven ward reject <id> --note "needs revision"
@@ -440,6 +448,11 @@ principal binding. Veto-bearing approval metadata must explicitly declare both
 values and refuses ambiguous declarations without rewriting the source or
 creating a backup. A minimum is invalid without a veto window and on human
 approval paths. The command exits non-zero if any migration fails.
+
+Legacy harness-block names without approval tiers do not create scheduled
+approval policy: migrated editable paths remain Tier 2, and the original names
+remain in the backup. Approval tiers without nonempty harness blocks are
+rejected without rewriting the source or creating a backup.
 
 Accepted retired invariants become active `[[identity_invariant]]` entries,
 not backup-only annotations. You keep the original configuration in
