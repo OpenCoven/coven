@@ -2,7 +2,10 @@ use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{InputGuardrail, Model, OutputGuardrail, Tool, ToolDefinition};
+use crate::{
+    AgentRef, AgentRefError, AgentRevision, InputGuardrail, Model, OutputGuardrail, Tool,
+    ToolDefinition,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -70,6 +73,7 @@ where
     C: Sync,
 {
     pub(crate) id: AgentId,
+    pub(crate) revision: Option<AgentRevision>,
     pub(crate) name: String,
     pub(crate) instructions: String,
     pub(crate) model: Arc<dyn Model<C>>,
@@ -91,6 +95,7 @@ where
     ) -> Self {
         Self {
             id: id.into(),
+            revision: None,
             name: name.into(),
             instructions: instructions.into(),
             model,
@@ -105,6 +110,17 @@ where
         &self.id
     }
 
+    pub fn revision(&self) -> Option<&AgentRevision> {
+        self.revision.as_ref()
+    }
+
+    pub fn agent_ref(&self) -> Result<AgentRef, AgentRefError> {
+        match &self.revision {
+            Some(revision) => AgentRef::with_revision(self.id.as_str(), revision.as_str()),
+            None => AgentRef::new(self.id.as_str()),
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -116,6 +132,11 @@ where
     pub fn with_tool(mut self, tool: Arc<dyn Tool<C>>) -> Self {
         let definition = tool.definition();
         self.tools.push(AgentTool { tool, definition });
+        self
+    }
+
+    pub fn with_revision(mut self, revision: AgentRevision) -> Self {
+        self.revision = Some(revision);
         self
     }
 

@@ -4,9 +4,11 @@ use std::{
 };
 
 use crate::{
-    Agent, AgentId, ConfigError, GuardrailStage, GuardrailVerdict, HandoffDefinition,
-    InvocationContext, InvocationId, ModelAction, ModelRequest, NoopObserver, RunError, RunEvent,
-    RunFailure, RunFailureKind, RunItem, RunObserver, SessionStore,
+    Agent, AgentId, AgentRef, ConfigError, GuardrailStage, GuardrailVerdict, HandoffDefinition,
+    InvocationContext, InvocationEvent, InvocationEventKind, InvocationFailureKind, InvocationId,
+    InvocationObserver, InvocationRequest, InvocationSource, ModelAction, ModelRequest,
+    NoopInvocationObserver, NoopObserver, RunError, RunEvent, RunFailure, RunFailureKind, RunItem,
+    RunObserver, SessionStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +49,20 @@ struct RunProgress {
     handoffs: usize,
 }
 
+const fn invocation_failure_kind(kind: RunFailureKind) -> InvocationFailureKind {
+    match kind {
+        RunFailureKind::Configuration => InvocationFailureKind::Configuration,
+        RunFailureKind::Session => InvocationFailureKind::Session,
+        RunFailureKind::InputGuardrail => InvocationFailureKind::InputGuardrail,
+        RunFailureKind::OutputGuardrail => InvocationFailureKind::OutputGuardrail,
+        RunFailureKind::Model => InvocationFailureKind::Model,
+        RunFailureKind::Tool => InvocationFailureKind::Tool,
+        RunFailureKind::Handoff => InvocationFailureKind::ControlTransfer,
+        RunFailureKind::InvalidResponse => InvocationFailureKind::InvalidResponse,
+        RunFailureKind::Limit => InvocationFailureKind::Limit,
+    }
+}
+
 pub struct Runner<C>
 where
     C: Sync,
@@ -54,6 +70,7 @@ where
     agents: BTreeMap<AgentId, Arc<Agent<C>>>,
     session: Option<Arc<dyn SessionStore>>,
     observer: Arc<dyn RunObserver>,
+    invocation_observer: Arc<dyn InvocationObserver>,
 }
 
 impl<C> Runner<C>
@@ -65,6 +82,12 @@ where
 
         for agent in agents {
             let id = agent.id.clone();
+            agent
+                .agent_ref()
+                .map_err(|source| ConfigError::InvalidAgentRef {
+                    agent: id.clone(),
+                    source,
+                })?;
             if registered.insert(id.clone(), Arc::new(agent)).is_some() {
                 return Err(ConfigError::DuplicateAgent(id));
             }
@@ -108,6 +131,7 @@ where
             agents: registered,
             session: None,
             observer: Arc::new(NoopObserver),
+            invocation_observer: Arc::new(NoopInvocationObserver),
         })
     }
 
@@ -121,7 +145,76 @@ where
         self
     }
 
+    pub fn with_invocation_observer(mut self, observer: Arc<dyn InvocationObserver>) -> Self {
+        self.invocation_observer = observer;
+        self
+    }
+
+    fn registered_agent_ref(&self, id: &AgentId) -> Option<AgentRef> {
+        self.agents
+            .get(id)
+            .map(|agent| agent.agent_ref().expect("runner validates agent refs"))
+    }
+
+    fn observe_invocation(&self, request: &InvocationRequest, event: InvocationEventKind) {
+        self.invocation_observer.on_event(&InvocationEvent::new(
+            request.invocation.clone(),
+            request.source.clone(),
+            request.requested_target.clone(),
+            event,
+        ));
+    }
+
     fn fail(
+        &self,
+        request: &InvocationRequest,
+        agent: &AgentId,
+        kind: RunFailureKind,
+        error: RunError,
+    ) -> RunError {
+        self.fail_with_location(
+            request,
+            agent,
+            self.registered_agent_ref(agent),
+            kind,
+            error,
+        )
+    }
+
+    fn fail_before_execution(
+        &self,
+        request: &InvocationRequest,
+        agent: &AgentId,
+        kind: RunFailureKind,
+        error: RunError,
+    ) -> RunError {
+        self.fail_with_location(request, agent, None, kind, error)
+    }
+
+    fn fail_with_location(
+        &self,
+        request: &InvocationRequest,
+        agent: &AgentId,
+        failed_at: Option<AgentRef>,
+        kind: RunFailureKind,
+        error: RunError,
+    ) -> RunError {
+        self.observer.on_event(&RunEvent::RunFailed {
+            invocation: request.invocation.clone(),
+            agent: agent.clone(),
+            kind,
+        });
+        self.observe_invocation(
+            request,
+            InvocationEventKind::Failed {
+                failed_at,
+                kind: invocation_failure_kind(kind),
+            },
+        );
+        error
+    }
+
+    fn fail_legacy(
         &self,
         invocation: &InvocationContext,
         agent: &AgentId,
@@ -149,7 +242,7 @@ where
     /// or tool execution.
     async fn check_input_guardrails(
         &self,
-        invocation: &InvocationContext,
+        request: &InvocationRequest,
         agent: &Agent<C>,
         input: &str,
         context: &C,
@@ -157,7 +250,7 @@ where
         for guardrail in &agent.input_guardrails {
             let verdict = guardrail.check(input, context).await.map_err(|source| {
                 self.fail(
-                    invocation,
+                    request,
                     &agent.id,
                     RunFailureKind::InputGuardrail,
                     RunError::GuardrailFailed {
@@ -170,7 +263,7 @@ where
             })?;
             let allowed = verdict == GuardrailVerdict::Allow;
             self.observer.on_event(&RunEvent::GuardrailChecked {
-                invocation: invocation.clone(),
+                invocation: request.invocation.clone(),
                 agent: agent.id.clone(),
                 guardrail: guardrail.name().to_owned(),
                 stage: GuardrailStage::Input,
@@ -178,7 +271,7 @@ where
             });
             if let GuardrailVerdict::Reject { reason } = verdict {
                 return Err(self.fail(
-                    invocation,
+                    request,
                     &agent.id,
                     RunFailureKind::InputGuardrail,
                     RunError::GuardrailRejected {
@@ -241,19 +334,83 @@ where
         options: RunOptions,
         invocation: InvocationContext,
     ) -> Result<RunResult, RunFailure> {
+        let starting_agent = starting_agent.into();
+        let requested_target = match AgentRef::new(starting_agent.as_str()) {
+            Ok(requested_target) => requested_target,
+            Err(source) => {
+                let mut progress = RunProgress::default();
+                progress.items.push(RunItem::UserMessage {
+                    content: input.into(),
+                });
+                self.observer.on_event(&RunEvent::RunStarted {
+                    invocation: invocation.clone(),
+                    starting_agent: starting_agent.clone(),
+                });
+                let error = self.fail_legacy(
+                    &invocation,
+                    &starting_agent,
+                    RunFailureKind::Configuration,
+                    RunError::InvalidAgentRef {
+                        agent: starting_agent.clone(),
+                        source,
+                    },
+                );
+                return Err(RunFailure {
+                    invocation: Box::new(invocation),
+                    error,
+                    new_items: progress.items.into_boxed_slice(),
+                    turns: 0,
+                    handoffs: 0,
+                });
+            }
+        };
+        let requested_target = self
+            .registered_agent_ref(requested_target.id())
+            .unwrap_or(requested_target);
+        self.run_invocation_inner(
+            InvocationRequest::new(invocation, InvocationSource::Caller, requested_target),
+            input,
+            context,
+            options,
+            false,
+        )
+        .await
+    }
+
+    /// Runs one validated invocation request and emits its versioned metadata
+    /// event stream alongside the compatibility [`RunEvent`] stream.
+    pub async fn run_invocation(
+        &self,
+        request: InvocationRequest,
+        input: impl Into<String>,
+        context: &C,
+        options: RunOptions,
+    ) -> Result<RunResult, RunFailure> {
+        self.run_invocation_inner(request, input, context, options, true)
+            .await
+    }
+
+    async fn run_invocation_inner(
+        &self,
+        request: InvocationRequest,
+        input: impl Into<String>,
+        context: &C,
+        options: RunOptions,
+        require_revision: bool,
+    ) -> Result<RunResult, RunFailure> {
         let mut progress = RunProgress::default();
 
         self.run_loop(
-            &invocation,
-            starting_agent.into(),
+            &request,
             input.into(),
             context,
             options,
+            require_revision,
             &mut progress,
         )
         .await
         .map_err(|error| RunFailure {
-            invocation: Box::new(invocation.clone()),
+            invocation: Box::new(request.invocation.clone()),
             error,
             new_items: progress.items.into_boxed_slice(),
             turns: progress.turns,
@@ -263,39 +420,67 @@ where
 
     async fn run_loop(
         &self,
-        invocation: &InvocationContext,
-        starting_agent: AgentId,
+        request: &InvocationRequest,
         input: String,
         context: &C,
         options: RunOptions,
+        require_revision: bool,
         progress: &mut RunProgress,
     ) -> Result<RunResult, RunError> {
+        let starting_agent = request.requested_target.id().clone();
         self.observer.on_event(&RunEvent::RunStarted {
-            invocation: invocation.clone(),
+            invocation: request.invocation.clone(),
             starting_agent: starting_agent.clone(),
         });
+        self.observe_invocation(request, InvocationEventKind::Started {});
 
         progress.items.push(RunItem::UserMessage {
             content: input.clone(),
         });
 
         let mut current = self.agents.get(&starting_agent).cloned().ok_or_else(|| {
-            self.fail(
-                invocation,
+            self.fail_before_execution(
+                request,
                 &starting_agent,
                 RunFailureKind::Configuration,
                 RunError::UnknownStartingAgent(starting_agent.clone()),
             )
         })?;
 
-        self.check_input_guardrails(invocation, &current, &input, context)
+        let registered_target = current.agent_ref().expect("runner validates agent refs");
+        if require_revision
+            && (request.requested_target.revision().is_none()
+                || registered_target.revision().is_none())
+        {
+            return Err(self.fail_before_execution(
+                request,
+                &starting_agent,
+                RunFailureKind::Configuration,
+                RunError::AgentRevisionRequired {
+                    agent: starting_agent.clone(),
+                },
+            ));
+        }
+        if request.requested_target != registered_target {
+            return Err(self.fail_before_execution(
+                request,
+                &starting_agent,
+                RunFailureKind::Configuration,
+                RunError::AgentRevisionMismatch {
+                    requested: Box::new(request.requested_target.clone()),
+                    registered: Box::new(registered_target),
+                },
+            ));
+        }
+
+        self.check_input_guardrails(request, &current, &input, context)
             .await?;
 
         let mut model_items = match (&options.session_id, &self.session) {
             (Some(session_id), Some(session)) => {
                 let mut items = session.load(session_id).await.map_err(|source| {
                     self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::Session,
                         RunError::SessionFailed {
@@ -309,7 +494,7 @@ where
             }
             (Some(_), None) => {
                 return Err(self.fail(
-                    invocation,
+                    request,
                     &current.id,
                     RunFailureKind::Session,
                     RunError::SessionUnavailable,
@@ -330,12 +515,12 @@ where
             progress.turns = turn;
 
             self.observer.on_event(&RunEvent::ModelRequested {
-                invocation: invocation.clone(),
+                invocation: request.invocation.clone(),
                 agent: current.id.clone(),
                 turn,
             });
 
-            let request = ModelRequest {
+            let model_request = ModelRequest {
                 agent_id: current.id.clone(),
                 agent_name: current.name.clone(),
                 instructions: current.instructions.clone(),
@@ -357,11 +542,11 @@ where
             };
             let response = current
                 .model
-                .generate(request, context)
+                .generate(model_request, context)
                 .await
                 .map_err(|source| {
                     self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::Model,
                         RunError::ModelFailed {
@@ -383,7 +568,7 @@ where
             if response.actions.is_empty() {
                 let output = response.assistant_message.ok_or_else(|| {
                     self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::InvalidModelResponse {
@@ -397,7 +582,7 @@ where
                 for guardrail in &current.output_guardrails {
                     let verdict = guardrail.check(&output, context).await.map_err(|source| {
                         self.fail(
-                            invocation,
+                            request,
                             &current.id,
                             RunFailureKind::OutputGuardrail,
                             RunError::GuardrailFailed {
@@ -410,7 +595,7 @@ where
                     })?;
                     let allowed = verdict == GuardrailVerdict::Allow;
                     self.observer.on_event(&RunEvent::GuardrailChecked {
-                        invocation: invocation.clone(),
+                        invocation: request.invocation.clone(),
                         agent: current.id.clone(),
                         guardrail: guardrail.name().to_owned(),
                         stage: GuardrailStage::Output,
@@ -418,7 +603,7 @@ where
                     });
                     if let GuardrailVerdict::Reject { reason } = verdict {
                         return Err(self.fail(
-                            invocation,
+                            request,
                             &current.id,
                             RunFailureKind::OutputGuardrail,
                             RunError::GuardrailRejected {
@@ -437,7 +622,7 @@ where
                         .await
                         .map_err(|source| {
                             self.fail(
-                                invocation,
+                                request,
                                 &current.id,
                                 RunFailureKind::Session,
                                 RunError::SessionFailed {
@@ -449,13 +634,21 @@ where
                 }
 
                 self.observer.on_event(&RunEvent::RunCompleted {
-                    invocation: invocation.clone(),
+                    invocation: request.invocation.clone(),
                     final_agent: current.id.clone(),
                     turns: turn,
                     handoffs: progress.handoffs,
                 });
+                self.observe_invocation(
+                    request,
+                    InvocationEventKind::Completed {
+                        final_agent: current.agent_ref().expect("runner validates agent refs"),
+                        turns: turn,
+                        control_transfers: progress.handoffs,
+                    },
+                );
                 return Ok(RunResult {
-                    invocation: invocation.clone(),
+                    invocation: request.invocation.clone(),
                     final_output: output,
                     final_agent: current.id.clone(),
                     new_items: std::mem::take(&mut progress.items),
@@ -472,7 +665,7 @@ where
             if handoff_actions > 0 {
                 if response.actions.len() != 1 {
                     return Err(self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::InvalidModelResponse {
@@ -484,7 +677,7 @@ where
                 progress.handoffs += 1;
                 if progress.handoffs > options.max_handoffs {
                     return Err(self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::Limit,
                         RunError::MaxHandoffsExceeded {
@@ -495,7 +688,7 @@ where
 
                 let [ModelAction::Handoff(call)] = response.actions.as_slice() else {
                     return Err(self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::InvalidModelResponse {
@@ -510,7 +703,7 @@ where
                     .find(|handoff| handoff.name == call.name)
                     .ok_or_else(|| {
                         self.fail(
-                            invocation,
+                            request,
                             &current.id,
                             RunFailureKind::Handoff,
                             RunError::UnknownHandoff {
@@ -521,7 +714,7 @@ where
                     })?;
                 let target = self.agents.get(&handoff.target).cloned().ok_or_else(|| {
                     self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::Configuration,
                         RunError::InvalidConfiguration {
@@ -540,17 +733,25 @@ where
                 progress.items.push(item.clone());
                 model_items.push(item);
                 self.observer.on_event(&RunEvent::Handoff {
-                    invocation: invocation.clone(),
+                    invocation: request.invocation.clone(),
                     from: current.id.clone(),
                     to: target.id.clone(),
                     name: handoff.name.clone(),
                 });
+                self.observe_invocation(
+                    request,
+                    InvocationEventKind::ControlTransferred {
+                        from: current.agent_ref().expect("runner validates agent refs"),
+                        to: target.agent_ref().expect("runner validates agent refs"),
+                        name: handoff.name.clone(),
+                    },
+                );
                 current = target;
                 // Ingress parity: the handoff target enforces the same input
                 // policy it would enforce as the starting agent, checked
                 // against the original user input, before its first model turn
                 // or tool execution.
-                self.check_input_guardrails(invocation, &current, &input, context)
+                self.check_input_guardrails(request, &current, &input, context)
                     .await?;
                 continue;
             }
@@ -564,7 +765,7 @@ where
                 };
                 if !seen_call_ids.insert(call.id.clone()) {
                     return Err(self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::DuplicateToolCallId {
@@ -578,7 +779,7 @@ where
             for action in response.actions {
                 let ModelAction::ToolCall(call) = action else {
                     return Err(self.fail(
-                        invocation,
+                        request,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::InvalidModelResponse {
@@ -593,7 +794,7 @@ where
                     .find(|tool| tool.definition.name == call.name)
                     .ok_or_else(|| {
                         self.fail(
-                            invocation,
+                            request,
                             &current.id,
                             RunFailureKind::Tool,
                             RunError::UnknownTool {
@@ -609,7 +810,7 @@ where
                 progress.items.push(call_item.clone());
                 model_items.push(call_item);
                 self.observer.on_event(&RunEvent::ToolStarted {
-                    invocation: invocation.clone(),
+                    invocation: request.invocation.clone(),
                     agent: current.id.clone(),
                     tool: call.name.clone(),
                     call_id: call.id.clone(),
@@ -620,7 +821,7 @@ where
                         .await
                         .map_err(|source| {
                             self.fail(
-                                invocation,
+                                request,
                                 &current.id,
                                 RunFailureKind::Tool,
                                 RunError::ToolFailed {
@@ -639,7 +840,7 @@ where
                 progress.items.push(result_item.clone());
                 model_items.push(result_item);
                 self.observer.on_event(&RunEvent::ToolCompleted {
-                    invocation: invocation.clone(),
+                    invocation: request.invocation.clone(),
                     agent: current.id.clone(),
                     tool: call.name,
                     call_id: call.id,
@@ -648,7 +849,7 @@ where
         }
 
         Err(self.fail(
-            invocation,
+            request,
             &current.id,
             RunFailureKind::Limit,
             RunError::MaxTurnsExceeded {
