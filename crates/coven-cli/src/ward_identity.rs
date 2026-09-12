@@ -71,10 +71,14 @@ pub(crate) fn candidate_identity_context(
         authorization,
         resolved_decisions,
     )?;
+    let source_ward = ward::Ward::new(workspace, config.clone()).ok()?;
+    let soul_source = source_ward.materialize("SOUL.md").ok()?;
+    let identity_source = source_ward.materialize("IDENTITY.md").ok()?;
     let roster = relevant_roster_source(coven_home, familiar_id, &required_facts);
     let soul = relevant_surface_source(
         workspace,
         "SOUL.md",
+        &soul_source,
         &overrides,
         required_facts.contains(&IdentityFact::Name)
             || required_facts.contains(&IdentityFact::Purpose),
@@ -82,6 +86,7 @@ pub(crate) fn candidate_identity_context(
     let identity = relevant_surface_source(
         workspace,
         "IDENTITY.md",
+        &identity_source,
         &overrides,
         required_facts.contains(&IdentityFact::Name)
             || required_facts.contains(&IdentityFact::Pronouns),
@@ -297,6 +302,7 @@ impl SurfaceSource {
 fn relevant_surface_source(
     workspace: &Path,
     surface: &'static str,
+    resolved: &str,
     overrides: &BTreeMap<String, Vec<u8>>,
     needed: bool,
 ) -> SurfaceSource {
@@ -306,8 +312,8 @@ fn relevant_surface_source(
             bytes: None,
         };
     }
-    let bytes = overrides.get(surface).cloned().or_else(|| {
-        crate::threads_gate::read_surface_if_exists(workspace, surface)
+    let bytes = overrides.get(resolved).cloned().or_else(|| {
+        crate::threads_gate::read_surface_if_exists(workspace, resolved)
             .ok()
             .flatten()
     });

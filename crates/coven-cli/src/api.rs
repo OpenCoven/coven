@@ -12416,7 +12416,7 @@ fn proposal_recovery_commitment(
             authorization,
             None,
         )
-        .expect("validated identity invariants always materialize a context");
+        .context("materializing identity evidence for proposal recovery")?;
         hasher.update(b"identity-candidate-commitment");
         hasher.update(&identity_context.candidate_commitment);
     }
@@ -28543,6 +28543,55 @@ id = "size-delta"
     }
 
     #[test]
+    fn identity_predicate_uses_case_resolved_candidate_sources() -> Result<()> {
+        for (name, expected_status) in [("Another Familiar", 403), ("Sage", 200)] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_identity_predicate_familiar(home)?;
+            let ward_path = workspace.join("ward.toml");
+            let config = std::fs::read_to_string(&ward_path)?
+                .replace(
+                    "protected_surface = [\"SOUL.md\", \"IDENTITY.md\", \"MEMORY.md\"]",
+                    "protected_surface = [\"SOUL.md\", \"MEMORY.md\"]",
+                )
+                .replace(
+                    "path = \"IDENTITY.md\"\ntier = 0",
+                    "path = \"IDENTITY.md\"\ntier = 2",
+                );
+            std::fs::write(ward_path, config)?;
+            std::fs::rename(workspace.join("IDENTITY.md"), workspace.join("identity.md"))?;
+            let expected_status = if workspace.join("IDENTITY.md").exists() {
+                expected_status
+            } else {
+                // On a case-sensitive filesystem the canonical source is
+                // genuinely absent, so even unchanged identity must fail closed.
+                403
+            };
+            let before = std::fs::read(workspace.join("identity.md"))?;
+            let contents =
+                format!("# IDENTITY.md - {name}\n- **Name:** {name}\n- **Pronouns:** she/her\n");
+            let response = post_edits(
+                home,
+                &json!({"edits": [{"target": "identity.md", "contents": contents}]}).to_string(),
+            )?;
+            assert_eq!(
+                response.status, expected_status,
+                "{name}: {}",
+                response.body
+            );
+            if expected_status == 403 {
+                assert_eq!(std::fs::read(workspace.join("identity.md"))?, before);
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("identity.md"))?,
+                    contents
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn identity_predicate_refuses_incomplete_materialized_target_evidence() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = seed_identity_predicate_familiar(temp.path())?;
@@ -31092,6 +31141,54 @@ tier = 0
             std::fs::read_to_string(workspace.join("reviewed/note.md"))?,
             "before research\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn identity_predicate_recovery_handles_unavailable_materialization_without_panicking(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+        assert!(decide_threads_proposal(home, &proposal_id, "approve", Some("{}")).is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .context("interrupted approval leaves a claim")?;
+        let before = std::fs::read(&claim)?;
+        let document = read_pending_proposal_document(&claim)?;
+        let outside = home.join("outside-note.md");
+        std::fs::write(&outside, "outside\n")?;
+        std::fs::remove_file(workspace.join("reviewed/note.md"))?;
+        std::os::unix::fs::symlink(&outside, workspace.join("reviewed/note.md"))?;
+        let config = ward::WardConfig::load(&workspace)?.context("fixture Ward exists")?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        // Exercise the fallible helper without poisoning the process-wide lock
+        // if this regression ever reintroduces a panic.
+        let commitment = proposal_recovery_commitment(
+            &conn,
+            &config,
+            &document,
+            ProposalRecoveryContext {
+                coven_home: home,
+                workspace: &workspace,
+                familiar_id: "sage",
+                targets: &["reviewed/note.md".to_string()],
+                authorization: &authorization_from_writer(&document.pending().writer),
+            },
+        );
+        assert!(commitment.is_err());
+        assert!(decide_threads_proposal(home, &proposal_id, "approve", Some("{}")).is_err());
+        assert_eq!(std::fs::read(claim)?, before);
+        assert_eq!(std::fs::read_to_string(outside)?, "outside\n");
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes.md","contents":"still usable\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 200, "got {}", response.body);
         Ok(())
     }
 
