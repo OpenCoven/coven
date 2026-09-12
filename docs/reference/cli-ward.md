@@ -284,11 +284,12 @@ typed approval contains explicit `veto: null`, and it emits no window events.
 Retired-Ward migration remains conservative: it does not grant this opt-in
 or lower reviewed paths to tier 2.
 
-The supported familiar-edits request stages this configured surface **before**
-ordinary apply, including malformed or mixed requests. Unconfigured ordinary
-writes are not intercepted. Routing considers both the normalized declared
-target and the resolved surface. A declared output-format path redirected by
-an outgoing symlink is refused, and retained cross-platform file identity
+The supported familiar-edits request checks this configured surface through
+proposal admission **before** ordinary apply. Valid eligible replacements
+stage; malformed or mixed requests refuse without publishing a proposal.
+Unconfigured ordinary writes are not intercepted. Routing considers both the
+normalized declared target and the resolved surface. A declared output-format
+path redirected by an outgoing symlink is refused, and retained cross-platform file identity
 recognizes unsupported hardlink aliases before ordinary apply. Such alias
 refusal applies to the whole batch and to stronger configured ceremonies.
 The configured canonical path's confined destination is also resolved, so
@@ -317,6 +318,15 @@ as do old automatic envelopes missing the commitment. Final conditional
 image/authority checks still guard commit. Interrupted applying recovery
 retains its existing proof requirements and quarantines unavailable authority;
 it never treats post-apply bytes as a new regression baseline.
+
+Before reverting this route, stop new write admission for the affected familiar
+and resolve or quarantine pending auto claims with the compatible implementation.
+Keep the daemon stopped while reverting the paired code. Before restarting an
+older version, verify that `output-format.json` is a regular, non-symlink file
+with an explicit protected tier-0 declaration and that older code will not process
+unresolved auto claims. Preserve the audit and interrupted-apply evidence.
+Changing only the approval ceremony is not a safe rollback barrier: older
+daemons can directly apply logged tier-2 edits without consulting that ceremony.
 
 ## Principal decisions
 

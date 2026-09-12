@@ -1146,6 +1146,7 @@ fn foreground_daemon_startup_failure_retains_exit_and_output() -> Result<()> {
     evidence.write_setup_failure(&error)?;
     let manifest: Value =
         serde_json::from_slice(&fs::read(artifacts.path().join("manifest.json"))?)?;
+    let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
     assert_eq!(manifest["daemon_launch"], "owned_foreground");
     assert_eq!(manifest["setup_completed"], false);
     assert_eq!(manifest["daemon_lifecycle"][0]["operation"], "daemon serve");
@@ -1153,7 +1154,7 @@ fn foreground_daemon_startup_failure_retains_exit_and_output() -> Result<()> {
         manifest["daemon_lifecycle"][0]["command_status"]
             .as_i64()
             .is_some_and(|status| status != 0),
-        "failed foreground child lost its exit status: {manifest}"
+        "failed foreground child lost its exit status: {manifest}\nretained daemon output:\n{log}"
     );
     let exit = &manifest["daemon_lifecycle"][0]["owned_child_exit"];
     assert!(
@@ -1168,7 +1169,6 @@ fn foreground_daemon_startup_failure_retains_exit_and_output() -> Result<()> {
         exit["origin"].as_str(),
         Some("observed_exit" | "fixture_termination_requested")
     ));
-    let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
     assert!(log.contains("foreground daemon stderr:"));
     assert!(
         log.contains("not a database"),
@@ -1209,6 +1209,65 @@ fn foreground_restart_failure_is_finalized_before_return() -> Result<()> {
     assert_eq!(event["command_status"], event["owned_child_exit"]["code"]);
     let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
     assert!(log.contains("not a database"));
+    Ok(())
+}
+
+#[test]
+fn fatal_probe_failure_retains_natural_exit_before_capturing_evidence() -> Result<()> {
+    let artifacts = tempfile::tempdir()?;
+    let mut evidence = EvidenceContext::new("fatal-probe-natural-exit");
+    evidence.artifact_dir = artifacts.path().to_path_buf();
+    evidence.foreground_daemon = true;
+    let mut owned_pid = None;
+    let error = ThreadsFixture::start_with_setup_and_start(
+        &evidence,
+        |home, _| {
+            fs::write(
+                home.join("coven.sqlite3"),
+                b"synthetic invalid SQLite store",
+            )?;
+            Ok(())
+        },
+        |fixture| {
+            fixture.start_owned_daemon_with_readiness(|child, _| {
+                owned_pid = Some(child.id());
+                assert!(child.exit_status().is_none());
+                Err(coven_client::ClientError::Io {
+                    operation: "failed to read Coven daemon response",
+                    source: std::io::Error::from_raw_os_error(109),
+                }
+                .into())
+            })
+        },
+    )
+    .err()
+    .context("fatal probe failure must remain an admission failure")?;
+    assert!(
+        matches!(
+            error.downcast_ref::<coven_client::ClientError>(),
+            Some(coven_client::ClientError::Io { source, .. })
+                if source.raw_os_error() == Some(109)
+        ),
+        "lost the causal transport error: {error:#}"
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(artifacts.path().join("manifest.json"))?)?;
+    let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
+    let event = &manifest["daemon_lifecycle"][0];
+    assert_eq!(manifest["setup_completed"], false);
+    assert_eq!(event["pid_after"], owned_pid.context("owned child pid")?);
+    assert_eq!(
+        event["command_status"], 1,
+        "fatal probe failure was captured before the natural child exit: {manifest}\nretained daemon output:\n{log}"
+    );
+    assert_eq!(event["owned_child_exit"]["origin"], "observed_exit");
+    assert_eq!(event["owned_child_exit"]["code"], 1);
+    assert!(manifest["failure"].as_str().unwrap().contains("109"));
+    assert!(
+        log.contains("not a database"),
+        "missing natural child error: {log}"
+    );
+    assert!(!pid_is_alive(owned_pid.unwrap()));
     Ok(())
 }
 
@@ -1365,7 +1424,8 @@ fn owned_serve_failure_retains_provenance_and_reaps_before_home_cleanup() -> Res
     let artifacts = tempfile::tempdir()?;
     let mut evidence = EvidenceContext::new("owned-serve-startup-retention");
     evidence.artifact_dir = artifacts.path().to_path_buf();
-    evidence.foreground_daemon = true;
+    // Explicit owned launch must correct the caller's initially detached mode.
+    evidence.foreground_daemon = false;
     let mut owned_pid = None;
     let mut fixture_home = None;
     let result = ThreadsFixture::start_with_setup_and_start(
@@ -1399,25 +1459,56 @@ fn owned_serve_failure_retains_provenance_and_reaps_before_home_cleanup() -> Res
         serde_json::from_slice(&fs::read(artifacts.path().join("manifest.json"))?)?;
     assert_eq!(manifest["result"], "failed");
     assert_eq!(manifest["setup_completed"], false);
+    assert_eq!(manifest["daemon_launch"], "owned_foreground");
     assert!(manifest["coven_commit"].is_string());
     assert_eq!(manifest["daemon_lifecycle"][0]["operation"], "daemon serve");
     assert_eq!(
         manifest["daemon_lifecycle"][0]["pid_after"],
         owned_pid.unwrap()
     );
+    assert!(manifest["daemon_lifecycle"][0]["command_status"].is_null());
     let exit = &manifest["daemon_lifecycle"][0]["owned_child_exit"];
     assert_eq!(exit["origin"], "fixture_termination_requested");
     assert!(exit["status"].is_string());
-    assert_eq!(
-        exit["code"],
-        manifest["daemon_lifecycle"][0]["command_status"]
-    );
     let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
     assert!(log.contains("synthetic owned readiness failure"));
     assert!(log.contains("synthetic admission failure at <coven-home>"));
     assert!(!log.contains(&fixture_home.unwrap().display().to_string()));
     assert!(artifacts.path().join("state/daemon-status.json").exists());
     Ok(())
+}
+
+#[test]
+fn owned_exit_receipt_distinguishes_natural_status_from_requested_termination() {
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(1 << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(1)
+    };
+    for termination_requested in [false, true] {
+        let exit = threads_admission::ExitEvidence {
+            status,
+            termination_requested,
+        };
+        let mut event = DaemonLifecycleEvent::note("daemon serve", None, "synthetic exit");
+        event.record_owned_exit(exit);
+        let receipt = event.as_json();
+        assert_eq!(
+            receipt["command_status"],
+            if termination_requested {
+                Value::Null
+            } else {
+                json!(1)
+            }
+        );
+        assert_eq!(receipt["owned_child_exit"]["code"], 1);
+        assert_eq!(receipt["owned_child_exit"]["origin"], exit.origin());
+    }
 }
 
 fn run_fixture_journey(
@@ -1918,6 +2009,17 @@ impl DaemonLifecycleEvent {
         })
     }
 
+    fn record_owned_exit(&mut self, exit: threads_admission::ExitEvidence) {
+        // A cleanup kill can also report code 1 on Windows; it is not a natural
+        // failed-command receipt. Preserve it separately, including signal exits.
+        self.command_status = if exit.termination_requested {
+            None
+        } else {
+            exit.status.code()
+        };
+        self.owned_exit = Some(exit);
+    }
+
     fn render_log(&self) -> String {
         let mut output = format!("event: {}\n", self.operation);
         if let Some(pid_before) = self.pid_before {
@@ -2156,6 +2258,7 @@ impl ThreadsFixture {
             self.owned_daemon.is_none() && self.current_daemon_pid().is_none(),
             "owned fixture daemon must be stopped before start"
         );
+        self.foreground_daemon = true;
         #[cfg(windows)]
         let endpoint = coven_client::owner_only_windows_pipe_name(&self.coven_home)?;
         #[cfg(unix)]
@@ -2193,10 +2296,10 @@ impl ThreadsFixture {
                 .last_mut()
                 .context("serve event")?
                 .pid_after = Some(pid);
-            readiness(
-                self.owned_daemon.as_mut().context("owned fixture daemon")?,
-                &self.coven_home,
-            )
+            self.owned_daemon
+                .as_mut()
+                .context("owned fixture daemon")?
+                .admit(|child| readiness(child, &self.coven_home))
         })();
         match result {
             Ok(()) => Ok(()),
@@ -2224,8 +2327,9 @@ impl ThreadsFixture {
             .rev()
             .find(|event| event.operation == "daemon serve" && event.pid_after == Some(pid))
             .context("owned serve event was not recorded")?;
-        event.command_status = exit.and_then(|exit| exit.status.code());
-        event.owned_exit = exit;
+        if let Some(exit) = exit {
+            event.record_owned_exit(exit);
+        }
         Ok(())
     }
 

@@ -102,16 +102,19 @@ discovery and authenticated transport; Windows uses the owner-only named pipe.
 Additional regressions cover startup-evidence retention, artifact-root
 isolation, launch selection, readiness, owned replacement/crash/reaping,
 failed-child output, failed-request response pairing, and failed-restart CLI
-evidence. These are not extra authority journeys or native Windows execution
-evidence.
+evidence. A real-process regression injects fatal pipe error 109 before observing
+an invalid-store child's natural exit, checking the original transport error,
+exit code 1, persisted stderr, and absence of a surviving child together.
+These are not extra authority journeys or native Windows execution evidence.
 HTTP framing regressions belong to the shared client's tests, not a separate
 harness parser. A cross-target compilation or Windows workspace run alone is
 not evidence that these journeys executed on Windows.
 
 Windows authority journeys serialize admission and retain an owned
 `coven daemon serve` child, using the same native helper as the smaller Threads
-fixtures. Their fixed 15-second readiness budget is a fixture hang guard for
-cold-store initialization, independent of production CLI lifecycle deadlines.
+fixtures. Their fixed 15-second readiness budget starts before process spawn,
+so spawn time and deferred probing cannot renew it. It is a fixture hang guard
+for cold-store initialization, independent of production CLI lifecycle deadlines.
 Only pending transport observations are polled; invalid health, changed
 identity, and child-exit/inspection errors fail admission immediately. Readiness
 requires the authenticated pipe server PID, health PID, and owner-local pipe to
@@ -148,7 +151,10 @@ rejects an incorrect authenticated Windows server PID and malformed JSON.
 `startup_wait_retries_only_pending_transport_not_identity_or_protocol_errors`
 subsumes the foreground pending-transport cases, including Unix-only
 not-found/connection-refused observations. Those errors are not retryable on
-Windows; identity, permission, and partial-response failures remain terminal.
+Windows; identity, permission, partial-response, and raw error-109 failures
+remain terminal. Shared regressions also retain natural code-0 exits across
+repeated observation, keep failed admission failed after a later successful
+process exit, and exercise zero/10-ms remaining settlement and observer errors.
 
 ## Testing a local Threads checkout
 
@@ -208,19 +214,24 @@ cleanup; fallback markers do not overwrite captured files. A capture error in
 one state source is reported without discarding the others.
 Owned-serve stdout/stderr and observed child exit status are included in the
 sanitized evidence, including admission failures before status publication.
-After fatal readiness failure, the fixture observes the owned child for up to
-250 ms, then requests termination if it remains alive. Observation and reaping
-share one absolute 15-second teardown budget, including fallback cleanup; no
-fatal health request is retried. Exit evidence is finalized before an owned
-start/restart returns failure or startup failure artifacts are written, so child
-output and status do not depend on a later destructor. The original readiness error remains the primary error-chain
-cause, with any finalization failure attached as additional context.
+After fatal readiness failure, the fixture observes only its owned child through
+the remainder of the original pre-spawn admission deadline; it never retries
+health. If the child remains alive, exact-handle termination and reaping use a
+separate absolute 15-second teardown budget shared with fallback cleanup.
+Neither settlement nor fallback renews either deadline. Exit evidence is
+finalized before an owned start/restart returns failure or startup failure
+artifacts are written, so child output and status do not depend on a later
+destructor. The original readiness error remains the primary error-chain cause,
+with any finalization failure attached as additional context.
 
 Each owned lifecycle event's `owned_child_exit` records the observed status,
 optional numeric code, and `origin`: `observed_exit` means the fixture had not
 requested termination; `fixture_termination_requested` records an attempt,
 not a claim that the request caused the exit. This distinguishes startup exit
 from fixture cleanup even when termination races with natural exit.
+For owned launches, `command_status` records only a natural exit; it remains
+null when termination was requested, even if Windows reports the same code as
+a natural startup failure. The actual status and code remain in `owned_child_exit`.
 Failed restart commands retain their exit status and CLI output even before a
 health probe can run. A request that fails before a JSON response is captured
 records a null response, never a response from an earlier request.
