@@ -31027,6 +31027,41 @@ tier = 0
     }
 
     #[test]
+    fn identity_predicate_active_policy_change_invalidates_pending_binding() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        let document = read_pending_proposal_document(&pending)?;
+        let ward_path = workspace.join("ward.toml");
+        let updated = std::fs::read_to_string(&ward_path)?
+            .replace("expected = \"research\"", "expected = \"search\"");
+        std::fs::write(ward_path, updated)?;
+        let config = ward::WardConfig::load(&workspace)?.context("active policy remains valid")?;
+        let context = crate::ward_identity::candidate_identity_context(
+            home,
+            "sage",
+            &workspace,
+            &config,
+            &staged_edits_to_ward_edits(document.pending())?,
+            &authorization_from_writer(&document.pending().writer),
+            None,
+        );
+        assert!(crate::ward_identity::candidate_rejection(&config, context.as_ref())?.is_none());
+        assert_ne!(
+            crate::ward_identity::candidate_binding(&config, context.as_ref())?,
+            document.identity_evidence
+        );
+        let response = decide_threads_proposal(home, &proposal_id, "approve", Some("{}"))?;
+        assert_eq!(response.status, 409, "got {}", response.body);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/note.md"))?,
+            "before research\n"
+        );
+        assert!(pending.exists());
+        Ok(())
+    }
+
+    #[test]
     fn identity_predicate_approval_refuses_changed_source_bytes_that_still_hold() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();

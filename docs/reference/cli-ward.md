@@ -386,12 +386,19 @@ sentence ending in `research.` satisfies `operator = "includes"` with
 make extraction unavailable.
 Other prose is not an alternative authority.
 
-Existing configurations without invariants retain their previous behavior.
-A retired `[protected].invariants` block in an active Phase-2 file, or
-identity declarations stranded only in its backup, fails loading rather than
-silently dropping protection. Unsupported backup declarations also require
-review, and a malformed backup cannot establish that protection is absent.
-Preserve the backup and review the active declarations before restarting.
+Configurations without either active or archived identity declarations retain
+their previous behavior. A retired `[protected].invariants` block in an active
+Phase-2 file fails loading. When the active file has no identity declarations,
+the backup acts as a compatibility sentinel: archived declarations, including
+unsupported ones, require review rather than silently becoming no protection.
+A malformed backup cannot establish that protection is absent.
+
+Once a complete, valid active set exists, that set is the current policy.
+The immutable backup is not a second policy and does not require permanent
+equality with later active declarations. Migration must preserve every supported
+declaration; later active-policy changes invalidate earlier proposal evidence.
+Preserve the original backup rather than rewriting it to match current policy,
+consistent with [the identity authority clarification](https://github.com/OpenCoven/coven/issues/885#issuecomment-5601508338).
 
 The production scheduled-publication work remains tracked in #972. Historical
 scheduled-envelope regressions exercise replay and terminal closure; they
