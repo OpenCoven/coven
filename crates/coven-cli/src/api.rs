@@ -10567,10 +10567,20 @@ fn decide_threads_proposal_inner(
                 .as_ref()
                 .and_then(|intent| intent.approver.as_deref())
                 == decision_approver.map(coven_threads_core::WriterId::as_str);
+        if !actor_matches {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "decision-actor",
+                "proposal-recovery-decision-actor-invalid",
+                "interrupted apply decision actor diverges from its durable intent",
+            );
+        }
         if recorded_intent
             .as_ref()
             .is_none_or(|intent| intent.state != *applying)
-            || !actor_matches
         {
             return json_response(
                 409,
@@ -12310,6 +12320,11 @@ fn scheduled_submission_authority(
     if crate::threads_gate::familiar_weave_id(&familiar_id) != pending.familiar_id {
         return Err(invalid_submission_authority(
             "scheduled proposal submission familiar does not match its pending envelope",
+        ));
+    }
+    if weave_hash.len() != 32 {
+        return Err(invalid_submission_authority(
+            "scheduled proposal submission weave hash is not a SHA-256 digest",
         ));
     }
     let expected_detail = json!({
@@ -38194,6 +38209,36 @@ tier = 0
     }
 
     #[test]
+    fn threads_scheduler_quarantines_malformed_submission_weave_hash() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute_batch("DROP TRIGGER ward_audit_append_only_update")?;
+        conn.execute(
+            "UPDATE ward_audit SET ward_hash = X''
+             WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+            [&proposal_id],
+        )?;
+        drop(conn);
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!pending.exists());
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn threads_scheduler_checks_submission_receipt_before_corrupt_window_terminalization(
     ) -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -38297,6 +38342,62 @@ tier = 0
         let mut staged: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
         staged["decisionRequest"]["decisionActor"] = json!("principal:forged");
         std::fs::write(&claim, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!claim.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_mutated_apply_intent_approver() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .context("interrupted approval leaves a recovery claim")?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute_batch("DROP TRIGGER ward_audit_append_only_update")?;
+        conn.execute(
+            "UPDATE ward_audit SET approver = 'principal:forged'
+             WHERE proposal_id = ?1
+               AND event_type = 'validation_verdict'
+               AND decision = 'proposal-apply-intent'",
+            [&proposal_id],
+        )?;
+        drop(conn);
 
         assert_eq!(process_due_threads_proposals(home)?, 0);
         assert!(!claim.exists());
