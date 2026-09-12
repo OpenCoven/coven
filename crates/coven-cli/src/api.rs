@@ -7589,6 +7589,35 @@ fn revalidate_scheduled_materialized_before(
     Ok(())
 }
 
+fn revalidate_scheduled_approval_policy(
+    config: &ward::WardConfig,
+    scheduled: &crate::proposal_scheduler::ScheduledProposal,
+) -> std::result::Result<(), &'static str> {
+    let classification = scheduled.classification();
+    if classification.affected_regions.is_empty() {
+        return Ok(());
+    }
+    let bindings = config
+        .compiled_approval_tiers()
+        .map_err(|_| "proposal-live-approval-policy-invalid")?
+        .ok_or("proposal-live-approval-policy-missing")?;
+    let mut live_path: Option<coven_threads_core::ApprovalPath> = None;
+    for region in &classification.affected_regions {
+        let path = bindings
+            .approval_path_for(region)
+            .cloned()
+            .ok_or("proposal-live-region-unbound")?;
+        live_path = Some(match live_path {
+            Some(existing) => existing.highest(path),
+            None => path,
+        });
+    }
+    if live_path.as_ref() != Some(&classification.approval_path) {
+        return Err("proposal-live-approval-policy-changed");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn proposal_revision(authority_value: &Value) -> Result<String> {
     let bytes =
@@ -10924,6 +10953,8 @@ fn decide_threads_proposal_inner(
             });
             let rejection = if live_tier_escalated {
                 Some("proposal-live-tier-escalated")
+            } else if let Err(reason) = revalidate_scheduled_approval_policy(&config, scheduled) {
+                Some(reason)
             } else {
                 revalidate_scheduled_materialized_before(&workspace, scheduled).err()
             };
@@ -37418,6 +37449,85 @@ tier = 0
             "after heartbeat\n"
         );
         assert!(!pending_path.exists(), "replayed proposal must be consumed");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_rejects_live_approval_policy_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        retime_scheduled_proposal(
+            &pending,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+        )?;
+
+        let ward_path = workspace.join("ward.toml");
+        let ward = std::fs::read_to_string(&ward_path)?
+            .replace(
+                "[approval_tiers.familiar_review]",
+                "[approval_tiers.human_review]",
+            )
+            .replace(
+                "gate = \"familiar_coherence_check\"",
+                "gate = \"human_approval\"",
+            );
+        let strengthened = ward
+            .lines()
+            .filter(|line| {
+                !line.starts_with("human_veto_window_hours")
+                    && !line.starts_with("min_visible_seconds")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&ward_path, format!("{strengthened}\n"))?;
+
+        let decision_body = scheduled_decision_body(home, proposal_id, None)?;
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-live-approval-policy-changed");
+        assert_eq!(body["terminal"], true);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        assert!(!pending.exists(), "stale-policy proposal must be terminal");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let detail: String = conn.query_row(
+            "SELECT detail
+             FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        let close: coven_threads_core::ProposalWindowCloseAuditDetail =
+            serde_json::from_str(&detail)?;
+        assert_eq!(
+            close.reason,
+            coven_threads_core::WindowCloseReason::RevalidationFailed
+        );
+        assert_eq!(close.replay_hash_matched, Some(false));
         Ok(())
     }
 
