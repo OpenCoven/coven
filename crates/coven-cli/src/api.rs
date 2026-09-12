@@ -11068,7 +11068,7 @@ fn decide_threads_proposal_inner(
             proposal_id,
             &familiar_id,
             state.weave.weave_hash(),
-            &pending.writer,
+            decision_approver,
             &targets,
             pending.channel,
             decision_now,
@@ -28962,10 +28962,28 @@ forbidden = ["(?i)ignore previous"]
     }
 
     fn seed_retired_ward_familiar(home: &Path, ward_toml: &str) -> Result<std::path::PathBuf> {
-        seed_familiars_toml(home)?;
+        std::fs::write(
+            home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads and synthesizes."
+pronouns = "she/her"
+person = "Example principal"
+coven = "OpenCoven"
+"#,
+        )?;
         let workspace = home.join("familiars").join("sage");
         std::fs::create_dir_all(&workspace)?;
-        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        std::fs::write(
+            workspace.join("SOUL.md"),
+            "# SOUL\n## I am Sage\nMy purpose is research.\n",
+        )?;
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** she/her\n",
+        )?;
         std::fs::write(workspace.join("TOOLS.md"), "before tools\n")?;
         std::fs::write(workspace.join("HEARTBEAT.md"), "before heartbeat\n")?;
         std::fs::write(workspace.join("AGENTS.md"), "before agents\n")?;
@@ -37859,6 +37877,11 @@ tier = 0
         let staged: Value = serde_json::from_str(&raw)?;
         assert_eq!(staged["schema"], "phase5_v1");
         assert!(staged.get("reviewKind").is_none());
+        assert_eq!(
+            staged["identityEvidence"].as_array().map(Vec::len),
+            Some(32),
+            "scheduled staging must preserve the active identity-policy binding"
+        );
         assert_eq!(
             staged["classification"]["affected_regions"][0],
             "tool_defaults"
