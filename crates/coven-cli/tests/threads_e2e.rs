@@ -1476,20 +1476,33 @@ fn seed_clock(coven_home: &Path, capability: &str) -> Result<()> {
 
 #[cfg(feature = "threads-test-clock")]
 fn write_private_fixture_file(path: &Path, contents: &str) -> Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
+    write_private_fixture_file_with(path, |file| {
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("writing private fixture file {}", path.display()))
+    })
+}
 
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("creating private fixture file {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("writing private fixture file {}", path.display()))?;
-    file.sync_all()
+#[cfg(feature = "threads-test-clock")]
+fn write_private_fixture_file_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> Result<()>,
+) -> Result<()> {
+    let parent = path.parent().context("private fixture file parent")?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".threads-marker-")
+        .tempfile_in(parent)
+        .with_context(|| format!("staging private fixture file {}", path.display()))?;
+    write(staged.as_file_mut())?;
+    staged
+        .as_file()
+        .sync_all()
         .with_context(|| format!("syncing private fixture file {}", path.display()))?;
+    // Readers must see the complete capability on first discovery. Publishing
+    // in the same directory also preserves create-new/no-clobber semantics.
+    staged
+        .persist_noclobber(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publishing private fixture file {}", path.display()))?;
     Ok(())
 }
 
