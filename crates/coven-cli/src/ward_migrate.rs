@@ -37,6 +37,7 @@ pub struct MigrationEntry {
     pub status: MigrationStatus,
     pub protected_files: Vec<String>,
     pub editable_paths: Vec<String>,
+    pub editable_tier: Option<Tier>,
     pub translated_globs: Vec<(String, String)>,
     /// Fidelity records for v0.1 `[protected].invariants`: each entry is
     /// either a compiled typed-fact disposition or an explicit rejection
@@ -143,6 +144,7 @@ fn migrate_one(
                 status: MigrationStatus::NoWard,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -168,6 +170,7 @@ fn migrate_one(
                     status: MigrationStatus::Unmigratable,
                     protected_files: Vec::new(),
                     editable_paths: Vec::new(),
+                    editable_tier: None,
                     translated_globs: Vec::new(),
                     invariant_dispositions: Vec::new(),
                     generated_toml: None,
@@ -188,6 +191,7 @@ fn migrate_one(
                     status: MigrationStatus::Unmigratable,
                     protected_files: Vec::new(),
                     editable_paths: Vec::new(),
+                    editable_tier: None,
                     translated_globs: Vec::new(),
                     invariant_dispositions: Vec::new(),
                     generated_toml: None,
@@ -202,6 +206,7 @@ fn migrate_one(
                 status: MigrationStatus::AlreadyMigrated,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -220,6 +225,7 @@ fn migrate_one(
                 status: MigrationStatus::Unmigratable,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -236,6 +242,7 @@ fn migrate_one(
             status: MigrationStatus::Unmigratable,
             protected_files: Vec::new(),
             editable_paths: Vec::new(),
+            editable_tier: None,
             translated_globs: Vec::new(),
             invariant_dispositions: Vec::new(),
             generated_toml: None,
@@ -254,6 +261,7 @@ fn migrate_one(
                 status: MigrationStatus::Unmigratable,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -295,6 +303,7 @@ fn migrate_one(
             status: MigrationStatus::Unmigratable,
             protected_files,
             editable_paths,
+            editable_tier: None,
             translated_globs: Vec::new(),
             invariant_dispositions,
             generated_toml: None,
@@ -326,6 +335,7 @@ fn migrate_one(
     } else {
         Tier::Logged
     };
+    let migrated_editable_tier = (!editable_paths.is_empty()).then_some(editable_tier);
 
     let config = WardConfig {
         principal_key_fingerprint: fingerprint.to_string(),
@@ -361,6 +371,7 @@ fn migrate_one(
             status: MigrationStatus::ValidationFailed,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -375,6 +386,7 @@ fn migrate_one(
             status: MigrationStatus::WouldMigrate,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -400,6 +412,7 @@ fn migrate_one(
             status: MigrationStatus::BackupExists,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -416,6 +429,7 @@ fn migrate_one(
             status: MigrationStatus::ValidationFailed,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -429,6 +443,7 @@ fn migrate_one(
         status: MigrationStatus::Migrated,
         protected_files,
         editable_paths,
+        editable_tier: migrated_editable_tier,
         translated_globs,
         invariant_dispositions: invariant_dispositions.clone(),
         generated_toml: Some(generated_toml),
@@ -593,12 +608,7 @@ pub fn print_report(report: &MigrationReport) {
 }
 
 fn migrated_editable_tier(entry: &MigrationEntry) -> u8 {
-    entry
-        .generated_toml
-        .as_deref()
-        .filter(|generated| generated.contains("[approval_tiers."))
-        .map(|_| 1)
-        .unwrap_or(2)
+    entry.editable_tier.map(u8::from).unwrap_or(2)
 }
 
 #[cfg(test)]
@@ -851,6 +861,7 @@ human_veto_window_hours = 1
             status: MigrationStatus::Migrated,
             protected_files: Vec::new(),
             editable_paths: vec!["TOOLS.md".to_string()],
+            editable_tier: Some(Tier::Reviewed),
             translated_globs: Vec::new(),
             invariant_dispositions: Vec::new(),
             generated_toml: Some(
@@ -859,6 +870,7 @@ human_veto_window_hours = 1
             message: "ok".to_string(),
         };
         let logged = MigrationEntry {
+            editable_tier: Some(Tier::Logged),
             generated_toml: Some("[surface]\npath = \"notes/\"\ntier = 2\n".to_string()),
             ..reviewed.clone()
         };

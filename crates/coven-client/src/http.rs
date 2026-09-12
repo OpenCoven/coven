@@ -228,41 +228,7 @@ impl DaemonClient {
 }
 
 fn validate_raw_request(method: &str, path: &str) -> Result<(), ClientError> {
-    if method.is_empty()
-        || !method.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
-    {
-        return Err(ClientError::InvalidRouteParameter("HTTP method"));
-    }
-    if !(path.starts_with("/api/v1/") || (method == "GET" && path == "/health"))
-        || !path.starts_with('/')
-        || path.starts_with("//")
-        || !path.is_ascii()
-        || path
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'#')
-    {
-        return Err(ClientError::InvalidRouteParameter("HTTP request target"));
-    }
-    Ok(())
+    transport::validate_request_line(method, path)
 }
 
 fn daemon_error(status: u16, body: Vec<u8>) -> Result<ClientError, ClientError> {

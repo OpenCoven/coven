@@ -144,7 +144,6 @@ struct DaemonHealthStatus {
 #[cfg(not(windows))]
 const MAX_DAEMON_STATUS_BYTES: usize = coven_client::MAX_DAEMON_STATUS_BYTES;
 const DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
-const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(windows, test))]
 const WINDOWS_STARTUP_HEALTH_PROBE_SLICE: Duration = Duration::from_millis(250);
 
@@ -1984,7 +1983,7 @@ pub fn ensure_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<DaemonStatus> {
-    let deadline = LifecycleDeadline::after(DAEMON_STARTUP_TIMEOUT)?;
+    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
     deadline.remaining("resolving Coven daemon profile")?;
     let coven_home = canonical_lifecycle_home(coven_home)?;
     let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
@@ -2763,7 +2762,7 @@ pub fn restart_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<(bool, DaemonStatus)> {
-    let deadline = LifecycleDeadline::after(DAEMON_STARTUP_TIMEOUT)?;
+    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
     deadline.remaining("resolving Coven daemon profile")?;
     let coven_home = canonical_lifecycle_home(coven_home)?;
     let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
@@ -3607,7 +3606,7 @@ fn ensure_background_server_with_controllers(
         started_at,
         status_controller,
         start_controller,
-        LifecycleDeadline::after(DAEMON_STARTUP_TIMEOUT)?,
+        LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
     )
 }
 
@@ -3685,17 +3684,48 @@ fn start_with_budget_observation(
     let before = Instant::now();
     let result = controller.start_background_server(coven_home, current_exe, started_at);
     let after = Instant::now();
-    // Sample around launch, then log: diagnostic I/O still consumes the original budget.
-    for (phase, observed) in [
+    let observations = [
         (StartupSpawnPhase::Before, before),
         (StartupSpawnPhase::After, after),
-    ] {
-        append_daemon_recovery_log(
-            coven_home,
-            &format_startup_budget(phase, deadline, observed),
-        );
-    }
-    result
+    ];
+    let diagnostics = record_startup_budget_observations(coven_home, deadline, observations);
+    result.and_then(|status| diagnostics.map(|()| status))
+}
+
+fn record_startup_budget_observations(
+    coven_home: &Path,
+    deadline: LifecycleDeadline,
+    observations: [(StartupSpawnPhase, Instant); 2],
+) -> Result<()> {
+    const PHASE: &str = "recording startup budget observations";
+    deadline.remaining(PHASE)?;
+    let home = coven_home.to_path_buf();
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    // Logging can wait on a mutex or filesystem. Only the remaining original
+    // lifecycle budget may be spent waiting for this diagnostic worker.
+    let _worker = std::thread::Builder::new()
+        .name("coven-startup-diagnostics".to_owned())
+        .spawn(move || {
+            for (phase, observed) in observations {
+                if Instant::now() >= deadline.instant {
+                    break;
+                }
+                append_daemon_recovery_log(
+                    &home,
+                    &format_startup_budget(phase, deadline, observed),
+                );
+            }
+            let _ = finished_tx.send(());
+        })
+        .context("starting startup budget diagnostic worker")?;
+    finished_rx
+        .recv_timeout(deadline.remaining(PHASE)?)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => anyhow::anyhow!("timed out {PHASE}"),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                anyhow::anyhow!("startup budget diagnostic worker disconnected")
+            }
+        })
 }
 
 fn is_daemon_status_parse_error(error: &anyhow::Error) -> bool {
@@ -4263,40 +4293,17 @@ fn serve_accepted_tcp_connection(
 }
 
 #[cfg(unix)]
-pub fn bind_api_socket(coven_home: &Path) -> Result<PublishedUnixListener> {
+pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
     bind_api_socket_with_publisher(coven_home, |staged, target| {
         std::fs::hard_link(staged, target)
     })
 }
 
 #[cfg(unix)]
-#[derive(Debug)]
-pub struct PublishedUnixListener {
-    listener: UnixListener,
-    _staged_dir: tempfile::TempDir,
-}
-
-#[cfg(unix)]
-impl std::ops::Deref for PublishedUnixListener {
-    type Target = UnixListener;
-
-    fn deref(&self) -> &Self::Target {
-        &self.listener
-    }
-}
-
-#[cfg(unix)]
-impl std::ops::DerefMut for PublishedUnixListener {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.listener
-    }
-}
-
-#[cfg(unix)]
 fn bind_api_socket_with_publisher(
     coven_home: &Path,
     publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<PublishedUnixListener> {
+) -> Result<UnixListener> {
     ensure_private_coven_home(coven_home)?;
     let socket_path = daemon_socket_path(coven_home);
     // Fail closed if the socket path would resolve outside the trusted state
@@ -4360,16 +4367,14 @@ fn bind_api_socket_with_publisher(
             });
         }
     }
-    // Keep the temporary bound pathname alive for the listener's lifetime; coven.sock
-    // remains the public entry while the staged name preserves the inode the listener
-    // is actually bound to. Reserve a private staging directory first so bind()
-    // never races another writer for the same temporary socket pathname.
-    let staged_dir = tempfile::Builder::new()
+    // Keep the temporary name no longer than coven.sock, preserving Unix path limits.
+    let staged = tempfile::Builder::new()
         .prefix(".")
-        .rand_bytes(5)
-        .tempdir_in(coven_home)
-        .context("reserving private daemon socket staging directory")?;
-    let staged = staged_dir.path().join("s");
+        .rand_bytes(8)
+        .tempfile_in(coven_home)
+        .context("reserving private daemon socket staging path")?
+        .into_temp_path();
+    std::fs::remove_file(&staged).context("preparing reserved daemon socket staging path")?;
     let listener = UnixListener::bind(&staged)
         .with_context(|| format!("failed to bind Coven API socket {}", socket_path.display()))?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).with_context(
@@ -4382,10 +4387,10 @@ fn bind_api_socket_with_publisher(
     )?;
     // A hard link publishes the already-private socket without replacing a raced entry.
     publish(&staged, &socket_path).context("publishing private Coven API socket")?;
-    Ok(PublishedUnixListener {
-        listener,
-        _staged_dir: staged_dir,
-    })
+    staged
+        .close()
+        .context("removing daemon socket staging path")?;
+    Ok(listener)
 }
 
 pub fn daemon_recovery_log_path(coven_home: &Path) -> PathBuf {
@@ -4436,12 +4441,17 @@ pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
         DAEMON_RECOVERY_LOG_MAX_BYTES,
         DAEMON_RECOVERY_LOG_BACKUPS,
     );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
     {
-        let _ = f.write_all(line.as_bytes());
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    if let Ok(mut f) = options.open(&path) {
+        if f.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
@@ -6785,36 +6795,6 @@ mod tests {
 
     #[test]
     fn stop_cleanup_does_not_run_after_the_outer_lifecycle_deadline() -> Result<()> {
-        struct SlowVerifiedStop;
-        impl DaemonStopController for SlowVerifiedStop {
-            fn stop_verified_daemon(
-                &self,
-                _coven_home: &Path,
-                _status: &DaemonStatus,
-                deadline: LifecycleDeadline,
-            ) -> Result<VerifiedStopOutcome> {
-                let remaining = deadline.remaining("forcing the test stop deadline to expire")?;
-                std::thread::sleep(remaining.saturating_add(Duration::from_millis(10)));
-                Ok(VerifiedStopOutcome::Exited)
-            }
-
-            fn recorded_process_state(
-                &self,
-                _status: &DaemonStatus,
-            ) -> Result<RecordedProcessState> {
-                Ok(RecordedProcessState::Gone)
-            }
-
-            fn status_matches_running_daemon(
-                &self,
-                _coven_home: &Path,
-                _status: &DaemonStatus,
-                _deadline: LifecycleDeadline,
-            ) -> Result<bool> {
-                Ok(false)
-            }
-        }
-
         let temp_dir = tempfile::tempdir()?;
         let status = DaemonStatus {
             pid: 42,
@@ -6823,10 +6803,15 @@ mod tests {
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
-        let error = stop_background_server_with_controller_until(
+        let socket_path = daemon_socket_path(temp_dir.path());
+        let socket_marker = b"synthetic cleanup sentinel";
+        std::fs::write(&socket_path, socket_marker)?;
+
+        // Enter the actual cleanup phase with an expired deadline; status I/O
+        // and shared-runner scheduling must not decide which phase is tested.
+        let error = clear_status_and_socket_until(
             temp_dir.path(),
-            &SlowVerifiedStop,
-            LifecycleDeadline::after(Duration::from_millis(100))?,
+            LifecycleDeadline::from_instant(Instant::now()),
         )
         .expect_err("cleanup must not start after the original stop budget");
 
@@ -6836,6 +6821,44 @@ mod tests {
                 .contains("timed out cleaning up Coven daemon lifecycle state"),
             "unexpected timeout phase: {error:#}"
         );
+        assert_eq!(read_status(temp_dir.path())?, Some(status));
+        assert_eq!(std::fs::read(&socket_path)?, socket_marker);
+        clear_status_and_socket(temp_dir.path())?;
+        assert_eq!(read_status(temp_dir.path())?, None);
+        assert!(!socket_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn stop_with_expired_outer_deadline_preserves_status_without_signaling() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 42,
+            started_at: "2026-08-16T00:00:00Z".to_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
+        };
+        write_status(temp_dir.path(), &status)?;
+        let signaled = std::sync::Arc::default();
+        let controller = FakeStopController {
+            pid_alive: true,
+            exited_after_signal: true,
+            signal_error: None,
+            verified_daemon: true,
+            signaled: std::sync::Arc::clone(&signaled),
+        };
+        let error = stop_background_server_with_controller_until(
+            temp_dir.path(),
+            &controller,
+            LifecycleDeadline::from_instant(Instant::now()),
+        )
+        .expect_err("an expired outer deadline must stop before reading status");
+
+        assert_eq!(
+            error.to_string(),
+            "timed out reading Coven daemon lifecycle status"
+        );
+        assert_eq!(*signaled.lock().unwrap(), 0);
         assert_eq!(read_status(temp_dir.path())?, Some(status));
         Ok(())
     }
@@ -10753,9 +10776,8 @@ mod tests {
         })?;
         let client = UnixStream::connect(daemon_socket_path(home.path()))?;
         let (server, _) = listener.accept()?;
-        assert_eq!(std::fs::read_dir(home.path())?.count(), 2);
-        drop((client, server, listener));
         assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
+        drop((client, server, listener));
         Ok(())
     }
 
@@ -11814,7 +11836,7 @@ mod tests {
             .map(|(_, observation)| observation)
             .collect();
         assert_eq!(observations.len(), 2);
-        let mut previous = DAEMON_STARTUP_TIMEOUT.as_millis();
+        let mut previous = DAEMON_LIFECYCLE_TIMEOUT.as_millis();
         for (observation, phase) in observations.iter().zip(["before-spawn", "after-spawn"]) {
             let remaining = observation
                 .strip_prefix(&format!("phase={phase} remaining_ms="))
@@ -13421,13 +13443,13 @@ mod tests {
     #[test]
     fn startup_budget_distinguishes_parent_cost_from_child_store_elapsed() {
         let start = Instant::now();
-        let deadline = LifecycleDeadline::from_instant(start + DAEMON_STARTUP_TIMEOUT);
+        let deadline = LifecycleDeadline::from_instant(start + DAEMON_LIFECYCLE_TIMEOUT);
         // Synthetic timelines, not measurements of Windows or an E2E reproduction.
         // The same child store duration can fit or exhaust the parent's deadline.
         for (preparation_ms, launch_ms, expected_before, expected_after, fits) in [
-            (50, 10, 4950, 4940, true),
-            (4500, 10, 500, 490, false),
-            (50, 4460, 4950, 490, false),
+            (50, 10, 1950, 1940, true),
+            (1500, 10, 500, 490, false),
+            (50, 1460, 1950, 490, false),
         ] {
             let before = start + Duration::from_millis(preparation_ms);
             let after = before + Duration::from_millis(launch_ms);
@@ -13570,6 +13592,126 @@ mod tests {
             ),
             "startup_budget phase=after-spawn remaining_ms=175"
         );
+    }
+
+    fn run_startup_diagnostic_subprocess(test_name: &str) -> Result<bool> {
+        const CHILD_ENV: &str = "COVEN_TEST_STARTUP_DIAGNOSTIC_CHILD";
+        if std::env::var_os(CHILD_ENV).as_deref() == Some(std::ffi::OsStr::new(test_name)) {
+            return Ok(false);
+        }
+        // A stalled log must not hold the process-global mutex for other tests.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ENV, test_name)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "isolated startup diagnostic test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(true)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_budget_observation_does_not_wait_for_a_fifo_reader() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if run_startup_diagnostic_subprocess(
+            "daemon::tests::startup_budget_observation_does_not_wait_for_a_fifo_reader",
+        )? {
+            return Ok(());
+        }
+        let home = tempfile::tempdir()?;
+        let fifo = daemon_recovery_log_path(home.path());
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let worker_home = home.path().to_path_buf();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = start_with_budget_observation(
+                &FakeStartController {
+                    started: std::sync::Arc::default(),
+                    running_after_start: true,
+                },
+                &worker_home,
+                Path::new("coven"),
+                "synthetic-start".to_owned(),
+                LifecycleDeadline::from_instant(started + DAEMON_LIFECYCLE_TIMEOUT),
+            );
+            let _ = finished_tx.send(result);
+        });
+        // A hang guard, not extra lifecycle budget. Release a regressed blocking
+        // open before asserting so no worker or global log lock is stranded.
+        let completion = finished_rx.recv_timeout(Duration::from_secs(10));
+        let returned_without_reader = completion.is_ok();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)?;
+        let result = match completion {
+            Ok(result) => result,
+            Err(_) => finished_rx.recv_timeout(Duration::from_secs(10))?,
+        };
+        worker.join().expect("startup worker panicked");
+        drop(reader);
+        assert!(
+            returned_without_reader,
+            "startup diagnostics waited for a FIFO reader; elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(result?.pid, 54321);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_budget_observation_bounds_log_lock_contention() -> Result<()> {
+        if run_startup_diagnostic_subprocess(
+            "daemon::tests::startup_budget_observation_bounds_log_lock_contention",
+        )? {
+            return Ok(());
+        }
+        let home = tempfile::tempdir()?;
+        let guard = recovery_log_lock().lock().unwrap();
+        let worker_home = home.path().to_path_buf();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = start_with_budget_observation(
+                &FakeStartController {
+                    started: std::sync::Arc::default(),
+                    running_after_start: true,
+                },
+                &worker_home,
+                Path::new("coven"),
+                "synthetic-start".to_owned(),
+                LifecycleDeadline::from_instant(started + Duration::from_millis(200)),
+            );
+            let _ = finished_tx.send(result);
+        });
+        // The lock cannot become available before this observation; the large
+        // timeout only bounds a regression and leaves room for runner load.
+        let completion = finished_rx.recv_timeout(Duration::from_secs(10));
+        let returned_with_lock_held = completion.is_ok();
+        drop(guard);
+        let result = match completion {
+            Ok(result) => result,
+            Err(_) => finished_rx.recv_timeout(Duration::from_secs(10))?,
+        };
+        worker.join().expect("startup worker panicked");
+        assert!(
+            returned_with_lock_held,
+            "startup diagnostics waited for the log lock; elapsed={:?}",
+            started.elapsed()
+        );
+        assert!(result
+            .expect_err("the original diagnostic budget must expire")
+            .to_string()
+            .contains("timed out recording startup budget observations"));
+        Ok(())
     }
 
     #[test]
