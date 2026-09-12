@@ -1,4 +1,4 @@
-use crate::{AgentId, GuardrailStage, InvocationContext};
+use crate::{AgentId, GuardrailStage, InvocationContext, InvocationEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunFailureKind {
@@ -86,4 +86,15 @@ pub struct NoopObserver;
 
 impl RunObserver for NoopObserver {
     fn on_event(&self, _event: &RunEvent) {}
+}
+
+pub trait InvocationObserver: Send + Sync {
+    fn on_event(&self, event: &InvocationEvent);
+}
+
+#[derive(Debug, Default)]
+pub struct NoopInvocationObserver;
+
+impl InvocationObserver for NoopInvocationObserver {
+    fn on_event(&self, _event: &InvocationEvent) {}
 }

@@ -12,6 +12,8 @@ applications, and familiar runtimes can share:
 - persistent loop journals that can be rediscovered after process or machine restart
 - explicit offline reconciliation before ambiguous work resumes
 - metadata-only lifecycle observation
+- validated logical agent references with optional immutable revisions
+- versioned, serializable invocation lifecycle events
 
 Input guardrails apply to the starting agent, and output guardrails apply to the
 agent that produces the final output. A `SessionStore` must serialize writers
@@ -29,6 +31,26 @@ individual event variants. `Runner::run_with_invocation` accepts an explicit
 context, including an optional parent invocation ID for caller-managed nested
 work. These IDs provide correlation only: they do not authorize execution or
 promise durable adoption, idempotency, deduplication, or safe retries.
+
+`AgentRef` pairs a validated logical agent ID with an optional immutable
+`AgentRevision`. Agent IDs and revisions are non-empty, at most 127 bytes, and
+contain no whitespace or control characters. `Runner::new` rejects agents whose
+legacy `AgentId` cannot form a valid reference. Callers can register a revision
+with `Agent::with_revision`; an explicit `InvocationRequest` must then name that
+exact revision or the run fails before model execution. The compatibility
+`Runner::run` and `Runner::run_with_invocation` entry points resolve the
+currently registered revision automatically.
+
+`InvocationObserver` receives a separate canonical metadata stream without
+changing the existing `RunObserver` event shapes. Every admitted request emits
+one versioned `started` event and one terminal `completed` or `failed` event.
+Legacy handoffs inside the same run are emitted as `control_transferred`, not as
+durable delegation. Every event carries the original requested target and
+source; failures separately identify `failed_at`, so a target-resolution
+failure is not mislabeled as execution by that target. The
+`coven.agent-invocation-event.v1` wire schema rejects unknown fields. Attempt
+and executor bindings remain absent until Coven has an executor contract that
+can supply them truthfully.
 
 This pre-1.0 API adds an `invocation` field to event and outcome shapes.
 `RunFailure::invocation` is boxed, and `RunFailure::new_items` is an owned boxed
