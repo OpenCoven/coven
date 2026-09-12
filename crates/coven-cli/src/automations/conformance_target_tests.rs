@@ -11,6 +11,9 @@ const ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS: &str = include_str!(
 const COMMAND_ADOPTION_IDEMPOTENCY_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/command-adoption-idempotency.vectors.json"
 );
+const DEFINITION_LIFECYCLE_TRANSITIONS_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/definition-lifecycle-transitions.vectors.json"
+);
 const DEFINITION_VALIDATION_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/definition-validation.vectors.json");
 const EVENT_REDUCER_DETERMINISM_VECTORS: &str = include_str!(
@@ -66,6 +69,7 @@ fn capability_advertises_the_native_structural_suites() {
                     "attempt-terminal-immutability",
                     CAPABILITY_NEGOTIATION_SUITE,
                     "command-adoption-idempotency",
+                    "definition-lifecycle-transitions",
                     "definition-validation",
                     "event-reducer-determinism",
                     "occurrence-fence-uniqueness",
@@ -76,6 +80,50 @@ fn capability_advertises_the_native_structural_suites() {
             }]
         })
     );
+}
+
+#[test]
+fn definition_lifecycle_transitions_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(DEFINITION_LIFECYCLE_TRANSITIONS_VECTORS).unwrap();
+    let response = evaluate(&request_for("definition-lifecycle-transitions", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 17);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 17);
+}
+
+#[test]
+fn definition_lifecycle_transitions_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value =
+        serde_json::from_str(DEFINITION_LIFECYCLE_TRANSITIONS_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["finalState"] = json!("active");
+
+    let response = evaluate(&request_for("definition-lifecycle-transitions", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn definition_lifecycle_transitions_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 6] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
+        |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
+        |vectors| vectors["cases"][3]["initialState"] = json!("active"),
+        |vectors| vectors["cases"][3]["operation"] = json!("revise_paused"),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value =
+            serde_json::from_str(DEFINITION_LIFECYCLE_TRANSITIONS_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for("definition-lifecycle-transitions", vectors)).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
 }
 
 #[test]
