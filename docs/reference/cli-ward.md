@@ -362,7 +362,11 @@ Candidate overrides require complete Gate-2 resolution; the daemon never falls
 back to a client-declared path when materialization fails.
 
 New pending records carry an `identityEvidence` digest over the canonical typed
-declarations and candidate source commitment. The digest participates in the
+declarations and candidate source commitment. The roster commitment includes
+every field in the authoritative familiar entry, including `workspace`, `role`,
+and `description`, rather than only the extracted identity facts. Redirecting a
+familiar to another workspace invalidates its pending identity evidence.
+The digest participates in the
 proposal's canonical revision and recovery commitment. Changing authoritative
 source bytes before approval fails replay even when the new facts still satisfy
 the declarations. A missing digest with active invariants also fails closed.

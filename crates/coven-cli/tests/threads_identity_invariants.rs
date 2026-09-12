@@ -168,6 +168,43 @@ fn changed_identity_bytes_that_still_satisfy_predicates_refuse_approval() -> Res
 }
 
 #[test]
+fn redirected_roster_workspace_refuses_existing_proposal_approval() -> Result<()> {
+    run_journey(|fixture| {
+        configure_identity(fixture, true)?;
+        let proposal = stage_coherence(fixture)?;
+        let replacement = fixture.coven_home.join("replacement-workspace");
+        for source in ["SOUL.md", "IDENTITY.md", "MEMORY.md", "ward.toml", REVIEWED] {
+            let destination = replacement.join(source);
+            fs::create_dir_all(destination.parent().context("replacement parent")?)?;
+            fs::copy(fixture.workspace.join(source), destination)?;
+        }
+        let workspace = serde_json::to_string(&replacement)?;
+        fs::write(
+            fixture.coven_home.join("familiars.toml"),
+            format!("{}workspace = {workspace}\n", roster("Val")),
+        )?;
+        let refused = fixture.request(
+            "POST",
+            &proposal.approval_path(),
+            Some(&proposal.decision_body()),
+        )?;
+        assert_eq!(refused.status, 409, "{refused:?}");
+        assert_eq!(
+            refused.body["why"], "proposal-identity-evidence-diverged",
+            "{refused:?}"
+        );
+        assert_eq!(fs::read_to_string(replacement.join(REVIEWED))?, BEFORE);
+        assert_eq!(
+            fs::read_to_string(fixture.workspace.join(REVIEWED))?,
+            BEFORE
+        );
+        assert!(proposal.pending.is_file());
+        assert_no_write_authority(fixture)?;
+        assert_no_reservations(fixture)
+    })
+}
+
+#[test]
 fn changed_valid_identity_evidence_refuses_approval_after_restart() -> Result<()> {
     assert_approval_refused(IdentityChange::IdentityBytes, true)
 }

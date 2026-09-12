@@ -4,7 +4,6 @@ use std::path::Path;
 use coven_threads_core::{
     CandidateIdentityContext, CandidateIdentityFact, CandidateIdentityFacts, IdentityFact,
 };
-use serde::Serialize;
 
 use crate::cockpit_sources;
 use crate::ward;
@@ -245,39 +244,22 @@ fn relevant_roster_source(
             serialized: None,
         };
     };
-    let record = RosterRecord {
-        id: entry.id.clone(),
-        name: entry.name.clone(),
-        display_name: entry.display_name.clone(),
-        pronouns: entry.pronouns.clone(),
-        person: entry.person.clone(),
-        coven: entry.coven.clone(),
-    };
     let facts = RosterFacts {
-        name: normalize_inline(record.name.as_deref().unwrap_or(&record.display_name)),
-        person: record.person.as_deref().and_then(normalize_inline),
-        pronouns: record.pronouns.as_deref().and_then(normalize_inline),
-        coven: record.coven.as_deref().and_then(normalize_inline),
+        name: normalize_inline(entry.name.as_deref().unwrap_or(&entry.display_name)),
+        person: entry.person.as_deref().and_then(normalize_inline),
+        pronouns: entry.pronouns.as_deref().and_then(normalize_inline),
+        coven: entry.coven.as_deref().and_then(normalize_inline),
     };
-    let serialized = serde_json::to_vec(&record).ok();
-    RosterSource {
-        facts: Some(facts),
-        serialized,
+    match serde_json::to_vec(entry) {
+        Ok(serialized) => RosterSource {
+            facts: Some(facts),
+            serialized: Some(serialized),
+        },
+        Err(_) => RosterSource {
+            facts: None,
+            serialized: None,
+        },
     }
-}
-
-#[derive(Debug, Serialize)]
-struct RosterRecord {
-    id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    display_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pronouns: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    person: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coven: Option<String>,
 }
 
 #[derive(Debug, Clone)]
