@@ -174,7 +174,12 @@ fn request_with_peer(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    if !valid_request_method(method) || !valid_request_target(method, path) {
+    if !valid_request_method(method) || !valid_request_target(path) {
+        return Err(ClientError::InvalidHttpResponse(
+            "attempted malformed HTTP request method or target".to_owned(),
+        ));
+    }
+    if !allowed_request_route(method, path) {
         return Err(ClientError::InvalidHttpResponse(
             "attempted request outside /api/v1 or exact GET /health".to_owned(),
         ));
@@ -248,14 +253,17 @@ fn valid_request_method(method: &str) -> bool {
         })
 }
 
-fn valid_request_target(method: &str, path: &str) -> bool {
-    (path.starts_with("/api/v1/") || (method == "GET" && path == "/health"))
-        && path.starts_with('/')
+fn valid_request_target(path: &str) -> bool {
+    path.starts_with('/')
         && !path.starts_with("//")
         && path.is_ascii()
         && !path
             .bytes()
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'#')
+}
+
+fn allowed_request_route(method: &str, path: &str) -> bool {
+    path.starts_with("/api/v1/") || (method == "GET" && path == "/health")
 }
 
 #[cfg(test)]
@@ -356,7 +364,7 @@ mod tests {
             "/api/v1/health#fragment",
         ] {
             assert!(
-                !super::valid_request_target("GET", path),
+                !super::valid_request_target(path),
                 "unsafe request target was accepted: {path:?}"
             );
         }
@@ -364,8 +372,8 @@ mod tests {
 
     #[test]
     fn request_target_guard_allows_health_only_for_get() {
-        assert!(super::valid_request_target("GET", "/health"));
-        assert!(!super::valid_request_target("POST", "/health"));
+        assert!(super::allowed_request_route("GET", "/health"));
+        assert!(!super::allowed_request_route("POST", "/health"));
     }
 
     #[test]

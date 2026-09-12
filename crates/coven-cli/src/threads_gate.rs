@@ -1236,6 +1236,7 @@ fn stage_pending_proposal(
         })
         .context("serializing pending proposal")?
     };
+    crate::api::validate_proposal_envelope_preflight(&body)?;
     crate::proposal_store::publish_new(coven_home, &path, &body)?;
     Ok(path)
 }
@@ -1908,6 +1909,8 @@ coven = "OpenCoven"
         assert_eq!(value["probes"][0]["surface"], "SOUL.md");
         assert_eq!(value["probes"][0]["status"], "unscored");
         assert_eq!(value["probes"][0]["results"], serde_json::json!([]));
+        crate::api::validate_proposal_envelope_preflight(&raw)
+            .expect("legacy staged proposal must pass envelope preflight");
         assert_eq!(
             value["probes"][0]["baselineSha256"].as_str().map(str::len),
             Some(64)
