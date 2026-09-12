@@ -9,9 +9,11 @@ belong. Update it when a slice lands or the concentration picture changes.
 ## Method
 
 This snapshot was generated from commit
-`7928c4e899fa76ee4c46ba8895275988889ddb15` on 2026-09-11. The measurements
-below refer to that revision, not to a moving branch. Reproduce the ranking
-without changing your checkout:
+`7928c4e899fa76ee4c46ba8895275988889ddb15` on 2026-09-11. The `store.rs` and
+`store/schema.rs` rows were refreshed from
+`4335c6c913bd6ee8014adfa6cfda9c891ca5b96d` on 2026-09-12; other measurements
+retain the original revision. Reproduce the original ranking without changing
+your checkout:
 
 ```sh
 python3 - <<'PY'
@@ -39,6 +41,10 @@ for total, production, size, path in sorted(rows, reverse=True)[:20]:
 PY
 ```
 
+To reproduce the refreshed store rows, set `ref` to
+`4335c6c913bd6ee8014adfa6cfda9c891ca5b96d` and remove the `[:20]` output limit.
+The smaller private schema module is shown beside its facade below.
+
 "Production lines" below means lines before the terminal module-scope
 `mod tests` block. It is a comparison aid, not a source-code metric: some
 `#[cfg(test)]` hooks intentionally remain beside the production boundary.
@@ -55,7 +61,8 @@ security sensitivity), not size alone.
 | --- | ---: | ---: | --- | --- |
 | [`api.rs`](../crates/coven-cli/src/api.rs) | 36,410 / 12,496 | 1,373,450 | transport dispatch, parsing, validation, transport authority, domain orchestration, persistence access, response mapping | **Highest concentration.** `handle_request_with_runtime_and_authority` remains the central route dispatcher. Session lifecycle, Ward/Threads proposals, and Automations handlers share the module. The proposal path also coordinates a process-wide Ward audit lock, filesystem artifacts, SQLite state, recovery, and response precedence. |
 | [`daemon.rs`](../crates/coven-cli/src/daemon.rs) | 13,210 / 5,833 | 494,030 | local IPC and TCP transport, daemon lifecycle, live session ownership, process supervision, recovery, scheduler startup, telemetry | **High mutable-state risk.** `LiveSessionRuntime` owns the shared live-session registry and launch/shutdown coordination; `serve_forever` acquires lifecycle authority, initializes durable state, starts recovery and schedulers, and accepts concurrent transports. In `handle_http_stream_with_lifecycle`, ordinary API requests not consumed by owner-local lifecycle or mobile local-control handling derive transport authority and enter the central API dispatch. |
-| [`store.rs`](../crates/coven-cli/src/store.rs) | 12,899 / 6,155 | 476,581 | schema and migration, query/command persistence, retention, storage health mapping | **High fan-out.** The production portion exposes 106 crate/public free functions. `initialize_store` delegates schema work to its private `schema` module, while session, handoff, event, Ward, hub, Automations, maintenance, and health queries remain in the parent. The process-global `initialized_store_paths` cache and `STORAGE_HEALTH_SNAPSHOTS` add ownership coupling. |
+| [`store.rs`](../crates/coven-cli/src/store.rs) | 11,673 / 4,929 | 426,915 | initialization facade and cache, query/command persistence, retention, storage health mapping | **High fan-out.** The production portion exposes 107 crate/public free functions. `initialize_store` delegates schema work to its private `schema` module, while session, handoff, event, Ward, hub, Automations, maintenance, and health queries remain in the parent. The process-global `initialized_store_paths` cache and `STORAGE_HEALTH_SNAPSHOTS` add ownership coupling. |
+| [`store/schema.rs`](../crates/coven-cli/src/store/schema.rs) | 1,301 / 1,301 | 52,211 | schema and migration, SQLite connection configuration, compatibility and FTS backfills | **Private initialization boundary.** The parent facade calls this module without changing SQL, migration order, transaction/rollback boundaries, or startup observation order. Successful-initialization caching and domain commands/queries remain in `store.rs`. |
 | [`automations/runner.rs`](../crates/coven-cli/src/automations/runner.rs) | 10,101 / 3,966 | 376,070 | occurrence dispatch, scheduler fencing, runtime adoption, retries, timeout/cancellation, crash recovery, terminal settlement | **High state-machine risk.** `dispatch_occurrence_with_clock` combines direct SQL, scheduler-generation checks, runtime launch, cancellation, and settlement; recovery and stop fencing share the production module. #856 has landed, but remaining #857 correctness work should settle before structural movement. |
 | [`pty_runner.rs`](../crates/coven-cli/src/pty_runner.rs) | 9,954 / 5,551 | 367,600 | harness command construction, PTY/piped I/O, stream decoding, platform process containment, timeout/cancellation, supervisor protocol | **High platform/security risk.** Strict child containment, guardian/supervisor protocol, stream adapters, and detached/attached execution share one module. Windows and Unix ownership guarantees converge at `spawn_strict_child_process_tree`, while cancellation also uses process-global signal coordination in `SUPERVISED_STREAM_CANCELLATION_SIGNAL` and `SUPERVISED_STREAM_CANCELLATION_LOCK`. |
 | [`main.rs`](../crates/coven-cli/src/main.rs) | 9,028 / 5,542 | 330,896 | CLI parsing and command dispatch, setup, user-facing mapping | **Medium.** High fan-in but mostly presentation/entry-point code. Do not prioritize it ahead of authority-bearing modules merely for size. |
@@ -98,8 +105,9 @@ points coordinating several authority classes at once:
   filesystem evidence, durable decision state, recovery, and error mapping;
 - `LiveSessionRuntime` and daemon startup combine process ownership with
   transport and scheduler lifecycle;
-- the store offers one broad command/query surface over unrelated domains while
-  also owning schema migration and process-global health/initialization caches;
+- the store facade offers one broad command/query surface over unrelated domains
+  and retains process-global health/initialization caches; its private `schema`
+  module owns schema migration and connection configuration;
 - `pty_runner` combines adapter construction with the platform-specific process
   containment boundary that makes cancellation and crash recovery trustworthy.
 
@@ -130,7 +138,7 @@ The ranking accounts for current dependency blockers as well as inherent risk.
 | ---: | --- | --- | --- | --- |
 | 1 | **Threads proposal coordinator out of `api.rs`** | Existing proposal/Ward tests in `api.rs`, `threads_gate.rs`, the public `/threads/proposals` API, Ward audit records, and the real-daemon work in #884 | transport-owner gate, decision/error precedence, lock ordering, audit reservation, filesystem recovery, fail-closed uncertainty | **Blocked.** #885-#888 must settle identity materialization, terminal close, protected-proposal rejection, and scheduler/recovery behavior first. Moving the code now would freeze disputed contracts. |
 | 2 | **Session route family out of `api.rs`** | `SessionRuntime`, request-adoption and execution-binding tests, API contract docs, session lifecycle integration tests, Windows daemon lifecycle tests | launch/input/kill adoption semantics, event ordering, status/error payloads, lock release before runtime calls, crash/restart behavior | **Characterization in progress.** Use #884's real-daemon harness before moving the full family. |
-| 3 | **Store initialization/schema from runtime commands and queries** | `open_store`, `initialize_store`, `open_initialized_store`, migration/compatibility tests, store health and smoke tests | schema and migration order, transaction boundaries, per-request no-DDL path, function signatures, and policy remaining outside persistence | **Best independent next slice.** First move schema/migration ownership behind the existing three-function facade; do not reorganize domain queries in the same PR. |
+| 3 | **Store initialization/schema from runtime commands and queries** | `open_store`, `initialize_store`, `open_initialized_store`, migration/compatibility tests, store health and smoke tests | schema and migration order, transaction boundaries, per-request no-DDL path, function signatures, and policy remaining outside persistence | **Implemented in #1033.** Private `store::schema` owns initialization behind the existing facade. Domain-query decomposition and the broader #806 acceptance criteria remain separate work. |
 | 4 | **Daemon transport accept loops from live-session supervision** | daemon inline tests, Unix/TCP request tests, `windows_daemon_lifecycle.rs`, stop/restart budget and recovery tests | single-writer lifecycle locks, owner-derived request authority, bounded in-flight handling, shutdown cleanup, live-session registry semantics | Ready only as separate platform-complete slices; Unix and Windows must keep equivalent outer behavior. |
 | 5 | **Process containment/supervisor from adapter and stream code in `pty_runner.rs`** | strict-containment tests, native Windows lifecycle tests, piped/PTY integration tests, timeout/cancellation tests | before-first-instruction ownership, kill-on-close/process-group guarantees, receipt protocol, terminal callback ordering | Characterize the supervisor protocol as one unit before moving it. Never split Unix and Windows into contracts that can drift. |
 | 6 | **Ward pure classification/budget code from verified apply engine** | Ward unit tests, direct/proposal API tests, hostile replacement and rollback tests | the bounded set of direct, Threads-approved, and coherence-approved Ward entry points; all-or-nothing disposition; path confinement; audit evidence; cleanup uncertainty | Defer until #924's platform guarantee is resolved. Pure helpers may move; private atomic-write helpers must not become callable outside the Ward engine. |
