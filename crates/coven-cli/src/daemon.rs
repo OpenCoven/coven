@@ -144,6 +144,9 @@ struct DaemonHealthStatus {
 #[cfg(not(windows))]
 const MAX_DAEMON_STATUS_BYTES: usize = coven_client::MAX_DAEMON_STATUS_BYTES;
 const DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
+// Start and the whole restart share a cold-readiness budget; standalone
+// stop/status retain their strict two-second budget.
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(windows, test))]
 const WINDOWS_STARTUP_HEALTH_PROBE_SLICE: Duration = Duration::from_millis(250);
 
@@ -1983,7 +1986,7 @@ pub fn ensure_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<DaemonStatus> {
-    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    let deadline = LifecycleOperation::Start.deadline()?;
     deadline.remaining("resolving Coven daemon profile")?;
     let coven_home = canonical_lifecycle_home(coven_home)?;
     let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
@@ -2750,7 +2753,7 @@ pub fn clear_status(coven_home: &Path) -> Result<bool> {
 }
 
 pub fn stop_background_server(coven_home: &Path) -> Result<bool> {
-    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    let deadline = LifecycleOperation::Stop.deadline()?;
     deadline.remaining("resolving Coven daemon profile")?;
     let coven_home = canonical_lifecycle_home(coven_home)?;
     let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
@@ -2762,7 +2765,7 @@ pub fn restart_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<(bool, DaemonStatus)> {
-    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    let deadline = LifecycleOperation::Restart.deadline()?;
     deadline.remaining("resolving Coven daemon profile")?;
     let coven_home = canonical_lifecycle_home(coven_home)?;
     let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
@@ -2819,7 +2822,7 @@ fn background_server_status_locked_with_controller(
     coven_home: &Path,
     controller: &dyn DaemonStopController,
 ) -> Result<Option<DaemonStatusState>> {
-    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    let deadline = LifecycleOperation::Status.deadline()?;
     deadline.remaining("resolving Coven daemon profile")?;
     let coven_home = canonical_lifecycle_home(coven_home)?;
     let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
@@ -2877,13 +2880,40 @@ enum RecordedProcessState {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum LifecycleOperation {
+    Start,
+    Restart,
+    Stop,
+    Status,
+}
+
+impl LifecycleOperation {
+    fn deadline(self) -> Result<LifecycleDeadline> {
+        self.deadline_at(Instant::now())
+    }
+
+    fn deadline_at(self, started: Instant) -> Result<LifecycleDeadline> {
+        let timeout = match self {
+            Self::Start | Self::Restart => DAEMON_STARTUP_TIMEOUT,
+            Self::Stop | Self::Status => DAEMON_LIFECYCLE_TIMEOUT,
+        };
+        LifecycleDeadline::after_at(started, timeout)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct LifecycleDeadline {
     instant: Instant,
 }
 
 impl LifecycleDeadline {
+    #[cfg(test)]
     fn after(timeout: Duration) -> Result<Self> {
-        let instant = Instant::now()
+        Self::after_at(Instant::now(), timeout)
+    }
+
+    fn after_at(started: Instant, timeout: Duration) -> Result<Self> {
+        let instant = started
             .checked_add(timeout)
             .context("daemon lifecycle deadline overflowed")?;
         Ok(Self { instant })
@@ -3606,7 +3636,7 @@ fn ensure_background_server_with_controllers(
         started_at,
         status_controller,
         start_controller,
-        LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+        LifecycleOperation::Start.deadline()?,
     )
 }
 
@@ -6473,6 +6503,43 @@ mod tests {
             status.process_creation_time.map(|value| value.get()),
             Some(134_157_822_123_456_789)
         );
+    }
+
+    #[test]
+    fn lifecycle_operation_budgets_separate_startup_from_stop_and_status() -> Result<()> {
+        let started = Instant::now();
+        for operation in [LifecycleOperation::Start, LifecycleOperation::Restart] {
+            let deadline = operation.deadline_at(started)?;
+            // Synthetic cold readiness, not a measurement of the failed native run.
+            assert_eq!(
+                deadline.remaining_at(
+                    started + Duration::from_secs(3),
+                    "waiting for Coven daemon startup health",
+                )?,
+                Duration::from_secs(2),
+                "{operation:?} must use the reviewed five-second startup budget"
+            );
+            assert!(deadline
+                .remaining_at(started + Duration::from_secs(5), "completing startup")
+                .is_err());
+        }
+        for operation in [LifecycleOperation::Stop, LifecycleOperation::Status] {
+            let deadline = operation.deadline_at(started)?;
+            assert_eq!(
+                deadline.remaining_at(
+                    started + Duration::from_millis(1500),
+                    "authenticating daemon",
+                )?,
+                Duration::from_millis(500)
+            );
+            assert!(
+                deadline
+                    .remaining_at(started + Duration::from_secs(2), "completing lifecycle")
+                    .is_err(),
+                "{operation:?} must retain its two-second budget"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -11836,7 +11903,7 @@ mod tests {
             .map(|(_, observation)| observation)
             .collect();
         assert_eq!(observations.len(), 2);
-        let mut previous = DAEMON_LIFECYCLE_TIMEOUT.as_millis();
+        let mut previous = DAEMON_STARTUP_TIMEOUT.as_millis();
         for (observation, phase) in observations.iter().zip(["before-spawn", "after-spawn"]) {
             let remaining = observation
                 .strip_prefix(&format!("phase={phase} remaining_ms="))
@@ -13443,13 +13510,15 @@ mod tests {
     #[test]
     fn startup_budget_distinguishes_parent_cost_from_child_store_elapsed() {
         let start = Instant::now();
-        let deadline = LifecycleDeadline::from_instant(start + DAEMON_LIFECYCLE_TIMEOUT);
+        let deadline = LifecycleOperation::Start
+            .deadline_at(start)
+            .expect("startup deadline");
         // Synthetic timelines, not measurements of Windows or an E2E reproduction.
         // The same child store duration can fit or exhaust the parent's deadline.
         for (preparation_ms, launch_ms, expected_before, expected_after, fits) in [
-            (50, 10, 1950, 1940, true),
-            (1500, 10, 500, 490, false),
-            (50, 1460, 1950, 490, false),
+            (50, 10, 4950, 4940, true),
+            (4500, 10, 500, 490, false),
+            (50, 4460, 4950, 490, false),
         ] {
             let before = start + Duration::from_millis(preparation_ms);
             let after = before + Duration::from_millis(launch_ms);

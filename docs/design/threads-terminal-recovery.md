@@ -23,9 +23,10 @@ scheduled-proposal publication route.
 On Windows, the fixture owns a foreground `coven daemon serve` child and waits
 for authenticated health under a bounded startup guard. It uses the real
 `daemon stop` command and replaces the process before checking restart recovery.
-This covers server authority and durable recovery, not the separate two-second
-CLI launcher or atomic `daemon restart` contract. Dedicated lifecycle tests
-retain those contracts. Unix journeys continue to use the normal launcher.
+This covers server authority and durable recovery, not the separate
+[CLI lifecycle deadlines](../reference/cli-daemon.md#lifecycle-deadlines).
+Dedicated lifecycle tests retain those contracts, including the two-second
+standalone stop bound. Unix journeys continue to use the normal launcher.
 
 ## Terminal evidence
 

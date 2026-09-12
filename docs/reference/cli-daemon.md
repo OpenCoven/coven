@@ -23,6 +23,17 @@ coven daemon status
 | `coven daemon stop` | Stop the daemon for the active `COVEN_HOME`. |
 | `coven daemon serve` | Hidden foreground server entrypoint used by the background launcher and supervisors. |
 
+## Lifecycle deadlines
+
+`start` and the complete `restart` operation each use one five-second deadline
+for cold readiness. The deadline starts before profile resolution and lifecycle
+locking; restart does not renew it after stopping the old daemon. Standalone
+`stop` and `status` retain their two-second deadlines.
+
+The startup allowance does not relax authentication, profile matching, or
+failure cleanup. A failed health probe is not permission to trust a different
+daemon or retry an operation that may already have committed.
+
 ## First-run sequence
 
 ```sh
