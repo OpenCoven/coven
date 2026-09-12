@@ -9596,10 +9596,33 @@ fn proposal_recovery_is_proven_unapplied(
         return false;
     };
     let proposal_id = pending.id.0.to_string();
-    if load_proposal_apply_intent(conn, &proposal_id)
+    let trusted_approver = match trusted_decision_approver(
+        conn,
+        &proposal_id,
+        document
+            .decision_request
+            .as_ref()
+            .map_or(applying.decision.as_str(), |request| {
+                request.decision.as_str()
+            }),
+        document.decision_request.as_ref(),
+    ) {
+        Ok(origin) => origin,
+        Err(_) => return false,
+    };
+    let Some(intent) = load_proposal_apply_intent(conn, &proposal_id)
         .ok()
         .flatten()
-        .is_none_or(|intent| intent.state != *applying)
+    else {
+        return false;
+    };
+    if intent.state != *applying
+        || (trusted_approver.1
+            && intent.approver.as_deref()
+                != trusted_approver
+                    .0
+                    .as_ref()
+                    .map(coven_threads_core::WriterId::as_str))
     {
         return false;
     }
@@ -38397,6 +38420,13 @@ tier = 0
                AND decision = 'proposal-apply-intent'",
             [&proposal_id],
         )?;
+        drop(conn);
+        let document = read_pending_proposal_document(&claim)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        assert!(
+            !proposal_recovery_is_proven_unapplied(home, &conn, &document),
+            "corrupt apply-intent attribution must not qualify for terminal expiry"
+        );
         drop(conn);
 
         assert_eq!(process_due_threads_proposals(home)?, 0);
