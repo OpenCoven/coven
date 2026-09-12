@@ -228,8 +228,8 @@ pub(crate) fn validate_request_line(method: &str, path: &str) -> Result<(), Clie
         return Err(ClientError::InvalidRouteParameter("HTTP request target"));
     }
     if !allowed_request_route(method, path) {
-        return Err(ClientError::InvalidHttpResponse(
-            "attempted request outside /api/v1 or exact GET /health".to_owned(),
+        return Err(ClientError::InvalidRouteParameter(
+            "HTTP request target outside /api/v1 or exact GET /health",
         ));
     }
     Ok(())
@@ -380,6 +380,18 @@ mod tests {
     fn request_target_guard_allows_health_only_for_get() {
         assert!(super::allowed_request_route("GET", "/health"));
         assert!(!super::allowed_request_route("POST", "/health"));
+    }
+
+    #[test]
+    fn request_line_reports_out_of_scope_routes_as_client_input_errors() {
+        let error = super::validate_request_line("POST", "/health")
+            .expect_err("POST /health must be rejected before any I/O");
+        assert!(matches!(
+            error,
+            ClientError::InvalidRouteParameter(
+                "HTTP request target outside /api/v1 or exact GET /health"
+            )
+        ));
     }
 
     #[test]
