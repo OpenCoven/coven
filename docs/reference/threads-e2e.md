@@ -134,3 +134,9 @@ blocked work, failure, process exit, or a failed diagnostic write. They neither
 measure post-cleanup survival nor prove the cause of a startup timeout.
 The fixtures use only synthetic identities and content; evidence never reads a
 developer's real Coven home.
+
+Both constructed-fixture and early-setup manifests record a generic
+reproduction `command` matching the compiled test profile, including
+`--features threads-test-clock` when enabled. This is not a capture of the
+producer's exact invocation or Cargo overlay; retain the upstream runner's
+command and overlay evidence when reproducing a downstream observation.

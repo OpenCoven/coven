@@ -21,6 +21,11 @@ const FAMILIAR_ID: &str = "sage";
 const PRINCIPAL_FINGERPRINT: &str = "fpr-e2e-synthetic";
 const REQUIRE_OVERRIDE_ENV: &str = "COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE";
 const ARTIFACT_ROOT_ENV: &str = "COVEN_THREADS_E2E_ARTIFACT_ROOT";
+const REPRODUCTION_COMMAND: &str = if cfg!(feature = "threads-test-clock") {
+    "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock -- --nocapture"
+} else {
+    "cargo test --locked -p coven-cli --test threads_e2e -- --nocapture"
+};
 
 #[cfg(feature = "threads-test-clock")]
 mod final_commit_cases {
@@ -1084,6 +1089,7 @@ fn startup_failure_retains_partial_fixture_evidence_before_cleanup() -> Result<(
     evidence.write_setup_failure(&error)?;
     let manifest: Value =
         serde_json::from_slice(&fs::read(artifacts.path().join("manifest.json"))?)?;
+    assert_manifest_command_matches_build(&manifest);
     assert_eq!(manifest["setup_completed"], false);
     assert!(manifest["coven_commit"].is_string());
     assert_eq!(manifest["daemon_lifecycle"][0]["command_status"], 1);
@@ -1954,7 +1960,7 @@ impl ThreadsFixture {
         let manifest = json!({
             "run_id": self.run_id,
             "scenario": self.scenario,
-            "command": "cargo test --locked -p coven-cli --test threads_e2e -- --nocapture",
+            "command": REPRODUCTION_COMMAND,
             "platform": std::env::consts::OS,
             "setup_completed": setup_completed,
             "fixture_evidence_captured": true,
@@ -2102,6 +2108,24 @@ struct EvidenceContext {
     artifact_dir: PathBuf,
 }
 
+fn assert_manifest_command_matches_build(manifest: &Value) {
+    let mut expected = vec![
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "coven-cli",
+        "--test",
+        "threads_e2e",
+    ];
+    if cfg!(feature = "threads-test-clock") {
+        expected.extend(["--features", "threads-test-clock"]);
+    }
+    expected.extend(["--", "--nocapture"]);
+    let command = manifest["command"].as_str().expect("manifest command");
+    assert_eq!(command.split_whitespace().collect::<Vec<_>>(), expected);
+}
+
 fn write_missing_setup_artifact(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<()> {
     use std::io::Write;
 
@@ -2147,7 +2171,9 @@ fn artifact_root_override_isolates_setup_failures_from_cached_evidence() -> Resu
         EvidenceContext::with_artifact_root("isolated-root", Some(root.clone().into_os_string()));
     assert_eq!(evidence.artifact_dir.parent(), Some(root.as_path()));
     evidence.write_setup_failure(&anyhow::anyhow!("synthetic setup failure"))?;
-    assert!(evidence.artifact_dir.join("manifest.json").is_file());
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(evidence.artifact_dir.join("manifest.json"))?)?;
+    assert_manifest_command_matches_build(&manifest);
     assert_eq!(fs::read_dir(&root)?.count(), 1);
     assert_eq!(
         fs::read(cached.join("manifest.json"))?,
@@ -2221,7 +2247,7 @@ impl EvidenceContext {
             serde_json::to_vec_pretty(&json!({
                 "run_id": self.run_id,
                 "scenario": self.scenario,
-                "command": "cargo test --locked -p coven-cli --test threads_e2e -- --nocapture",
+                "command": REPRODUCTION_COMMAND,
                 "platform": std::env::consts::OS,
                 "setup_completed": false,
                 "coven_commit": Value::Null,
