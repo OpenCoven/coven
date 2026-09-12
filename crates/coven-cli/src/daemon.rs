@@ -12630,6 +12630,133 @@ mod tests {
     }
 
     #[test]
+    fn startup_budget_distinguishes_parent_cost_from_child_store_elapsed() {
+        let start = Instant::now();
+        let deadline = LifecycleDeadline::from_instant(start + DAEMON_LIFECYCLE_TIMEOUT);
+        // Synthetic timelines, not measurements of Windows or an E2E reproduction.
+        // The same child store duration can fit or exhaust the parent's deadline.
+        for (preparation_ms, launch_ms, expected_before, expected_after, fits) in [
+            (50, 10, 1950, 1940, true),
+            (1500, 10, 500, 490, false),
+            (50, 1460, 1950, 490, false),
+        ] {
+            let before = start + Duration::from_millis(preparation_ms);
+            let after = before + Duration::from_millis(launch_ms);
+            assert_eq!(
+                format_startup_budget(StartupSpawnPhase::Before, deadline, before),
+                format!("startup_budget phase=before-spawn remaining_ms={expected_before}")
+            );
+            assert_eq!(
+                format_startup_budget(StartupSpawnPhase::After, deadline, after),
+                format!("startup_budget phase=after-spawn remaining_ms={expected_after}")
+            );
+            // This fixture puts child store entry after launch returns. Real child
+            // execution can overlap launch; neither budget sample locates store entry.
+            let store_begin = after + Duration::from_millis(20);
+            let store_end = store_begin + Duration::from_millis(600);
+            assert_eq!(
+                store_end.duration_since(store_begin),
+                Duration::from_millis(600)
+            );
+            assert_eq!(
+                deadline
+                    .remaining_at(store_end, "waiting for Coven daemon startup health")
+                    .is_ok(),
+                fits
+            );
+        }
+    }
+
+    #[test]
+    fn startup_budget_is_not_renewed_between_launch_and_readiness() -> Result<()> {
+        struct BudgetCheckingStart {
+            expected: LifecycleDeadline,
+            launches: std::cell::Cell<usize>,
+            waits: std::cell::Cell<usize>,
+        }
+
+        impl DaemonStartController for BudgetCheckingStart {
+            fn start_background_server(
+                &self,
+                coven_home: &Path,
+                _current_exe: &Path,
+                started_at: String,
+            ) -> Result<DaemonStatus> {
+                self.launches.set(self.launches.get() + 1);
+                Ok(DaemonStatus {
+                    pid: 54321,
+                    started_at,
+                    socket: test_daemon_status_socket(coven_home),
+                    process_creation_time: None,
+                })
+            }
+
+            fn wait_for_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                deadline: LifecycleDeadline,
+            ) -> Result<Option<DaemonStatus>> {
+                self.waits.set(self.waits.get() + 1);
+                assert_eq!(deadline.instant, self.expected.instant);
+                // Advance only the observation, never sleep or renew the deadline.
+                deadline.remaining_at(
+                    self.expected.instant,
+                    "waiting for Coven daemon startup health",
+                )?;
+                anyhow::bail!("expired startup budget was accepted")
+            }
+        }
+
+        for restart in [false, true] {
+            let home = tempfile::tempdir()?;
+            // Hang guard for real filesystem preparation, not a promptness assertion.
+            // Expiry itself is exercised at an exact synthetic instant above.
+            let deadline = LifecycleDeadline::after(Duration::from_secs(3600))?;
+            let start = BudgetCheckingStart {
+                expected: deadline,
+                launches: std::cell::Cell::new(0),
+                waits: std::cell::Cell::new(0),
+            };
+            let stop = RecoveringLifecycleStopController {
+                recovered: None,
+                authenticated: false,
+                stopped: std::sync::Arc::default(),
+            };
+            let result = if restart {
+                restart_background_server_with_controllers_until(
+                    home.path(),
+                    Path::new("coven"),
+                    "synthetic-start".to_owned(),
+                    &stop,
+                    &start,
+                    deadline,
+                )
+                .map(|(_, status)| status)
+            } else {
+                ensure_background_server_with_controllers_until(
+                    home.path(),
+                    Path::new("coven"),
+                    "synthetic-start".to_owned(),
+                    &stop,
+                    &start,
+                    deadline,
+                )
+            };
+            assert_eq!(
+                result
+                    .expect_err("readiness deadline must propagate")
+                    .to_string(),
+                "timed out waiting for Coven daemon startup health"
+            );
+            assert_eq!(start.launches.get(), 1);
+            assert_eq!(start.waits.get(), 1);
+            assert_eq!(read_status(home.path())?, None);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn startup_budget_observation_clamps_expired_deadlines_without_waiting() {
         let now = Instant::now();
         let deadline = LifecycleDeadline::from_instant(now + Duration::from_millis(250));
