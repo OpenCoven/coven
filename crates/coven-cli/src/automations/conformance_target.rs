@@ -30,6 +30,8 @@ const CAPABILITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.capability-negotiation-vectors.v1";
 const COMMAND_ADOPTION_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.command-adoption-idempotency-vectors.v1";
+const DEFINITION_LIFECYCLE_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.definition-lifecycle-transitions-vectors.v1";
 const ATTEMPT_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.attempt-terminal-immutability-vectors.v1";
 const DEFINITION_VALIDATION_VECTOR_SCHEMA_VERSION: &str =
@@ -50,6 +52,7 @@ const MAX_CASES: usize = 128;
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
+pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
@@ -160,6 +163,160 @@ struct ExpectedCommandAdoption {
     definition_rows: usize,
     adoption_rows: usize,
     event_rows: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DefinitionLifecycleVectorSet {
+    schema_version: String,
+    cases: Vec<DefinitionLifecycleVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DefinitionLifecycleVectorCase {
+    case_id: String,
+    scenario: DefinitionLifecycleScenario,
+    initial_state: DefinitionLifecycleState,
+    operation: DefinitionLifecycleOperation,
+    expected: ExpectedDefinitionLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DefinitionLifecycleScenario {
+    CreatePaused,
+    CreateActive,
+    CreateDisabledIsRefused,
+    PausedToActive,
+    ActiveToPaused,
+    PausedToDisabled,
+    ActiveToDisabled,
+    PausedToTombstoned,
+    ActiveToTombstoned,
+    DisabledToTombstoned,
+    DisabledToActiveIsRefused,
+    DisabledToPausedIsRefused,
+    DisabledToDisabledIsRefused,
+    TombstonedToActiveIsRefused,
+    TombstonedToPausedIsRefused,
+    TombstonedToDisabledIsRefused,
+    TombstonedToTombstonedIsRefused,
+}
+
+impl DefinitionLifecycleScenario {
+    const COUNT: usize = 17;
+
+    const fn input(self) -> (DefinitionLifecycleState, DefinitionLifecycleOperation) {
+        match self {
+            Self::CreatePaused => (
+                DefinitionLifecycleState::Absent,
+                DefinitionLifecycleOperation::CreatePaused,
+            ),
+            Self::CreateActive => (
+                DefinitionLifecycleState::Absent,
+                DefinitionLifecycleOperation::CreateActive,
+            ),
+            Self::CreateDisabledIsRefused => (
+                DefinitionLifecycleState::Absent,
+                DefinitionLifecycleOperation::CreateDisabled,
+            ),
+            Self::PausedToActive => (
+                DefinitionLifecycleState::Paused,
+                DefinitionLifecycleOperation::ReviseActive,
+            ),
+            Self::ActiveToPaused => (
+                DefinitionLifecycleState::Active,
+                DefinitionLifecycleOperation::RevisePaused,
+            ),
+            Self::PausedToDisabled => (
+                DefinitionLifecycleState::Paused,
+                DefinitionLifecycleOperation::Disable,
+            ),
+            Self::ActiveToDisabled => (
+                DefinitionLifecycleState::Active,
+                DefinitionLifecycleOperation::Disable,
+            ),
+            Self::PausedToTombstoned => (
+                DefinitionLifecycleState::Paused,
+                DefinitionLifecycleOperation::Tombstone,
+            ),
+            Self::ActiveToTombstoned => (
+                DefinitionLifecycleState::Active,
+                DefinitionLifecycleOperation::Tombstone,
+            ),
+            Self::DisabledToTombstoned => (
+                DefinitionLifecycleState::Disabled,
+                DefinitionLifecycleOperation::Tombstone,
+            ),
+            Self::DisabledToActiveIsRefused => (
+                DefinitionLifecycleState::Disabled,
+                DefinitionLifecycleOperation::ReviseActive,
+            ),
+            Self::DisabledToPausedIsRefused => (
+                DefinitionLifecycleState::Disabled,
+                DefinitionLifecycleOperation::RevisePaused,
+            ),
+            Self::DisabledToDisabledIsRefused => (
+                DefinitionLifecycleState::Disabled,
+                DefinitionLifecycleOperation::Disable,
+            ),
+            Self::TombstonedToActiveIsRefused => (
+                DefinitionLifecycleState::Tombstoned,
+                DefinitionLifecycleOperation::ReviseActive,
+            ),
+            Self::TombstonedToPausedIsRefused => (
+                DefinitionLifecycleState::Tombstoned,
+                DefinitionLifecycleOperation::RevisePaused,
+            ),
+            Self::TombstonedToDisabledIsRefused => (
+                DefinitionLifecycleState::Tombstoned,
+                DefinitionLifecycleOperation::Disable,
+            ),
+            Self::TombstonedToTombstonedIsRefused => (
+                DefinitionLifecycleState::Tombstoned,
+                DefinitionLifecycleOperation::Tombstone,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DefinitionLifecycleState {
+    Absent,
+    Paused,
+    Active,
+    Disabled,
+    Tombstoned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DefinitionLifecycleOperation {
+    CreatePaused,
+    CreateActive,
+    CreateDisabled,
+    RevisePaused,
+    ReviseActive,
+    Disable,
+    Tombstone,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedDefinitionLifecycle {
+    Committed {
+        #[serde(rename = "finalState")]
+        final_state: DefinitionLifecycleState,
+        revision: u64,
+    },
+    Rejected {
+        code: ErrorCode,
+        #[serde(rename = "finalState")]
+        final_state: DefinitionLifecycleState,
+        revision: Option<u64>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,6 +635,7 @@ pub fn capability() -> TargetCapability {
                 ATTEMPT_TERMINAL_IMMUTABILITY_SUITE,
                 CAPABILITY_NEGOTIATION_SUITE,
                 COMMAND_ADOPTION_IDEMPOTENCY_SUITE,
+                DEFINITION_LIFECYCLE_TRANSITIONS_SUITE,
                 DEFINITION_VALIDATION_SUITE,
                 EVENT_REDUCER_DETERMINISM_SUITE,
                 OCCURRENCE_FENCE_UNIQUENESS_SUITE,
@@ -508,6 +666,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         CAPABILITY_NEGOTIATION_SUITE => evaluate_capability_negotiation(&request.vector)?,
         COMMAND_ADOPTION_IDEMPOTENCY_SUITE => {
             evaluate_command_adoption_idempotency(&request.vector)?
+        }
+        DEFINITION_LIFECYCLE_TRANSITIONS_SUITE => {
+            evaluate_definition_lifecycle_transitions(&request.vector)?
         }
         DEFINITION_VALIDATION_SUITE => evaluate_definition_validation(&request.vector)?,
         EVENT_REDUCER_DETERMINISM_SUITE => evaluate_event_reducer_determinism(&request.vector)?,
@@ -638,23 +799,7 @@ fn evaluate_command_adoption_idempotency(vector: &Value) -> Result<bool, &'stati
 }
 
 fn command_adoption_case_matches(case: &CommandAdoptionVectorCase) -> Result<bool, &'static str> {
-    let conn = Connection::open_in_memory().map_err(|_| "conformance suite execution failed")?;
-    conn.execute_batch(super::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
-        .map_err(|_| "conformance suite execution failed")?;
-    conn.execute_batch(super::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
-        .map_err(|_| "conformance suite execution failed")?;
-    conn.execute_batch(super::runs::AUTOMATION_RUNS_SCHEMA_SQL)
-        .map_err(|_| "conformance suite execution failed")?;
-    conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL);")
-        .map_err(|_| "conformance suite execution failed")?;
-    conn.execute_batch(AUTOMATION_ATTEMPTS_SCHEMA_SQL)
-        .map_err(|_| "conformance suite execution failed")?;
-    conn.execute_batch(AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL)
-        .map_err(|_| "conformance suite execution failed")?;
-    conn.execute_batch(super::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
-        .map_err(|_| "conformance suite execution failed")?;
-    ensure_global_adoption_key_guards(&conn).map_err(|_| "conformance suite execution failed")?;
-
+    let conn = command_conformance_connection()?;
     let first = execute_definition_command(
         &conn,
         &case.adoption_key,
@@ -716,6 +861,248 @@ fn command_adoption_case_matches(case: &CommandAdoptionVectorCase) -> Result<boo
             && adoption_rows == case.expected.adoption_rows
             && event_rows == case.expected.event_rows,
     )
+}
+
+fn command_conformance_connection() -> Result<Connection, &'static str> {
+    let conn = Connection::open_in_memory().map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::runs::AUTOMATION_RUNS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL);")
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(AUTOMATION_ATTEMPTS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    ensure_global_adoption_key_guards(&conn).map_err(|_| "conformance suite execution failed")?;
+    Ok(conn)
+}
+
+fn evaluate_definition_lifecycle_transitions(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: DefinitionLifecycleVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != DEFINITION_LIFECYCLE_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != DefinitionLifecycleScenario::COUNT
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || case.scenario.input() != (case.initial_state, case.operation)
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != DefinitionLifecycleScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut all_passed = true;
+    for case in &vectors.cases {
+        all_passed &= definition_lifecycle_case_matches(case)?;
+    }
+    Ok(all_passed)
+}
+
+fn definition_lifecycle_case_matches(
+    case: &DefinitionLifecycleVectorCase,
+) -> Result<bool, &'static str> {
+    let conn = command_conformance_connection()?;
+    let automation_id = format!("lifecycle-{}", case.case_id);
+    prepare_definition_lifecycle_state(&conn, &automation_id, case.initial_state)?;
+    let current_revision = observed_definition_lifecycle(&conn, &automation_id)?.1;
+    let response = execute_definition_command(
+        &conn,
+        &format!("adopt:lifecycle:{}:operation", case.case_id),
+        lifecycle_operation_command(&automation_id, case.operation, current_revision),
+        "2026-08-30T09:02:00.000Z",
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let (final_state, revision) = observed_definition_lifecycle(&conn, &automation_id)?;
+
+    Ok(match &case.expected {
+        ExpectedDefinitionLifecycle::Committed {
+            final_state: expected_state,
+            revision: expected_revision,
+        } => {
+            response.outcome == DefinitionCommandOutcome::Committed
+                && response.error.is_none()
+                && response.revision == Some(*expected_revision)
+                && final_state == *expected_state
+                && revision == Some(*expected_revision)
+        }
+        ExpectedDefinitionLifecycle::Rejected {
+            code,
+            final_state: expected_state,
+            revision: expected_revision,
+        } => {
+            response.outcome == DefinitionCommandOutcome::Rejected
+                && response.error.as_ref().map(|error| error.code()) == Some(*code)
+                && response.revision == *expected_revision
+                && final_state == *expected_state
+                && revision == *expected_revision
+        }
+    })
+}
+
+fn prepare_definition_lifecycle_state(
+    conn: &Connection,
+    automation_id: &str,
+    state: DefinitionLifecycleState,
+) -> Result<(), &'static str> {
+    if state == DefinitionLifecycleState::Absent {
+        return Ok(());
+    }
+    let initial_status = if state == DefinitionLifecycleState::Active {
+        DefinitionLifecycleState::Active
+    } else {
+        DefinitionLifecycleState::Paused
+    };
+    let created = execute_definition_command(
+        conn,
+        &format!("adopt:lifecycle:{automation_id}:create"),
+        lifecycle_operation_command(
+            automation_id,
+            match initial_status {
+                DefinitionLifecycleState::Active => DefinitionLifecycleOperation::CreateActive,
+                DefinitionLifecycleState::Paused => DefinitionLifecycleOperation::CreatePaused,
+                _ => return Err("conformance suite execution failed"),
+            },
+            None,
+        ),
+        "2026-08-30T09:00:00.000Z",
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    if created.outcome != DefinitionCommandOutcome::Committed {
+        return Err("conformance suite execution failed");
+    }
+
+    let setup_operation = match state {
+        DefinitionLifecycleState::Disabled => Some(DefinitionLifecycleOperation::Disable),
+        DefinitionLifecycleState::Tombstoned => Some(DefinitionLifecycleOperation::Tombstone),
+        DefinitionLifecycleState::Paused | DefinitionLifecycleState::Active => None,
+        DefinitionLifecycleState::Absent => unreachable!(),
+    };
+    if let Some(operation) = setup_operation {
+        let setup = execute_definition_command(
+            conn,
+            &format!("adopt:lifecycle:{automation_id}:setup"),
+            lifecycle_operation_command(automation_id, operation, Some(1)),
+            "2026-08-30T09:01:00.000Z",
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+        if setup.outcome != DefinitionCommandOutcome::Committed {
+            return Err("conformance suite execution failed");
+        }
+    }
+    Ok(())
+}
+
+fn lifecycle_operation_command(
+    automation_id: &str,
+    operation: DefinitionLifecycleOperation,
+    expected_revision: Option<u64>,
+) -> DefinitionCommand {
+    match operation {
+        DefinitionLifecycleOperation::CreatePaused
+        | DefinitionLifecycleOperation::CreateActive
+        | DefinitionLifecycleOperation::CreateDisabled => DefinitionCommand::Create {
+            definition: lifecycle_definition(
+                automation_id,
+                match operation {
+                    DefinitionLifecycleOperation::CreatePaused => "PAUSED",
+                    DefinitionLifecycleOperation::CreateActive => "ACTIVE",
+                    DefinitionLifecycleOperation::CreateDisabled => "DISABLED",
+                    _ => unreachable!(),
+                },
+            ),
+        },
+        DefinitionLifecycleOperation::RevisePaused | DefinitionLifecycleOperation::ReviseActive => {
+            DefinitionCommand::Revise {
+                definition: lifecycle_definition(
+                    automation_id,
+                    match operation {
+                        DefinitionLifecycleOperation::RevisePaused => "PAUSED",
+                        DefinitionLifecycleOperation::ReviseActive => "ACTIVE",
+                        _ => unreachable!(),
+                    },
+                ),
+                expected_revision,
+            }
+        }
+        DefinitionLifecycleOperation::Disable => DefinitionCommand::Disable {
+            automation_id: automation_id.to_owned(),
+            expected_revision,
+            reason: Some("native lifecycle conformance".to_string()),
+        },
+        DefinitionLifecycleOperation::Tombstone => DefinitionCommand::Delete {
+            automation_id: automation_id.to_owned(),
+            expected_revision,
+        },
+    }
+}
+
+fn lifecycle_definition(automation_id: &str, status: &str) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "id": automation_id,
+        "name": "Lifecycle conformance",
+        "status": status,
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native lifecycle conformance probe."
+    })
+}
+
+fn observed_definition_lifecycle(
+    conn: &Connection,
+    automation_id: &str,
+) -> Result<(DefinitionLifecycleState, Option<u64>), &'static str> {
+    let row = conn
+        .query_row(
+            "SELECT lifecycle_state, revision, tombstoned_at IS NOT NULL
+             FROM automation_definitions
+             WHERE id = ?1",
+            [automation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| "conformance suite execution failed")?;
+    let Some((lifecycle_state, revision, tombstoned)) = row else {
+        return Ok((DefinitionLifecycleState::Absent, None));
+    };
+    let revision = u64::try_from(revision).map_err(|_| "conformance suite execution failed")?;
+    let state = if tombstoned {
+        DefinitionLifecycleState::Tombstoned
+    } else {
+        match lifecycle_state.as_str() {
+            "paused" => DefinitionLifecycleState::Paused,
+            "active" => DefinitionLifecycleState::Active,
+            "disabled" => DefinitionLifecycleState::Disabled,
+            _ => return Err("conformance suite execution failed"),
+        }
+    };
+    Ok((state, Some(revision)))
 }
 
 const fn command_outcome(outcome: DefinitionCommandOutcome) -> CommandAdoptionOutcome {
