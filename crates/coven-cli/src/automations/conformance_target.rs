@@ -7,8 +7,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation};
+use super::command_adoption::{
+    ensure_global_adoption_key_guards, execute_definition_command, DefinitionCommand,
+    DefinitionCommandOutcome, AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL,
+};
+use super::contract::error::ErrorCode;
 use super::contract::events::EventReducer;
-use super::contract::types::{AutomationId, OccurrenceId, Sha256Digest};
+use super::contract::types::{AdoptionKey, AutomationId, OccurrenceId, Sha256Digest};
 use super::contract::{
     canonicalize, canonicalize_without_integrity, sha256_hex, AutomationDefinition,
     AutomationReceipt, EventEnvelope,
@@ -22,6 +27,8 @@ const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-
 const SUITE_RESULT_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-result.v1";
 const CAPABILITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.capability-negotiation-vectors.v1";
+const COMMAND_ADOPTION_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.command-adoption-idempotency-vectors.v1";
 const ATTEMPT_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.attempt-terminal-immutability-vectors.v1";
 const DEFINITION_VALIDATION_VECTOR_SCHEMA_VERSION: &str =
@@ -39,6 +46,7 @@ const MAX_CASES: usize = 128;
 
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
+pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
@@ -107,6 +115,47 @@ struct CapabilityVectorCase {
 enum ExpectedNegotiation {
     Supported,
     Unsupported { variant: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandAdoptionVectorSet {
+    schema_version: String,
+    cases: Vec<CommandAdoptionVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandAdoptionVectorCase {
+    case_id: String,
+    adoption_key: String,
+    definition: Value,
+    conflicting_definition: Value,
+    expected: ExpectedCommandAdoption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CommandAdoptionOutcome {
+    Committed,
+    Replayed,
+    Rejected,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedCommandAdoption {
+    first_outcome: CommandAdoptionOutcome,
+    exact_replay_outcome: CommandAdoptionOutcome,
+    conflicting_replay_outcome: CommandAdoptionOutcome,
+    conflict_code: ErrorCode,
+    exact_replay_result_preserved: bool,
+    exact_replay_event_preserved: bool,
+    first_commit_time_preserved: bool,
+    original_definition_preserved: bool,
+    definition_rows: usize,
+    adoption_rows: usize,
+    event_rows: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +379,7 @@ pub fn capability() -> TargetCapability {
             suites: vec![
                 ATTEMPT_TERMINAL_IMMUTABILITY_SUITE,
                 CAPABILITY_NEGOTIATION_SUITE,
+                COMMAND_ADOPTION_IDEMPOTENCY_SUITE,
                 DEFINITION_VALIDATION_SUITE,
                 EVENT_REDUCER_DETERMINISM_SUITE,
                 OCCURRENCE_FENCE_UNIQUENESS_SUITE,
@@ -357,6 +407,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
             evaluate_attempt_terminal_immutability(&request.vector)?
         }
         CAPABILITY_NEGOTIATION_SUITE => evaluate_capability_negotiation(&request.vector)?,
+        COMMAND_ADOPTION_IDEMPOTENCY_SUITE => {
+            evaluate_command_adoption_idempotency(&request.vector)?
+        }
         DEFINITION_VALIDATION_SUITE => evaluate_definition_validation(&request.vector)?,
         EVENT_REDUCER_DETERMINISM_SUITE => evaluate_event_reducer_determinism(&request.vector)?,
         OCCURRENCE_FENCE_UNIQUENESS_SUITE => evaluate_occurrence_fence_uniqueness(&request.vector)?,
@@ -435,6 +488,148 @@ fn evaluate_capability_negotiation(vector: &Value) -> Result<bool, &'static str>
     }
 
     Ok(vectors.cases.iter().all(capability_case_matches))
+}
+
+fn evaluate_command_adoption_idempotency(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: CommandAdoptionVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != COMMAND_ADOPTION_VECTOR_SCHEMA_VERSION
+        || vectors.cases.is_empty()
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut adoption_keys = BTreeSet::new();
+    for case in &vectors.cases {
+        let definition = super::definition::RoutineDefinition::from_json(&case.definition)
+            .map_err(|_| "conformance vector is invalid")?;
+        let conflicting =
+            super::definition::RoutineDefinition::from_json(&case.conflicting_definition)
+                .map_err(|_| "conformance vector is invalid")?;
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || AdoptionKey::new(case.adoption_key.clone()).is_err()
+            || !adoption_keys.insert(&case.adoption_key)
+            || definition.id != conflicting.id
+            || definition == conflicting
+            || case.expected.first_outcome != CommandAdoptionOutcome::Committed
+            || case.expected.exact_replay_outcome != CommandAdoptionOutcome::Replayed
+            || case.expected.conflicting_replay_outcome != CommandAdoptionOutcome::Rejected
+            || case.expected.conflict_code != ErrorCode::AdoptionReplayMismatch
+            || !case.expected.exact_replay_result_preserved
+            || !case.expected.exact_replay_event_preserved
+            || !case.expected.first_commit_time_preserved
+            || !case.expected.original_definition_preserved
+            || case.expected.definition_rows != 1
+            || case.expected.adoption_rows != 1
+            || case.expected.event_rows != 1
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+
+    let mut all_passed = true;
+    for case in &vectors.cases {
+        all_passed &= command_adoption_case_matches(case)?;
+    }
+    Ok(all_passed)
+}
+
+fn command_adoption_case_matches(case: &CommandAdoptionVectorCase) -> Result<bool, &'static str> {
+    let conn = Connection::open_in_memory().map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::runs::AUTOMATION_RUNS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL);")
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(AUTOMATION_ATTEMPTS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    ensure_global_adoption_key_guards(&conn).map_err(|_| "conformance suite execution failed")?;
+
+    let first = execute_definition_command(
+        &conn,
+        &case.adoption_key,
+        DefinitionCommand::Create {
+            definition: case.definition.clone(),
+        },
+        "2026-08-30T09:00:00.000Z",
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let exact_replay = execute_definition_command(
+        &conn,
+        &case.adoption_key,
+        DefinitionCommand::Create {
+            definition: case.definition.clone(),
+        },
+        "2026-08-30T09:01:00.000Z",
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let conflicting_replay = execute_definition_command(
+        &conn,
+        &case.adoption_key,
+        DefinitionCommand::Create {
+            definition: case.conflicting_definition.clone(),
+        },
+        "2026-08-30T09:02:00.000Z",
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+
+    let definition_rows = table_row_count(&conn, "SELECT COUNT(*) FROM automation_definitions")?;
+    let adoption_rows =
+        table_row_count(&conn, "SELECT COUNT(*) FROM automation_command_adoptions")?;
+    let event_rows = table_row_count(&conn, "SELECT COUNT(*) FROM automation_events")?;
+    let expected_definition = super::definition::RoutineDefinition::from_json(&case.definition)
+        .map_err(|_| "conformance vector is invalid")?;
+    let stored_definition = super::store::get_definition(&conn, &expected_definition.id)
+        .map_err(|_| "conformance suite execution failed")?
+        .and_then(|stored| {
+            serde_json::from_str::<super::definition::RoutineDefinition>(&stored.definition_json)
+                .ok()
+        });
+    let original_definition_preserved = stored_definition
+        .as_ref()
+        .is_some_and(|stored| stored == &expected_definition);
+    Ok(
+        command_outcome(first.outcome) == case.expected.first_outcome
+            && command_outcome(exact_replay.outcome) == case.expected.exact_replay_outcome
+            && command_outcome(conflicting_replay.outcome)
+                == case.expected.conflicting_replay_outcome
+            && conflicting_replay.error.as_ref().map(|error| error.code())
+                == Some(case.expected.conflict_code)
+            && (first.result == exact_replay.result) == case.expected.exact_replay_result_preserved
+            && (first.event_ref == exact_replay.event_ref)
+                == case.expected.exact_replay_event_preserved
+            && (exact_replay.replay_first_committed_at.as_deref()
+                == Some("2026-08-30T09:00:00.000Z"))
+                == case.expected.first_commit_time_preserved
+            && original_definition_preserved == case.expected.original_definition_preserved
+            && definition_rows == case.expected.definition_rows
+            && adoption_rows == case.expected.adoption_rows
+            && event_rows == case.expected.event_rows,
+    )
+}
+
+const fn command_outcome(outcome: DefinitionCommandOutcome) -> CommandAdoptionOutcome {
+    match outcome {
+        DefinitionCommandOutcome::Committed => CommandAdoptionOutcome::Committed,
+        DefinitionCommandOutcome::Replayed => CommandAdoptionOutcome::Replayed,
+        DefinitionCommandOutcome::Rejected => CommandAdoptionOutcome::Rejected,
+    }
+}
+
+fn table_row_count(conn: &Connection, query: &str) -> Result<usize, &'static str> {
+    conn.query_row(query, [], |row| row.get::<_, i64>(0))
+        .map_err(|_| "conformance suite execution failed")
+        .and_then(|count| usize::try_from(count).map_err(|_| "conformance suite execution failed"))
 }
 
 fn evaluate_definition_validation(vector: &Value) -> Result<bool, &'static str> {

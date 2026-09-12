@@ -123,6 +123,7 @@ source metadata for the files and binary under test. `source.commit` must equal
 The checked-in
 [`attempt-terminal-immutability.vectors.json`](attempt-terminal-immutability.vectors.json),
 [`capability-negotiation.vectors.json`](capability-negotiation.vectors.json),
+[`command-adoption-idempotency.vectors.json`](command-adoption-idempotency.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
 [`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
@@ -146,6 +147,7 @@ The runner invokes the target directly without a shell.
       "suites": [
         "attempt-terminal-immutability",
         "capability-negotiation",
+        "command-adoption-idempotency",
         "definition-validation",
         "event-reducer-determinism",
         "occurrence-fence-uniqueness",
@@ -163,11 +165,17 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements seven structural suites.
+The native Coven target currently implements eight structural suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
-real routine-definition parser and capability policy. `definition-validation`
+real routine-definition parser and capability policy.
+`command-adoption-idempotency` executes a valid definition create through the
+production transactional adoption path, then proves that an exact replay
+returns the committed result without duplicating the definition, adoption, or
+event while a changed request under the same adoption key is refused with
+`ADOPTION_REPLAY_MISMATCH`.
+`definition-validation`
 executes the portable v1 definition parser, integrity verification, and typed
 serialization path, accepting a canonical valid definition only when its
 normalized JCS digest matches and rejecting a tampered definition.
