@@ -11488,9 +11488,9 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             )
         };
         let mut revalidation_required = opened_window
-            && !document
+            && document
                 .scheduled()
-                .is_some_and(|proposal| proposal.veto_deadline().is_some());
+                .is_none_or(|proposal| proposal.veto_deadline().is_none());
         if revalidation_required {
             crate::daemon::append_daemon_recovery_log(
                 coven_home,
