@@ -125,12 +125,28 @@ not that POSIX primitive gap.
 
 ## Pending proposals
 
-Two lanes stage here, distinguished by `reviewKind`:
+The queue accepts two envelope kinds:
 
-- `authority` — a Tier-0 (protected) write whose thread frayed
-  (`DegradeToProposal`, coven-threads §5).
-- `coherence` — a Tier-1 (reviewed) write held for Gate-3 coherence review
-  (`docs/design/ward-gate3-coherence.md`).
+- legacy proposals distinguished by `reviewKind`:
+  `authority` records require live authority revalidation, and `coherence`
+  records hold Tier-1 reviewed writes without retired-Ward approval metadata.
+- canonical `phase5_v1` scheduled proposals for reviewed writes whose Ward
+  declares `editable.harness_blocks` + `approval_tiers` and whose staged diff
+  binds entirely to the daemon's typed region predicates. These carry
+  `classification.approval_path`, `materialized_diff`, `region_evidence`, and
+  derived lifecycle/deadline fields; `reviewKind` is intentionally absent.
+
+If approval metadata cannot produce authoritative typed evidence for the staged
+diff, the daemon returns `409 scheduled_publication_invalid` instead of falling
+back to a weaker legacy proposal.
+
+Neither label grants protected-write authority. Tier-0 intake returns
+`protected_proposal_forbidden`, even with a supplied fingerprint or approval
+identifier, and appends a non-authorizing rejection receipt. A queued target
+that becomes protected is refused on decision or scheduler revalidation.
+If an interrupted apply may already have changed its bytes, Coven preserves
+the recovery evidence in quarantine instead of inventing an unapplied
+rejection.
 
 The active queue accepts at most **64 proposals** and **64 MiB
 (67,108,864 bytes)** of exact serialized pending/decision-claim data. Coven
@@ -161,9 +177,16 @@ consult the daemon recovery log, preserve any needed evidence, and delete old
 quarantine artifacts under the normal retention policy. Unknown ids fail with
 `proposal_not_found`.
 
-Proposals older than 30 days are terminally rejected by the scheduler with
-audit decision `expired`; target files are never applied. Interrupted expiry
-uses the same durable decision-request recovery path as principal decisions.
+No-window proposals older than 30 days are terminally rejected with audit
+decision `expired`; their target files are not applied. An opened veto window
+does not expire through this retention shortcut. Its deadline triggers replay
+and one typed terminal close. Interrupted decisions use the same durable
+decision-request recovery path as principal decisions.
+
+Quarantine is not a terminal close. When a previous apply is unresolved, its
+audit capacity reservation stays attached to the preserved recovery evidence.
+Resolve that state explicitly rather than deleting the evidence or claiming
+that the proposal was never applied.
 
 Every newly staged proposal carries deterministic, offline probe evidence.
 The list prints its aggregate `passed`, `failed`, or `unscored` status;
@@ -320,4 +343,56 @@ fail with `familiar_not_found`.
 `coven ward migrate` inspects (and with `--apply`, rewrites) v0.1
 `ward.toml` files into the Phase-2 `WardConfig` dialect. Use `--familiar
 <ID>` to scope to one familiar and `--fingerprint <FPR>` to set the
-principal binding. Exits non-zero if any migration fails.
+principal binding. Veto-bearing approval metadata must explicitly declare both
+`human_veto_window_hours` and `min_visible_seconds`. Migration preserves these
+values and refuses ambiguous declarations without rewriting the source or
+creating a backup. A minimum is invalid without a veto window and on human
+approval paths. The command exits non-zero if any migration fails.
+
+Accepted retired invariants become active `[[identity_invariant]]` entries,
+not backup-only annotations. You keep the original configuration in
+`ward.toml.v01.bak`.
+
+## Active identity invariants
+
+Declare deterministic identity requirements in `ward.toml` to enforce them
+through the identity-aware Threads predicate:
+
+```toml
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Fixture Familiar"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Fixture Principal"
+```
+
+Both `name` and `person` are mandatory when you configure invariants. Supported
+facts are `name`, `person`, `pronouns`, `purpose`, and `coven`; supported
+operators are `equals` and `includes`. Unsupported, duplicate, or incomplete
+declaration sets fail configuration loading.
+
+Coven extracts facts from the complete candidate `SOUL.md`, `IDENTITY.md`,
+and matching `[[familiar]]` roster entry, including unchanged identity files.
+It does not use the invariant's expected value as evidence. Missing,
+unparseable, or conflicting facts fail the predicate closed. Configured
+predicates run before either staging or applying a candidate, including reviewed
+and logged targets that do not edit an identity file. Candidate source
+commitments also participate in approval recovery, so changed identity
+evidence cannot reuse an earlier recovery decision.
+
+The current deterministic adapter recognizes `# I am ...` or `## I am ...`
+in `SOUL.md`, `My purpose is ...` or a `## Purpose` section, and
+`# IDENTITY.md - ...`, `- **Name:** ...`, and `- **Pronouns:** ...` in
+`IDENTITY.md`. The roster supplies the name, principal binding (`person`),
+pronouns, and Coven membership. Other prose is not an alternative authority.
+
+Existing configurations without invariants retain their previous behavior.
+A retired `[protected].invariants` block in an active Phase-2 file, or
+compilable invariants stranded only in its backup, fails loading rather than
+silently dropping protection. Preserve the backup and review the active
+declarations before restarting. These predicates do not grant a proposal
+route permission to write protected content.

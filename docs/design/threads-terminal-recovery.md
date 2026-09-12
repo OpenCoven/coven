@@ -39,8 +39,10 @@ requires an opened-window row if and only if the decision carries typed
 | `proposal_vetoed` | `vetoed` |
 | `proposal_rejected` | `evidence_diverged`, `revalidation_failed`, or `superseded` |
 
-The `superseded` reason is part of the contract. This checkpoint does not add a
-production supersession or scheduled-publication path.
+The `superseded` reason is part of the contract. The integrated decision layer
+supports explicit supersession only after validating the replacement proposal.
+See [Threads real-daemon E2E](../reference/threads-e2e.md) for supported scheduled
+intake coverage; seeded historical recovery alone does not prove that path.
 
 Deadline expiry starts revalidation. It does not authorize a write or replace
 an opened window with `proposal_expired`. Human approval without a window

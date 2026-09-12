@@ -6,7 +6,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use coven_threads_core::IdentityInvariantSet;
 use serde::Deserialize;
 
-use crate::ward::{SurfaceEntry, Tier, WardConfig, WARD_CONFIG_FILE};
+use crate::ward::{
+    ApprovalTierDeclarations, EditableConfig, SurfaceEntry, Tier, WardConfig, WARD_CONFIG_FILE,
+};
 
 const V01_BACKUP_FILE: &str = "ward.toml.v01.bak";
 
@@ -80,6 +82,7 @@ impl MigrationReport {
 struct LegacyWardConfig {
     protected: Option<LegacyProtected>,
     editable: Option<LegacyEditable>,
+    approval_tiers: Option<ApprovalTierDeclarations>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +97,8 @@ struct LegacyProtected {
 struct LegacyEditable {
     #[serde(default)]
     paths: Vec<String>,
+    #[serde(default)]
+    harness_blocks: Vec<String>,
 }
 
 pub fn run_migration(coven_home: &Path, options: WardMigrateOptions) -> Result<MigrationReport> {
@@ -151,9 +156,10 @@ fn migrate_one(
         Ok(_) => {
             // A-1 guard: WardConfig tolerates unknown fields, so a file can
             // parse as valid Phase-2 while still carrying a v0.1
-            // `[protected].invariants` remnant. Phase-2 has no invariants
-            // surface — blessing such a hybrid as AlreadyMigrated would
-            // silently ignore identity declarations. Fail closed instead.
+            // `[protected].invariants` remnant. Phase-2 uses
+            // `[[identity_invariant]]`; blessing a hybrid as AlreadyMigrated
+            // would hide that the retired declarations never crossed the
+            // active enforcement boundary. Fail closed instead.
             let remnants = v01_invariant_remnants(&raw);
             if let Some(remnants) = remnants {
                 return Ok(MigrationEntry {
@@ -166,12 +172,27 @@ fn migrate_one(
                     invariant_dispositions: Vec::new(),
                     generated_toml: None,
                     message: format!(
-                        "ward.toml parses as Phase-2 but retains a v0.1 [protected].invariants remnant ({}); Phase-2 has no invariants surface, so these would be silently inert — remove the remnant or restore the v0.1 file and re-run migration",
+                        "ward.toml parses as Phase-2 but retains a v0.1 [protected].invariants remnant ({}); move those declarations into [[identity_invariant]] tables or restore the v0.1 file and re-run migration",
                         if remnants == 0 {
                             "empty list".to_string()
                         } else {
                             format!("{remnants} declaration(s)")
                         }
+                    ),
+                });
+            }
+            if let Err(error) = WardConfig::load(workspace) {
+                return Ok(MigrationEntry {
+                    familiar_id: familiar_id.to_string(),
+                    workspace: workspace.to_path_buf(),
+                    status: MigrationStatus::Unmigratable,
+                    protected_files: Vec::new(),
+                    editable_paths: Vec::new(),
+                    translated_globs: Vec::new(),
+                    invariant_dispositions: Vec::new(),
+                    generated_toml: None,
+                    message: format!(
+                        "ward.toml parses as Phase-2 but fails identity-invariant compatibility checks: {error:#}"
                     ),
                 });
             }
@@ -244,10 +265,11 @@ fn migrate_one(
         .protected
         .map(|protected| (protected.files, protected.invariants))
         .unwrap_or_default();
-    let editable_paths = legacy
+    let (editable_paths, harness_blocks) = legacy
         .editable
-        .map(|editable| editable.paths)
+        .map(|editable| (editable.paths, editable.harness_blocks))
         .unwrap_or_default();
+    let approval_tiers = legacy.approval_tiers;
 
     // Fidelity gate for retired v0.1 identity invariants: every declaration
     // must compile deterministically through coven-threads-core or the
@@ -291,10 +313,26 @@ fn migrate_one(
             translated
         })
         .collect();
+    let compiled_identity_invariants = if legacy_invariants.is_empty() {
+        Vec::new()
+    } else {
+        IdentityInvariantSet::compile(&legacy_invariants)
+            .expect("rejection reasons were handled above")
+            .declarations()
+            .to_vec()
+    };
+    let editable_tier = if approval_tiers.is_some() {
+        Tier::Reviewed
+    } else {
+        Tier::Logged
+    };
 
     let config = WardConfig {
         principal_key_fingerprint: fingerprint.to_string(),
         protected_surface: protected_files.clone(),
+        default_tier: Tier::Logged,
+        editable: (!harness_blocks.is_empty()).then_some(EditableConfig { harness_blocks }),
+        approval_tiers,
         surface: protected_files
             .iter()
             .cloned()
@@ -308,11 +346,11 @@ fn migrate_one(
                     .cloned()
                     .map(|path| SurfaceEntry {
                         path,
-                        tier: Tier::Logged,
+                        tier: editable_tier,
                     }),
             )
             .collect(),
-        default_tier: Tier::Logged,
+        identity_invariants: compiled_identity_invariants,
         probe: Vec::new(),
     };
     let generated_toml = render_phase2_toml(&config)?;
@@ -346,7 +384,7 @@ fn migrate_one(
                     String::new()
                 } else {
                     format!(
-                        "; {} retired identity invariant(s) compiled deterministically (dry-run: backup not written, not carried into Phase-2 ward.toml)",
+                        "; {} retired identity invariant(s) compiled deterministically (dry-run: backup not written, would be written as [[identity_invariant]] tables)",
                         invariant_dispositions.len()
                     )
                 }
@@ -446,7 +484,7 @@ fn invariant_summary_suffix(dispositions: &[InvariantDisposition]) -> String {
         return String::new();
     }
     format!(
-        "; {} retired identity invariant(s) compiled deterministically (preserved in {}, not carried into Phase-2 ward.toml)",
+        "; {} retired identity invariant(s) compiled into Phase-2 ward.toml as [[identity_invariant]] tables (original preserved in {}; compilation is deterministic)",
         dispositions.len(),
         V01_BACKUP_FILE,
     )
@@ -524,7 +562,11 @@ pub fn print_report(report: &MigrationReport) {
             );
         }
         if !entry.editable_paths.is_empty() {
-            println!("  editable -> tier 2: {}", entry.editable_paths.join(", "));
+            let editable_tier = migrated_editable_tier(entry);
+            println!(
+                "  editable -> tier {editable_tier}: {}",
+                entry.editable_paths.join(", ")
+            );
         }
         for (from, to) in &entry.translated_globs {
             println!("  translated glob: {from} -> {to}");
@@ -548,6 +590,15 @@ pub fn print_report(report: &MigrationReport) {
             println!("  round-trip validation: {validation}");
         }
     }
+}
+
+fn migrated_editable_tier(entry: &MigrationEntry) -> u8 {
+    entry
+        .generated_toml
+        .as_deref()
+        .filter(|generated| generated.contains("[approval_tiers."))
+        .map(|_| 1)
+        .unwrap_or(2)
 }
 
 #[cfg(test)]
@@ -591,18 +642,21 @@ owner = "nova"
 files = ["SOUL.md", "IDENTITY.md"]
 invariants = [
     "familiar.name == 'Nova'",
-    "familiar.person == \"Val Alexander\"",
+    "familiar.person == \"Example principal\"",
     "familiar.pronouns == 'they/them'",
     "familiar.purpose includes 'authority boundary'",
     "familiar.coven includes \"OpenCoven\"",
 ]
 
 [editable]
-paths = ["skills/*/", "memory/*", "notes/"]
-harness_blocks = ["synthetic-harness"]
+paths = ["TOOLS.md", "HEARTBEAT.md"]
+harness_blocks = ["tool_defaults", "heartbeat_behavior"]
 
-[approval_tiers.tier0]
-required = ["principal"]
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults", "heartbeat_behavior"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
 
 [audit]
 append_only = true
@@ -643,9 +697,7 @@ append_only = true
         assert!(!report.has_errors());
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].status, MigrationStatus::WouldMigrate);
-        assert!(report.entries[0]
-            .translated_globs
-            .contains(&("memory/*".to_string(), "memory/**".to_string())));
+        assert!(report.entries[0].translated_globs.is_empty());
         assert_eq!(
             report.entries[0].invariant_dispositions,
             [
@@ -675,8 +727,9 @@ append_only = true
         // v0.1 backup; the generated Phase-2 ward.toml has no invariants
         // surface, so they must not leak into it.
         assert!(!generated.contains("invariants"));
-        assert!(!generated.contains("harness_blocks"));
-        assert!(!generated.contains("approval_tiers"));
+        assert!(generated.contains("harness_blocks"));
+        assert!(generated.contains("[approval_tiers.familiar_review]"));
+        assert!(generated.contains("min_visible_seconds = 900"));
         assert!(!generated.contains("[audit]"));
         let config = WardConfig::from_toml_str(generated)?;
         assert_eq!(config.principal_key_fingerprint, "SHA256:test-principal");
@@ -691,17 +744,12 @@ append_only = true
             .map(|entry| entry.path.clone())
             .collect();
         assert_eq!(config.protected_surface, tier0);
-
         let ward = Ward::new(workspace, config)?;
         let outcome = ward.evaluate(&Proposal {
-            targets: vec![
-                "skills/rust/SKILL.md".to_string(),
-                "memory/deep/fact.md".to_string(),
-                "notes/today.md".to_string(),
-            ],
+            targets: vec!["TOOLS.md".to_string(), "HEARTBEAT.md".to_string()],
             authorization: Authorization::default(),
         });
-        assert!(outcome.decisions.iter().all(|d| d.tier == Tier::Logged));
+        assert!(outcome.decisions.iter().all(|d| d.tier == Tier::Reviewed));
         Ok(())
     }
 
@@ -741,6 +789,76 @@ append_only = true
         assert!(!second.has_errors());
         assert_eq!(second.entries[0].status, MigrationStatus::AlreadyMigrated);
         Ok(())
+    }
+
+    #[test]
+    fn migration_refuses_veto_without_explicit_minimum_without_writing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = seed_familiars(temp.path())?;
+        let original = r#"[meta]
+version = "0.1"
+owner = "nova"
+
+[protected]
+files = ["SOUL.md"]
+invariants = [
+    "familiar.name == 'Nova'",
+    "familiar.person == 'Example principal'",
+]
+
+[editable]
+paths = ["TOOLS.md"]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+"#;
+        fs::write(workspace.join("ward.toml"), original)?;
+
+        let report = run_migration(
+            temp.path(),
+            WardMigrateOptions {
+                familiar: Some("nova".to_string()),
+                fingerprint: "SHA256:test-principal".to_string(),
+                apply: true,
+            },
+        )?;
+
+        assert!(report.has_errors());
+        let entry = &report.entries[0];
+        assert_eq!(entry.status, MigrationStatus::ValidationFailed);
+        assert!(entry
+            .message
+            .contains("requires explicit min_visible_seconds"));
+        assert_eq!(fs::read(workspace.join("ward.toml"))?, original.as_bytes());
+        assert!(!workspace.join("ward.toml.v01.bak").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn migration_report_detects_reviewed_editable_tier_from_nested_approval_tables() {
+        let reviewed = MigrationEntry {
+            familiar_id: "nova".to_string(),
+            workspace: PathBuf::from("/tmp/nova"),
+            status: MigrationStatus::Migrated,
+            protected_files: Vec::new(),
+            editable_paths: vec!["TOOLS.md".to_string()],
+            translated_globs: Vec::new(),
+            invariant_dispositions: Vec::new(),
+            generated_toml: Some(
+                "[approval_tiers.familiar_review]\nblocks = [\"tool_defaults\"]\n".to_string(),
+            ),
+            message: "ok".to_string(),
+        };
+        let logged = MigrationEntry {
+            generated_toml: Some("[surface]\npath = \"notes/\"\ntier = 2\n".to_string()),
+            ..reviewed.clone()
+        };
+
+        assert_eq!(migrated_editable_tier(&reviewed), 1);
+        assert_eq!(migrated_editable_tier(&logged), 2);
     }
 
     fn synthetic_v01_with_invariants(invariants_toml: &str) -> String {
@@ -804,23 +922,23 @@ paths = ["notes/"]
         // mandatory name/person cases mirror the retired-Ward corpus grammar.
         let cases: &[(&str, &str)] = &[
             (
-                r#"invariants = ["familiar.mood == 'sunny'", "familiar.name == 'Nova'", "familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.mood == 'sunny'", "familiar.name == 'Nova'", "familiar.person == 'Example principal'"]"#,
                 "unsupported identity fact",
             ),
             (
-                r#"invariants = ["familiar.name matches 'Nova'", "familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.name matches 'Nova'", "familiar.person == 'Example principal'"]"#,
                 "expected `==` or `includes` operator",
             ),
             (
-                r#"invariants = ["familiar.name == 'Nova'", "familiar.name == 'Supernova'", "familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.name == 'Nova'", "familiar.name == 'Supernova'", "familiar.person == 'Example principal'"]"#,
                 "duplicate Name identity invariant",
             ),
             (
-                r#"invariants = ["familiar.name == ''", "familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.name == ''", "familiar.person == 'Example principal'"]"#,
                 "expected value must not be empty",
             ),
             (
-                r#"invariants = ["familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.person == 'Example principal'"]"#,
                 "missing mandatory Name identity invariant",
             ),
             (
@@ -929,7 +1047,7 @@ paths = ["notes/"]
     }
 
     #[test]
-    fn apply_preserves_compiled_invariants_in_backup_only() -> Result<()> {
+    fn identity_predicate_apply_preserves_compiled_invariants_in_active_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = seed_familiars(temp.path())?;
         let original = synthetic_v01();
@@ -948,15 +1066,17 @@ paths = ["notes/"]
         let entry = &report.entries[0];
         assert_eq!(entry.status, MigrationStatus::Migrated);
         assert_eq!(entry.invariant_dispositions.len(), 5);
-        assert!(entry
-            .message
-            .contains("preserved in ward.toml.v01.bak, not carried into Phase-2 ward.toml"));
+        assert!(entry.message.contains("compiled into Phase-2 ward.toml"));
 
-        // The declarations survive verbatim in the backup and only there.
+        // The declarations survive verbatim in the backup and actively in the
+        // Phase-2 config.
         let backup = fs::read_to_string(workspace.join("ward.toml.v01.bak"))?;
         assert!(backup.contains("familiar.name == 'Nova'"));
         let migrated = fs::read_to_string(workspace.join("ward.toml"))?;
-        assert!(!migrated.contains("invariants"));
+        assert!(migrated.contains("[[identity_invariant]]"));
+        assert!(migrated.contains("fact = \"name\""));
+        assert!(migrated.contains("fact = \"person\""));
+        assert!(!migrated.contains("[protected]\ninvariants"));
         Ok(())
     }
 

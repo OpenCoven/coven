@@ -60,10 +60,10 @@ struct FamiliarsFile {
 }
 
 #[derive(Debug, Deserialize)]
-struct FamiliarEntry {
-    id: String,
-    name: Option<String>,
-    display_name: String,
+pub(crate) struct FamiliarEntry {
+    pub(crate) id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) display_name: String,
     emoji: Option<String>,
     /// See [`FamiliarDto::icon`]. Free-form string at this layer — the
     /// renderer decides whether to treat a `ph:` prefix as an icon vs.
@@ -71,7 +71,9 @@ struct FamiliarEntry {
     icon: Option<String>,
     role: String,
     description: String,
-    pronouns: Option<String>,
+    pub(crate) pronouns: Option<String>,
+    pub(crate) person: Option<String>,
+    pub(crate) coven: Option<String>,
     active_channel: Option<String>,
     /// Explicit workspace path for this familiar. When set, the daemon uses this
     /// instead of the conventional `~/.coven/familiars/<id>/` path.
@@ -143,7 +145,7 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
     Ok(out)
 }
 
-fn read_familiar_entries(coven_home: &Path) -> Result<Vec<FamiliarEntry>> {
+pub(crate) fn read_familiar_entries(coven_home: &Path) -> Result<Vec<FamiliarEntry>> {
     let path = coven_home.join(FAMILIARS_CONFIG_FILE);
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,

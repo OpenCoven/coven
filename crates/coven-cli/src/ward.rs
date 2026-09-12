@@ -132,6 +132,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 #[cfg(not(unix))]
 use cap_std::fs::OpenOptions as CapOpenOptions;
+use coven_threads_core::{self as threads, IdentityInvariantDeclaration, IdentityInvariantSet};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use unicode_casefold::UnicodeCaseFold;
@@ -266,21 +267,71 @@ pub enum ProbeFormat {
     MarkdownFrontMatter,
 }
 
+/// Retired-Ward metadata the daemon can bind to typed proposal regions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EditableConfig {
+    /// Region ids the daemon is allowed to compile into typed approval paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harness_blocks: Vec<String>,
+}
+
+/// Approval-tier declarations compiled into typed `ApprovalPath`s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ApprovalTierDeclarations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<ApprovalTierDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub familiar_review: Option<ApprovalTierDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_review: Option<ApprovalTierDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_required: Option<ApprovalTierDeclaration>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalTierDeclaration {
+    pub blocks: Vec<String>,
+    pub gate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cave_board_card: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_veto_window_hours: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_visible_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompiledApprovalTiers {
+    region_paths: BTreeMap<String, threads::ApprovalPath>,
+}
+
+impl CompiledApprovalTiers {
+    pub(crate) fn approval_path_for(
+        &self,
+        region_id: &threads::SurfaceRegionId,
+    ) -> Option<&threads::ApprovalPath> {
+        self.region_paths.get(region_id.as_str())
+    }
+}
+
 /// A familiar's Ward configuration — the declared surface plus the principal
 /// binding that authorizes Tier 0 changes.
 ///
 /// Loadable from a `ward.toml` (see [`WardConfig::from_toml_str`]). The type is
 /// also `serde`-portable to JSON so it can ride inside a `familiar.yaml`
 /// identity block once a YAML loader feeds it in.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WardConfig {
     /// Fingerprint of the principal's signing key. A Tier 0 modification is
     /// authorized only if its proposal carries a signature with this
     /// fingerprint (Gate 1).
     pub principal_key_fingerprint: String,
-    /// Declared surface regions.
-    #[serde(default)]
-    pub surface: Vec<SurfaceEntry>,
     /// The Tier 0 paths, enumerated explicitly. Validated to match exactly the
     /// set of `tier = 0` entries (Familiar Spec validation rule 6).
     #[serde(default)]
@@ -290,6 +341,24 @@ pub struct WardConfig {
     /// stays large while unknown edits are still recorded — not frozen.
     #[serde(default = "default_unmatched_tier")]
     pub default_tier: Tier,
+    /// Typed Gate-4 identity invariants materialized from canonical sources.
+    /// The singular rename maps to TOML's repeated `[[identity_invariant]]`
+    /// tables while keeping the Rust field readable.
+    #[serde(
+        default,
+        rename = "identity_invariant",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub identity_invariants: Vec<IdentityInvariantDeclaration>,
+    /// Retired-Ward region declarations that compile to typed approval paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editable: Option<EditableConfig>,
+    /// Retired-Ward approval tiers preserved verbatim for daemon compilation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_tiers: Option<ApprovalTierDeclarations>,
+    /// Declared surface regions.
+    #[serde(default)]
+    pub surface: Vec<SurfaceEntry>,
     /// Deterministic, advisory Gate-3 probes. The singular field name maps to
     /// TOML's repeated `[[probe]]` tables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -300,8 +369,14 @@ fn default_unmatched_tier() -> Tier {
     Tier::Logged
 }
 
+const APPROVAL_GATE_AUTO: &str = "regression_suite";
+const APPROVAL_GATE_FAMILIAR_REVIEW: &str = "familiar_coherence_check";
+const APPROVAL_GATE_HUMAN_REVIEW: &str = "human_approval";
+const APPROVAL_GATE_HUMAN_REQUIRED: &str = "human_approval_with_rationale";
+
 /// Conventional name of the Ward configuration file inside a familiar home.
 pub const WARD_CONFIG_FILE: &str = "ward.toml";
+const LEGACY_WARD_BACKUP_FILE: &str = "ward.toml.v01.bak";
 
 impl WardConfig {
     /// Load the Ward configuration from `<home>/ward.toml`.
@@ -318,9 +393,21 @@ impl WardConfig {
                 return Err(anyhow!("reading ward config {}: {err}", path.display()));
             }
         };
-        Self::from_toml_str(&raw)
-            .with_context(|| format!("invalid ward config at {}", path.display()))
-            .map(Some)
+        if let Some(remnants) = legacy_invariant_remnants(&raw) {
+            bail!(
+                "ward.toml still carries a retired [protected].invariants remnant ({remnants}); move these declarations into [[identity_invariant]] tables"
+            );
+        }
+        let config = Self::from_toml_str(&raw)
+            .with_context(|| format!("invalid ward config at {}", path.display()))?;
+        if config.identity_invariants.is_empty()
+            && backup_carries_compiled_identity_invariants(home)?
+        {
+            bail!(
+                "ward.toml.v01.bak carries compilable identity invariants but active ward.toml has none; rerun migration or add [[identity_invariant]] entries"
+            );
+        }
+        Ok(Some(config))
     }
 
     /// Parse a `ward.toml` document.
@@ -338,6 +425,7 @@ impl WardConfig {
         if self.principal_key_fingerprint.trim().is_empty() {
             bail!("ward config has an empty principal_key_fingerprint; a familiar with no principal cannot be warded");
         }
+        self.identity_invariant_set()?;
 
         let declared_tier0: BTreeSet<&str> = self
             .surface
@@ -357,6 +445,8 @@ impl WardConfig {
                  not declared tier-0: {extra:?}"
             );
         }
+
+        self.compiled_approval_tiers()?;
 
         for (index, probe) in self.probe.iter().enumerate() {
             if probe.surface.trim().is_empty() {
@@ -404,6 +494,246 @@ impl WardConfig {
 
         Ok(())
     }
+
+    pub(crate) fn identity_invariant_set(&self) -> Result<Option<IdentityInvariantSet>> {
+        if self.identity_invariants.is_empty() {
+            return Ok(None);
+        }
+        IdentityInvariantSet::try_new(self.identity_invariants.clone())
+            .map(Some)
+            .map_err(|error| anyhow!(error))
+    }
+}
+
+fn legacy_invariant_remnants(raw: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(raw).ok()?;
+    let invariants = value.get("protected")?.get("invariants")?;
+    Some(match invariants.as_array() {
+        Some(array) => {
+            if array.is_empty() {
+                "empty list".to_string()
+            } else {
+                format!("{} declaration(s)", array.len())
+            }
+        }
+        None => "1 declaration".to_string(),
+    })
+}
+
+fn backup_carries_compiled_identity_invariants(home: &Path) -> Result<bool> {
+    let backup = home.join(LEGACY_WARD_BACKUP_FILE);
+    let raw = match std::fs::read_to_string(&backup) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading legacy Ward backup {}", backup.display()))
+        }
+    };
+    let value: toml::Value = match toml::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let declarations = match value
+        .get("protected")
+        .and_then(|protected| protected.get("invariants"))
+        .and_then(toml::Value::as_array)
+    {
+        Some(declarations) => declarations
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        None => return Ok(false),
+    };
+    if declarations.is_empty() {
+        return Ok(false);
+    }
+    Ok(IdentityInvariantSet::compile(declarations).is_ok())
+}
+
+impl WardConfig {
+    pub(crate) fn classify_resolved_path(&self, resolved: &str) -> Result<Tier> {
+        let mut tier = self.default_tier;
+        for entry in &self.surface {
+            let matcher = compile_glob(&entry.path, false)
+                .with_context(|| format!("invalid surface glob `{}`", entry.path))?
+                .compile_matcher();
+            if matcher.is_match(resolved) && entry.tier.as_u8() < tier.as_u8() {
+                tier = entry.tier;
+            }
+        }
+        Ok(tier)
+    }
+
+    pub(crate) fn compiled_approval_tiers(&self) -> Result<Option<CompiledApprovalTiers>> {
+        let (Some(editable), Some(approval_tiers)) = (&self.editable, &self.approval_tiers) else {
+            if self.editable.is_some() || self.approval_tiers.is_some() {
+                bail!(
+                    "ward config must declare [editable].harness_blocks and [approval_tiers] together"
+                );
+            }
+            return Ok(None);
+        };
+
+        if editable.harness_blocks.is_empty() {
+            bail!(
+                "ward config [editable].harness_blocks must not be empty when [approval_tiers] is present"
+            );
+        }
+        if let Some(tier) = approval_tiers.extra.keys().next() {
+            bail!("ward config approval_tiers contains unknown tier `{tier}`");
+        }
+
+        let known_regions: BTreeSet<String> = threads::SurfaceRegionRegistry::default_registry()
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.region_id.as_str().to_string())
+            .collect();
+        let mut declared_blocks = BTreeSet::new();
+        for (index, block) in editable.harness_blocks.iter().enumerate() {
+            if block.trim().is_empty() {
+                bail!("editable.harness_blocks[{index}] must not be blank");
+            }
+            if !known_regions.contains(block) {
+                bail!(
+                    "editable.harness_blocks[{index}] `{block}` has no typed daemon region binding"
+                );
+            }
+            if !declared_blocks.insert(block.clone()) {
+                bail!("editable.harness_blocks declares duplicate block `{block}`");
+            }
+        }
+
+        let mut region_paths = BTreeMap::new();
+        let mut saw_tier = false;
+        for (tier_name, expected_gate, declaration) in [
+            ("auto", APPROVAL_GATE_AUTO, approval_tiers.auto.as_ref()),
+            (
+                "familiar_review",
+                APPROVAL_GATE_FAMILIAR_REVIEW,
+                approval_tiers.familiar_review.as_ref(),
+            ),
+            (
+                "human_review",
+                APPROVAL_GATE_HUMAN_REVIEW,
+                approval_tiers.human_review.as_ref(),
+            ),
+            (
+                "human_required",
+                APPROVAL_GATE_HUMAN_REQUIRED,
+                approval_tiers.human_required.as_ref(),
+            ),
+        ] {
+            let Some(declaration) = declaration else {
+                continue;
+            };
+            saw_tier = true;
+            if declaration.gate != expected_gate {
+                bail!(
+                    "approval_tiers.{tier_name}.gate must be `{expected_gate}`, found `{}`",
+                    declaration.gate
+                );
+            }
+            if declaration.blocks.is_empty() {
+                bail!("approval_tiers.{tier_name}.blocks must not be empty");
+            }
+            if matches!(tier_name, "human_review" | "human_required")
+                && declaration.human_veto_window_hours.is_some()
+            {
+                bail!(
+                    "approval_tiers.{tier_name}.human_veto_window_hours is only valid on auto and familiar_review"
+                );
+            }
+            if matches!(tier_name, "human_review" | "human_required")
+                && declaration.min_visible_seconds.is_some()
+            {
+                bail!(
+                    "approval_tiers.{tier_name}.min_visible_seconds is not valid on human approval paths"
+                );
+            }
+            if !matches!(tier_name, "human_review" | "human_required")
+                && declaration.human_veto_window_hours.is_none()
+                && declaration.min_visible_seconds.is_some()
+            {
+                bail!(
+                    "approval_tiers.{tier_name}.min_visible_seconds requires human_veto_window_hours"
+                );
+            }
+
+            let approval_path = match tier_name {
+                "auto" => threads::ApprovalPath::AutoRegression {
+                    veto: declared_veto_window(tier_name, declaration)?,
+                },
+                "familiar_review" => threads::ApprovalPath::FamiliarCoherence {
+                    veto: declared_veto_window(tier_name, declaration)?.context(
+                        "approval_tiers.familiar_review requires human_veto_window_hours and explicit min_visible_seconds",
+                    )?,
+                },
+                "human_review" => threads::ApprovalPath::HumanApproval,
+                "human_required" => threads::ApprovalPath::HumanApprovalWithRationale,
+                _ => unreachable!("known approval tier names are enumerated above"),
+            };
+
+            for (index, block) in declaration.blocks.iter().enumerate() {
+                if block.trim().is_empty() {
+                    bail!("approval_tiers.{tier_name}.blocks[{index}] must not be blank");
+                }
+                if !declared_blocks.contains(block) {
+                    bail!(
+                        "approval_tiers.{tier_name}.blocks[{index}] `{block}` is not declared in [editable].harness_blocks"
+                    );
+                }
+                if region_paths
+                    .insert(block.clone(), approval_path.clone())
+                    .is_some()
+                {
+                    bail!("harness block `{block}` is assigned by more than one approval tier");
+                }
+            }
+        }
+
+        if !saw_tier {
+            bail!("ward config [approval_tiers] must declare at least one tier");
+        }
+        if let Some(block) = declared_blocks
+            .iter()
+            .find(|block| !region_paths.contains_key(block.as_str()))
+        {
+            bail!("harness block `{block}` is not assigned to any approval tier");
+        }
+
+        Ok(Some(CompiledApprovalTiers { region_paths }))
+    }
+}
+
+fn declared_veto_window(
+    tier_name: &str,
+    declaration: &ApprovalTierDeclaration,
+) -> Result<Option<threads::VetoWindow>> {
+    let Some(hours) = declaration.human_veto_window_hours else {
+        return Ok(None);
+    };
+    let min_visible_seconds = declaration.min_visible_seconds.with_context(|| {
+        format!(
+            "approval_tiers.{tier_name}.human_veto_window_hours requires explicit min_visible_seconds; no implicit minimum is defined"
+        )
+    })?;
+    veto_window_from_hours(hours, min_visible_seconds)
+        .with_context(|| format!("approval_tiers.{tier_name}.min_visible_seconds is invalid"))
+        .map(Some)
+}
+
+fn veto_window_from_hours(hours: u64, min_visible_seconds: u64) -> Result<threads::VetoWindow> {
+    if hours == 0 {
+        bail!("human_veto_window_hours must be at least 1");
+    }
+    let duration_secs = hours
+        .checked_mul(60)
+        .and_then(|minutes| minutes.checked_mul(60))
+        .context("human_veto_window_hours overflowed a duration")?;
+    let duration = std::time::Duration::from_secs(duration_secs);
+    let min_visible = std::time::Duration::from_secs(min_visible_seconds);
+    threads::VetoWindow::try_new(duration, min_visible).map_err(anyhow::Error::msg)
 }
 
 /// Whether a proposal carries principal authorization for Tier 0 changes.
@@ -686,6 +1016,15 @@ pub enum Disposition {
 pub(crate) enum ApprovedApplyMode {
     Initial,
     Recovery,
+}
+
+pub(crate) type ApprovedCommitCheck<'a> = Option<&'a mut dyn FnMut() -> Result<()>>;
+
+fn run_approved_commit_check(check: &mut ApprovedCommitCheck<'_>) -> Result<()> {
+    if let Some(check) = check.as_deref_mut() {
+        check()?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1329,6 +1668,25 @@ impl Ward {
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
     ) -> Result<ApplyReport> {
+        self.apply_after_threads_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_threads_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Vec<u8>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
+    ) -> Result<ApplyReport> {
         (|| -> Result<()> {
             let mut budget = validate_file_edit_budget(edits)?;
             WardEditBudget::for_edit_count(expected_before.len())?;
@@ -1384,6 +1742,7 @@ impl Ward {
             outcome.decisions,
             &expected_before,
             mode,
+            final_authority_check,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -1403,6 +1762,25 @@ impl Ward {
         expected_before: &BTreeMap<String, Option<Vec<u8>>>,
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
+    ) -> Result<ApplyReport> {
+        self.apply_after_coherence_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_coherence_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
     ) -> Result<ApplyReport> {
         validate_approved_edit_budget(edits, expected_before)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -1449,6 +1827,84 @@ impl Ward {
             outcome.decisions,
             expected_before,
             mode,
+            final_authority_check,
+        )?;
+        Ok(ApplyReport { changes })
+    }
+
+    /// Apply edits after scheduled approval semantics have already been
+    /// resolved. Unlike explicit coherence approval, scheduled proposals may
+    /// target reviewed, logged, or free surfaces, but they must still fail
+    /// closed on protected or blocked targets and remain bound to the staged
+    /// before-images.
+    pub(crate) fn apply_after_scheduled_approval(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+    ) -> Result<ApplyReport> {
+        self.apply_after_scheduled_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_scheduled_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
+    ) -> Result<ApplyReport> {
+        validate_approved_edit_budget(edits, expected_before)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let anchored_home = AnchoredHome::open(&self.home)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let proposal = Proposal {
+            targets: edits.iter().map(|edit| edit.target.clone()).collect(),
+            authorization: authorization.clone(),
+        };
+        let outcome = self.evaluate_with_home(&proposal, Some(&anchored_home.absolute));
+        maybe_swap_evaluated_home(&self.home)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        ensure_expected_resolutions(&outcome.decisions, expected_resolved)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let refused = outcome.decisions.iter().any(|decision| {
+            matches!(
+                decision.verdict,
+                Verdict::AuthorizedProtectedChange | Verdict::Blocked { .. }
+            )
+        });
+        if refused {
+            let changes = outcome
+                .decisions
+                .into_iter()
+                .map(|decision| AppliedChange {
+                    disposition: Disposition::Refused,
+                    decision,
+                    audit: None,
+                })
+                .collect();
+            return Ok(ApplyReport { changes });
+        }
+        anchored_home
+            .verify_path_unchanged()
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let changes = write_atomically_if_unchanged(
+            &anchored_home,
+            edits,
+            outcome.decisions,
+            expected_before,
+            mode,
+            final_authority_check,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -2299,6 +2755,7 @@ fn write_atomically_if_unchanged(
     decisions: Vec<Decision>,
     expected_before: &BTreeMap<String, Option<Vec<u8>>>,
     mode: ApprovedApplyMode,
+    mut final_authority_check: ApprovedCommitCheck<'_>,
 ) -> Result<Vec<AppliedChange>> {
     validate_approved_edit_budget(edits, expected_before)
         .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -2386,6 +2843,9 @@ fn write_atomically_if_unchanged(
     }
 
     let mut swapped = Vec::new();
+    if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
+        return fail_after_conditional_rollback(&prepared, &swapped, error);
+    }
     for index in 0..prepared.len() {
         if prepared[index].already_applied {
             continue;
@@ -2397,6 +2857,9 @@ fn write_atomically_if_unchanged(
                 .as_ref()
                 .context("prepared approved write has no staging paths")?;
             if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
+                return fail_after_conditional_rollback(&prepared, &swapped, error);
+            }
+            if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
                 return fail_after_conditional_rollback(&prepared, &swapped, error);
             }
             if write.expected_before.is_some() {
@@ -2494,6 +2957,9 @@ fn write_atomically_if_unchanged(
         if let Err(error) = verification {
             return fail_after_conditional_rollback(&prepared, &swapped, error);
         }
+        if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
+            return fail_after_conditional_rollback(&prepared, &swapped, error);
+        }
     }
 
     let final_verification = (|| -> Result<()> {
@@ -2543,6 +3009,7 @@ fn write_atomically_if_unchanged(
                 &changed,
             )?;
         }
+        run_approved_commit_check(&mut final_authority_check)?;
         Ok(())
     })();
     if let Err(error) = final_verification {
@@ -2698,10 +3165,9 @@ fn fail_after_conditional_rollback(
                 ApprovedApplyFailure::RolledBack,
             )),
             Err(cleanup_error) => Err(approved_apply_error(
-                anyhow!(
-                    "{error:#}; approved proposal was rolled back but cleanup failed: \
-                     {cleanup_error:#}"
-                ),
+                error.context(format!(
+                    "approved proposal was rolled back but cleanup failed: {cleanup_error:#}"
+                )),
                 ApprovedApplyFailure::RolledBackCleanupFailed {
                     targets: prepared
                         .iter()
@@ -4416,7 +4882,7 @@ pub(crate) fn set_conditional_write_hook(path: PathBuf, replacement: Vec<u8>) {
 }
 
 #[cfg(test)]
-fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8>)>) {
+pub(crate) fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8>)>) {
     set_conditional_write_test_actions(
         trigger,
         actions
@@ -5369,6 +5835,9 @@ mod tests {
             ],
             protected_surface: vec!["SOUL.md".into(), "IDENTITY.md".into(), "USER.md".into()],
             default_tier: Tier::Logged,
+            identity_invariants: Vec::new(),
+            editable: None,
+            approval_tiers: None,
             probe: Vec::new(),
         }
     }
@@ -5497,6 +5966,8 @@ tier = 2
         assert_eq!(config.surface.len(), 2);
         assert_eq!(config.surface[0].tier, Tier::Protected);
         assert_eq!(config.default_tier, Tier::Logged);
+        assert!(config.editable.is_none());
+        assert!(config.approval_tiers.is_none());
         assert!(config.probe.is_empty());
     }
 
@@ -5535,6 +6006,104 @@ required = ["(?m)^name:"]
         let matcher = config.probe[1].surface_matcher().unwrap();
         assert!(matcher.is_match("reviewed/SKILL.md"));
         assert!(!matcher.is_match("notes/SKILL.md"));
+    }
+
+    #[test]
+    fn identity_predicate_validation_rejects_incomplete_active_invariants() {
+        let toml = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = ["SOUL.md"]
+
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Synthetic-identity"
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+"#;
+
+        let error = WardConfig::from_toml_str(toml).expect_err("must reject");
+        assert!(error
+            .to_string()
+            .contains("missing mandatory Person identity invariant declaration"));
+    }
+
+    #[test]
+    fn identity_predicate_load_rejects_backup_only_invariants() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join(WARD_CONFIG_FILE),
+            r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = ["SOUL.md"]
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+"#,
+        )
+        .expect("write ward.toml");
+        std::fs::write(
+            temp.path().join(LEGACY_WARD_BACKUP_FILE),
+            r#"[protected]
+invariants = [
+    "familiar.name == 'Synthetic-identity'",
+    "familiar.person == 'Example principal'",
+]
+"#,
+        )
+        .expect("write backup");
+
+        let error = WardConfig::load(temp.path()).expect_err("must reject");
+        assert!(error
+            .to_string()
+            .contains("ward.toml.v01.bak carries compilable identity invariants"));
+    }
+
+    #[test]
+    fn parses_retired_ward_approval_metadata() {
+        let toml = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = ["SOUL.md"]
+default_tier = 2
+
+[editable]
+harness_blocks = ["tool_defaults", "heartbeat_behavior"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults", "heartbeat_behavior"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+
+[[surface]]
+path = "HEARTBEAT.md"
+tier = 1
+"#;
+
+        let config = WardConfig::from_toml_str(toml).expect("approval metadata parses");
+        let compiled = config
+            .compiled_approval_tiers()
+            .expect("approval metadata compiles")
+            .expect("approval metadata is present");
+        assert!(matches!(
+            compiled.approval_path_for(&threads::SurfaceRegionId::new("tool_defaults")),
+            Some(threads::ApprovalPath::FamiliarCoherence { .. })
+        ));
+        assert!(matches!(
+            compiled.approval_path_for(&threads::SurfaceRegionId::new("heartbeat_behavior")),
+            Some(threads::ApprovalPath::FamiliarCoherence { .. })
+        ));
     }
 
     #[test]
@@ -5578,6 +6147,158 @@ formatter = "lenient"
 "#;
         let error = WardConfig::from_toml_str(unknown_parameter).unwrap_err();
         assert!(format!("{error:#}").contains("unknown field"));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_retired_ward_approval_metadata() {
+        let partial = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#;
+        assert!(WardConfig::from_toml_str(partial)
+            .unwrap_err()
+            .to_string()
+            .contains("declare [editable].harness_blocks and [approval_tiers] together"));
+
+        let unknown_block = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults", "mystery_block"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#;
+        assert!(WardConfig::from_toml_str(unknown_block)
+            .unwrap_err()
+            .to_string()
+            .contains("has no typed daemon region binding"));
+
+        let unbound = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults", "heartbeat_behavior"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+
+[[surface]]
+path = "HEARTBEAT.md"
+tier = 1
+"#;
+        assert!(WardConfig::from_toml_str(unbound)
+            .unwrap_err()
+            .to_string()
+            .contains("is not assigned to any approval tier"));
+
+        let missing_minimum = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#;
+        assert!(WardConfig::from_toml_str(missing_minimum)
+            .unwrap_err()
+            .to_string()
+            .contains("requires explicit min_visible_seconds"));
+
+        let excessive_minimum = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 7200
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#;
+        assert!(WardConfig::from_toml_str(excessive_minimum)
+            .unwrap_err()
+            .to_string()
+            .contains("min_visible_seconds is invalid"));
+
+        let minimum_without_veto = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.auto]
+blocks = ["tool_defaults"]
+gate = "regression_suite"
+min_visible_seconds = 900
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#;
+        assert!(WardConfig::from_toml_str(minimum_without_veto)
+            .unwrap_err()
+            .to_string()
+            .contains("min_visible_seconds requires human_veto_window_hours"));
+
+        let human_minimum = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.human_review]
+blocks = ["tool_defaults"]
+gate = "human_approval"
+min_visible_seconds = 900
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#;
+        assert!(WardConfig::from_toml_str(human_minimum)
+            .unwrap_err()
+            .to_string()
+            .contains("min_visible_seconds is not valid on human approval paths"));
     }
 
     #[test]
@@ -7947,6 +8668,7 @@ formatter = "lenient"
             vec![decision],
             &BTreeMap::from([(edit.target.clone(), Some(b"before".to_vec()))]),
             ApprovedApplyMode::Initial,
+            None,
         );
 
         #[cfg(not(windows))]

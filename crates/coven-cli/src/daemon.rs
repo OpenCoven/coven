@@ -1876,6 +1876,7 @@ pub fn background_server_spec(
     }
 }
 
+#[cfg(any(not(windows), test))]
 pub fn start_background_server(
     coven_home: &Path,
     current_exe: &Path,
@@ -1991,7 +1992,7 @@ pub fn ensure_background_server(
         current_exe,
         started_at,
         &SystemDaemonStopController,
-        &SystemDaemonStartController,
+        &SystemDaemonStartController::default(),
         deadline,
     )?;
     #[cfg(unix)]
@@ -2770,7 +2771,7 @@ pub fn restart_background_server(
         current_exe,
         started_at,
         &SystemDaemonStopController,
-        &SystemDaemonStartController,
+        &SystemDaemonStartController::default(),
         deadline,
     )
 }
@@ -2787,8 +2788,13 @@ fn restart_background_server_with_controllers_until(
     let was_running =
         stop_background_server_with_controller_until(&coven_home, stop_controller, deadline)?;
     deadline.remaining("starting Coven daemon")?;
-    let launched =
-        start_controller.start_background_server(&coven_home, current_exe, started_at)?;
+    let launched = start_with_budget_observation(
+        start_controller,
+        &coven_home,
+        current_exe,
+        started_at,
+        deadline,
+    )?;
     let Some(status) =
         start_controller.wait_for_running_daemon(&coven_home, &launched, deadline)?
     else {
@@ -2932,7 +2938,31 @@ trait DaemonStartController {
     ) -> Result<Option<DaemonStatus>>;
 }
 
-struct SystemDaemonStartController;
+#[derive(Default)]
+struct SystemDaemonStartController {
+    #[cfg(any(windows, test))]
+    child: Mutex<Option<std::process::Child>>,
+}
+
+impl SystemDaemonStartController {
+    #[cfg(any(windows, test))]
+    fn child_observation(&self) -> String {
+        let Ok(mut child) = self.child.lock() else {
+            return "child=observation-lock-poisoned".to_owned();
+        };
+        let Some(child) = child.as_mut() else {
+            return "child=not-retained".to_owned();
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => match status.code() {
+                Some(code) => format!("child=exited code={code}"),
+                None => "child=exited-without-code".to_owned(),
+            },
+            Ok(None) => "child=still-running".to_owned(),
+            Err(error) => format!("child=observation-error kind={:?}", error.kind()),
+        }
+    }
+}
 
 impl DaemonStartController for SystemDaemonStartController {
     fn start_background_server(
@@ -2941,7 +2971,26 @@ impl DaemonStartController for SystemDaemonStartController {
         current_exe: &Path,
         started_at: String,
     ) -> Result<DaemonStatus> {
-        start_background_server(coven_home, current_exe, started_at)
+        #[cfg(not(windows))]
+        {
+            start_background_server(coven_home, current_exe, started_at)
+        }
+        #[cfg(windows)]
+        {
+            prevent_background_server_stdio_handle_leaks()?;
+            start_background_server_with_spawn(coven_home, current_exe, started_at, |spec| {
+                let child = background_server_command(spec).spawn().with_context(|| {
+                    format!("failed to start Coven daemon {}", spec.program.display())
+                })?;
+                let pid = child.id();
+                *self
+                    .child
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("startup child observation lock poisoned"))? =
+                    Some(child);
+                Ok(pid)
+            })
+        }
     }
 
     fn wait_for_running_daemon(
@@ -2977,6 +3026,7 @@ impl DaemonStartController for SystemDaemonStartController {
                 },
             )
             .map(Some)
+            .with_context(|| self.child_observation())
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -3026,6 +3076,27 @@ where
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+enum WindowsStartupReadinessPhase {
+    NotProbed,
+    UnavailableOrUnmatchedHealth,
+    ConnectTimeout,
+    NoResponseBytes,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsStartupReadinessPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotProbed => "not-probed",
+            Self::UnavailableOrUnmatchedHealth => "unavailable-or-unmatched-health",
+            Self::ConnectTimeout => "connect-timeout",
+            Self::NoResponseBytes => "no-response-bytes",
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
 fn wait_for_windows_running_daemon_with_identity_probe_until<P>(
     status: &DaemonStatus,
     deadline: LifecycleDeadline,
@@ -3034,10 +3105,17 @@ fn wait_for_windows_running_daemon_with_identity_probe_until<P>(
 where
     P: FnMut(&str, LifecycleDeadline) -> Result<Option<DaemonStatus>>,
 {
+    let mut last_phase = WindowsStartupReadinessPhase::NotProbed;
     loop {
         let probe_started = Instant::now();
         let probe_timeout = deadline
-            .remaining_at(probe_started, "waiting for Coven daemon startup health")?
+            .remaining_at(probe_started, "waiting for Coven daemon startup health")
+            .with_context(|| {
+                format!(
+                    "timed out waiting for Coven daemon startup health; last_readiness={}",
+                    last_phase.label()
+                )
+            })?
             .min(WINDOWS_STARTUP_HEALTH_PROBE_SLICE);
         let probe_deadline = LifecycleDeadline {
             instant: probe_started
@@ -3048,32 +3126,43 @@ where
         // connect and silent-response probes within the outer lifecycle deadline.
         match probe(&status.socket, probe_deadline) {
             Ok(Some(live)) => return Ok(live),
-            Ok(None) => {}
-            Err(error) if windows_startup_probe_is_pending(&error) => {}
-            Err(error) => return Err(error),
+            Ok(None) => last_phase = WindowsStartupReadinessPhase::UnavailableOrUnmatchedHealth,
+            Err(error) => match windows_startup_pending_phase(&error) {
+                Some(phase) => last_phase = phase,
+                None => return Err(error),
+            },
         }
-        let remaining = deadline.remaining("waiting for Coven daemon startup health")?;
+        let remaining = deadline
+            .remaining("waiting for Coven daemon startup health")
+            .with_context(|| {
+                format!(
+                    "timed out waiting for Coven daemon startup health; last_readiness={}",
+                    last_phase.label()
+                )
+            })?;
         std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
 }
 
 /// Retry only known startup transport timeouts, never identity or protocol errors.
 #[cfg(any(windows, test))]
-fn windows_startup_probe_is_pending(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
+fn windows_startup_pending_phase(error: &anyhow::Error) -> Option<WindowsStartupReadinessPhase> {
+    error.chain().find_map(|cause| {
         cause
             .downcast_ref::<coven_client::ClientError>()
-            .is_some_and(|error| {
-                matches!(
-                    error,
-                    coven_client::ClientError::InvalidHttpResponse(message)
-                        if message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE
-                ) || matches!(
-                    error,
-                    coven_client::ClientError::Io { operation, source }
-                        if *operation == coven_client::WINDOWS_CONNECT_OPERATION
-                            && source.kind() == std::io::ErrorKind::TimedOut
-                )
+            .and_then(|error| match error {
+                coven_client::ClientError::InvalidHttpResponse(message)
+                    if message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE =>
+                {
+                    Some(WindowsStartupReadinessPhase::NoResponseBytes)
+                }
+                coven_client::ClientError::Io { operation, source }
+                    if *operation == coven_client::WINDOWS_CONNECT_OPERATION
+                        && source.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    Some(WindowsStartupReadinessPhase::ConnectTimeout)
+                }
+                _ => None,
             })
     })
 }
@@ -3539,8 +3628,13 @@ fn ensure_background_server_with_controllers_until(
         ),
         None => {
             deadline.remaining("starting Coven daemon")?;
-            let launched =
-                start_controller.start_background_server(&coven_home, current_exe, started_at)?;
+            let launched = start_with_budget_observation(
+                start_controller,
+                &coven_home,
+                current_exe,
+                started_at,
+                deadline,
+            )?;
             deadline.remaining("waiting for Coven daemon startup health")?;
             let Some(status) =
                 start_controller.wait_for_running_daemon(&coven_home, &launched, deadline)?
@@ -3554,6 +3648,53 @@ fn ensure_background_server_with_controllers_until(
             Ok(status)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum StartupSpawnPhase {
+    Before,
+    After,
+}
+
+fn format_startup_budget(
+    phase: StartupSpawnPhase,
+    deadline: LifecycleDeadline,
+    observed: Instant,
+) -> String {
+    let phase = match phase {
+        StartupSpawnPhase::Before => "before-spawn",
+        StartupSpawnPhase::After => "after-spawn",
+    };
+    format!(
+        "startup_budget phase={phase} remaining_ms={}",
+        deadline
+            .instant
+            .saturating_duration_since(observed)
+            .as_millis()
+    )
+}
+
+fn start_with_budget_observation(
+    controller: &dyn DaemonStartController,
+    coven_home: &Path,
+    current_exe: &Path,
+    started_at: String,
+    deadline: LifecycleDeadline,
+) -> Result<DaemonStatus> {
+    let before = Instant::now();
+    let result = controller.start_background_server(coven_home, current_exe, started_at);
+    let after = Instant::now();
+    // Sample around launch, then log: diagnostic I/O still consumes the original budget.
+    for (phase, observed) in [
+        (StartupSpawnPhase::Before, before),
+        (StartupSpawnPhase::After, after),
+    ] {
+        append_daemon_recovery_log(
+            coven_home,
+            &format_startup_budget(phase, deadline, observed),
+        );
+    }
+    result
 }
 
 fn is_daemon_status_parse_error(error: &anyhow::Error) -> bool {
@@ -4122,6 +4263,16 @@ fn serve_accepted_tcp_connection(
 
 #[cfg(unix)]
 pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
+    bind_api_socket_with_publisher(coven_home, |staged, target| {
+        std::fs::hard_link(staged, target)
+    })
+}
+
+#[cfg(unix)]
+fn bind_api_socket_with_publisher(
+    coven_home: &Path,
+    publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<UnixListener> {
     ensure_private_coven_home(coven_home)?;
     let socket_path = daemon_socket_path(coven_home);
     // Fail closed if the socket path would resolve outside the trusted state
@@ -4185,9 +4336,17 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
             });
         }
     }
-    let listener = UnixListener::bind(&socket_path)
+    // Keep the temporary name no longer than coven.sock, preserving Unix path limits.
+    let staged = tempfile::Builder::new()
+        .prefix(".")
+        .rand_bytes(8)
+        .tempfile_in(coven_home)
+        .context("reserving private daemon socket staging path")?
+        .into_temp_path();
+    std::fs::remove_file(&staged).context("preparing reserved daemon socket staging path")?;
+    let listener = UnixListener::bind(&staged)
         .with_context(|| format!("failed to bind Coven API socket {}", socket_path.display()))?;
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).with_context(
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).with_context(
         || {
             format!(
                 "failed to set Coven API socket permissions {}",
@@ -4195,6 +4354,11 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
             )
         },
     )?;
+    // A hard link publishes the already-private socket without replacing a raced entry.
+    publish(&staged, &socket_path).context("publishing private Coven API socket")?;
+    staged
+        .close()
+        .context("removing daemon socket staging path")?;
     Ok(listener)
 }
 
@@ -4684,9 +4848,77 @@ pub(crate) fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
     })
 }
 
+#[derive(Clone, Copy)]
+enum StartupCheckpoint {
+    StorePhase(crate::store::StoreInitializationPhase),
+    DaemonStoreBegin,
+    StoreInitializeBegin,
+    StoreInitializeEnd,
+    DaemonStoreEnd,
+    StatusPublicationBegin,
+    StatusPublicationEnd,
+}
+
+impl StartupCheckpoint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StorePhase(phase) => match phase {
+                crate::store::StoreInitializationPhase::ConnectionConfigured => {
+                    "store-connection-configured"
+                }
+                crate::store::StoreInitializationPhase::WardComplete => "store-ward-complete",
+                crate::store::StoreInitializationPhase::RuntimeComplete => "store-runtime-complete",
+                crate::store::StoreInitializationPhase::MainLockAcquired => {
+                    "store-main-lock-acquired"
+                }
+                crate::store::StoreInitializationPhase::MainSchemaComplete => {
+                    "store-main-schema-complete"
+                }
+                crate::store::StoreInitializationPhase::CommitComplete => "store-commit-complete",
+            },
+            Self::DaemonStoreBegin => "daemon-store-begin",
+            Self::StoreInitializeBegin => "store-initialize-begin",
+            Self::StoreInitializeEnd => "store-initialize-end",
+            Self::DaemonStoreEnd => "daemon-store-end",
+            Self::StatusPublicationBegin => "status-publication-begin",
+            Self::StatusPublicationEnd => "status-publication-end",
+        }
+    }
+}
+
+fn append_startup_checkpoint(coven_home: &Path, phase: StartupCheckpoint, started: Instant) {
+    // Store initialization and status publication each have their own elapsed-time origin.
+    append_daemon_recovery_log(
+        coven_home,
+        &format!(
+            "startup_checkpoint phase={} elapsed_ms={}",
+            phase.label(),
+            started.elapsed().as_millis()
+        ),
+    );
+}
+
+fn write_startup_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
+    let started = Instant::now();
+    append_startup_checkpoint(
+        coven_home,
+        StartupCheckpoint::StatusPublicationBegin,
+        started,
+    );
+    write_status(coven_home, status)?;
+    append_startup_checkpoint(coven_home, StartupCheckpoint::StatusPublicationEnd, started);
+    Ok(())
+}
+
 fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
+    let started = Instant::now();
+    append_startup_checkpoint(coven_home, StartupCheckpoint::DaemonStoreBegin, started);
     let store_path = coven_home.join("coven.sqlite3");
-    crate::store::initialize_store(&store_path)?;
+    append_startup_checkpoint(coven_home, StartupCheckpoint::StoreInitializeBegin, started);
+    crate::store::initialize_store_with_observer(&store_path, |phase| {
+        append_startup_checkpoint(coven_home, StartupCheckpoint::StorePhase(phase), started);
+    })?;
+    append_startup_checkpoint(coven_home, StartupCheckpoint::StoreInitializeEnd, started);
     let conn = crate::store::open_initialized_store(&store_path)?;
     crate::hub::initialize_hub_identity(&conn)
         .context("failed to initialize hub identity during daemon startup")?;
@@ -4713,6 +4945,7 @@ fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
             );
         }
     }
+    append_startup_checkpoint(coven_home, StartupCheckpoint::DaemonStoreEnd, started);
     Ok(())
 }
 
@@ -4770,7 +5003,7 @@ pub fn serve_forever(
     unix_listener
         .set_nonblocking(true)
         .context("failed to configure interruptible Unix API listener")?;
-    write_status(coven_home, &status)?;
+    write_startup_status(coven_home, &status)?;
     let shutdown_guard = ShutdownGuard {
         socket_path: socket_path.clone(),
         status_path: status_path.clone(),
@@ -5784,7 +6017,7 @@ fn serve_forever_with_lifetime_job_installer(
     // daemon must fail at bind without replacing the incumbent's daemon.json
     // or marking sessions owned by that live daemon orphaned.
     initialize_daemon_store(coven_home)?;
-    write_status(coven_home, &status)?;
+    write_startup_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
     recover_stale_created_sessions(coven_home, &started_at)?;
     recover_orphaned_afs_mounts(coven_home);
@@ -6426,6 +6659,46 @@ mod tests {
 
         assert_eq!(ready, status);
         assert_eq!(calls.get(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_start_wait_timeout_retains_last_readiness_phase() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let deadline = LifecycleDeadline::after(Duration::from_secs(1))?;
+        let error =
+            wait_for_windows_running_daemon_with_identity_probe_until(&status, deadline, |_, _| {
+                std::thread::sleep(deadline.instant.saturating_duration_since(Instant::now()));
+                Err(anyhow::Error::new(
+                    coven_client::ClientError::InvalidHttpResponse(
+                        coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE.to_owned(),
+                    ),
+                ))
+            })
+            .expect_err("exhausted readiness budget");
+        assert!(
+            format!("{error:#}").contains("last_readiness=no-response-bytes"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_child_observation_reports_exit_without_signaling() -> Result<()> {
+        let executable = std::env::current_exe()?;
+        let mut child = Command::new(executable)
+            .args([
+                "--list",
+                "startup_child_observation_reports_exit_without_signaling",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let exited = child.wait()?;
+        assert!(exited.success());
+        let controller = SystemDaemonStartController::default();
+        *controller.child.lock().unwrap() = Some(child);
+        assert_eq!(controller.child_observation(), "child=exited code=0");
         Ok(())
     }
 
@@ -10442,6 +10715,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn bind_api_socket_publishes_private_listener_atomically() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let listener = bind_api_socket_with_publisher(home.path(), |staged, target| {
+            assert!(!target.exists());
+            let metadata = std::fs::symlink_metadata(staged)?;
+            assert!(metadata.file_type().is_socket());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert!(staged.file_name().unwrap().len() <= target.file_name().unwrap().len());
+            std::fs::hard_link(staged, target)
+        })?;
+        let client = UnixStream::connect(daemon_socket_path(home.path()))?;
+        let (server, _) = listener.accept()?;
+        assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
+        drop((client, server, listener));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_api_socket_never_clobbers_a_raced_publication_target() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let result = bind_api_socket_with_publisher(home.path(), |staged, target| {
+            std::fs::write(target, b"unrelated raced file")?;
+            std::fs::hard_link(staged, target)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(daemon_socket_path(home.path()))?,
+            b"unrelated raced file"
+        );
+        assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bind_api_socket_hardens_coven_home_permissions() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o755))?;
@@ -11471,6 +11780,22 @@ mod tests {
         assert_eq!(*started.lock().unwrap(), 1);
         assert_eq!(status.pid, 54321);
         assert_eq!(read_status(temp_dir.path())?, Some(status));
+        let log = std::fs::read_to_string(daemon_recovery_log_path(temp_dir.path()))?;
+        let observations: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once("startup_budget "))
+            .map(|(_, observation)| observation)
+            .collect();
+        assert_eq!(observations.len(), 2);
+        let mut previous = DAEMON_LIFECYCLE_TIMEOUT.as_millis();
+        for (observation, phase) in observations.iter().zip(["before-spawn", "after-spawn"]) {
+            let remaining = observation
+                .strip_prefix(&format!("phase={phase} remaining_ms="))
+                .context("unexpected budget fields")?
+                .parse::<u128>()?;
+            assert!(remaining <= previous);
+            previous = remaining;
+        }
         Ok(())
     }
 
@@ -13063,6 +13388,236 @@ mod tests {
             status_path.exists(),
             "an older daemon must not remove newer daemon status on shutdown"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_budget_distinguishes_parent_cost_from_child_store_elapsed() {
+        let start = Instant::now();
+        let deadline = LifecycleDeadline::from_instant(start + DAEMON_LIFECYCLE_TIMEOUT);
+        // Synthetic timelines, not measurements of Windows or an E2E reproduction.
+        // The same child store duration can fit or exhaust the parent's deadline.
+        for (preparation_ms, launch_ms, expected_before, expected_after, fits) in [
+            (50, 10, 1950, 1940, true),
+            (1500, 10, 500, 490, false),
+            (50, 1460, 1950, 490, false),
+        ] {
+            let before = start + Duration::from_millis(preparation_ms);
+            let after = before + Duration::from_millis(launch_ms);
+            assert_eq!(
+                format_startup_budget(StartupSpawnPhase::Before, deadline, before),
+                format!("startup_budget phase=before-spawn remaining_ms={expected_before}")
+            );
+            assert_eq!(
+                format_startup_budget(StartupSpawnPhase::After, deadline, after),
+                format!("startup_budget phase=after-spawn remaining_ms={expected_after}")
+            );
+            // This fixture puts child store entry after launch returns. Real child
+            // execution can overlap launch; neither budget sample locates store entry.
+            let store_begin = after + Duration::from_millis(20);
+            let store_end = store_begin + Duration::from_millis(600);
+            assert_eq!(
+                store_end.duration_since(store_begin),
+                Duration::from_millis(600)
+            );
+            assert_eq!(
+                deadline
+                    .remaining_at(store_end, "waiting for Coven daemon startup health")
+                    .is_ok(),
+                fits
+            );
+        }
+    }
+
+    #[test]
+    fn startup_budget_is_not_renewed_between_launch_and_readiness() -> Result<()> {
+        struct BudgetCheckingStart {
+            expected: LifecycleDeadline,
+            launches: std::cell::Cell<usize>,
+            waits: std::cell::Cell<usize>,
+        }
+
+        impl DaemonStartController for BudgetCheckingStart {
+            fn start_background_server(
+                &self,
+                coven_home: &Path,
+                _current_exe: &Path,
+                started_at: String,
+            ) -> Result<DaemonStatus> {
+                self.launches.set(self.launches.get() + 1);
+                Ok(DaemonStatus {
+                    pid: 54321,
+                    started_at,
+                    socket: test_daemon_status_socket(coven_home),
+                    process_creation_time: None,
+                })
+            }
+
+            fn wait_for_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                deadline: LifecycleDeadline,
+            ) -> Result<Option<DaemonStatus>> {
+                self.waits.set(self.waits.get() + 1);
+                assert_eq!(deadline.instant, self.expected.instant);
+                // Advance only the observation, never sleep or renew the deadline.
+                deadline.remaining_at(
+                    self.expected.instant,
+                    "waiting for Coven daemon startup health",
+                )?;
+                anyhow::bail!("expired startup budget was accepted")
+            }
+        }
+
+        for restart in [false, true] {
+            let home = tempfile::tempdir()?;
+            // Hang guard for real filesystem preparation, not a promptness assertion.
+            // Expiry itself is exercised at an exact synthetic instant above.
+            let deadline = LifecycleDeadline::after(Duration::from_secs(3600))?;
+            let start = BudgetCheckingStart {
+                expected: deadline,
+                launches: std::cell::Cell::new(0),
+                waits: std::cell::Cell::new(0),
+            };
+            let stop = RecoveringLifecycleStopController {
+                recovered: None,
+                authenticated: false,
+                stopped: std::sync::Arc::default(),
+            };
+            let result = if restart {
+                restart_background_server_with_controllers_until(
+                    home.path(),
+                    Path::new("coven"),
+                    "synthetic-start".to_owned(),
+                    &stop,
+                    &start,
+                    deadline,
+                )
+                .map(|(_, status)| status)
+            } else {
+                ensure_background_server_with_controllers_until(
+                    home.path(),
+                    Path::new("coven"),
+                    "synthetic-start".to_owned(),
+                    &stop,
+                    &start,
+                    deadline,
+                )
+            };
+            assert_eq!(
+                result
+                    .expect_err("readiness deadline must propagate")
+                    .to_string(),
+                "timed out waiting for Coven daemon startup health"
+            );
+            assert_eq!(start.launches.get(), 1);
+            assert_eq!(start.waits.get(), 1);
+            assert_eq!(read_status(home.path())?, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_budget_observation_clamps_expired_deadlines_without_waiting() {
+        let now = Instant::now();
+        let deadline = LifecycleDeadline::from_instant(now + Duration::from_millis(250));
+        assert_eq!(
+            format_startup_budget(StartupSpawnPhase::Before, deadline, now),
+            "startup_budget phase=before-spawn remaining_ms=250"
+        );
+        for observed in [
+            deadline.instant,
+            deadline.instant + Duration::from_millis(1),
+        ] {
+            assert_eq!(
+                format_startup_budget(StartupSpawnPhase::After, deadline, observed),
+                "startup_budget phase=after-spawn remaining_ms=0"
+            );
+        }
+        assert_eq!(
+            format_startup_budget(
+                StartupSpawnPhase::After,
+                deadline,
+                now + Duration::from_millis(75)
+            ),
+            "startup_budget phase=after-spawn remaining_ms=175"
+        );
+    }
+
+    #[test]
+    fn startup_checkpoints_report_fixed_phases_and_monotonic_elapsed() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        initialize_daemon_store(home.path())?;
+        let log = std::fs::read_to_string(daemon_recovery_log_path(home.path()))?;
+        let checkpoints: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once("startup_checkpoint "))
+            .map(|(_, checkpoint)| checkpoint)
+            .collect();
+        let mut previous = 0;
+        let phases = [
+            "daemon-store-begin",
+            "store-initialize-begin",
+            "store-connection-configured",
+            "store-ward-complete",
+            "store-runtime-complete",
+            "store-main-lock-acquired",
+            "store-main-schema-complete",
+            "store-commit-complete",
+            "store-initialize-end",
+            "daemon-store-end",
+        ];
+        assert_eq!(checkpoints.len(), phases.len());
+        for (checkpoint, phase) in checkpoints.iter().zip(phases) {
+            let elapsed = checkpoint
+                .strip_prefix(&format!("phase={phase} elapsed_ms="))
+                .context("unexpected checkpoint fields")?
+                .parse::<u128>()?;
+            assert!(elapsed >= previous);
+            previous = elapsed;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_checkpoints_report_status_completion_only_after_success() -> Result<()> {
+        for fail_publication in [false, true] {
+            let home = tempfile::tempdir()?;
+            let status = DaemonStatus {
+                pid: 12345,
+                started_at: "2026-04-27T10:00:00Z".to_owned(),
+                socket: test_daemon_status_socket(home.path()),
+                process_creation_time: None,
+            };
+            if fail_publication {
+                std::fs::create_dir(daemon_status_path(home.path()))?;
+            }
+            let result = write_startup_status(home.path(), &status);
+            assert_eq!(result.is_err(), fail_publication);
+            let log = std::fs::read_to_string(daemon_recovery_log_path(home.path()))?;
+            let phases = ["status-publication-begin", "status-publication-end"];
+            let entries: Vec<_> = log.lines().collect();
+            assert_eq!(entries.len(), if fail_publication { 1 } else { 2 });
+            let mut previous = 0;
+            for (entry, phase) in entries.iter().zip(phases) {
+                let (_, elapsed) = entry
+                    .split_once(&format!("startup_checkpoint phase={phase} elapsed_ms="))
+                    .context("unexpected status checkpoint")?;
+                let elapsed = elapsed.parse::<u128>()?;
+                assert!(elapsed >= previous);
+                previous = elapsed;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_checkpoints_remain_advisory_when_log_cannot_be_opened() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        std::fs::create_dir(daemon_recovery_log_path(home.path()))?;
+        initialize_daemon_store(home.path())?;
+        assert!(home.path().join("coven.sqlite3").is_file());
         Ok(())
     }
 

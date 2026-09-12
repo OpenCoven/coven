@@ -23,7 +23,7 @@ pub use discovery::{
 pub use error::{
     ClientError, DaemonError, EMPTY_RESPONSE_TIMEOUT_MESSAGE, WINDOWS_CONNECT_OPERATION,
 };
-pub use http::DaemonClient;
+pub use http::{DaemonClient, DaemonHttpResponse};
 #[cfg(unix)]
 #[doc(hidden)]
 pub use lifecycle::{probe_unix_daemon_health, shutdown_unix_daemon};

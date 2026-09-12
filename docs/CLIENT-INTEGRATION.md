@@ -27,7 +27,7 @@ Recommended handshake:
 Rust integrations should use the owner-adjacent `coven-client` crate for this
 handshake and daemon framing. Discover `DaemonEndpoint` from the chosen Coven
 home, pass it to `DaemonClient::new`, and use its typed `/api/v1` operations.
-It does not accept URLs, arbitrary socket paths, or arbitrary request paths:
+It does not accept URLs or arbitrary socket paths:
 Unix discovery requires the current user's private `coven.sock`, and Windows
 discovery derives and validates only the daemon's owner-only named pipe. The
 client accepts a recorded legacy Windows pipe only from a validated private
@@ -38,6 +38,16 @@ The negotiated capabilities are tied to the connected daemon's peer
 fingerprint. Endpoint replacement invalidates the cache before request bytes
 are sent; callers must negotiate again, and mutations are never replayed
 automatically.
+
+For versioned routes without a typed wrapper, `DaemonClient::request_json`
+returns `DaemonHttpResponse` with the original HTTP status and body bytes,
+including non-success responses. It accepts confined `/api/v1/` targets and
+the exact `GET /health` probe, validates method/target syntax before I/O, and
+uses the same health negotiation, peer binding, framing limits, and deadlines
+as typed calls. Transport or identity failures remain errors. This does not
+grant request authority or imply that a returned HTTP error is safe to retry;
+the daemon remains responsible for route-specific authorization. Typed calls
+retain their capability checks and structured-error behavior.
 
 The `coven.daemon.v1` session routes use their historical raw-byte behavior,
 not URL-component decoding. `engine/42` is a valid raw path remainder and a

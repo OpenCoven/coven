@@ -214,6 +214,15 @@ committed write; they are not a claim that the ledger append succeeded.
 Clients must retain/escalate that response and reconcile the ledger rather
 than replaying the file edit.
 
+When a reviewed write lands under retired-Ward `editable.harness_blocks` +
+`approval_tiers` metadata and every touched surface binds to the daemon's typed
+region predicates, the `202` response includes `scheduledProposal` with the
+canonical `phase5_v1` envelope (`classification`, `materialized_diff`,
+`region_evidence`, `lifecycle`, deadlines) and omits `reviewKind`. Unsupported
+or weaker-than-region approval metadata fails closed with `409
+scheduled_publication_invalid`. Legacy reviewed holds without approval metadata
+continue to stage the additive `reviewKind: "coherence"` envelope.
+
 Every submitted Ward request accepts at most 32 edits, including Tier-0/Tier-1
 edits that will be held or staged and Tier-2/Tier-3 edits eligible for direct
 apply. Proposed contents may total at most 16 MiB (16,777,216 bytes). During
@@ -282,10 +291,23 @@ that exceeded the reported limit.
 
 ## Ward proposals (threads)
 
-Held Ward writes stage at `~/.coven/pending/` for the principal —
-Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
-`reviewKind` (`authority` / `coherence`). See
-[cli-ward](cli-ward.md) and `docs/design/ward-gate3-coherence.md`.
+Eligible held Ward writes stage at `~/.coven/pending/` for the principal.
+Tier-0 targets are refused with `protected_proposal_forbidden`; neither new
+intake nor historical authority-proposal records grant protected-write
+permission. Tier-1 reviewed holds either keep the legacy
+`reviewKind: "coherence"` shape or, when retired-Ward approval metadata binds
+the diff to typed regions, stage as canonical `phase5_v1` scheduled proposals
+whose authority lives in `classification.approval_path`, not in `reviewKind`.
+Approval metadata that declares `human_veto_window_hours` must also declare an
+explicit `min_visible_seconds` value; Coven validates both through the
+scheduled-publication veto-window contract and does not infer a default minimum
+from example fixtures. `min_visible_seconds` is invalid without a veto window
+and on human approval paths.
+Replay compares the committed regional approval path with the live compiled
+policy. Changed, removed, or unbound approval policy rejects the proposal;
+an opened window closes once with `revalidation_failed`. Existing unclassified
+envelopes without regional policy retain their legacy handling.
+See [cli-ward](cli-ward.md) and `docs/design/ward-gate3-coherence.md`.
 
 | Method | Path | Purpose | Success | Errors |
 |---|---|---|---|---|
@@ -293,7 +315,7 @@ Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
 | GET | `/api/v1/threads/proposals` | Owner-local cursor-paginated pending proposals with compact `probeSummary` evidence. `limit` defaults to and is capped at 64; pass the opaque `nextCursor` as `cursor`. Invalid files are reported once as `degraded` and quarantined. | `{ proposals, limit, hasMore, nextCursor }` | `400 invalid_request`, `403 transport_forbidden` |
 | GET | `/api/v1/threads/proposals/:id` | Owner-local detail for one pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request`, `403 transport_forbidden`, `404 proposal_not_found` |
 | POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. `HumanApprovalWithRationale` paths require a non-empty `note`. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `413 ward_apply_too_large`, `413 proposal_quota_exceeded`, `507 ward_audit_capacity_exceeded` |
-| POST | `/api/v1/threads/proposals/:id/reject` | Reject/veto and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `507 ward_audit_capacity_exceeded` |
+| POST | `/api/v1/threads/proposals/:id/reject` | Reject/veto and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. To explicitly supersede this proposal with a newer matching pending replacement, also pass `{ replacementProposalId, replacementProposalRevision }` from that replacement proposal's detail/list response. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `507 ward_audit_capacity_exceeded` |
 
 Proposal metadata includes familiar identity, target paths, writer
 fingerprints, hashes, and probe diagnostics, so reads and mutations both
@@ -304,6 +326,20 @@ request under `/api/v1/threads/proposals` fails with stable
 creation, target access, or audit append. The response includes
 `details: { requiredAuthority: "owner_local_ipc", writeApplied: false }`.
 Host/Origin allowlists do not elevate TCP authority.
+
+Explicit supersession stays opt-in: ordinary proposal submission does not
+cancel earlier proposals. On `POST /api/v1/threads/proposals/:id/reject`, Coven
+derives supersession only after it revalidates a newer durable pending
+replacement with matching familiar, writer/approval lane, channel, and exact
+affected-surface scope. Veto-window proposals audit that outcome as
+`proposal_rejected` with `detail.reason = "superseded"` and
+`detail.replay_hash_matched = null`; human approval paths remain ordinary
+`proposal_rejected` rows with no close detail.
+
+Coven persists replacement intent in the decision claim and revalidates it
+after restart. Incomplete or invalid persisted intent is rejected, not
+reinterpreted as an ordinary veto. Preserve in-flight claims when rolling back:
+a daemon predating this extension cannot recover their added fields.
 
 ### Pending-proposal capacity and bounded maintenance
 
