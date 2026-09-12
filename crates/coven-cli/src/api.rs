@@ -8221,6 +8221,8 @@ struct ProposalEnvelopePreflight {
     earliest_close: Option<serde::de::IgnoredAny>,
     #[serde(rename = "reviewKind", default)]
     review_kind: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "identityEvidence", default)]
+    identity_evidence: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     probes: Option<serde::de::IgnoredAny>,
     #[serde(rename = "decisionRequest", default)]
@@ -8292,6 +8294,7 @@ impl ProposalJsonField {
             | "after"
             | "replay_bytes"
             | "evidence_replay_hash"
+            | "identityEvidence"
             | "recoveryCommitment"
             | "weaveHash" => Self::ByteArray,
             "edits" => Self::Edits,
@@ -8327,6 +8330,7 @@ fn proposal_json_object_key_allowed(context: ProposalJsonValueContext, key: &str
             "edits",
             "staged_at",
             "reviewKind",
+            "identityEvidence",
             "probes",
             "decisionRequest",
             "decisionState",
@@ -8721,6 +8725,8 @@ struct ProposalEnvelopeWire {
     staged_at: Option<time::OffsetDateTime>,
     #[serde(rename = "reviewKind", default)]
     review_kind: PresentField<String>,
+    #[serde(rename = "identityEvidence", default)]
+    identity_evidence: PresentField<[u8; 32]>,
     #[serde(default)]
     probes: PresentField<Box<serde_json::value::RawValue>>,
     #[serde(rename = "decisionRequest", default)]
@@ -8737,6 +8743,7 @@ enum ProposalAuthority {
 struct ProposalEnvelopeDocument {
     authority: ProposalAuthority,
     review_kind: Option<String>,
+    identity_evidence: Option<[u8; 32]>,
     probes: Option<Box<serde_json::value::RawValue>>,
     decision_request: Option<ProposalDecisionRequest>,
     decision_state: Option<ProposalApplyingState>,
@@ -8748,6 +8755,8 @@ struct StoredLegacyProposalRef<'a> {
     pending: &'a coven_threads_core::PendingProposal,
     #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
     review_kind: Option<&'a String>,
+    #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
+    identity_evidence: Option<[u8; 32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probes: Option<&'a serde_json::value::RawValue>,
     #[serde(rename = "decisionRequest", skip_serializing_if = "Option::is_none")]
@@ -8762,6 +8771,8 @@ struct StoredScheduledProposalRef<'a> {
     scheduled: &'a crate::proposal_scheduler::ScheduledProposal,
     #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
     review_kind: Option<&'a String>,
+    #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
+    identity_evidence: Option<[u8; 32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probes: Option<&'a serde_json::value::RawValue>,
     #[serde(rename = "decisionRequest", skip_serializing_if = "Option::is_none")]
@@ -9026,6 +9037,7 @@ impl ProposalEnvelopeDocument {
         Ok(Self {
             authority,
             review_kind,
+            identity_evidence: wire.identity_evidence.0,
             probes,
             decision_request,
             decision_state,
@@ -9055,6 +9067,7 @@ impl ProposalEnvelopeDocument {
             ProposalAuthority::Legacy(pending) => serde_json::to_vec(&StoredLegacyProposalRef {
                 pending,
                 review_kind: self.review_kind.as_ref(),
+                identity_evidence: self.identity_evidence,
                 probes: self.probes.as_deref(),
                 decision_request,
                 decision_state,
@@ -9063,6 +9076,7 @@ impl ProposalEnvelopeDocument {
                 serde_json::to_vec(&StoredScheduledProposalRef {
                     scheduled,
                     review_kind: self.review_kind.as_ref(),
+                    identity_evidence: self.identity_evidence,
                     probes: self.probes.as_deref(),
                     decision_request,
                     decision_state,
@@ -9488,9 +9502,18 @@ fn proposal_recovery_is_proven_unapplied(
         .iter()
         .map(|edit| edit.surface.as_str().to_string())
         .collect();
-    let Ok(commitment) =
-        proposal_recovery_commitment(conn, &config, document, &familiar_id, &targets)
-    else {
+    let Ok(commitment) = proposal_recovery_commitment(
+        conn,
+        &config,
+        document,
+        ProposalRecoveryContext {
+            coven_home,
+            workspace: &workspace,
+            familiar_id: &familiar_id,
+            targets: &targets,
+            authorization: &authorization_from_writer(&pending.writer),
+        },
+    ) else {
         return false;
     };
     if commitment != applying.recovery_commitment {
@@ -10371,8 +10394,18 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
-        let recovery_commitment =
-            proposal_recovery_commitment(&conn, &config, &document, &familiar_id, &targets)?;
+        let recovery_commitment = proposal_recovery_commitment(
+            &conn,
+            &config,
+            &document,
+            ProposalRecoveryContext {
+                coven_home,
+                workspace: &workspace,
+                familiar_id: &familiar_id,
+                targets: &targets,
+                authorization: &authorization,
+            },
+        )?;
         if applying.recovery_commitment != recovery_commitment {
             return json_response(
                 409,
@@ -10659,6 +10692,15 @@ fn decide_threads_proposal_inner(
         }
         Err(error) => return Err(error),
     };
+    let identity_context = crate::ward_identity::candidate_identity_context(
+        coven_home,
+        &familiar_id,
+        &workspace,
+        &config,
+        &edits,
+        &authorization,
+        Some(&adjudication.decisions),
+    );
     if decision == "approve"
         && review_kind == PendingReviewKind::Authority
         && gated_targets.is_empty()
@@ -10737,6 +10779,92 @@ fn decide_threads_proposal_inner(
             }
         }
         return json_response(200, &response);
+    }
+
+    let identity_rejection =
+        crate::ward_identity::candidate_rejection(&config, identity_context.as_ref())?;
+    let identity_failure = if identity_rejection.is_some() {
+        Some((
+            "proposal-revalidation-failed",
+            coven_threads_core::WindowCloseReason::RevalidationFailed,
+        ))
+    } else if crate::ward_identity::candidate_binding(&config, identity_context.as_ref())?
+        != document.identity_evidence
+    {
+        Some((
+            "proposal-identity-evidence-diverged",
+            coven_threads_core::WindowCloseReason::EvidenceDiverged,
+        ))
+    } else {
+        None
+    };
+    if let Some((reason, close_reason)) = identity_failure {
+        if scheduled.is_some() && applying_state.is_none() {
+            let window_close = scheduled_rejection_window_close(
+                scheduled,
+                close_reason,
+                Some(false),
+                note.as_deref(),
+            );
+            claim.preserve();
+            append_proposal_decision_audit(
+                &conn,
+                ProposalDecisionAudit {
+                    event_type: coven_threads_core::AuditEventType::ProposalRejected,
+                    proposal_id,
+                    familiar_id: &familiar_id,
+                    weave_hash: state.weave.weave_hash(),
+                    approver: Some(&pending.writer),
+                    files_touched: &targets,
+                    decision: window_close
+                        .as_ref()
+                        .map_or(reason, |close| close.reason.tag()),
+                    approval_rationale: note.as_deref(),
+                    approval_path_label: &decision_semantics.approval_path_label,
+                    window_close: window_close.as_ref(),
+                    channel: pending.channel,
+                },
+                decision_now,
+            )?;
+            audit_reservation.finish()?;
+            claim.consume()?;
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": reason,
+                    "proposalId": proposal_id,
+                    "terminal": true,
+                    "verdict": identity_rejection,
+                }),
+            );
+        }
+        append_proposal_refusal_audit(
+            &conn,
+            proposal_id,
+            &familiar_id,
+            state.weave.weave_hash(),
+            &pending.writer,
+            &targets,
+            pending.channel,
+            decision_now,
+        )?;
+        if applying_state.is_some() {
+            claim.preserve();
+            audit_reservation.preserve()?;
+        } else {
+            audit_reservation.finish()?;
+            claim.restore_pending(&document)?;
+        }
+        return json_response(
+            409,
+            &json!({
+                "blocked": true,
+                "why": reason,
+                "proposalId": proposal_id,
+                "verdict": identity_rejection,
+            }),
+        );
     }
 
     if applying_state.is_none() {
@@ -10969,7 +11097,7 @@ fn decide_threads_proposal_inner(
                 surface: coven_threads_core::SurfaceId::new(target.clone()),
                 writer: pending.writer.clone(),
                 channel: pending.channel,
-                identity_context: None,
+                identity_context: identity_context.clone(),
             };
             let verdict = coven_threads_core::validate_fail_closed(&state.weave, &request);
             crate::threads_gate::append_audit_row(
@@ -11068,8 +11196,13 @@ fn decide_threads_proposal_inner(
             &conn,
             &config,
             &document,
-            &familiar_id,
-            &targets,
+            ProposalRecoveryContext {
+                coven_home,
+                workspace: &workspace,
+                familiar_id: &familiar_id,
+                targets: &targets,
+                authorization: &authorization,
+            },
         )?,
         weave_hash: state.weave.weave_hash().to_vec(),
         before_images,
@@ -12227,13 +12360,27 @@ struct ProposalBeforeImage {
     contents: Option<coven_threads_core::StagedContents>,
 }
 
+struct ProposalRecoveryContext<'a> {
+    coven_home: &'a Path,
+    workspace: &'a Path,
+    familiar_id: &'a str,
+    targets: &'a [String],
+    authorization: &'a ward::Authorization,
+}
+
 fn proposal_recovery_commitment(
     conn: &rusqlite::Connection,
     config: &ward::WardConfig,
     document: &ProposalEnvelopeDocument,
-    familiar_id: &str,
-    targets: &[String],
+    context: ProposalRecoveryContext<'_>,
 ) -> Result<Vec<u8>> {
+    let ProposalRecoveryContext {
+        coven_home,
+        workspace,
+        familiar_id,
+        targets,
+        authorization,
+    } = context;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"coven:proposal-decision-recovery:v2");
     let config_bytes = serde_json::to_vec(config).context("serializing Ward config")?;
@@ -12258,6 +12405,20 @@ fn proposal_recovery_commitment(
                 hasher.update(&[0]);
             }
         };
+    }
+    if config.identity_invariant_set()?.is_some() {
+        let identity_context = crate::ward_identity::candidate_identity_context(
+            coven_home,
+            familiar_id,
+            workspace,
+            config,
+            &staged_edits_to_ward_edits(document.pending())?,
+            authorization,
+            None,
+        )
+        .context("materializing identity evidence for proposal recovery")?;
+        hasher.update(b"identity-candidate-commitment");
+        hasher.update(&identity_context.candidate_commitment);
     }
     Ok(hasher.finalize().as_bytes().to_vec())
 }
@@ -28275,6 +28436,233 @@ forbidden = ["(?i)ignore previous"]
         Ok(limit)
     }
 
+    fn seed_identity_predicate_familiar(home: &Path) -> Result<std::path::PathBuf> {
+        std::fs::write(
+            home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads and synthesizes."
+pronouns = "she/her"
+person = "Val"
+coven = "OpenCoven"
+"#,
+        )?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(
+            workspace.join("SOUL.md"),
+            "# SOUL\n## I am Sage\nMy purpose is research.\n",
+        )?;
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** she/her\n",
+        )?;
+        std::fs::write(workspace.join("MEMORY.md"), "facts stay local\n")?;
+        std::fs::write(
+            workspace.join("ward.toml"),
+            r#"principal_key_fingerprint = "fpr-val"
+protected_surface = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
+
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Sage"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Val"
+
+[[identity_invariant]]
+fact = "pronouns"
+operator = "equals"
+expected = "she/her"
+
+[[identity_invariant]]
+fact = "purpose"
+operator = "includes"
+expected = "research"
+
+[[identity_invariant]]
+fact = "coven"
+operator = "equals"
+expected = "OpenCoven"
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "IDENTITY.md"
+tier = 0
+
+[[surface]]
+path = "MEMORY.md"
+tier = 0
+
+[[surface]]
+path = "reviewed/"
+tier = 1
+
+[[probe]]
+surface = "reviewed/**"
+id = "size-delta"
+"#,
+        )?;
+        Ok(workspace)
+    }
+
+    fn valid_identity_soul() -> &'static str {
+        "# SOUL\n## I am Sage\nMy purpose is research.\n"
+    }
+
+    fn stage_pending_identity_predicate_edit(
+        home: &Path,
+    ) -> Result<(std::path::PathBuf, String, std::path::PathBuf)> {
+        let workspace = seed_identity_predicate_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        std::fs::write(workspace.join("reviewed/note.md"), "before research\n")?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/note.md","contents":"after research\n"}]}"#,
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+        let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let pending = std::path::PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .expect("staged response carries pendingPath"),
+        );
+        let proposal_id = body["proposalId"]
+            .as_str()
+            .expect("staged response carries proposalId")
+            .to_string();
+        Ok((pending, proposal_id, workspace))
+    }
+
+    #[test]
+    fn identity_predicate_uses_case_resolved_candidate_sources() -> Result<()> {
+        for (name, expected_status) in [("Another Familiar", 403), ("Sage", 200)] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_identity_predicate_familiar(home)?;
+            let ward_path = workspace.join("ward.toml");
+            let config = std::fs::read_to_string(&ward_path)?
+                .replace(
+                    "protected_surface = [\"SOUL.md\", \"IDENTITY.md\", \"MEMORY.md\"]",
+                    "protected_surface = [\"SOUL.md\", \"MEMORY.md\"]",
+                )
+                .replace(
+                    "path = \"IDENTITY.md\"\ntier = 0",
+                    "path = \"IDENTITY.md\"\ntier = 2",
+                );
+            std::fs::write(ward_path, config)?;
+            std::fs::rename(workspace.join("IDENTITY.md"), workspace.join("identity.md"))?;
+            let expected_status = if workspace.join("IDENTITY.md").exists() {
+                expected_status
+            } else {
+                // On a case-sensitive filesystem the canonical source is
+                // genuinely absent, so even unchanged identity must fail closed.
+                403
+            };
+            let before = std::fs::read(workspace.join("identity.md"))?;
+            let contents =
+                format!("# IDENTITY.md - {name}\n- **Name:** {name}\n- **Pronouns:** she/her\n");
+            let response = post_edits(
+                home,
+                &json!({"edits": [{"target": "identity.md", "contents": contents}]}).to_string(),
+            )?;
+            assert_eq!(
+                response.status, expected_status,
+                "{name}: {}",
+                response.body
+            );
+            if expected_status == 403 {
+                assert_eq!(std::fs::read(workspace.join("identity.md"))?, before);
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("identity.md"))?,
+                    contents
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_refuses_incomplete_materialized_target_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = seed_identity_predicate_familiar(temp.path())?;
+        let config = ward::WardConfig::load(&workspace)?.context("fixture Ward exists")?;
+        let edits = [ward::FileEdit::new(
+            "identity-alias.md",
+            "# IDENTITY.md - Another Familiar\n",
+        )];
+        let context = crate::ward_identity::candidate_identity_context(
+            temp.path(),
+            "sage",
+            &workspace,
+            &config,
+            &edits,
+            &ward::Authorization::unsigned(),
+            Some(&[]),
+        );
+        assert!(crate::ward_identity::candidate_rejection(&config, context.as_ref())?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_intake_does_not_normalize_distinct_or_empty_values_into_facts(
+    ) -> Result<()> {
+        for failure in ["literal-punctuation", "empty-duplicate"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_identity_predicate_familiar(home)?;
+            if failure == "literal-punctuation" {
+                let roster = home.join("familiars.toml");
+                let contents = std::fs::read_to_string(&roster)?
+                    .replace("person = \"Val\"", "person = \"Val.\"");
+                std::fs::write(roster, contents)?;
+            } else {
+                std::fs::write(
+                    workspace.join("IDENTITY.md"),
+                    "# IDENTITY.md - Sage\n- **Name:**\n- **Pronouns:** she/her\n",
+                )?;
+            }
+            let response = post_edits(
+                home,
+                r#"{"edits":[{"target":"notes.md","contents":"new note\n"}]}"#,
+            )?;
+            assert_eq!(response.status, 403, "{failure}: {}", response.body);
+            assert!(!workspace.join("notes.md").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_intake_refuses_invalid_sources_before_write_or_stage() -> Result<()> {
+        for target in ["notes.md", "reviewed/note.md"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_identity_predicate_familiar(home)?;
+            std::fs::write(
+                workspace.join("SOUL.md"),
+                "# SOUL\n## I am Sage\nMy purpose is sabotage.\n",
+            )?;
+            let response = post_edits(
+                home,
+                &json!({"edits": [{"target": target, "contents": "new note\n"}]}).to_string(),
+            )?;
+            assert_eq!(response.status, 403, "{target}: {}", response.body);
+            assert!(!workspace.join(target).exists());
+            let pending = home.join("pending");
+            assert!(!pending.exists() || std::fs::read_dir(pending)?.next().is_none());
+        }
+        Ok(())
+    }
+
     pub(super) fn direct_ward_audit_reservation_bytes(
         home: &Path,
         body_bytes: usize,
@@ -30636,6 +31024,253 @@ tier = 0
             .expect("staged response carries proposalId")
             .to_string();
         Ok((pending, proposal_id))
+    }
+
+    #[test]
+    fn identity_predicate_active_policy_change_invalidates_pending_binding() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        let document = read_pending_proposal_document(&pending)?;
+        let ward_path = workspace.join("ward.toml");
+        let updated = std::fs::read_to_string(&ward_path)?
+            .replace("expected = \"research\"", "expected = \"search\"");
+        std::fs::write(ward_path, updated)?;
+        let config = ward::WardConfig::load(&workspace)?.context("active policy remains valid")?;
+        let context = crate::ward_identity::candidate_identity_context(
+            home,
+            "sage",
+            &workspace,
+            &config,
+            &staged_edits_to_ward_edits(document.pending())?,
+            &authorization_from_writer(&document.pending().writer),
+            None,
+        );
+        assert!(crate::ward_identity::candidate_rejection(&config, context.as_ref())?.is_none());
+        assert_ne!(
+            crate::ward_identity::candidate_binding(&config, context.as_ref())?,
+            document.identity_evidence
+        );
+        let response = decide_threads_proposal(home, &proposal_id, "approve", Some("{}"))?;
+        assert_eq!(response.status, 409, "got {}", response.body);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/note.md"))?,
+            "before research\n"
+        );
+        assert!(pending.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_approval_refuses_changed_source_bytes_that_still_hold() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        std::fs::write(
+            workspace.join("SOUL.md"),
+            format!("{}\nA new source revision.\n", valid_identity_soul()),
+        )?;
+        let response = decide_threads_proposal(home, &proposal_id, "approve", Some("{}"))?;
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let response: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response["why"], "proposal-identity-evidence-diverged");
+        assert!(pending.exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/note.md"))?,
+            "before research\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_pending_binding_survives_roundtrip_and_revision() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (pending, _, _) = stage_pending_identity_predicate_edit(temp.path())?;
+        let original = parse_proposal_envelope(&std::fs::read(pending)?)?;
+        assert!(original.identity_evidence.is_some());
+        let mut restored = parse_proposal_envelope(&original.authority_bytes()?)?;
+        assert_eq!(original.identity_evidence, restored.identity_evidence);
+        assert_eq!(original.revision()?, restored.revision()?);
+        restored.identity_evidence = None;
+        assert_ne!(original.revision()?, restored.revision()?);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_deadline_failure_closes_the_opened_window() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        // Synthetic historical scheduled authority, not public publication.
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            time::OffsetDateTime::now_utc() - time::Duration::minutes(10),
+        )?;
+        let workspace = seed_identity_predicate_familiar(home)?;
+        std::fs::write(
+            workspace.join("SOUL.md"),
+            "# SOUL\n## I am Sage\nMy purpose is sabotage.\n",
+        )?;
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "before"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let detail: String = conn.query_row(
+            "SELECT detail FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        let close: coven_threads_core::ProposalWindowCloseAuditDetail =
+            serde_json::from_str(&detail)?;
+        assert_eq!(
+            close.reason,
+            coven_threads_core::WindowCloseReason::RevalidationFailed
+        );
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        let terminals: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
+             AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminals, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_approve_revalidates_authoritative_sources() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        std::fs::write(workspace.join("SOUL.md"), valid_identity_soul())?;
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** they/them\n",
+        )?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert!(pending.exists(), "failed approval must stay pending");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            valid_identity_soul()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/note.md"))?,
+            "before research\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn identity_predicate_recovery_handles_unavailable_materialization_without_panicking(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+        assert!(decide_threads_proposal(home, &proposal_id, "approve", Some("{}")).is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .context("interrupted approval leaves a claim")?;
+        let before = std::fs::read(&claim)?;
+        let document = read_pending_proposal_document(&claim)?;
+        let outside = home.join("outside-note.md");
+        std::fs::write(&outside, "outside\n")?;
+        std::fs::remove_file(workspace.join("reviewed/note.md"))?;
+        std::os::unix::fs::symlink(&outside, workspace.join("reviewed/note.md"))?;
+        let config = ward::WardConfig::load(&workspace)?.context("fixture Ward exists")?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        // Exercise the fallible helper without poisoning the process-wide lock
+        // if this regression ever reintroduces a panic.
+        let commitment = proposal_recovery_commitment(
+            &conn,
+            &config,
+            &document,
+            ProposalRecoveryContext {
+                coven_home: home,
+                workspace: &workspace,
+                familiar_id: "sage",
+                targets: &["reviewed/note.md".to_string()],
+                authorization: &authorization_from_writer(&document.pending().writer),
+            },
+        );
+        assert!(commitment.is_err());
+        assert!(decide_threads_proposal(home, &proposal_id, "approve", Some("{}")).is_err());
+        assert_eq!(std::fs::read(claim)?, before);
+        assert_eq!(std::fs::read_to_string(outside)?, "outside\n");
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes.md","contents":"still usable\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_recovery_preserves_claim_if_identity_evidence_diverged() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        std::fs::write(workspace.join("SOUL.md"), valid_identity_soul())?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(interrupted.is_err());
+
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .expect("interrupted approval leaves a recovery claim");
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** they/them\n",
+        )?;
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(retry.status, 409, "got {}", retry.body);
+        let body: Value = serde_json::from_str(&retry.body)?;
+        assert_eq!(body["why"], "proposal-recovery-evidence-diverged");
+        assert!(claim.exists(), "recovery claim must remain durable");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            valid_identity_soul()
+        );
+        Ok(())
     }
 
     fn stage_coherence_edit(

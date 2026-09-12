@@ -932,7 +932,7 @@ dependencies = [
 [[package]]
 name = "coven-threads-core"
 version = "0.2.0"
-source = "git+https://github.com/OpenCoven/coven-threads?rev=c102844#c102844e998778a7dbd92652711edc816ef42bc7"
+source = "git+https://github.com/OpenCoven/coven-threads?rev=c3bd46bcadb6396db8436c47411a4d0eac17192b#c3bd46bcadb6396db8436c47411a4d0eac17192b"
 dependencies = [
  "blake3",
  "serde",
