@@ -591,6 +591,19 @@ fn rejects_handoffs_to_unregistered_agents() {
     );
 }
 
+#[test]
+fn rejects_registered_agents_without_valid_identity_refs() {
+    let model = Arc::new(QueueModel::default());
+    let agent = Agent::new("invalid agent", "Invalid", "Answer.", model);
+
+    let error = Runner::new([agent]).err().unwrap();
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidAgentRef { ref agent, .. } if agent.as_str() == "invalid agent"
+    ));
+}
+
 #[tokio::test]
 async fn unknown_starting_agent_reports_a_paired_run_lifecycle() {
     let model = Arc::new(QueueModel::new([ModelResponse::final_output("unused")]));
