@@ -23,10 +23,22 @@ const ACTIVATION_SENTINEL: &str = "threads_test_clock_v1";
 const CAPABILITY_FILE: &str = "capability";
 #[cfg(feature = "threads-test-clock")]
 const STATE_FILE: &str = "state.json";
+#[cfg(feature = "threads-test-clock")]
+const FINAL_COMMIT_PAUSE_FILE: &str = "pause-final-commit";
+#[cfg(feature = "threads-test-clock")]
+const FINAL_COMMIT_PAUSE_REACHED_FILE: &str = "pause-final-commit.reached";
+#[cfg(feature = "threads-test-clock")]
+const FINAL_COMMIT_PAUSE_REACHED_SENTINEL: &str = "threads_test_final_commit_pause_reached_v1";
+#[cfg(feature = "threads-test-clock")]
+const FINAL_COMMIT_PAUSE_RELEASE_FILE: &str = "pause-final-commit.release";
+#[cfg(feature = "threads-test-clock")]
+const FINAL_COMMIT_PAUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClockSource {
     WallClock,
+    #[cfg(test)]
+    UnitTest,
     #[cfg(feature = "threads-test-clock")]
     DeterministicFixture,
 }
@@ -36,6 +48,8 @@ impl ClockSource {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::WallClock => "wall_clock",
+            #[cfg(test)]
+            Self::UnitTest => "unit_test",
             Self::DeterministicFixture => "deterministic_fixture",
         }
     }
@@ -51,7 +65,40 @@ pub(crate) fn now(coven_home: &Path) -> Result<OffsetDateTime> {
     snapshot(coven_home).map(|snapshot| snapshot.now)
 }
 
+#[cfg(test)]
+thread_local! {
+    static UNIT_TEST_TIMES: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf, OffsetDateTime>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_time<T>(home: &Path, now: OffsetDateTime, action: impl FnOnce() -> T) -> T {
+    struct RestoreTime(std::path::PathBuf, Option<OffsetDateTime>);
+    impl Drop for RestoreTime {
+        fn drop(&mut self) {
+            UNIT_TEST_TIMES.with(|times| {
+                let mut times = times.borrow_mut();
+                if let Some(previous) = self.1 {
+                    times.insert(self.0.clone(), previous);
+                } else {
+                    times.remove(&self.0);
+                }
+            });
+        }
+    }
+    let previous = UNIT_TEST_TIMES.with(|times| times.borrow_mut().insert(home.to_path_buf(), now));
+    let _restore = RestoreTime(home.to_path_buf(), previous);
+    action()
+}
+
 pub(crate) fn snapshot(coven_home: &Path) -> Result<ClockSnapshot> {
+    #[cfg(test)]
+    if let Some(now) = UNIT_TEST_TIMES.with(|times| times.borrow().get(coven_home).copied()) {
+        return Ok(ClockSnapshot {
+            now,
+            source: ClockSource::UnitTest,
+        });
+    }
     #[cfg(feature = "threads-test-clock")]
     if let Some(fixture) = ActiveFixture::load(coven_home)? {
         return Ok(ClockSnapshot {
@@ -166,6 +213,76 @@ pub(crate) fn fixture_mode_enabled(_coven_home: &Path) -> Result<bool> {
 pub(crate) fn fixture_control_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(feature = "threads-test-clock")]
+pub(crate) fn pause_final_commit_if_requested(coven_home: &Path) -> Result<()> {
+    let Some(fixture) = ActiveFixture::load(coven_home)? else {
+        return Ok(());
+    };
+    let fixture_dir = fixture_directory(coven_home);
+    let pause_path = fixture_dir.join(FINAL_COMMIT_PAUSE_FILE);
+    match fs::symlink_metadata(&pause_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading deterministic Threads final commit pause {}",
+                    pause_path.display()
+                )
+            });
+        }
+    }
+    crate::mobile_memory::config::validate_private_file(&pause_path)?;
+    let requested = read_capability(&pause_path)?;
+    if requested != fixture.capability {
+        return Err(InvalidFixtureCapability.into());
+    }
+
+    let reached_path = fixture_dir.join(FINAL_COMMIT_PAUSE_REACHED_FILE);
+    crate::mobile_memory::config::atomic_replace_private(
+        &reached_path,
+        format!("{FINAL_COMMIT_PAUSE_REACHED_SENTINEL}\n").as_bytes(),
+    )
+    .with_context(|| {
+        format!(
+            "recording deterministic Threads final commit pause {}",
+            reached_path.display()
+        )
+    })?;
+    let release_path = fixture_dir.join(FINAL_COMMIT_PAUSE_RELEASE_FILE);
+    let deadline = std::time::Instant::now() + FINAL_COMMIT_PAUSE_TIMEOUT;
+    loop {
+        match fs::symlink_metadata(&release_path) {
+            Ok(_) => {
+                crate::mobile_memory::config::validate_private_file(&release_path)?;
+                let release = read_capability(&release_path)?;
+                if release != fixture.capability {
+                    return Err(InvalidFixtureCapability.into());
+                }
+                let _ = fs::remove_file(&pause_path);
+                let _ = fs::remove_file(&release_path);
+                let _ = fs::remove_file(&reached_path);
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "deterministic Threads final commit pause timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading deterministic Threads final commit release {}",
+                        release_path.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 #[cfg(feature = "threads-test-clock")]
@@ -372,6 +489,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unit_test_time_is_scoped_to_home_and_restored() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("first");
+        let other = temp.path().join("second");
+        let earlier = OffsetDateTime::UNIX_EPOCH;
+        let later = earlier + time::Duration::days(1);
+        with_test_time(&home, earlier, || -> Result<()> {
+            assert_eq!(
+                snapshot(&home)?,
+                ClockSnapshot {
+                    now: earlier,
+                    source: ClockSource::UnitTest
+                }
+            );
+            assert_eq!(snapshot(&other)?.source, ClockSource::WallClock);
+            with_test_time(&home, later, || -> Result<()> {
+                assert_eq!(now(&home)?, later);
+                Ok(())
+            })?;
+            assert_eq!(now(&home)?, earlier);
+            Ok(())
+        })?;
+        assert_eq!(snapshot(&home)?.source, ClockSource::WallClock);
+        Ok(())
+    }
+
+    #[test]
     fn default_snapshot_uses_wall_clock() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let snapshot = snapshot(temp.path())?;
@@ -488,6 +632,45 @@ mod tests {
         assert_eq!(
             non_monotonic.requested,
             initial + time::Duration::minutes(4)
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn final_commit_pause_requires_active_fixture_capability() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let initial = time::OffsetDateTime::parse(
+            "2026-09-09T10:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )?;
+        seed_fixture_for_tests(home, "cap-4", initial)?;
+        let fixture_dir = fixture_directory(home);
+        crate::mobile_memory::config::atomic_create_private(
+            &fixture_dir.join(FINAL_COMMIT_PAUSE_FILE),
+            b"cap-4",
+        )?;
+        crate::mobile_memory::config::atomic_create_private(
+            &fixture_dir.join(FINAL_COMMIT_PAUSE_RELEASE_FILE),
+            b"cap-4",
+        )?;
+
+        pause_final_commit_if_requested(home)?;
+
+        assert!(!fixture_dir.join(FINAL_COMMIT_PAUSE_FILE).exists());
+        assert!(!fixture_dir.join(FINAL_COMMIT_PAUSE_RELEASE_FILE).exists());
+        assert!(!fixture_dir.join(FINAL_COMMIT_PAUSE_REACHED_FILE).exists());
+
+        crate::mobile_memory::config::atomic_create_private(
+            &fixture_dir.join(FINAL_COMMIT_PAUSE_FILE),
+            b"wrong-cap",
+        )?;
+        let error = pause_final_commit_if_requested(home)
+            .expect_err("pause control must require the active fixture capability");
+        assert!(
+            error.downcast_ref::<InvalidFixtureCapability>().is_some(),
+            "got {error:#}"
         );
         Ok(())
     }

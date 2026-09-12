@@ -78,6 +78,7 @@ iana-time-zone = "0.1.65"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2"

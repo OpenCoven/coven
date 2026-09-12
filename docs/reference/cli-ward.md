@@ -125,12 +125,28 @@ not that POSIX primitive gap.
 
 ## Pending proposals
 
-Pending records distinguish two lanes with `reviewKind`:
+The queue accepts two envelope kinds:
 
-- `authority`: historical authority proposals and daemon-owned scheduled
-  records. Public intake no longer stages Tier-0 writes.
-- `coherence`: a Tier-1 (reviewed) write held for Gate-3 coherence review
-  (`docs/design/ward-gate3-coherence.md`).
+- legacy proposals distinguished by `reviewKind`:
+  `authority` records require live authority revalidation, and `coherence`
+  records hold Tier-1 reviewed writes without retired-Ward approval metadata.
+- canonical `phase5_v1` scheduled proposals for reviewed writes whose Ward
+  declares `editable.harness_blocks` + `approval_tiers` and whose staged diff
+  binds entirely to the daemon's typed region predicates. These carry
+  `classification.approval_path`, `materialized_diff`, `region_evidence`, and
+  derived lifecycle/deadline fields; `reviewKind` is intentionally absent.
+
+If approval metadata cannot produce authoritative typed evidence for the staged
+diff, the daemon returns `409 scheduled_publication_invalid` instead of falling
+back to a weaker legacy proposal.
+
+Neither label grants protected-write authority. Tier-0 intake returns
+`protected_proposal_forbidden`, even with a supplied fingerprint or approval
+identifier, and appends a non-authorizing rejection receipt. A queued target
+that becomes protected is refused on decision or scheduler revalidation.
+If an interrupted apply may already have changed its bytes, Coven preserves
+the recovery evidence in quarantine instead of inventing an unapplied
+rejection.
 
 The active queue accepts at most **64 proposals** and **64 MiB
 (67,108,864 bytes)** of exact serialized pending/decision-claim data. Coven
@@ -161,9 +177,16 @@ consult the daemon recovery log, preserve any needed evidence, and delete old
 quarantine artifacts under the normal retention policy. Unknown ids fail with
 `proposal_not_found`.
 
-Proposals older than 30 days are terminally rejected by the scheduler with
-audit decision `expired`; target files are never applied. Interrupted expiry
-uses the same durable decision-request recovery path as principal decisions.
+No-window proposals older than 30 days are terminally rejected with audit
+decision `expired`; their target files are not applied. An opened veto window
+does not expire through this retention shortcut. Its deadline triggers replay
+and one typed terminal close. Interrupted decisions use the same durable
+decision-request recovery path as principal decisions.
+
+Quarantine is not a terminal close. When a previous apply is unresolved, its
+audit capacity reservation stays attached to the preserved recovery evidence.
+Resolve that state explicitly rather than deleting the evidence or claiming
+that the proposal was never applied.
 
 Every newly staged proposal carries deterministic, offline probe evidence.
 The list prints its aggregate `passed`, `failed`, or `unscored` status;
@@ -230,6 +253,14 @@ they are owner-local too. The optional loopback TCP listener returns
 mutation before proposal lookup or audit mutation; UUID secrecy is never an
 authorization control. Automatic expiry/apply and interrupted-decision
 recovery are internal daemon work and have no TCP route.
+
+On upgrade, an interrupted historical decision must match its original
+reservation, append-only apply intent, and versioned recovery evidence.
+An unknown historical decider stays explicitly unknown in the audit
+(`unknown:historical` with `decisionOrigin.kind = historical_unknown`), never
+the proposal writer or an invented human. Missing proof requires renewed
+review; potentially applied bytes and their evidence remain preserved rather
+than being mislabeled as corruption or silently approved.
 
 ```sh
 coven ward approve <id> --note "reviewed identity change"
@@ -320,7 +351,16 @@ fail with `familiar_not_found`.
 `coven ward migrate` inspects (and with `--apply`, rewrites) v0.1
 `ward.toml` files into the Phase-2 `WardConfig` dialect. Use `--familiar
 <ID>` to scope to one familiar and `--fingerprint <FPR>` to set the
-principal binding. Exits non-zero if any migration fails.
+principal binding. Veto-bearing approval metadata must explicitly declare both
+`human_veto_window_hours` and `min_visible_seconds`. Migration preserves these
+values and refuses ambiguous declarations without rewriting the source or
+creating a backup. A minimum is invalid without a veto window and on human
+approval paths. The command exits non-zero if any migration fails.
+
+Legacy harness-block names without approval tiers do not create scheduled
+approval policy: migrated editable paths remain Tier 2, and the original names
+remain in the backup. Approval tiers without nonempty harness blocks are
+rejected without rewriting the source or creating a backup.
 
 Accepted retired invariants become active `[[identity_invariant]]` entries,
 not backup-only annotations. You keep the original configuration in

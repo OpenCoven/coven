@@ -174,11 +174,7 @@ fn request_with_peer(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    if !path.starts_with("/api/v1/") {
-        return Err(ClientError::InvalidHttpResponse(
-            "attempted request outside /api/v1".to_owned(),
-        ));
-    }
+    validate_request_line(method, path)?;
     if let Some(body) = body {
         if body.len() > MAX_REQUEST_BODY_BYTES {
             return Err(ClientError::RequestTooLarge {
@@ -223,6 +219,58 @@ pub use windows::{
     probe_windows_daemon_health_with_identity, probe_windows_daemon_health_with_identity_until,
     windows_process_creation_time, WindowsDaemonHealthProbe, WindowsDaemonProcess,
 };
+
+pub(crate) fn validate_request_line(method: &str, path: &str) -> Result<(), ClientError> {
+    if !valid_request_method(method) {
+        return Err(ClientError::InvalidRouteParameter("HTTP method"));
+    }
+    if !valid_request_target(path) {
+        return Err(ClientError::InvalidRouteParameter("HTTP request target"));
+    }
+    if !allowed_request_route(method, path) {
+        return Err(ClientError::InvalidRouteParameter(
+            "HTTP request target outside /api/v1 or exact GET /health",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_request_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn valid_request_target(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && path.is_ascii()
+        && !path
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'#')
+}
+
+fn allowed_request_route(method: &str, path: &str) -> bool {
+    path.starts_with("/api/v1/") || (method == "GET" && path == "/health")
+}
 
 #[cfg(test)]
 mod tests {
@@ -310,5 +358,49 @@ mod tests {
             .expect("an interrupted write must be retried under the same deadline");
 
         assert_eq!(stream.bytes, b"payload");
+    }
+
+    #[test]
+    fn request_target_guard_rejects_non_origin_or_injected_targets() {
+        for path in [
+            "http://evil.example/api/v1/health",
+            "//evil.example/api/v1/health",
+            "/api/v1/health HTTP/1.1",
+            "/api/v1/health\r\nX: injected",
+            "/api/v1/health#fragment",
+        ] {
+            assert!(
+                !super::valid_request_target(path),
+                "unsafe request target was accepted: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_target_guard_allows_health_only_for_get() {
+        assert!(super::allowed_request_route("GET", "/health"));
+        assert!(!super::allowed_request_route("POST", "/health"));
+    }
+
+    #[test]
+    fn request_line_reports_out_of_scope_routes_as_client_input_errors() {
+        let error = super::validate_request_line("POST", "/health")
+            .expect_err("POST /health must be rejected before any I/O");
+        assert!(matches!(
+            error,
+            ClientError::InvalidRouteParameter(
+                "HTTP request target outside /api/v1 or exact GET /health"
+            )
+        ));
+    }
+
+    #[test]
+    fn request_method_guard_rejects_injected_or_blank_methods() {
+        for method in ["", "GE T", "GET\r\nX: injected", "GET\t"] {
+            assert!(
+                !super::valid_request_method(method),
+                "unsafe request method was accepted: {method:?}"
+            );
+        }
     }
 }

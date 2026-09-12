@@ -575,6 +575,23 @@ pub fn open_store(path: &Path) -> Result<Connection> {
 /// sequence. Call this before serving requests; ordinary request connections
 /// should use [`open_initialized_store`] after this succeeds.
 pub fn initialize_store(path: &Path) -> Result<()> {
+    initialize_store_with_observer(path, |_| {})
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StoreInitializationPhase {
+    ConnectionConfigured,
+    WardComplete,
+    RuntimeComplete,
+    MainLockAcquired,
+    MainSchemaComplete,
+    CommitComplete,
+}
+
+pub(crate) fn initialize_store_with_observer(
+    path: &Path,
+    mut observe: impl FnMut(StoreInitializationPhase),
+) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -586,19 +603,26 @@ pub fn initialize_store(path: &Path) -> Result<()> {
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
     configure_initializing_connection(&conn)?;
+    observe(StoreInitializationPhase::ConnectionConfigured);
     // Table-rebuild migrators own their transactions so they can change SQLite
     // foreign-key mode safely and roll back atomically. Run them before the
     // transaction for the remaining idempotent schema work.
     ensure_ward_audit_schema(&conn)?;
+    observe(StoreInitializationPhase::WardComplete);
     crate::automations::runs::ensure_runtime_authority_unsupported_failure_class(&conn)?;
     crate::automations::runtime_terminal_evidence::ensure_runtime_terminal_evidence_schema(&conn)?;
+    observe(StoreInitializationPhase::RuntimeComplete);
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("failed to acquire SQLite initialization transaction")?;
+    observe(StoreInitializationPhase::MainLockAcquired);
     let result = initialize_store_schema(&conn);
     match result {
-        Ok(()) => conn
-            .execute_batch("COMMIT")
-            .context("failed to commit SQLite initialization transaction")?,
+        Ok(()) => {
+            observe(StoreInitializationPhase::MainSchemaComplete);
+            conn.execute_batch("COMMIT")
+                .context("failed to commit SQLite initialization transaction")?;
+            observe(StoreInitializationPhase::CommitComplete);
+        }
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");
             return Err(error);
@@ -1398,6 +1422,7 @@ pub struct WardAuditReservation<'a> {
     conn: &'a Connection,
     reservation_id: String,
     store_id: String,
+    reused_existing: bool,
     preserve_on_drop: bool,
     finished: bool,
 }
@@ -1640,9 +1665,35 @@ impl<'a> WardAuditReservation<'a> {
             conn,
             reservation_id: reservation_token,
             store_id,
+            reused_existing: previous_reserved_bytes.is_some(),
             preserve_on_drop: previous_reserved_bytes.is_some(),
             finished: false,
         })
+    }
+
+    pub fn reused_existing(&self) -> bool {
+        self.reused_existing
+    }
+
+    pub fn replace_purpose(&self, purpose: &str) -> Result<()> {
+        anyhow::ensure!(
+            !purpose.trim().is_empty(),
+            "Ward audit reservation purpose is empty"
+        );
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE coven_ward_audit_reservations
+                 SET purpose = ?2
+                 WHERE token = ?1",
+                params![&self.reservation_id, purpose],
+            )
+            .context("failed to replace Ward audit reservation purpose")?;
+        anyhow::ensure!(
+            updated == 1,
+            "active Ward audit reservation disappeared before purpose replacement"
+        );
+        Ok(())
     }
 
     pub fn connection(&self) -> &Connection {

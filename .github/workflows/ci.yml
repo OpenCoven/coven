@@ -255,6 +255,8 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Exercise isolated Threads clock feature
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
+      - name: Exercise real-daemon Threads journeys
+        run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock
 
   rust-test-windows:
     name: Rust tests (Windows)
@@ -262,12 +264,18 @@ jobs:
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
     # A healthy cached run is already about 15-16 minutes. Keep enough
-    # shared-runner headroom for the suite to report failures instead of being
-    # cancelled by the job cap while tests are still progressing.
+    # shared-runner headroom for the separate clock-feature build and daemon
+    # journeys to report failures without renewing their own startup budgets.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
+      - name: Configure Threads evidence directory
+        shell: pwsh
+        env:
+          COVEN_THREADS_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          "COVEN_THREADS_E2E_ARTIFACT_ROOT=$env:COVEN_THREADS_E2E_ARTIFACT_ROOT" >> $env:GITHUB_ENV
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -279,7 +287,19 @@ jobs:
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
       - name: Exercise isolated Threads clock feature
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
+      - name: Exercise real-daemon Threads journeys
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock
+      - name: Upload Threads daemon evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: threads-daemon-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
 
   # macOS runners bill at roughly ten times the Linux rate, so this follows the
   # npm-onboarding split: a cheap matrix on pull requests, the full one on main.
@@ -308,6 +328,8 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Exercise isolated Threads clock feature
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
+      - name: Exercise real-daemon Threads journeys
+        run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock
 
   afs-mount-linux:
     name: AFS mount backend (Linux)

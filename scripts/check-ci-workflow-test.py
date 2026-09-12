@@ -121,6 +121,63 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", CI_TEXT)
 
+    def test_all_platforms_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
+        command = "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock"
+        for job, next_job in [
+            ("rust-test-linux", "rust-test-windows"),
+            ("rust-test-windows", "rust-test-macos"),
+            ("rust-test-macos", "afs-mount-linux"),
+        ]:
+            block = CI_TEXT.split(f"\n  {job}:\n", 1)[1].split(f"\n  {next_job}:\n", 1)[0]
+            self.assertIn(command, block)
+        harness = CI_WORKFLOW.parents[2] / "crates/coven-cli/tests/threads_e2e.rs"
+        self.assertNotIn("#![cfg(unix)]", harness.read_text(encoding="utf-8"))
+
+    def test_windows_threads_journeys_retain_failure_evidence(self) -> None:
+        windows = CI_TEXT.split("\n  rust-test-windows:\n", 1)[1].split(
+            "\n  rust-test-macos:\n", 1
+        )[0]
+        self.assertIn("name: Upload Threads daemon evidence", windows)
+        self.assertIn("if: ${{ always() }}", windows)
+        job_config, steps = windows.split("\n    steps:\n", 1)
+        artifact_root = "${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}"
+        initialization = steps.split(
+            "- name: Configure Threads evidence directory\n", 1
+        )[1].split("\n      - ", 1)[0]
+        self.assertIn(f"COVEN_THREADS_E2E_ARTIFACT_ROOT: {artifact_root}", initialization)
+        self.assertIn("shell: pwsh", initialization)
+        self.assertIn(
+            '"COVEN_THREADS_E2E_ARTIFACT_ROOT=$env:COVEN_THREADS_E2E_ARTIFACT_ROOT" >> $env:GITHUB_ENV',
+            initialization,
+        )
+        self.assertLess(
+            steps.index("- name: Configure Threads evidence directory"),
+            steps.index("- uses: actions/cache@"),
+        )
+        self.assertEqual(steps.count("COVEN_THREADS_E2E_ARTIFACT_ROOT:"), 1)
+        self.assertNotIn("runner.", job_config)
+        self.assertNotIn("COVEN_THREADS_E2E_ARTIFACT_ROOT:", job_config)
+        self.assertNotIn("/../", windows)
+        self.assertNotIn("path: target/e2e-artifacts/", steps)
+        upload = steps.split("- name: Upload Threads daemon evidence\n", 1)[1]
+        self.assertIn(
+            "name: threads-daemon-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            upload,
+        )
+        self.assertIn(f"path: {artifact_root}", upload)
+        self.assertIn("if: ${{ always() }}", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        self.assertIn("retention-days: 14", windows)
+
+    def test_windows_has_budget_for_both_threads_build_profiles(self) -> None:
+        windows = CI_TEXT.split("\n  rust-test-windows:\n", 1)[1].split(
+            "\n  rust-test-macos:\n", 1
+        )[0]
+        self.assertIn("\n    timeout-minutes: 30\n", windows)
+        for step in ["Exercise isolated Threads clock feature", "Exercise real-daemon Threads journeys"]:
+            self.assertIn(f"- name: {step}\n        if: ${{{{ !cancelled() }}}}", windows)
+        self.assertNotIn("continue-on-error: true", windows)
+
     def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
         release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
         for workflow_text in [CI_TEXT, RELEASE_TEXT, release_stress_text]:

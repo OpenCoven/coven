@@ -6,7 +6,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use coven_threads_core::IdentityInvariantSet;
 use serde::Deserialize;
 
-use crate::ward::{SurfaceEntry, Tier, WardConfig, WARD_CONFIG_FILE};
+use crate::ward::{
+    ApprovalTierDeclarations, EditableConfig, SurfaceEntry, Tier, WardConfig, WARD_CONFIG_FILE,
+};
 
 const V01_BACKUP_FILE: &str = "ward.toml.v01.bak";
 
@@ -35,6 +37,7 @@ pub struct MigrationEntry {
     pub status: MigrationStatus,
     pub protected_files: Vec<String>,
     pub editable_paths: Vec<String>,
+    pub editable_tier: Option<Tier>,
     pub translated_globs: Vec<(String, String)>,
     /// Fidelity records for v0.1 `[protected].invariants`: each entry is
     /// either a compiled typed-fact disposition or an explicit rejection
@@ -80,6 +83,7 @@ impl MigrationReport {
 struct LegacyWardConfig {
     protected: Option<LegacyProtected>,
     editable: Option<LegacyEditable>,
+    approval_tiers: Option<ApprovalTierDeclarations>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +98,8 @@ struct LegacyProtected {
 struct LegacyEditable {
     #[serde(default)]
     paths: Vec<String>,
+    #[serde(default)]
+    harness_blocks: Vec<String>,
 }
 
 pub fn run_migration(coven_home: &Path, options: WardMigrateOptions) -> Result<MigrationReport> {
@@ -138,6 +144,7 @@ fn migrate_one(
                 status: MigrationStatus::NoWard,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -163,6 +170,7 @@ fn migrate_one(
                     status: MigrationStatus::Unmigratable,
                     protected_files: Vec::new(),
                     editable_paths: Vec::new(),
+                    editable_tier: None,
                     translated_globs: Vec::new(),
                     invariant_dispositions: Vec::new(),
                     generated_toml: None,
@@ -183,6 +191,7 @@ fn migrate_one(
                     status: MigrationStatus::Unmigratable,
                     protected_files: Vec::new(),
                     editable_paths: Vec::new(),
+                    editable_tier: None,
                     translated_globs: Vec::new(),
                     invariant_dispositions: Vec::new(),
                     generated_toml: None,
@@ -197,6 +206,7 @@ fn migrate_one(
                 status: MigrationStatus::AlreadyMigrated,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -215,6 +225,7 @@ fn migrate_one(
                 status: MigrationStatus::Unmigratable,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -231,6 +242,7 @@ fn migrate_one(
             status: MigrationStatus::Unmigratable,
             protected_files: Vec::new(),
             editable_paths: Vec::new(),
+            editable_tier: None,
             translated_globs: Vec::new(),
             invariant_dispositions: Vec::new(),
             generated_toml: None,
@@ -249,6 +261,7 @@ fn migrate_one(
                 status: MigrationStatus::Unmigratable,
                 protected_files: Vec::new(),
                 editable_paths: Vec::new(),
+                editable_tier: None,
                 translated_globs: Vec::new(),
                 invariant_dispositions: Vec::new(),
                 generated_toml: None,
@@ -260,10 +273,11 @@ fn migrate_one(
         .protected
         .map(|protected| (protected.files, protected.invariants))
         .unwrap_or_default();
-    let editable_paths = legacy
+    let (editable_paths, harness_blocks) = legacy
         .editable
-        .map(|editable| editable.paths)
+        .map(|editable| (editable.paths, editable.harness_blocks))
         .unwrap_or_default();
+    let approval_tiers = legacy.approval_tiers;
 
     // Fidelity gate for retired v0.1 identity invariants: every declaration
     // must compile deterministically through coven-threads-core or the
@@ -289,6 +303,7 @@ fn migrate_one(
             status: MigrationStatus::Unmigratable,
             protected_files,
             editable_paths,
+            editable_tier: None,
             translated_globs: Vec::new(),
             invariant_dispositions,
             generated_toml: None,
@@ -315,10 +330,21 @@ fn migrate_one(
             .declarations()
             .to_vec()
     };
+    let editable_tier = if approval_tiers.is_some() {
+        Tier::Reviewed
+    } else {
+        Tier::Logged
+    };
+    let migrated_editable_tier = (!editable_paths.is_empty()).then_some(editable_tier);
 
     let config = WardConfig {
         principal_key_fingerprint: fingerprint.to_string(),
         protected_surface: protected_files.clone(),
+        default_tier: Tier::Logged,
+        editable: approval_tiers
+            .as_ref()
+            .map(|_| EditableConfig { harness_blocks }),
+        approval_tiers,
         surface: protected_files
             .iter()
             .cloned()
@@ -332,11 +358,10 @@ fn migrate_one(
                     .cloned()
                     .map(|path| SurfaceEntry {
                         path,
-                        tier: Tier::Logged,
+                        tier: editable_tier,
                     }),
             )
             .collect(),
-        default_tier: Tier::Logged,
         identity_invariants: compiled_identity_invariants,
         probe: Vec::new(),
     };
@@ -348,6 +373,7 @@ fn migrate_one(
             status: MigrationStatus::ValidationFailed,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -362,6 +388,7 @@ fn migrate_one(
             status: MigrationStatus::WouldMigrate,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -387,6 +414,7 @@ fn migrate_one(
             status: MigrationStatus::BackupExists,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -403,6 +431,7 @@ fn migrate_one(
             status: MigrationStatus::ValidationFailed,
             protected_files,
             editable_paths,
+            editable_tier: migrated_editable_tier,
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
@@ -416,6 +445,7 @@ fn migrate_one(
         status: MigrationStatus::Migrated,
         protected_files,
         editable_paths,
+        editable_tier: migrated_editable_tier,
         translated_globs,
         invariant_dispositions: invariant_dispositions.clone(),
         generated_toml: Some(generated_toml),
@@ -549,7 +579,11 @@ pub fn print_report(report: &MigrationReport) {
             );
         }
         if !entry.editable_paths.is_empty() {
-            println!("  editable -> tier 2: {}", entry.editable_paths.join(", "));
+            let editable_tier = migrated_editable_tier(entry);
+            println!(
+                "  editable -> tier {editable_tier}: {}",
+                entry.editable_paths.join(", ")
+            );
         }
         for (from, to) in &entry.translated_globs {
             println!("  translated glob: {from} -> {to}");
@@ -573,6 +607,10 @@ pub fn print_report(report: &MigrationReport) {
             println!("  round-trip validation: {validation}");
         }
     }
+}
+
+fn migrated_editable_tier(entry: &MigrationEntry) -> u8 {
+    entry.editable_tier.map(u8::from).unwrap_or(2)
 }
 
 #[cfg(test)]
@@ -616,18 +654,21 @@ owner = "nova"
 files = ["SOUL.md", "IDENTITY.md"]
 invariants = [
     "familiar.name == 'Nova'",
-    "familiar.person == \"Val Alexander\"",
+    "familiar.person == \"Example principal\"",
     "familiar.pronouns == 'they/them'",
     "familiar.purpose includes 'authority boundary'",
     "familiar.coven includes \"OpenCoven\"",
 ]
 
 [editable]
-paths = ["skills/*/", "memory/*", "notes/"]
-harness_blocks = ["synthetic-harness"]
+paths = ["TOOLS.md", "HEARTBEAT.md"]
+harness_blocks = ["tool_defaults", "heartbeat_behavior"]
 
-[approval_tiers.tier0]
-required = ["principal"]
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults", "heartbeat_behavior"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
 
 [audit]
 append_only = true
@@ -668,9 +709,7 @@ append_only = true
         assert!(!report.has_errors());
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].status, MigrationStatus::WouldMigrate);
-        assert!(report.entries[0]
-            .translated_globs
-            .contains(&("memory/*".to_string(), "memory/**".to_string())));
+        assert!(report.entries[0].translated_globs.is_empty());
         assert_eq!(
             report.entries[0].invariant_dispositions,
             [
@@ -696,18 +735,22 @@ append_only = true
             .as_deref()
             .expect("dry run includes generated toml");
         assert!(generated.contains("Migrated from Ward v0.1"));
+        assert!(generated.contains("harness_blocks"));
+        assert!(generated.contains("[approval_tiers.familiar_review]"));
+        assert!(generated.contains("min_visible_seconds = 900"));
         assert!(generated.contains("[[identity_invariant]]"));
         assert!(generated.contains("fact = \"name\""));
         assert!(generated.contains("operator = \"equals\""));
         assert!(generated.contains("expected = \"Nova\""));
-        assert!(generated.contains("expected = \"Val Alexander\""));
+        assert!(generated.contains("expected = \"Example principal\""));
         assert!(generated.contains("expected = \"they/them\""));
         assert!(generated.contains("fact = \"purpose\""));
         assert!(generated.contains("operator = \"includes\""));
         assert!(generated.contains("expected = \"authority boundary\""));
         assert!(generated.contains("expected = \"OpenCoven\""));
-        assert!(!generated.contains("harness_blocks"));
-        assert!(!generated.contains("approval_tiers"));
+        assert!(generated.contains("harness_blocks"));
+        assert!(generated.contains("[approval_tiers.familiar_review]"));
+        assert!(generated.contains("min_visible_seconds = 900"));
         assert!(!generated.contains("[audit]"));
         let config = WardConfig::from_toml_str(generated)?;
         assert_eq!(config.principal_key_fingerprint, "SHA256:test-principal");
@@ -722,17 +765,12 @@ append_only = true
             .map(|entry| entry.path.clone())
             .collect();
         assert_eq!(config.protected_surface, tier0);
-
         let ward = Ward::new(workspace, config)?;
         let outcome = ward.evaluate(&Proposal {
-            targets: vec![
-                "skills/rust/SKILL.md".to_string(),
-                "memory/deep/fact.md".to_string(),
-                "notes/today.md".to_string(),
-            ],
+            targets: vec!["TOOLS.md".to_string(), "HEARTBEAT.md".to_string()],
             authorization: Authorization::default(),
         });
-        assert!(outcome.decisions.iter().all(|d| d.tier == Tier::Logged));
+        assert!(outcome.decisions.iter().all(|d| d.tier == Tier::Reviewed));
         Ok(())
     }
 
@@ -772,6 +810,170 @@ append_only = true
         assert!(!second.has_errors());
         assert_eq!(second.entries[0].status, MigrationStatus::AlreadyMigrated);
         Ok(())
+    }
+
+    #[test]
+    fn migration_without_approval_tiers_keeps_legacy_harness_blocks_at_tier2() -> Result<()> {
+        for apply in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let workspace = seed_familiars(temp.path())?;
+            let original = r#"[meta]
+version = "0.1"
+owner = "nova"
+
+[editable]
+paths = ["TOOLS.md"]
+harness_blocks = ["legacy_unbound_block"]
+"#;
+            fs::write(workspace.join("ward.toml"), original)?;
+            let report = run_migration(
+                temp.path(),
+                WardMigrateOptions {
+                    familiar: Some("nova".to_string()),
+                    fingerprint: "SHA256:test-principal".to_string(),
+                    apply,
+                },
+            )?;
+            assert!(!report.has_errors(), "{report:?}");
+            let entry = &report.entries[0];
+            assert_eq!(
+                entry.status,
+                if apply {
+                    MigrationStatus::Migrated
+                } else {
+                    MigrationStatus::WouldMigrate
+                }
+            );
+            let generated = entry.generated_toml.as_deref().expect("generated config");
+            let config = WardConfig::from_toml_str(generated)?;
+            assert!(config.editable.is_none());
+            assert!(config.compiled_approval_tiers()?.is_none());
+            assert_eq!(config.classify_resolved_path("TOOLS.md")?, Tier::Logged);
+            assert_eq!(migrated_editable_tier(entry), 2);
+            if apply {
+                assert_eq!(
+                    fs::read_to_string(workspace.join("ward.toml.v01.bak"))?,
+                    original
+                );
+                assert_eq!(load_migrated_config(&workspace)?, config);
+            } else {
+                assert_eq!(fs::read_to_string(workspace.join("ward.toml"))?, original);
+                assert!(!workspace.join("ward.toml.v01.bak").exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_refuses_approval_tiers_without_harness_blocks_without_writing() -> Result<()> {
+        for editable in [
+            "",
+            "[editable]\npaths = [\"TOOLS.md\"]\n",
+            "[editable]\nharness_blocks = []\n",
+        ] {
+            let temp = tempfile::tempdir()?;
+            let workspace = seed_familiars(temp.path())?;
+            let original = format!(
+                r#"[meta]
+version = "0.1"
+owner = "nova"
+
+{editable}
+[approval_tiers.human_review]
+blocks = ["tool_defaults"]
+gate = "human_approval"
+"#
+            );
+            fs::write(workspace.join("ward.toml"), &original)?;
+            let report = run_migration(
+                temp.path(),
+                WardMigrateOptions {
+                    familiar: Some("nova".to_string()),
+                    fingerprint: "SHA256:test-principal".to_string(),
+                    apply: true,
+                },
+            )?;
+            assert!(report.has_errors());
+            assert_eq!(report.entries[0].status, MigrationStatus::ValidationFailed);
+            assert!(report.entries[0]
+                .message
+                .contains("harness_blocks must not be empty"));
+            assert_eq!(fs::read_to_string(workspace.join("ward.toml"))?, original);
+            assert!(!workspace.join("ward.toml.v01.bak").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_refuses_veto_without_explicit_minimum_without_writing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = seed_familiars(temp.path())?;
+        let original = r#"[meta]
+version = "0.1"
+owner = "nova"
+
+[protected]
+files = ["SOUL.md"]
+invariants = [
+    "familiar.name == 'Nova'",
+    "familiar.person == 'Example principal'",
+]
+
+[editable]
+paths = ["TOOLS.md"]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+"#;
+        fs::write(workspace.join("ward.toml"), original)?;
+
+        let report = run_migration(
+            temp.path(),
+            WardMigrateOptions {
+                familiar: Some("nova".to_string()),
+                fingerprint: "SHA256:test-principal".to_string(),
+                apply: true,
+            },
+        )?;
+
+        assert!(report.has_errors());
+        let entry = &report.entries[0];
+        assert_eq!(entry.status, MigrationStatus::ValidationFailed);
+        assert!(entry
+            .message
+            .contains("requires explicit min_visible_seconds"));
+        assert_eq!(fs::read(workspace.join("ward.toml"))?, original.as_bytes());
+        assert!(!workspace.join("ward.toml.v01.bak").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn migration_report_detects_reviewed_editable_tier_from_nested_approval_tables() {
+        let reviewed = MigrationEntry {
+            familiar_id: "nova".to_string(),
+            workspace: PathBuf::from("/tmp/nova"),
+            status: MigrationStatus::Migrated,
+            protected_files: Vec::new(),
+            editable_paths: vec!["TOOLS.md".to_string()],
+            editable_tier: Some(Tier::Reviewed),
+            translated_globs: Vec::new(),
+            invariant_dispositions: Vec::new(),
+            generated_toml: Some(
+                "[approval_tiers.familiar_review]\nblocks = [\"tool_defaults\"]\n".to_string(),
+            ),
+            message: "ok".to_string(),
+        };
+        let logged = MigrationEntry {
+            editable_tier: Some(Tier::Logged),
+            generated_toml: Some("[surface]\npath = \"notes/\"\ntier = 2\n".to_string()),
+            ..reviewed.clone()
+        };
+
+        assert_eq!(migrated_editable_tier(&reviewed), 1);
+        assert_eq!(migrated_editable_tier(&logged), 2);
     }
 
     fn synthetic_v01_with_invariants(invariants_toml: &str) -> String {
@@ -835,23 +1037,23 @@ paths = ["notes/"]
         // mandatory name/person cases mirror the retired-Ward corpus grammar.
         let cases: &[(&str, &str)] = &[
             (
-                r#"invariants = ["familiar.mood == 'sunny'", "familiar.name == 'Nova'", "familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.mood == 'sunny'", "familiar.name == 'Nova'", "familiar.person == 'Example principal'"]"#,
                 "unsupported identity fact",
             ),
             (
-                r#"invariants = ["familiar.name matches 'Nova'", "familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.name matches 'Nova'", "familiar.person == 'Example principal'"]"#,
                 "expected `==` or `includes` operator",
             ),
             (
-                r#"invariants = ["familiar.name == 'Nova'", "familiar.name == 'Supernova'", "familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.name == 'Nova'", "familiar.name == 'Supernova'", "familiar.person == 'Example principal'"]"#,
                 "duplicate Name identity invariant",
             ),
             (
-                r#"invariants = ["familiar.name == ''", "familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.name == ''", "familiar.person == 'Example principal'"]"#,
                 "expected value must not be empty",
             ),
             (
-                r#"invariants = ["familiar.person == 'Val'"]"#,
+                r#"invariants = ["familiar.person == 'Example principal'"]"#,
                 "missing mandatory Name identity invariant",
             ),
             (
