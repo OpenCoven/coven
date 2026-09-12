@@ -110,6 +110,21 @@ HTTP framing regressions belong to the shared client's tests, not a separate
 harness parser. A cross-target compilation or Windows workspace run alone is
 not evidence that these journeys executed on Windows.
 
+## Lifecycle deadlines
+
+Production `start` and the complete `restart` operation each use one
+five-second deadline for cold readiness. The deadline starts before profile
+resolution and lifecycle locking; restart does not renew it after stopping the
+old daemon. Standalone `stop` and `status` retain their two-second deadlines.
+The startup allowance does not relax authentication, profile matching, or
+failure cleanup.
+
+The dedicated Windows CLI fixture captures allowlisted startup phases and
+numeric timing fields before temporary-home cleanup on failure. This diagnostic
+read uses at most 16 KiB and a one-second caller guard, preserves the original
+command result, and reports missing or delayed data explicitly. Its five helper
+tests are diagnostic coverage, not additional CLI or authority journeys.
+
 Windows authority journeys serialize admission and retain an owned
 `coven daemon serve` child, using the same native helper as the smaller Threads
 fixtures. Their fixed 15-second readiness budget starts before process spawn,
