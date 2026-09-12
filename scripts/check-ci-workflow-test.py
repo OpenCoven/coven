@@ -60,6 +60,11 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn(f"actions/cache@{CACHE_SHA}", CI_TEXT)
         self.assertNotIn('actions/cache@v', CI_TEXT)
 
+    def test_windows_rust_gate_has_shared_runner_headroom(self) -> None:
+        windows = ci_job_block('rust-test-windows')
+        self.assertIn('timeout-minutes: 30', windows)
+        self.assertNotIn('timeout-minutes: 20', windows)
+
     def test_ci_runs_expected_workflow_checks(self) -> None:
         for needle in [
             'python3 scripts/classify-ci-changes-test.py',
