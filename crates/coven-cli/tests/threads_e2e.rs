@@ -1801,7 +1801,13 @@ impl ThreadsFixture {
     fn start_daemon(&mut self) -> Result<()> {
         let pid_before = self.current_daemon_pid();
         self.stopped = false;
-        let output = self.daemon_command(&["daemon", "start"])?;
+        let mut output = self.daemon_command(&["daemon", "start"])?;
+        if cfg!(windows)
+            && !output.status.success()
+            && daemon_start_timed_out_waiting_for_health_connect(output.stderr.as_slice())
+        {
+            output = self.daemon_command(&["daemon", "start"])?;
+        }
         self.complete_daemon_start(pid_before, output)
     }
 
@@ -2399,6 +2405,12 @@ fn run_coven(coven: &Path, coven_home: &Path, path: &OsString, args: &[&str]) ->
         .env("PATH", path)
         .output()
         .map_err(Into::into)
+}
+
+fn daemon_start_timed_out_waiting_for_health_connect(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).contains(
+        "timed out waiting for Coven daemon startup health; last_readiness=connect-timeout",
+    )
 }
 
 fn wait_for_daemon_health(coven_home: &Path) -> Result<()> {
