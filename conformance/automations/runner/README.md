@@ -128,7 +128,7 @@ The checked-in
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
 [`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
-and
+[`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
 files contain the current nonempty vector sets.
 
@@ -152,6 +152,7 @@ The runner invokes the target directly without a shell.
         "event-reducer-determinism",
         "occurrence-fence-uniqueness",
         "receipt-integrity-validation",
+        "rrule-vocabulary",
         "run-terminal-monotonicity"
       ]
     }
@@ -165,7 +166,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eight structural suites.
+The native Coven target currently implements nine structural suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
@@ -192,6 +193,11 @@ SHA-256 integrity value and a minimally tampered receipt whose unchanged
 integrity value must be rejected. Accepted receipts are compared by a pinned
 digest of their normalized typed representation; receipt contents are not
 returned as target evidence.
+`rrule-vocabulary` executes a fixed portable matrix through the production
+Rust RRULE parser. It covers daily and weekly defaults, hour and weekday
+normalization, and fail-closed rejection of unsupported frequencies and keys,
+invalid combinations, duplicate parts or values, malformed parts, empty
+segments or values, and out-of-range inputs.
 `run-terminal-monotonicity` executes the checked-in settlement and replay cases
 against the real Rust run ledger in an isolated in-memory store, proving that a
 later terminal observation cannot rewrite the first committed terminal state.

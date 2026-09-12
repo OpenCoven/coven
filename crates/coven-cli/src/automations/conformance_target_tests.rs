@@ -22,6 +22,8 @@ const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
 const RECEIPT_INTEGRITY_VALIDATION_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/receipt-integrity-validation.vectors.json"
 );
+const RRULE_VOCABULARY_VECTORS: &str =
+    include_str!("../../../../conformance/automations/runner/rrule-vocabulary.vectors.json");
 
 fn request_for(suite_id: &str, vector: Value) -> Value {
     json!({
@@ -68,11 +70,93 @@ fn capability_advertises_the_native_structural_suites() {
                     "event-reducer-determinism",
                     "occurrence-fence-uniqueness",
                     "receipt-integrity-validation",
+                    "rrule-vocabulary",
                     RUN_TERMINAL_MONOTONICITY_SUITE
                 ]
             }]
         })
     );
+}
+
+#[test]
+fn rrule_vocabulary_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(RRULE_VOCABULARY_VECTORS).unwrap();
+    let response = evaluate(&request_for("rrule-vocabulary", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 22);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 22);
+}
+
+#[test]
+fn rrule_vocabulary_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(RRULE_VOCABULARY_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["byHour"] = json!([10]);
+
+    let response = evaluate(&request_for("rrule-vocabulary", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn rrule_vocabulary_suite_reports_outcome_mismatches() {
+    let mismatches: [fn(&mut Value); 2] = [
+        |vectors| vectors["cases"][0]["expected"] = json!({"outcome": "rejected"}),
+        |vectors| {
+            vectors["cases"][4]["expected"] = json!({
+                "outcome": "accepted",
+                "frequency": "daily",
+                "byHour": [9],
+                "byDay": []
+            })
+        },
+    ];
+
+    for mismatch in mismatches {
+        let mut vectors: Value = serde_json::from_str(RRULE_VOCABULARY_VECTORS).unwrap();
+        mismatch(&mut vectors);
+        let response = evaluate(&request_for("rrule-vocabulary", vectors)).unwrap();
+        assert_eq!(response.status, TargetSuiteStatus::Failed);
+        assert_eq!(response.evidence, None);
+    }
+}
+
+#[test]
+fn rrule_vocabulary_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 10] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][0]["rrule"] = json!(""),
+        |vectors| vectors["cases"][0]["rrule"] = json!("x".repeat(1025)),
+        |vectors| {
+            vectors["cases"][2]["rrule"] = json!("FREQ=DAILY;BYHOUR=10");
+            vectors["cases"][2]["expected"] = json!({
+                "outcome": "accepted",
+                "frequency": "daily",
+                "byHour": [10],
+                "byDay": []
+            });
+        },
+        |vectors| vectors["cases"][4]["rrule"] = json!("FREQ=DAILY;COUNT=4"),
+        |vectors| vectors["cases"][0]["expected"]["byHour"] = json!([17, 9]),
+        |vectors| vectors["cases"][2]["expected"]["byDay"] = json!([]),
+        |vectors| {
+            vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone();
+        },
+        |vectors| {
+            vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone();
+        },
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(RRULE_VOCABULARY_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for("rrule-vocabulary", vectors)).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
 }
 
 #[test]
