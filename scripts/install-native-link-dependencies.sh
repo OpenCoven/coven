@@ -16,7 +16,7 @@ trap cleanup EXIT
 # Apt's unprivileged downloader must be able to traverse the public metadata directory.
 chmod 755 "$workdir"
 
-ubuntu_archive_pattern='ubuntu\.com/ubuntu/?([[:space:]]|$)'
+ubuntu_archive_pattern='https?://([[:alnum:]-]+\.)*ubuntu\.com/ubuntu/?([[:space:]]|$)'
 
 deb822_source_points_to_ubuntu_archive() {
   local file="$1"
