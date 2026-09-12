@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use super::authority::test_support::{
+    authority_extensions_value, extension_bag, AcceptingVerifier,
+};
 use super::authority::{
     validate_authority_profile, AuthorityConsumerClass, AuthorityEvidenceVerifier,
     AuthorityProfileDisposition, AuthorityProfileError, AuthorityProfileErrorCode,
@@ -17,29 +20,7 @@ fn vectors() -> Value {
 }
 
 fn authority_extensions() -> ExtensionBag {
-    let vectors = vectors();
-    let value = json!({
-        AUTHORITY_EXTENSION_KEY: {
-            "profile": "coven.automations.authority.v1",
-            "kind": "AutomationAuthorityExtension",
-            "executionBinding": vectors["fixtures"]["binding"].clone(),
-            "receiptEvidence": vectors["fixtures"]["receiptEvidence"].clone()
-        }
-    });
-    serde_json::from_value(value).expect("authority extension bag")
-}
-
-#[derive(Debug)]
-struct AcceptingVerifier;
-
-impl AuthorityEvidenceVerifier for AcceptingVerifier {
-    fn verify(
-        &self,
-        _extension: &AutomationAuthorityExtension,
-        _phase: AuthorityValidationPhase,
-    ) -> Result<(), AuthorityProfileError> {
-        Ok(())
-    }
+    extension_bag(authority_extensions_value())
 }
 
 #[derive(Debug)]

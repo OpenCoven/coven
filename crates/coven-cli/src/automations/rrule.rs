@@ -53,8 +53,10 @@ fn parse_by_day(raw: &str) -> Result<Vec<String>, String> {
         if !ALLOWED.contains(&part.as_str()) {
             return Err(format!("BYDAY entry `{part}` is not a weekday"));
         }
-        // Canonicalize the two-letter form.
-        days.insert(part[..2].to_string());
+        let canonical = part[..2].to_string();
+        if !days.insert(canonical.clone()) {
+            return Err(format!("BYDAY repeats entry {canonical}"));
+        }
     }
     Ok(days.into_iter().collect())
 }
@@ -67,7 +69,7 @@ pub fn parse_rrule(text: &str) -> Result<ParsedRrule, String> {
     for part in text.split(';') {
         let part = part.trim();
         if part.is_empty() {
-            continue;
+            return Err("rrule contains an empty part".to_string());
         }
         let Some((key, value)) = part.split_once('=') else {
             return Err(format!("rrule part `{part}` is not KEY=VALUE"));
@@ -208,5 +210,27 @@ mod tests {
     fn rejects_missing_frequency() {
         let error = parse_rrule("BYHOUR=9").unwrap_err();
         assert!(error.contains("requires FREQ"), "{error}");
+    }
+
+    #[test]
+    fn rejects_empty_parts() {
+        for rule in ["FREQ=DAILY;", "FREQ=DAILY;;BYHOUR=9"] {
+            let error = parse_rrule(rule).unwrap_err();
+            assert!(error.contains("empty part"), "{rule}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_weekday_values_after_normalization() {
+        for rule in ["FREQ=WEEKLY;BYDAY=MO,MO", "FREQ=WEEKLY;BYDAY=MO,MON"] {
+            let error = parse_rrule(rule).unwrap_err();
+            assert!(error.contains("repeats entry MO"), "{rule}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_weekday_entries() {
+        let error = parse_rrule("FREQ=WEEKLY;BYDAY=MO,,TU").unwrap_err();
+        assert!(error.contains("is not a weekday"), "{error}");
     }
 }

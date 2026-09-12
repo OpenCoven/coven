@@ -1,0 +1,108 @@
+{
+  "schemaVersion": "coven.automations.event-reducer-determinism-vectors.v1",
+  "cases": [
+    {
+      "caseId": "duplicate-delivery-converges",
+      "events": [
+        {
+          "schemaVersion": "coven.automations.v1",
+          "eventId": "evtocc00a7c3e9d24b6f8051",
+          "stream": {
+            "kind": "occurrence",
+            "id": "daily-notes-1756544400000"
+          },
+          "sequence": 0,
+          "recordedAt": "2026-08-30T09:00:00.000Z",
+          "observedAt": "2026-08-30T09:00:00.000Z",
+          "producer": {
+            "component": "coven-daemon",
+            "instanceId": "daemon@host-a"
+          },
+          "automationId": "daily-notes",
+          "occurrenceId": "daily-notes-1756544400000",
+          "kind": "occurrence.transitioned",
+          "summary": "occurrence occurrence none -> planned",
+          "payload": {
+            "entity": "occurrence",
+            "from": "none",
+            "to": "planned",
+            "reason": "slot_fenced",
+            "fenceGeneration": 1
+          },
+          "privacy": {
+            "classification": "operational",
+            "retention": {
+              "classification": "standard"
+            }
+          }
+        },
+        {
+          "schemaVersion": "coven.automations.v1",
+          "eventId": "evtocc01a7c3e9d24b6f8051",
+          "stream": {
+            "kind": "occurrence",
+            "id": "daily-notes-1756544400000"
+          },
+          "sequence": 1,
+          "recordedAt": "2026-08-30T09:00:01.000Z",
+          "observedAt": "2026-08-30T09:00:01.000Z",
+          "producer": {
+            "component": "coven-daemon",
+            "instanceId": "daemon@host-a"
+          },
+          "automationId": "daily-notes",
+          "occurrenceId": "daily-notes-1756544400000",
+          "kind": "occurrence.transitioned",
+          "summary": "occurrence occurrence planned -> eligible",
+          "payload": {
+            "entity": "occurrence",
+            "from": "planned",
+            "to": "eligible",
+            "reason": "eligibility_passed",
+            "fenceGeneration": 1
+          },
+          "privacy": {
+            "classification": "operational",
+            "retention": {
+              "classification": "standard"
+            }
+          }
+        },
+        {
+          "schemaVersion": "coven.automations.v1",
+          "eventId": "evtocc02a7c3e9d24b6f8051",
+          "stream": {
+            "kind": "occurrence",
+            "id": "daily-notes-1756544400000"
+          },
+          "sequence": 2,
+          "recordedAt": "2026-08-30T09:00:02.000Z",
+          "observedAt": "2026-08-30T09:00:02.000Z",
+          "producer": {
+            "component": "coven-daemon",
+            "instanceId": "daemon@host-a"
+          },
+          "automationId": "daily-notes",
+          "occurrenceId": "daily-notes-1756544400000",
+          "kind": "occurrence.transitioned",
+          "summary": "occurrence occurrence eligible -> claimed",
+          "payload": {
+            "entity": "occurrence",
+            "from": "eligible",
+            "to": "claimed",
+            "reason": "claim",
+            "fenceGeneration": 1
+          },
+          "privacy": {
+            "classification": "operational",
+            "retention": {
+              "classification": "standard"
+            }
+          }
+        }
+      ],
+      "duplicateIndex": 1,
+      "expectedStateDigest": "sha256:e91e796586ea1aed5d954073255f34f14b844c4f9920acaf4b2817408412f2ea"
+    }
+  ]
+}

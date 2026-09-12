@@ -221,8 +221,8 @@ pub struct GateRequest<'a> {
     pub edits: &'a [ward::FileEdit],
     /// Gate-2 *resolved* home-relative paths of the proposal's unblocked
     /// Tier-0 targets. Blocked targets are already refused by the Ward
-    /// downstream. Empty means no protected target: the gate is a no-op
-    /// `Permitted` — editable-tier writes are the Ward tiers' lane.
+    /// downstream. Empty leaves structural authority to the Ward tiers;
+    /// configured identity predicates still constrain the complete candidate.
     pub gated_targets: &'a [String],
     /// The proposal's authorization.
     pub authorization: &'a ward::Authorization,
@@ -246,7 +246,18 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         authorization,
     } = *req;
     ward::validate_file_edit_budget(edits)?;
-    if gated_targets.is_empty() {
+    let identity_context = crate::ward_identity::candidate_identity_context(
+        coven_home,
+        familiar_id,
+        workspace,
+        config,
+        edits,
+        authorization,
+        None,
+    );
+    let identity_rejection =
+        crate::ward_identity::candidate_rejection(config, identity_context.as_ref())?;
+    if gated_targets.is_empty() && identity_rejection.is_none() {
         return Ok(GateReport {
             verdicts: Vec::new(),
             outcome: GateOutcome::Permitted,
@@ -257,10 +268,43 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
         None => threads::WriterId::new("client:unsigned"),
     };
-    let now = time::OffsetDateTime::now_utc();
-    let state = build_weave_state(conn, familiar_id, workspace, config, gated_targets, true)?;
+    let now = crate::threads_clock::now(coven_home)?;
+    let state = build_weave_state_at(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        gated_targets,
+        identity_rejection.is_none(),
+        now,
+    )?;
     let familiar_uuid = state.familiar_uuid;
     let weave = state.weave;
+    if let Some(verdict) = identity_rejection {
+        let mut verdicts = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let request = threads::MutationRequest {
+                surface: threads::SurfaceId::new(edit.target.clone()),
+                writer: request_writer.clone(),
+                channel: threads::Channel::Mutation,
+                identity_context: identity_context.clone(),
+            };
+            append_audit_row(
+                conn,
+                familiar_id,
+                &familiar_uuid,
+                weave.weave_hash(),
+                &request,
+                &verdict,
+                now,
+            )?;
+            verdicts.push((edit.target.clone(), verdict.clone()));
+        }
+        return Ok(GateReport {
+            verdicts,
+            outcome: GateOutcome::Rejected,
+        });
+    }
 
     // Validate every gated target; audit every verdict (RFC-0001 §5.6).
     let mut verdicts = Vec::with_capacity(gated_targets.len());
@@ -271,7 +315,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             surface: threads::SurfaceId::new(target.clone()),
             writer: request_writer.clone(),
             channel: threads::Channel::Mutation,
-            identity_context: None,
+            identity_context: identity_context.clone(),
         };
         let verdict = threads::validate_fail_closed(&weave, &request);
         append_audit_row(
@@ -315,6 +359,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             None,
             edits,
             StagingProbeContext {
+                familiar_id,
                 workspace,
                 config,
                 authorization,
@@ -344,42 +389,48 @@ pub(crate) fn build_weave_state(
     extra_targets: &[String],
     bootstrap_missing_baselines: bool,
 ) -> Result<WeaveState> {
-    build_weave_state_for_writer(
+    build_weave_state_at(
         conn,
         familiar_id,
         workspace,
         config,
         extra_targets,
         bootstrap_missing_baselines,
-        None,
+        time::OffsetDateTime::now_utc(),
     )
 }
 
-fn build_read_only_weave_state(
-    conn: &Connection,
-    familiar_id: &str,
-    workspace: &Path,
-    config: &ward::WardConfig,
-    extra_targets: &[String],
-) -> Result<WeaveState> {
-    build_weave_state_for_writer(
-        conn,
-        familiar_id,
-        workspace,
-        config,
-        extra_targets,
-        false,
-        None,
-    )
-}
-
-pub(crate) fn build_weave_state_for_writer(
+pub(crate) fn build_weave_state_at(
     conn: &Connection,
     familiar_id: &str,
     workspace: &Path,
     config: &ward::WardConfig,
     extra_targets: &[String],
     bootstrap_missing_baselines: bool,
+    now: time::OffsetDateTime,
+) -> Result<WeaveState> {
+    build_weave_state_for_writer_at(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        extra_targets,
+        bootstrap_missing_baselines,
+        now,
+        None,
+    )
+}
+
+// All surfaces share one captured time alongside the existing writer-specific weave inputs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_weave_state_for_writer_at(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    extra_targets: &[String],
+    bootstrap_missing_baselines: bool,
+    now: time::OffsetDateTime,
     writer: Option<&threads::WriterId>,
 ) -> Result<WeaveState> {
     let familiar_uuid = familiar_weave_id(familiar_id);
@@ -403,7 +454,6 @@ pub(crate) fn build_weave_state_for_writer(
     surfaces.sort();
 
     let manifest_id = load_or_create_manifest_id(conn, familiar_id)?;
-    let now = time::OffsetDateTime::now_utc();
     let mut woven = Vec::with_capacity(surfaces.len());
     for surface in &surfaces {
         let surface_id = threads::SurfaceId::new(surface.clone());
@@ -467,7 +517,7 @@ pub(crate) fn build_weave_state_for_writer(
         woven.push(thread);
     }
 
-    let pattern = threads::AllSurfacesHoldOnChannels {
+    let structural = threads::AllSurfacesHoldOnChannels {
         name: format!("{familiar_id}-protected-surface"),
         surfaces: surfaces
             .iter()
@@ -475,14 +525,17 @@ pub(crate) fn build_weave_state_for_writer(
             .collect(),
         channels: PROTECTED_CHANNELS.to_vec(),
     };
-    let weave = threads::Weave::new(
-        threads::WeaveId::new(),
-        familiar_uuid,
-        woven,
-        Box::new(pattern),
-        None,
-    )
-    .context("weaving protected surfaces")?;
+    let pattern: Box<dyn threads::PatternPredicate + Send + Sync> =
+        if let Some(invariants) = config.identity_invariant_set()? {
+            Box::new(threads::IdentityAwarePattern {
+                structural: Box::new(structural),
+                invariants,
+            })
+        } else {
+            Box::new(structural)
+        };
+    let weave = threads::Weave::new(threads::WeaveId::new(), familiar_uuid, woven, pattern, None)
+        .context("weaving protected surfaces")?;
 
     Ok(WeaveState {
         familiar_uuid,
@@ -854,7 +907,14 @@ pub fn persist_apply_audit_records(
     config: &ward::WardConfig,
     report: &ward::ApplyReport,
 ) -> Result<()> {
-    persist_apply_audit_records_on_connection(conn, familiar_id, workspace, config, report)
+    persist_apply_audit_records_on_connection(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        report,
+        time::OffsetDateTime::now_utc(),
+    )
 }
 
 pub(crate) fn persist_apply_audit_records_on_connection(
@@ -863,6 +923,7 @@ pub(crate) fn persist_apply_audit_records_on_connection(
     workspace: &Path,
     config: &ward::WardConfig,
     report: &ward::ApplyReport,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     if report.audit_records().next().is_none() {
         return Ok(());
@@ -873,14 +934,15 @@ pub(crate) fn persist_apply_audit_records_on_connection(
             .context("starting apply-audit batch transaction")?;
     }
     let result = (|| -> Result<()> {
-        let state = build_read_only_weave_state(conn, familiar_id, workspace, config, &[])?;
-        append_apply_audit_records(
+        let state = build_weave_state_at(conn, familiar_id, workspace, config, &[], false, now)?;
+        append_apply_audit_records_at(
             conn,
             None,
             familiar_id,
             state.weave.weave_hash(),
             report,
             threads::Channel::Mutation,
+            now,
         )?;
         if owns_transaction {
             conn.execute_batch("COMMIT")
@@ -900,17 +962,17 @@ pub(crate) fn persist_apply_audit_records_on_connection(
 /// proposal event commit as one unit. Direct writes use
 /// [`persist_apply_audit_records_on_connection`] to append within the existing
 /// transaction when present, or a dedicated transaction otherwise.
-pub(crate) fn append_apply_audit_records(
+pub(crate) fn append_apply_audit_records_at(
     conn: &Connection,
     proposal_id: Option<&str>,
     familiar_id: &str,
     ward_hash: &[u8],
     report: &ward::ApplyReport,
     channel: threads::Channel,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let records = report.audit_records();
     let familiar_uuid = familiar_weave_id(familiar_id);
-    let now = time::OffsetDateTime::now_utc();
     let format = time::format_description::well_known::Rfc3339;
     let now_text = now.format(&format)?;
     {
@@ -1011,9 +1073,9 @@ pub(crate) fn stage_coherence_proposal(
         Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
         None => threads::WriterId::new("client:unsigned"),
     };
-    let now = time::OffsetDateTime::now_utc();
+    let now = crate::threads_clock::now(coven_home)?;
     // Read-only weave view: coherence staging must not bootstrap baselines.
-    let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
+    let state = build_weave_state_at(conn, familiar_id, workspace, config, &[], false, now)?;
     let thread_id = threads::ThreadId::new();
     let lane = StagingLane {
         thread_id,
@@ -1031,6 +1093,7 @@ pub(crate) fn stage_coherence_proposal(
             &bindings,
             now,
             StagingProbeContext {
+                familiar_id,
                 workspace,
                 config,
                 authorization,
@@ -1043,6 +1106,7 @@ pub(crate) fn stage_coherence_proposal(
                 lane.review_kind,
                 edits,
                 StagingProbeContext {
+                    familiar_id,
                     workspace,
                     config,
                     authorization,
@@ -1115,15 +1179,39 @@ struct StagingLane {
 }
 
 struct StagingProbeContext<'a> {
+    familiar_id: &'a str,
     workspace: &'a Path,
     config: &'a ward::WardConfig,
     authorization: &'a ward::Authorization,
+}
+
+fn staging_identity_evidence(
+    coven_home: &Path,
+    edits: &[ward::FileEdit],
+    probe_context: &StagingProbeContext<'_>,
+) -> Result<Option<[u8; 32]>> {
+    let identity_context = crate::ward_identity::candidate_identity_context(
+        coven_home,
+        probe_context.familiar_id,
+        probe_context.workspace,
+        probe_context.config,
+        edits,
+        probe_context.authorization,
+        None,
+    );
+    if let Some(verdict) =
+        crate::ward_identity::candidate_rejection(probe_context.config, identity_context.as_ref())?
+    {
+        anyhow::bail!("identity predicates refuse proposal staging: {verdict:?}");
+    }
+    crate::ward_identity::candidate_binding(probe_context.config, identity_context.as_ref())
 }
 
 fn stage_pending_proposal(
     coven_home: &Path,
     pending: &threads::PendingProposal,
     review_kind: Option<&'static str>,
+    identity_evidence: Option<[u8; 32]>,
     probes: &[crate::ward_probes::SurfaceProbeReport],
 ) -> Result<PathBuf> {
     let pending_dir = coven_home.join("pending");
@@ -1140,11 +1228,14 @@ fn stage_pending_proposal(
             proposal: &'a threads::PendingProposal,
             #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
             review_kind: Option<&'static str>,
+            #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
+            identity_evidence: Option<[u8; 32]>,
             probes: &'a [crate::ward_probes::SurfaceProbeReport],
         }
         serde_json::to_vec_pretty(&StagedProposalFile {
             proposal: pending,
             review_kind,
+            identity_evidence,
             probes,
         })
         .context("serializing pending proposal")?
@@ -1186,6 +1277,7 @@ fn stage_legacy_pending_proposal(
     probe_context: StagingProbeContext<'_>,
 ) -> Result<(PathBuf, String)> {
     ward::validate_file_edit_budget(edits)?;
+    let identity_evidence = staging_identity_evidence(coven_home, edits, &probe_context)?;
     let probes = crate::ward_probes::run_at_staging(
         probe_context.workspace,
         probe_context.config,
@@ -1193,7 +1285,13 @@ fn stage_legacy_pending_proposal(
         probe_context.authorization,
     )
     .context("running deterministic Ward probes")?;
-    let path = stage_pending_proposal(coven_home, &pending, review_kind, &probes)?;
+    let path = stage_pending_proposal(
+        coven_home,
+        &pending,
+        review_kind,
+        identity_evidence,
+        &probes,
+    )?;
     Ok((path, pending.id.0.to_string()))
 }
 
@@ -1206,6 +1304,7 @@ fn stage_scheduled_coherence_proposal(
     probe_context: StagingProbeContext<'_>,
 ) -> Result<StagedCoherenceProposal> {
     let mut budget = ward::validate_file_edit_budget(edits)?;
+    let identity_evidence = staging_identity_evidence(coven_home, edits, &probe_context)?;
     let diff = materialize_diff(probe_context.workspace, edits, &mut budget)?;
     let region_evidence = threads::SurfaceRegionRegistry::default_registry().classify_all(&diff);
     if region_evidence.is_empty() {
@@ -1291,10 +1390,13 @@ fn stage_scheduled_coherence_proposal(
         struct StagedScheduledProposalFile<'a> {
             #[serde(flatten)]
             scheduled: &'a crate::proposal_scheduler::ScheduledProposal,
+            #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
+            identity_evidence: Option<[u8; 32]>,
             probes: &'a [crate::ward_probes::SurfaceProbeReport],
         }
         serde_json::to_vec_pretty(&StagedScheduledProposalFile {
             scheduled: &scheduled,
+            identity_evidence,
             probes: &probes,
         })
         .context("serializing scheduled proposal")?
@@ -1379,6 +1481,120 @@ tier = 2
         ward::Authorization::signed_by("fp-val-1")
     }
 
+    fn identity_config() -> ward::WardConfig {
+        ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
+
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Sage"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Val"
+
+[[identity_invariant]]
+fact = "pronouns"
+operator = "equals"
+expected = "she/her"
+
+[[identity_invariant]]
+fact = "purpose"
+operator = "includes"
+expected = "research"
+
+[[identity_invariant]]
+fact = "coven"
+operator = "equals"
+expected = "OpenCoven"
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "IDENTITY.md"
+tier = 0
+
+[[surface]]
+path = "MEMORY.md"
+tier = 0
+"#,
+        )
+        .expect("identity config parses")
+    }
+
+    fn minimal_identity_config() -> ward::WardConfig {
+        ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
+
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Sage"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Val"
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "IDENTITY.md"
+tier = 0
+
+[[surface]]
+path = "MEMORY.md"
+tier = 0
+"#,
+        )
+        .expect("minimal identity config parses")
+    }
+
+    fn canonical_soul(name: &str, purpose: &str) -> String {
+        format!("# SOUL\n## I am {name}\nMy purpose is {purpose}.\n")
+    }
+
+    fn canonical_identity(name: &str, pronouns: &str) -> String {
+        format!("# IDENTITY.md - {name}\n- **Name:** {name}\n- **Pronouns:** {pronouns}\n")
+    }
+
+    fn configure_identity_sources(f: &Fixture) {
+        std::fs::write(
+            f.coven_home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads and synthesizes."
+pronouns = "she/her"
+person = "Val"
+coven = "OpenCoven"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            f.workspace.join("SOUL.md"),
+            canonical_soul("Sage", "research"),
+        )
+        .unwrap();
+        std::fs::write(
+            f.workspace.join("IDENTITY.md"),
+            canonical_identity("Sage", "she/her"),
+        )
+        .unwrap();
+        std::fs::write(f.workspace.join("MEMORY.md"), "facts stay local\n").unwrap();
+    }
+
     #[test]
     fn hex_to_bytes_rejects_non_ascii_without_panicking() {
         let error = hex_to_bytes("0éx").expect_err("non-ASCII hex must be rejected");
@@ -1448,8 +1664,15 @@ tier = 2
             .unwrap();
 
         f.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        persist_apply_audit_records_on_connection(&f.conn, "sage", &f.workspace, &config, &report)
-            .unwrap();
+        persist_apply_audit_records_on_connection(
+            &f.conn,
+            "sage",
+            &f.workspace,
+            &config,
+            &report,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         let count_in_transaction: i64 = f
             .conn
             .query_row(
@@ -1785,6 +2008,184 @@ tier = 0
         )
         .expect_err("absolute declaration must refuse");
         assert!(format!("{err:#}").contains("workspace-relative"));
+    }
+
+    #[test]
+    fn identity_predicate_rejects_failed_candidate_fact() {
+        let f = fixture();
+        configure_identity_sources(&f);
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &identity_config(),
+                edits: &[ward::FileEdit::new(
+                    "SOUL.md",
+                    canonical_soul("Sage", "sabotage"),
+                )],
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report.outcome, GateOutcome::Rejected),
+            "{report:?}"
+        );
+        let threads::Verdict::Reject {
+            reason: threads::RejectReason::WeaveBroken { reason },
+            ..
+        } = &report.verdicts[0].1
+        else {
+            panic!("expected weave-broken reject, got {report:?}");
+        };
+        assert!(reason.contains("Purpose identity invariant did not hold"));
+    }
+
+    #[test]
+    fn identity_predicate_fails_closed_when_authoritative_source_is_missing() {
+        let f = fixture();
+        configure_identity_sources(&f);
+        std::fs::remove_file(f.workspace.join("IDENTITY.md")).unwrap();
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &minimal_identity_config(),
+                edits: &[ward::FileEdit::new(
+                    "SOUL.md",
+                    canonical_soul("Sage", "research"),
+                )],
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report.outcome, GateOutcome::Rejected),
+            "{report:?}"
+        );
+        let threads::Verdict::Reject {
+            reason: threads::RejectReason::WeaveBroken { reason },
+            ..
+        } = &report.verdicts[0].1
+        else {
+            panic!("expected weave-broken reject, got {report:?}");
+        };
+        assert!(reason.contains("identity fact unavailable"));
+    }
+
+    #[test]
+    fn identity_predicate_fails_closed_on_ambiguous_roster_sources() {
+        let f = fixture();
+        std::fs::write(
+            f.coven_home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads and synthesizes."
+pronouns = "she/her"
+person = "Val"
+coven = "OpenCoven"
+
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Conflicting duplicate."
+pronouns = "she/her"
+person = "Val"
+coven = "OpenCoven"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            f.workspace.join("SOUL.md"),
+            canonical_soul("Sage", "research"),
+        )
+        .unwrap();
+        std::fs::write(
+            f.workspace.join("IDENTITY.md"),
+            canonical_identity("Sage", "she/her"),
+        )
+        .unwrap();
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &minimal_identity_config(),
+                edits: &[ward::FileEdit::new(
+                    "SOUL.md",
+                    canonical_soul("Sage", "research"),
+                )],
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report.outcome, GateOutcome::Rejected),
+            "{report:?}"
+        );
+        let threads::Verdict::Reject {
+            reason: threads::RejectReason::WeaveBroken { reason },
+            ..
+        } = &report.verdicts[0].1
+        else {
+            panic!("expected weave-broken reject, got {report:?}");
+        };
+        assert!(reason.contains("identity fact unavailable"));
+    }
+
+    #[test]
+    fn identity_predicate_reads_complete_candidate_for_unrelated_targets() {
+        let f = fixture();
+        configure_identity_sources(&f);
+        std::fs::write(
+            f.workspace.join("SOUL.md"),
+            canonical_soul("Sage", "sabotage"),
+        )
+        .unwrap();
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &identity_config(),
+                edits: &[ward::FileEdit::new("MEMORY.md", "refined notes\n")],
+                gated_targets: &["MEMORY.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report.outcome, GateOutcome::Rejected),
+            "{report:?}"
+        );
+        let threads::Verdict::Reject {
+            reason: threads::RejectReason::WeaveBroken { reason },
+            ..
+        } = &report.verdicts[0].1
+        else {
+            panic!("expected weave-broken reject, got {report:?}");
+        };
+        assert!(reason.contains("Purpose identity invariant did not hold"));
     }
 
     #[cfg(unix)]

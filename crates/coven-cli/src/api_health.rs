@@ -50,6 +50,9 @@ pub struct HealthCapabilities {
     /// empty rather than failing deserialization.
     #[serde(default)]
     pub request_adoption_contracts: Vec<String>,
+    /// Refusal-only admission contracts, advertised only over owner-local IPC.
+    #[serde(default)]
+    pub session_policy_contracts: Vec<String>,
 }
 
 /// `afsMount`: a backend name, or `false`.
@@ -139,6 +142,11 @@ pub(crate) fn health_response_for_authority(
             afs_commit_dry_run: true,
             execution_binding_contracts: vec![crate::execution_binding::CONTRACT.to_string()],
             request_adoption_contracts: vec![crate::request_adoption::CONTRACT.to_string()],
+            session_policy_contracts: if authority.allows_session_launch_policy() {
+                vec![crate::session_policy::CONTRACT.to_string()]
+            } else {
+                Vec::new()
+            },
         },
         daemon,
         hub: None,
@@ -175,11 +183,33 @@ mod tests {
     }
 
     #[test]
+    fn session_policy_contract_is_owner_local_only_and_other_health_is_unchanged() {
+        let owner = serde_json::to_value(health_response_for_authority(
+            None,
+            RequestAuthority::OwnerLocalIpc,
+        ))
+        .unwrap();
+        let mut tcp =
+            serde_json::to_value(health_response_for_authority(None, RequestAuthority::Tcp))
+                .unwrap();
+        assert_eq!(
+            owner["capabilities"]["sessionPolicyContracts"],
+            json!(["coven.session-policy.v1"])
+        );
+        assert_eq!(tcp["capabilities"]["sessionPolicyContracts"], json!([]));
+        tcp["capabilities"]["sessionLaunchPolicy"] = json!(true);
+        tcp["capabilities"]["sessionPolicyContracts"] =
+            owner["capabilities"]["sessionPolicyContracts"].clone();
+        assert_eq!(owner, tcp);
+    }
+
+    #[test]
     fn authority_changes_only_the_owner_gated_launch_policy() {
         let owner_local = health_response_for_authority(None, RequestAuthority::OwnerLocalIpc);
         let tcp = health_response_for_authority(None, RequestAuthority::Tcp);
         let mut expected_tcp = owner_local.clone();
         expected_tcp.capabilities.session_launch_policy = false;
+        expected_tcp.capabilities.session_policy_contracts.clear();
 
         assert_eq!(tcp, expected_tcp);
         assert_eq!(
@@ -204,12 +234,14 @@ mod tests {
         capabilities.remove("sessionLaunchPolicy");
         capabilities.remove("executionBindingContracts");
         capabilities.remove("requestAdoptionContracts");
+        capabilities.remove("sessionPolicyContracts");
 
         let decoded: HealthResponse = serde_json::from_value(payload)?;
         assert!(!decoded.capabilities.afs_commit_dry_run);
         assert!(!decoded.capabilities.session_launch_policy);
         assert!(decoded.capabilities.execution_binding_contracts.is_empty());
         assert!(decoded.capabilities.request_adoption_contracts.is_empty());
+        assert!(decoded.capabilities.session_policy_contracts.is_empty());
         Ok(())
     }
 

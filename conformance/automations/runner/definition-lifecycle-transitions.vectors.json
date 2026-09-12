@@ -1,0 +1,200 @@
+{
+  "schemaVersion": "coven.automations.definition-lifecycle-transitions-vectors.v1",
+  "cases": [
+    {
+      "caseId": "create-paused",
+      "scenario": "create_paused",
+      "initialState": "absent",
+      "operation": "create_paused",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "paused",
+        "revision": 1
+      }
+    },
+    {
+      "caseId": "create-active",
+      "scenario": "create_active",
+      "initialState": "absent",
+      "operation": "create_active",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "active",
+        "revision": 1
+      }
+    },
+    {
+      "caseId": "create-disabled-is-refused",
+      "scenario": "create_disabled_is_refused",
+      "initialState": "absent",
+      "operation": "create_disabled",
+      "expected": {
+        "outcome": "rejected",
+        "code": "ILLEGAL_TRANSITION",
+        "finalState": "absent",
+        "revision": null
+      }
+    },
+    {
+      "caseId": "paused-to-active",
+      "scenario": "paused_to_active",
+      "initialState": "paused",
+      "operation": "revise_active",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "active",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "active-to-paused",
+      "scenario": "active_to_paused",
+      "initialState": "active",
+      "operation": "revise_paused",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "paused",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "paused-to-disabled",
+      "scenario": "paused_to_disabled",
+      "initialState": "paused",
+      "operation": "disable",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "disabled",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "active-to-disabled",
+      "scenario": "active_to_disabled",
+      "initialState": "active",
+      "operation": "disable",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "disabled",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "paused-to-tombstoned",
+      "scenario": "paused_to_tombstoned",
+      "initialState": "paused",
+      "operation": "tombstone",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "tombstoned",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "active-to-tombstoned",
+      "scenario": "active_to_tombstoned",
+      "initialState": "active",
+      "operation": "tombstone",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "tombstoned",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "disabled-to-tombstoned",
+      "scenario": "disabled_to_tombstoned",
+      "initialState": "disabled",
+      "operation": "tombstone",
+      "expected": {
+        "outcome": "committed",
+        "finalState": "tombstoned",
+        "revision": 3
+      }
+    },
+    {
+      "caseId": "disabled-to-active-is-refused",
+      "scenario": "disabled_to_active_is_refused",
+      "initialState": "disabled",
+      "operation": "revise_active",
+      "expected": {
+        "outcome": "rejected",
+        "code": "ILLEGAL_TRANSITION",
+        "finalState": "disabled",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "disabled-to-paused-is-refused",
+      "scenario": "disabled_to_paused_is_refused",
+      "initialState": "disabled",
+      "operation": "revise_paused",
+      "expected": {
+        "outcome": "rejected",
+        "code": "ILLEGAL_TRANSITION",
+        "finalState": "disabled",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "disabled-to-disabled-is-refused",
+      "scenario": "disabled_to_disabled_is_refused",
+      "initialState": "disabled",
+      "operation": "disable",
+      "expected": {
+        "outcome": "rejected",
+        "code": "ILLEGAL_TRANSITION",
+        "finalState": "disabled",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "tombstoned-to-active-is-refused",
+      "scenario": "tombstoned_to_active_is_refused",
+      "initialState": "tombstoned",
+      "operation": "revise_active",
+      "expected": {
+        "outcome": "rejected",
+        "code": "GONE_TOMBSTONED",
+        "finalState": "tombstoned",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "tombstoned-to-paused-is-refused",
+      "scenario": "tombstoned_to_paused_is_refused",
+      "initialState": "tombstoned",
+      "operation": "revise_paused",
+      "expected": {
+        "outcome": "rejected",
+        "code": "GONE_TOMBSTONED",
+        "finalState": "tombstoned",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "tombstoned-to-disabled-is-refused",
+      "scenario": "tombstoned_to_disabled_is_refused",
+      "initialState": "tombstoned",
+      "operation": "disable",
+      "expected": {
+        "outcome": "rejected",
+        "code": "GONE_TOMBSTONED",
+        "finalState": "tombstoned",
+        "revision": 2
+      }
+    },
+    {
+      "caseId": "tombstoned-to-tombstoned-is-refused",
+      "scenario": "tombstoned_to_tombstoned_is_refused",
+      "initialState": "tombstoned",
+      "operation": "tombstone",
+      "expected": {
+        "outcome": "rejected",
+        "code": "GONE_TOMBSTONED",
+        "finalState": "tombstoned",
+        "revision": 2
+      }
+    }
+  ]
+}

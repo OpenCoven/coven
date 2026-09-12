@@ -11,7 +11,10 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
-use super::contract::{MobileDeviceScope, MobilePairedDevice, MobilePairingRequest};
+use super::assurance::{NewAuthorizationKey, StepUpAuthorizationEnrollment};
+use super::contract::{
+    AssuranceClass, MobileDeviceScope, MobilePairedDevice, MobilePairingRequest,
+};
 use super::registry::{DeviceRecord, DeviceRegistry, DeviceScope};
 use super::MOBILE_PROTOCOL_VERSION;
 
@@ -32,6 +35,9 @@ pub struct PendingPairing {
     pub host_confirmed: bool,
     pub device_confirmed: bool,
     pub consumed: bool,
+    pub cancelled: bool,
+    pub expired: bool,
+    pub cancellation_audited: bool,
     pub completed: Option<MobilePairedDevice>,
 }
 
@@ -41,6 +47,13 @@ pub struct PendingDevice {
     pub public_key_x963: String,
     pub app_version: String,
     pub scopes: Vec<DeviceScope>,
+    pub step_up_authorization: Option<PendingAuthorizationKey>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAuthorizationKey {
+    pub public_key_x963: String,
+    pub assurance_class: AssuranceClass,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +78,60 @@ pub enum PairingProgress {
         device: MobilePairedDevice,
         replayed: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingLifecycleState {
+    WaitingForDevice,
+    WaitingForConfirmation,
+    Completed,
+    Cancelled,
+    Expired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingStatus {
+    pub state: PairingLifecycleState,
+    pub phrase: Option<[String; 6]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingCancellation {
+    Cancelled {
+        replayed: bool,
+        audit_required: bool,
+    },
+    Completed,
+    Expired,
+}
+
+impl PairingCancellation {
+    pub const fn state(self) -> PairingLifecycleState {
+        match self {
+            Self::Cancelled { .. } => PairingLifecycleState::Cancelled,
+            Self::Completed => PairingLifecycleState::Completed,
+            Self::Expired => PairingLifecycleState::Expired,
+        }
+    }
+
+    pub const fn replayed(self) -> bool {
+        match self {
+            Self::Cancelled { replayed, .. } => replayed,
+            Self::Completed | Self::Expired => true,
+        }
+    }
+
+    pub const fn audit_required(self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled {
+                audit_required: true,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +204,9 @@ impl PairingManager {
             host_confirmed: false,
             device_confirmed: false,
             consumed: false,
+            cancelled: false,
+            expired: false,
+            cancellation_audited: false,
             completed: None,
         };
         let mut pending = self
@@ -197,10 +267,10 @@ impl PairingManager {
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
         if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
+            pairing.expire_pending_material();
             return Err(PairingError::PairingExpired);
         }
-        if pairing.consumed {
+        if pairing.cancelled || pairing.expired || pairing.consumed {
             return Err(PairingError::PairingConsumed);
         }
         pairing.consumed = true;
@@ -222,6 +292,9 @@ impl PairingManager {
             public_key,
         );
         let transcript_hash = transcript.hash();
+        if let Some(step_up) = &request.step_up_authorization {
+            verify_step_up_enrollment(step_up, transcript_hash)?;
+        }
         let phrase = derive_pairing_phrase(&transcript);
         pairing.transcript_hash = Some(transcript_hash);
         pairing.device = Some(PendingDevice {
@@ -229,6 +302,12 @@ impl PairingManager {
             public_key_x963: request.device_public_key,
             app_version: request.app_version,
             scopes: vec![DeviceScope::MemoryRead],
+            step_up_authorization: request.step_up_authorization.map(|step_up| {
+                PendingAuthorizationKey {
+                    public_key_x963: step_up.public_key,
+                    assurance_class: step_up.assurance_class,
+                }
+            }),
         });
         Ok(EnrolledPairing {
             id: pairing_id,
@@ -280,20 +359,81 @@ impl PairingManager {
         self.confirm(pairing_id, phrase, now, false)
     }
 
+    pub fn status(
+        &self,
+        pairing_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<PairingStatus, PairingError> {
+        let mut pending = self.lock_pending(now, pairing_id)?;
+        let pairing = pending
+            .get_mut(&pairing_id)
+            .ok_or(PairingError::PairingConsumed)?;
+        if now >= pairing.expires_at
+            && pairing.completed.is_none()
+            && !pairing.cancelled
+            && !pairing.expired
+        {
+            pairing.expire_pending_material();
+        }
+        let state = pairing.lifecycle_state();
+        Ok(PairingStatus {
+            state,
+            phrase: (state == PairingLifecycleState::WaitingForConfirmation)
+                .then(|| phrase_for_hash(pairing.transcript_hash.expect("state has transcript"))),
+        })
+    }
+
     pub fn phrase(
         &self,
         pairing_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<Option<[String; 6]>, PairingError> {
+        Ok(self.status(pairing_id, now)?.phrase)
+    }
+
+    pub fn cancel(
+        &self,
+        pairing_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<PairingCancellation, PairingError> {
         let mut pending = self.lock_pending(now, pairing_id)?;
-        let pairing = pending
-            .get(&pairing_id)
-            .ok_or(PairingError::PairingConsumed)?;
-        if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
-            return Err(PairingError::PairingExpired);
+        let Some(pairing) = pending.get_mut(&pairing_id) else {
+            return Ok(PairingCancellation::Expired);
+        };
+        if pairing.completed.is_some() {
+            return Ok(PairingCancellation::Completed);
         }
-        Ok(pairing.transcript_hash.map(phrase_for_hash))
+        if pairing.cancelled {
+            return Ok(PairingCancellation::Cancelled {
+                replayed: true,
+                audit_required: !pairing.cancellation_audited,
+            });
+        }
+        if pairing.expired || now >= pairing.expires_at {
+            pairing.expire_pending_material();
+            return Ok(PairingCancellation::Expired);
+        }
+        pairing.clear_pending_material();
+        pairing.cancelled = true;
+        Ok(PairingCancellation::Cancelled {
+            replayed: false,
+            audit_required: true,
+        })
+    }
+
+    pub fn mark_cancellation_audited(&self, pairing_id: Uuid) -> Result<(), PairingError> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| PairingError::InvalidRequest)?;
+        let pairing = pending
+            .get_mut(&pairing_id)
+            .ok_or(PairingError::PairingConsumed)?;
+        if !pairing.cancelled {
+            return Err(PairingError::InvalidRequest);
+        }
+        pairing.cancellation_audited = true;
+        Ok(())
     }
 
     fn confirm(
@@ -308,8 +448,13 @@ impl PairingManager {
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
         if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
+            if pairing.completed.is_none() {
+                pairing.expire_pending_material();
+            }
             return Err(PairingError::PairingExpired);
+        }
+        if pairing.cancelled || pairing.expired {
+            return Err(PairingError::PairingConsumed);
         }
         let transcript_hash = pairing
             .transcript_hash
@@ -347,8 +492,22 @@ impl PairingManager {
             revoked_at: None,
             scopes: device.scopes,
         };
+        let grant = super::grant::DeviceGrant::for_device(
+            record.id,
+            &record.public_key_x963,
+            record.scopes.clone(),
+            record.paired_at,
+        )
+        .map_err(|_| PairingError::InvalidRequest)?;
+        let authorization_key = device
+            .step_up_authorization
+            .map(|step_up| NewAuthorizationKey {
+                public_key_x963: step_up.public_key_x963,
+                assurance_class: step_up.assurance_class,
+                enrolled_at: now,
+            });
         self.registry
-            .register(record.clone())
+            .register_with_grant_and_authorization(record.clone(), grant, authorization_key)
             .map_err(|_| PairingError::InvalidRequest)?;
         let completed = MobilePairedDevice {
             id: record.id,
@@ -372,6 +531,38 @@ impl PairingManager {
     }
 }
 
+impl PendingPairing {
+    fn lifecycle_state(&self) -> PairingLifecycleState {
+        if self.completed.is_some() {
+            PairingLifecycleState::Completed
+        } else if self.cancelled {
+            PairingLifecycleState::Cancelled
+        } else if self.expired {
+            PairingLifecycleState::Expired
+        } else if self.transcript_hash.is_some() {
+            PairingLifecycleState::WaitingForConfirmation
+        } else if self.consumed {
+            PairingLifecycleState::Unavailable
+        } else {
+            PairingLifecycleState::WaitingForDevice
+        }
+    }
+
+    fn clear_pending_material(&mut self) {
+        self.nonce_hash = [0; 32];
+        self.transcript_hash = None;
+        self.device = None;
+        self.host_confirmed = false;
+        self.device_confirmed = false;
+        self.consumed = true;
+    }
+
+    fn expire_pending_material(&mut self) {
+        self.clear_pending_material();
+        self.expired = true;
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PairingTranscript {
     V1 {
@@ -389,6 +580,7 @@ enum PairingTranscript {
         device_public_key: Vec<u8>,
         device_name: String,
         app_version: String,
+        step_up_authorization: Option<(Vec<u8>, AssuranceClass)>,
     },
 }
 
@@ -415,6 +607,14 @@ impl PairingTranscript {
                 device_public_key,
                 device_name: request.device_name.clone(),
                 app_version: request.app_version.clone(),
+                step_up_authorization: request.step_up_authorization.as_ref().map(|step_up| {
+                    (
+                        URL_SAFE_NO_PAD
+                            .decode(&step_up.public_key)
+                            .expect("validated step-up key"),
+                        step_up.assurance_class,
+                    )
+                }),
             }
         }
     }
@@ -448,6 +648,7 @@ impl PairingTranscript {
                 device_public_key,
                 device_name,
                 app_version,
+                step_up_authorization,
             } => {
                 let protocol_version = protocol_version.to_be_bytes();
                 let supported_minimum = supported_minimum.to_be_bytes();
@@ -463,6 +664,10 @@ impl PairingTranscript {
                     app_version.as_bytes(),
                 ] {
                     update_length_prefixed(&mut digest, field);
+                }
+                if let Some((public_key, assurance_class)) = step_up_authorization {
+                    update_length_prefixed(&mut digest, public_key);
+                    update_length_prefixed(&mut digest, assurance_class.as_str().as_bytes());
                 }
             }
         }
@@ -536,7 +741,40 @@ fn validate_pairing_request(request: &MobilePairingRequest) -> Result<(), Pairin
     {
         return Err(PairingError::InvalidRequest);
     }
+    if let Some(step_up) = &request.step_up_authorization {
+        if request.protocol_version != PAIRING_PROTOCOL_VERSION
+            || step_up.public_key == request.device_public_key
+            || super::assurance::validate_public_key(&step_up.public_key).is_err()
+        {
+            return Err(PairingError::InvalidRequest);
+        }
+    }
     Ok(())
+}
+
+fn verify_step_up_enrollment(
+    enrollment: &StepUpAuthorizationEnrollment,
+    transcript_hash: [u8; 32],
+) -> Result<(), PairingError> {
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+
+    let public_key = super::assurance::validate_public_key(&enrollment.public_key)
+        .map_err(|_| PairingError::InvalidRequest)?;
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(&public_key).map_err(|_| PairingError::InvalidRequest)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(&enrollment.enrollment_signature)
+        .map_err(|_| PairingError::InvalidRequest)?;
+    if URL_SAFE_NO_PAD.encode(&signature) != enrollment.enrollment_signature {
+        return Err(PairingError::InvalidRequest);
+    }
+    let signature = Signature::from_der(&signature).map_err(|_| PairingError::InvalidRequest)?;
+    let mut message = b"COVEN-STEPUP-ENROLL/1\0".to_vec();
+    message.extend_from_slice(&transcript_hash);
+    verifying_key
+        .verify(&message, &signature)
+        .map_err(|_| PairingError::InvalidRequest)
 }
 
 fn derive_pairing_phrase(transcript: &PairingTranscript) -> [String; 6] {
@@ -623,6 +861,8 @@ pub fn render_pairing_invitation(
 mod tests {
     use super::*;
     use chrono::Duration;
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rand::random;
     use std::collections::HashSet;
@@ -678,6 +918,7 @@ mod tests {
                         minimum: 1,
                         maximum: 1,
                     },
+                    step_up_authorization: None,
                 },
             }
         }
@@ -686,6 +927,42 @@ mod tests {
             self.request.protocol_version = PAIRING_PROTOCOL_VERSION;
             self.request.supported_protocol.minimum = PAIRING_PROTOCOL_MINIMUM_VERSION;
             self.request.supported_protocol.maximum = PAIRING_PROTOCOL_VERSION;
+        }
+
+        fn enroll_step_up(&mut self, seed: u8, assurance_class: AssuranceClass) {
+            self.use_v2();
+            let signing_key = SigningKey::from_slice(&[seed; 32]).unwrap();
+            self.request.step_up_authorization = Some(StepUpAuthorizationEnrollment {
+                public_key: URL_SAFE_NO_PAD.encode(
+                    signing_key
+                        .verifying_key()
+                        .to_encoded_point(false)
+                        .as_bytes(),
+                ),
+                assurance_class,
+                enrollment_signature: String::new(),
+            });
+            let device_public_key = URL_SAFE_NO_PAD
+                .decode(&self.request.device_public_key)
+                .unwrap();
+            let transcript = PairingTranscript::for_request(
+                &self.request,
+                PairingOfferV2 {
+                    host_fingerprint: [3; 32],
+                    pairing_id: self.pairing_id,
+                    nonce: self.pairing_nonce,
+                    expires_at: self.now + Duration::minutes(5),
+                },
+                device_public_key,
+            );
+            let mut enrollment = b"COVEN-STEPUP-ENROLL/1\0".to_vec();
+            enrollment.extend_from_slice(&transcript.hash());
+            let signature: Signature = signing_key.sign(&enrollment);
+            self.request
+                .step_up_authorization
+                .as_mut()
+                .unwrap()
+                .enrollment_signature = URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes());
         }
 
         fn enroll(&self) -> EnrolledPairing {
@@ -749,6 +1026,7 @@ mod tests {
             device_public_key: vec![4; 65],
             device_name: "Synthetic phone".to_owned(),
             app_version: "1.0.0".to_owned(),
+            step_up_authorization: None,
         }
     }
 
@@ -804,6 +1082,266 @@ mod tests {
     }
 
     #[test]
+    fn rejected_enrollment_never_reports_a_usable_waiting_state() {
+        for failure in ["nonce", "protocol", "public_key", "step_up"] {
+            let mut harness = PairingHarness::new();
+            let mut nonce = harness.pairing_nonce;
+            match failure {
+                "nonce" => nonce[0] ^= 1,
+                "protocol" => harness.request.protocol_version = 99,
+                "public_key" => harness.request.device_public_key = "invalid".to_owned(),
+                "step_up" => {
+                    harness.enroll_step_up(2, AssuranceClass::BiometricOnly);
+                    harness
+                        .request
+                        .step_up_authorization
+                        .as_mut()
+                        .unwrap()
+                        .enrollment_signature
+                        .clear();
+                }
+                _ => unreachable!(),
+            }
+            assert!(harness.enroll_with_nonce(nonce).is_err());
+            let status = harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(status.state).unwrap(),
+                "unavailable",
+                "rejected {failure} enrollment must be terminal"
+            );
+            assert!(status.phrase.is_none());
+            assert_eq!(
+                harness
+                    .enroll_with_nonce(harness.pairing_nonce)
+                    .unwrap_err(),
+                PairingError::PairingConsumed
+            );
+            assert!(harness.devices().is_empty());
+        }
+    }
+
+    #[test]
+    fn cancellation_before_enrollment_is_idempotent_and_erases_invitation_material() {
+        let harness = PairingHarness::new();
+
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled {
+                replayed: false,
+                audit_required: true,
+            }
+        );
+        harness
+            .manager
+            .mark_cancellation_audited(harness.pairing_id)
+            .unwrap();
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled {
+                replayed: true,
+                audit_required: false,
+            }
+        );
+        assert_eq!(
+            harness
+                .manager
+                .cancel(Uuid::from_u128(99), harness.now)
+                .unwrap(),
+            PairingCancellation::Expired
+        );
+        assert_eq!(
+            harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingStatus {
+                state: PairingLifecycleState::Cancelled,
+                phrase: None,
+            }
+        );
+        let pending = harness.manager.pending.lock().unwrap();
+        let cancelled = pending.get(&harness.pairing_id).unwrap();
+        assert_eq!(cancelled.nonce_hash, [0; 32]);
+        assert!(cancelled.transcript_hash.is_none());
+        assert!(cancelled.device.is_none());
+        drop(pending);
+        assert_eq!(
+            harness
+                .enroll_with_nonce(harness.pairing_nonce)
+                .unwrap_err(),
+            PairingError::PairingConsumed
+        );
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn cancellation_after_enrollment_or_one_confirmation_never_registers_a_device() {
+        for confirmation in [None, Some(true), Some(false)] {
+            let harness = PairingHarness::new();
+            let enrolled = harness.enroll();
+            match confirmation {
+                Some(true) => assert_eq!(
+                    harness.confirm_host(&enrolled.phrase),
+                    PairingProgress::Pending
+                ),
+                Some(false) => assert_eq!(
+                    harness.confirm_device(&enrolled.phrase),
+                    PairingProgress::Pending
+                ),
+                None => {}
+            }
+
+            assert_eq!(
+                harness
+                    .manager
+                    .cancel(harness.pairing_id, harness.now)
+                    .unwrap(),
+                PairingCancellation::Cancelled {
+                    replayed: false,
+                    audit_required: true,
+                }
+            );
+            assert_eq!(
+                harness
+                    .manager
+                    .confirm_host(harness.pairing_id, &enrolled.phrase, harness.now)
+                    .unwrap_err(),
+                PairingError::PairingConsumed
+            );
+            assert_eq!(
+                harness
+                    .manager
+                    .confirm_device(harness.pairing_id, &enrolled.phrase, harness.now)
+                    .unwrap_err(),
+                PairingError::PairingConsumed
+            );
+            assert!(harness.devices().is_empty());
+        }
+    }
+
+    #[test]
+    fn cancellation_after_completion_preserves_the_registered_device() {
+        let harness = PairingHarness::new();
+        let enrolled = harness.enroll();
+        assert_eq!(
+            harness.confirm_host(&enrolled.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(harness.confirm_device(&enrolled.phrase), false);
+
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Completed
+        );
+        assert_eq!(
+            harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingStatus {
+                state: PairingLifecycleState::Completed,
+                phrase: None,
+            }
+        );
+        assert_eq!(
+            assert_complete(harness.confirm_host(&enrolled.phrase), true),
+            device
+        );
+        assert_eq!(harness.devices().len(), 1);
+    }
+
+    #[test]
+    fn expired_pairing_status_erases_pending_material_without_becoming_cancelled() {
+        let harness = PairingHarness::new();
+        let status = harness
+            .manager
+            .status(harness.pairing_id, harness.now + Duration::minutes(6))
+            .unwrap();
+        assert_eq!(status.state, PairingLifecycleState::Expired);
+        assert!(status.phrase.is_none());
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now + Duration::minutes(6),)
+                .unwrap(),
+            PairingCancellation::Expired
+        );
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn pairing_v2_step_up_is_transcript_bound_and_persisted_after_confirmation() {
+        let mut baseline = PairingHarness::new();
+        baseline.use_v2();
+        let baseline_phrase = baseline.enroll().phrase;
+
+        let mut enrolled = PairingHarness::new();
+        enrolled.enroll_step_up(2, AssuranceClass::BiometricOnly);
+        let pending = enrolled.enroll();
+        assert_ne!(pending.phrase, baseline_phrase);
+        assert_eq!(
+            enrolled.confirm_host(&pending.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(enrolled.confirm_device(&pending.phrase), false);
+        let key = enrolled
+            .manager
+            .registry
+            .authorization_key(device.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.assurance_class, AssuranceClass::BiometricOnly);
+        assert_eq!(key.key_epoch, 1);
+    }
+
+    #[test]
+    fn pairing_rejects_step_up_on_v1_same_key_and_invalid_possession_proof() {
+        let mut v1 = PairingHarness::new();
+        v1.enroll_step_up(2, AssuranceClass::UserVerification);
+        v1.request.protocol_version = MOBILE_PROTOCOL_VERSION;
+        assert_eq!(
+            v1.enroll_with_nonce(v1.pairing_nonce).unwrap_err(),
+            PairingError::InvalidRequest
+        );
+
+        let mut same_key = PairingHarness::new();
+        same_key.enroll_step_up(1, AssuranceClass::BiometricOnly);
+        assert_eq!(
+            same_key
+                .enroll_with_nonce(same_key.pairing_nonce)
+                .unwrap_err(),
+            PairingError::InvalidRequest
+        );
+
+        let mut invalid_signature = PairingHarness::new();
+        invalid_signature.enroll_step_up(2, AssuranceClass::DeviceCredential);
+        invalid_signature
+            .request
+            .step_up_authorization
+            .as_mut()
+            .unwrap()
+            .enrollment_signature = URL_SAFE_NO_PAD.encode([7; 64]);
+        assert_eq!(
+            invalid_signature
+                .enroll_with_nonce(invalid_signature.pairing_nonce)
+                .unwrap_err(),
+            PairingError::InvalidRequest
+        );
+    }
+
+    #[test]
     fn pairing_nonce_is_consumed_on_first_enrollment_attempt() {
         let harness = PairingHarness::new();
         assert_eq!(
@@ -835,7 +1373,7 @@ mod tests {
         let harness = PairingHarness::new();
         let pending = harness.enroll();
         let mut wrong_phrase = pending.phrase.clone();
-        wrong_phrase[0] = "wrong".to_owned();
+        wrong_phrase[0].push_str("-mismatch");
 
         assert_eq!(
             harness
@@ -897,7 +1435,7 @@ mod tests {
         );
         let device = assert_complete(harness.confirm_device(&pending.phrase), false);
         let mut wrong_phrase = pending.phrase.clone();
-        wrong_phrase[0] = "wrong".to_owned();
+        wrong_phrase[0].push_str("-mismatch");
 
         assert_eq!(
             harness
@@ -962,6 +1500,7 @@ mod tests {
                 minimum: 1,
                 maximum: 1,
             },
+            step_up_authorization: None,
         };
         manager
             .begin_pairing_with_id(
@@ -1157,6 +1696,7 @@ mod tests {
             device_public_key: decode_hex(vector["devicePublicKeyX963Hex"].as_str().unwrap()),
             device_name: vector["deviceName"].as_str().unwrap().to_owned(),
             app_version: vector["appVersion"].as_str().unwrap().to_owned(),
+            step_up_authorization: None,
         };
         assert_eq!(
             encode_hex(&transcript.hash()),

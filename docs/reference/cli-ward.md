@@ -10,10 +10,18 @@ description: "Reference for coven ward: inspect, approve, or reject pending Ward
 source_adjacent_reason: "Tracks the Ward CLI and security contracts implemented in this repository."
 ---
 
-`coven ward` groups the Ward's principal-facing lifecycle verbs. Held writes
-into a familiar home never dead-end: the daemon stages them at
+`coven ward` groups the Ward's principal-facing lifecycle verbs. Held Tier-1 writes
+into a familiar home enter a review lifecycle: the daemon stages them at
 `~/.coven/pending/` for the principal's decision, and `coven ward pending`
 is the supported way to see what is waiting.
+
+Tier-0 protected targets and `ward.toml` cannot enter this lifecycle. Generic
+edit intake returns `403 protected_proposal_forbidden` without staging or
+echoing proposed content; a supplied fingerprint or approval reference does
+not grant protected-write authority. Approval and recovery reclassify live
+targets, rejecting pending protected edits and quarantining interrupted
+applying claims rather than resuming them. A separate authenticated,
+operation-bound protected-write path remains disabled.
 
 ```sh
 coven ward pending             # bounded table of staged proposals
@@ -28,8 +36,8 @@ coven ward migrate --apply     # migrate v0.1 ward.toml files to Phase-2
 ## Ward apply resource limits
 
 Every submitted Ward request accepts at most 32 edits. The cap includes
-Tier-0/Tier-1 edits that will be held or staged as well as Tier-2/Tier-3 edits
-eligible for direct apply. It runs on the borrowed request array before content
+Tier-0 edits that will be refused, Tier-1 edits eligible for staging, and
+Tier-2/Tier-3 edits eligible for direct apply. It runs on the borrowed request array before content
 cloning, Ward/Gate-2 evaluation, probe execution, target preparation, proposal
 staging, or mutation. Each existing edit can retain three file descriptors
 through finalization: its before-image, installed staging inode, and displaced
@@ -120,8 +128,8 @@ not that POSIX primitive gap.
 Two kinds of pending proposals stage here:
 
 - legacy proposals distinguished by `reviewKind`:
-  `authority` for Tier-0 protected writes whose thread frayed
-  (`DegradeToProposal`, coven-threads §5), and `coherence` for Tier-1
+  `authority` for historical authority proposals (public intake no longer
+  stages Tier-0 writes), and `coherence` for Tier-1
   reviewed writes held without retired-Ward approval metadata.
 - canonical `phase5_v1` scheduled proposals for reviewed writes whose Ward
   declares `editable.harness_blocks` + `approval_tiers` and whose staged diff
@@ -328,3 +336,86 @@ values verbatim and refuses ambiguous historical declarations instead of
 guessing a minimum-visibility default or writing a backup. `min_visible_seconds`
 is invalid when no veto window is configured and on human approval paths. Exits
 non-zero if any migration fails.
+
+Accepted retired invariants become active `[[identity_invariant]]` entries,
+not backup-only annotations. You keep the original configuration in
+`ward.toml.v01.bak`.
+
+## Active identity invariants
+
+Declare deterministic identity requirements in `ward.toml` to enforce them
+through the identity-aware Threads predicate:
+
+```toml
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Fixture Familiar"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Fixture Principal"
+```
+
+Both `name` and `person` are mandatory when you configure invariants. Supported
+facts are `name`, `person`, `pronouns`, `purpose`, and `coven`; supported
+operators are `equals` and `includes`. Unsupported, duplicate, or incomplete
+declaration sets fail configuration loading.
+
+These declarations constrain every supported edit, including ordinary
+Tier-2/Tier-3 writes and Tier-1 coherence staging. Approval, deadline replay,
+and interrupted-apply recovery use the same typed identity predicates.
+Passing an identity predicate doesn't grant authority to change a protected
+target.
+
+Coven extracts facts from the complete candidate `SOUL.md`, `IDENTITY.md`,
+and matching `[[familiar]]` roster entry, including unchanged identity files.
+It does not use the invariant's expected value as evidence. Missing,
+unparseable, conflicting, or explicitly empty facts fail the predicate closed.
+Candidate overrides require complete Gate-2 resolution; the daemon never falls
+back to a client-declared path when materialization fails.
+
+New pending records carry an `identityEvidence` digest over the canonical typed
+declarations and candidate source commitment. The roster commitment includes
+every field in the authoritative familiar entry, including `workspace`, `role`,
+and `description`, rather than only the extracted identity facts. Redirecting a
+familiar to another workspace invalidates its pending identity evidence.
+The digest participates in the
+proposal's canonical revision and recovery commitment. Changing authoritative
+source bytes before approval fails replay even when the new facts still satisfy
+the declarations. A missing digest with active invariants also fails closed.
+An unapplied scheduled failure closes its opened veto window with a typed
+`revalidation_failed` or `evidence_diverged` rejection. Unverifiable interrupted
+applies preserve their recovery evidence instead of fabricating a terminal
+decision.
+
+The current deterministic adapter recognizes `# I am ...` or `## I am ...`
+in `SOUL.md`, `My purpose is ...` or a `## Purpose` section, and
+`# IDENTITY.md - ...`, `- **Name:** ...`, and `- **Pronouns:** ...` in
+`IDENTITY.md`. The roster supplies the name, principal binding (`person`),
+pronouns, and Coven membership. Extraction collapses whitespace but preserves
+punctuation, quotes, and markup characters in values. For example, a purpose
+sentence ending in `research.` satisfies `operator = "includes"` with
+`expected = "research"`, but isn't equal to `research`. Empty duplicate fields
+make extraction unavailable.
+Other prose is not an alternative authority.
+
+Configurations without either active or archived identity declarations retain
+their previous behavior. A retired `[protected].invariants` block in an active
+Phase-2 file fails loading. When the active file has no identity declarations,
+the backup acts as a compatibility sentinel: archived declarations, including
+unsupported ones, require review rather than silently becoming no protection.
+A malformed backup cannot establish that protection is absent.
+
+Once a complete, valid active set exists, that set is the current policy.
+The immutable backup is not a second policy and does not require permanent
+equality with later active declarations. Migration must preserve every supported
+declaration; later active-policy changes invalidate earlier proposal evidence.
+Preserve the original backup rather than rewriting it to match current policy,
+consistent with [the identity authority clarification](https://github.com/OpenCoven/coven/issues/885#issuecomment-5601508338).
+
+The production scheduled-publication work remains tracked in #972. Historical
+scheduled-envelope regressions exercise replay and terminal closure; they
+don't demonstrate a supported public publication path or complete #885's
+cross-repository acceptance gate.

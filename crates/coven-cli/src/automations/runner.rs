@@ -14,17 +14,23 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
+use super::authority_projection::AutomationAuthorityConsumerProjection;
 use super::contract::authority::{
     validate_authority_profile, AuthorityConsumerClass, AuthorityEvidenceVerifier,
     AuthorityProfileDisposition, AuthorityProfileError, AuthorityProfileErrorCode,
-    AuthorityValidationPhase, AutomationAuthorityExtension, AUTHORITY_PROFILE,
-    RUNTIME_AUTHORITY_CAPABILITY,
+    AuthorityValidationPhase, AutomationAuthorityExtension, AutomationExecutionBinding,
+    AUTHORITY_PROFILE, RUNTIME_AUTHORITY_CAPABILITY,
 };
-use super::contract::types::{BackoffPolicy, ExtensionBag, RetryableClass};
+use super::contract::events::stream_head;
+use super::contract::types::{AutomationReceipt, BackoffPolicy, ExtensionBag, RetryableClass};
 use super::definition::{RoutineDefinition, RoutineRetryPolicy};
 use super::occurrences::{
     insert_claimed_occurrence, mark_occurrence_running, recover_expired_leases,
     recover_expired_leases_with_scheduler_fence, settle_occurrence,
+};
+use super::receipts::{
+    build_no_launch_receipt, build_receipt_recorded_event, commit_authorized_receipt, read_receipt,
+    ReceiptCommitOutcome, NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL,
 };
 use super::runs::{
     is_retry_quarantined, record_retry_exhaustion, record_run_finish, record_run_start, RunFinish,
@@ -32,6 +38,9 @@ use super::runs::{
 };
 use crate::api::{SessionLaunch, SessionRuntime};
 use crate::harness::HarnessLaunchMode;
+
+const RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON: &str =
+    "trusted runtime terminal evidence is required before Runtime Authority settlement";
 
 pub(crate) fn containment_receipt_path(coven_home: &Path, session_id: &str) -> PathBuf {
     coven_home
@@ -217,10 +226,22 @@ pub(crate) struct AutomationAuthorityRequest {
     pub runtime_id: String,
 }
 
+// Production construction remains blocked until the trusted-state adapter lands.
+#[allow(dead_code)]
+pub(crate) struct AutomationTerminalAuthorityRequest<'a> {
+    pub execution_binding: &'a AutomationExecutionBinding,
+    pub receipt: &'a AutomationReceipt,
+}
+
 pub(crate) trait AutomationDispatchAuthority: AuthorityEvidenceVerifier {
     fn resolve(
         &self,
         request: &AutomationAuthorityRequest,
+    ) -> Result<ExtensionBag, AuthorityProfileError>;
+
+    fn produce_terminal_evidence(
+        &self,
+        request: &AutomationTerminalAuthorityRequest<'_>,
     ) -> Result<ExtensionBag, AuthorityProfileError>;
 }
 
@@ -273,10 +294,17 @@ fn authority_binding_matches_request(
         && extension.execution_binding.runtime.runtime_id.as_str() == request.runtime_id
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAuthority {
+    extension_json: String,
+    execution_binding: AutomationExecutionBinding,
+    consumer_projection: AutomationAuthorityConsumerProjection,
+}
+
 fn resolve_authority_extension(
     authority: AutomationAuthorityMode<'_>,
     request: &AutomationAuthorityRequest,
-) -> Result<Option<String>, String> {
+) -> Result<Option<ResolvedAuthority>, String> {
     let AutomationAuthorityMode::RuntimeAuthority(authority) = authority else {
         return Ok(None);
     };
@@ -304,9 +332,15 @@ fn resolve_authority_extension(
             "authority binding does not match the claimed automation attempt",
         )));
     }
-    serde_json::to_string(extension.as_ref())
-        .map(Some)
-        .map_err(|_| "failed to serialize validated automation authority binding".to_string())
+    let consumer_projection =
+        AutomationAuthorityConsumerProjection::from_validated(extension.as_ref());
+    let extension_json = serde_json::to_string(extension.as_ref())
+        .map_err(|_| "failed to serialize validated automation authority binding".to_string())?;
+    Ok(Some(ResolvedAuthority {
+        extension_json,
+        execution_binding: extension.execution_binding.clone(),
+        consumer_projection,
+    }))
 }
 
 fn persist_launch_with_clock(
@@ -586,7 +620,7 @@ fn persist_launch_with_clock(
             },
         )
         .map_err(|error| format!("failed to construct automation authority request: {error}"))?;
-    let authority_extension_json = resolve_authority_extension(context.authority, &request)?;
+    let authority = resolve_authority_extension(context.authority, &request)?;
     let dispatched = transaction
         .execute(
             "UPDATE automation_attempts
@@ -607,7 +641,9 @@ fn persist_launch_with_clock(
                 run_id,
                 i64::from(attempt_number),
                 now_iso,
-                authority_extension_json,
+                authority
+                    .as_ref()
+                    .map(|authority| authority.extension_json.as_str()),
             ],
         )
         .map_err(|error| format!("failed to dispatch automation attempt: {error}"))?;
@@ -633,6 +669,7 @@ fn persist_launch_with_clock(
     Ok(PersistLaunch::Ready(AttemptDispatch {
         run_id: run_id.to_string(),
         attempt_number,
+        authority: authority.map(Box::new),
     }))
 }
 
@@ -731,6 +768,172 @@ struct RejectedLaunch<'a> {
     scheduler_fence: Option<&'a super::leadership::SchedulerFence>,
 }
 
+struct UnsupportedAuthorityLaunch<'a> {
+    occurrence_id: &'a str,
+    run_id: &'a str,
+    attempt_number: u8,
+    session_id: &'a str,
+    familiar_id: &'a str,
+    resolved: &'a ResolvedAuthority,
+    authority: &'a dyn AutomationDispatchAuthority,
+    scheduler_fence: Option<&'a super::leadership::SchedulerFence>,
+}
+
+fn no_launch_receipt_id(binding: &AutomationExecutionBinding) -> String {
+    let digest = blake3::hash(
+        format!(
+            "runtime-authority-unsupported:{}",
+            binding.base.attempt_id.as_str()
+        )
+        .as_bytes(),
+    );
+    format!("receipt-{}", digest.to_hex())
+}
+
+fn no_launch_receipt_event_id(receipt_id: &str) -> String {
+    let digest = blake3::hash(receipt_id.as_bytes()).to_hex().to_string();
+    format!("evt{}", &digest[..32])
+}
+
+fn settle_runtime_authority_unsupported(
+    conn: &Connection,
+    rejected: UnsupportedAuthorityLaunch<'_>,
+    now: DateTime<Utc>,
+) -> Result<ReceiptCommitOutcome, String> {
+    let UnsupportedAuthorityLaunch {
+        occurrence_id,
+        run_id,
+        attempt_number,
+        session_id,
+        familiar_id,
+        resolved,
+        authority,
+        scheduler_fence,
+    } = rejected;
+    let receipt_id = no_launch_receipt_id(&resolved.execution_binding);
+    let receipt = read_receipt(conn, &receipt_id)
+        .map_err(|error| format!("failed to inspect no-launch receipt replay: {error:#}"))?
+        .map_or_else(
+            || build_no_launch_receipt(&receipt_id, &resolved.execution_binding, familiar_id, now),
+            Ok,
+        )
+        .map_err(|error| format!("failed to build no-launch receipt: {error:#}"))?;
+    let terminal_extensions = authority
+        .produce_terminal_evidence(&AutomationTerminalAuthorityRequest {
+            execution_binding: &resolved.execution_binding,
+            receipt: &receipt,
+        })
+        .map_err(|error| {
+            format!(
+                "automation authority refused terminal evidence: {}",
+                error.code().as_str()
+            )
+        })?;
+
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to begin no-launch receipt settlement: {error}"))?;
+    if let Some(fence) = scheduler_fence {
+        require_current_scheduler_fence(&transaction, occurrence_id, fence)?;
+    }
+    let event_id = no_launch_receipt_event_id(receipt.receipt_id.as_str());
+    let existing_sequence = transaction
+        .query_row(
+            "SELECT sequence FROM automation_events WHERE event_id = ?1",
+            [&event_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect no-launch receipt event replay: {error}"))?;
+    let event_sequence = match existing_sequence {
+        Some(sequence) => u64::try_from(sequence)
+            .map_err(|_| "stored no-launch receipt event sequence is negative".to_string())?,
+        None => stream_head(&transaction, "run", run_id)
+            .map_err(|error| format!("failed to read no-launch receipt event sequence: {error}"))?
+            .map_or(Ok(0), |head| {
+                head.checked_add(1)
+                    .ok_or_else(|| "no-launch receipt event sequence overflowed".to_string())
+            })?,
+    };
+    let event = build_receipt_recorded_event(&event_id, &receipt, event_sequence)
+        .map_err(|error| format!("failed to build no-launch receipt event: {error:#}"))?;
+
+    if existing_sequence.is_none() {
+        let now_iso = receipt.produced_at.as_str();
+        let settled_session = crate::store::update_session_terminal_if_active(
+            &transaction,
+            session_id,
+            "failed",
+            None,
+            now_iso,
+        )
+        .map_err(|error| format!("failed to settle unsupported authority session: {error:#}"))?;
+        if !settled_session {
+            return Err("unsupported authority session changed before settlement".to_string());
+        }
+        let failure = PreownershipFailure::RuntimeAuthorityUnsupported;
+        let settled_attempt = transaction
+            .execute(
+                "UPDATE automation_attempts
+                 SET state = 'failed',
+                     failure_class = ?3,
+                     state_reason = ?4,
+                     settled_at = ?5
+                 WHERE run_id = ?1
+                   AND attempt_number = ?2
+                   AND state = 'dispatching'",
+                rusqlite::params![
+                    run_id,
+                    i64::from(attempt_number),
+                    failure_class_name(failure),
+                    NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL,
+                    now_iso,
+                ],
+            )
+            .map_err(|error| format!("failed to settle unsupported authority attempt: {error}"))?;
+        if settled_attempt != 1 {
+            return Err("unsupported authority attempt changed before settlement".to_string());
+        }
+        if !settle_occurrence(
+            &transaction,
+            occurrence_id,
+            "failed",
+            Some(NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL),
+            now,
+        )? {
+            return Err("unsupported authority occurrence changed before settlement".to_string());
+        }
+        if !record_run_finish(
+            &transaction,
+            run_id,
+            RunFinish {
+                status: "failed",
+                exit_code: None,
+                session_id: Some(session_id.to_string()),
+                log_json: None,
+                output_commit: None,
+            },
+            now,
+        )
+        .map_err(|error| format!("failed to settle unsupported authority run: {error:#}"))?
+        {
+            return Err("unsupported authority run changed before settlement".to_string());
+        }
+    }
+
+    let outcome = commit_authorized_receipt(
+        &transaction,
+        &receipt,
+        &event,
+        &terminal_extensions,
+        authority,
+    )
+    .map_err(|error| format!("failed to commit no-launch authority receipt: {error:#}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit no-launch receipt settlement: {error}"))?;
+    Ok(outcome)
+}
+
 fn settle_rejected_launch(
     conn: &Connection,
     rejected: RejectedLaunch<'_>,
@@ -785,7 +988,9 @@ fn settle_rejected_launch(
     }
     let retryable = match failure {
         PreownershipFailure::Retryable(failure_class) => definition.retry.retries(failure_class),
-        PreownershipFailure::LaunchRefused => false,
+        PreownershipFailure::LaunchRefused | PreownershipFailure::RuntimeAuthorityUnsupported => {
+            false
+        }
     };
     let retry_deadline_open: bool = transaction
         .query_row(
@@ -941,6 +1146,7 @@ enum PersistLaunch {
 struct AttemptDispatch {
     run_id: String,
     attempt_number: u8,
+    authority: Option<Box<ResolvedAuthority>>,
 }
 
 struct DispatchControl<'a> {
@@ -987,6 +1193,41 @@ fn dispatch_occurrence_with_clock(
         }
     };
 
+    if let Some(resolved) = attempt.authority.as_deref() {
+        if !runtime.accepts_automation_authority_projection() {
+            let AutomationAuthorityMode::RuntimeAuthority(authority) = control.authority else {
+                return Err(
+                    "unsupported Runtime Authority dispatch is missing its authority producer"
+                        .to_string(),
+                );
+            };
+            let failure_at = (control.clock)().max(now);
+            settle_runtime_authority_unsupported(
+                conn,
+                UnsupportedAuthorityLaunch {
+                    occurrence_id,
+                    run_id: &attempt.run_id,
+                    attempt_number: attempt.attempt_number,
+                    session_id: &launch.id,
+                    familiar_id: definition.familiar_id.as_deref().ok_or_else(|| {
+                        "Runtime Authority no-launch receipt requires a durable familiar ID"
+                            .to_string()
+                    })?,
+                    resolved,
+                    authority,
+                    scheduler_fence: control.scheduler_fence,
+                },
+                failure_at,
+            )?;
+            return Ok(DispatchAttempt::Completed(RunOutcome {
+                run_id,
+                status: "failed".to_string(),
+                session_id: None,
+                error: Some(NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL.to_string()),
+            }));
+        }
+    }
+
     let ownership_published = Cell::new(false);
     let ownership_publication_error = RefCell::new(None);
     let mut ownership_established = || match publish_runtime_ownership(
@@ -1009,8 +1250,15 @@ fn dispatch_occurrence_with_clock(
             ))
         }
     };
-    let launch_result =
-        runtime.launch_contained_adopted_session(&launch, None, &mut ownership_established);
+    let launch_result = runtime.launch_authorized_contained_adopted_session(
+        &launch,
+        attempt
+            .authority
+            .as_deref()
+            .map(|authority| &authority.consumer_projection),
+        None,
+        &mut ownership_established,
+    );
     if let Some(fence) = control.scheduler_fence {
         if !fence
             .is_current(conn)
@@ -1195,6 +1443,7 @@ fn current_run_id_for_occurrence(
 enum PreownershipFailure {
     Retryable(RetryableClass),
     LaunchRefused,
+    RuntimeAuthorityUnsupported,
 }
 
 fn classify_preownership_failure(error: &anyhow::Error) -> PreownershipFailure {
@@ -1223,13 +1472,14 @@ fn classify_preownership_failure(error: &anyhow::Error) -> PreownershipFailure {
 }
 
 fn failure_class_name(failure: PreownershipFailure) -> &'static str {
-    let PreownershipFailure::Retryable(failure_class) = failure else {
-        return "launch_refused";
-    };
-    match failure_class {
-        RetryableClass::TransientDispatch => "transient_dispatch",
-        RetryableClass::LeaseExpired => "lease_expired",
-        RetryableClass::RuntimeUnavailable => "runtime_unavailable",
+    match failure {
+        PreownershipFailure::Retryable(failure_class) => match failure_class {
+            RetryableClass::TransientDispatch => "transient_dispatch",
+            RetryableClass::LeaseExpired => "lease_expired",
+            RetryableClass::RuntimeUnavailable => "runtime_unavailable",
+        },
+        PreownershipFailure::LaunchRefused => "launch_refused",
+        PreownershipFailure::RuntimeAuthorityUnsupported => "runtime_authority_unsupported",
     }
 }
 
@@ -2594,6 +2844,13 @@ pub(crate) enum ConfirmedStop {
     TimedOut,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfirmedStopSettlement {
+    LostRace,
+    Settled,
+    RecoveryRequired,
+}
+
 pub(crate) enum StopFenceClaim {
     Acquired,
     InProgress,
@@ -2775,7 +3032,7 @@ pub(crate) fn settle_confirmed_stop(
     session_id: &str,
     disposition: ConfirmedStop,
     now: DateTime<Utc>,
-) -> Result<bool, String> {
+) -> Result<ConfirmedStopSettlement, String> {
     let (session_status, aggregate_state, attempt_state, failure_class, state_reason, exit_code) =
         match disposition {
             ConfirmedStop::Cancelled => (
@@ -2808,10 +3065,151 @@ pub(crate) fn settle_confirmed_stop(
     )
     .map_err(|error| format!("failed to settle automation session `{session_id}`: {error:#}"))?
     {
+        let lifecycle = transaction
+            .query_row(
+                "SELECT r.authority_profile, r.occurrence_id, r.status, s.status,
+                        (
+                            SELECT a.state
+                            FROM automation_attempts AS a
+                            WHERE a.run_id = r.id
+                              AND (
+                                  a.session_id = r.session_id
+                                  OR (a.state = 'dispatching' AND a.session_id IS NULL)
+                              )
+                            ORDER BY a.attempt_number DESC
+                            LIMIT 1
+                        )
+                 FROM automation_runs AS r
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE r.id = ?1 AND r.session_id = ?2",
+                rusqlite::params![run_id, session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                format!("failed to inspect losing automation stop settlement: {error}")
+            })?;
+        let recovery_occurrence = match lifecycle {
+            None => Err(format!(
+                "automation run `{run_id}` changed before stop settlement completed"
+            )),
+            Some((
+                authority_profile,
+                occurrence_id,
+                run_status,
+                current_session_status,
+                attempt_state,
+            )) => {
+                let terminal_session = matches!(
+                    current_session_status.as_str(),
+                    "completed" | "failed" | "cancelled" | "killed" | "idle"
+                );
+                if !terminal_session {
+                    Err(format!(
+                        "automation session `{session_id}` changed to an unexpected nonterminal state"
+                    ))
+                } else if authority_profile.as_deref() != Some(AUTHORITY_PROFILE) {
+                    Ok(None)
+                } else {
+                    let authoritative_run_settled = matches!(
+                        run_status.as_str(),
+                        "succeeded" | "failed" | "cancelled" | "timed_out"
+                    );
+                    let authoritative_attempt_settled =
+                        attempt_state.as_deref().is_some_and(|state| {
+                            matches!(state, "succeeded" | "failed" | "cancelled" | "timed_out")
+                        });
+                    if authoritative_run_settled || authoritative_attempt_settled {
+                        Ok(None)
+                    } else if run_status == "running"
+                        && attempt_state.as_deref().is_some_and(|state| {
+                            matches!(state, "dispatching" | "started" | "observing" | "ambiguous")
+                        })
+                    {
+                        occurrence_id
+                            .ok_or_else(|| {
+                                format!("running automation run `{run_id}` has no occurrence")
+                            })
+                            .map(Some)
+                    } else {
+                        Err(format!(
+                            "Runtime Authority run `{run_id}` has no unresolved lifecycle to hold"
+                        ))
+                    }
+                }
+            }
+        };
+        match recovery_occurrence {
+            Ok(Some(occurrence_id)) => {
+                hold_runtime_authority_terminal_settlement_in(
+                    &transaction,
+                    run_id,
+                    &occurrence_id,
+                    now,
+                )?;
+                transaction
+                    .execute(
+                        "DELETE FROM automation_stop_fences
+                         WHERE run_id = ?1 AND session_id = ?2",
+                        rusqlite::params![run_id, session_id],
+                    )
+                    .map_err(|error| {
+                        format!("failed to release automation stop ownership: {error}")
+                    })?;
+                transaction.commit().map_err(|error| {
+                    format!("failed to commit Runtime Authority stop hold: {error}")
+                })?;
+                return Ok(ConfirmedStopSettlement::RecoveryRequired);
+            }
+            Ok(None) => {
+                transaction.rollback().map_err(|error| {
+                    format!("failed to roll back losing stop settlement: {error}")
+                })?;
+                return Ok(ConfirmedStopSettlement::LostRace);
+            }
+            Err(error) => {
+                transaction.rollback().map_err(|rollback_error| {
+                    format!("failed to roll back invalid stop settlement: {rollback_error}")
+                })?;
+                return Err(error);
+            }
+        }
+    }
+
+    let (authority_profile, occurrence_id): (Option<String>, String) = transaction
+        .query_row(
+            "SELECT authority_profile, occurrence_id
+             FROM automation_runs
+             WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
+            rusqlite::params![run_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read stopped run authority profile: {error}"))?
+        .ok_or_else(|| {
+            format!("automation run `{run_id}` changed before stop settlement completed")
+        })?;
+    if authority_profile.as_deref() == Some(AUTHORITY_PROFILE) {
+        hold_runtime_authority_terminal_settlement_in(&transaction, run_id, &occurrence_id, now)?;
         transaction
-            .rollback()
-            .map_err(|error| format!("failed to roll back losing stop settlement: {error}"))?;
-        return Ok(false);
+            .execute(
+                "DELETE FROM automation_stop_fences
+                 WHERE run_id = ?1 AND session_id = ?2",
+                rusqlite::params![run_id, session_id],
+            )
+            .map_err(|error| format!("failed to release automation stop ownership: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit Runtime Authority stop hold: {error}"))?;
+        return Ok(ConfirmedStopSettlement::RecoveryRequired);
     }
 
     let attempt_changed = transaction
@@ -2864,15 +3262,8 @@ pub(crate) fn settle_confirmed_stop(
         transaction
             .rollback()
             .map_err(|error| format!("failed to roll back incomplete run stop: {error}"))?;
-        return Ok(false);
+        return Ok(ConfirmedStopSettlement::LostRace);
     }
-    let occurrence_id: String = transaction
-        .query_row(
-            "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
-            [run_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("failed to resolve stopped run occurrence: {error}"))?;
     if !settle_occurrence(
         &transaction,
         &occurrence_id,
@@ -2897,7 +3288,7 @@ pub(crate) fn settle_confirmed_stop(
     transaction
         .commit()
         .map_err(|error| format!("failed to commit automation stop settlement: {error}"))?;
-    Ok(true)
+    Ok(ConfirmedStopSettlement::Settled)
 }
 
 pub(crate) fn mark_unconfirmed_stop_for_recovery(
@@ -3096,15 +3487,16 @@ pub fn mark_active_attempts_for_restart_reconciliation(
 }
 
 /// Reconciles nonterminal automation rows against the authoritative session
-/// ledger. A completed session with an explicit zero exit code produces
-/// success, acknowledged cancellation remains distinct, and every other
-/// terminal session disposition is a failure.
+/// ledger. Base-v1 runs retain their legacy exit-based settlement. Runtime
+/// Authority runs remain unresolved until a later adapter consumes verified
+/// terminal runtime evidence.
 pub fn settle_finished_runs(
     conn: &Connection,
     now: DateTime<Utc>,
 ) -> Result<SettlementReport, String> {
     type RunningRow = (
         String,
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -3119,7 +3511,8 @@ pub fn settle_finished_runs(
     let rows: Vec<RunningRow> = {
         let mut statement = conn
             .prepare(
-                "SELECT r.id, r.occurrence_id, r.session_id, s.status, s.exit_code,
+                "SELECT r.id, r.authority_profile, r.occurrence_id, r.session_id,
+                        s.status, s.exit_code,
                         o.state, r.timeout_at,
                         COALESCE(
                             (
@@ -3165,6 +3558,7 @@ pub fn settle_finished_runs(
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
                 ))
             })
             .map_err(|error| format!("failed to query automation reconciliation: {error}"))?;
@@ -3180,6 +3574,7 @@ pub fn settle_finished_runs(
     let mut report = SettlementReport::default();
     for (
         run_id,
+        authority_profile,
         occurrence_id,
         session_id,
         session_status,
@@ -3198,6 +3593,15 @@ pub fn settle_finished_runs(
             )
         });
         if !terminal_session {
+            continue;
+        }
+        if authority_profile.as_deref() == Some(AUTHORITY_PROFILE) {
+            hold_runtime_authority_terminal_settlement(
+                conn,
+                &run_id,
+                occurrence_id.as_deref(),
+                now,
+            )?;
             continue;
         }
 
@@ -3366,6 +3770,102 @@ pub fn settle_finished_runs(
     Ok(report)
 }
 
+fn hold_runtime_authority_terminal_settlement(
+    conn: &Connection,
+    run_id: &str,
+    occurrence_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let occurrence_id = occurrence_id
+        .ok_or_else(|| format!("running automation run `{run_id}` has no occurrence"))?;
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin Runtime Authority recovery hold: {error}"))?;
+    hold_runtime_authority_terminal_settlement_in(&transaction, run_id, occurrence_id, now)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit Runtime Authority recovery hold: {error}"))
+}
+
+fn hold_runtime_authority_terminal_settlement_in(
+    conn: &Connection,
+    run_id: &str,
+    occurrence_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    conn.execute(
+        "UPDATE automation_attempts
+             SET state_reason = ?2
+             WHERE run_id = ?1
+               AND state IN ('dispatching', 'started', 'observing')
+               AND state_reason IS NOT ?2",
+        rusqlite::params![run_id, RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON],
+    )
+    .map_err(|error| {
+        format!("failed to record Runtime Authority terminal evidence hold: {error}")
+    })?;
+    let unresolved_attempts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM automation_attempts
+             WHERE run_id = ?1
+               AND state IN ('dispatching', 'started', 'observing', 'ambiguous')",
+            [run_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            format!("failed to inspect Runtime Authority terminal evidence hold: {error}")
+        })?;
+    if unresolved_attempts != 1 {
+        return Err(format!(
+            "Runtime Authority run `{run_id}` has no single unresolved attempt"
+        ));
+    }
+    conn.execute(
+        "UPDATE automation_occurrences
+             SET state = 'recovery_required',
+                 failure_reason = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?3
+             WHERE id = ?1
+               AND (
+                   state IN ('claimed', 'running')
+                   OR (
+                       state = 'recovery_required'
+                       AND failure_reason IS NOT ?2
+                   )
+               )",
+        rusqlite::params![
+            occurrence_id,
+            RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON,
+            now_iso,
+        ],
+    )
+    .map_err(|error| {
+        format!("failed to mark Runtime Authority occurrence for recovery: {error}")
+    })?;
+    let held: Option<String> = conn
+        .query_row(
+            "SELECT state
+             FROM automation_occurrences
+             WHERE id = ?1",
+            [occurrence_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            format!("failed to verify Runtime Authority occurrence recovery hold: {error}")
+        })?;
+    if held.as_deref() != Some("recovery_required") {
+        return Err(format!(
+            "Runtime Authority occurrence `{occurrence_id}` changed during recovery hold"
+        ));
+    }
+    Ok(())
+}
+
 /// Reads and validates a stored definition for dispatch.
 pub fn load_definition_for_run(
     conn: &Connection,
@@ -3466,18 +3966,31 @@ fn load_definition_for_occurrence_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automations::contract::authority::test_support::{
+        authority_extensions_value, extension_bag, resign_authority_extensions,
+    };
     use crate::automations::contract::authority::{
         AuthorityEvidenceVerifier, AuthorityProfileError, AuthorityProfileErrorCode,
         AuthorityValidationPhase, AutomationAuthorityExtension, AUTHORITY_EXTENSION_KEY,
     };
+    use crate::automations::contract::canonical_json::{canonicalize, sha256_hex};
+    use crate::automations::contract::runtime_terminal_evidence::{
+        RuntimeTerminalEvidence, RuntimeTerminalEvidenceError, RuntimeTerminalEvidenceErrorCode,
+        RuntimeTerminalEvidenceVerifier, RUNTIME_TERMINAL_EVIDENCE_AUTHENTICATION_DOMAIN,
+        RUNTIME_TERMINAL_EVIDENCE_PROFILE,
+    };
     use crate::automations::contract::types::{BackoffPolicy, RetryableClass};
     use crate::automations::definition::{RoutineDefinition, RoutineRetryPolicy, RoutineStatus};
+    use crate::automations::runtime_terminal_evidence::store_runtime_terminal_evidence;
     use crate::automations::store::insert_definition;
     use crate::store::initialize_store;
     use chrono::TimeZone;
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
     use std::collections::BTreeSet;
+
+    const EXPECTED_RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON: &str =
+        "trusted runtime terminal evidence is required before Runtime Authority settlement";
 
     struct RejectingRuntime;
 
@@ -3588,6 +4101,22 @@ mod tests {
             ))
         }
 
+        fn accepts_automation_authority_projection(&self) -> bool {
+            true
+        }
+
+        fn launch_authorized_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _authority: Option<&AutomationAuthorityConsumerProjection>,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::Error::new(
+                crate::api::RuntimeLaunchAdmissionClosedError,
+            ))
+        }
+
         fn send_input(
             &self,
             _session_id: &str,
@@ -3665,6 +4194,160 @@ mod tests {
         }
     }
 
+    struct BaseV1CapabilityProbeRuntime {
+        capability_queries: Cell<usize>,
+        launches: Cell<usize>,
+    }
+
+    impl SessionRuntime for BaseV1CapabilityProbeRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch must use strict containment")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            self.launches.set(self.launches.get() + 1);
+            ownership_established()
+        }
+
+        fn accepts_automation_authority_projection(&self) -> bool {
+            self.capability_queries
+                .set(self.capability_queries.get() + 1);
+            false
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ForgingAuthorityUnsupportedRuntime {
+        launches: Cell<usize>,
+    }
+
+    impl SessionRuntime for ForgingAuthorityUnsupportedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            self.launches.set(self.launches.get() + 1);
+            Ok(())
+        }
+
+        fn launch_authorized_contained_adopted_session(
+            &self,
+            launch: &SessionLaunch,
+            authority: Option<&AutomationAuthorityConsumerProjection>,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            self.launch_session(launch)?;
+            let mut ignored_ownership = || Ok(());
+            SessionRuntime::launch_authorized_contained_adopted_session(
+                &ContainedRuntime,
+                launch,
+                authority,
+                None,
+                &mut ignored_ownership,
+            )
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct GenericAuthorityRejectingRuntime;
+
+    impl SessionRuntime for GenericAuthorityRejectingRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch must use the authority-aware entrypoint")
+        }
+
+        fn accepts_automation_authority_projection(&self) -> bool {
+            true
+        }
+
+        fn launch_authorized_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            authority: Option<&AutomationAuthorityConsumerProjection>,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            assert!(authority.is_some());
+            anyhow::bail!("synthetic generic authority-aware launch refusal")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct IoAuthorityRejectingRuntime;
+
+    impl SessionRuntime for IoAuthorityRejectingRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch must use the authority-aware entrypoint")
+        }
+
+        fn accepts_automation_authority_projection(&self) -> bool {
+            true
+        }
+
+        fn launch_authorized_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            authority: Option<&AutomationAuthorityConsumerProjection>,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            assert!(authority.is_some());
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "synthetic authority runtime unavailable",
+            )
+            .into())
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     struct AuthorityObservingRuntime<'a> {
         conn: &'a Connection,
     }
@@ -3674,13 +4357,43 @@ mod tests {
             unreachable!("automation dispatch must use strict containment")
         }
 
-        fn launch_contained_adopted_session(
+        fn accepts_automation_authority_projection(&self) -> bool {
+            true
+        }
+
+        fn launch_authorized_contained_adopted_session(
             &self,
             launch: &SessionLaunch,
+            authority: Option<&AutomationAuthorityConsumerProjection>,
             _writer: Option<crate::maintenance_gate::WriterLease>,
             ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
         ) -> anyhow::Result<()> {
-            let (profile, extension): (Option<String>, Option<String>) = self.conn.query_row(
+            let authority = authority
+                .ok_or_else(|| anyhow::anyhow!("runtime authority projection is missing"))?;
+            assert_eq!(
+                authority.profile,
+                crate::automations::contract::authority::AuthorityProfile::V1
+            );
+            assert_eq!(authority.principal_id.as_str(), "principal:val");
+            assert_eq!(authority.familiar_root_id.as_str(), "familiar:charm");
+            assert_eq!(
+                authority.runtime.runtime_id.as_str(),
+                launch.harness.as_str()
+            );
+            let projected = serde_json::to_value(authority)?;
+            for omitted in [
+                "authorization",
+                "approval",
+                "contextProjection",
+                "memoryProjection",
+                "authentication",
+            ] {
+                anyhow::ensure!(
+                    projected.get(omitted).is_none(),
+                    "consumer projection exposed `{omitted}`"
+                );
+            }
+            let (profile, extension): (Option<String>, String) = self.conn.query_row(
                 "SELECT r.authority_profile, a.authority_extension_json
                  FROM automation_runs AS r
                  JOIN automation_attempts AS a ON a.run_id = r.id
@@ -3692,9 +4405,14 @@ mod tests {
                 profile.as_deref() == Some("coven.automations.authority.v1"),
                 "runtime launch observed an unpinned authority profile"
             );
-            anyhow::ensure!(
-                extension.is_some(),
-                "runtime launch observed an unpinned authority extension"
+            let extension: serde_json::Value = serde_json::from_str(&extension)?;
+            let binding = &extension["executionBinding"];
+            assert_eq!(projected["occurrenceId"], binding["base"]["occurrenceId"]);
+            assert_eq!(projected["runId"], binding["base"]["runId"]);
+            assert_eq!(projected["attemptId"], binding["base"]["attemptId"]);
+            assert_eq!(
+                projected["authorizationValidUntil"],
+                binding["authorization"]["validUntil"]
             );
             ownership_established()
         }
@@ -3828,6 +4546,7 @@ mod tests {
             binding["approval"]["consumption"]["attemptNumber"] = json!(request.attempt_number);
             binding["approval"]["consumption"]["fenceGeneration"] =
                 json!(request.occurrence_fence_generation);
+            binding["risk"]["sideEffectClass"] = json!("external_mutation");
 
             let mut body = binding.clone();
             let object = body.as_object_mut().expect("binding object");
@@ -3861,16 +4580,364 @@ mod tests {
                 )
             })
         }
+
+        fn produce_terminal_evidence(
+            &self,
+            request: &AutomationTerminalAuthorityRequest<'_>,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            let mut value = authority_extensions_value();
+            let extension = &mut value[AUTHORITY_EXTENSION_KEY];
+            extension["executionBinding"] = serde_json::to_value(request.execution_binding)
+                .map_err(|error| {
+                    AuthorityProfileError::new(
+                        AuthorityProfileErrorCode::SchemaInvalid,
+                        error.to_string(),
+                    )
+                })?;
+            let binding = extension["executionBinding"].clone();
+            let receipt = request.receipt;
+            let evidence = &mut extension["receiptEvidence"];
+            evidence["receiptId"] = json!(receipt.receipt_id.as_str());
+            evidence["automationId"] = json!(receipt.automation_id.as_str());
+            evidence["automationRevision"] = json!(receipt.automation_revision.get());
+            evidence["definitionDigest"] =
+                serde_json::to_value(receipt.definition_digest.as_ref().unwrap()).unwrap();
+            evidence["occurrenceId"] = json!(receipt.occurrence_id.as_str());
+            evidence["occurrenceFenceGeneration"] =
+                json!(receipt.occurrence_fence_generation.unwrap().get());
+            evidence["runId"] = json!(receipt.run_id.as_str());
+            evidence["attemptId"] = json!(receipt.attempt_id.as_str());
+            evidence["attemptNumber"] = json!(receipt.attempt_number.unwrap().get());
+            evidence["baseReceiptDigest"] = json!({
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": receipt.integrity.value.as_str()
+            });
+            evidence["bindingId"] = binding["bindingId"].clone();
+            evidence["bindingDigest"] = binding["integrity"].clone();
+            evidence["principalId"] = binding["principal"]["principalId"].clone();
+            evidence["familiar"] = json!({
+                "familiarRootId": binding["familiar"]["familiarRootId"],
+                "identityRevisionId": binding["familiar"]["identityRevisionId"],
+                "declarationDigest": binding["familiar"]["declarationDigest"],
+                "statusAtDecision": binding["familiar"]["statusAtDecision"],
+                "verifiedAt": binding["familiar"]["verifiedAt"],
+                "freshnessPolicyVersion": binding["familiar"]["freshnessPolicyVersion"],
+                "freshnessBoundSeconds": binding["familiar"]["freshnessBoundSeconds"],
+                "validTime": binding["familiar"]["validTime"],
+                "revocation": binding["familiar"]["revocation"],
+                "retirement": binding["familiar"]["retirement"]
+            });
+            evidence["authorization"] = json!({
+                "operation": binding["authorization"]["operation"],
+                "requestId": binding["authorization"]["requestId"],
+                "requestDigest": binding["authorization"]["requestDigest"],
+                "decisionId": binding["authorization"]["decisionId"],
+                "decisionDigest": binding["authorization"]["decisionDigest"],
+                "consumptionSnapshotDigest":
+                    binding["authorization"]["consumptionSnapshotDigest"],
+                "outcome": binding["authorization"]["outcome"]
+            });
+            evidence["capabilities"] = json!({
+                "requested": binding["capabilities"]["requested"],
+                "granted": binding["capabilities"]["granted"],
+                "denied": binding["capabilities"]["denied"],
+                "degraded": binding["capabilities"]["degraded"],
+                "exercised": []
+            });
+            evidence["approval"] = binding["approval"].clone();
+            evidence["risk"] = binding["risk"].clone();
+            evidence["runtime"] = json!({
+                "runtimeId": binding["runtime"]["runtimeId"],
+                "descriptorVersion": binding["runtime"]["descriptorVersion"],
+                "descriptorDigest": binding["runtime"]["descriptorDigest"],
+                "capabilities": binding["runtime"]["capabilities"]
+            });
+            evidence["decisionTimestamp"] = binding["decisionTimestamp"].clone();
+            evidence["producer"] = binding["producer"].clone();
+            evidence["privacy"] = binding["privacy"].clone();
+            resign_authority_extensions(&mut value);
+            Ok(extension_bag(value))
+        }
     }
 
     impl AuthorityEvidenceVerifier for VectorAuthority {
         fn verify(
             &self,
-            _extension: &AutomationAuthorityExtension,
+            extension: &AutomationAuthorityExtension,
+            _phase: AuthorityValidationPhase,
+        ) -> Result<(), AuthorityProfileError> {
+            if let Some(evidence) = extension.receipt_evidence.0.as_deref() {
+                assert_ne!(
+                    evidence.authentication.signature,
+                    extension.execution_binding.authentication.signature
+                );
+            }
+            Ok(())
+        }
+    }
+
+    impl RuntimeTerminalEvidenceVerifier for VectorAuthority {
+        fn verify(
+            &self,
+            evidence: &RuntimeTerminalEvidence,
+        ) -> Result<(), RuntimeTerminalEvidenceError> {
+            if evidence.authentication.key_id.as_str() != "key:runtime-instance-1"
+                || evidence.authentication.signature.as_str()
+                    != format!(
+                        "{}{}",
+                        evidence.authentication.signed_digest.value.as_str(),
+                        evidence.authentication.signed_digest.value.as_str()
+                    )
+            {
+                return Err(RuntimeTerminalEvidenceError::new(
+                    RuntimeTerminalEvidenceErrorCode::AuthenticationInvalid,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn runtime_terminal_evidence(
+        conn: &Connection,
+        run_id: &str,
+        session_id: &str,
+    ) -> RuntimeTerminalEvidence {
+        let extension_json: String = conn
+            .query_row(
+                "SELECT authority_extension_json
+                 FROM automation_attempts
+                 WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let extension: serde_json::Value = serde_json::from_str(&extension_json).unwrap();
+        let binding = &extension["executionBinding"];
+        let mut value = json!({
+            "profile": RUNTIME_TERMINAL_EVIDENCE_PROFILE,
+            "evidenceId": format!("evidence:{run_id}"),
+            "sessionId": session_id,
+            "runId": binding["base"]["runId"],
+            "attemptId": binding["base"]["attemptId"],
+            "binding": {
+                "bindingId": binding["bindingId"],
+                "bindingDigest": binding["integrity"]
+            },
+            "runtime": {
+                "runtimeId": binding["runtime"]["runtimeId"],
+                "descriptorDigest": binding["runtime"]["descriptorDigest"]
+            },
+            "producedAt": "2026-09-03T12:30:00.000Z",
+            "disposition": "succeeded",
+            "sideEffects": {
+                "state": "observed",
+                "maximumClass": "local_write",
+                "coverage": "complete"
+            },
+            "exercisedCapabilities": {
+                "state": "observed",
+                "values": ["analysis.read", "artifact.write"],
+                "coverage": "complete"
+            },
+            "result": {"state": "not_produced"},
+            "delivery": {"state": "not_attempted"},
+            "producer": {
+                "component": "runtime-adapter",
+                "instanceId": "runtime-instance-1",
+                "implementationVersion": "1.0.0"
+            },
+            "privacy": {
+                "classification": "operational",
+                "retention": {"classification": "standard"}
+            },
+            "integrity": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "0".repeat(64)
+            },
+            "authentication": {
+                "method": "ed25519",
+                "keyId": "key:runtime-instance-1",
+                "proofRef": "proof:runtime-instance-1",
+                "signedDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "0".repeat(64)
+                },
+                "signature": "0".repeat(128)
+            }
+        });
+        let mut body = value.clone();
+        let object = body.as_object_mut().unwrap();
+        object.remove("integrity");
+        object.remove("authentication");
+        let canonical = canonicalize(&body).unwrap();
+        let integrity = sha256_hex(&canonical);
+        let mut authentication_preimage = Vec::new();
+        authentication_preimage.extend_from_slice(RUNTIME_TERMINAL_EVIDENCE_AUTHENTICATION_DOMAIN);
+        authentication_preimage.push(0);
+        authentication_preimage.extend_from_slice(&canonical);
+        let signed_digest = sha256_hex(&authentication_preimage);
+        value["integrity"]["value"] = json!(integrity);
+        value["authentication"]["signedDigest"]["value"] = json!(signed_digest);
+        value["authentication"]["signature"] = json!(format!("{signed_digest}{signed_digest}"));
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingAuthority {
+        resolve_calls: Cell<usize>,
+        terminal_calls: Cell<usize>,
+    }
+
+    impl AutomationDispatchAuthority for CountingAuthority {
+        fn resolve(
+            &self,
+            request: &AutomationAuthorityRequest,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            self.resolve_calls.set(self.resolve_calls.get() + 1);
+            VectorAuthority.resolve(request)
+        }
+
+        fn produce_terminal_evidence(
+            &self,
+            request: &AutomationTerminalAuthorityRequest<'_>,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            self.terminal_calls.set(self.terminal_calls.get() + 1);
+            VectorAuthority.produce_terminal_evidence(request)
+        }
+    }
+
+    impl AuthorityEvidenceVerifier for CountingAuthority {
+        fn verify(
+            &self,
+            extension: &AutomationAuthorityExtension,
             phase: AuthorityValidationPhase,
         ) -> Result<(), AuthorityProfileError> {
-            assert_eq!(phase, AuthorityValidationPhase::PreDispatch);
-            Ok(())
+            AuthorityEvidenceVerifier::verify(&VectorAuthority, extension, phase)
+        }
+    }
+
+    #[derive(Debug)]
+    struct RefusingTerminalAuthority;
+
+    impl AutomationDispatchAuthority for RefusingTerminalAuthority {
+        fn resolve(
+            &self,
+            request: &AutomationAuthorityRequest,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            VectorAuthority.resolve(request)
+        }
+
+        fn produce_terminal_evidence(
+            &self,
+            _request: &AutomationTerminalAuthorityRequest<'_>,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            Err(AuthorityProfileError::new(
+                AuthorityProfileErrorCode::Stale,
+                "private terminal signer detail",
+            ))
+        }
+    }
+
+    impl AuthorityEvidenceVerifier for RefusingTerminalAuthority {
+        fn verify(
+            &self,
+            extension: &AutomationAuthorityExtension,
+            phase: AuthorityValidationPhase,
+        ) -> Result<(), AuthorityProfileError> {
+            AuthorityEvidenceVerifier::verify(&VectorAuthority, extension, phase)
+        }
+    }
+
+    #[derive(Debug)]
+    struct RefusingTerminalVerifierAuthority;
+
+    impl AutomationDispatchAuthority for RefusingTerminalVerifierAuthority {
+        fn resolve(
+            &self,
+            request: &AutomationAuthorityRequest,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            VectorAuthority.resolve(request)
+        }
+
+        fn produce_terminal_evidence(
+            &self,
+            request: &AutomationTerminalAuthorityRequest<'_>,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            VectorAuthority.produce_terminal_evidence(request)
+        }
+    }
+
+    impl AuthorityEvidenceVerifier for RefusingTerminalVerifierAuthority {
+        fn verify(
+            &self,
+            extension: &AutomationAuthorityExtension,
+            phase: AuthorityValidationPhase,
+        ) -> Result<(), AuthorityProfileError> {
+            if phase == AuthorityValidationPhase::Terminal {
+                return Err(AuthorityProfileError::new(
+                    AuthorityProfileErrorCode::Stale,
+                    "private terminal verifier detail",
+                ));
+            }
+            AuthorityEvidenceVerifier::verify(&VectorAuthority, extension, phase)
+        }
+    }
+
+    struct SupersedingTerminalAuthority<'a> {
+        conn: &'a Connection,
+        terminal_calls: Cell<usize>,
+    }
+
+    impl AutomationDispatchAuthority for SupersedingTerminalAuthority<'_> {
+        fn resolve(
+            &self,
+            request: &AutomationAuthorityRequest,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            VectorAuthority.resolve(request)
+        }
+
+        fn produce_terminal_evidence(
+            &self,
+            request: &AutomationTerminalAuthorityRequest<'_>,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            self.terminal_calls.set(self.terminal_calls.get() + 1);
+            self.conn
+                .execute(
+                    "UPDATE automation_scheduler_authority
+                     SET owner_id = 'replacement-scheduler',
+                         generation = generation + 1
+                     WHERE id = 1",
+                    [],
+                )
+                .map_err(|error| {
+                    AuthorityProfileError::new(
+                        AuthorityProfileErrorCode::TrustedStateUnavailable,
+                        error.to_string(),
+                    )
+                })?;
+            VectorAuthority.produce_terminal_evidence(request)
+        }
+    }
+
+    impl AuthorityEvidenceVerifier for SupersedingTerminalAuthority<'_> {
+        fn verify(
+            &self,
+            extension: &AutomationAuthorityExtension,
+            phase: AuthorityValidationPhase,
+        ) -> Result<(), AuthorityProfileError> {
+            AuthorityEvidenceVerifier::verify(&VectorAuthority, extension, phase)
         }
     }
 
@@ -3887,6 +4954,14 @@ mod tests {
                 AuthorityProfileErrorCode::Stale,
                 "synthetic trusted-state detail that must not escape",
             ))
+        }
+
+        fn produce_terminal_evidence(
+            &self,
+            _request: &AutomationTerminalAuthorityRequest<'_>,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            unreachable!("stale authority resolution must refuse before terminal evidence")
         }
     }
 
@@ -3912,6 +4987,14 @@ mod tests {
             let mut mismatched = request.clone();
             mismatched.runtime_id = "different-runtime".to_string();
             VectorAuthority.resolve(&mismatched)
+        }
+
+        fn produce_terminal_evidence(
+            &self,
+            _request: &AutomationTerminalAuthorityRequest<'_>,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            unreachable!("mismatched authority must refuse before terminal evidence")
         }
     }
 
@@ -4134,6 +5217,138 @@ mod tests {
         initialize_store(&path).unwrap();
         let conn = crate::store::open_store(&path).unwrap();
         (temp, conn)
+    }
+
+    fn receipt_artifact_counts(conn: &Connection, run_id: &str) -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM automation_receipts WHERE run_id = ?1),
+                (SELECT COUNT(*) FROM automation_receipt_authority_extensions
+                 WHERE run_id = ?1),
+                (SELECT COUNT(*) FROM automation_events
+                 WHERE stream_kind = 'run' AND stream_id = ?1
+                   AND json_extract(event_json, '$.kind') = 'receipt.recorded')",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    struct NoLaunchTerminalState {
+        occurrence_state: String,
+        occurrence_reason: Option<String>,
+        occurrence_updated_at: String,
+        run_status: String,
+        run_finished_at: Option<String>,
+        receipt_id: Option<String>,
+        attempt_state: String,
+        attempt_failure_class: Option<String>,
+        attempt_reason: Option<String>,
+        attempt_settled_at: Option<String>,
+        session_status: String,
+        session_updated_at: String,
+    }
+
+    struct RuntimeAuthorityHoldState {
+        occurrence_state: String,
+        occurrence_reason: Option<String>,
+        run_status: String,
+        exit_code: Option<i64>,
+        finished_at: Option<String>,
+        receipt_id: Option<String>,
+        attempt_state: String,
+        attempt_reason: Option<String>,
+        attempt_settled_at: Option<String>,
+        attempt_count: i64,
+    }
+
+    fn persist_authority_attempt(
+        conn: &Connection,
+        routine: &RoutineDefinition,
+        occurrence_id: &str,
+        run_id: &str,
+        now: DateTime<Utc>,
+        authority: &dyn AutomationDispatchAuthority,
+        scheduler_fence: Option<&super::super::leadership::SchedulerFence>,
+    ) -> (SessionLaunch, AttemptDispatch) {
+        let launch = build_session_launch(routine, routine.cwd.as_deref().unwrap()).unwrap();
+        let attempt = persist_launch_with_clock(
+            conn,
+            run_id,
+            occurrence_id,
+            routine,
+            &launch,
+            PersistLaunchContext {
+                not_before: now,
+                authority: AutomationAuthorityMode::RuntimeAuthority(authority),
+                scheduler_fence,
+            },
+            || now,
+        )
+        .unwrap();
+        let PersistLaunch::Ready(attempt) = attempt else {
+            panic!("authority attempt must be ready for dispatch");
+        };
+        (launch, attempt)
+    }
+
+    fn assert_dispatching_without_receipt(
+        conn: &Connection,
+        run_id: &str,
+        occurrence_id: &str,
+        session_id: &str,
+    ) {
+        let state: (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT o.state, r.status, a.state, o.failure_reason, a.failure_class, r.receipt_id
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE o.id = ?1 AND r.id = ?2 AND r.session_id = ?3",
+                rusqlite::params![occurrence_id, run_id, session_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "claimed".to_string(),
+                "running".to_string(),
+                "dispatching".to_string(),
+                None,
+                None,
+                None,
+            )
+        );
+        let session_status: String = conn
+            .query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_status, "created");
+        assert_eq!(receipt_artifact_counts(conn, run_id), (0, 0, 0));
+        assert_eq!(
+            super::super::contract::events::stream_head(conn, "run", run_id).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -4483,6 +5698,589 @@ mod tests {
             .unwrap();
         assert_eq!(profile.as_deref(), Some("coven.automations.authority.v1"));
         assert!(extension.is_some());
+        assert_eq!(receipt_artifact_counts(&conn, &outcome.run_id), (0, 0, 0));
+    }
+
+    #[test]
+    fn runtime_authority_capability_refusal_never_invokes_a_forgeable_launch_entrypoint() {
+        let (temp, conn) = temp_store();
+        let routine = definition("daily-notes");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.daily-notes-unaware-runtime";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now,)
+                .unwrap()
+        );
+        let mut clock = || now;
+        let cancelled = || false;
+        let authority = CountingAuthority::default();
+        let runtime = ForgingAuthorityUnsupportedRuntime {
+            launches: Cell::new(0),
+        };
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&authority),
+            scheduler_fence: None,
+        };
+
+        let dispatch = dispatch_occurrence_with_clock(
+            &conn,
+            &runtime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        )
+        .unwrap();
+        let DispatchAttempt::Completed(outcome) = dispatch else {
+            panic!("authority-bound dispatch must settle an unaware runtime refusal");
+        };
+
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.session_id, None);
+        assert_eq!(authority.resolve_calls.get(), 1);
+        assert_eq!(authority.terminal_calls.get(), 1);
+        assert_eq!(
+            runtime.launches.get(),
+            0,
+            "dispatcher-controlled refusal must not invoke any runtime launch method"
+        );
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("runtime does not accept automation authority projections; no process started")
+        );
+        let state = conn
+            .query_row(
+                "SELECT o.state, o.failure_reason, o.updated_at,
+                        r.status, r.finished_at, r.receipt_id,
+                        a.state, a.failure_class, a.state_reason, a.settled_at,
+                        s.status, s.updated_at
+                 FROM automation_attempts AS a
+                 JOIN automation_runs AS r ON r.id = a.run_id
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| {
+                    Ok(NoLaunchTerminalState {
+                        occurrence_state: row.get(0)?,
+                        occurrence_reason: row.get(1)?,
+                        occurrence_updated_at: row.get(2)?,
+                        run_status: row.get(3)?,
+                        run_finished_at: row.get(4)?,
+                        receipt_id: row.get(5)?,
+                        attempt_state: row.get(6)?,
+                        attempt_failure_class: row.get(7)?,
+                        attempt_reason: row.get(8)?,
+                        attempt_settled_at: row.get(9)?,
+                        session_status: row.get(10)?,
+                        session_updated_at: row.get(11)?,
+                    })
+                },
+            )
+            .unwrap();
+        let receipt_id = state
+            .receipt_id
+            .expect("terminal Runtime Authority receipt");
+        let terminal_time = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert_eq!(state.occurrence_state, "failed");
+        assert_eq!(
+            state.occurrence_reason.as_deref(),
+            Some("runtime does not accept automation authority projections; no process started")
+        );
+        assert_eq!(state.occurrence_updated_at, terminal_time);
+        assert_eq!(state.run_status, "failed");
+        assert_eq!(
+            state.run_finished_at.as_deref(),
+            Some(terminal_time.as_str())
+        );
+        assert_eq!(state.attempt_state, "failed");
+        assert_eq!(
+            state.attempt_failure_class.as_deref(),
+            Some("runtime_authority_unsupported")
+        );
+        assert_eq!(
+            state.attempt_reason.as_deref(),
+            Some("runtime does not accept automation authority projections; no process started")
+        );
+        assert_eq!(
+            state.attempt_settled_at.as_deref(),
+            Some(terminal_time.as_str())
+        );
+        assert_eq!(state.session_status, "failed");
+        assert_eq!(state.session_updated_at, terminal_time);
+        let counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM automation_receipts WHERE run_id = ?1),
+                    (SELECT COUNT(*) FROM automation_receipt_authority_extensions
+                     WHERE run_id = ?1),
+                    (SELECT COUNT(*) FROM automation_events
+                     WHERE stream_kind = 'run' AND stream_id = ?1
+                       AND json_extract(event_json, '$.kind') = 'receipt.recorded')",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1));
+        assert_eq!(
+            super::super::contract::events::stream_head(&conn, "run", &outcome.run_id).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            settle_finished_runs(&conn, now + chrono::Duration::seconds(1)).unwrap(),
+            SettlementReport::default()
+        );
+        drop(conn);
+
+        let reopened =
+            crate::store::open_store(&temp.path().join("store.sqlite")).expect("reopened store");
+        let authorized = super::super::receipts::read_authorized_receipt(
+            &reopened,
+            &receipt_id,
+            &VectorAuthority,
+        )
+        .unwrap()
+        .expect("authorized no-launch receipt");
+        let receipt = serde_json::to_value(&authorized.receipt).unwrap();
+        assert_eq!(receipt["identity"]["familiarId"], json!("charm"));
+        assert_eq!(
+            receipt["authority"]["principal"]["principalId"],
+            json!("principal:val")
+        );
+        assert_eq!(receipt["exercisedCapabilities"], json!([]));
+        assert_eq!(receipt["sideEffectClass"], json!("none"));
+        assert!(receipt.get("runtime").is_none());
+        assert!(receipt.get("resultDigest").is_none());
+        assert!(receipt.get("deliveryDigest").is_none());
+        let authority = serde_json::to_value(&authorized.authority).unwrap();
+        assert_eq!(
+            authority["receiptEvidence"]["baseReceiptDigest"]["value"],
+            receipt["integrity"]["value"]
+        );
+        assert_eq!(
+            authority["receiptEvidence"]["bindingDigest"],
+            authority["executionBinding"]["integrity"]
+        );
+        assert_eq!(
+            authority["receiptEvidence"]["capabilities"]["exercised"],
+            json!([])
+        );
+        assert_eq!(
+            authority["receiptEvidence"]["risk"]["sideEffectClass"],
+            json!("external_mutation")
+        );
+        assert_ne!(
+            authority["receiptEvidence"]["authentication"]["signature"],
+            authority["executionBinding"]["authentication"]["signature"]
+        );
+    }
+
+    #[test]
+    fn terminal_authority_producer_refusal_preserves_dispatching_state() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("terminal-producer-refusal");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.terminal-producer-refusal";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now)
+                .unwrap()
+        );
+        let mut clock = || now;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&RefusingTerminalAuthority),
+            scheduler_fence: None,
+        };
+
+        let error = match dispatch_occurrence_with_clock(
+            &conn,
+            &ContainedRuntime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        ) {
+            Ok(_) => panic!("terminal producer refusal must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("AUTHORITY_STALE"), "{error}");
+        assert!(!error.contains("private terminal signer detail"), "{error}");
+        let (run_id, session_id): (String, String) = conn
+            .query_row(
+                "SELECT id, session_id FROM automation_runs WHERE occurrence_id = ?1",
+                [occurrence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_dispatching_without_receipt(&conn, &run_id, occurrence_id, &session_id);
+    }
+
+    #[test]
+    fn generic_and_io_authority_launch_failures_do_not_produce_receipts() {
+        for (runtime, expected_failure) in [
+            (
+                &GenericAuthorityRejectingRuntime as &dyn SessionRuntime,
+                "launch_refused",
+            ),
+            (
+                &IoAuthorityRejectingRuntime as &dyn SessionRuntime,
+                "runtime_unavailable",
+            ),
+        ] {
+            let (_temp, conn) = temp_store();
+            let routine = definition("non-terminal-authority-error");
+            insert_definition(&conn, &routine).unwrap();
+            let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+            let occurrence_id = "occurrence.non-terminal-authority-error";
+            assert!(insert_claimed_occurrence(
+                &conn,
+                occurrence_id,
+                &routine.id,
+                "daemon",
+                60,
+                now
+            )
+            .unwrap());
+            let mut clock = || now;
+            let cancelled = || false;
+            let mut control = DispatchControl {
+                clock: &mut clock,
+                cancelled: &cancelled,
+                authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+                scheduler_fence: None,
+            };
+
+            let dispatch = dispatch_occurrence_with_clock(
+                &conn,
+                runtime,
+                &routine,
+                occurrence_id,
+                routine.cwd.as_deref().unwrap(),
+                now,
+                &mut control,
+            )
+            .unwrap();
+            let DispatchAttempt::Completed(outcome) = dispatch else {
+                panic!("generic authority-aware failure must settle");
+            };
+
+            assert_eq!(outcome.status, "failed");
+            let failure_class: Option<String> = conn
+                .query_row(
+                    "SELECT failure_class FROM automation_attempts WHERE run_id = ?1",
+                    [&outcome.run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(failure_class.as_deref(), Some(expected_failure));
+            assert_eq!(receipt_artifact_counts(&conn, &outcome.run_id), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn terminal_authority_verifier_refusal_rolls_back_lifecycle_and_evidence() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("terminal-verifier-refusal");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.terminal-verifier-refusal";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now)
+                .unwrap()
+        );
+        let mut clock = || now;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(
+                &RefusingTerminalVerifierAuthority,
+            ),
+            scheduler_fence: None,
+        };
+
+        let error = match dispatch_occurrence_with_clock(
+            &conn,
+            &ContainedRuntime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        ) {
+            Ok(_) => panic!("terminal verification refusal must roll back"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("terminal automation authority evidence is invalid"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("private terminal verifier detail"),
+            "{error}"
+        );
+        let (run_id, session_id): (String, String) = conn
+            .query_row(
+                "SELECT id, session_id FROM automation_runs WHERE occurrence_id = ?1",
+                [occurrence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_dispatching_without_receipt(&conn, &run_id, occurrence_id, &session_id);
+    }
+
+    #[test]
+    fn terminal_authority_sidecar_failure_rolls_back_lifecycle_event_and_link() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("terminal-sidecar-failure");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.terminal-sidecar-failure";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now)
+                .unwrap()
+        );
+        conn.execute_batch(
+            "CREATE TRIGGER reject_terminal_authority_sidecar
+             BEFORE INSERT ON automation_receipt_authority_extensions
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic sidecar failure');
+             END;",
+        )
+        .unwrap();
+        let mut clock = || now;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+
+        let error = match dispatch_occurrence_with_clock(
+            &conn,
+            &ContainedRuntime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        ) {
+            Ok(_) => panic!("sidecar failure must roll back the full settlement"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("synthetic sidecar failure"), "{error}");
+        let (run_id, session_id): (String, String) = conn
+            .query_row(
+                "SELECT id, session_id FROM automation_runs WHERE occurrence_id = ?1",
+                [occurrence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_dispatching_without_receipt(&conn, &run_id, occurrence_id, &session_id);
+    }
+
+    #[test]
+    fn stale_scheduler_after_terminal_signing_rolls_back_every_settlement_write() {
+        let (temp, conn) = temp_store();
+        let routine = definition("stale-terminal-authority");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let leadership =
+            super::super::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        let occurrence_id = "occurrence.stale-terminal-authority";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now)
+                .unwrap()
+        );
+        conn.execute(
+            "UPDATE automation_occurrences
+             SET scheduler_generation = ?2
+             WHERE id = ?1",
+            rusqlite::params![occurrence_id, leadership.fence().generation()],
+        )
+        .unwrap();
+        let authority = SupersedingTerminalAuthority {
+            conn: &conn,
+            terminal_calls: Cell::new(0),
+        };
+        let (launch, attempt) = persist_authority_attempt(
+            &conn,
+            &routine,
+            occurrence_id,
+            "run-stale-terminal-authority",
+            now,
+            &authority,
+            Some(&leadership.fence()),
+        );
+        let resolved = attempt.authority.as_deref().unwrap();
+
+        let error = settle_runtime_authority_unsupported(
+            &conn,
+            UnsupportedAuthorityLaunch {
+                occurrence_id,
+                run_id: &attempt.run_id,
+                attempt_number: attempt.attempt_number,
+                session_id: &launch.id,
+                familiar_id: routine.familiar_id.as_deref().unwrap(),
+                resolved,
+                authority: &authority,
+                scheduler_fence: Some(&leadership.fence()),
+            },
+            now,
+        )
+        .expect_err("stale scheduler must refuse terminal commitment");
+
+        assert_eq!(authority.terminal_calls.get(), 1);
+        assert!(error.contains("scheduler fence is stale"), "{error}");
+        assert_dispatching_without_receipt(&conn, &attempt.run_id, occurrence_id, &launch.id);
+    }
+
+    #[test]
+    fn no_launch_receipt_uses_the_exact_next_run_event_sequence() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("no-launch-event-sequence");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.no-launch-event-sequence";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now)
+                .unwrap()
+        );
+        let (launch, attempt) = persist_authority_attempt(
+            &conn,
+            &routine,
+            occurrence_id,
+            "run-no-launch-event-sequence",
+            now,
+            &VectorAuthority,
+            None,
+        );
+        let existing: crate::automations::contract::types::EventEnvelope =
+            serde_json::from_value(json!({
+                "schemaVersion": "coven.automations.v1",
+                "eventId": "evtruntransition00000001",
+                "stream": {"kind": "run", "id": attempt.run_id},
+                "sequence": 0,
+                "recordedAt": "2026-09-03T12:00:00.000Z",
+                "observedAt": "2026-09-03T12:00:00.000Z",
+                "producer": {"component": "coven-daemon", "instanceId": "daemon@test"},
+                "automationId": routine.id,
+                "occurrenceId": occurrence_id,
+                "runId": attempt.run_id,
+                "kind": "run.transitioned",
+                "summary": "run accepted for dispatch",
+                "payload": {
+                    "entity": "run",
+                    "from": "accepted",
+                    "to": "running",
+                    "reason": "dispatch"
+                },
+                "privacy": {
+                    "classification": "operational",
+                    "retention": {"classification": "standard"}
+                }
+            }))
+            .unwrap();
+        super::super::contract::events::append_event(&conn, &existing, 0).unwrap();
+        let resolved = attempt.authority.as_deref().unwrap();
+
+        assert_eq!(
+            settle_runtime_authority_unsupported(
+                &conn,
+                UnsupportedAuthorityLaunch {
+                    occurrence_id,
+                    run_id: &attempt.run_id,
+                    attempt_number: attempt.attempt_number,
+                    session_id: &launch.id,
+                    familiar_id: routine.familiar_id.as_deref().unwrap(),
+                    resolved,
+                    authority: &VectorAuthority,
+                    scheduler_fence: None,
+                },
+                now,
+            )
+            .unwrap(),
+            ReceiptCommitOutcome::Committed
+        );
+        let receipt_sequence: i64 = conn
+            .query_row(
+                "SELECT sequence FROM automation_events
+                 WHERE stream_kind = 'run' AND stream_id = ?1
+                   AND json_extract(event_json, '$.kind') = 'receipt.recorded'",
+                [&attempt.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_sequence, 1);
+        assert_eq!(
+            super::super::contract::events::stream_head(&conn, "run", &attempt.run_id).unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn no_launch_receipt_settlement_replays_without_a_duplicate_event() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("no-launch-replay");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.no-launch-replay";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now)
+                .unwrap()
+        );
+        let (launch, attempt) = persist_authority_attempt(
+            &conn,
+            &routine,
+            occurrence_id,
+            "run-no-launch-replay",
+            now,
+            &VectorAuthority,
+            None,
+        );
+        let resolved = attempt.authority.as_deref().unwrap();
+        let rejected = || UnsupportedAuthorityLaunch {
+            occurrence_id,
+            run_id: &attempt.run_id,
+            attempt_number: attempt.attempt_number,
+            session_id: &launch.id,
+            familiar_id: routine.familiar_id.as_deref().unwrap(),
+            resolved,
+            authority: &VectorAuthority,
+            scheduler_fence: None,
+        };
+
+        assert_eq!(
+            settle_runtime_authority_unsupported(&conn, rejected(), now).unwrap(),
+            ReceiptCommitOutcome::Committed
+        );
+        assert_eq!(
+            settle_runtime_authority_unsupported(
+                &conn,
+                rejected(),
+                now + chrono::Duration::seconds(30),
+            )
+            .unwrap(),
+            ReceiptCommitOutcome::Replayed
+        );
+        assert_eq!(receipt_artifact_counts(&conn, &attempt.run_id), (1, 1, 1));
+        assert_eq!(
+            super::super::contract::events::stream_head(&conn, "run", &attempt.run_id).unwrap(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -4670,6 +6468,10 @@ mod tests {
         assert_eq!(attempt_state, "failed");
         assert!(authority.is_some());
         assert_eq!(occurrence_state, "failed");
+        assert_eq!(
+            receipt_artifact_counts(&conn, "run.daily-notes-no-process"),
+            (0, 0, 0)
+        );
     }
 
     #[test]
@@ -4727,6 +6529,7 @@ mod tests {
         assert_eq!(attempt_state, "failed");
         assert!(authority.is_some());
         assert_eq!(occurrence_state, "failed");
+        assert_eq!(receipt_artifact_counts(&conn, &outcome.run_id), (0, 0, 0));
     }
 
     #[test]
@@ -4792,6 +6595,7 @@ mod tests {
         assert_ne!(attempts[0].1, attempts[1].1);
         assert_eq!(attempts[1].2, "adopted");
         assert!(attempts[1].3.is_none());
+        assert_eq!(receipt_artifact_counts(&conn, &outcome.run_id), (0, 0, 0));
     }
 
     #[test]
@@ -5253,10 +7057,15 @@ mod tests {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily")).unwrap();
         let launched_at = Utc::now();
-        let outcome =
-            run_routine_now(&conn, &ContainedRuntime, &definition("daily"), launched_at).unwrap();
+        let runtime = BaseV1CapabilityProbeRuntime {
+            capability_queries: Cell::new(0),
+            launches: Cell::new(0),
+        };
+        let outcome = run_routine_now(&conn, &runtime, &definition("daily"), launched_at).unwrap();
         assert_eq!(outcome.status, "running");
         assert!(outcome.session_id.is_some());
+        assert_eq!(runtime.capability_queries.get(), 0);
+        assert_eq!(runtime.launches.get(), 1);
 
         let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -5323,6 +7132,344 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "succeeded");
+    }
+
+    #[test]
+    fn runtime_authority_terminal_session_without_consumed_evidence_enters_recovery_hold() {
+        let (temp, conn) = temp_store();
+        let routine = definition("authority-terminal-hold");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.authority-terminal-hold";
+        assert!(insert_claimed_occurrence(
+            &conn,
+            occurrence_id,
+            &routine.id,
+            "daemon",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let runtime = AuthorityObservingRuntime { conn: &conn };
+        let mut clock = || launched_at;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+        let DispatchAttempt::Completed(outcome) = dispatch_occurrence_with_clock(
+            &conn,
+            &runtime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            launched_at,
+            &mut control,
+        )
+        .unwrap() else {
+            panic!("Runtime Authority launch must complete");
+        };
+        let session_id = outcome.session_id.as_deref().unwrap();
+        conn.execute(
+            "INSERT INTO events (id, session_id, kind, payload_json, created_at)
+             VALUES ('event-runtime-evidence-shaped-output', ?1, 'output', ?2, ?3)",
+            rusqlite::params![
+                session_id,
+                json!({
+                    "text": {
+                        "profile": RUNTIME_TERMINAL_EVIDENCE_PROFILE,
+                        "disposition": "succeeded"
+                    }
+                })
+                .to_string(),
+                launched_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ],
+        )
+        .unwrap();
+        let terminal_at = launched_at + chrono::Duration::seconds(5);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "completed",
+            Some(0),
+            &terminal_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            settle_finished_runs(&conn, terminal_at).unwrap(),
+            SettlementReport::default()
+        );
+        let state: RuntimeAuthorityHoldState = conn
+            .query_row(
+                "SELECT o.state, o.failure_reason, r.status, r.exit_code,
+                        r.finished_at, r.receipt_id, a.state, a.state_reason,
+                        a.settled_at,
+                        (SELECT COUNT(*) FROM automation_attempts WHERE run_id = r.id)
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| {
+                    Ok(RuntimeAuthorityHoldState {
+                        occurrence_state: row.get(0)?,
+                        occurrence_reason: row.get(1)?,
+                        run_status: row.get(2)?,
+                        exit_code: row.get(3)?,
+                        finished_at: row.get(4)?,
+                        receipt_id: row.get(5)?,
+                        attempt_state: row.get(6)?,
+                        attempt_reason: row.get(7)?,
+                        attempt_settled_at: row.get(8)?,
+                        attempt_count: row.get(9)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(state.occurrence_state, "recovery_required");
+        assert_eq!(
+            state.occurrence_reason.as_deref(),
+            Some(EXPECTED_RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON)
+        );
+        assert_eq!(state.run_status, "running");
+        assert_eq!(state.exit_code, None);
+        assert_eq!(state.finished_at, None);
+        assert_eq!(state.receipt_id, None);
+        assert_eq!(state.attempt_state, "started");
+        assert_eq!(
+            state.attempt_reason.as_deref(),
+            Some(EXPECTED_RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON)
+        );
+        assert_eq!(state.attempt_settled_at, None);
+        assert_eq!(state.attempt_count, 1);
+        assert_eq!(receipt_artifact_counts(&conn, &outcome.run_id), (0, 0, 0));
+
+        assert_eq!(
+            settle_finished_runs(&conn, terminal_at + chrono::Duration::seconds(1)).unwrap(),
+            SettlementReport::default()
+        );
+        drop(conn);
+        let reopened = crate::store::open_initialized_store(&temp.path().join("store.sqlite"))
+            .expect("reopened store");
+        assert_eq!(
+            settle_finished_runs(&reopened, terminal_at + chrono::Duration::seconds(2)).unwrap(),
+            SettlementReport::default()
+        );
+        let reopened_state: (String, String, String, Option<String>, Option<String>) = reopened
+            .query_row(
+                "SELECT o.state, r.status, a.state, r.receipt_id, a.settled_at
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            reopened_state,
+            (
+                "recovery_required".to_string(),
+                "running".to_string(),
+                "started".to_string(),
+                None,
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn stored_runtime_evidence_is_not_consumed_without_a_production_adapter() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("authority-stored-evidence-hold");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.authority-stored-evidence-hold";
+        assert!(insert_claimed_occurrence(
+            &conn,
+            occurrence_id,
+            &routine.id,
+            "daemon",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let runtime = AuthorityObservingRuntime { conn: &conn };
+        let mut clock = || launched_at;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+        let DispatchAttempt::Completed(outcome) = dispatch_occurrence_with_clock(
+            &conn,
+            &runtime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            launched_at,
+            &mut control,
+        )
+        .unwrap() else {
+            panic!("Runtime Authority launch must complete");
+        };
+        let session_id = outcome.session_id.as_deref().unwrap();
+        let evidence = runtime_terminal_evidence(&conn, &outcome.run_id, session_id);
+        store_runtime_terminal_evidence(&conn, &evidence, &VectorAuthority).unwrap();
+        let terminal_at = launched_at + chrono::Duration::seconds(5);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "completed",
+            Some(0),
+            &terminal_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            settle_finished_runs(&conn, terminal_at).unwrap(),
+            SettlementReport::default()
+        );
+        let state: (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT o.state, r.status, a.state, r.receipt_id
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "recovery_required".to_string(),
+                "running".to_string(),
+                "started".to_string(),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn confirmed_runtime_authority_stops_preserve_unresolved_evidence_state() {
+        for (name, disposition, expected_session_state) in [
+            (
+                "authority-confirmed-cancel",
+                ConfirmedStop::Cancelled,
+                "cancelled",
+            ),
+            (
+                "authority-confirmed-timeout",
+                ConfirmedStop::TimedOut,
+                "killed",
+            ),
+        ] {
+            let (_temp, conn) = temp_store();
+            let routine = definition(name);
+            insert_definition(&conn, &routine).unwrap();
+            let launched_at = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+            let occurrence_id = format!("occurrence.{name}");
+            assert!(insert_claimed_occurrence(
+                &conn,
+                &occurrence_id,
+                &routine.id,
+                "daemon",
+                60,
+                launched_at,
+            )
+            .unwrap());
+            let runtime = AuthorityObservingRuntime { conn: &conn };
+            let mut clock = || launched_at;
+            let cancelled = || false;
+            let mut control = DispatchControl {
+                clock: &mut clock,
+                cancelled: &cancelled,
+                authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+                scheduler_fence: None,
+            };
+            let DispatchAttempt::Completed(outcome) = dispatch_occurrence_with_clock(
+                &conn,
+                &runtime,
+                &routine,
+                &occurrence_id,
+                routine.cwd.as_deref().unwrap(),
+                launched_at,
+                &mut control,
+            )
+            .unwrap() else {
+                panic!("Runtime Authority launch must complete");
+            };
+            let session_id = outcome.session_id.as_deref().unwrap();
+
+            assert_eq!(
+                settle_confirmed_stop(
+                    &conn,
+                    &outcome.run_id,
+                    session_id,
+                    disposition,
+                    launched_at + chrono::Duration::seconds(5),
+                )
+                .unwrap(),
+                ConfirmedStopSettlement::RecoveryRequired
+            );
+
+            let state: (
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+            ) = conn
+                .query_row(
+                    "SELECT o.state, r.status, a.state, r.receipt_id, a.settled_at, s.status
+                     FROM automation_runs AS r
+                     JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                     JOIN automation_attempts AS a ON a.run_id = r.id
+                     JOIN sessions AS s ON s.id = r.session_id
+                     WHERE r.id = ?1",
+                    [&outcome.run_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                (
+                    "recovery_required".to_string(),
+                    "running".to_string(),
+                    "started".to_string(),
+                    None,
+                    None,
+                    expected_session_state.to_string(),
+                ),
+                "{name}"
+            );
+            assert_eq!(receipt_artifact_counts(&conn, &outcome.run_id), (0, 0, 0));
+        }
     }
 
     #[test]
@@ -5942,6 +8089,7 @@ mod tests {
 
         let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
         assert_eq!(runs[0].status, "failed");
+        assert_eq!(receipt_artifact_counts(&conn, &outcome.run_id), (0, 0, 0));
         assert_eq!(runs[0].exit_code, Some(17));
 
         let state: String = conn
@@ -6119,6 +8267,7 @@ mod tests {
 
         let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
         assert_eq!(runs[0].status, "failed");
+        assert_eq!(receipt_artifact_counts(&conn, &outcome.run_id), (0, 0, 0));
 
         let state: String = conn
             .query_row(
