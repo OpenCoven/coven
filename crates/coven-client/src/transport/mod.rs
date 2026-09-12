@@ -174,10 +174,9 @@ fn request_with_peer(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    let _ = method;
-    if !valid_request_target(path) {
+    if !valid_request_target(method, path) {
         return Err(ClientError::InvalidHttpResponse(
-            "attempted request outside /api/v1 or exact /health".to_owned(),
+            "attempted request outside /api/v1 or exact GET /health".to_owned(),
         ));
     }
     if let Some(body) = body {
@@ -225,8 +224,8 @@ pub use windows::{
     windows_process_creation_time, WindowsDaemonHealthProbe, WindowsDaemonProcess,
 };
 
-fn valid_request_target(path: &str) -> bool {
-    (path.starts_with("/api/v1/") || path == "/health")
+fn valid_request_target(method: &str, path: &str) -> bool {
+    (path.starts_with("/api/v1/") || (method == "GET" && path == "/health"))
         && path.starts_with('/')
         && !path.starts_with("//")
         && path.is_ascii()
@@ -333,9 +332,15 @@ mod tests {
             "/api/v1/health#fragment",
         ] {
             assert!(
-                !super::valid_request_target(path),
+                !super::valid_request_target("GET", path),
                 "unsafe request target was accepted: {path:?}"
             );
         }
+    }
+
+    #[test]
+    fn request_target_guard_allows_health_only_for_get() {
+        assert!(super::valid_request_target("GET", "/health"));
+        assert!(!super::valid_request_target("POST", "/health"));
     }
 }
