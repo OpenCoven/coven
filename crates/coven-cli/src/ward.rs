@@ -390,7 +390,7 @@ impl WardConfig {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => {
-                return Err(anyhow!("reading ward config {}: {err}", path.display()));
+                return Err(err).with_context(|| format!("reading ward config {}", path.display()));
             }
         };
         if let Some(remnants) = legacy_invariant_remnants(&raw) {

@@ -10432,9 +10432,54 @@ fn decide_threads_proposal_inner(
                 &json!({ "blocked": true, "why": "proposal-familiar-missing" }),
             );
         }
-        Err(error) => {
+        Err(error) if authority_read_error_is_transient(&error) => {
             if durable_request.is_some() || applying_state.is_some() {
                 claim.preserve();
+                audit_reservation.preserve_if_unfinished();
+            } else {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            }
+            return Err(error);
+        }
+        Err(_) if applying_state.is_some() => {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "familiar-unavailable",
+                "proposal-recovery-familiar-unavailable",
+                "interrupted apply has no readable live familiar authority",
+            );
+        }
+        Err(_) if opened_window.is_some() => {
+            claim.preserve();
+            append_open_window_revalidation_failure(
+                &conn,
+                pending,
+                opened_window
+                    .as_ref()
+                    .expect("guard established opened window context"),
+                approval_path_label,
+                decision_approver,
+                note.as_deref(),
+                decision_now,
+            )?;
+            audit_reservation.finish()?;
+            claim.consume()?;
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-familiar-missing",
+                    "proposalId": proposal_id,
+                    "terminal": true,
+                }),
+            );
+        }
+        Err(error) => {
+            if claim.request_preexisting {
                 audit_reservation.preserve_if_unfinished();
             } else {
                 claim.restore_pending(&document)?;
@@ -10494,9 +10539,54 @@ fn decide_threads_proposal_inner(
                 &json!({ "blocked": true, "why": "ward-not-configured" }),
             );
         }
-        Err(error) => {
+        Err(error) if authority_read_error_is_transient(&error) => {
             if durable_request.is_some() || applying_state.is_some() {
                 claim.preserve();
+                audit_reservation.preserve_if_unfinished();
+            } else {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            }
+            return Err(error);
+        }
+        Err(_) if applying_state.is_some() => {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "ward-unavailable",
+                "proposal-recovery-ward-unavailable",
+                "interrupted apply has no readable live Ward authority",
+            );
+        }
+        Err(_) if opened_window.is_some() => {
+            claim.preserve();
+            append_open_window_revalidation_failure(
+                &conn,
+                pending,
+                opened_window
+                    .as_ref()
+                    .expect("guard established opened window context"),
+                approval_path_label,
+                decision_approver,
+                note.as_deref(),
+                decision_now,
+            )?;
+            audit_reservation.finish()?;
+            claim.consume()?;
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "ward-not-configured",
+                    "proposalId": proposal_id,
+                    "terminal": true,
+                }),
+            );
+        }
+        Err(error) => {
+            if claim.request_preexisting {
                 audit_reservation.preserve_if_unfinished();
             } else {
                 claim.restore_pending(&document)?;
@@ -14145,6 +14235,17 @@ fn human_familiar_id_for_weave(
         }
     }
     Ok(None)
+}
+
+fn authority_read_error_is_transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            !matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::NotFound
+            )
+        })
+    })
 }
 
 fn authorization_from_writer(writer: &coven_threads_core::WriterId) -> ward::Authorization {
@@ -34846,8 +34947,10 @@ tier = 0
         for failure in [
             "missing-familiar",
             "invalid-familiar",
+            "invalid-familiar-utf8",
             "missing-ward",
             "invalid-ward",
+            "invalid-ward-utf8",
             "invalid-ward-glob",
         ] {
             let temp = tempfile::tempdir()?;
@@ -34877,8 +34980,10 @@ tier = 0
             match failure {
                 "missing-familiar" => std::fs::write(home.join("familiars.toml"), "")?,
                 "invalid-familiar" => std::fs::write(home.join("familiars.toml"), "invalid = [")?,
+                "invalid-familiar-utf8" => std::fs::write(home.join("familiars.toml"), [0xff])?,
                 "missing-ward" => std::fs::remove_file(&ward_path)?,
                 "invalid-ward" => std::fs::write(&ward_path, "invalid = [")?,
+                "invalid-ward-utf8" => std::fs::write(&ward_path, [0xff])?,
                 "invalid-ward-glob" => {
                     let config = std::fs::read_to_string(&ward_path)?
                         .replace("path = \"reviewed/\"", "path = \"[\"");
@@ -35143,9 +35248,11 @@ tier = 0
         for failure in [
             "missing-ward",
             "invalid-ward",
+            "invalid-ward-utf8",
             "invalid-ward-glob",
             "missing-familiar",
             "invalid-familiar",
+            "invalid-familiar-utf8",
             "invalid-protected-baseline",
         ] {
             let temp = tempfile::tempdir()?;
@@ -35174,6 +35281,7 @@ tier = 0
             match failure {
                 "missing-ward" => std::fs::remove_file(&ward_path)?,
                 "invalid-ward" => std::fs::write(&ward_path, "invalid = [")?,
+                "invalid-ward-utf8" => std::fs::write(&ward_path, [0xff])?,
                 "invalid-ward-glob" => {
                     let config = std::fs::read_to_string(&ward_path)?
                         .replace("path = \"reviewed/\"", "path = \"[\"");
@@ -35181,6 +35289,7 @@ tier = 0
                 }
                 "missing-familiar" => std::fs::write(home.join("familiars.toml"), "")?,
                 "invalid-familiar" => std::fs::write(home.join("familiars.toml"), "invalid = [")?,
+                "invalid-familiar-utf8" => std::fs::write(home.join("familiars.toml"), [0xff])?,
                 "invalid-protected-baseline" => {
                     std::fs::remove_file(home.join("familiars/sage/SOUL.md"))?;
                     std::fs::create_dir(home.join("familiars/sage/SOUL.md"))?;
