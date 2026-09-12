@@ -591,7 +591,6 @@ fn scheduled_window_replay_fails_closed_across_real_daemon_restart() -> Result<(
                 let staged = submit_retired_case(fixture, case)?;
                 let id = staged["proposalId"].as_str().context("proposal id")?;
                 tick_scheduler(fixture, capability)?;
-                fixture.stop_daemon()?;
                 match scenario {
                     "surface-diverged" => fs::write(
                         fixture.workspace.join("TOOLS.md"),
@@ -635,7 +634,7 @@ fn scheduled_window_replay_fails_closed_across_real_daemon_restart() -> Result<(
                     "vetoed" => {}
                     _ => unreachable!("scenarios are enumerated above"),
                 }
-                fixture.start_daemon()?;
+                fixture.restart_daemon()?;
                 let (event, reason, replay) = if scenario == "vetoed" {
                     let payload =
                         proposal_decision_payload(fixture, id, "Synthetic principal veto")?;
