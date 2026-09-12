@@ -5658,6 +5658,24 @@ fn proposal_decision_audit_reservation_bytes(
     store::ward_audit_reservation_bytes(conn, row_count, variable_payload)
 }
 
+fn proposal_decision_reservation_purpose(
+    decision: &str,
+    expired: bool,
+    decision_actor: Option<&str>,
+) -> &'static str {
+    if expired {
+        "proposal-expiry"
+    } else {
+        match (decision, decision_actor) {
+            ("approve", Some(OWNER_LOCAL_DECISION_ACTOR)) => "proposal-approval-owner-local",
+            ("reject", Some(OWNER_LOCAL_DECISION_ACTOR)) => "proposal-rejection-owner-local",
+            ("approve", _) => "proposal-approval-automatic",
+            ("reject", _) => "proposal-rejection-automatic",
+            _ => "proposal-decision-invalid",
+        }
+    }
+}
+
 fn protected_proposal_targets(
     adjudication: &ward::Outcome,
     ward: &ward::Ward,
@@ -9581,8 +9599,7 @@ fn proposal_recovery_is_proven_unapplied(
     if load_proposal_apply_intent(conn, &proposal_id)
         .ok()
         .flatten()
-        .as_ref()
-        != Some(applying)
+        .is_none_or(|intent| intent.state != *applying)
     {
         return false;
     }
@@ -9752,7 +9769,7 @@ fn decide_threads_proposal_inner(
         effective_decision = "reject";
         effective_expired = true;
     }
-    let (mut audit_reservation, mut claim) = loop {
+    let (mut audit_reservation, mut claim, reservation_decision) = loop {
         let write_applied_if_capacity_blocked =
             if find_any_pending_decision_claim(coven_home, proposal_id).is_some() {
                 None
@@ -9767,15 +9784,16 @@ fn decide_threads_proposal_inner(
         )?;
         let reservation_bytes =
             proposal_decision_audit_reservation_bytes(&conn, effective_decision)?;
+        let reservation_purpose = proposal_decision_reservation_purpose(
+            effective_decision,
+            effective_expired,
+            decision_actor,
+        );
         let audit_reservation = match store::WardAuditReservation::acquire(
             &conn,
             &proposal_store_path,
             format!("proposal:{proposal_id}:{reservation_decision}"),
-            if effective_decision == "reject" {
-                "proposal-rejection"
-            } else {
-                "proposal-approval"
-            },
+            reservation_purpose,
             reservation_bytes,
         ) {
             Ok(reservation) => reservation,
@@ -9856,7 +9874,7 @@ fn decide_threads_proposal_inner(
             }
             Err(error) => return Err(error),
         };
-        break (audit_reservation, claim);
+        break (audit_reservation, claim, reservation_decision);
     };
     let decision = effective_decision;
     let expired = effective_expired;
@@ -9908,6 +9926,39 @@ fn decide_threads_proposal_inner(
         audit_reservation.release_if_unneeded()?;
         return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
     }
+    if let Some(scheduled) = document.scheduled() {
+        match scheduled_submission_authority(&conn, scheduled) {
+            Ok(_) => {}
+            Err(error) if invalid_scheduled_submission_authority(&error) => {
+                let claim_path = claim.path.clone();
+                claim.preserve();
+                audit_reservation.release_if_unneeded()?;
+                let quarantine = crate::proposal_store::quarantine(
+                    coven_home,
+                    &claim_path,
+                    "submission-receipt",
+                )?;
+                return json_response(
+                    409,
+                    &json!({
+                        "blocked": true,
+                        "why": "proposal-submission-receipt-invalid",
+                        "proposalId": proposal_id,
+                        "quarantined": true,
+                        "quarantinePath": quarantine.map(|path| path.display().to_string()),
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+            Err(error) => {
+                if !claim.recovery {
+                    claim.restore_pending(&document)?;
+                }
+                audit_reservation.release_if_unneeded()?;
+                return Err(error);
+            }
+        }
+    }
     let Some(review_kind) = PendingReviewKind::from_stored_value(document.review_kind.as_deref())
     else {
         let opened_window = proposal_window_context(&conn, proposal_id)?;
@@ -9954,10 +10005,13 @@ fn decide_threads_proposal_inner(
         return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
     };
     let durable_request = document.decision_request.take();
-    maybe_fail_proposal_decision(
+    if let Err(error) = maybe_fail_proposal_decision(
         ProposalDecisionFailpoint::ClaimBeforeValidation,
         proposal_id,
-    )?;
+    ) {
+        audit_reservation.preserve_if_unfinished();
+        return Err(error);
+    }
     if durable_request
         .as_ref()
         .is_some_and(|request| request.decision != decision)
@@ -10038,24 +10092,24 @@ fn decide_threads_proposal_inner(
     };
     let scheduled = document.scheduled();
     let pending = document.pending();
-    let decision_actor = durable_request
-        .as_ref()
-        .filter(|request| request.revision_required)
-        .and_then(|request| request.decision_actor.as_deref())
-        .map(coven_threads_core::WriterId::new);
-    let decision_approver = decision_actor.as_ref();
-    if let Some(scheduled) = scheduled {
-        if let Err(error) = scheduled_submission_authority(&conn, scheduled) {
+    let (decision_actor, verify_apply_intent_actor) = match trusted_decision_approver(
+        &conn,
+        proposal_id,
+        &reservation_decision,
+        durable_request.as_ref(),
+    ) {
+        Ok(actor) => actor,
+        Err(error) => {
             let claim_path = claim.path.clone();
             claim.preserve();
             audit_reservation.release_if_unneeded()?;
             let quarantine =
-                crate::proposal_store::quarantine(coven_home, &claim_path, "submission-receipt")?;
+                crate::proposal_store::quarantine(coven_home, &claim_path, "decision-actor")?;
             return json_response(
                 409,
                 &json!({
                     "blocked": true,
-                    "why": "proposal-submission-receipt-invalid",
+                    "why": "proposal-decision-actor-invalid",
                     "proposalId": proposal_id,
                     "quarantined": true,
                     "quarantinePath": quarantine.map(|path| path.display().to_string()),
@@ -10063,7 +10117,8 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
-    }
+    };
+    let decision_approver = decision_actor.as_ref();
     if decision == "approve" {
         if let Err(error) = ward::validate_staged_edit_budget(&pending.edits) {
             if let Some(limit) = ward::ward_edit_budget_failure(&error) {
@@ -10507,7 +10562,16 @@ fn decide_threads_proposal_inner(
     }
     if let Some(applying) = applying_state.as_ref() {
         let recorded_intent = load_proposal_apply_intent(&conn, proposal_id)?;
-        if recorded_intent.as_ref() != Some(applying) {
+        let actor_matches = !verify_apply_intent_actor
+            || recorded_intent
+                .as_ref()
+                .and_then(|intent| intent.approver.as_deref())
+                == decision_approver.map(coven_threads_core::WriterId::as_str);
+        if recorded_intent
+            .as_ref()
+            .is_none_or(|intent| intent.state != *applying)
+            || !actor_matches
+        {
             return json_response(
                 409,
                 &json!({
@@ -11794,10 +11858,25 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
         };
         let conn = store::open_store(&store_path(coven_home))?;
         if let Some(proposal) = document.scheduled() {
-            if let Err(error) = scheduled_submission_authority(&conn, proposal) {
-                drop(conn);
-                quarantine_scheduler_candidate(coven_home, &path, &error);
-                continue;
+            match scheduled_submission_authority(&conn, proposal) {
+                Ok(_) => {}
+                Err(error) if invalid_scheduled_submission_authority(&error) => {
+                    drop(conn);
+                    quarantine_scheduler_candidate(coven_home, &path, &error);
+                    continue;
+                }
+                Err(error) => {
+                    drop(conn);
+                    crate::daemon::append_daemon_recovery_log(
+                        coven_home,
+                        &format!(
+                            "threads scheduler: submission receipt unavailable for {}: \
+                             {error:#}; retained for retry",
+                            path.display()
+                        ),
+                    );
+                    continue;
+                }
             }
         }
         let mut opened_window =
@@ -11816,7 +11895,18 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                     .expect("guard established scheduled proposal"),
                 now,
             ) {
-                quarantine_scheduler_candidate(coven_home, &path, &error);
+                if invalid_scheduled_submission_authority(&error) {
+                    quarantine_scheduler_candidate(coven_home, &path, &error);
+                } else {
+                    crate::daemon::append_daemon_recovery_log(
+                        coven_home,
+                        &format!(
+                            "threads scheduler: proposal window audit failed for {}: \
+                             {error:#}; retained for retry",
+                            path.display()
+                        ),
+                    );
+                }
                 continue;
             }
             opened_window = true;
@@ -12136,6 +12226,27 @@ fn ensure_proposal_window_opened_audit_with_conn(
     Ok(())
 }
 
+#[derive(Debug)]
+struct InvalidScheduledSubmissionAuthority(String);
+
+impl std::fmt::Display for InvalidScheduledSubmissionAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidScheduledSubmissionAuthority {}
+
+fn invalid_submission_authority(message: impl Into<String>) -> anyhow::Error {
+    InvalidScheduledSubmissionAuthority(message.into()).into()
+}
+
+fn invalid_scheduled_submission_authority(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<InvalidScheduledSubmissionAuthority>()
+        .is_some()
+}
+
 fn scheduled_submission_authority(
     conn: &rusqlite::Connection,
     proposal: &crate::proposal_scheduler::ScheduledProposal,
@@ -12152,10 +12263,11 @@ fn scheduled_submission_authority(
         [pending.id.0.to_string()],
         |row| row.get(0),
     )?;
-    anyhow::ensure!(
-        submission_count == 1,
-        "scheduled proposal must have exactly one submission receipt"
-    );
+    if submission_count != 1 {
+        return Err(invalid_submission_authority(
+            "scheduled proposal must have exactly one submission receipt",
+        ));
+    }
     let (familiar_id, weave_hash, detail, files_touched, channel, submitted_at): (
         String,
         Vec<u8>,
@@ -12163,57 +12275,81 @@ fn scheduled_submission_authority(
         String,
         String,
         String,
-    ) = conn
-        .query_row(
-            "SELECT familiar_id, ward_hash, detail, files_touched, channel, submitted_at
+    ) = match conn.query_row(
+        "SELECT familiar_id, ward_hash, detail, files_touched, channel, submitted_at
              FROM ward_audit
              WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'
              LIMIT 1",
-            [pending.id.0.to_string()],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )
-        .context("loading scheduled proposal submission receipt")?;
-    anyhow::ensure!(
-        crate::threads_gate::familiar_weave_id(&familiar_id) == pending.familiar_id,
-        "scheduled proposal submission familiar does not match its pending envelope"
-    );
+        [pending.id.0.to_string()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    ) {
+        Ok(receipt) => receipt,
+        Err(
+            error @ (rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::QueryReturnedNoRows),
+        ) => {
+            return Err(invalid_submission_authority(format!(
+                "scheduled proposal submission receipt is invalid: {error}"
+            )));
+        }
+        Err(error) => {
+            return Err(error).context("loading scheduled proposal submission receipt");
+        }
+    };
+    if crate::threads_gate::familiar_weave_id(&familiar_id) != pending.familiar_id {
+        return Err(invalid_submission_authority(
+            "scheduled proposal submission familiar does not match its pending envelope",
+        ));
+    }
     let expected_detail = json!({
         "classification": proposal.classification(),
         "veto_deadline": proposal.veto_deadline(),
         "earliest_close": proposal.earliest_close(),
     });
-    let recorded_detail: Value =
-        serde_json::from_str(&detail).context("scheduled proposal submission detail is invalid")?;
-    anyhow::ensure!(
-        recorded_detail == expected_detail,
-        "scheduled proposal authority diverges from its submission receipt"
-    );
-    let recorded_targets: Vec<String> = serde_json::from_str(&files_touched)
-        .context("scheduled proposal submission targets are invalid")?;
-    anyhow::ensure!(
-        recorded_targets == targets,
-        "scheduled proposal targets diverge from its submission receipt"
-    );
-    anyhow::ensure!(
-        channel == format!("{:?}", pending.channel).to_lowercase(),
-        "scheduled proposal channel diverges from its submission receipt"
-    );
+    let recorded_detail: Value = serde_json::from_str(&detail).map_err(|error| {
+        invalid_submission_authority(format!(
+            "scheduled proposal submission detail is invalid: {error}"
+        ))
+    })?;
+    if recorded_detail != expected_detail {
+        return Err(invalid_submission_authority(
+            "scheduled proposal authority diverges from its submission receipt",
+        ));
+    }
+    let recorded_targets: Vec<String> = serde_json::from_str(&files_touched).map_err(|error| {
+        invalid_submission_authority(format!(
+            "scheduled proposal submission targets are invalid: {error}"
+        ))
+    })?;
+    if recorded_targets != targets {
+        return Err(invalid_submission_authority(
+            "scheduled proposal targets diverge from its submission receipt",
+        ));
+    }
+    if channel != format!("{:?}", pending.channel).to_lowercase() {
+        return Err(invalid_submission_authority(
+            "scheduled proposal channel diverges from its submission receipt",
+        ));
+    }
     let expected_submitted_at = pending
         .staged_at
         .format(&time::format_description::well_known::Rfc3339)?;
-    anyhow::ensure!(
-        submitted_at == expected_submitted_at,
-        "scheduled proposal staged time diverges from its submission receipt"
-    );
+    if submitted_at != expected_submitted_at {
+        return Err(invalid_submission_authority(
+            "scheduled proposal staged time diverges from its submission receipt",
+        ));
+    }
     Ok((familiar_id, weave_hash))
 }
 
@@ -12546,6 +12682,76 @@ struct ProposalDecisionRequest {
     expired: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decision_actor: Option<String>,
+}
+
+fn trusted_decision_approver(
+    conn: &rusqlite::Connection,
+    proposal_id: &str,
+    reservation_decision: &str,
+    request: Option<&ProposalDecisionRequest>,
+) -> Result<(Option<coven_threads_core::WriterId>, bool)> {
+    let Some(request) = request else {
+        return Ok((None, false));
+    };
+    if request.expired {
+        anyhow::ensure!(
+            request.decision_actor.is_none(),
+            "automatic proposal expiry cannot carry a decision actor"
+        );
+        return Ok((None, false));
+    }
+    let purpose: String = conn
+        .query_row(
+            "SELECT purpose
+             FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            [format!("proposal:{proposal_id}:{reservation_decision}")],
+            |row| row.get(0),
+        )
+        .context("loading proposal decision origin")?;
+    let expected_purpose = match request.decision.as_str() {
+        "approve" => (
+            "proposal-approval-owner-local",
+            "proposal-approval-automatic",
+            "proposal-approval",
+        ),
+        "reject" => (
+            "proposal-rejection-owner-local",
+            "proposal-rejection-automatic",
+            "proposal-rejection",
+        ),
+        _ => anyhow::bail!("proposal decision request has an invalid decision"),
+    };
+    match purpose.as_str() {
+        purpose if purpose == expected_purpose.0 => {
+            anyhow::ensure!(
+                request.revision_required
+                    && request.decision_actor.as_deref() == Some(OWNER_LOCAL_DECISION_ACTOR),
+                "manual proposal decision origin does not match its durable reservation"
+            );
+            Ok((
+                Some(coven_threads_core::WriterId::new(
+                    OWNER_LOCAL_DECISION_ACTOR,
+                )),
+                true,
+            ))
+        }
+        purpose if purpose == expected_purpose.1 => {
+            anyhow::ensure!(
+                !request.revision_required && request.decision_actor.is_none(),
+                "automatic proposal decision origin does not match its durable reservation"
+            );
+            Ok((None, true))
+        }
+        purpose if purpose == expected_purpose.2 => {
+            anyhow::ensure!(
+                request.decision_actor.is_none(),
+                "legacy proposal decision reservation cannot carry a decision actor"
+            );
+            Ok((None, false))
+        }
+        _ => anyhow::bail!("proposal decision reservation purpose is invalid"),
+    }
 }
 
 fn bool_is_false(value: &bool) -> bool {
@@ -12937,15 +13143,21 @@ fn append_proposal_apply_intent(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RecordedProposalApplyIntent {
+    state: ProposalApplyingState,
+    approver: Option<String>,
+}
+
 fn load_proposal_apply_intent(
     conn: &rusqlite::Connection,
     proposal_id: &str,
-) -> Result<Option<ProposalApplyingState>> {
+) -> Result<Option<RecordedProposalApplyIntent>> {
     use rusqlite::OptionalExtension;
 
-    let detail: Option<String> = conn
+    let row: Option<(String, Option<String>)> = conn
         .query_row(
-            "SELECT detail
+            "SELECT detail, approver
              FROM ward_audit
              WHERE proposal_id = ?1
                AND event_type = 'validation_verdict'
@@ -12953,13 +13165,17 @@ fn load_proposal_apply_intent(
              ORDER BY id DESC
              LIMIT 1",
             [proposal_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .context("loading proposal apply intent")?;
-    detail
-        .map(|detail| serde_json::from_str(&detail).context("invalid proposal apply intent"))
-        .transpose()
+    row.map(|(detail, approver)| {
+        Ok(RecordedProposalApplyIntent {
+            state: serde_json::from_str(&detail).context("invalid proposal apply intent")?,
+            approver,
+        })
+    })
+    .transpose()
 }
 
 fn proposal_expected_resolved_surfaces(
@@ -37974,6 +38190,132 @@ tier = 0
         let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
             .collect::<std::io::Result<Vec<_>>>()?;
         assert_eq!(quarantined.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_checks_submission_receipt_before_corrupt_window_terminalization(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            time::OffsetDateTime::now_utc(),
+        )?;
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        staged["reviewKind"] = json!("automatic");
+        staged["pending"]["staged_at"] =
+            serde_json::to_value(time::OffsetDateTime::now_utc() - time::Duration::hours(2))?;
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!pending.exists());
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_count, 0,
+            "receipt corruption must not invent a terminal decision"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_retains_valid_window_when_audit_store_is_temporarily_full() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            time::OffsetDateTime::now_utc(),
+        )?;
+        saturate_ward_audit_capacity(home)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(
+            pending.exists(),
+            "transient audit failure remains retryable"
+        );
+        assert!(
+            !home.join("pending/quarantine").exists(),
+            "valid receipt evidence must not be quarantined"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let opened: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(opened, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_quarantines_mutated_manual_decision_actor() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyIntentBeforeWrite,
+            proposal_id.clone(),
+        )));
+        assert!(handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )
+        .is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .context("interrupted approval leaves a recovery claim")?;
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
+        staged["decisionRequest"]["decisionActor"] = json!("principal:forged");
+        std::fs::write(&claim, serde_json::to_vec_pretty(&staged)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(!claim.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_count, 0);
         Ok(())
     }
 
