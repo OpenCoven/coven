@@ -278,6 +278,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
+      - name: Diagnose terminal fixture startup concurrency
+        if: ${{ failure() && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          cargo test --locked -p coven-cli --test threads_terminal_recovery -- --nocapture
+          $parallel = $LASTEXITCODE
+          cargo test --locked -p coven-cli --test threads_terminal_recovery -- --nocapture --test-threads=1
+          $serial = $LASTEXITCODE
+          Write-Host "Terminal fixture comparison: parallel=$parallel serial=$serial"
+          exit 1
       - name: Exercise isolated Threads clock feature
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
 

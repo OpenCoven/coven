@@ -172,6 +172,7 @@ forbidden = ["(?i)ignore previous"]
     }
 
     fn daemon_command(&self, operation: &str) -> Result<Output> {
+        let started = Instant::now();
         let mut command = Command::new(env!("CARGO_BIN_EXE_coven"));
         command.env_clear();
         // Keep only OS launch necessities, not developer credentials or test controls.
@@ -195,9 +196,13 @@ forbidden = ["(?i)ignore previous"]
             .output()?;
         anyhow::ensure!(
             output.status.success(),
-            "daemon {operation} failed\nstdout:\n{}\nstderr:\n{}",
+            "daemon {operation} failed after {:?}\nstdout:\n{}\nstderr:\n{}\n\
+             fixture status: {:?}\nfixture recovery log: {:?}",
+            started.elapsed(),
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(self.coven_home.join("daemon.json")),
+            fs::read_to_string(self.coven_home.join("daemon-recovery.log")),
         );
         Ok(output)
     }
