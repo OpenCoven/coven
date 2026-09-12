@@ -18,7 +18,11 @@ mod tool;
 pub use agent::{Agent, AgentId, Handoff};
 pub use error::{BoxError, ConfigError, GuardrailStage, RunError, RunFailure};
 pub use guardrail::{GuardrailVerdict, InputGuardrail, OutputGuardrail};
-pub use invocation::{InvocationContext, InvocationId};
+pub use invocation::{
+    AgentRef, AgentRefError, AgentRevision, InvocationContext, InvocationEvent,
+    InvocationEventKind, InvocationEventVersion, InvocationFailureKind, InvocationId,
+    InvocationRequest, InvocationSource,
+};
 pub use loop_journal::FileLoopJournal;
 pub use loop_runner::{
     GoalLoopRunner, InMemoryLoopJournal, LoopAttempt, LoopCheckpoint, LoopCheckpointStatus,
@@ -29,7 +33,9 @@ pub use model::{
     HandoffCall, HandoffDefinition, Model, ModelAction, ModelRequest, ModelResponse, RunItem,
     ToolCall,
 };
-pub use observer::{NoopObserver, RunEvent, RunFailureKind, RunObserver};
+pub use observer::{
+    InvocationObserver, NoopInvocationObserver, NoopObserver, RunEvent, RunFailureKind, RunObserver,
+};
 pub use runner::{RunOptions, RunResult, Runner};
 pub use session::{InMemorySession, SessionStore};
 pub use tool::{Tool, ToolDefinition};

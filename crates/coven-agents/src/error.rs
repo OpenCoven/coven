@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{AgentId, InvocationContext, RunItem};
+use crate::{AgentId, AgentRef, AgentRefError, InvocationContext, RunItem};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -23,6 +23,12 @@ impl std::fmt::Display for GuardrailStage {
 pub enum ConfigError {
     #[error("at least one agent is required")]
     NoAgents,
+    #[error("agent `{agent}` does not form a valid agent reference")]
+    InvalidAgentRef {
+        agent: AgentId,
+        #[source]
+        source: AgentRefError,
+    },
     #[error("agent id `{0}` is registered more than once")]
     DuplicateAgent(AgentId),
     #[error("agent `{agent}` registers tool `{tool}` more than once")]
@@ -41,6 +47,19 @@ pub enum ConfigError {
 pub enum RunError {
     #[error("starting agent `{0}` is not registered")]
     UnknownStartingAgent(AgentId),
+    #[error("starting agent reference `{requested}` does not match registered `{registered}`")]
+    AgentRevisionMismatch {
+        requested: Box<AgentRef>,
+        registered: Box<AgentRef>,
+    },
+    #[error("explicit invocation target `{agent}` requires an immutable registered revision")]
+    AgentRevisionRequired { agent: AgentId },
+    #[error("starting agent `{agent}` does not form a valid agent reference")]
+    InvalidAgentRef {
+        agent: AgentId,
+        #[source]
+        source: AgentRefError,
+    },
     #[error("runner configuration became invalid: {reason}")]
     InvalidConfiguration { reason: String },
     #[error("session id was provided but no session store is configured")]
