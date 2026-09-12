@@ -71,3 +71,7 @@ earliest close, and beyond the deadline. Submit proposals through supported
 intake, and inspect filesystem, pending, and `ward_audit` effects after each
 step. The fixture token controls time only; it never supplies proposal,
 approval, or protected-write authority.
+
+See [Threads terminal recovery](threads-terminal-recovery.md) for typed close
+evidence and the distinction between recovering pending work and quarantining
+an unverifiable interrupted apply.
