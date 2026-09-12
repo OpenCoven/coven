@@ -32,6 +32,16 @@ The final-commit journey pauses after authority validation, changes the
 authoritative identity bytes, and requires a typed rejection without applying
 the candidate writes.
 
+Four additional identity-replay cases each exercise a live deadline and a
+restart: changed `IDENTITY.md` bytes, changed `SOUL.md` bytes, changed roster
+metadata, and a strengthened but still-satisfied active purpose predicate.
+They use supported scheduled intake, not injected proposal envelopes. The
+original proposal must have one `EvidenceDiverged` close when deadline replay
+is exercised, without applying; its submission/opening/terminal chain must survive
+another restart unchanged. A fresh proposal under the changed authority must
+then apply successfully, distinguishing valid evidence drift from a failed
+identity predicate.
+
 These tests use owner-local IPC, the strongest current supported authorization
 path. A supplied fingerprint does not grant protected-write authority. The
 suite does not certify a signed principal-authorization profile, changed runtime
@@ -47,7 +57,7 @@ fixture in each disposable home and explicit real-scheduler ticks, not sleeps
 or a mock scheduler. See [Threads test clock](../design/threads-test-clock.md).
 Without the feature, Cargo runs only the smaller smoke/lifecycle subset. CI
 executes the feature-enabled target on Linux, Windows, and the existing macOS
-push lane. All platforms run the same 15 daemon journey tests through `coven-client`
+push lane. All platforms run the same feature-enabled journeys through `coven-client`
 discovery and authenticated transport; Windows uses the owner-only named pipe.
 Three additional artifact regressions exercise startup-evidence retention;
 they are not extra daemon journeys.
@@ -56,14 +66,16 @@ Two real-process artifact regressions cover failed-request response pairing and
 failed-restart CLI evidence. Two foreground-process regressions cover owned
 replacement/crash cleanup and failed-child evidence; two readiness regressions
 cover process/endpoint matching and the narrow pending-transport error set.
-These bring the default target to 16 tests and the feature-enabled target to 26;
-the additional fixture regressions add no authority-journey coverage.
+Shared admission regressions also cover launch selection, fixed readiness
+budgets, owned-child cleanup, and readiness failure before status publication.
+These fixture regressions add no authority-journey coverage or native Windows
+execution evidence.
 HTTP framing regressions belong to the shared client's tests, not a separate
 harness parser. A cross-target compilation or Windows workspace run alone is
 not evidence that these journeys executed on Windows.
 
 Windows authority fixtures own a real `coven daemon serve` child, following the
-shared Threads fixture rather than testing the separate two-second launcher SLA
+shared admission helper rather than testing the separate two-second launcher SLA
 on every authority scenario. Startup uses a fixed 15-second hang guard and the
 client's authenticated named-pipe health probe, matching the peer PID, health
 PID, and endpoint to the retained child. Only pending connection/empty-response
@@ -78,9 +90,19 @@ lifecycle journey and failed-restart artifact regression still use production
 `daemon start`/`restart`; no production lifecycle deadline is changed.
 Unix authority journeys also retain their CLI launch path, while the explicit
 foreground regressions exercise owned-child lifecycle behavior on every platform.
-Windows crash injection binds the process handle to the authenticated pipe
-server PID and creation time before termination. Requests are never retried
-automatically; a response timeout does not prove a mutation did not commit.
+Foreground crash injection terminates the retained owned handle; detached
+Windows daemon termination still authenticates the pipe server PID and
+creation time. The dedicated native `windows_daemon_lifecycle` CLI deadline
+tests are unchanged.
+Unix lifecycle health compares the canonical profile directory and socket
+basename, then checks non-symlink socket metadata against the authenticated
+endpoint's device/inode. This handles hard-linked socket leaves without
+accepting another reported socket name for the same inode and does not change
+the production socket publisher. The shared
+admission regressions inject time, pending probes, and child/health identity;
+they do not use wall-clock sleeps as authority evidence. Requests are never
+retried automatically; a response timeout does not prove a mutation did not
+commit.
 
 ## Testing a local Threads checkout
 
@@ -135,12 +157,21 @@ test log, and early setup failures can still lack revision metadata.
 On failure, the same directory also contains the synthetic request and
 response, daemon recovery log, Ward audit rows, hashed pending/workspace
 inventories, SQLite schema, and a bounded, sanitized status snapshot. Startup
-failures retain the failed CLI event and available fixture evidence before
+failures retain the failed CLI or owned-serve event and available fixture evidence before
 cleanup; fallback markers do not overwrite captured files. A capture error in
 one state source is reported without discarding the others.
 Failed restart commands retain their exit status and CLI output even before a
 health probe can run. A request that fails before a JSON response is captured
 records a null response, never a response from an earlier request.
+
+Owned-serve stdout/stderr are included in the sanitized daemon log, including
+admission failures before status publication.
+
+Successful valid-identity-drift scenarios also retain
+`identity-replay-proof.json`: original and fresh intake documents, queried
+submission/opening/terminal audit projections, and the stale proposal's
+zero-apply observation before the positive control. These packets supplement
+the scenario manifest; they do not replace its source/override provenance.
 
 For a constructed fixture, `manifest.json` includes exact Coven and Threads
 revisions and `local_threads_override_active`, even if daemon startup fails;
