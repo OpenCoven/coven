@@ -124,6 +124,7 @@ The checked-in
 [`attempt-terminal-immutability.vectors.json`](attempt-terminal-immutability.vectors.json),
 [`capability-negotiation.vectors.json`](capability-negotiation.vectors.json),
 [`command-adoption-idempotency.vectors.json`](command-adoption-idempotency.vectors.json),
+[`definition-lifecycle-transitions.vectors.json`](definition-lifecycle-transitions.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
 [`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
@@ -148,6 +149,7 @@ The runner invokes the target directly without a shell.
         "attempt-terminal-immutability",
         "capability-negotiation",
         "command-adoption-idempotency",
+        "definition-lifecycle-transitions",
         "definition-validation",
         "event-reducer-determinism",
         "occurrence-fence-uniqueness",
@@ -166,7 +168,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements nine structural suites.
+The native Coven target currently implements ten structural suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
@@ -176,6 +178,10 @@ production transactional adoption path, then proves that an exact replay
 returns the committed result without duplicating the definition, adoption, or
 event while a changed request under the same adoption key is refused with
 `ADOPTION_REPLAY_MISMATCH`.
+`definition-lifecycle-transitions` executes the complete versioned definition
+lifecycle graph through the production command transaction: creation into
+paused or active, active/paused revision, disable, tombstone, and fail-closed
+refusal of disabled reactivation and every transition out of a tombstone.
 `definition-validation`
 executes the portable v1 definition parser, integrity verification, and typed
 serialization path, accepting a canonical valid definition only when its
@@ -202,8 +208,8 @@ segments or values, and out-of-range inputs.
 against the real Rust run ledger in an isolated in-memory store, proving that a
 later terminal observation cannot rewrite the first committed terminal state.
 Each vector must use distinct first and replay statuses so a passing case
-exercises an actual conflict. These suites do not claim the complete definition,
-occurrence, or attempt state machines.
+exercises an actual conflict. These suites do not claim the complete occurrence
+or attempt state machines.
 
 The runner computes a JCS SHA-256 digest of returned evidence and discards the
 raw evidence after building the result envelope. Evidence is restricted to JSON
