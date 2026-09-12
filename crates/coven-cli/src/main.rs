@@ -56,6 +56,7 @@ mod memory_import;
 pub mod mobile_memory;
 mod observe;
 mod openclaw_repo;
+mod output_format_auto;
 mod parallel_protocol;
 mod patch;
 mod paths;

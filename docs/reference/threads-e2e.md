@@ -32,6 +32,46 @@ The final-commit journey pauses after authority validation, changes the
 authoritative identity bytes, and requires a typed rejection without applying
 the candidate writes.
 
+The `output_auto` cases submit bounded `output-format.json` replacements
+through the familiar-edits API, never by planting positive pending envelopes.
+They cover both auto variants, explicit null veto, submission commitments,
+minimum visibility/deadline and restart, exactly-once approval/veto/rejection,
+malformed and mixed-batch refusal, explicit opt-in and protected aliases,
+stronger human ceremonies, advisory isolation, failed/unscored regression
+gates, valid identity/policy/probe/image drift, and final-commit races.
+Interrupted-apply cases crash the real daemon after the persisted intent:
+unchanged authority recovers, while unavailable Ward authority is quarantined
+without a fabricated terminal.
+
+The separate `output_auto_review` regressions cover outgoing symlinks and
+hardlink aliases under auto and human policies, valid/malformed single and
+mixed requests, both link-creation directions, and both forbidden Serde
+representations as before and after images. Preservation cases cover lexical
+and case-only routing, inward symlink staging, canonical hardlink replacement,
+and unrelated hardlinked ordinary writes. Symlink-specific cases execute on
+Unix; hardlink and representation cases are cross-platform. These are
+additional scenarios, not replacements for the original auto/replay journeys.
+
+The Unix `output_auto_chain` cases additionally cover composed symlink chains,
+direct and hardlinked destination requests, broken-destination creation, and
+directory-link/parent traversal semantics. Auto and human single/mixed requests
+must leave files, pending state, and audit unchanged on refusal; unrelated
+ordinary controls remain applicable with both live and broken canonical links.
+The non-UTF-8 destination case is Linux-only because macOS rejects that fixture
+filename before a daemon request can execute.
+
+```sh
+COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE=1 \
+  cargo test --locked -p coven-cli --test threads_e2e \
+  --features threads-test-clock output_auto -- --nocapture
+```
+
+This route requires the matching Threads checkout with `OutputFormatRegion`;
+until that core is published and pinned, use the ephemeral local override
+described below. The fixture does not reinterpret legacy migration as tier-2
+authorization. Native platform execution is required separately; compilation
+and macOS results do not establish Windows acceptance.
+
 These tests use owner-local IPC, the strongest current supported authorization
 path. A supplied fingerprint does not grant protected-write authority. The
 suite does not certify a signed principal-authorization profile, changed runtime

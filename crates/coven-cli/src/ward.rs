@@ -359,8 +359,8 @@ pub struct WardConfig {
     /// Declared surface regions.
     #[serde(default)]
     pub surface: Vec<SurfaceEntry>,
-    /// Deterministic, advisory Gate-3 probes. The singular field name maps to
-    /// TOML's repeated `[[probe]]` tables.
+    /// Deterministic Gate-3 probes, advisory outside explicitly opted-in bounded
+    /// output-format auto approval. Maps to TOML's repeated `[[probe]]` tables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe: Vec<ProbeConfig>,
 }
@@ -1988,6 +1988,114 @@ impl AnchoredHome {
         }
     }
 
+    fn existing_entry(&self, resolved: &str) -> Result<Option<AnchoredEntry>> {
+        let relative = lexical_join(Path::new(""), resolved)
+            .context("file identity requires a confined relative surface")?;
+        let name = relative
+            .file_name()
+            .context("file identity requires a leaf")?;
+        let mut directory = Arc::clone(&self.dir);
+        let mut absolute = self.absolute.clone();
+        for component in relative
+            .parent()
+            .context("relative surface parent")?
+            .components()
+        {
+            let Component::Normal(part) = component else {
+                bail!("file identity parent contains a non-normal component");
+            };
+            let child = match open_child_dir_nofollow(&directory, part) {
+                Ok(child) => child,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error).context("opening file identity parent"),
+            };
+            directory = Arc::new(child);
+            absolute.push(part);
+        }
+        Ok(Some(AnchoredEntry::new(directory, &absolute, name)))
+    }
+
+    fn confined_surface_destination(&self, surface: &str) -> Result<PathBuf> {
+        let relative = lexical_join(Path::new(""), surface)
+            .context("surface destination must be confined to the familiar home")?;
+        let mut pending: std::collections::VecDeque<_> = relative
+            .components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect();
+        let mut directories = vec![Arc::clone(&self.dir)];
+        let mut destination = PathBuf::new();
+        let mut links = 0;
+        // Walk links (including dangling ones) without following them on open.
+        // Parent components are interpreted after preceding directory links.
+        while let Some(name) = pending.pop_front() {
+            if name == OsStr::new(".") {
+                continue;
+            }
+            if name == OsStr::new("..") {
+                if directories.len() <= 1 || !destination.pop() {
+                    bail!("surface link escapes the familiar home");
+                }
+                directories.pop();
+                continue;
+            }
+            let directory = directories
+                .last()
+                .expect("confined root handle is retained");
+            let metadata = match directory.symlink_metadata(&name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    if pending.iter().any(|part| part == OsStr::new("..")) {
+                        bail!("missing ancestor prevents proving surface link destination");
+                    }
+                    destination.push(name);
+                    destination.extend(pending);
+                    return Ok(destination);
+                }
+                Err(error) => return Err(error).context("reading confined surface destination"),
+            };
+            if metadata.file_type().is_symlink() {
+                links += 1;
+                if links > 40 {
+                    bail!("surface link chain exceeds the bounded resolution limit");
+                }
+                let target = directory
+                    .read_link_contents(&name)
+                    .context("reading confined surface link")?;
+                let target = if target.is_absolute() {
+                    directories.truncate(1);
+                    destination.clear();
+                    target
+                        .strip_prefix(&self.absolute)
+                        .context("surface link leaves the familiar home")?
+                } else {
+                    &target
+                };
+                for component in target.components().rev() {
+                    match component {
+                        Component::Normal(_) | Component::CurDir | Component::ParentDir => {
+                            pending.push_front(component.as_os_str().to_os_string());
+                        }
+                        Component::RootDir | Component::Prefix(_) => {
+                            bail!("surface link is not confined to the familiar home");
+                        }
+                    }
+                }
+                continue;
+            }
+            destination.push(&name);
+            if !pending.is_empty() {
+                directories.push(Arc::new(
+                    open_child_dir_nofollow(directory, &name)
+                        .context("opening confined surface parent")?,
+                ));
+            }
+        }
+        if destination.as_os_str().is_empty() {
+            bail!("surface destination must name a file");
+        }
+        Ok(destination)
+    }
+
     fn binding_matches(&self) -> Result<bool> {
         let Ok(current_absolute) = self.configured.canonicalize() else {
             return Ok(false);
@@ -2051,6 +2159,61 @@ struct AnchoredEntry {
     parent: Arc<Dir>,
     name: OsString,
     absolute: PathBuf,
+}
+
+/// Compare the configured surface's confined destination and retained regular
+/// file identity. Missing destinations still participate in path comparisons.
+pub(crate) fn has_resolved_file_alias(
+    workspace: &Path,
+    canonical: &str,
+    decisions: &[Decision],
+) -> Result<bool> {
+    let home = AnchoredHome::open(workspace)?;
+    let destination = home.confined_surface_destination(canonical)?;
+    destination
+        .to_str()
+        .context("configured surface destination is not UTF-8")?;
+    let destination_key = portable_surface_key(&to_forward_slashes(&destination));
+    let canonical_entry = home.existing_entry(&to_forward_slashes(&destination))?;
+    let file = canonical_entry
+        .as_ref()
+        .map(open_regular_file_handle_without_following_links)
+        .transpose()?
+        .flatten();
+    let mut aliases = false;
+    for decision in decisions {
+        let candidate_destination = home.confined_surface_destination(&decision.resolved)?;
+        candidate_destination
+            .to_str()
+            .context("requested surface destination is not UTF-8")?;
+        let candidate_surface = to_forward_slashes(&candidate_destination);
+        aliases |= portable_surface_key(&candidate_surface) == destination_key;
+        if let (Some(file), Some(candidate)) =
+            (file.as_ref(), home.existing_entry(&candidate_surface)?)
+        {
+            aliases |= open_file_matches_path(file, &candidate)?;
+        }
+    }
+    home.verify_path_unchanged()?;
+    if home.confined_surface_destination(canonical)? != destination {
+        bail!("configured surface destination changed during alias comparison");
+    }
+    let current_entry = home.existing_entry(&to_forward_slashes(&destination))?;
+    if let (Some(file), Some(canonical)) = (file.as_ref(), current_entry.as_ref()) {
+        if !open_file_matches_path(file, canonical)? {
+            bail!("canonical surface identity changed during alias comparison");
+        }
+    } else if file.is_some()
+        || current_entry
+            .as_ref()
+            .map(open_regular_file_handle_without_following_links)
+            .transpose()?
+            .flatten()
+            .is_some()
+    {
+        bail!("canonical surface identity changed during alias comparison");
+    }
+    Ok(aliases)
 }
 
 impl AnchoredEntry {

@@ -6104,6 +6104,80 @@ fn apply_familiar_edits(
         crate::threads_gate::GateOutcome::Permitted => {}
     }
 
+    let intercept_output_format =
+        match crate::output_format_auto::intercepts(&workspace, &config, &adjudication.decisions) {
+            Ok(intercepted) => intercepted,
+            Err(error) => {
+                audit_reservation.finish()?;
+                return api_error(
+                    409,
+                    "scheduled_publication_invalid",
+                    "Output-format routing could not establish a supported target.",
+                    Some(json!({"reason": format!("{error:#}")})),
+                );
+            }
+        };
+    if intercept_output_format {
+        if edits.len() != 1 {
+            audit_reservation.finish()?;
+            return api_error(
+                409,
+                "scheduled_publication_invalid",
+                "Configured output-format proposals require exactly one replacement.",
+                None,
+            );
+        }
+        let staged_edits: Vec<_> = adjudication
+            .decisions
+            .iter()
+            .zip(&edits)
+            .map(|(decision, edit)| {
+                ward::FileEdit::new(&decision.resolved, edit.new_contents.clone())
+            })
+            .collect();
+        let staged = match crate::threads_gate::stage_coherence_proposal(
+            audit_reservation.connection(),
+            coven_home,
+            familiar_id,
+            &workspace,
+            &config,
+            &staged_edits,
+            &authorization,
+        ) {
+            Ok(staged) => staged,
+            Err(error) if crate::proposal_store::quota_failure(&error).is_some() => {
+                audit_reservation.release_if_unneeded()?;
+                return proposal_quota_exceeded_response(
+                    crate::proposal_store::quota_failure(&error).expect("typed quota failure"),
+                );
+            }
+            Err(error) if crate::threads_gate::scheduled_publication_failure(&error).is_some() => {
+                audit_reservation.finish()?;
+                return api_error(
+                    409,
+                    "scheduled_publication_invalid",
+                    "Output-format did not meet its bounded scheduled-publication contract.",
+                    Some(
+                        crate::threads_gate::scheduled_publication_failure(&error)
+                            .expect("typed publication failure")
+                            .details(),
+                    ),
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        audit_reservation.finish()?;
+        return json_response(
+            202,
+            &json!({
+                "ok": true, "disposition": "staged", "proposalId": staged.proposal_id,
+                "pendingPath": staged.pending_path.display().to_string(),
+                "scheduledProposal": staged.scheduled,
+                "threadsGate": gate_report.to_json(),
+            }),
+        );
+    }
+
     let apply_now = crate::threads_clock::now(coven_home)?;
     let (report, apply_cleanup_error) = match ward.apply(&edits, &authorization) {
         Ok(report) => (report, None),
@@ -8388,6 +8462,8 @@ struct ProposalEnvelopePreflight {
     review_kind: Option<serde::de::IgnoredAny>,
     #[serde(rename = "identityEvidence", default)]
     identity_evidence: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "autoRegressionEvidence", default)]
+    auto_regression_evidence: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     probes: Option<serde::de::IgnoredAny>,
     #[serde(rename = "decisionRequest", default)]
@@ -8460,6 +8536,7 @@ impl ProposalJsonField {
             | "replay_bytes"
             | "evidence_replay_hash"
             | "identityEvidence"
+            | "autoRegressionEvidence"
             | "recoveryCommitment"
             | "weaveHash" => Self::ByteArray,
             "edits" => Self::Edits,
@@ -8496,6 +8573,7 @@ fn proposal_json_object_key_allowed(context: ProposalJsonValueContext, key: &str
             "staged_at",
             "reviewKind",
             "identityEvidence",
+            "autoRegressionEvidence",
             "probes",
             "decisionRequest",
             "decisionState",
@@ -8892,6 +8970,8 @@ struct ProposalEnvelopeWire {
     review_kind: PresentField<String>,
     #[serde(rename = "identityEvidence", default)]
     identity_evidence: PresentField<[u8; 32]>,
+    #[serde(rename = "autoRegressionEvidence", default)]
+    auto_regression_evidence: PresentField<[u8; 32]>,
     #[serde(default)]
     probes: PresentField<Box<serde_json::value::RawValue>>,
     #[serde(rename = "decisionRequest", default)]
@@ -8909,6 +8989,7 @@ struct ProposalEnvelopeDocument {
     authority: ProposalAuthority,
     review_kind: Option<String>,
     identity_evidence: Option<[u8; 32]>,
+    auto_regression_evidence: Option<[u8; 32]>,
     probes: Option<Box<serde_json::value::RawValue>>,
     decision_request: Option<ProposalDecisionRequest>,
     decision_state: Option<ProposalApplyingState>,
@@ -8922,6 +9003,11 @@ struct StoredLegacyProposalRef<'a> {
     review_kind: Option<&'a String>,
     #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
     identity_evidence: Option<[u8; 32]>,
+    #[serde(
+        rename = "autoRegressionEvidence",
+        skip_serializing_if = "Option::is_none"
+    )]
+    auto_regression_evidence: Option<[u8; 32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probes: Option<&'a serde_json::value::RawValue>,
     #[serde(rename = "decisionRequest", skip_serializing_if = "Option::is_none")]
@@ -8938,6 +9024,11 @@ struct StoredScheduledProposalRef<'a> {
     review_kind: Option<&'a String>,
     #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
     identity_evidence: Option<[u8; 32]>,
+    #[serde(
+        rename = "autoRegressionEvidence",
+        skip_serializing_if = "Option::is_none"
+    )]
+    auto_regression_evidence: Option<[u8; 32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probes: Option<&'a serde_json::value::RawValue>,
     #[serde(rename = "decisionRequest", skip_serializing_if = "Option::is_none")]
@@ -9206,6 +9297,7 @@ impl ProposalEnvelopeDocument {
             authority,
             review_kind,
             identity_evidence: wire.identity_evidence.0,
+            auto_regression_evidence: wire.auto_regression_evidence.0,
             probes,
             decision_request,
             decision_state,
@@ -9236,6 +9328,7 @@ impl ProposalEnvelopeDocument {
                 pending,
                 review_kind: self.review_kind.as_ref(),
                 identity_evidence: self.identity_evidence,
+                auto_regression_evidence: self.auto_regression_evidence,
                 probes: self.probes.as_deref(),
                 decision_request,
                 decision_state,
@@ -9245,6 +9338,7 @@ impl ProposalEnvelopeDocument {
                     scheduled,
                     review_kind: self.review_kind.as_ref(),
                     identity_evidence: self.identity_evidence,
+                    auto_regression_evidence: self.auto_regression_evidence,
                     probes: self.probes.as_deref(),
                     decision_request,
                     decision_state,
@@ -11066,7 +11160,8 @@ fn decide_threads_proposal_inner(
     } else {
         None
     };
-    if let Some((reason, close_reason)) = identity_failure {
+    let auto_failure = revalidate_auto_regression(&conn, &config, &document).err();
+    if let Some((reason, close_reason)) = identity_failure.or(auto_failure) {
         if scheduled.is_some() && applying_state.is_none() {
             let window_close = scheduled_rejection_window_close(
                 scheduled,
@@ -13046,6 +13141,71 @@ fn reload_proposal_baselines(
         .collect()
 }
 
+fn revalidate_auto_regression(
+    conn: &rusqlite::Connection,
+    config: &ward::WardConfig,
+    document: &ProposalEnvelopeDocument,
+) -> std::result::Result<(), (&'static str, coven_threads_core::WindowCloseReason)> {
+    use coven_threads_core::{ApprovalPath, WindowCloseReason};
+    let unavailable = || {
+        (
+            "proposal-auto-regression-unavailable",
+            WindowCloseReason::RevalidationFailed,
+        )
+    };
+    let diverged = (
+        "proposal-auto-regression-evidence-diverged",
+        WindowCloseReason::EvidenceDiverged,
+    );
+    let Some(scheduled) = document.scheduled().filter(|scheduled| {
+        matches!(
+            scheduled.classification().approval_path,
+            ApprovalPath::AutoRegression { .. }
+        )
+    }) else {
+        return if document.auto_regression_evidence.is_some() {
+            Err(unavailable())
+        } else {
+            Ok(())
+        };
+    };
+    let expected = document.auto_regression_evidence.ok_or_else(unavailable)?;
+    let (current, reports) = crate::output_format_auto::regression_evidence(
+        config,
+        scheduled.materialized_diff(),
+        &scheduled.classification().evidence_replay_hash,
+        document.identity_evidence,
+    )
+    .map_err(|_| unavailable())?;
+    let stored: Vec<crate::ward_probes::SurfaceProbeReport> =
+        serde_json::from_str(document.probes.as_ref().ok_or_else(unavailable)?.get())
+            .map_err(|_| unavailable())?;
+    if expected != current
+        || crate::output_format_auto::authoritative_projection(&stored)
+            != crate::output_format_auto::authoritative_projection(&reports)
+    {
+        return Err(diverged);
+    }
+    let mut statement = conn.prepare(
+        "SELECT detail FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+    ).map_err(|_| unavailable())?;
+    let details = statement
+        .query_map([scheduled.pending().id.0.to_string()], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| unavailable())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| unavailable())?;
+    let [detail] = details.as_slice() else {
+        return Err(unavailable());
+    };
+    let anchor: Value = serde_json::from_str(detail).map_err(|_| unavailable())?;
+    if anchor.get("autoRegressionEvidence") != Some(&json!(expected)) {
+        return Err(diverged);
+    }
+    Ok(())
+}
+
 fn ensure_proposal_final_authority_unchanged(
     conn: &rusqlite::Connection,
     config: &ward::WardConfig,
@@ -13078,6 +13238,8 @@ fn ensure_proposal_final_authority_unchanged(
     if current != expected_recovery_commitment {
         return Err(final_authority_drift("authority-evidence-changed", None));
     }
+    revalidate_auto_regression(conn, config, document)
+        .map_err(|(reason, _)| final_authority_drift(reason, None))?;
     Ok(())
 }
 
@@ -14604,6 +14766,10 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod output_auto_cases {
+        use super::*;
+        include!("api_output_auto_tests.rs");
+    }
     use super::*;
     use crate::api_routes::{COVEN_API_ROUTE_VERSION, SUPPORTED_API_ROUTE_VERSIONS};
 
@@ -36871,14 +37037,7 @@ tier = 0
                 path.with_file_name(format!("aaaa-{index:02}-{proposal_id}.json")),
             )?;
         }
-        let (due_path, due_id) = stage_scheduled_edit(
-            home,
-            "logged/skill.md",
-            2,
-            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
-            time::OffsetDateTime::now_utc(),
-            coven_threads_core::Channel::Mutation,
-        )?;
+        let (due_path, due_id) = output_auto_cases::stage_supported_output_auto(home)?;
         std::fs::rename(
             &due_path,
             due_path.with_file_name(format!("zzzz-{due_id}.json")),
@@ -36890,8 +37049,8 @@ tier = 0
             "the first tick must stop after the bounded human-review batch"
         );
         assert_eq!(
-            std::fs::read_to_string(home.join("familiars/sage/logged/skill.md"))?,
-            "before"
+            std::fs::read_to_string(home.join("familiars/sage/output-format.json"))?,
+            output_auto_cases::BEFORE
         );
 
         assert_eq!(
@@ -36900,8 +37059,8 @@ tier = 0
             "the persistent cursor must advance to the later due proposal"
         );
         assert_eq!(
-            std::fs::read_to_string(home.join("familiars/sage/logged/skill.md"))?,
-            "after"
+            std::fs::read_to_string(home.join("familiars/sage/output-format.json"))?,
+            output_auto_cases::AFTER
         );
         Ok(())
     }
@@ -36950,21 +37109,14 @@ tier = 0
             }
             return Err(error.into());
         }
-        let (_, proposal_id) = stage_scheduled_edit(
-            home,
-            "logged/skill.md",
-            2,
-            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
-            time::OffsetDateTime::now_utc(),
-            coven_threads_core::Channel::Mutation,
-        )?;
+        let (_, proposal_id) = output_auto_cases::stage_supported_output_auto(home)?;
 
         assert_eq!(process_due_threads_proposals(home)?, 1);
         assert_eq!(process_due_threads_proposals(home)?, 0);
 
         assert_eq!(
-            std::fs::read_to_string(home.join("familiars/sage/logged/skill.md"))?,
-            "after"
+            std::fs::read_to_string(home.join("familiars/sage/output-format.json"))?,
+            output_auto_cases::AFTER
         );
         assert!(std::fs::symlink_metadata(&invalid).is_err());
         assert_eq!(std::fs::read_dir(pending.join("quarantine"))?.count(), 1);
@@ -37386,14 +37538,7 @@ tier = 0
             )),
             &expired_path,
         )?;
-        let (later_path, later_id) = stage_scheduled_edit(
-            home,
-            "logged/later.md",
-            2,
-            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
-            time::OffsetDateTime::now_utc(),
-            coven_threads_core::Channel::Mutation,
-        )?;
+        let (later_path, later_id) = output_auto_cases::stage_supported_output_auto(home)?;
         let later_path = later_path.with_file_name(format!("zzzz-{later_id}.json"));
         std::fs::rename(
             home.join("pending").join(format!(
@@ -37414,8 +37559,8 @@ tier = 0
             "valid transiently blocked proposals must not be quarantined"
         );
         assert_eq!(
-            std::fs::read_to_string(home.join("familiars/sage/logged/later.md"))?,
-            "before"
+            std::fs::read_to_string(home.join("familiars/sage/output-format.json"))?,
+            output_auto_cases::BEFORE
         );
         let cursor = read_scheduler_cursor(home).context("scheduler cursor")?;
         assert!(
@@ -37760,14 +37905,7 @@ tier = 0
     fn invalid_manual_decision_does_not_block_automatic_apply() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
-        let (_, proposal_id) = stage_scheduled_edit(
-            home,
-            "logged/skill.md",
-            2,
-            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
-            time::OffsetDateTime::now_utc(),
-            coven_threads_core::Channel::Mutation,
-        )?;
+        let (_, proposal_id) = output_auto_cases::stage_supported_output_auto(home)?;
         let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
 
         let rejected = handle_request_with_body(
@@ -37797,22 +37935,15 @@ tier = 0
     fn threads_scheduler_fails_closed_when_audit_capacity_is_unavailable() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
-        let (pending, _proposal_id) = stage_scheduled_edit(
-            home,
-            "logged/skill.md",
-            2,
-            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
-            time::OffsetDateTime::now_utc(),
-            coven_threads_core::Channel::Mutation,
-        )?;
-        let target = home.join("familiars/sage/logged/skill.md");
+        let (pending, _proposal_id) = output_auto_cases::stage_supported_output_auto(home)?;
+        let target = home.join("familiars/sage/output-format.json");
         saturate_ward_audit_capacity(home)?;
 
         let processed = process_due_threads_proposals(home)?;
 
         assert_eq!(processed, 0);
         assert!(pending.exists());
-        assert_eq!(std::fs::read_to_string(target)?, "before");
+        assert_eq!(std::fs::read_to_string(target)?, output_auto_cases::BEFORE);
         Ok(())
     }
 

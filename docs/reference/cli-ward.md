@@ -130,7 +130,8 @@ The queue accepts two envelope kinds:
 - legacy proposals distinguished by `reviewKind`:
   `authority` records require live authority revalidation, and `coherence`
   records hold Tier-1 reviewed writes without retired-Ward approval metadata.
-- canonical `phase5_v1` scheduled proposals for reviewed writes whose Ward
+- canonical `phase5_v1` scheduled proposals for reviewed writes and explicitly
+  opted-in bounded output-format replacements whose Ward
   declares `editable.harness_blocks` + `approval_tiers` and whose staged diff
   binds entirely to the daemon's typed region predicates. These carry
   `classification.approval_path`, `materialized_diff`, `region_evidence`, and
@@ -228,13 +229,94 @@ required = ["(?m)^name:"]
 
 No matching `[[probe]]` declaration is explicitly `unscored`, never a pass.
 Invalid regexes, unreadable baselines, and other probe errors are also
-`unscored`. Failed and unscored results are advisory evidence: neither result
-applies, rejects, or auto-approves a proposal.
+`unscored`. Results remain advisory outside the explicitly opted-in bounded
+output-format auto path below. No probe result alone approves a proposal.
 
 The daemon recomputes persisted evidence against the staged edits, current
 baseline, Gate-2 path resolution, and declared probe set. Stale, malformed, or
 inconsistent sidecars are demoted to `unscored` and carry
 `probeEvidenceDegraded`; they are never summarized as a pass.
+
+### Explicit bounded output-format auto approval
+
+This additive route covers only replacement of `output-format.json`, with
+both UTF-8 images at most 256 bytes and exactly this closed JSON shape:
+
+```json
+{"schema":"coven.output-format/v1","indent":2,"final_newline":true}
+```
+
+`indent` must be integer `2` or `4`; `final_newline` must be boolean. Unknown,
+duplicate, missing, or wrongly typed fields, other versions, malformed prior
+images, creation, deletion, and mixed batches are refused. There are no
+templates, prompts, executable fields, arbitrary configuration promotion, or
+memory edits. Existing protected and reviewed floors are unchanged.
+The top-level JSON must be an object and `schema` must be the exact v1 string:
+array representations or externally tagged schema objects are not equivalent.
+
+Opt in explicitly in the current typed Ward configuration:
+
+```toml
+[[surface]]
+path = "output-format.json"
+tier = 2
+
+[editable]
+harness_blocks = ["output_format"]
+
+[approval_tiers.auto]
+blocks = ["output_format"]
+gate = "regression_suite"
+human_veto_window_hours = 1
+min_visible_seconds = 60
+
+[[probe]]
+surface = "output-format.json"
+id = "parse"
+format = "json"
+```
+
+The literal declaration and effective resolved tier must both be 2; a default,
+glob-only declaration, stronger overlapping floor, or protected alias does
+not qualify. A stronger compiled approval ceremony is honored instead of
+auto approval. Remove both veto fields for no-window auto; its persisted
+typed approval contains explicit `veto: null`, and it emits no window events.
+Retired-Ward migration remains conservative: it does not grant this opt-in
+or lower reviewed paths to tier 2.
+
+The supported familiar-edits request stages this configured surface **before**
+ordinary apply, including malformed or mixed requests. Unconfigured ordinary
+writes are not intercepted. Routing considers both the normalized declared
+target and the resolved surface. A declared output-format path redirected by
+an outgoing symlink is refused, and retained cross-platform file identity
+recognizes unsupported hardlink aliases before ordinary apply. Such alias
+refusal applies to the whole batch and to stronger configured ceremonies.
+The configured canonical path's confined destination is also resolved, so
+composed chains, direct destination requests, destination hardlinks, and
+creation of a dangling link's destination cannot bypass routing. Resolution
+uses retained directories and no-follow opens; parent components are evaluated
+after preceding directory links, not prematurely collapsed. Unknown, escaping,
+cyclic, or unrepresentable destinations fail closed. An unrelated ordinary
+file remains ordinary when its disjoint destination can be established, even
+if the configured canonical path is symlinked or broken.
+Unrelated hardlinked files remain ordinary writes; writing the canonical
+output-format path still stages, and its eventual atomic replacement does not
+write through another hardlink. Auto requires an applicable `parse/json` probe
+and every applicable configured probe freshly `passed`; absent, failed,
+unscored, erroneous, or unavailable evidence refuses admission/replay.
+`size-delta` alone is not a regression gate. Other proposal paths keep
+advisory probe behavior.
+
+The private versioned `autoRegressionEvidence` commitment binds exact
+before/after and region evidence, identity binding presence/value, the full
+typed Ward policy, and deterministic probe configuration/results. It is
+anchored in the existing `proposal_submitted.detail`, not a new audit store.
+Deadline and restart replay rerun probes against the committed images and
+require current filesystem agreement. Valid-but-different evidence rejects,
+as do old automatic envelopes missing the commitment. Final conditional
+image/authority checks still guard commit. Interrupted applying recovery
+retains its existing proof requirements and quarantines unavailable authority;
+it never treats post-apply bytes as a new regression baseline.
 
 ## Principal decisions
 

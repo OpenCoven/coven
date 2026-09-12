@@ -125,6 +125,7 @@ pub(crate) struct StagedCoherenceProposal {
     pub pending_path: PathBuf,
     pub proposal_id: String,
     pub scheduled: Option<crate::proposal_scheduler::ScheduledProposal>,
+    pub auto_regression_evidence: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1134,6 +1135,7 @@ pub(crate) fn stage_coherence_proposal(
                 pending_path,
                 proposal_id,
                 scheduled: None,
+                auto_regression_evidence: None,
             }
         }
     };
@@ -1154,6 +1156,7 @@ pub(crate) fn stage_coherence_proposal(
                 "classification": scheduled.classification(),
                 "veto_deadline": scheduled.veto_deadline(),
                 "earliest_close": scheduled.earliest_close(),
+                "autoRegressionEvidence": staging.auto_regression_evidence,
             }))
         })
         .transpose()?;
@@ -1168,7 +1171,14 @@ pub(crate) fn stage_coherence_proposal(
             staging.proposal_id.as_str(),
             familiar_id,
             state.weave.weave_hash(),
-            i64::from(u8::from(ward::Tier::Reviewed)),
+            i64::from(
+                staging
+                    .scheduled
+                    .as_ref()
+                    .map_or(u8::from(ward::Tier::Reviewed), |scheduled| scheduled
+                        .classification()
+                        .path_tier_floor,)
+            ),
             if staging.scheduled.is_some() {
                 "staged:scheduled"
             } else {
@@ -1324,6 +1334,18 @@ fn stage_scheduled_coherence_proposal(
     let mut budget = ward::validate_file_edit_budget(edits)?;
     let identity_evidence = staging_identity_evidence(coven_home, edits, &probe_context)?;
     let diff = materialize_diff(probe_context.workspace, edits, &mut budget)?;
+    if diff.surfaces().iter().any(|surface| {
+        ward::portable_surface_key(surface.surface.as_str())
+            == ward::portable_surface_key(threads::OutputFormatRegion::SURFACE)
+    }) {
+        crate::output_format_auto::validate_opt_in(probe_context.config, &diff).map_err(
+            |error| {
+                scheduled_publication_error(ScheduledPublicationFailure::InvalidClassification {
+                    reason: error.to_string(),
+                })
+            },
+        )?;
+    }
     let region_evidence = threads::SurfaceRegionRegistry::default_registry().classify_all(&diff);
     if region_evidence.is_empty() {
         return Err(scheduled_publication_error(
@@ -1391,13 +1413,41 @@ fn stage_scheduled_coherence_proposal(
                     reason: error.to_string(),
                 })
             })?;
-    let probes = crate::ward_probes::run_at_staging(
-        probe_context.workspace,
-        probe_context.config,
-        edits,
-        probe_context.authorization,
-    )
-    .context("running deterministic Ward probes")?;
+    let (auto_regression_evidence, probes) = if matches!(
+        scheduled.classification().approval_path,
+        threads::ApprovalPath::AutoRegression { .. }
+    ) {
+        let (evidence, reports) = crate::output_format_auto::regression_evidence(
+            probe_context.config,
+            scheduled.materialized_diff(),
+            &scheduled.classification().evidence_replay_hash,
+            identity_evidence,
+        )
+        .map_err(|error| {
+            scheduled_publication_error(ScheduledPublicationFailure::InvalidClassification {
+                reason: error.to_string(),
+            })
+        })?;
+        for surface in scheduled.materialized_diff().surfaces() {
+            anyhow::ensure!(
+                read_surface_if_exists(probe_context.workspace, surface.surface.as_str())?
+                    == surface.before,
+                "output-format before image changed during intake"
+            );
+        }
+        (Some(evidence), reports)
+    } else {
+        (
+            None,
+            crate::ward_probes::run_at_staging(
+                probe_context.workspace,
+                probe_context.config,
+                edits,
+                probe_context.authorization,
+            )
+            .context("running deterministic Ward probes")?,
+        )
+    };
 
     let pending_dir = coven_home.join("pending");
     std::fs::create_dir_all(&pending_dir)
@@ -1410,11 +1460,17 @@ fn stage_scheduled_coherence_proposal(
             scheduled: &'a crate::proposal_scheduler::ScheduledProposal,
             #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
             identity_evidence: Option<[u8; 32]>,
+            #[serde(
+                rename = "autoRegressionEvidence",
+                skip_serializing_if = "Option::is_none"
+            )]
+            auto_regression_evidence: Option<[u8; 32]>,
             probes: &'a [crate::ward_probes::SurfaceProbeReport],
         }
         serde_json::to_vec_pretty(&StagedScheduledProposalFile {
             scheduled: &scheduled,
             identity_evidence,
+            auto_regression_evidence,
             probes: &probes,
         })
         .context("serializing scheduled proposal")?
@@ -1425,6 +1481,7 @@ fn stage_scheduled_coherence_proposal(
         pending_path: path,
         proposal_id: scheduled.pending().id.0.to_string(),
         scheduled: Some(scheduled),
+        auto_regression_evidence,
     })
 }
 

@@ -32,6 +32,11 @@ mod final_commit_cases {
     include!("support/threads_final_commit_cases.rs");
 }
 
+#[cfg(feature = "threads-test-clock")]
+mod output_auto_cases {
+    include!("support/threads_output_auto_cases.rs");
+}
+
 #[test]
 fn smoke_bounded_ward_apply_over_real_daemon() -> Result<()> {
     run_journey("smoke-bounded-ward-apply", |fixture| {
