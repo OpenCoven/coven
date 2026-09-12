@@ -20,6 +20,13 @@ This target runs the actual daemon. Its historical-window fixtures seed audit
 state only while the daemon is stopped. They exercise recovery, not a supported
 scheduled-proposal publication route.
 
+On Windows, the fixture owns a foreground `coven daemon serve` child and waits
+for authenticated health under a bounded startup guard. It uses the real
+`daemon stop` command and replaces the process before checking restart recovery.
+This covers server authority and durable recovery, not the separate two-second
+CLI launcher or atomic `daemon restart` contract. Dedicated lifecycle tests
+retain those contracts. Unix journeys continue to use the normal launcher.
+
 ## Terminal evidence
 
 The central decision audit writer rejects duplicate terminal rows. It also

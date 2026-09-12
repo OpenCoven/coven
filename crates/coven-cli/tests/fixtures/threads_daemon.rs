@@ -20,8 +20,8 @@ const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn run_journey(journey: impl FnOnce(&mut ThreadsFixture) -> Result<()>) -> Result<()> {
     // These are authority journeys, not concurrent cold-start throughput tests.
-    // Keep native Windows process admission within its strict lifecycle budget,
-    // as in windows_daemon_lifecycle; transport-only tests remain concurrent.
+    // Keep native Windows process admission isolated, as in
+    // windows_daemon_lifecycle; transport-only tests remain concurrent.
     #[cfg(windows)]
     let _admission = {
         static ADMISSION: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -54,6 +54,8 @@ pub struct ThreadsFixture {
     pub workspace: PathBuf,
     daemon_pid: Option<u32>,
     stopped: bool,
+    #[cfg(windows)]
+    owned_daemon: Option<std::process::Child>,
 }
 
 impl ThreadsFixture {
@@ -103,6 +105,8 @@ forbidden = ["(?i)ignore previous"]
             workspace,
             daemon_pid: None,
             stopped: true,
+            #[cfg(windows)]
+            owned_daemon: None,
         };
         fixture.start_daemon()?;
         Ok(fixture)
@@ -110,10 +114,125 @@ forbidden = ["(?i)ignore previous"]
 
     pub fn start_daemon(&mut self) -> Result<()> {
         anyhow::ensure!(self.stopped, "fixture daemon must be stopped before start");
-        self.stopped = false;
-        self.daemon_command("start")?;
-        self.wait_for_health()?;
+        #[cfg(windows)]
+        {
+            self.start_owned_windows_daemon()?;
+        }
+        #[cfg(unix)]
+        {
+            self.stopped = false;
+            self.daemon_command("start")?;
+            self.wait_for_health()?;
+        }
         self.daemon_pid = Some(self.read_daemon_pid()?);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn start_owned_windows_daemon(&mut self) -> Result<()> {
+        let stdout = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.coven_home.join("fixture-serve.stdout.log"))?;
+        let stderr = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.coven_home.join("fixture-serve.stderr.log"))?;
+        // Exercise the real server, not the separate two-second launcher SLA.
+        let child = self
+            .daemon_command_builder("serve")
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()?;
+        let pid = child.id();
+        self.owned_daemon = Some(child);
+        self.daemon_pid = Some(pid);
+        self.stopped = false;
+        self.wait_for_owned_windows_health(pid).with_context(|| {
+            format!(
+                "foreground fixture daemon {pid} failed readiness; stdout: {:?}; stderr: {:?}",
+                fs::read_to_string(self.coven_home.join("fixture-serve.stdout.log")),
+                fs::read_to_string(self.coven_home.join("fixture-serve.stderr.log")),
+            )
+        })
+    }
+
+    #[cfg(windows)]
+    fn wait_for_owned_windows_health(&mut self, pid: u32) -> Result<()> {
+        let started = Instant::now();
+        let deadline = started + LIFECYCLE_TIMEOUT;
+        let pipe = coven_client::owner_only_windows_pipe_name(&self.coven_home)?;
+        let mut last_pending = None;
+        loop {
+            let child = self
+                .owned_daemon
+                .as_mut()
+                .context("owned fixture process")?;
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("fixture daemon exited before readiness: {status}");
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "fixture daemon did not become healthy after {:?}: {last_pending:?}",
+                started.elapsed(),
+            );
+            let probe_deadline = deadline.min(Instant::now() + Duration::from_millis(250));
+            match coven_client::probe_windows_daemon_health_with_identity_until(
+                &pipe,
+                probe_deadline,
+            ) {
+                Ok(Some(probe)) => {
+                    let body: Value = serde_json::from_slice(&probe.body)?;
+                    anyhow::ensure!(
+                        probe.status == 200 && body["ok"] == true,
+                        "fixture daemon returned invalid health: HTTP {} {body}",
+                        probe.status,
+                    );
+                    anyhow::ensure!(
+                        probe.server_pid == pid
+                            && body["daemon"]["pid"] == pid
+                            && body["daemon"]["socket"] == pipe,
+                        "fixture health did not identify its owned process and pipe: {body}",
+                    );
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "fixture daemon readiness exceeded its deadline after {:?}",
+                        started.elapsed(),
+                    );
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) if is_pending_windows_startup_error(&error) => {
+                    last_pending = Some(error.to_string());
+                }
+                Err(error) => return Err(error.into()),
+            }
+            thread::sleep(
+                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn reap_owned_daemon(&mut self, terminate: bool) -> Result<()> {
+        let Some(child) = self.owned_daemon.as_mut() else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_none() && terminate {
+            child.kill()?;
+        }
+        let started = Instant::now();
+        while child.try_wait()?.is_none() {
+            anyhow::ensure!(
+                started.elapsed() < LIFECYCLE_TIMEOUT,
+                "owned fixture daemon {} was not reaped after {:?}",
+                child.id(),
+                started.elapsed(),
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        self.owned_daemon = None;
         Ok(())
     }
 
@@ -182,8 +301,7 @@ forbidden = ["(?i)ignore previous"]
         .map_err(Into::into)
     }
 
-    fn daemon_command(&self, operation: &str) -> Result<Output> {
-        let started = Instant::now();
+    fn daemon_command_builder(&self, operation: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_coven"));
         command.env_clear();
         // Keep only OS launch necessities, not developer credentials or test controls.
@@ -192,7 +310,7 @@ forbidden = ["(?i)ignore previous"]
                 command.env(key, value);
             }
         }
-        let output = command
+        command
             .args(["daemon", operation])
             .current_dir(&self.workspace)
             .env("COVEN_HOME", &self.coven_home)
@@ -203,8 +321,13 @@ forbidden = ["(?i)ignore previous"]
             .env("XDG_CACHE_HOME", self._temp.path().join("cache"))
             .env("TMPDIR", self._temp.path())
             .env("TEMP", self._temp.path())
-            .env("TMP", self._temp.path())
-            .output()?;
+            .env("TMP", self._temp.path());
+        command
+    }
+
+    fn daemon_command(&self, operation: &str) -> Result<Output> {
+        let started = Instant::now();
+        let output = self.daemon_command_builder(operation).output()?;
         anyhow::ensure!(
             output.status.success(),
             "daemon {operation} failed after {:?}\nstdout:\n{}\nstderr:\n{}\n\
@@ -233,6 +356,7 @@ forbidden = ["(?i)ignore previous"]
             .or_else(|| self.read_daemon_pid().ok().filter(|pid| pid_is_alive(*pid)))
     }
 
+    #[cfg(unix)]
     fn wait_for_health(&self) -> Result<()> {
         let started = Instant::now();
         loop {
@@ -258,6 +382,8 @@ forbidden = ["(?i)ignore previous"]
         }
         let pid = self.current_daemon_pid();
         self.daemon_command("stop")?;
+        #[cfg(windows)]
+        self.reap_owned_daemon(false)?;
         let started = Instant::now();
         while pid.is_some_and(pid_is_alive)
             || self.coven_home.join("daemon.json").exists()
@@ -279,8 +405,16 @@ forbidden = ["(?i)ignore previous"]
         let before = self
             .current_daemon_pid()
             .context("restart requires a live daemon")?;
-        self.daemon_command("restart")?;
-        self.wait_for_health()?;
+        #[cfg(windows)]
+        {
+            self.stop_daemon()?;
+            self.start_daemon()?;
+        }
+        #[cfg(unix)]
+        {
+            self.daemon_command("restart")?;
+            self.wait_for_health()?;
+        }
         let after = self.read_daemon_pid()?;
         self.daemon_pid = Some(after);
         anyhow::ensure!(
@@ -304,12 +438,30 @@ impl Drop for ThreadsFixture {
         if let Err(error) = self.stop_daemon() {
             eprintln!("threads fixture graceful shutdown failed: {error:#}");
         }
+        #[cfg(windows)]
+        if self.owned_daemon.is_some() {
+            if let Err(error) = self.reap_owned_daemon(true) {
+                eprintln!("failed terminating owned fixture daemon: {error:#}");
+            }
+            return;
+        }
         if let Some(pid) = pid.filter(|pid| pid_is_alive(*pid)) {
             eprintln!("threads fixture fallback terminating its daemon pid {pid}");
             if let Err(error) = self.terminate_daemon_process(pid) {
                 eprintln!("failed terminating fixture daemon pid {pid}: {error:#}");
             }
         }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_pending_windows_startup_error(error: &coven_client::ClientError) -> bool {
+    match error {
+        coven_client::ClientError::Io { source, .. } => source.kind() == io::ErrorKind::TimedOut,
+        coven_client::ClientError::InvalidHttpResponse(message) => {
+            message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE
+        }
+        _ => false,
     }
 }
 
@@ -548,6 +700,29 @@ fn windows_pipe_connected(stream: &WindowsPipe) -> io::Result<()> {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    #[test]
+    fn startup_wait_retries_only_pending_transport_not_identity_or_protocol_errors() {
+        use coven_client::ClientError;
+        assert!(is_pending_windows_startup_error(&ClientError::Io {
+            operation: coven_client::WINDOWS_CONNECT_OPERATION,
+            source: io::ErrorKind::TimedOut.into(),
+        }));
+        assert!(is_pending_windows_startup_error(
+            &ClientError::InvalidHttpResponse(coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE.into())
+        ));
+        for error in [
+            ClientError::DaemonInstanceChanged,
+            ClientError::Discovery("wrong owner".into()),
+            ClientError::InvalidHttpResponse("partial response timed out".into()),
+            ClientError::Io {
+                operation: coven_client::WINDOWS_CONNECT_OPERATION,
+                source: io::ErrorKind::PermissionDenied.into(),
+            },
+        ] {
+            assert!(!is_pending_windows_startup_error(&error), "{error}");
+        }
+    }
     use std::collections::VecDeque;
 
     struct ScriptedStream(VecDeque<&'static [u8]>);
