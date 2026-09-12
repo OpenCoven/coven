@@ -61,16 +61,26 @@ The non-UTF-8 destination case is Linux-only because macOS rejects that fixture
 filename before a daemon request can execute.
 
 ```sh
-COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE=1 \
-  cargo test --locked -p coven-cli --test threads_e2e \
+cargo test --locked -p coven-cli --test threads_e2e \
   --features threads-test-clock output_auto -- --nocapture
 ```
 
-This route requires the matching Threads checkout with `OutputFormatRegion`;
-until that core is published and pinned, use the ephemeral local override
-described below. The fixture does not reinterpret legacy migration as tier-2
+The daemon pins the matching published core with `OutputFormatRegion`. To
+observe a different current Threads checkout, use the ephemeral local override
+described below and require `COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE=1`.
+The fixture does not reinterpret legacy migration as tier-2
 authorization. Native platform execution is required separately; compilation
 and macOS results do not establish Windows acceptance.
+
+Four additional identity-replay cases each exercise a live deadline and a
+restart: changed `IDENTITY.md` bytes, changed `SOUL.md` bytes, changed roster
+metadata, and a strengthened but still-satisfied active purpose predicate.
+They use supported scheduled intake, not injected proposal envelopes. The
+original proposal must have one `EvidenceDiverged` close when deadline replay
+is exercised, without applying; its submission/opening/terminal chain must survive
+another restart unchanged. A fresh proposal under the changed authority must
+then apply successfully, distinguishing valid evidence drift from a failed
+identity predicate.
 
 These tests use owner-local IPC, the strongest current supported authorization
 path. A supplied fingerprint does not grant protected-write authority. The
@@ -78,25 +88,67 @@ suite does not certify a signed principal-authorization profile, changed runtime
 bindings, every commit/recovery interleaving, or Cave acceptance. It is bounded
 process-boundary evidence, not complete closure of every assertion in
 [OpenCoven/coven#884](https://github.com/OpenCoven/coven/issues/884).
+Passing scheduled-intake journeys does not close the separately coordinated
+production scheduled-publication work in
+[OpenCoven/coven#888](https://github.com/OpenCoven/coven/issues/888).
 
 The clock feature is disabled in production builds. It uses a capability-gated
 fixture in each disposable home and explicit real-scheduler ticks, not sleeps
 or a mock scheduler. See [Threads test clock](../design/threads-test-clock.md).
 Without the feature, Cargo runs only the smaller smoke/lifecycle subset. CI
 executes the feature-enabled target on Linux, Windows, and the existing macOS
-push lane. All platforms run the same 15 daemon journeys through `coven-client`
+push lane. All platforms run the same feature-enabled journeys through `coven-client`
 discovery and authenticated transport; Windows uses the owner-only named pipe.
-Three additional artifact regressions exercise startup-evidence retention;
-they are not extra daemon journeys.
-Two further regressions cover artifact-root isolation and the local default.
+Additional regressions cover startup-evidence retention, artifact-root
+isolation, launch selection, readiness, owned replacement/crash/reaping,
+failed-child output, failed-request response pairing, and failed-restart CLI
+evidence. These are not extra authority journeys or native Windows execution
+evidence.
 HTTP framing regressions belong to the shared client's tests, not a separate
 harness parser. A cross-target compilation or Windows workspace run alone is
 not evidence that these journeys executed on Windows.
 
-Lifecycle commands still use the production CLI and its existing deadlines.
-Windows crash injection binds the process handle to the authenticated pipe
-server PID and creation time before termination. Requests are never retried
-automatically; a response timeout does not prove a mutation did not commit.
+Windows authority journeys serialize admission and retain an owned
+`coven daemon serve` child, using the same native helper as the smaller Threads
+fixtures. Their fixed 15-second readiness budget is a fixture hang guard for
+cold-store initialization, independent of production CLI lifecycle deadlines.
+Only pending transport observations are polled; invalid health, changed
+identity, and child-exit/inspection errors fail admission immediately. Readiness
+requires the authenticated pipe server PID, health PID, and owner-local pipe to
+match the owned child. The child is reaped on shutdown, crash, or setup failure,
+even if it never published status.
+
+Owned fixture restart means checked CLI stop followed by a new owned
+`daemon serve`; provenance records those operations, not `daemon restart`.
+Unix authority journeys default to the CLI launch path. The dedicated same-home
+CLI lifecycle journey and failed-restart artifact regression explicitly select
+CLI mode on every platform; the native `windows_daemon_lifecycle` deadline
+tests also remain separate. Explicit foreground regressions exercise owned
+replacement, crash/reaping, and bad-store child-exit/output evidence on both
+Unix and Windows.
+
+Both fixtures use `fixtures/threads_admission.rs` for owned child lifecycle and
+the fixed readiness budget. Unix owned admission uses the client's bounded,
+authenticated lifecycle health probe, then checks the returned PID and socket
+against the owned child and expected endpoint. Windows retains its authenticated
+pipe server PID plus exact health PID/socket checks.
+Unix lifecycle health compares the canonical profile directory and socket
+basename, then checks non-symlink socket metadata against the authenticated
+endpoint's device/inode. This supports retained private staging hard links
+without accepting another reported socket name for the same inode.
+Owned crash injection terminates the retained child handle. The shared
+admission regressions inject time, pending probes, and child/health identity;
+they do not use wall-clock sleeps as authority evidence. Requests are never
+retried automatically; a response timeout does not prove a mutation did not
+commit.
+
+The shared `admission_rejects_unowned_or_invalid_health_without_retry` regression
+subsumes the foreground process/endpoint/health matching cases and additionally
+rejects an incorrect authenticated Windows server PID and malformed JSON.
+`startup_wait_retries_only_pending_transport_not_identity_or_protocol_errors`
+subsumes the foreground pending-transport cases, including Unix-only
+not-found/connection-refused observations. Those errors are not retryable on
+Windows; identity, permission, and partial-response failures remain terminal.
 
 ## Testing a local Threads checkout
 
@@ -151,13 +203,39 @@ test log, and early setup failures can still lack revision metadata.
 On failure, the same directory also contains the synthetic request and
 response, daemon recovery log, Ward audit rows, hashed pending/workspace
 inventories, SQLite schema, and a bounded, sanitized status snapshot. Startup
-failures retain the failed CLI event and available fixture evidence before
+failures retain the failed CLI or owned-serve event and available fixture evidence before
 cleanup; fallback markers do not overwrite captured files. A capture error in
 one state source is reported without discarding the others.
+Owned-serve stdout/stderr and observed child exit status are included in the
+sanitized evidence, including admission failures before status publication.
+After fatal readiness failure, the fixture observes the owned child for up to
+250 ms, then requests termination if it remains alive. Observation and reaping
+share one absolute 15-second teardown budget, including fallback cleanup; no
+fatal health request is retried. Exit evidence is finalized before an owned
+start/restart returns failure or startup failure artifacts are written, so child
+output and status do not depend on a later destructor. The original readiness error remains the primary error-chain
+cause, with any finalization failure attached as additional context.
+
+Each owned lifecycle event's `owned_child_exit` records the observed status,
+optional numeric code, and `origin`: `observed_exit` means the fixture had not
+requested termination; `fixture_termination_requested` records an attempt,
+not a claim that the request caused the exit. This distinguishes startup exit
+from fixture cleanup even when termination races with natural exit.
+Failed restart commands retain their exit status and CLI output even before a
+health probe can run. A request that fails before a JSON response is captured
+records a null response, never a response from an earlier request.
+
+Successful valid-identity-drift scenarios also retain
+`identity-replay-proof.json`: original and fresh intake documents, queried
+submission/opening/terminal audit projections, and the stale proposal's
+zero-apply observation before the positive control. These packets supplement
+the scenario manifest; they do not replace its source/override provenance.
 
 For a constructed fixture, `manifest.json` includes exact Coven and Threads
 revisions and `local_threads_override_active`, even if daemon startup fails;
-earlier failures can record those fields as null. Windows readiness errors
+earlier failures can record those fields as null. Its `daemon_launch` field
+distinguishes `owned_foreground` from `detached_cli`; foreground success is not
+evidence of meeting the CLI startup deadline. Windows CLI readiness errors
 include a bounded last-probe category and observation of the retained child
 handle, without changing the startup deadline or identity checks.
 The existing recovery log also records fixed-category remaining-budget samples

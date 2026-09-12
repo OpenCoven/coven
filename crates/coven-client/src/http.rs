@@ -228,39 +228,7 @@ impl DaemonClient {
 }
 
 fn validate_raw_request(method: &str, path: &str) -> Result<(), ClientError> {
-    if method.is_empty()
-        || !method.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
-    {
-        return Err(ClientError::InvalidRouteParameter("HTTP method"));
-    }
-    if !(path.starts_with("/api/v1/") || (method == "GET" && path == "/health"))
-        || !path.is_ascii()
-        || path
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'#')
-    {
-        return Err(ClientError::InvalidRouteParameter("HTTP request target"));
-    }
-    Ok(())
+    transport::validate_request_line(method, path)
 }
 
 fn daemon_error(status: u16, body: Vec<u8>) -> Result<ClientError, ClientError> {
@@ -411,7 +379,7 @@ fn validate_session_request_target_data(value: &str) -> Result<(), ClientError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{read_path, write_path, RESERVED_SESSION_DETAIL_ROUTE_ERROR};
+    use super::{read_path, validate_raw_request, write_path, RESERVED_SESSION_DETAIL_ROUTE_ERROR};
     use crate::models::{ReadEndpoint, WriteEndpoint};
     use crate::ClientError;
 
@@ -513,6 +481,26 @@ mod tests {
             assert!(
                 matches!(error, ClientError::InvalidRouteParameter(_)),
                 "unexpected error for {cursor:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_requests_reject_non_origin_form_targets_before_io() {
+        for path in [
+            "http://evil.example/api/v1/health",
+            "https://evil.example/api/v1/sessions",
+            "//evil.example/api/v1/health",
+            "//evil.example/health",
+        ] {
+            let error =
+                validate_raw_request("GET", path).expect_err("non-origin-form target was accepted");
+            assert!(
+                matches!(
+                    error,
+                    ClientError::InvalidRouteParameter("HTTP request target")
+                ),
+                "unexpected error for {path:?}: {error}"
             );
         }
     }
