@@ -3,7 +3,7 @@ pub(super) const BEFORE: &str =
 pub(super) const AFTER: &str =
     r#"{"schema":"coven.output-format/v1","indent":4,"final_newline":false}"#;
 
-pub(super) fn stage_supported_output_auto(home: &Path) -> Result<(PathBuf, String)> {
+fn seed_supported_output_auto(home: &Path) -> Result<PathBuf> {
     let workspace = seed_warded_familiar(home)?;
     let config = std::fs::read_to_string(workspace.join("ward.toml"))?;
     std::fs::write(
@@ -16,6 +16,11 @@ pub(super) fn stage_supported_output_auto(home: &Path) -> Result<(PathBuf, Strin
         ),
     )?;
     std::fs::write(workspace.join("output-format.json"), BEFORE)?;
+    Ok(workspace)
+}
+
+pub(super) fn stage_supported_output_auto(home: &Path) -> Result<(PathBuf, String)> {
+    seed_supported_output_auto(home)?;
     let response = post_edits(
         home,
         &json!({"edits":[{"target":"output-format.json","contents":AFTER}]}).to_string(),
@@ -30,6 +35,366 @@ pub(super) fn stage_supported_output_auto(home: &Path) -> Result<(PathBuf, Strin
         PathBuf::from(response["pendingPath"].as_str().context("pending path")?),
         response["proposalId"].as_str().context("id")?.to_string(),
     ))
+}
+
+thread_local! {
+    static ORDINARY_ADMISSION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn run_ordinary_admission_hook() {
+    let hook = ORDINARY_ADMISSION_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_admission_retarget_before_apply_refuses_whole_batch() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir()?;
+    let home = temp.path();
+    let workspace = seed_supported_output_auto(home)?;
+    std::fs::write(workspace.join("notes.json"), BEFORE)?;
+    std::fs::write(workspace.join("other.json"), "ordinary before")?;
+    symlink("notes.json", workspace.join("alias.json"))?;
+    let (admitted_tx, admitted_rx) = mpsc::channel();
+    let (retargeted_tx, retargeted_rx) = mpsc::channel();
+    // A generous hang guard bounds a broken fixture; channel ordering proves the race.
+    let guard = Duration::from_secs(60);
+    ORDINARY_ADMISSION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            admitted_tx.send(()).expect("admission observer stopped");
+            retargeted_rx
+                .recv_timeout(guard)
+                .expect("retarget worker did not release admission");
+        }));
+    });
+    let response = std::thread::scope(|scope| {
+        let changed_workspace = &workspace;
+        let worker = scope.spawn(move || {
+            admitted_rx
+                .recv_timeout(guard)
+                .context("ordinary admission hook was not reached")?;
+            let result = (|| -> Result<()> {
+                std::fs::remove_file(changed_workspace.join("alias.json"))?;
+                symlink("output-format.json", changed_workspace.join("alias.json"))?;
+                Ok(())
+            })();
+            retargeted_tx.send(()).context("admission request stopped")?;
+            result
+        });
+        let response = post_edits(
+            home,
+            &json!({"edits":[
+                {"target":"other.json","contents":"ordinary after"},
+                {"target":"alias.json","contents":"not an output-format document"}
+            ]})
+            .to_string(),
+        );
+        ORDINARY_ADMISSION_HOOK.with(|hook| hook.borrow_mut().take());
+        worker.join().expect("retarget worker panicked")?;
+        response
+    })?;
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("output-format.json"))?,
+        BEFORE,
+        "ordinary admission must not directly write the retargeted configured surface: {}",
+        response.body
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("other.json"))?,
+        "ordinary before",
+        "changed admission must refuse the entire batch"
+    );
+    assert_eq!(std::fs::read_to_string(workspace.join("notes.json"))?, BEFORE);
+    assert!(response.status >= 400, "{}", response.body);
+    let conn = store::open_store(&home.join("coven.sqlite3"))?;
+    let writes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ward_audit WHERE event_type IN ('edit_applied', 'proposal_submitted')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(writes, 0);
+    Ok(())
+}
+
+#[test]
+fn ordinary_admission_changes_through_commit_refuse_whole_batch() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    for phase in ["admission", "first-commit", "second-commit"] {
+        for change in [
+            #[cfg(unix)]
+            "alias",
+            "same-bytes-inode",
+            "target-hardlink",
+            "parent",
+            #[cfg(unix)]
+            "parent-symlink",
+            #[cfg(unix)]
+            "canonical-symlink",
+            "canonical-hardlink",
+        ] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_supported_output_auto(home)?;
+            std::fs::create_dir(workspace.join("ordinary"))?;
+            std::fs::write(workspace.join("ordinary/notes.json"), BEFORE)?;
+            std::fs::write(workspace.join("other.json"), "ordinary before")?;
+            #[cfg(unix)]
+            let target = {
+                symlink("ordinary/notes.json", workspace.join("alias.json"))?;
+                "alias.json"
+            };
+            #[cfg(not(unix))]
+            let target = "ordinary/notes.json";
+            let changed_workspace = workspace.clone();
+            let mutate = move || {
+                let workspace = changed_workspace;
+                match change {
+                    #[cfg(unix)]
+                    "alias" => {
+                        std::fs::remove_file(workspace.join("alias.json")).unwrap();
+                        symlink("output-format.json", workspace.join("alias.json")).unwrap();
+                    }
+                    "same-bytes-inode" => {
+                        std::fs::rename(
+                            workspace.join("ordinary/notes.json"),
+                            workspace.join("original.json"),
+                        )
+                        .unwrap();
+                        std::fs::write(workspace.join("ordinary/notes.json"), BEFORE).unwrap();
+                    }
+                    "target-hardlink" => {
+                        std::fs::remove_file(workspace.join("ordinary/notes.json")).unwrap();
+                        std::fs::hard_link(
+                            workspace.join("output-format.json"),
+                            workspace.join("ordinary/notes.json"),
+                        )
+                        .unwrap();
+                    }
+                    "parent" => {
+                        std::fs::rename(workspace.join("ordinary"), workspace.join("moved"))
+                            .unwrap();
+                        std::fs::create_dir(workspace.join("ordinary")).unwrap();
+                        // Keep the leaf inode unchanged: the ancestor identity must matter.
+                        std::fs::hard_link(
+                            workspace.join("moved/notes.json"),
+                            workspace.join("ordinary/notes.json"),
+                        )
+                        .unwrap();
+                    }
+                    #[cfg(unix)]
+                    "parent-symlink" => {
+                        std::fs::rename(workspace.join("ordinary"), workspace.join("moved"))
+                            .unwrap();
+                        symlink("moved", workspace.join("ordinary")).unwrap();
+                    }
+                    #[cfg(unix)]
+                    "canonical-symlink" => {
+                        std::fs::remove_file(workspace.join("output-format.json")).unwrap();
+                        symlink("ordinary/notes.json", workspace.join("output-format.json"))
+                            .unwrap();
+                    }
+                    "canonical-hardlink" => {
+                        std::fs::remove_file(workspace.join("output-format.json")).unwrap();
+                        std::fs::hard_link(
+                            workspace.join("ordinary/notes.json"),
+                            workspace.join("output-format.json"),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            match phase {
+                "admission" => ORDINARY_ADMISSION_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(mutate));
+                }),
+                "first-commit" => ward::set_direct_commit_hook("other.json", mutate),
+                "second-commit" => ward::set_direct_commit_hook(target, mutate),
+                _ => unreachable!(),
+            }
+            let response = post_edits(
+                home,
+                &json!({"edits":[
+                    {"target":"other.json","contents":"ordinary after"},
+                    {"target":target,"contents":AFTER}
+                ]})
+                .to_string(),
+            )?;
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("output-format.json"))?,
+                BEFORE,
+                "{phase}/{change}: {}",
+                response.body
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("other.json"))?,
+                "ordinary before",
+                "{phase}/{change}: entire batch must be refused or rolled back"
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("ordinary/notes.json"))?,
+                BEFORE,
+                "{phase}/{change}: admitted destination must not be changed"
+            );
+            if workspace.join("moved").exists() {
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("moved/notes.json"))?,
+                    BEFORE,
+                    "{phase}/{change}: detached parent must not retain a write"
+                );
+            }
+            assert!(response.status >= 400, "{phase}/{change}: {}", response.body);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_admission_restored_alias_cannot_redirect_the_consumed_outcome() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let home = temp.path();
+    let workspace = seed_supported_output_auto(home)?;
+    std::fs::remove_file(workspace.join("output-format.json"))?;
+    std::fs::create_dir(workspace.join("ordinary"))?;
+    symlink("ordinary", workspace.join("redirect"))?;
+
+    let changed_workspace = workspace.clone();
+    ORDINARY_ADMISSION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::remove_file(changed_workspace.join("redirect")).unwrap();
+            symlink(".", changed_workspace.join("redirect")).unwrap();
+        }));
+    });
+    let restored_workspace = workspace.clone();
+    ward::set_direct_evaluation_hook(move || {
+        std::fs::remove_file(restored_workspace.join("redirect")).unwrap();
+        symlink("ordinary", restored_workspace.join("redirect")).unwrap();
+    });
+    let response = post_edits(
+        home,
+        &json!({"edits":[{
+            "target":"redirect/output-format.json",
+            "contents":"ordinary content, not an output-format document"
+        }]}).to_string(),
+    )?;
+
+    assert!(
+        !workspace.join("output-format.json").exists(),
+        "a different evaluated outcome escaped the restored admission: {}",
+        response.body
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("ordinary/output-format.json"))?,
+        "ordinary content, not an output-format document"
+    );
+    let body: Value = serde_json::from_str(&response.body)?;
+    assert_eq!(body["changes"][0]["resolved"], "ordinary/output-format.json");
+    Ok(())
+}
+
+#[test]
+fn ordinary_admission_stable_aliases_and_creates_still_apply() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    for alias_kind in [
+        "literal",
+        #[cfg(unix)]
+        "symlink",
+        #[cfg(unix)]
+        "parent-symlink",
+        "hardlink",
+        "create",
+    ] {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_supported_output_auto(home)?;
+        std::fs::create_dir(workspace.join("ordinary"))?;
+        std::fs::write(workspace.join("ordinary/notes.json"), BEFORE)?;
+        let target = match alias_kind {
+            "literal" => "ordinary/./notes.json",
+            #[cfg(unix)]
+            "symlink" => {
+                symlink("ordinary/notes.json", workspace.join("alias.json"))?;
+                "alias.json"
+            }
+            #[cfg(unix)]
+            "parent-symlink" => {
+                symlink("ordinary", workspace.join("alias"))?;
+                "alias/notes.json"
+            }
+            "hardlink" => {
+                std::fs::hard_link(
+                    workspace.join("ordinary/notes.json"),
+                    workspace.join("alias.json"),
+                )?;
+                "alias.json"
+            }
+            "create" => "new/parent/notes.json",
+            _ => unreachable!(),
+        };
+        let response = post_edits(
+            home,
+            &json!({"edits":[{"target":target,"contents":"ordinary after"}]}).to_string(),
+        )?;
+        assert_eq!(response.status, 200, "{alias_kind}: {}", response.body);
+        assert_eq!(std::fs::read_to_string(workspace.join(target))?, "ordinary after");
+        assert_eq!(std::fs::read_to_string(workspace.join("output-format.json"))?, BEFORE);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_admission_rollback_uses_admitted_destination_not_retargeted_alias() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let home = temp.path();
+    let workspace = seed_supported_output_auto(home)?;
+    std::fs::write(workspace.join("notes.json"), BEFORE)?;
+    std::fs::write(workspace.join("other.json"), "ordinary before")?;
+    symlink("notes.json", workspace.join("alias.json"))?;
+    let changed_workspace = workspace.clone();
+    ward::set_direct_commit_hook("other.json", move || {
+        assert_eq!(
+            std::fs::read_to_string(changed_workspace.join("notes.json")).unwrap(),
+            AFTER,
+            "the first edit must have committed before the routing refusal"
+        );
+        std::fs::remove_file(changed_workspace.join("alias.json")).unwrap();
+        symlink("output-format.json", changed_workspace.join("alias.json")).unwrap();
+    });
+    let response = post_edits(
+        home,
+        &json!({"edits":[
+            {"target":"alias.json","contents":AFTER},
+            {"target":"other.json","contents":"ordinary after"}
+        ]})
+        .to_string(),
+    )?;
+    assert!(response.status >= 400, "{}", response.body);
+    for target in ["notes.json", "output-format.json"] {
+        assert_eq!(std::fs::read_to_string(workspace.join(target))?, BEFORE);
+    }
+    assert_eq!(std::fs::read_to_string(workspace.join("other.json"))?, "ordinary before");
+    assert_eq!(std::fs::read_link(workspace.join("alias.json"))?, Path::new("output-format.json"));
+    let body: Value = serde_json::from_str(&response.body)?;
+    assert_eq!(body["error"]["details"]["writeApplied"], false);
+    Ok(())
 }
 
 #[test]

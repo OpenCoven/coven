@@ -5928,11 +5928,12 @@ fn apply_familiar_edits(
     // Resolve and classify every target before opening the store or publishing
     // a proposal. Tier-0 writes require a distinct daemon-owned authority
     // operation; client-supplied fingerprint text is not such authority.
-    let adjudication = ward.evaluate(&ward::Proposal {
+    let admission = ward.admit_direct(&ward::Proposal {
         targets: edits.iter().map(|e| e.target.clone()).collect(),
         authorization: authorization.clone(),
-    });
-    let protected_targets = protected_proposal_targets(&adjudication, &ward)?;
+    })?;
+    let adjudication = &admission.outcome;
+    let protected_targets = protected_proposal_targets(adjudication, &ward)?;
     if !protected_targets.is_empty() {
         let store_path = store_path(coven_home);
         let conn = store::open_store(&store_path)?;
@@ -5999,7 +6000,7 @@ fn apply_familiar_edits(
     // A proposal with any Blocked target (traversal/symlink escape or case
     // collision) is refused as a unit before any staging or write.
     if adjudication.is_blocked() {
-        let report = ward.apply(&edits, &authorization)?;
+        let report = ward.apply_admitted(&edits, &authorization, &admission, None)?;
         let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
         return api_error(
             403,
@@ -6178,8 +6179,22 @@ fn apply_familiar_edits(
         );
     }
 
+    #[cfg(test)]
+    tests::output_auto_cases::run_ordinary_admission_hook();
     let apply_now = crate::threads_clock::now(coven_home)?;
-    let (report, apply_cleanup_error) = match ward.apply(&edits, &authorization) {
+    let mut final_routing_check = || {
+        anyhow::ensure!(
+            !crate::output_format_auto::intercepts(&workspace, &config, &adjudication.decisions)?,
+            "ordinary apply admission changed to configured output-format routing"
+        );
+        Ok(())
+    };
+    let (report, apply_cleanup_error) = match ward.apply_admitted(
+        &edits,
+        &authorization,
+        &admission,
+        Some(&mut final_routing_check),
+    ) {
         Ok(report) => (report, None),
         Err(error) => {
             if let Some(limit) = ward::ward_edit_budget_failure(&error) {
@@ -14766,7 +14781,7 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    mod output_auto_cases {
+    pub(super) mod output_auto_cases {
         use super::*;
         include!("api_output_auto_tests.rs");
     }

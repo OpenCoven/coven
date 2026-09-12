@@ -838,6 +838,59 @@ pub struct Outcome {
     pub decisions: Vec<Decision>,
 }
 
+/// Gate-2 destinations and filesystem identities retained across API routing.
+pub(crate) struct DirectApplyAdmission {
+    pub(crate) outcome: Outcome,
+    home: AnchoredHome,
+    targets: BTreeMap<String, AdmittedDirectTarget>,
+}
+
+struct AdmittedDirectTarget {
+    parents: Vec<AnchoredParent>,
+    file: Option<std::fs::File>,
+}
+
+impl DirectApplyAdmission {
+    fn verify_routing(&self, ward: &Ward, proposal: &Proposal) -> Result<()> {
+        self.home.verify_path_unchanged()?;
+        if ward.evaluate_with_home(proposal, Some(&self.home.absolute)) != self.outcome {
+            bail!("ordinary apply admission changed Gate-2 routing; refusing the batch");
+        }
+        for target in self.targets.values() {
+            for parent in &target.parents {
+                if !directory_handle_matches_path(&parent.dir, &parent.absolute)? {
+                    bail!("ordinary apply admission parent identity changed; refusing the batch");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_target(
+        &self,
+        path: &AnchoredEntry,
+        target: &str,
+        before: Option<&OpenRegularFile>,
+    ) -> Result<()> {
+        let admitted = self
+            .targets
+            .get(target)
+            .context("missing ordinary admission identity")?;
+        let matches = match (admitted.file.as_ref(), before) {
+            (Some(file), Some(before)) => {
+                open_files_have_same_identity(file, &before.file)?
+                    && open_file_matches_path_if_present(file, path)?
+            }
+            (None, None) => open_regular_file_handle_without_following_links(path)?.is_none(),
+            _ => false,
+        };
+        if !matches {
+            bail!("ordinary apply admission file identity changed for `{target}`");
+        }
+        Ok(())
+    }
+}
+
 impl Outcome {
     /// Whether any target was blocked. A proposal is refused as a unit if any
     /// of its targets is refused.
@@ -1357,8 +1410,49 @@ pub struct Ward {
 }
 
 #[cfg(test)]
+struct DirectCommitHook {
+    target: String,
+    callback: Box<dyn FnOnce()>,
+}
+
+#[cfg(test)]
 thread_local! {
     static EVALUATE_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DIRECT_COMMIT_HOOK: std::cell::RefCell<Option<DirectCommitHook>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static DIRECT_EVALUATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn set_direct_evaluation_hook(callback: impl FnOnce() + 'static) {
+    DIRECT_EVALUATION_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_direct_commit_hook(target: &str, callback: impl FnOnce() + 'static) {
+    DIRECT_COMMIT_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(DirectCommitHook {
+            target: target.to_owned(),
+            callback: Box::new(callback),
+        });
+    });
+}
+
+#[cfg(test)]
+fn run_direct_commit_hook(target: &str) {
+    let callback = DIRECT_COMMIT_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if hook.as_ref().is_some_and(|armed| armed.target == target) {
+            hook.take().map(|armed| armed.callback)
+        } else {
+            None
+        }
+    });
+    if let Some(callback) = callback {
+        callback();
+    }
 }
 
 #[cfg(test)]
@@ -1424,6 +1518,67 @@ impl Ward {
     /// (authorization) for each target.
     pub fn evaluate(&self, proposal: &Proposal) -> Outcome {
         self.evaluate_with_home(proposal, None)
+    }
+
+    pub(crate) fn admit_direct(&self, proposal: &Proposal) -> Result<DirectApplyAdmission> {
+        let home = AnchoredHome::open(&self.home)?;
+        let outcome = self.evaluate_with_home(proposal, Some(&home.absolute));
+        let mut targets = BTreeMap::new();
+        if outcome
+            .decisions
+            .iter()
+            .all(|decision| matches!(decision.verdict, Verdict::Allow | Verdict::AllowWithLog))
+        {
+            for decision in &outcome.decisions {
+                let relative = lexical_join(Path::new(""), &decision.resolved)
+                    .context("ordinary admission requires a confined destination")?;
+                let mut directory = Arc::clone(&home.dir);
+                let mut absolute = home.absolute.clone();
+                let mut parents = Vec::new();
+                let mut parent_exists = true;
+                for component in relative.parent().context("admitted parent")?.components() {
+                    let Component::Normal(part) = component else {
+                        bail!("ordinary admission parent contains a non-normal component");
+                    };
+                    let child = match open_child_dir_nofollow(&directory, part) {
+                        Ok(child) => child,
+                        Err(error) if error.kind() == ErrorKind::NotFound => {
+                            parent_exists = false;
+                            break;
+                        }
+                        Err(error) => {
+                            return Err(error).context("opening ordinary admission parent")
+                        }
+                    };
+                    directory = Arc::new(child);
+                    absolute.push(part);
+                    parents.push(AnchoredParent {
+                        dir: Arc::clone(&directory),
+                        absolute: absolute.clone(),
+                    });
+                }
+                let file = if parent_exists {
+                    open_regular_file_handle_without_following_links(&AnchoredEntry::new(
+                        directory,
+                        &absolute,
+                        relative.file_name().context("admitted leaf")?,
+                    ))?
+                } else {
+                    None
+                };
+                targets.insert(
+                    decision.target.clone(),
+                    AdmittedDirectTarget { parents, file },
+                );
+            }
+        }
+        let admission = DirectApplyAdmission {
+            outcome,
+            home,
+            targets,
+        };
+        admission.verify_routing(self, proposal)?;
+        Ok(admission)
     }
 
     pub(crate) fn declares_protected_target(&self, target: &str) -> bool {
@@ -1590,14 +1745,56 @@ impl Ward {
     /// target cloning or Gate 2; budget and I/O failures return `Err`, while a
     /// refusal or hold is a normal [`ApplyReport`].
     pub fn apply(&self, edits: &[FileEdit], authorization: &Authorization) -> Result<ApplyReport> {
+        self.apply_inner(edits, authorization, None, None)
+    }
+
+    pub(crate) fn apply_admitted(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        admission: &DirectApplyAdmission,
+        final_routing_check: ApprovedCommitCheck<'_>,
+    ) -> Result<ApplyReport> {
+        self.apply_inner(edits, authorization, Some(admission), final_routing_check)
+    }
+
+    fn apply_inner(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        admission: Option<&DirectApplyAdmission>,
+        mut final_routing_check: ApprovedCommitCheck<'_>,
+    ) -> Result<ApplyReport> {
         validate_file_edit_budget(edits)?;
-        let anchored_home = AnchoredHome::open(&self.home)?;
+        let opened_home;
+        let anchored_home = match admission {
+            Some(admission) => &admission.home,
+            None => {
+                opened_home = AnchoredHome::open(&self.home)?;
+                &opened_home
+            }
+        };
         let proposal = Proposal {
             targets: edits.iter().map(|e| e.target.clone()).collect(),
             authorization: authorization.clone(),
         };
-        let outcome = self.evaluate_with_home(&proposal, Some(&anchored_home.absolute));
+        let outcome = match admission {
+            Some(admission) => admission.outcome.clone(),
+            None => self.evaluate_with_home(&proposal, Some(&anchored_home.absolute)),
+        };
+        #[cfg(all(test, unix))]
+        DIRECT_EVALUATION_HOOK.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
         maybe_swap_evaluated_home(&self.home)?;
+        if let Some(admission) = admission {
+            admission
+                .verify_routing(self, &proposal)
+                .map_err(|error| direct_apply_error(error, DirectApplyFailure::RolledBack))?;
+        }
 
         // Decide the proposal-wide disposition before touching the filesystem.
         let unit = if outcome.is_blocked() {
@@ -1640,7 +1837,19 @@ impl Ward {
 
         // Every edit is Tier 2/3 and cleared. Stage and commit the batch as one
         // rollback unit so a later failure cannot strand an unaudited write.
-        write_direct_batch(&anchored_home, edits, outcome.decisions)
+        let mut commit_check = || {
+            if let Some(admission) = admission {
+                admission.verify_routing(self, &proposal)?;
+            }
+            run_approved_commit_check(&mut final_routing_check)
+        };
+        write_direct_batch(
+            anchored_home,
+            edits,
+            outcome.decisions,
+            admission,
+            Some(&mut commit_check),
+        )
     }
 
     /// Apply edits after an explicit principal proposal approval has cleared the
@@ -2334,6 +2543,8 @@ fn write_direct_batch(
     home: &AnchoredHome,
     edits: &[FileEdit],
     decisions: Vec<Decision>,
+    admission: Option<&DirectApplyAdmission>,
+    mut final_routing_check: ApprovedCommitCheck<'_>,
 ) -> Result<ApplyReport> {
     let mut retained_bytes = validate_file_edit_budget(edits)?.retained_content_bytes();
     let mut prepared = Vec::with_capacity(edits.len());
@@ -2350,6 +2561,9 @@ fn write_direct_batch(
             let path = canonical_parent.entry(name);
             maybe_swap_prepared_parent(&path)?;
             let before = open_direct_before_image(&path, &decision.target, retained_bytes)?;
+            if let Some(admission) = admission {
+                admission.verify_target(&path, &decision.target, before.as_ref())?;
+            }
             if let Some(before) = &before {
                 retained_bytes = reserve_ward_content_bytes(
                     retained_bytes,
@@ -2386,6 +2600,11 @@ fn write_direct_batch(
     }
 
     let mut swapped = Vec::new();
+    if admission.is_some() {
+        if let Err(error) = verify_direct_parents(&prepared) {
+            return fail_after_direct_rollback(&prepared, &swapped, error);
+        }
+    }
     for index in 0..prepared.len() {
         let commit = {
             let write = &prepared[index];
@@ -2394,6 +2613,16 @@ fn write_direct_batch(
                 .as_ref()
                 .context("prepared direct write has no staging paths")?;
             if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
+                return fail_after_direct_rollback(&prepared, &swapped, error);
+            }
+            #[cfg(test)]
+            run_direct_commit_hook(&write.decision.target);
+            if admission.is_some() {
+                if let Err(error) = verify_direct_parents(&prepared) {
+                    return fail_after_direct_rollback(&prepared, &swapped, error);
+                }
+            }
+            if let Err(error) = run_approved_commit_check(&mut final_routing_check) {
                 return fail_after_direct_rollback(&prepared, &swapped, error);
             }
             if write.before.is_some() {
@@ -2480,6 +2709,10 @@ fn write_direct_batch(
     }
 
     let final_verification = (|| -> Result<()> {
+        run_approved_commit_check(&mut final_routing_check)?;
+        if admission.is_some() {
+            verify_direct_parents(&prepared)?;
+        }
         for write in &mut prepared {
             let installed = write
                 .installed
@@ -2524,6 +2757,22 @@ fn write_direct_batch(
         ));
     }
     Ok(report)
+}
+
+fn verify_direct_parents(prepared: &[PreparedDirectWrite<'_>]) -> Result<()> {
+    for write in prepared {
+        if !directory_handle_matches_path(
+            &write.path.parent,
+            write
+                .path
+                .absolute
+                .parent()
+                .context("prepared direct parent")?,
+        )? {
+            bail!("ordinary apply destination parent changed before batch finalization");
+        }
+    }
+    Ok(())
 }
 
 fn reserve_ward_content_bytes(retained: u64, additional: u64) -> Result<u64> {
@@ -4084,6 +4333,26 @@ fn rollback_replaced_regular_target(
         );
     }
     Ok(())
+}
+
+fn open_files_have_same_identity(left: &std::fs::File, right: &std::fs::File) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left = left.metadata()?;
+        let right = right.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(windows)]
+    {
+        Ok(windows_file_identity_from_open_file(left)?
+            == windows_file_identity_from_open_file(right)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        bail!("ordinary admission file identity is unsupported on this platform")
+    }
 }
 
 fn open_file_matches_path_if_present(file: &std::fs::File, path: &AnchoredEntry) -> Result<bool> {
@@ -8810,6 +9079,8 @@ tier = 1
                 new_contents: b"leak".to_vec(),
             }],
             vec![decision],
+            None,
+            None,
         )
         .unwrap_err();
 
