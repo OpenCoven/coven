@@ -77,6 +77,10 @@ Windows fixture restart means checked CLI stop followed by a new owned
 `daemon serve`; provenance records those operations, not `daemon restart`.
 Unix fixture lifecycle commands and the dedicated native
 `windows_daemon_lifecycle` CLI start/stop/restart deadline tests are unchanged.
+Unix lifecycle health compares the canonical profile directory and socket
+basename, then checks non-symlink socket metadata against the authenticated
+endpoint's device/inode. This supports retained private staging hard links
+without accepting another reported socket name for the same inode.
 Crash injection terminates the retained owned handle on Windows. The shared
 admission regressions inject time, pending probes, and child/health identity;
 they do not use wall-clock sleeps as authority evidence. Requests are never

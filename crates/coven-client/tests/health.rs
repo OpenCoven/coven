@@ -107,15 +107,21 @@ fn serve_responses(
     home: &Path,
     responses: Vec<(String, u16, String)>,
 ) -> std::thread::JoinHandle<()> {
-    use std::{
-        io::{Read, Write},
-        os::unix::{fs::PermissionsExt, net::UnixListener},
-    };
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
     let socket = home.join("coven.sock");
     let listener = UnixListener::bind(&socket).expect("bind test daemon socket");
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .expect("make test daemon socket owner-only");
+    serve_bound_responses(listener, responses)
+}
+
+fn serve_bound_responses(
+    listener: std::os::unix::net::UnixListener,
+    responses: Vec<(String, u16, String)>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+
     std::thread::spawn(move || {
         for (expected_path, status, body) in responses {
             let (mut stream, _) = listener.accept().expect("accept client request");
@@ -1607,6 +1613,58 @@ fn lifecycle_probe_returns_the_profile_bound_daemon_identity() {
 
     assert_eq!(actual, expected);
     server.join().expect("server thread");
+}
+
+#[test]
+fn lifecycle_probe_accepts_private_staged_hardlink_publication() {
+    assert_staged_lifecycle_binding(false);
+}
+
+#[test]
+fn lifecycle_probe_rejects_another_hardlink_name_for_the_same_inode() {
+    assert_staged_lifecycle_binding(true);
+}
+
+fn assert_staged_lifecycle_binding(report_staged_name: bool) {
+    use std::{
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+        time::Duration,
+    };
+
+    let home = TestHome::new();
+    let staging = home.path.join(".private");
+    fs::create_dir(&staging).expect("create private socket staging directory");
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+        .expect("protect socket staging directory");
+    let staged = staging.join("s");
+    let published = home.path.join("coven.sock");
+    let listener = UnixListener::bind(&staged).expect("bind private staged socket");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).expect("protect staged socket");
+    fs::hard_link(&staged, &published).expect("publish owner-local socket");
+    let expected = lifecycle_status(&home.path);
+    let mut reported = expected.clone();
+    if report_staged_name {
+        reported.socket = staged.to_string_lossy().into_owned();
+    }
+    let server = serve_bound_responses(
+        listener,
+        vec![("/health".to_owned(), 200, lifecycle_health(&reported))],
+    );
+    let actual = probe_unix_daemon_health(&home.path, Duration::from_secs(1));
+    server.join().expect("server thread");
+    if report_staged_name {
+        assert!(
+            matches!(actual, Err(ClientError::Discovery(_))),
+            "same inode must not authorize a different reported profile path: {actual:?}"
+        );
+    } else {
+        assert_eq!(
+            actual
+                .expect("probe privately published socket")
+                .expect("health included daemon identity"),
+            expected
+        );
+    }
 }
 
 #[test]
