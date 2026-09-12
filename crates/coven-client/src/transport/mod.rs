@@ -174,10 +174,11 @@ fn request_with_peer(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    if !valid_request_method(method) || !valid_request_target(path) {
-        return Err(ClientError::InvalidHttpResponse(
-            "attempted malformed HTTP request method or target".to_owned(),
-        ));
+    if !valid_request_method(method) {
+        return Err(ClientError::InvalidRouteParameter("HTTP method"));
+    }
+    if !valid_request_target(path) {
+        return Err(ClientError::InvalidRouteParameter("HTTP request target"));
     }
     if !allowed_request_route(method, path) {
         return Err(ClientError::InvalidHttpResponse(

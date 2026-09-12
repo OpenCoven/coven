@@ -21,6 +21,8 @@ const FAMILIAR_ID: &str = "sage";
 const PRINCIPAL_FINGERPRINT: &str = "fpr-e2e-synthetic";
 const REQUIRE_OVERRIDE_ENV: &str = "COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE";
 const ARTIFACT_ROOT_ENV: &str = "COVEN_THREADS_E2E_ARTIFACT_ROOT";
+// Keep this in lockstep with the daemon startup readiness contract.
+const DAEMON_STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const REPRODUCTION_COMMAND: &str = if cfg!(feature = "threads-test-clock") {
     "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock -- --nocapture"
 } else {
@@ -2414,7 +2416,7 @@ fn daemon_start_timed_out_waiting_for_health_connect(stderr: &[u8]) -> bool {
 }
 
 fn wait_for_daemon_health(coven_home: &Path) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + DAEMON_STARTUP_HEALTH_TIMEOUT;
     let mut last_error = None;
     while Instant::now() < deadline {
         if coven_home.join("daemon.json").exists() {
