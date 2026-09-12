@@ -11487,7 +11487,20 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                 proposal_retention_expired(coven_home, &conn, &document, now),
             )
         };
-        let mut revalidation_required = false;
+        let mut revalidation_required = opened_window
+            && !document
+                .scheduled()
+                .is_some_and(|proposal| proposal.veto_deadline().is_some());
+        if revalidation_required {
+            crate::daemon::append_daemon_recovery_log(
+                coven_home,
+                &format!(
+                    "threads scheduler: proposal {} has opened-window history without a \
+                     veto-window approval path; recovering through the terminal decision boundary",
+                    path.display()
+                ),
+            );
+        }
         let protected_targets = match pending_document_protected_targets(coven_home, &document) {
             Ok(targets) => targets,
             Err(error) if opened_window => {
