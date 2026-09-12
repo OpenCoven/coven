@@ -144,6 +144,7 @@ struct DaemonHealthStatus {
 #[cfg(not(windows))]
 const MAX_DAEMON_STATUS_BYTES: usize = coven_client::MAX_DAEMON_STATUS_BYTES;
 const DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(windows, test))]
 const WINDOWS_STARTUP_HEALTH_PROBE_SLICE: Duration = Duration::from_millis(250);
 
@@ -1983,7 +1984,7 @@ pub fn ensure_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<DaemonStatus> {
-    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    let deadline = LifecycleDeadline::after(DAEMON_STARTUP_TIMEOUT)?;
     deadline.remaining("resolving Coven daemon profile")?;
     let coven_home = canonical_lifecycle_home(coven_home)?;
     let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
@@ -2762,7 +2763,7 @@ pub fn restart_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<(bool, DaemonStatus)> {
-    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    let deadline = LifecycleDeadline::after(DAEMON_STARTUP_TIMEOUT)?;
     deadline.remaining("resolving Coven daemon profile")?;
     let coven_home = canonical_lifecycle_home(coven_home)?;
     let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
@@ -3606,7 +3607,7 @@ fn ensure_background_server_with_controllers(
         started_at,
         status_controller,
         start_controller,
-        LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+        LifecycleDeadline::after(DAEMON_STARTUP_TIMEOUT)?,
     )
 }
 
@@ -4262,17 +4263,40 @@ fn serve_accepted_tcp_connection(
 }
 
 #[cfg(unix)]
-pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
+pub fn bind_api_socket(coven_home: &Path) -> Result<PublishedUnixListener> {
     bind_api_socket_with_publisher(coven_home, |staged, target| {
         std::fs::hard_link(staged, target)
     })
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+pub struct PublishedUnixListener {
+    listener: UnixListener,
+    _staged_dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for PublishedUnixListener {
+    type Target = UnixListener;
+
+    fn deref(&self) -> &Self::Target {
+        &self.listener
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for PublishedUnixListener {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.listener
+    }
+}
+
+#[cfg(unix)]
 fn bind_api_socket_with_publisher(
     coven_home: &Path,
     publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<UnixListener> {
+) -> Result<PublishedUnixListener> {
     ensure_private_coven_home(coven_home)?;
     let socket_path = daemon_socket_path(coven_home);
     // Fail closed if the socket path would resolve outside the trusted state
@@ -4336,14 +4360,16 @@ fn bind_api_socket_with_publisher(
             });
         }
     }
-    // Keep the temporary name no longer than coven.sock, preserving Unix path limits.
-    let staged = tempfile::Builder::new()
+    // Keep the temporary bound pathname alive for the listener's lifetime; coven.sock
+    // remains the public entry while the staged name preserves the inode the listener
+    // is actually bound to. Reserve a private staging directory first so bind()
+    // never races another writer for the same temporary socket pathname.
+    let staged_dir = tempfile::Builder::new()
         .prefix(".")
-        .rand_bytes(8)
-        .tempfile_in(coven_home)
-        .context("reserving private daemon socket staging path")?
-        .into_temp_path();
-    std::fs::remove_file(&staged).context("preparing reserved daemon socket staging path")?;
+        .rand_bytes(5)
+        .tempdir_in(coven_home)
+        .context("reserving private daemon socket staging directory")?;
+    let staged = staged_dir.path().join("s");
     let listener = UnixListener::bind(&staged)
         .with_context(|| format!("failed to bind Coven API socket {}", socket_path.display()))?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).with_context(
@@ -4356,10 +4382,10 @@ fn bind_api_socket_with_publisher(
     )?;
     // A hard link publishes the already-private socket without replacing a raced entry.
     publish(&staged, &socket_path).context("publishing private Coven API socket")?;
-    staged
-        .close()
-        .context("removing daemon socket staging path")?;
-    Ok(listener)
+    Ok(PublishedUnixListener {
+        listener,
+        _staged_dir: staged_dir,
+    })
 }
 
 pub fn daemon_recovery_log_path(coven_home: &Path) -> PathBuf {
@@ -10727,8 +10753,9 @@ mod tests {
         })?;
         let client = UnixStream::connect(daemon_socket_path(home.path()))?;
         let (server, _) = listener.accept()?;
-        assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
+        assert_eq!(std::fs::read_dir(home.path())?.count(), 2);
         drop((client, server, listener));
+        assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
         Ok(())
     }
 
@@ -11787,7 +11814,7 @@ mod tests {
             .map(|(_, observation)| observation)
             .collect();
         assert_eq!(observations.len(), 2);
-        let mut previous = DAEMON_LIFECYCLE_TIMEOUT.as_millis();
+        let mut previous = DAEMON_STARTUP_TIMEOUT.as_millis();
         for (observation, phase) in observations.iter().zip(["before-spawn", "after-spawn"]) {
             let remaining = observation
                 .strip_prefix(&format!("phase={phase} remaining_ms="))
@@ -13394,13 +13421,13 @@ mod tests {
     #[test]
     fn startup_budget_distinguishes_parent_cost_from_child_store_elapsed() {
         let start = Instant::now();
-        let deadline = LifecycleDeadline::from_instant(start + DAEMON_LIFECYCLE_TIMEOUT);
+        let deadline = LifecycleDeadline::from_instant(start + DAEMON_STARTUP_TIMEOUT);
         // Synthetic timelines, not measurements of Windows or an E2E reproduction.
         // The same child store duration can fit or exhaust the parent's deadline.
         for (preparation_ms, launch_ms, expected_before, expected_after, fits) in [
-            (50, 10, 1950, 1940, true),
-            (1500, 10, 500, 490, false),
-            (50, 1460, 1950, 490, false),
+            (50, 10, 4950, 4940, true),
+            (4500, 10, 500, 490, false),
+            (50, 4460, 4950, 490, false),
         ] {
             let before = start + Duration::from_millis(preparation_ms);
             let after = before + Duration::from_millis(launch_ms);

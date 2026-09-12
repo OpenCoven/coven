@@ -10,7 +10,7 @@ use coven_client::ClientError;
 #[cfg(any(windows, test))]
 use serde_json::Value;
 
-// Fixture hang guard, not the production CLI's two-second startup contract.
+// Fixture hang guard, independent of production CLI lifecycle deadlines.
 pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn start_operation(windows: bool) -> &'static str {
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_authority_admission_does_not_use_the_two_second_launcher() {
+    fn windows_authority_admission_does_not_use_the_cli_launcher() {
         assert_eq!(start_operation(true), "serve");
         assert_eq!(start_operation(false), "start");
     }
@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_accepts_pending_cold_store_beyond_launcher_sla_without_relaunch() -> Result<()> {
+    fn admission_handles_recorded_cold_store_delay_without_relaunch() -> Result<()> {
         let start = Instant::now();
         let clock = Cell::new(start);
         let polls = Cell::new(0);

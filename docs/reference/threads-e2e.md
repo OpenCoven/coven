@@ -36,8 +36,8 @@ Four additional identity-replay cases each exercise a live deadline and a
 restart: changed `IDENTITY.md` bytes, changed `SOUL.md` bytes, changed roster
 metadata, and a strengthened but still-satisfied active purpose predicate.
 They use supported scheduled intake, not injected proposal envelopes. The
-original proposal must close once with `EvidenceDiverged` at the logical
-deadline without applying; its submission/opening/terminal chain must survive
+original proposal must have one `EvidenceDiverged` close when deadline replay
+is exercised, without applying; its submission/opening/terminal chain must survive
 another restart unchanged. A fresh proposal under the changed authority must
 then apply successfully, distinguishing valid evidence drift from a failed
 identity predicate.
@@ -66,8 +66,8 @@ not evidence that these journeys executed on Windows.
 Windows authority journeys serialize admission and retain an owned
 `coven daemon serve` child, using the same native helper as the smaller Threads
 fixtures. Their fixed 15-second readiness budget is a fixture hang guard for
-cold-store initialization, not a change to the production two-second launcher
-SLA. Only pending transport observations are polled; invalid health, changed
+cold-store initialization, independent of production CLI lifecycle deadlines.
+Only pending transport observations are polled; invalid health, changed
 identity, and child-exit/inspection errors fail admission immediately. Readiness
 requires the authenticated pipe server PID, health PID, and owner-local pipe to
 match the owned child. The child is reaped on shutdown, crash, or setup failure,

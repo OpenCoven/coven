@@ -133,7 +133,7 @@ forbidden = ["(?i)ignore previous"]
             .create(true)
             .append(true)
             .open(self.coven_home.join("fixture-serve.stderr.log"))?;
-        // Exercise the real server, not the separate two-second launcher SLA.
+        // Exercise the real server, not the separate CLI launcher deadline.
         let mut command = self.daemon_command_builder(threads_admission::start_operation(true));
         command
             .stdin(std::process::Stdio::null())
