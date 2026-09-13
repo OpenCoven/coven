@@ -1,0 +1,126 @@
+{
+  "schemaVersion": "coven.automations.calendar-schedule-resolution-vectors.v1",
+  "cases": [
+    {
+      "caseId": "daily-same-day",
+      "scenario": "daily_same_day",
+      "rrule": "FREQ=DAILY;BYHOUR=9",
+      "timezone": "utc",
+      "from": "2026-08-28T08:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2026-08-28T09:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "multiple-daily-hours",
+      "scenario": "multiple_daily_hours",
+      "rrule": "FREQ=DAILY;BYHOUR=9,17",
+      "timezone": "utc",
+      "from": "2026-08-28T12:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2026-08-28T17:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "weekly-weekday",
+      "scenario": "weekly_weekday",
+      "rrule": "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8",
+      "timezone": "utc",
+      "from": "2026-08-28T09:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2026-08-31T08:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "iana-winter-offset",
+      "scenario": "iana_winter_offset",
+      "rrule": "FREQ=DAILY;BYHOUR=9",
+      "timezone": "America/New_York",
+      "from": "2026-01-15T13:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2026-01-15T14:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "iana-summer-offset",
+      "scenario": "iana_summer_offset",
+      "rrule": "FREQ=DAILY;BYHOUR=9",
+      "timezone": "America/New_York",
+      "from": "2026-07-15T12:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2026-07-15T13:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "dst-spring-gap",
+      "scenario": "dst_spring_gap",
+      "rrule": "FREQ=DAILY;BYHOUR=2",
+      "timezone": "America/New_York",
+      "from": "2026-03-07T08:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2026-03-09T06:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "dst-fall-fold",
+      "scenario": "dst_fall_fold",
+      "rrule": "FREQ=DAILY;BYHOUR=1",
+      "timezone": "America/New_York",
+      "from": "2026-11-01T04:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2026-11-01T05:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "leap-day-boundary",
+      "scenario": "leap_day_boundary",
+      "rrule": "FREQ=DAILY;BYHOUR=9",
+      "timezone": "utc",
+      "from": "2028-02-28T10:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2028-02-29T09:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "month-boundary",
+      "scenario": "month_boundary",
+      "rrule": "FREQ=DAILY;BYHOUR=9",
+      "timezone": "utc",
+      "from": "2026-08-31T10:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2026-09-01T09:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "year-boundary",
+      "scenario": "year_boundary",
+      "rrule": "FREQ=WEEKLY;BYDAY=FR;BYHOUR=8",
+      "timezone": "utc",
+      "from": "2026-12-31T12:00:00.000Z",
+      "expected": {
+        "outcome": "scheduled",
+        "nextDueAt": "2027-01-01T08:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "local-timezone-refused",
+      "scenario": "local_timezone_refused",
+      "rrule": "FREQ=DAILY;BYHOUR=9",
+      "timezone": "local",
+      "from": "2026-08-28T08:00:00.000Z",
+      "expected": {
+        "outcome": "rejected",
+        "reason": "local_timezone_unresolved"
+      }
+    }
+  ]
+}
