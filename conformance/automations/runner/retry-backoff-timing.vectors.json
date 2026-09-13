@@ -1,0 +1,109 @@
+{
+  "schemaVersion": "coven.automations.retry-backoff-timing-vectors.v1",
+  "cases": [
+    {
+      "caseId": "no-backoff-is-immediate",
+      "scenario": "none_immediate",
+      "policy": {
+        "maxAttempts": 2,
+        "backoffPolicy": "none",
+        "retryableClasses": ["runtime_unavailable"]
+      },
+      "runId": "retry-none",
+      "nextAttemptNumber": 2,
+      "observedAt": "2026-09-01T10:00:00.000Z",
+      "expected": {
+        "delaySeconds": 0,
+        "minimumDelaySeconds": 0,
+        "maximumDelaySeconds": 0,
+        "ceilingSeconds": 0,
+        "notBefore": "2026-09-01T10:00:00.000Z",
+        "deterministic": true
+      }
+    },
+    {
+      "caseId": "fixed-backoff-starts-at-observation",
+      "scenario": "fixed_from_observation",
+      "policy": {
+        "maxAttempts": 2,
+        "backoffPolicy": "fixed",
+        "backoffSeconds": 60,
+        "retryableClasses": ["transient_dispatch"]
+      },
+      "runId": "retry-fixed",
+      "nextAttemptNumber": 2,
+      "observedAt": "2026-09-01T10:00:50.000Z",
+      "expected": {
+        "delaySeconds": 60,
+        "minimumDelaySeconds": 60,
+        "maximumDelaySeconds": 60,
+        "ceilingSeconds": 60,
+        "notBefore": "2026-09-01T10:01:50.000Z",
+        "deterministic": true
+      }
+    },
+    {
+      "caseId": "exponential-second-attempt-uses-base-ceiling",
+      "scenario": "exponential_attempt_two",
+      "policy": {
+        "maxAttempts": 4,
+        "backoffPolicy": "exponential",
+        "backoffSeconds": 10,
+        "retryableClasses": ["runtime_unavailable"]
+      },
+      "runId": "retry-exponential-two",
+      "nextAttemptNumber": 2,
+      "observedAt": "2026-09-01T10:00:00.000Z",
+      "expected": {
+        "delaySeconds": 8,
+        "minimumDelaySeconds": 1,
+        "maximumDelaySeconds": 10,
+        "ceilingSeconds": 10,
+        "notBefore": "2026-09-01T10:00:08.000Z",
+        "deterministic": true
+      }
+    },
+    {
+      "caseId": "exponential-fourth-attempt-grows-ceiling",
+      "scenario": "exponential_attempt_four",
+      "policy": {
+        "maxAttempts": 4,
+        "backoffPolicy": "exponential",
+        "backoffSeconds": 10,
+        "retryableClasses": ["runtime_unavailable"]
+      },
+      "runId": "retry-exponential-four",
+      "nextAttemptNumber": 4,
+      "observedAt": "2026-09-01T10:00:00.000Z",
+      "expected": {
+        "delaySeconds": 17,
+        "minimumDelaySeconds": 1,
+        "maximumDelaySeconds": 40,
+        "ceilingSeconds": 40,
+        "notBefore": "2026-09-01T10:00:17.000Z",
+        "deterministic": true
+      }
+    },
+    {
+      "caseId": "exponential-backoff-caps-at-one-day",
+      "scenario": "exponential_one_day_cap",
+      "policy": {
+        "maxAttempts": 3,
+        "backoffPolicy": "exponential",
+        "backoffSeconds": 50000,
+        "retryableClasses": ["lease_expired"]
+      },
+      "runId": "retry-exponential-cap",
+      "nextAttemptNumber": 3,
+      "observedAt": "2026-09-01T10:00:00.000Z",
+      "expected": {
+        "delaySeconds": 61621,
+        "minimumDelaySeconds": 1,
+        "maximumDelaySeconds": 86400,
+        "ceilingSeconds": 86400,
+        "notBefore": "2026-09-02T03:07:01.000Z",
+        "deterministic": true
+      }
+    }
+  ]
+}

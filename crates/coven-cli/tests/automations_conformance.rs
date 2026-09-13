@@ -28,6 +28,8 @@ const OCCURRENCE_LEASE_RECOVERY_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/occurrence-lease-recovery.vectors.json");
 const OVERLAP_FORBID_CLAIMING_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/overlap-forbid-claiming.vectors.json");
+const RETRY_BACKOFF_TIMING_VECTORS: &str =
+    include_str!("../../../conformance/automations/runner/retry-backoff-timing.vectors.json");
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
@@ -119,7 +121,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "calendar-schedule-resolution",
                         "misfire-latest-planning",
                         "occurrence-lease-recovery",
-                        "overlap-forbid-claiming"
+                        "overlap-forbid-claiming",
+                        "retry-backoff-timing"
                     ]
                 }
             ]
@@ -289,6 +292,47 @@ fn native_target_evaluates_checked_in_overlap_forbid_claiming_vectors() -> anyho
     assert_eq!(response["status"], "passed");
     assert_eq!(response["evidence"]["executedCases"], 7);
     assert_eq!(response["evidence"]["passedCases"], 7);
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_retry_backoff_timing_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(RETRY_BACKOFF_TIMING_VECTORS)?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "retry-backoff-timing",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "retry-backoff-timing");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 5);
+    assert_eq!(response["evidence"]["passedCases"], 5);
     assert!(!coven_home.exists());
     Ok(())
 }
