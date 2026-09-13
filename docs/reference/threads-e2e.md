@@ -28,6 +28,25 @@ window terminals, and no-window human approval. It also covers restart with
 changed or unavailable identity, principal binding, materialized surfaces,
 regional approval policy, and inconsistent human-path/opened-window history.
 Unsupported corpus input and invalid identity are exercised at intake.
+The `corpus_closure_cases` supplement uses the same generated familiar-review
+case and real `ward migrate --apply` path. It rejects the corpus's
+`unknown-identity-fact` declaration without altering the retired source or
+creating a backup, then confirms live intake cannot stage it. Its restarted
+pending case drives two daemon scheduler workers concurrently through the
+existing pass lock, requiring one apply intent, one typed approval, completion
+counts `[0, 1]`, and unchanged audit history after another restart. No positive
+pending record or terminal row is seeded by these journeys.
+
+Successful corpus submissions retain their exact synthetic case, canonical
+pending envelope, retired-source hash, and active-Ward hash in
+`corpus-intake-<proposal-id>.json`. Typed-terminal assertions additionally
+retain the single daemon store's audit rows under `state/ward-audit.jsonl`.
+These are evidence exports, not a second authority store. The existing
+`scheduled_window_replay` cases use this same migrated corpus for veto,
+downtime surface drift and unavailable identity; `explicit_supersession`
+does so for the replaced and replacement proposals. They are not substituted
+generic cases.
+
 The final-commit journey pauses after authority validation, changes the
 authoritative identity bytes, and requires a typed rejection without applying
 the candidate writes.

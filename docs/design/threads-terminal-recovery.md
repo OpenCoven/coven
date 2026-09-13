@@ -160,6 +160,28 @@ Do not delete quarantined intent or classify it as a completed rejection to
 make the terminal count balance. This checkpoint also does not repair arbitrary
 historical database corruption or infer missing close evidence for past writes.
 
+## Deployed-history classification boundary
+
+Startup and decision recovery classify retained pending items; they do not
+perform a one-time census of every historical `ward_audit` opening.
+
+| Evidence available | Existing recovery disposition |
+| --- | --- |
+| Matching submission, one opening, no apply intent, confirmed invalid authority | Typed `revalidation_failed` rejection; consume the pending item only after the terminal is durable. |
+| Human-labelled envelope contradicts its opening, but original receipt and opening are fully provable and unapplied | Reconstruct rejection context only; never execute or rewrite it as approved history. |
+| Transient authority read failure | Preserve request, claim, and reservation for retry; an I/O error is not proof of invalid authority. |
+| Existing valid terminal plus leftover pending item | Consume leftover state idempotently without another write or terminal. |
+| Interrupted apply, corrupt/misbound receipt, unprovable original opening, or invalid decision origin | Preserve/quarantine evidence for explicit recovery; no fabricated no-write assertion or close. |
+| Audit opening without any retained pending/claim item | Outside the pending-item classifier; not automatically repaired or certified closed. |
+
+A deployed-history migration must first inventory the last two classes and
+preserve the original database and pending/intent evidence. Do not update old
+rows, infer approval from final file bytes, or append rejection merely to make
+counts balance. The current per-item policy is not evidence that a complete
+one-time classifier, repair tool, or operator resolution procedure has run.
+That remaining migration obligation is separate from the supported nine-case
+terminal matrix and keeps the universal historical closure claim open.
+
 For deterministic scheduler deadlines, use the opt-in
 [Threads test clock](threads-test-clock.md). Neither the clock nor seeded
 historical recovery fixtures grant protected-write authority.
