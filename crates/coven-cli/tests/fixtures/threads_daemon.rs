@@ -235,6 +235,10 @@ forbidden = ["(?i)ignore previous"]
     }
 
     fn daemon_command_builder(&self, operation: &str) -> Command {
+        self.cli_command_builder(&["daemon", operation])
+    }
+
+    pub fn cli_command_builder(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_coven"));
         command.env_clear();
         // Keep only OS launch necessities, not developer credentials or test controls.
@@ -244,7 +248,7 @@ forbidden = ["(?i)ignore previous"]
             }
         }
         command
-            .args(["daemon", operation])
+            .args(args)
             .current_dir(&self.workspace)
             .env("COVEN_HOME", &self.coven_home)
             .env("HOME", self._temp.path())
