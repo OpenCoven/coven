@@ -52,6 +52,10 @@ const RETRY_QUARANTINE_RECOVERY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.retry-quarantine-recovery-vectors.v1";
 const RETRY_QUARANTINE_FIXTURE_CREATED_AT: &str = "2026-09-01T08:00:00.000Z";
 const RETRY_QUARANTINE_OBSERVE_AT: &str = "2026-09-02T10:00:00.000Z";
+const SCHEDULER_LEADERSHIP_FENCING_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.scheduler-leadership-fencing-vectors.v1";
+const SCHEDULER_LEADERSHIP_FIRST_AT: &str = "2026-09-03T12:00:00.000Z";
+const SCHEDULER_LEADERSHIP_SECOND_AT: &str = "2026-09-03T12:00:01.000Z";
 const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
@@ -76,6 +80,7 @@ pub const OCCURRENCE_LEASE_RECOVERY_SUITE: &str = "occurrence-lease-recovery";
 pub const OVERLAP_FORBID_CLAIMING_SUITE: &str = "overlap-forbid-claiming";
 pub const RETRY_BACKOFF_TIMING_SUITE: &str = "retry-backoff-timing";
 pub const RETRY_QUARANTINE_RECOVERY_SUITE: &str = "retry-quarantine-recovery";
+pub const SCHEDULER_LEADERSHIP_FENCING_SUITE: &str = "scheduler-leadership-fencing";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -882,6 +887,102 @@ struct ExpectedRetryQuarantineRecovery {
     claimed_count: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SchedulerLeadershipFencingVectorSet {
+    schema_version: String,
+    cases: Vec<SchedulerLeadershipFencingVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SchedulerLeadershipFencingVectorCase {
+    case_id: String,
+    scenario: SchedulerLeadershipFencingScenario,
+    first_acquired_at: String,
+    second_attempt_at: String,
+    expected: ExpectedSchedulerLeadershipFencing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SchedulerLeadershipFencingScenario {
+    ExclusiveAcquisition,
+    RestartAdvancesGeneration,
+    StaleFenceRejected,
+}
+
+impl SchedulerLeadershipFencingScenario {
+    const COUNT: usize = 3;
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedSchedulerLeadershipFencing {
+    SecondAcquisitionRefused {
+        #[serde(rename = "firstGeneration")]
+        first_generation: i64,
+        #[serde(rename = "firstFenceCurrent")]
+        first_fence_current: bool,
+    },
+    GenerationAdvanced {
+        #[serde(rename = "firstGeneration")]
+        first_generation: i64,
+        #[serde(rename = "secondGeneration")]
+        second_generation: i64,
+        #[serde(rename = "firstFenceCurrent")]
+        first_fence_current: bool,
+        #[serde(rename = "secondFenceCurrent")]
+        second_fence_current: bool,
+    },
+    StaleTickRejected {
+        #[serde(rename = "firstGeneration")]
+        first_generation: i64,
+        #[serde(rename = "secondGeneration")]
+        second_generation: i64,
+        #[serde(rename = "staleTickRejected")]
+        stale_tick_rejected: bool,
+        #[serde(rename = "currentTickAccepted")]
+        current_tick_accepted: bool,
+    },
+}
+
+impl ExpectedSchedulerLeadershipFencing {
+    fn matches_scenario(&self, scenario: SchedulerLeadershipFencingScenario) -> bool {
+        matches!(
+            (scenario, self),
+            (
+                SchedulerLeadershipFencingScenario::ExclusiveAcquisition,
+                Self::SecondAcquisitionRefused { .. }
+            ) | (
+                SchedulerLeadershipFencingScenario::RestartAdvancesGeneration,
+                Self::GenerationAdvanced { .. }
+            ) | (
+                SchedulerLeadershipFencingScenario::StaleFenceRejected,
+                Self::StaleTickRejected { .. }
+            )
+        )
+    }
+
+    fn generations_are_coherent(&self) -> bool {
+        match self {
+            Self::SecondAcquisitionRefused {
+                first_generation, ..
+            } => *first_generation > 0,
+            Self::GenerationAdvanced {
+                first_generation,
+                second_generation,
+                ..
+            }
+            | Self::StaleTickRejected {
+                first_generation,
+                second_generation,
+                ..
+            } => *first_generation > 0 && *second_generation > *first_generation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OverlapTargetState {
@@ -1173,6 +1274,7 @@ pub fn capability() -> TargetCapability {
                     OVERLAP_FORBID_CLAIMING_SUITE,
                     RETRY_BACKOFF_TIMING_SUITE,
                     RETRY_QUARANTINE_RECOVERY_SUITE,
+                    SCHEDULER_LEADERSHIP_FENCING_SUITE,
                 ],
             },
         ],
@@ -1235,6 +1337,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, RETRY_QUARANTINE_RECOVERY_SUITE) => {
             evaluate_retry_quarantine_recovery(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, SCHEDULER_LEADERSHIP_FENCING_SUITE) => {
+            evaluate_scheduler_leadership_fencing(&request.vector)?
         }
         _ => return Err("conformance suite is unsupported"),
     };
@@ -2455,6 +2560,161 @@ fn retry_quarantine_recovery_case_matches(
         && release_changed == case.expected.release_changed
         && tick.planned.len() == case.expected.planned_count
         && tick.claimed.len() == case.expected.claimed_count)
+}
+
+fn evaluate_scheduler_leadership_fencing(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: SchedulerLeadershipFencingVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != SCHEDULER_LEADERSHIP_FENCING_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != SchedulerLeadershipFencingScenario::COUNT
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let first_acquired_at = canonical_timestamp(SCHEDULER_LEADERSHIP_FIRST_AT)
+        .ok_or("conformance vector is invalid")?;
+    let second_acquired_at = canonical_timestamp(SCHEDULER_LEADERSHIP_SECOND_AT)
+        .ok_or("conformance vector is invalid")?;
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        let first =
+            canonical_timestamp(&case.first_acquired_at).ok_or("conformance vector is invalid")?;
+        let second =
+            canonical_timestamp(&case.second_attempt_at).ok_or("conformance vector is invalid")?;
+        let expected_second = match case.scenario {
+            SchedulerLeadershipFencingScenario::ExclusiveAcquisition => first_acquired_at,
+            SchedulerLeadershipFencingScenario::RestartAdvancesGeneration
+            | SchedulerLeadershipFencingScenario::StaleFenceRejected => second_acquired_at,
+        };
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || first != first_acquired_at
+            || second != expected_second
+            || !case.expected.matches_scenario(case.scenario)
+            || !case.expected.generations_are_coherent()
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != SchedulerLeadershipFencingScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut passed_cases = 0;
+    for case in &vectors.cases {
+        passed_cases += usize::from(scheduler_leadership_fencing_case_matches(case)?);
+    }
+    Ok(passed_cases == vectors.cases.len())
+}
+
+fn scheduler_leadership_fencing_case_matches(
+    case: &SchedulerLeadershipFencingVectorCase,
+) -> Result<bool, &'static str> {
+    let scheduler_home = tempfile::tempdir().map_err(|_| "conformance suite execution failed")?;
+    crate::daemon::ensure_private_coven_home(scheduler_home.path())
+        .map_err(|_| "conformance suite execution failed")?;
+    let store_path = scheduler_home.path().join("coven.sqlite3");
+    let conn =
+        crate::store::open_store(&store_path).map_err(|_| "conformance suite execution failed")?;
+    let first_acquired_at =
+        canonical_timestamp(&case.first_acquired_at).ok_or("conformance vector is invalid")?;
+    let second_attempt_at =
+        canonical_timestamp(&case.second_attempt_at).ok_or("conformance vector is invalid")?;
+    let first = super::leadership::SchedulerLeadership::acquire(
+        scheduler_home.path(),
+        &conn,
+        first_acquired_at,
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let first_fence = first.fence();
+
+    match &case.expected {
+        ExpectedSchedulerLeadershipFencing::SecondAcquisitionRefused {
+            first_generation,
+            first_fence_current,
+        } => {
+            let second_refused = match super::leadership::SchedulerLeadership::acquire(
+                scheduler_home.path(),
+                &conn,
+                second_attempt_at,
+            ) {
+                Ok(_) => false,
+                Err(error) => error
+                    .to_string()
+                    .starts_with("automations scheduler leadership is already held for "),
+            };
+            let first_is_current = first_fence
+                .is_current(&conn)
+                .map_err(|_| "conformance suite execution failed")?;
+            Ok(second_refused
+                && first_fence.generation() == *first_generation
+                && first_is_current == *first_fence_current)
+        }
+        ExpectedSchedulerLeadershipFencing::GenerationAdvanced {
+            first_generation,
+            second_generation,
+            first_fence_current,
+            second_fence_current,
+        } => {
+            drop(first);
+            drop(conn);
+            let conn = crate::store::open_store(&store_path)
+                .map_err(|_| "conformance suite execution failed")?;
+            let second = super::leadership::SchedulerLeadership::acquire(
+                scheduler_home.path(),
+                &conn,
+                second_attempt_at,
+            )
+            .map_err(|_| "conformance suite execution failed")?;
+            let second_fence = second.fence();
+            let first_is_current = first_fence
+                .is_current(&conn)
+                .map_err(|_| "conformance suite execution failed")?;
+            let second_is_current = second_fence
+                .is_current(&conn)
+                .map_err(|_| "conformance suite execution failed")?;
+            Ok(first_fence.generation() == *first_generation
+                && second_fence.generation() == *second_generation
+                && first_is_current == *first_fence_current
+                && second_is_current == *second_fence_current)
+        }
+        ExpectedSchedulerLeadershipFencing::StaleTickRejected {
+            first_generation,
+            second_generation,
+            stale_tick_rejected,
+            current_tick_accepted,
+        } => {
+            drop(first);
+            drop(conn);
+            let conn = crate::store::open_store(&store_path)
+                .map_err(|_| "conformance suite execution failed")?;
+            let second = super::leadership::SchedulerLeadership::acquire(
+                scheduler_home.path(),
+                &conn,
+                second_attempt_at,
+            )
+            .map_err(|_| "conformance suite execution failed")?;
+            let second_fence = second.fence();
+            let stale_rejected = super::occurrences::tick_with_scheduler_fence(
+                &conn,
+                second_attempt_at,
+                &first_fence,
+            )
+            .is_err_and(|error| error.to_string() == "automations scheduler fence is stale");
+            let current_accepted = super::occurrences::tick_with_scheduler_fence(
+                &conn,
+                second_attempt_at,
+                &second_fence,
+            )
+            .is_ok();
+            Ok(first_fence.generation() == *first_generation
+                && second_fence.generation() == *second_generation
+                && stale_rejected == *stale_tick_rejected
+                && current_accepted == *current_tick_accepted)
+        }
+    }
 }
 
 fn evaluate_misfire_latest_planning(vector: &Value) -> Result<bool, &'static str> {

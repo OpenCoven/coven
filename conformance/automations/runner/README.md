@@ -134,6 +134,7 @@ The checked-in
 [`overlap-forbid-claiming.vectors.json`](overlap-forbid-claiming.vectors.json),
 [`retry-backoff-timing.vectors.json`](retry-backoff-timing.vectors.json),
 [`retry-quarantine-recovery.vectors.json`](retry-quarantine-recovery.vectors.json),
+[`scheduler-leadership-fencing.vectors.json`](scheduler-leadership-fencing.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -172,7 +173,8 @@ The runner invokes the target directly without a shell.
         "occurrence-lease-recovery",
         "overlap-forbid-claiming",
         "retry-backoff-timing",
-        "retry-quarantine-recovery"
+        "retry-quarantine-recovery",
+        "scheduler-leadership-fencing"
       ]
     }
   ]
@@ -185,7 +187,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements ten structural suites and six
+The native Coven target currently implements ten structural suites and seven
 scheduler-reliability suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -239,6 +241,11 @@ production retry-state ledger and scheduler tick. It proves first and repeated
 exhaustions quarantine a routine with current failure evidence, quarantine
 blocks occurrence planning, explicit release clears the state and restores
 scheduling, and release without an existing quarantine is an idempotent no-op.
+`scheduler-leadership-fencing` executes fixed virtual-time cases through the
+production filesystem leadership lock, durable scheduler generation, and
+fenced scheduler tick. It proves a concurrent scheduler is refused, a restart
+advances the generation and invalidates the prior fence, and stale leaders
+cannot tick while the current leader can.
 `occurrence-fence-uniqueness` executes a portable three-case matrix against the
 production SQLite occurrence schema, proving that one automation cannot claim
 the same scheduled slot twice while different automations may share a slot and
