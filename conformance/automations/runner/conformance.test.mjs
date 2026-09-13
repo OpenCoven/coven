@@ -138,7 +138,12 @@ if (operation === "evaluate") {
   }
   process.stdout.write(JSON.stringify({
     schemaVersion: "coven.automations.conformance-target-capability.v1",
-    profiles: [{ profile: "structural", suites: ["schema-validation"] }]
+    profiles: mode === "slow-stateful-suite"
+      ? [{
+          profile: "scheduler_reliability",
+          suites: ["startup-reconciliation-wake"],
+        }]
+      : [{ profile: "structural", suites: ["schema-validation"] }]
   }));
   process.exit(0);
 }
@@ -146,6 +151,9 @@ if (operation !== "evaluate") process.exit(3);
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
+if (mode === "slow-stateful-suite") {
+  await new Promise((resolve) => setTimeout(resolve, 2_500));
+}
 if (mode === "malformed") {
   process.stdout.write('{"credential":"SECRET-TARGET-OUTPUT"');
   process.exit(0);
@@ -544,6 +552,32 @@ test("provides runner-owned scratch storage to every target invocation", async (
   const result = await runRunner({
     targetCommand: target,
     env: { COVEN_TEST_TARGET_MODE: "require-runner-scratch" },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("allows the stateful startup wake suite to use its synchronization budget", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  const target = await writeTarget(directory);
+  const job = validJob({
+    suites: [
+      {
+        profile: "scheduler_reliability",
+        suiteId: "startup-reconciliation-wake",
+        vector: {
+          schemaVersion: "coven.automations.startup-reconciliation-wake-vectors.v1",
+          cases: [],
+        },
+      },
+    ],
+  });
+  job.runner.vectorSetSha256 = sha256(canonicalize(job.suites));
+
+  const result = await runRunner({
+    job,
+    targetCommand: target,
+    env: { COVEN_TEST_TARGET_MODE: "slow-stateful-suite" },
   });
 
   assert.equal(result.status, 0, result.stderr);

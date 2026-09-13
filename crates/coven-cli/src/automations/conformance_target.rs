@@ -3017,8 +3017,9 @@ impl SchedulerWaitHandshake {
         if self.observations.fetch_add(1, Ordering::SeqCst) != 0 {
             return;
         }
-        if self.ready.send(()).is_err() {
-            return;
+        match self.ready.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => return,
         }
         let _ = self
             .release
@@ -4141,5 +4142,34 @@ mod scheduler_conformance_runtime_tests {
             });
         assert!(result.is_ok());
         assert_eq!(runtime.launches.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn wait_observation_does_not_block_when_readiness_is_no_longer_consumed() {
+        let (ready_tx, _ready_rx) = sync_channel(1);
+        ready_tx.send(()).unwrap();
+        let (release_tx, release_rx) = sync_channel(1);
+        release_tx.send(()).unwrap();
+        let handshake = Arc::new(SchedulerWaitHandshake {
+            ready: ready_tx,
+            release: Mutex::new(release_rx),
+            observations: AtomicUsize::new(0),
+        });
+        let (finished_tx, finished_rx) = sync_channel(1);
+
+        std::thread::spawn(move || {
+            handshake.observe();
+            let _ = finished_tx.send(());
+        });
+
+        let started_at = StdInstant::now();
+        finished_rx
+            .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "late wait observation did not complete within the hang guard after {:?}: {error}",
+                    started_at.elapsed()
+                )
+            });
     }
 }
