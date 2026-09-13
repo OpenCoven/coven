@@ -276,7 +276,9 @@ jobs:
           COVEN_THREADS_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           "COVEN_THREADS_E2E_ARTIFACT_ROOT=$env:COVEN_THREADS_E2E_ARTIFACT_ROOT" >> $env:GITHUB_ENV
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The manual Windows release-stress job owns cache writes. Post-job
+      # packing must not consume this acceptance job's remaining test budget.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
