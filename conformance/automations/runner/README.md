@@ -124,6 +124,7 @@ The checked-in
 [`attempt-terminal-immutability.vectors.json`](attempt-terminal-immutability.vectors.json),
 [`capability-negotiation.vectors.json`](capability-negotiation.vectors.json),
 [`calendar-schedule-resolution.vectors.json`](calendar-schedule-resolution.vectors.json),
+[`cancellation-timeout-arbitration.vectors.json`](cancellation-timeout-arbitration.vectors.json),
 [`command-adoption-idempotency.vectors.json`](command-adoption-idempotency.vectors.json),
 [`definition-lifecycle-transitions.vectors.json`](definition-lifecycle-transitions.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
@@ -170,6 +171,7 @@ The runner invokes the target directly without a shell.
       "profile": "scheduler_reliability",
       "suites": [
         "calendar-schedule-resolution",
+        "cancellation-timeout-arbitration",
         "misfire-latest-planning",
         "occurrence-lease-recovery",
         "overlap-forbid-claiming",
@@ -189,7 +191,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements ten structural suites and eight
+The native Coven target currently implements ten structural suites and nine
 scheduler-reliability suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -217,6 +219,12 @@ schedules, weekly weekday selection, winter and summer offsets, skipped DST
 gaps, deterministic selection of the first DST-fold occurrence, leap-day,
 month, and year boundaries, and fail-closed refusal of unresolved `local`
 timezones.
+`cancellation-timeout-arbitration` executes two synchronized races through the
+production cancellation and timeout stop-fence paths. It proves that an
+in-flight cancellation prevents timeout from issuing a duplicate runtime stop,
+that an in-flight timeout rejects a stale cancellation executor, that each race
+issues exactly one runtime stop, and that replay plus durable run, occurrence,
+attempt, and cancellation states preserve the winning authority.
 `misfire-latest-planning` executes fixed virtual-time cases through the
 production occurrence planner. It proves that downtime collapses daily work to
 the latest due slot, exact replay is idempotent, a clock rollback does not add

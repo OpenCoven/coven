@@ -16,6 +16,9 @@ const COMMAND_ADOPTION_IDEMPOTENCY_VECTORS: &str = include_str!(
 const CALENDAR_SCHEDULE_RESOLUTION_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/calendar-schedule-resolution.vectors.json"
 );
+const CANCELLATION_TIMEOUT_ARBITRATION_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/cancellation-timeout-arbitration.vectors.json"
+);
 const DEFINITION_LIFECYCLE_TRANSITIONS_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/definition-lifecycle-transitions.vectors.json"
 );
@@ -110,6 +113,7 @@ fn capability_advertises_the_native_structural_suites() {
                     "profile": "scheduler_reliability",
                     "suites": [
                         CALENDAR_SCHEDULE_RESOLUTION_SUITE,
+                        "cancellation-timeout-arbitration",
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
                         OVERLAP_FORBID_CLAIMING_SUITE,
@@ -121,6 +125,81 @@ fn capability_advertises_the_native_structural_suites() {
                 }
             ]
         })
+    );
+}
+
+#[test]
+fn cancellation_timeout_arbitration_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(CANCELLATION_TIMEOUT_ARBITRATION_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "cancellation-timeout-arbitration",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 2);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 2);
+}
+
+#[test]
+fn cancellation_timeout_arbitration_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value =
+        serde_json::from_str(CANCELLATION_TIMEOUT_ARBITRATION_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["runtimeStopCount"] = json!(2);
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "cancellation-timeout-arbitration",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn cancellation_timeout_arbitration_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 11] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
+        |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
+        |vectors| vectors["cases"][0]["cancellationAt"] = json!("not-a-time"),
+        |vectors| vectors["cases"][0]["timeoutAt"] = vectors["cases"][0]["cancellationAt"].clone(),
+        |vectors| {
+            vectors["cases"][0]["timeoutObservedAt"] = vectors["cases"][0]["timeoutAt"].clone()
+        },
+        |vectors| vectors["cases"][0]["expected"]["cancellationOutcome"] = json!("cancel_pending"),
+        |vectors| vectors["cases"][1]["expected"]["competingOutcome"] = json!("deferred"),
+        |vectors| vectors["cases"][0]["expected"]["runtimeStopCount"] = json!(0),
+        |vectors| vectors["cases"][1]["unexpected"] = json!(true),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value =
+            serde_json::from_str(CANCELLATION_TIMEOUT_ARBITRATION_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                "cancellation-timeout-arbitration",
+                vectors,
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn cancellation_timeout_arbitration_suite_requires_scheduler_profile() {
+    let vectors: Value = serde_json::from_str(CANCELLATION_TIMEOUT_ARBITRATION_VECTORS).unwrap();
+    assert_eq!(
+        evaluate(&request_for("cancellation-timeout-arbitration", vectors)).unwrap_err(),
+        "conformance suite is unsupported"
     );
 }
 

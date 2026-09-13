@@ -664,6 +664,26 @@ pub fn execute_run_cancellation(
     body: Value,
     now: DateTime<Utc>,
 ) -> Result<CancellationExecution, String> {
+    execute_run_cancellation_with_stop_fence_time(conn, runtime, body, now, None)
+}
+
+pub(crate) fn execute_run_cancellation_at_stop_fence(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+    stop_fence_at: DateTime<Utc>,
+) -> Result<CancellationExecution, String> {
+    execute_run_cancellation_with_stop_fence_time(conn, runtime, body, now, Some(stop_fence_at))
+}
+
+fn execute_run_cancellation_with_stop_fence_time(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+    stop_fence_at: Option<DateTime<Utc>>,
+) -> Result<CancellationExecution, String> {
     let digest = sha256_hex(
         &canonicalize(&body)
             .map_err(|error| format!("failed to canonicalize cancellation request: {error:#}"))?,
@@ -739,7 +759,7 @@ pub fn execute_run_cancellation(
             return Ok(CancellationExecution::Rejected(error));
         }
     };
-    execute_reserved_cancellation(conn, runtime, reservation, now, false)
+    execute_reserved_cancellation(conn, runtime, reservation, now, false, stop_fence_at)
 }
 
 fn execute_reserved_cancellation(
@@ -748,6 +768,7 @@ fn execute_reserved_cancellation(
     reservation: ReservedCancellation,
     now: DateTime<Utc>,
     replayed: bool,
+    stop_fence_at: Option<DateTime<Utc>>,
 ) -> Result<CancellationExecution, String> {
     if let Some(replay) =
         load_adopted_response(conn, &reservation.request.adoption_key, &reservation.digest)?
@@ -785,7 +806,7 @@ fn execute_reserved_cancellation(
         }));
     }
     before_stop_fence_test_hook();
-    let claim_now = stop_fence_clock();
+    let claim_now = stop_fence_at.unwrap_or_else(stop_fence_clock);
     if reserved_deadline_expired(conn, &reservation, claim_now)? {
         let error = illegal_transition_error(
             "the targeted automation run reached its timeout before cancellation",
@@ -1063,7 +1084,7 @@ pub(crate) fn reconcile_expired_cancellations(
             reconciled += 1;
             continue;
         }
-        execute_reserved_cancellation(conn, runtime, reservation, now, true)?;
+        execute_reserved_cancellation(conn, runtime, reservation, now, true, None)?;
         reconciled += 1;
     }
     Ok(reconciled)
