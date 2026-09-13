@@ -1072,6 +1072,13 @@ enum AutomationsConformanceCommand {
     Capability,
     #[command(about = "Evaluate one conformance suite request from standard input")]
     Evaluate,
+    #[command(hide = true, name = "scheduler-leadership-probe")]
+    SchedulerLeadershipProbe {
+        #[arg(long, hide = true)]
+        home: PathBuf,
+        #[arg(long, hide = true)]
+        at: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3689,6 +3696,13 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
                     .map_err(|_| anyhow!("conformance request is invalid"))?;
                 let response = automations::conformance_target::evaluate(&request)
                     .map_err(|message| anyhow!(message))?;
+                println!("{}", serde_json::to_string(&response)?);
+                Ok(())
+            }
+            AutomationsConformanceCommand::SchedulerLeadershipProbe { home, at } => {
+                let response =
+                    automations::conformance_target::scheduler_leadership_probe(&home, &at)
+                        .map_err(|message| anyhow!(message))?;
                 println!("{}", serde_json::to_string(&response)?);
                 Ok(())
             }
@@ -6320,6 +6334,24 @@ mod tests {
             Some(Command::Automations {
                 command: AutomationsCommand::Conformance {
                     command: AutomationsConformanceCommand::Evaluate
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from([
+                "coven",
+                "automations",
+                "conformance",
+                "scheduler-leadership-probe",
+                "--home",
+                "/tmp/coven-automations-leadership-fixture",
+                "--at",
+                "2026-09-03T12:00:01.000Z"
+            ])
+            .command,
+            Some(Command::Automations {
+                command: AutomationsCommand::Conformance {
+                    command: AutomationsConformanceCommand::SchedulerLeadershipProbe { .. }
                 }
             })
         ));
