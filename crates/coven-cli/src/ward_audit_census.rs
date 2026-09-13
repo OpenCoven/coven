@@ -890,6 +890,103 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn canonical_pending_and_claim_names_are_observed_without_a_familiar_prefix() -> Result<()> {
+        let (home, conn) = store()?;
+        let id = Uuid::new_v4().to_string();
+        append(
+            &conn,
+            &id,
+            "proposal_window_opened",
+            Some(&opening()?),
+            "sage",
+        )?;
+        let pending = home.path().join("pending");
+        fs::create_dir(&pending)?;
+        for prefix in ["", "sage-"] {
+            for suffix in ["", ".approve.deciding", ".reject.deciding", ".unknown"] {
+                let path = pending.join(format!("{prefix}{id}.json{suffix}"));
+                fs::write(&path, "unverified proposal candidate")?;
+                let report = load(home.path(), 100)?;
+                let window = &report.windows[0];
+                if suffix == ".unknown" {
+                    assert!(
+                        matches!(window.classification, Classification::UntrustedArtifacts),
+                        "{report:?}"
+                    );
+                    assert_eq!(window.artifacts.untrusted, 1);
+                } else {
+                    assert!(
+                        matches!(window.classification, Classification::OpenUnverified),
+                        "{report:?}"
+                    );
+                    assert_eq!(window.artifacts.pending, usize::from(suffix.is_empty()));
+                    assert_eq!(window.artifacts.claims, usize::from(!suffix.is_empty()));
+                }
+                assert_eq!(report.unattributed_artifact_entries, 0);
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn apply_intents_must_follow_the_opening_and_precede_any_terminal() -> Result<()> {
+        for order in ["before", "after", "between"] {
+            let (home, conn) = store()?;
+            let id = Uuid::new_v4().to_string();
+            let intent = || -> Result<()> {
+                conn.execute(
+                    "INSERT INTO ward_audit (
+                        event_type, proposal_id, familiar_id, ward_hash, decision,
+                        files_touched, submitted_at, decided_at
+                     ) VALUES ('validation_verdict', ?1, 'sage', X'00',
+                               'proposal-apply-intent', '[]',
+                               '2026-09-13T00:00:00Z', '2026-09-13T00:05:00Z')",
+                    [&id],
+                )?;
+                Ok(())
+            };
+            if order == "before" {
+                intent()?;
+            }
+            append(
+                &conn,
+                &id,
+                "proposal_window_opened",
+                Some(&opening()?),
+                "sage",
+            )?;
+            if order == "between" {
+                intent()?;
+            }
+            let (event, detail) = close(WindowCloseReason::Applied)?;
+            append(&conn, &id, &event, Some(&detail), "sage")?;
+            if order == "after" {
+                intent()?;
+            }
+            let report = load(home.path(), 100)?;
+            if order == "between" {
+                assert!(
+                    matches!(
+                        report.windows[0].classification,
+                        Classification::TypedTerminalRecorded
+                    ),
+                    "{report:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        report.windows[0].classification,
+                        Classification::InconsistentHistory
+                    ),
+                    "{report:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlinked_pending_directory_is_not_followed() -> Result<()> {
