@@ -81,6 +81,7 @@ mod theme;
 mod threads_clock;
 mod tui;
 mod verification;
+mod ward_audit_census;
 mod ward_identity;
 mod ward_probes;
 // Wired into the daemon router via `POST /familiars/{id}/edits` (api.rs);
@@ -1236,6 +1237,14 @@ enum WardCommand {
         #[arg(long, help = "Print the ledger as JSON (machine-readable)")]
         json: bool,
     },
+    #[command(about = "Inventory all opened audit windows without repair or authorization")]
+    AuditCensus {
+        #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=100_000),
+              help = "Fail rather than truncate above this many relevant audit rows")]
+        max_audit_rows: u32,
+        #[arg(long, help = "Print the complete audit-only census as JSON")]
+        json: bool,
+    },
     #[command(about = "Migrate Ward v0.1 ward.toml files to Phase-2 WardConfig")]
     Migrate {
         #[arg(long, value_name = "ID", help = "Only migrate the named familiar")]
@@ -1404,6 +1413,11 @@ fn main() -> Result<()> {
         &cli.command,
         Some(Command::Automations {
             command: AutomationsCommand::Conformance { .. }
+        })
+    ) || matches!(
+        &cli.command,
+        Some(Command::Ward {
+            command: WardCommand::AuditCensus { .. }
         })
     ) {
         return run_cli(cli);
@@ -4228,6 +4242,12 @@ fn run_ward_command(command: WardCommand) -> Result<()> {
             json,
         } => {
             return observe::run_ward_audit(&familiar, limit, event.as_deref(), json);
+        }
+        WardCommand::AuditCensus {
+            max_audit_rows,
+            json,
+        } => {
+            return ward_audit_census::run(&coven_home_dir()?, max_audit_rows, json);
         }
         WardCommand::Migrate {
             familiar,
