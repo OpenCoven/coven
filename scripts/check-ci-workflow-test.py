@@ -154,7 +154,11 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", CI_TEXT)
 
     def test_all_platforms_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
-        command = "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock"
+        command = (
+            "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock "
+            "--test threads_identity_invariants --test threads_protected_intake "
+            "--test threads_terminal_recovery --no-fail-fast"
+        )
         for job, next_job in [
             ("rust-test-linux", "rust-test-windows"),
             ("rust-test-windows", "rust-test-macos"),
