@@ -1,0 +1,42 @@
+{
+  "schemaVersion": "coven.automations.scheduler-leadership-fencing-vectors.v1",
+  "cases": [
+    {
+      "caseId": "concurrent-leader-is-refused",
+      "scenario": "exclusive_acquisition",
+      "firstAcquiredAt": "2026-09-03T12:00:00.000Z",
+      "secondAttemptAt": "2026-09-03T12:00:00.000Z",
+      "expected": {
+        "outcome": "second_acquisition_refused",
+        "firstGeneration": 1,
+        "firstFenceCurrent": true
+      }
+    },
+    {
+      "caseId": "restart-advances-generation",
+      "scenario": "restart_advances_generation",
+      "firstAcquiredAt": "2026-09-03T12:00:00.000Z",
+      "secondAttemptAt": "2026-09-03T12:00:01.000Z",
+      "expected": {
+        "outcome": "generation_advanced",
+        "firstGeneration": 1,
+        "secondGeneration": 2,
+        "firstFenceCurrent": false,
+        "secondFenceCurrent": true
+      }
+    },
+    {
+      "caseId": "stale-fence-cannot-tick",
+      "scenario": "stale_fence_rejected",
+      "firstAcquiredAt": "2026-09-03T12:00:00.000Z",
+      "secondAttemptAt": "2026-09-03T12:00:01.000Z",
+      "expected": {
+        "outcome": "stale_tick_rejected",
+        "firstGeneration": 1,
+        "secondGeneration": 2,
+        "staleTickRejected": true,
+        "currentTickAccepted": true
+      }
+    }
+  ]
+}
