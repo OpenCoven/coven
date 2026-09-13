@@ -31,6 +31,8 @@ const OCCURRENCE_LEASE_RECOVERY_VECTORS: &str = include_str!(
 );
 const OVERLAP_FORBID_CLAIMING_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/overlap-forbid-claiming.vectors.json");
+const RETRY_BACKOFF_TIMING_VECTORS: &str =
+    include_str!("../../../../conformance/automations/runner/retry-backoff-timing.vectors.json");
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
@@ -101,7 +103,8 @@ fn capability_advertises_the_native_structural_suites() {
                         CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
-                        OVERLAP_FORBID_CLAIMING_SUITE
+                        OVERLAP_FORBID_CLAIMING_SUITE,
+                        "retry-backoff-timing"
                     ]
                 }
             ]
@@ -335,6 +338,75 @@ fn overlap_forbid_claiming_suite_requires_scheduler_profile() {
     let vectors: Value = serde_json::from_str(OVERLAP_FORBID_CLAIMING_VECTORS).unwrap();
     assert_eq!(
         evaluate(&request_for(OVERLAP_FORBID_CLAIMING_SUITE, vectors)).unwrap_err(),
+        "conformance suite is unsupported"
+    );
+}
+
+#[test]
+fn retry_backoff_timing_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(RETRY_BACKOFF_TIMING_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "retry-backoff-timing",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 5);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 5);
+}
+
+#[test]
+fn retry_backoff_timing_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(RETRY_BACKOFF_TIMING_VECTORS).unwrap();
+    vectors["cases"][2]["expected"]["delaySeconds"] = json!(1);
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "retry-backoff-timing",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn retry_backoff_timing_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 9] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
+        |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
+        |vectors| vectors["cases"][0]["observedAt"] = json!("not-a-time"),
+        |vectors| vectors["cases"][0]["nextAttemptNumber"] = json!(1),
+        |vectors| vectors["cases"][1]["policy"]["backoffSeconds"] = Value::Null,
+        |vectors| vectors["cases"][2]["policy"]["backoffPolicy"] = json!("fixed"),
+        |vectors| vectors["cases"][4]["expected"]["minimumDelaySeconds"] = json!(90000),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(RETRY_BACKOFF_TIMING_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                "retry-backoff-timing",
+                vectors,
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn retry_backoff_timing_suite_requires_scheduler_profile() {
+    let vectors: Value = serde_json::from_str(RETRY_BACKOFF_TIMING_VECTORS).unwrap();
+    assert_eq!(
+        evaluate(&request_for("retry-backoff-timing", vectors)).unwrap_err(),
         "conformance suite is unsupported"
     );
 }

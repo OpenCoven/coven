@@ -132,6 +132,7 @@ The checked-in
 [`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
 [`occurrence-lease-recovery.vectors.json`](occurrence-lease-recovery.vectors.json),
 [`overlap-forbid-claiming.vectors.json`](overlap-forbid-claiming.vectors.json),
+[`retry-backoff-timing.vectors.json`](retry-backoff-timing.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -168,7 +169,8 @@ The runner invokes the target directly without a shell.
         "calendar-schedule-resolution",
         "misfire-latest-planning",
         "occurrence-lease-recovery",
-        "overlap-forbid-claiming"
+        "overlap-forbid-claiming",
+        "retry-backoff-timing"
       ]
     }
   ]
@@ -181,7 +183,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements ten structural suites and four
+The native Coven target currently implements ten structural suites and five
 scheduler-reliability suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -222,6 +224,14 @@ lease timeout alone.
 production atomic occurrence claim path. It proves that claimed or running
 occurrences and an independently running run block new work, while succeeded,
 failed, and cancelled occurrences release overlap capacity.
+`retry-backoff-timing` executes fixed virtual-time cases through the production
+retry timing primitive used by rejected-launch and lease-expiry recovery. It
+proves immediate and fixed delays are measured from failure observation,
+exponential full-jitter ceilings grow by attempt, deterministic replay is
+stable for one run and attempt, and the ceiling is capped at one day.
+Exponential vectors pin the scheduled delay derived from the first eight bytes
+of `BLAKE3("<runId>:<nextAttemptNumber>")`, interpreted as an unsigned
+big-endian integer and mapped to `1..=ceiling` with modulo arithmetic.
 `occurrence-fence-uniqueness` executes a portable three-case matrix against the
 production SQLite occurrence schema, proving that one automation cannot claim
 the same scheduled slot twice while different automations may share a slot and

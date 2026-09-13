@@ -46,6 +46,8 @@ const OCCURRENCE_LEASE_RECOVERY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-lease-recovery-vectors.v1";
 const OVERLAP_FORBID_CLAIMING_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.overlap-forbid-claiming-vectors.v1";
+const RETRY_BACKOFF_TIMING_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.retry-backoff-timing-vectors.v1";
 const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
@@ -68,6 +70,7 @@ pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const MISFIRE_LATEST_PLANNING_SUITE: &str = "misfire-latest-planning";
 pub const OCCURRENCE_LEASE_RECOVERY_SUITE: &str = "occurrence-lease-recovery";
 pub const OVERLAP_FORBID_CLAIMING_SUITE: &str = "overlap-forbid-claiming";
+pub const RETRY_BACKOFF_TIMING_SUITE: &str = "retry-backoff-timing";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -711,6 +714,88 @@ struct ExpectedOverlapForbidClaim {
     lease_expires_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryBackoffTimingVectorSet {
+    schema_version: String,
+    cases: Vec<RetryBackoffTimingVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryBackoffTimingVectorCase {
+    case_id: String,
+    scenario: RetryBackoffTimingScenario,
+    policy: Value,
+    run_id: String,
+    next_attempt_number: u8,
+    observed_at: String,
+    expected: ExpectedRetryBackoffTiming,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RetryBackoffTimingScenario {
+    NoneImmediate,
+    FixedFromObservation,
+    ExponentialAttemptTwo,
+    ExponentialAttemptFour,
+    ExponentialOneDayCap,
+}
+
+impl RetryBackoffTimingScenario {
+    const COUNT: usize = 5;
+
+    fn matches_input(
+        self,
+        policy: &super::definition::RoutineRetryPolicy,
+        next_attempt_number: u8,
+    ) -> bool {
+        use super::contract::types::BackoffPolicy;
+
+        match self {
+            Self::NoneImmediate => {
+                policy.backoff_policy == BackoffPolicy::None
+                    && policy.backoff_seconds.is_none()
+                    && next_attempt_number == 2
+            }
+            Self::FixedFromObservation => {
+                policy.backoff_policy == BackoffPolicy::Fixed
+                    && policy.backoff_seconds.is_some()
+                    && next_attempt_number == 2
+            }
+            Self::ExponentialAttemptTwo => {
+                policy.backoff_policy == BackoffPolicy::Exponential
+                    && policy.backoff_seconds.is_some()
+                    && next_attempt_number == 2
+            }
+            Self::ExponentialAttemptFour => {
+                policy.backoff_policy == BackoffPolicy::Exponential
+                    && policy.backoff_seconds.is_some()
+                    && next_attempt_number == 4
+            }
+            Self::ExponentialOneDayCap => {
+                policy.backoff_policy == BackoffPolicy::Exponential
+                    && policy
+                        .backoff_seconds
+                        .is_some_and(|seconds| seconds > 43_200)
+                    && next_attempt_number == 3
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedRetryBackoffTiming {
+    delay_seconds: u32,
+    minimum_delay_seconds: u32,
+    maximum_delay_seconds: u32,
+    ceiling_seconds: u32,
+    not_before: String,
+    deterministic: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OverlapTargetState {
@@ -1000,6 +1085,7 @@ pub fn capability() -> TargetCapability {
                     MISFIRE_LATEST_PLANNING_SUITE,
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
                     OVERLAP_FORBID_CLAIMING_SUITE,
+                    RETRY_BACKOFF_TIMING_SUITE,
                 ],
             },
         ],
@@ -1056,6 +1142,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, OVERLAP_FORBID_CLAIMING_SUITE) => {
             evaluate_overlap_forbid_claiming(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RETRY_BACKOFF_TIMING_SUITE) => {
+            evaluate_retry_backoff_timing(&request.vector)?
         }
         _ => return Err("conformance suite is unsupported"),
     };
@@ -1991,6 +2080,91 @@ fn overlap_forbid_claiming_case_matches(
             && observed.2 == case.expected.lease_owner
             && observed.3 == case.expected.lease_expires_at,
     )
+}
+
+fn evaluate_retry_backoff_timing(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: RetryBackoffTimingVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != RETRY_BACKOFF_TIMING_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != RetryBackoffTimingScenario::COUNT
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    let mut validated = Vec::with_capacity(vectors.cases.len());
+    for (case_index, case) in vectors.cases.iter().enumerate() {
+        let definition = super::definition::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": format!("retry-conformance-{case_index}"),
+            "name": "Retry backoff timing conformance",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "retry": case.policy,
+            "runtime": "coven-code",
+            "prompt": "Run the retry backoff timing conformance probe.",
+            "tags": []
+        }))
+        .map_err(|_| "conformance vector is invalid")?;
+        let observed_at =
+            canonical_timestamp(&case.observed_at).ok_or("conformance vector is invalid")?;
+        let expected_not_before = canonical_timestamp(&case.expected.not_before)
+            .ok_or("conformance vector is invalid")?;
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || !valid_case_id(&case.run_id)
+            || case.next_attempt_number < 2
+            || case.next_attempt_number > definition.retry.max_attempts
+            || definition.retry.retryable_classes.is_empty()
+            || !case
+                .scenario
+                .matches_input(&definition.retry, case.next_attempt_number)
+            || case.expected.minimum_delay_seconds > case.expected.maximum_delay_seconds
+            || case.expected.delay_seconds < case.expected.minimum_delay_seconds
+            || case.expected.delay_seconds > case.expected.maximum_delay_seconds
+            || case.expected.maximum_delay_seconds > 86_400
+        {
+            return Err("conformance vector is invalid");
+        }
+        validated.push((definition.retry, observed_at, expected_not_before));
+    }
+    if scenarios.len() != RetryBackoffTimingScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut passed_cases = 0;
+    for (case, (policy, observed_at, expected_not_before)) in vectors.cases.iter().zip(validated) {
+        let first = super::runner::retry_backoff_timing(
+            &policy,
+            &case.run_id,
+            case.next_attempt_number,
+            observed_at,
+        );
+        let replay = super::runner::retry_backoff_timing(
+            &policy,
+            &case.run_id,
+            case.next_attempt_number,
+            observed_at,
+        );
+        let deterministic = first == replay;
+        passed_cases += usize::from(
+            first.delay_seconds == case.expected.delay_seconds
+                && first.delay_seconds >= case.expected.minimum_delay_seconds
+                && first.delay_seconds <= case.expected.maximum_delay_seconds
+                && first.ceiling_seconds == case.expected.ceiling_seconds
+                && first.not_before
+                    == observed_at + Duration::seconds(i64::from(first.delay_seconds))
+                && first.not_before == expected_not_before
+                && deterministic == case.expected.deterministic,
+        );
+    }
+    Ok(passed_cases == vectors.cases.len())
 }
 
 fn evaluate_misfire_latest_planning(vector: &Value) -> Result<bool, &'static str> {

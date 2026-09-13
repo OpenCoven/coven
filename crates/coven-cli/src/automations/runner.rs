@@ -1003,12 +1003,8 @@ fn settle_rejected_launch(
         .map_err(|error| format!("failed to inspect retry run deadline: {error}"))?;
     if retryable && attempt_number < definition.retry.max_attempts && retry_deadline_open {
         let next_attempt_number = attempt_number + 1;
-        let retry_at = now
-            + chrono::Duration::seconds(i64::from(retry_delay_seconds(
-                &definition.retry,
-                run_id,
-                next_attempt_number,
-            )));
+        let retry_at =
+            retry_backoff_timing(&definition.retry, run_id, next_attempt_number, now).not_before;
         let retry_at_iso = retry_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         transaction
             .execute(
@@ -1498,14 +1494,31 @@ fn attempt_has_authority(
     .map_err(|error| format!("failed to inspect automation attempt authority: {error}"))
 }
 
-fn retry_delay_seconds(policy: &RoutineRetryPolicy, run_id: &str, next_attempt_number: u8) -> u32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RetryBackoffTiming {
+    pub delay_seconds: u32,
+    pub ceiling_seconds: u32,
+    pub not_before: DateTime<Utc>,
+}
+
+fn retry_delay_ceiling_seconds(policy: &RoutineRetryPolicy, next_attempt_number: u8) -> u32 {
     match policy.backoff_policy {
         BackoffPolicy::None => 0,
         BackoffPolicy::Fixed => policy.backoff_seconds.unwrap_or(1),
         BackoffPolicy::Exponential => {
             let base = policy.backoff_seconds.unwrap_or(1);
             let exponent = u32::from(next_attempt_number.saturating_sub(2)).min(16);
-            let ceiling = base.saturating_mul(1_u32 << exponent).min(86_400);
+            base.saturating_mul(1_u32 << exponent).min(86_400)
+        }
+    }
+}
+
+fn retry_delay_seconds(policy: &RoutineRetryPolicy, run_id: &str, next_attempt_number: u8) -> u32 {
+    let ceiling = retry_delay_ceiling_seconds(policy, next_attempt_number);
+    match policy.backoff_policy {
+        BackoffPolicy::None => 0,
+        BackoffPolicy::Fixed => ceiling,
+        BackoffPolicy::Exponential => {
             let digest = blake3::hash(format!("{run_id}:{next_attempt_number}").as_bytes());
             let sample = u64::from_be_bytes(
                 digest.as_bytes()[..8]
@@ -1515,6 +1528,21 @@ fn retry_delay_seconds(policy: &RoutineRetryPolicy, run_id: &str, next_attempt_n
             u32::try_from(sample % u64::from(ceiling) + 1)
                 .expect("retry delay is bounded to one day")
         }
+    }
+}
+
+pub(super) fn retry_backoff_timing(
+    policy: &RoutineRetryPolicy,
+    run_id: &str,
+    next_attempt_number: u8,
+    observed_at: DateTime<Utc>,
+) -> RetryBackoffTiming {
+    let ceiling_seconds = retry_delay_ceiling_seconds(policy, next_attempt_number);
+    let delay_seconds = retry_delay_seconds(policy, run_id, next_attempt_number);
+    RetryBackoffTiming {
+        delay_seconds,
+        ceiling_seconds,
+        not_before: observed_at + chrono::Duration::seconds(i64::from(delay_seconds)),
     }
 }
 
@@ -1776,12 +1804,8 @@ fn retry_proven_preownership_lease_expiry_in(
     }
     if retries_lease_expiry && attempt_number < definition.retry.max_attempts {
         let next_attempt_number = attempt_number + 1;
-        let retry_at = now
-            + chrono::Duration::seconds(i64::from(retry_delay_seconds(
-                &definition.retry,
-                run_id,
-                next_attempt_number,
-            )));
+        let retry_at =
+            retry_backoff_timing(&definition.retry, run_id, next_attempt_number, now).not_before;
         let retry_at_iso = retry_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
             "INSERT INTO automation_attempts
