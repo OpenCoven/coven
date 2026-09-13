@@ -21,6 +21,98 @@ const BEFORE: &str = "before";
 const AFTER: &str = "after";
 
 #[test]
+#[cfg(feature = "threads-test-clock")]
+fn direct_identity_drift_at_commit_refuses_real_daemon_write() -> Result<()> {
+    run_journey(|fixture| {
+        configure_identity(fixture, true)?;
+        fs::create_dir_all(fixture.workspace.join("notes"))?;
+        fs::write(fixture.workspace.join(NOTE), BEFORE)?;
+        let control = fixture
+            .coven_home
+            .join("test-fixtures/threads-deterministic-clock");
+        fs::create_dir_all(&control)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&control, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(
+                control.parent().context("fixture root")?,
+                fs::Permissions::from_mode(0o700),
+            )?;
+        }
+        let capability = "synthetic-identity-commit-capability";
+        for (name, value) in [
+            ("capability", capability),
+            ("state.json", r#"{"now":"2026-09-13T00:00:00Z"}"#),
+            ("enabled", "threads_test_clock_v1"),
+            ("pause-final-commit", capability),
+        ] {
+            publish_identity_marker(&control.join(name), value)?;
+        }
+        std::thread::scope(|scope| -> Result<()> {
+            let current = &*fixture;
+            let request = scope.spawn(move || {
+                current.request(
+                    "POST",
+                    EDITS,
+                    Some(&json!({"edits":[{"target":NOTE,"contents":AFTER}]})),
+                )
+            });
+            let reached = control.join("pause-final-commit.reached");
+            let timeout = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while !reached.try_exists()? {
+                anyhow::ensure!(
+                    !request.is_finished(),
+                    "direct apply skipped the final-commit barrier"
+                );
+                anyhow::ensure!(
+                    std::time::Instant::now() < timeout,
+                    "direct commit barrier was not reached"
+                );
+                std::thread::yield_now();
+            }
+            let path = fixture.workspace.join("IDENTITY.md");
+            let original = fs::read_to_string(&path)?;
+            let revised = format!("{original}\n<!-- Synthetic source revision. -->\n");
+            fs::write(&path, &revised)?;
+            publish_identity_marker(&control.join("pause-final-commit.release"), capability)?;
+            let response = request
+                .join()
+                .map_err(|_| anyhow::anyhow!("direct request panicked"))??;
+            let actual = fs::read_to_string(fixture.workspace.join(NOTE))?;
+            eprintln!(
+                "direct identity final-commit response={response:?}; actual={actual:?}; applies={}",
+                audit_count(fixture, "apply_audit")?
+            );
+            assert_ne!(response.status, 200, "{response:?}");
+            assert_eq!(
+                response.body["error"]["details"]["writeApplied"], false,
+                "{response:?}"
+            );
+            assert_eq!(actual, BEFORE);
+            assert_eq!(fs::read_to_string(path)?, revised);
+            assert_no_write_authority(fixture)?;
+            assert_no_pending(fixture)?;
+            assert_no_reservations(fixture)?;
+            Ok(())
+        })?;
+        fixture.restart_daemon()?;
+        assert_eq!(fs::read_to_string(fixture.workspace.join(NOTE))?, BEFORE);
+        assert_note_applies(fixture)
+    })
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn publish_identity_marker(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut staged = tempfile::NamedTempFile::new_in(path.parent().context("marker parent")?)?;
+    staged.write_all(contents.as_bytes())?;
+    staged.as_file().sync_all()?;
+    staged.persist_noclobber(path)?;
+    Ok(())
+}
+
+#[test]
 fn active_identity_allows_public_tier_two_write_across_restart() -> Result<()> {
     run_journey(|fixture| {
         configure_identity(fixture, true)?;

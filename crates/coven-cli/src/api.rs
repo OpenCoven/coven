@@ -6237,6 +6237,7 @@ fn apply_familiar_edits(
     tests::output_auto_cases::run_ordinary_admission_hook();
     let apply_now = crate::threads_clock::now(coven_home)?;
     let mut final_routing_check = || {
+        pause_threads_final_commit_fixture(coven_home)?;
         anyhow::ensure!(
             !crate::output_format_auto::intercepts(&workspace, &config, &adjudication.decisions)?,
             "ordinary apply admission changed to configured output-format routing"
@@ -17099,6 +17100,10 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod identity_route_cases {
+        use super::*;
+        include!("api_identity_route_tests.rs");
+    }
     pub(super) mod output_auto_cases {
         use super::*;
         include!("api_output_auto_tests.rs");
