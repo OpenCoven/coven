@@ -754,6 +754,28 @@ pub fn handle_request_with_body(
     handle_request_with_runtime(method, path, coven_home, daemon, body, &NoopSessionRuntime)
 }
 
+pub(crate) fn handle_request_with_body_at(
+    method: &str,
+    path: &str,
+    coven_home: &Path,
+    daemon: Option<DaemonStatus>,
+    body: Option<&str>,
+    automation_recorded_at: &str,
+) -> Result<ApiResponse> {
+    handle_request_with_runtime_authority_and_automation_time(
+        method,
+        path,
+        coven_home,
+        daemon,
+        body,
+        &NoopSessionRuntime,
+        RequestExecutionContext {
+            authority: RequestAuthority::OwnerLocalIpc,
+            automation_recorded_at: Some(automation_recorded_at),
+        },
+    )
+}
+
 pub fn handle_request_with_runtime(
     method: &str,
     path: &str,
@@ -782,6 +804,38 @@ pub(crate) fn handle_request_with_runtime_and_authority(
     runtime: &dyn SessionRuntime,
     authority: RequestAuthority,
 ) -> Result<ApiResponse> {
+    handle_request_with_runtime_authority_and_automation_time(
+        method,
+        path,
+        coven_home,
+        daemon,
+        body,
+        runtime,
+        RequestExecutionContext {
+            authority,
+            automation_recorded_at: None,
+        },
+    )
+}
+
+struct RequestExecutionContext<'a> {
+    authority: RequestAuthority,
+    automation_recorded_at: Option<&'a str>,
+}
+
+fn handle_request_with_runtime_authority_and_automation_time(
+    method: &str,
+    path: &str,
+    coven_home: &Path,
+    daemon: Option<DaemonStatus>,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+    context: RequestExecutionContext<'_>,
+) -> Result<ApiResponse> {
+    let RequestExecutionContext {
+        authority,
+        automation_recorded_at,
+    } = context;
     let (route, query) = split_path_query(path);
     let route = match normalize_api_route(route) {
         ApiRoute::Route(route) => route,
@@ -852,7 +906,12 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
-            let (status, response) = control_plane::route_action(payload, &conn, runtime);
+            let (status, response) = match automation_recorded_at {
+                Some(recorded_at) => {
+                    control_plane::route_action_at(payload, &conn, runtime, recorded_at)
+                }
+                None => control_plane::route_action(payload, &conn, runtime),
+            };
             if status == 200
                 && response.accepted
                 && matches!(

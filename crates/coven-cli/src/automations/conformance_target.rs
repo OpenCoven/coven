@@ -1,4 +1,8 @@
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -26,6 +30,9 @@ use super::runs::{
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
 const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-request.v1";
 const SUITE_RESULT_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-result.v1";
+#[cfg(not(test))]
+const CONFORMANCE_SCRATCH_ENV: &str = "COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH";
+const SCHEDULER_CONFORMANCE_SYNC_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const CAPABILITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.capability-negotiation-vectors.v1";
 const CALENDAR_SCHEDULE_RESOLUTION_VECTOR_SCHEMA_VERSION: &str =
@@ -56,6 +63,10 @@ const SCHEDULER_LEADERSHIP_FENCING_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.scheduler-leadership-fencing-vectors.v1";
 const SCHEDULER_LEADERSHIP_FIRST_AT: &str = "2026-09-03T12:00:00.000Z";
 const SCHEDULER_LEADERSHIP_SECOND_AT: &str = "2026-09-03T12:00:01.000Z";
+const STARTUP_RECONCILIATION_WAKE_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.startup-reconciliation-wake-vectors.v1";
+const STARTUP_RECONCILIATION_CREATED_AT: &str = "2099-09-01T08:00:00.000Z";
+const STARTUP_RECONCILIATION_OBSERVED_AT: &str = "2099-09-03T12:00:00.000Z";
 const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
@@ -81,6 +92,7 @@ pub const OVERLAP_FORBID_CLAIMING_SUITE: &str = "overlap-forbid-claiming";
 pub const RETRY_BACKOFF_TIMING_SUITE: &str = "retry-backoff-timing";
 pub const RETRY_QUARANTINE_RECOVERY_SUITE: &str = "retry-quarantine-recovery";
 pub const SCHEDULER_LEADERSHIP_FENCING_SUITE: &str = "scheduler-leadership-fencing";
+pub const STARTUP_RECONCILIATION_WAKE_SUITE: &str = "startup-reconciliation-wake";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -969,7 +981,163 @@ impl ExpectedSchedulerLeadershipFencing {
             )
         )
     }
+}
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StartupReconciliationWakeVectorSet {
+    schema_version: String,
+    cases: Vec<StartupReconciliationWakeVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StartupReconciliationWakeVectorCase {
+    case_id: String,
+    scenario: StartupReconciliationWakeScenario,
+    definition: Value,
+    #[serde(default)]
+    revised_definition: Option<Value>,
+    #[serde(default)]
+    changed_at: Option<String>,
+    created_at: String,
+    observed_at: String,
+    expected: ExpectedStartupReconciliationWake,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StartupReconciliationWakeScenario {
+    StartupImmediateReconcile,
+    DefinitionChangeWake,
+}
+
+impl StartupReconciliationWakeScenario {
+    const COUNT: usize = 2;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedSchedulerPassTrigger {
+    Startup,
+    Deadline,
+    Wake,
+}
+
+impl ExpectedSchedulerPassTrigger {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Deadline => "deadline",
+            Self::Wake => "wake",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedWakeOccurrenceState {
+    Planned,
+    Running,
+    RecoveryRequired,
+}
+
+impl ExpectedWakeOccurrenceState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Running => "running",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedStartupReconciliationWake {
+    StartupReconciled {
+        #[serde(rename = "productionStartPath")]
+        production_start_path: bool,
+        #[serde(rename = "systemWaitObserved")]
+        system_wait_observed: bool,
+        #[serde(rename = "launchCount")]
+        launch_count: usize,
+        #[serde(rename = "launchedBeforeFirstWait")]
+        launched_before_first_wait: bool,
+        #[serde(rename = "lastPassTrigger")]
+        last_pass_trigger: ExpectedSchedulerPassTrigger,
+        #[serde(rename = "occurrenceState")]
+        occurrence_state: ExpectedWakeOccurrenceState,
+    },
+    DefinitionChangeWokeScheduler {
+        #[serde(rename = "productionStartPath")]
+        production_start_path: bool,
+        #[serde(rename = "systemWaitObserved")]
+        system_wait_observed: bool,
+        #[serde(rename = "actionAccepted")]
+        action_accepted: bool,
+        #[serde(rename = "wakeObserved")]
+        wake_observed: bool,
+        #[serde(rename = "launchCount")]
+        launch_count: usize,
+        #[serde(rename = "finalRevision")]
+        final_revision: u64,
+        #[serde(rename = "lastPassTrigger")]
+        last_pass_trigger: ExpectedSchedulerPassTrigger,
+        #[serde(rename = "occurrenceState")]
+        occurrence_state: ExpectedWakeOccurrenceState,
+    },
+}
+
+impl ExpectedStartupReconciliationWake {
+    fn matches_scenario(&self, scenario: StartupReconciliationWakeScenario) -> bool {
+        matches!(
+            (scenario, self),
+            (
+                StartupReconciliationWakeScenario::StartupImmediateReconcile,
+                Self::StartupReconciled { .. }
+            ) | (
+                StartupReconciliationWakeScenario::DefinitionChangeWake,
+                Self::DefinitionChangeWokeScheduler { .. }
+            )
+        )
+    }
+
+    fn is_non_vacuous(&self) -> bool {
+        match self {
+            Self::StartupReconciled {
+                production_start_path,
+                system_wait_observed,
+                launch_count,
+                launched_before_first_wait,
+                ..
+            } => {
+                *production_start_path
+                    && *system_wait_observed
+                    && *launch_count > 0
+                    && *launched_before_first_wait
+            }
+            Self::DefinitionChangeWokeScheduler {
+                production_start_path,
+                system_wait_observed,
+                action_accepted,
+                wake_observed,
+                launch_count,
+                final_revision,
+                ..
+            } => {
+                *production_start_path
+                    && *system_wait_observed
+                    && *action_accepted
+                    && *wake_observed
+                    && *launch_count > 0
+                    && *final_revision > 1
+            }
+        }
+    }
+}
+
+impl ExpectedSchedulerLeadershipFencing {
     fn generations_are_coherent(&self) -> bool {
         match self {
             Self::SecondAcquisitionRefused {
@@ -1281,6 +1449,7 @@ pub fn capability() -> TargetCapability {
                     RETRY_BACKOFF_TIMING_SUITE,
                     RETRY_QUARANTINE_RECOVERY_SUITE,
                     SCHEDULER_LEADERSHIP_FENCING_SUITE,
+                    STARTUP_RECONCILIATION_WAKE_SUITE,
                 ],
             },
         ],
@@ -1346,6 +1515,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, SCHEDULER_LEADERSHIP_FENCING_SUITE) => {
             evaluate_scheduler_leadership_fencing(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, STARTUP_RECONCILIATION_WAKE_SUITE) => {
+            evaluate_startup_reconciliation_wake(&request.vector)?
         }
         _ => return Err("conformance suite is unsupported"),
     };
@@ -2721,6 +2893,371 @@ fn scheduler_leadership_fencing_case_matches(
     }
 }
 
+fn evaluate_startup_reconciliation_wake(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: StartupReconciliationWakeVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != STARTUP_RECONCILIATION_WAKE_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != StartupReconciliationWakeScenario::COUNT
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let expected_created_at = canonical_timestamp(STARTUP_RECONCILIATION_CREATED_AT)
+        .ok_or("conformance vector is invalid")?;
+    let expected_observed_at = canonical_timestamp(STARTUP_RECONCILIATION_OBSERVED_AT)
+        .ok_or("conformance vector is invalid")?;
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        let definition = super::definition::RoutineDefinition::from_json(&case.definition)
+            .map_err(|_| "conformance vector is invalid")?;
+        let created_at =
+            canonical_timestamp(&case.created_at).ok_or("conformance vector is invalid")?;
+        let observed_at =
+            canonical_timestamp(&case.observed_at).ok_or("conformance vector is invalid")?;
+        let changed_at = case.changed_at.as_deref().and_then(canonical_timestamp);
+        let valid_definition = match case.scenario {
+            StartupReconciliationWakeScenario::StartupImmediateReconcile => {
+                definition.status == super::definition::RoutineStatus::Active
+                    && case.revised_definition.is_none()
+                    && case.changed_at.is_none()
+            }
+            StartupReconciliationWakeScenario::DefinitionChangeWake => {
+                let revised = case
+                    .revised_definition
+                    .as_ref()
+                    .ok_or("conformance vector is invalid")
+                    .and_then(|value| {
+                        super::definition::RoutineDefinition::from_json(value)
+                            .map_err(|_| "conformance vector is invalid")
+                    })?;
+                definition.status == super::definition::RoutineStatus::Paused
+                    && revised.status == super::definition::RoutineStatus::Active
+                    && revised.id == definition.id
+                    && changed_at.is_some_and(|changed_at| {
+                        created_at < changed_at && changed_at < observed_at
+                    })
+            }
+        };
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || created_at != expected_created_at
+            || observed_at != expected_observed_at
+            || created_at >= observed_at
+            || !valid_definition
+            || !case.expected.matches_scenario(case.scenario)
+            || !case.expected.is_non_vacuous()
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != StartupReconciliationWakeScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut passed_cases = 0;
+    for case in &vectors.cases {
+        passed_cases += usize::from(startup_reconciliation_wake_case_matches(case)?);
+    }
+    Ok(passed_cases == vectors.cases.len())
+}
+
+struct SchedulerConformanceRuntime {
+    launches: AtomicUsize,
+    started: SyncSender<()>,
+}
+
+impl SchedulerConformanceRuntime {
+    fn record_launch(&self) -> anyhow::Result<()> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        match self.started.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => Err(anyhow::anyhow!(
+                "scheduler conformance observer is unavailable"
+            )),
+        }
+    }
+}
+
+impl crate::api::SessionRuntime for SchedulerConformanceRuntime {
+    fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "scheduler conformance requires contained adoption"
+        ))
+    }
+
+    fn launch_contained_adopted_session(
+        &self,
+        _launch: &crate::api::SessionLaunch,
+        _writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        ownership_established()?;
+        self.record_launch()
+    }
+
+    fn send_input(&self, _session_id: &str, _payload: &Value) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct SchedulerWaitHandshake {
+    ready: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+    observations: AtomicUsize,
+}
+
+impl SchedulerWaitHandshake {
+    fn observe(&self) {
+        if self.observations.fetch_add(1, Ordering::SeqCst) != 0 {
+            return;
+        }
+        match self.ready.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => return,
+        }
+        let _ = self
+            .release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv();
+    }
+}
+
+struct SchedulerConformanceClock {
+    now: DateTime<Utc>,
+    system: super::daemon_tick::SystemAutomationClock,
+    waits: AtomicUsize,
+    first_reason: Mutex<Option<super::daemon_tick::WakeReason>>,
+}
+
+impl super::daemon_tick::AutomationClock for SchedulerConformanceClock {
+    fn now_utc(&self) -> DateTime<Utc> {
+        self.now
+    }
+
+    fn monotonic_now(&self) -> super::daemon_tick::MonotonicInstant {
+        super::daemon_tick::AutomationClock::monotonic_now(&self.system)
+    }
+
+    fn sleep_until_or_wake(
+        &self,
+        deadline: super::daemon_tick::MonotonicInstant,
+        wake: &super::daemon_tick::AutomationWakeSignal,
+        observed_generation: u64,
+    ) -> super::daemon_tick::WakeReason {
+        if self.waits.fetch_add(1, Ordering::SeqCst) != 0 {
+            return super::daemon_tick::WakeReason::Shutdown;
+        }
+        let reason = super::daemon_tick::AutomationClock::sleep_until_or_wake(
+            &self.system,
+            deadline,
+            wake,
+            observed_generation,
+        );
+        *self
+            .first_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+        reason
+    }
+}
+
+fn startup_reconciliation_wake_case_matches(
+    case: &StartupReconciliationWakeVectorCase,
+) -> Result<bool, &'static str> {
+    let scheduler_home = scheduler_conformance_tempdir()?;
+    crate::daemon::ensure_private_coven_home(scheduler_home.path())
+        .map_err(|_| "conformance suite execution failed")?;
+    let store_path = scheduler_home.path().join("coven.sqlite3");
+    let conn =
+        crate::store::open_store(&store_path).map_err(|_| "conformance suite execution failed")?;
+    let definition = super::definition::RoutineDefinition::from_json(&case.definition)
+        .map_err(|_| "conformance vector is invalid")?;
+    super::store::insert_definition(&conn, &definition)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute(
+        "UPDATE automation_definitions
+         SET created_at = ?1, updated_at = ?1
+         WHERE id = ?2",
+        params![&case.created_at, &definition.id],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    drop(conn);
+
+    let (started_tx, started_rx) = sync_channel(4);
+    let runtime = Arc::new(SchedulerConformanceRuntime {
+        launches: AtomicUsize::new(0),
+        started: started_tx,
+    });
+    let (wait_ready_tx, wait_ready_rx) = sync_channel(1);
+    let (wait_release_tx, wait_release_rx) = sync_channel(1);
+    let wait_handshake = Arc::new(SchedulerWaitHandshake {
+        ready: wait_ready_tx,
+        release: Mutex::new(wait_release_rx),
+        observations: AtomicUsize::new(0),
+    });
+    let observed_handshake = Arc::clone(&wait_handshake);
+    let clock = Arc::new(SchedulerConformanceClock {
+        now: canonical_timestamp(&case.observed_at).ok_or("conformance vector is invalid")?,
+        system: super::daemon_tick::SystemAutomationClock::with_wait_observer(Arc::new(
+            move || {
+                observed_handshake.observe();
+            },
+        )),
+        waits: AtomicUsize::new(0),
+        first_reason: Mutex::new(None),
+    });
+    let mut handle = super::daemon_tick::start_automations_scheduler_with_clock(
+        scheduler_home.path(),
+        runtime.clone(),
+        clock.clone(),
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+
+    let synchronization_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
+    let system_wait_observed = wait_ready_rx
+        .recv_timeout(synchronization_deadline.saturating_duration_since(StdInstant::now()))
+        .is_ok();
+    let launches_before_first_wait = runtime.launches.load(Ordering::SeqCst);
+    let _ = wait_release_tx.send(());
+    let mut action_accepted = false;
+    if case.scenario == StartupReconciliationWakeScenario::DefinitionChangeWake {
+        let revised_definition = case
+            .revised_definition
+            .as_ref()
+            .ok_or("conformance vector is invalid")?;
+        let body = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:definition-wake:0001",
+            "expectedRevision": 1,
+            "definition": revised_definition
+        })
+        .to_string();
+        let response = crate::api::handle_request_with_body_at(
+            "POST",
+            "/api/v1/actions",
+            scheduler_home.path(),
+            None,
+            Some(&body),
+            case.changed_at
+                .as_deref()
+                .ok_or("conformance vector is invalid")?,
+        );
+        action_accepted = response.as_ref().is_ok_and(|response| {
+            response.status == 200
+                && serde_json::from_str::<Value>(&response.body)
+                    .ok()
+                    .and_then(|body| body["accepted"].as_bool())
+                    == Some(true)
+        });
+        let _ = started_rx
+            .recv_timeout(synchronization_deadline.saturating_duration_since(StdInstant::now()));
+    }
+    if handle
+        .shutdown_and_join_until(synchronization_deadline)
+        .is_err()
+    {
+        let cleanup_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
+        if handle.shutdown_and_join_until(cleanup_deadline).is_err() {
+            std::mem::forget(handle);
+            std::mem::forget(scheduler_home);
+        }
+        return Err("conformance suite execution failed");
+    }
+
+    let first_wait_reason = *clock
+        .first_reason
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let wake_observed = first_wait_reason == Some(super::daemon_tick::WakeReason::Signaled);
+    let conn =
+        crate::store::open_store(&store_path).map_err(|_| "conformance suite execution failed")?;
+    let occurrence_state = conn
+        .query_row(
+            "SELECT state
+             FROM automation_occurrences
+             WHERE automation_id = ?1",
+            [&definition.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| "conformance suite execution failed")?;
+    let last_pass_trigger = conn
+        .query_row(
+            "SELECT trigger FROM automation_scheduler_last_pass WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| "conformance suite execution failed")?;
+    let revision = super::store::get_definition(&conn, &definition.id)
+        .map_err(|_| "conformance suite execution failed")?
+        .map(|record| record.revision);
+    let launches = runtime.launches.load(Ordering::SeqCst);
+    Ok(match &case.expected {
+        ExpectedStartupReconciliationWake::StartupReconciled {
+            production_start_path,
+            system_wait_observed: expected_system_wait,
+            launch_count,
+            launched_before_first_wait,
+            last_pass_trigger: expected_trigger,
+            occurrence_state: expected_state,
+        } => {
+            *production_start_path
+                && system_wait_observed == *expected_system_wait
+                && launches == *launch_count
+                && (launches_before_first_wait > 0) == *launched_before_first_wait
+                && last_pass_trigger.as_deref() == Some(expected_trigger.as_str())
+                && occurrence_state.as_deref() == Some(expected_state.as_str())
+        }
+        ExpectedStartupReconciliationWake::DefinitionChangeWokeScheduler {
+            production_start_path,
+            system_wait_observed: expected_system_wait,
+            action_accepted: expected_action_accepted,
+            wake_observed: expected_wake_observed,
+            launch_count,
+            final_revision,
+            last_pass_trigger: expected_trigger,
+            occurrence_state: expected_state,
+        } => {
+            *production_start_path
+                && system_wait_observed == *expected_system_wait
+                && launches_before_first_wait == 0
+                && action_accepted == *expected_action_accepted
+                && wake_observed == *expected_wake_observed
+                && launches == *launch_count
+                && revision == Some(*final_revision)
+                && last_pass_trigger.as_deref() == Some(expected_trigger.as_str())
+                && occurrence_state.as_deref() == Some(expected_state.as_str())
+        }
+    })
+}
+
+fn scheduler_conformance_tempdir() -> Result<tempfile::TempDir, &'static str> {
+    #[cfg(test)]
+    {
+        tempfile::Builder::new()
+            .prefix("coven-automations-conformance-")
+            .tempdir()
+            .map_err(|_| "conformance suite execution failed")
+    }
+    #[cfg(not(test))]
+    {
+        let scratch = std::env::var_os(CONFORMANCE_SCRATCH_ENV)
+            .ok_or("conformance suite execution failed")?;
+        tempfile::Builder::new()
+            .prefix("scheduler-home-")
+            .tempdir_in(scratch)
+            .map_err(|_| "conformance suite execution failed")
+    }
+}
+
 #[cfg(not(test))]
 fn scheduler_leadership_contender_acquired(
     scheduler_home: &std::path::Path,
@@ -3573,4 +4110,66 @@ fn valid_sha256_digest(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     })
+}
+
+#[cfg(test)]
+mod scheduler_conformance_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn launch_observation_does_not_block_when_the_notification_channel_is_full() {
+        let (started, _started_rx) = sync_channel(1);
+        let runtime = Arc::new(SchedulerConformanceRuntime {
+            launches: AtomicUsize::new(0),
+            started,
+        });
+        runtime.record_launch().unwrap();
+
+        let (finished_tx, finished_rx) = sync_channel(1);
+        let second_runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            let _ = finished_tx.send(second_runtime.record_launch());
+        });
+
+        let started_at = StdInstant::now();
+        let result = finished_rx
+            .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "launch observation did not complete within the hang guard after {:?}: {error}",
+                    started_at.elapsed()
+                )
+            });
+        assert!(result.is_ok());
+        assert_eq!(runtime.launches.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn wait_observation_does_not_block_when_readiness_is_no_longer_consumed() {
+        let (ready_tx, _ready_rx) = sync_channel(1);
+        ready_tx.send(()).unwrap();
+        let (release_tx, release_rx) = sync_channel(1);
+        release_tx.send(()).unwrap();
+        let handshake = Arc::new(SchedulerWaitHandshake {
+            ready: ready_tx,
+            release: Mutex::new(release_rx),
+            observations: AtomicUsize::new(0),
+        });
+        let (finished_tx, finished_rx) = sync_channel(1);
+
+        std::thread::spawn(move || {
+            handshake.observe();
+            let _ = finished_tx.send(());
+        });
+
+        let started_at = StdInstant::now();
+        finished_rx
+            .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "late wait observation did not complete within the hang guard after {:?}: {error}",
+                    started_at.elapsed()
+                )
+            });
+    }
 }
