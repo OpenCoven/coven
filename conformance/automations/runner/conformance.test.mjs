@@ -152,7 +152,7 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
 if (mode === "slow-stateful-suite") {
-  await new Promise((resolve) => setTimeout(resolve, 2_500));
+  await new Promise((resolve) => setTimeout(resolve, 8_500));
 }
 if (mode === "malformed") {
   process.stdout.write('{"credential":"SECRET-TARGET-OUTPUT"');
@@ -217,7 +217,7 @@ async function runRunner({
   const result = spawnSync(process.execPath, args, {
       encoding: "utf8",
       env: { ...process.env, ...env },
-      timeout: 10_000,
+      timeout: 30_000,
   });
   return result;
 }
