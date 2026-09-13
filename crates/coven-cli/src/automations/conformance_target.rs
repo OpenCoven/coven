@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,8 @@ const CAPABILITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.capability-negotiation-vectors.v1";
 const CALENDAR_SCHEDULE_RESOLUTION_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.calendar-schedule-resolution-vectors.v1";
+const CANCELLATION_TIMEOUT_ARBITRATION_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.cancellation-timeout-arbitration-vectors.v1";
 const COMMAND_ADOPTION_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.command-adoption-idempotency-vectors.v1";
 const DEFINITION_LIFECYCLE_VECTOR_SCHEMA_VERSION: &str =
@@ -81,6 +84,7 @@ const MAX_CASES: usize = 128;
 
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
 pub const CALENDAR_SCHEDULE_RESOLUTION_SUITE: &str = "calendar-schedule-resolution";
+pub const CANCELLATION_TIMEOUT_ARBITRATION_SUITE: &str = "cancellation-timeout-arbitration";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
@@ -985,6 +989,104 @@ impl ExpectedSchedulerLeadershipFencing {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancellationTimeoutArbitrationVectorSet {
+    schema_version: String,
+    cases: Vec<CancellationTimeoutArbitrationVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancellationTimeoutArbitrationVectorCase {
+    case_id: String,
+    scenario: CancellationTimeoutArbitrationScenario,
+    cancellation_at: String,
+    timeout_at: String,
+    timeout_observed_at: String,
+    expected: ExpectedCancellationTimeoutArbitration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CancellationTimeoutArbitrationScenario {
+    CancellationWins,
+    TimeoutWins,
+}
+
+impl CancellationTimeoutArbitrationScenario {
+    const COUNT: usize = 2;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedCancellationOutcome {
+    Cancelled,
+    CancelPending,
+    IllegalTransition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedCompetingOutcome {
+    Deferred,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedCancellationReplayOutcome {
+    Cancelled,
+    IllegalTransition,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedCancellationTimeoutArbitration {
+    cancellation_outcome: ExpectedCancellationOutcome,
+    competing_outcome: ExpectedCompetingOutcome,
+    replay_outcome: ExpectedCancellationReplayOutcome,
+    pre_competing_cancellation_state: String,
+    pre_competing_stop_fence_owner: String,
+    competing_candidate_observed: bool,
+    runtime_stop_count: usize,
+    run_status: String,
+    occurrence_state: String,
+    attempt_state: String,
+    cancellation_state: String,
+}
+
+impl ExpectedCancellationTimeoutArbitration {
+    fn matches_scenario(&self, scenario: CancellationTimeoutArbitrationScenario) -> bool {
+        match scenario {
+            CancellationTimeoutArbitrationScenario::CancellationWins => {
+                self.cancellation_outcome == ExpectedCancellationOutcome::Cancelled
+                    && self.competing_outcome == ExpectedCompetingOutcome::Deferred
+                    && self.replay_outcome == ExpectedCancellationReplayOutcome::Cancelled
+                    && self.pre_competing_cancellation_state == "stopping"
+                    && self.pre_competing_stop_fence_owner == "cancellation"
+                    && self.competing_candidate_observed
+                    && self.run_status == "cancelled"
+                    && self.occurrence_state == "cancelled"
+                    && self.attempt_state == "cancelled"
+                    && self.cancellation_state == "cancelled"
+            }
+            CancellationTimeoutArbitrationScenario::TimeoutWins => {
+                self.cancellation_outcome == ExpectedCancellationOutcome::IllegalTransition
+                    && self.competing_outcome == ExpectedCompetingOutcome::TimedOut
+                    && self.replay_outcome == ExpectedCancellationReplayOutcome::IllegalTransition
+                    && self.pre_competing_cancellation_state == "requested"
+                    && self.pre_competing_stop_fence_owner == "none"
+                    && self.competing_candidate_observed
+                    && self.run_status == "failed"
+                    && self.occurrence_state == "failed"
+                    && self.attempt_state == "timed_out"
+                    && self.cancellation_state == "rejected"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StartupReconciliationWakeVectorSet {
     schema_version: String,
     cases: Vec<StartupReconciliationWakeVectorCase>,
@@ -1443,6 +1545,7 @@ pub fn capability() -> TargetCapability {
                 profile: SCHEDULER_RELIABILITY_PROFILE,
                 suites: vec![
                     CALENDAR_SCHEDULE_RESOLUTION_SUITE,
+                    CANCELLATION_TIMEOUT_ARBITRATION_SUITE,
                     MISFIRE_LATEST_PLANNING_SUITE,
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
                     OVERLAP_FORBID_CLAIMING_SUITE,
@@ -1498,6 +1601,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         (SCHEDULER_RELIABILITY_PROFILE, CALENDAR_SCHEDULE_RESOLUTION_SUITE) => {
             evaluate_calendar_schedule_resolution(&request.vector)?
         }
+        (SCHEDULER_RELIABILITY_PROFILE, CANCELLATION_TIMEOUT_ARBITRATION_SUITE) => {
+            evaluate_cancellation_timeout_arbitration(&request.vector)?
+        }
         (SCHEDULER_RELIABILITY_PROFILE, MISFIRE_LATEST_PLANNING_SUITE) => {
             evaluate_misfire_latest_planning(&request.vector)?
         }
@@ -1522,6 +1628,422 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         _ => return Err("conformance suite is unsupported"),
     };
     result_for(&request.suite_id, &request.vector, all_passed)
+}
+
+fn evaluate_cancellation_timeout_arbitration(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: CancellationTimeoutArbitrationVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != CANCELLATION_TIMEOUT_ARBITRATION_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != CancellationTimeoutArbitrationScenario::COUNT
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        let cancellation_at =
+            canonical_timestamp(&case.cancellation_at).ok_or("conformance vector is invalid")?;
+        let timeout_at =
+            canonical_timestamp(&case.timeout_at).ok_or("conformance vector is invalid")?;
+        let timeout_observed_at = canonical_timestamp(&case.timeout_observed_at)
+            .ok_or("conformance vector is invalid")?;
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || cancellation_at >= timeout_at
+            || timeout_at >= timeout_observed_at
+            || !case.expected.matches_scenario(case.scenario)
+            || case.expected.runtime_stop_count != 1
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != CancellationTimeoutArbitrationScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut passed_cases = 0;
+    for case in &vectors.cases {
+        passed_cases += usize::from(cancellation_timeout_arbitration_case_matches(case)?);
+    }
+    Ok(passed_cases == vectors.cases.len())
+}
+
+struct CancellationRaceRuntime {
+    stops: AtomicUsize,
+    started: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+}
+
+impl crate::api::SessionRuntime for CancellationRaceRuntime {
+    fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn send_input(&self, _session_id: &str, _payload: &Value) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+        let call = self.stops.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(call == 0, "duplicate runtime stop");
+        self.started
+            .send(())
+            .map_err(|_| anyhow::anyhow!("cancellation race observer is unavailable"))?;
+        self.release
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cancellation race release mutex is poisoned"))?
+            .recv()
+            .map_err(|_| anyhow::anyhow!("cancellation race release is unavailable"))
+    }
+}
+
+struct CancellationRaceFixture {
+    _home: tempfile::TempDir,
+    store_path: PathBuf,
+    run_id: String,
+    attempt_id: String,
+    session_id: String,
+    request: Value,
+}
+
+fn cancellation_race_fixture(
+    case: &CancellationTimeoutArbitrationVectorCase,
+) -> Result<CancellationRaceFixture, &'static str> {
+    let home = scheduler_conformance_tempdir()?;
+    crate::daemon::ensure_private_coven_home(home.path())
+        .map_err(|_| "conformance suite execution failed")?;
+    let store_path = home.path().join("coven.sqlite3");
+    let conn =
+        crate::store::open_store(&store_path).map_err(|_| "conformance suite execution failed")?;
+    let definition = super::definition::RoutineDefinition::from_json(&json!({
+        "schemaVersion": 1,
+        "id": "cancellation-timeout-arbitration",
+        "name": "Cancellation timeout arbitration",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "cwd": "/work/project",
+        "prompt": "Wait for cancellation arbitration.",
+        "tags": []
+    }))
+    .map_err(|_| "conformance suite execution failed")?;
+    super::store::insert_definition(&conn, &definition)
+        .map_err(|_| "conformance suite execution failed")?;
+    let cancellation_at =
+        canonical_timestamp(&case.cancellation_at).ok_or("conformance vector is invalid")?;
+    let run = super::runner::run_routine_now(
+        &conn,
+        &crate::api::NoopSessionRuntime,
+        &definition,
+        cancellation_at,
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let session_id = run.session_id.ok_or("conformance suite execution failed")?;
+    let attempt_id = conn
+        .query_row(
+            "SELECT id FROM automation_attempts WHERE run_id = ?1",
+            [&run.run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute(
+        "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+        params![&run.run_id, &case.timeout_at],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let request = json!({
+        "action": "coven.automations.run.cancel.v1",
+        "adoptionKey": format!("adopt:cancel:{}", case.case_id),
+        "runId": run.run_id,
+        "attemptId": attempt_id,
+        "runtimeCorrelation": {"sessionId": session_id},
+        "scope": "run",
+        "reason": "portable cancellation arbitration probe",
+        "requestedBy": {"principalId": "conformance:runner"}
+    });
+    Ok(CancellationRaceFixture {
+        _home: home,
+        store_path,
+        run_id: run.run_id,
+        attempt_id,
+        session_id,
+        request,
+    })
+}
+
+fn cancellation_execution_outcome(
+    execution: &super::cancellation::CancellationExecution,
+) -> Option<ExpectedCancellationOutcome> {
+    match execution {
+        super::cancellation::CancellationExecution::Success(success)
+            if success.payload["status"] == "cancelled" =>
+        {
+            Some(ExpectedCancellationOutcome::Cancelled)
+        }
+        super::cancellation::CancellationExecution::Rejected(error)
+            if error.code() == ErrorCode::CancelPending =>
+        {
+            Some(ExpectedCancellationOutcome::CancelPending)
+        }
+        super::cancellation::CancellationExecution::Rejected(error)
+            if error.code() == ErrorCode::IllegalTransition =>
+        {
+            Some(ExpectedCancellationOutcome::IllegalTransition)
+        }
+        _ => None,
+    }
+}
+
+fn cancellation_replay_outcome(
+    execution: &super::cancellation::CancellationExecution,
+) -> Option<ExpectedCancellationReplayOutcome> {
+    match execution {
+        super::cancellation::CancellationExecution::Success(success)
+            if success.replayed && success.payload["status"] == "cancelled" =>
+        {
+            Some(ExpectedCancellationReplayOutcome::Cancelled)
+        }
+        super::cancellation::CancellationExecution::Rejected(error)
+            if error.code() == ErrorCode::IllegalTransition =>
+        {
+            Some(ExpectedCancellationReplayOutcome::IllegalTransition)
+        }
+        _ => None,
+    }
+}
+
+fn cancellation_pre_competing_state(
+    store_path: &Path,
+    run_id: &str,
+) -> Result<(String, String), &'static str> {
+    let conn =
+        crate::store::open_store(store_path).map_err(|_| "conformance suite execution failed")?;
+    conn.query_row(
+        "SELECT c.state, COALESCE(f.owner, 'none')
+         FROM automation_cancellations AS c
+         LEFT JOIN automation_stop_fences AS f ON f.run_id = c.run_id
+         WHERE c.run_id = ?1",
+        [run_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .map_err(|_| "conformance suite execution failed")
+}
+
+fn cancellation_timeout_arbitration_case_matches(
+    case: &CancellationTimeoutArbitrationVectorCase,
+) -> Result<bool, &'static str> {
+    let fixture = cancellation_race_fixture(case)?;
+    let cancellation_at =
+        canonical_timestamp(&case.cancellation_at).ok_or("conformance vector is invalid")?;
+    let timeout_observed_at =
+        canonical_timestamp(&case.timeout_observed_at).ok_or("conformance vector is invalid")?;
+    let (started_tx, started_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let runtime = Arc::new(CancellationRaceRuntime {
+        stops: AtomicUsize::new(0),
+        started: started_tx,
+        release: Mutex::new(release_rx),
+    });
+
+    let (
+        cancellation_outcome,
+        competing_outcome,
+        pre_competing_cancellation_state,
+        pre_competing_stop_fence_owner,
+        competing_candidate_observed,
+    ) = match case.scenario {
+        CancellationTimeoutArbitrationScenario::CancellationWins => {
+            let store_path = fixture.store_path.clone();
+            let request = fixture.request.clone();
+            let runtime_for_cancellation = Arc::clone(&runtime);
+            let cancellation = std::thread::spawn(move || {
+                let conn = crate::store::open_store(&store_path)
+                    .map_err(|_| "conformance suite execution failed")?;
+                super::cancellation::execute_run_cancellation_at_stop_fence(
+                    &conn,
+                    runtime_for_cancellation.as_ref(),
+                    request,
+                    cancellation_at,
+                    cancellation_at,
+                )
+                .map_err(|_| "conformance suite execution failed")
+            });
+            let started = started_rx
+                .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
+                .is_ok();
+            let pre_competing_state = if started {
+                cancellation_pre_competing_state(&fixture.store_path, &fixture.run_id)
+            } else {
+                Err("conformance suite execution failed")
+            };
+            let timeout_result = if started {
+                let conn = crate::store::open_store(&fixture.store_path)
+                    .map_err(|_| "conformance suite execution failed")?;
+                let mut observed_candidates = 0;
+                let result = super::runner::enforce_run_timeouts_with_observer(
+                    &conn,
+                    runtime.as_ref(),
+                    timeout_observed_at,
+                    |candidate_run_id| {
+                        observed_candidates += usize::from(candidate_run_id == fixture.run_id);
+                    },
+                )
+                .map_err(|_| "conformance suite execution failed");
+                result.map(|failures| (failures, observed_candidates))
+            } else {
+                Err("conformance suite execution failed")
+            };
+            let _ = release_tx.send(());
+            let cancellation_result = cancellation
+                .join()
+                .map_err(|_| "conformance suite execution failed")??;
+            let (timeout_failures, observed_candidates) = timeout_result?;
+            let pre_competing_state = pre_competing_state?;
+            (
+                cancellation_execution_outcome(&cancellation_result),
+                timeout_failures
+                    .is_empty()
+                    .then_some(ExpectedCompetingOutcome::Deferred),
+                pre_competing_state.0,
+                pre_competing_state.1,
+                observed_candidates == 1,
+            )
+        }
+        CancellationTimeoutArbitrationScenario::TimeoutWins => {
+            let (reservation_ready_tx, reservation_ready_rx) = sync_channel(1);
+            let (reservation_release_tx, reservation_release_rx) = sync_channel(1);
+            let cancellation_store_path = fixture.store_path.clone();
+            let request = fixture.request.clone();
+            let runtime_for_cancellation = Arc::clone(&runtime);
+            let cancellation = std::thread::spawn(move || {
+                let conn = crate::store::open_store(&cancellation_store_path)
+                    .map_err(|_| "conformance suite execution failed")?;
+                super::cancellation::execute_run_cancellation_at_stop_fence_with_observer(
+                    &conn,
+                    runtime_for_cancellation.as_ref(),
+                    request,
+                    cancellation_at,
+                    cancellation_at,
+                    Box::new(move || {
+                        reservation_ready_tx.send(()).map_err(|_| {
+                            "cancellation reservation observer is unavailable".to_string()
+                        })?;
+                        reservation_release_rx.recv().map_err(|_| {
+                            "cancellation reservation release is unavailable".to_string()
+                        })
+                    }),
+                )
+                .map_err(|_| "conformance suite execution failed")
+            });
+            if reservation_ready_rx
+                .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
+                .is_err()
+            {
+                let _ = reservation_release_tx.send(());
+                let _ = release_tx.send(());
+                let _ = cancellation.join();
+                return Err("conformance suite execution failed");
+            }
+            let pre_competing_state =
+                match cancellation_pre_competing_state(&fixture.store_path, &fixture.run_id) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        let _ = reservation_release_tx.send(());
+                        let _ = release_tx.send(());
+                        let _ = cancellation.join();
+                        return Err(error);
+                    }
+                };
+
+            let reconciliation_store_path = fixture.store_path.clone();
+            let runtime_for_reconciliation = Arc::clone(&runtime);
+            let reconciliation = std::thread::spawn(move || {
+                let conn = crate::store::open_store(&reconciliation_store_path)
+                    .map_err(|_| "conformance suite execution failed")?;
+                super::cancellation::reconcile_expired_cancellations(
+                    &conn,
+                    runtime_for_reconciliation.as_ref(),
+                    timeout_observed_at,
+                )
+                .map_err(|_| "conformance suite execution failed")
+            });
+            let started = started_rx
+                .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
+                .is_ok();
+            let _ = reservation_release_tx.send(());
+            if !started {
+                let _ = release_tx.send(());
+                let _ = cancellation.join();
+                let _ = reconciliation.join();
+                return Err("conformance suite execution failed");
+            }
+            let cancellation_result = cancellation
+                .join()
+                .map_err(|_| "conformance suite execution failed")?;
+            let _ = release_tx.send(());
+            let reconciled = reconciliation
+                .join()
+                .map_err(|_| "conformance suite execution failed")??;
+            let cancellation_result = cancellation_result?;
+            (
+                cancellation_execution_outcome(&cancellation_result),
+                (reconciled == 1).then_some(ExpectedCompetingOutcome::TimedOut),
+                pre_competing_state.0,
+                pre_competing_state.1,
+                reconciled == 1,
+            )
+        }
+    };
+
+    let conn = crate::store::open_store(&fixture.store_path)
+        .map_err(|_| "conformance suite execution failed")?;
+    let replay = super::cancellation::execute_run_cancellation_at_stop_fence(
+        &conn,
+        runtime.as_ref(),
+        fixture.request,
+        cancellation_at,
+        cancellation_at,
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let lifecycle = conn
+        .query_row(
+            "SELECT r.status, o.state, a.state, c.state
+             FROM automation_runs AS r
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = ?2
+             JOIN automation_cancellations AS c ON c.run_id = r.id
+             WHERE r.id = ?1 AND r.session_id = ?3",
+            params![&fixture.run_id, &fixture.attempt_id, &fixture.session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+
+    Ok(
+        cancellation_outcome == Some(case.expected.cancellation_outcome)
+            && competing_outcome == Some(case.expected.competing_outcome)
+            && cancellation_replay_outcome(&replay) == Some(case.expected.replay_outcome)
+            && pre_competing_cancellation_state == case.expected.pre_competing_cancellation_state
+            && pre_competing_stop_fence_owner == case.expected.pre_competing_stop_fence_owner
+            && competing_candidate_observed == case.expected.competing_candidate_observed
+            && runtime.stops.load(Ordering::SeqCst) == case.expected.runtime_stop_count
+            && lifecycle.0 == case.expected.run_status
+            && lifecycle.1 == case.expected.occurrence_state
+            && lifecycle.2 == case.expected.attempt_state
+            && lifecycle.3 == case.expected.cancellation_state,
+    )
 }
 
 fn evaluate_attempt_terminal_immutability(vector: &Value) -> Result<bool, &'static str> {

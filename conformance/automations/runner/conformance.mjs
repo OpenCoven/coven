@@ -28,6 +28,9 @@ const DEFAULT_TARGET_TIMEOUT_MS = 2_000;
 // Two cases may each use a 5-second synchronization guard, and a failed
 // shutdown gets one separate 5-second cleanup window.
 const STARTUP_WAKE_TARGET_TIMEOUT_MS = 20_000;
+// The two race cases can consume three 5-second synchronization guards; keep
+// additional time for fixture setup, SQLite settlement, and process cleanup.
+const CANCELLATION_ARBITRATION_TARGET_TIMEOUT_MS = 20_000;
 const TARGET_KILL_GRACE_MS = 100;
 const TARGET_OUTPUT_LIMIT = 1024 * 1024;
 const MAX_JCS_DEPTH = 128;
@@ -400,6 +403,9 @@ async function invokeTarget(subject, operation, input) {
       operation === "evaluate" &&
       input?.suiteId === "startup-reconciliation-wake"
         ? STARTUP_WAKE_TARGET_TIMEOUT_MS
+        : operation === "evaluate" &&
+            input?.suiteId === "cancellation-timeout-arbitration"
+          ? CANCELLATION_ARBITRATION_TARGET_TIMEOUT_MS
         : DEFAULT_TARGET_TIMEOUT_MS;
     return await new Promise((resolve) => {
       const child = spawn(

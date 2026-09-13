@@ -143,6 +143,11 @@ if (operation === "evaluate") {
           profile: "scheduler_reliability",
           suites: ["startup-reconciliation-wake"],
         }]
+      : mode === "slow-cancellation-suite"
+        ? [{
+            profile: "scheduler_reliability",
+            suites: ["cancellation-timeout-arbitration"],
+          }]
       : [{ profile: "structural", suites: ["schema-validation"] }]
   }));
   process.exit(0);
@@ -153,6 +158,9 @@ for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
 if (mode === "slow-stateful-suite") {
   await new Promise((resolve) => setTimeout(resolve, 8_500));
+}
+if (mode === "slow-cancellation-suite") {
+  await new Promise((resolve) => setTimeout(resolve, 2_500));
 }
 if (mode === "malformed") {
   process.stdout.write('{"credential":"SECRET-TARGET-OUTPUT"');
@@ -578,6 +586,32 @@ test("allows the stateful startup wake suite to use its synchronization budget",
     job,
     targetCommand: target,
     env: { COVEN_TEST_TARGET_MODE: "slow-stateful-suite" },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("allows cancellation arbitration to use its synchronization budget", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  const target = await writeTarget(directory);
+  const job = validJob({
+    suites: [
+      {
+        profile: "scheduler_reliability",
+        suiteId: "cancellation-timeout-arbitration",
+        vector: {
+          schemaVersion: "coven.automations.cancellation-timeout-arbitration-vectors.v1",
+          cases: [],
+        },
+      },
+    ],
+  });
+  job.runner.vectorSetSha256 = sha256(canonicalize(job.suites));
+
+  const result = await runRunner({
+    job,
+    targetCommand: target,
+    env: { COVEN_TEST_TARGET_MODE: "slow-cancellation-suite" },
   });
 
   assert.equal(result.status, 0, result.stderr);

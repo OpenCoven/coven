@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "coven.automations.cancellation-timeout-arbitration-vectors.v1",
+  "cases": [
+    {
+      "caseId": "cancellation-stop-fence-defers-late-timeout",
+      "scenario": "cancellation_wins",
+      "cancellationAt": "2099-10-01T08:29:45.000Z",
+      "timeoutAt": "2099-10-01T08:30:00.000Z",
+      "timeoutObservedAt": "2099-10-01T08:30:01.000Z",
+      "expected": {
+        "cancellationOutcome": "cancelled",
+        "competingOutcome": "deferred",
+        "replayOutcome": "cancelled",
+        "preCompetingCancellationState": "stopping",
+        "preCompetingStopFenceOwner": "cancellation",
+        "competingCandidateObserved": true,
+        "runtimeStopCount": 1,
+        "runStatus": "cancelled",
+        "occurrenceState": "cancelled",
+        "attemptState": "cancelled",
+        "cancellationState": "cancelled"
+      }
+    },
+    {
+      "caseId": "timeout-stop-fence-rejects-stale-cancellation",
+      "scenario": "timeout_wins",
+      "cancellationAt": "2099-10-01T08:29:00.000Z",
+      "timeoutAt": "2099-10-01T08:30:00.000Z",
+      "timeoutObservedAt": "2099-10-01T08:31:00.000Z",
+      "expected": {
+        "cancellationOutcome": "illegal_transition",
+        "competingOutcome": "timed_out",
+        "replayOutcome": "illegal_transition",
+        "preCompetingCancellationState": "requested",
+        "preCompetingStopFenceOwner": "none",
+        "competingCandidateObserved": true,
+        "runtimeStopCount": 1,
+        "runStatus": "failed",
+        "occurrenceState": "failed",
+        "attemptState": "timed_out",
+        "cancellationState": "rejected"
+      }
+    }
+  ]
+}
