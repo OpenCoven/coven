@@ -48,6 +48,10 @@ const OVERLAP_FORBID_CLAIMING_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.overlap-forbid-claiming-vectors.v1";
 const RETRY_BACKOFF_TIMING_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.retry-backoff-timing-vectors.v1";
+const RETRY_QUARANTINE_RECOVERY_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.retry-quarantine-recovery-vectors.v1";
+const RETRY_QUARANTINE_FIXTURE_CREATED_AT: &str = "2026-09-01T08:00:00.000Z";
+const RETRY_QUARANTINE_OBSERVE_AT: &str = "2026-09-02T10:00:00.000Z";
 const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
@@ -71,6 +75,7 @@ pub const MISFIRE_LATEST_PLANNING_SUITE: &str = "misfire-latest-planning";
 pub const OCCURRENCE_LEASE_RECOVERY_SUITE: &str = "occurrence-lease-recovery";
 pub const OVERLAP_FORBID_CLAIMING_SUITE: &str = "overlap-forbid-claiming";
 pub const RETRY_BACKOFF_TIMING_SUITE: &str = "retry-backoff-timing";
+pub const RETRY_QUARANTINE_RECOVERY_SUITE: &str = "retry-quarantine-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -796,6 +801,87 @@ struct ExpectedRetryBackoffTiming {
     deterministic: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryQuarantineRecoveryVectorSet {
+    schema_version: String,
+    cases: Vec<RetryQuarantineRecoveryVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryQuarantineRecoveryVectorCase {
+    case_id: String,
+    scenario: RetryQuarantineRecoveryScenario,
+    exhaustions: Vec<RetryExhaustionInput>,
+    #[serde(default)]
+    release_at: Option<String>,
+    observe_at: String,
+    expected: ExpectedRetryQuarantineRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RetryQuarantineRecoveryScenario {
+    FirstExhaustion,
+    RepeatedExhaustion,
+    ExplicitRelease,
+    ReleaseWithoutQuarantine,
+}
+
+impl RetryQuarantineRecoveryScenario {
+    const COUNT: usize = 4;
+
+    fn matches_input(self, exhaustion_count: usize, has_release: bool) -> bool {
+        match self {
+            Self::FirstExhaustion => exhaustion_count == 1 && !has_release,
+            Self::RepeatedExhaustion => exhaustion_count == 2 && !has_release,
+            Self::ExplicitRelease => exhaustion_count == 1 && has_release,
+            Self::ReleaseWithoutQuarantine => exhaustion_count == 0 && has_release,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryExhaustionInput {
+    at: String,
+    failure_class: RetryExhaustionClass,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RetryExhaustionClass {
+    TransientDispatch,
+    LeaseExpired,
+    RuntimeUnavailable,
+}
+
+impl RetryExhaustionClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TransientDispatch => "transient_dispatch",
+            Self::LeaseExpired => "lease_expired",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedRetryQuarantineRecovery {
+    row_exists: bool,
+    consecutive_exhaustions: u32,
+    quarantined: bool,
+    quarantined_at: Option<String>,
+    failure_class: Option<String>,
+    reason: Option<String>,
+    release_changed: bool,
+    planned_count: usize,
+    claimed_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OverlapTargetState {
@@ -1086,6 +1172,7 @@ pub fn capability() -> TargetCapability {
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
                     OVERLAP_FORBID_CLAIMING_SUITE,
                     RETRY_BACKOFF_TIMING_SUITE,
+                    RETRY_QUARANTINE_RECOVERY_SUITE,
                 ],
             },
         ],
@@ -1145,6 +1232,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, RETRY_BACKOFF_TIMING_SUITE) => {
             evaluate_retry_backoff_timing(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RETRY_QUARANTINE_RECOVERY_SUITE) => {
+            evaluate_retry_quarantine_recovery(&request.vector)?
         }
         _ => return Err("conformance suite is unsupported"),
     };
@@ -2165,6 +2255,206 @@ fn evaluate_retry_backoff_timing(vector: &Value) -> Result<bool, &'static str> {
         );
     }
     Ok(passed_cases == vectors.cases.len())
+}
+
+fn evaluate_retry_quarantine_recovery(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: RetryQuarantineRecoveryVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != RETRY_QUARANTINE_RECOVERY_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != RetryQuarantineRecoveryScenario::COUNT
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    let fixture_created_at = canonical_timestamp(RETRY_QUARANTINE_FIXTURE_CREATED_AT)
+        .ok_or("conformance vector is invalid")?;
+    let expected_observe_at =
+        canonical_timestamp(RETRY_QUARANTINE_OBSERVE_AT).ok_or("conformance vector is invalid")?;
+    for case in &vectors.cases {
+        let observe_at =
+            canonical_timestamp(&case.observe_at).ok_or("conformance vector is invalid")?;
+        let release_at = match case.release_at.as_deref() {
+            Some(value) => Some(canonical_timestamp(value).ok_or("conformance vector is invalid")?),
+            None => None,
+        };
+        let mut previous_at = None;
+        for exhaustion in &case.exhaustions {
+            let at = canonical_timestamp(&exhaustion.at).ok_or("conformance vector is invalid")?;
+            if exhaustion.reason.trim().is_empty()
+                || exhaustion.reason.len() > 256
+                || previous_at.is_some_and(|previous| at <= previous)
+                || at <= fixture_created_at
+                || at > observe_at
+            {
+                return Err("conformance vector is invalid");
+            }
+            previous_at = Some(at);
+        }
+        let expected_state_is_coherent = if case.expected.row_exists {
+            if case.expected.quarantined {
+                case.expected.consecutive_exhaustions > 0
+                    && case.expected.quarantined_at.is_some()
+                    && case.expected.failure_class.is_some()
+                    && case.expected.reason.is_some()
+            } else {
+                case.expected.consecutive_exhaustions == 0
+                    && case.expected.quarantined_at.is_none()
+                    && case.expected.failure_class.is_none()
+                    && case.expected.reason.is_none()
+            }
+        } else {
+            case.expected.consecutive_exhaustions == 0
+                && !case.expected.quarantined
+                && case.expected.quarantined_at.is_none()
+                && case.expected.failure_class.is_none()
+                && case.expected.reason.is_none()
+        };
+        let repeated_exhaustion_replaces_evidence = match case.scenario {
+            RetryQuarantineRecoveryScenario::RepeatedExhaustion => {
+                case.exhaustions.windows(2).next().is_some_and(|pair| {
+                    pair[0].failure_class != pair[1].failure_class
+                        && pair[0].reason != pair[1].reason
+                })
+            }
+            _ => true,
+        };
+        let expected_scheduler_counts = match case.scenario {
+            RetryQuarantineRecoveryScenario::FirstExhaustion
+            | RetryQuarantineRecoveryScenario::RepeatedExhaustion => (0, 0),
+            RetryQuarantineRecoveryScenario::ExplicitRelease
+            | RetryQuarantineRecoveryScenario::ReleaseWithoutQuarantine => (1, 1),
+        };
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || observe_at != expected_observe_at
+            || !case
+                .scenario
+                .matches_input(case.exhaustions.len(), release_at.is_some())
+            || release_at.is_some_and(|release| {
+                release <= fixture_created_at
+                    || previous_at.is_some_and(|last_exhaustion| release <= last_exhaustion)
+                    || release > observe_at
+            })
+            || !repeated_exhaustion_replaces_evidence
+            || !expected_state_is_coherent
+            || case.expected.release_changed
+                != (case.scenario == RetryQuarantineRecoveryScenario::ExplicitRelease)
+            || (case.expected.planned_count, case.expected.claimed_count)
+                != expected_scheduler_counts
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != RetryQuarantineRecoveryScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut passed_cases = 0;
+    for (case_index, case) in vectors.cases.iter().enumerate() {
+        passed_cases += usize::from(retry_quarantine_recovery_case_matches(case_index, case)?);
+    }
+    Ok(passed_cases == vectors.cases.len())
+}
+
+fn retry_quarantine_recovery_case_matches(
+    case_index: usize,
+    case: &RetryQuarantineRecoveryVectorCase,
+) -> Result<bool, &'static str> {
+    let conn = command_conformance_connection()?;
+    conn.execute_batch(super::leadership::AUTOMATION_SCHEDULER_AUTHORITY_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    let automation_id = format!("retry-quarantine-{case_index}");
+    let definition = super::definition::RoutineDefinition::from_json(&json!({
+        "schemaVersion": 1,
+        "id": automation_id,
+        "name": "Retry quarantine conformance",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "cwd": "/tmp",
+        "prompt": "Run the retry quarantine conformance probe.",
+        "tags": []
+    }))
+    .map_err(|_| "conformance suite execution failed")?;
+    super::store::insert_definition(&conn, &definition)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute(
+        "UPDATE automation_definitions
+         SET created_at = ?1,
+             updated_at = ?1
+         WHERE id = ?2",
+        params![RETRY_QUARANTINE_FIXTURE_CREATED_AT, &automation_id],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+
+    for exhaustion in &case.exhaustions {
+        super::runs::record_retry_exhaustion(
+            &conn,
+            &automation_id,
+            exhaustion.failure_class.as_str(),
+            &exhaustion.reason,
+            canonical_timestamp(&exhaustion.at).ok_or("conformance vector is invalid")?,
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+    }
+    let release_changed = match case.release_at.as_deref() {
+        Some(release_at) => super::runs::clear_retry_quarantine(
+            &conn,
+            &automation_id,
+            canonical_timestamp(release_at).ok_or("conformance vector is invalid")?,
+        )
+        .map_err(|_| "conformance suite execution failed")?,
+        None => false,
+    };
+    let quarantined = super::runs::is_retry_quarantined(&conn, &automation_id)
+        .map_err(|_| "conformance suite execution failed")?;
+    let row = conn
+        .query_row(
+            "SELECT consecutive_exhaustions, quarantined_at, failure_class, reason
+             FROM automation_retry_state
+             WHERE automation_id = ?1",
+            [&automation_id],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| "conformance suite execution failed")?;
+    let observe_at =
+        canonical_timestamp(&case.observe_at).ok_or("conformance vector is invalid")?;
+    let scheduler_home = tempfile::tempdir().map_err(|_| "conformance suite execution failed")?;
+    crate::daemon::ensure_private_coven_home(scheduler_home.path())
+        .map_err(|_| "conformance suite execution failed")?;
+    let leadership =
+        super::leadership::SchedulerLeadership::acquire(scheduler_home.path(), &conn, observe_at)
+            .map_err(|_| "conformance suite execution failed")?;
+    let tick =
+        super::occurrences::tick_with_scheduler_fence(&conn, observe_at, &leadership.fence())
+            .map_err(|_| "conformance suite execution failed")?;
+    let row_exists = row.is_some();
+    let observed = row.unwrap_or((0, None, None, None));
+
+    Ok(row_exists == case.expected.row_exists
+        && observed.0 == case.expected.consecutive_exhaustions
+        && quarantined == case.expected.quarantined
+        && observed.1 == case.expected.quarantined_at
+        && observed.2 == case.expected.failure_class
+        && observed.3 == case.expected.reason
+        && release_changed == case.expected.release_changed
+        && tick.planned.len() == case.expected.planned_count
+        && tick.claimed.len() == case.expected.claimed_count)
 }
 
 fn evaluate_misfire_latest_planning(vector: &Value) -> Result<bool, &'static str> {

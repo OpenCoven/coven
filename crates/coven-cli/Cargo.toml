@@ -74,11 +74,11 @@ textwrap = "0.16"
 unicode-casefold = "0.2.0"
 chrono-tz = "0.10.4"
 iana-time-zone = "0.1.65"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
-tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2"
@@ -87,4 +87,3 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 jsonschema = { version = "0.56.0", default-features = false, features = ["arbitrary-precision"] }
-tempfile = "3"

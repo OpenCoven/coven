@@ -1,0 +1,98 @@
+{
+  "schemaVersion": "coven.automations.retry-quarantine-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "first-exhaustion-quarantines-and-blocks",
+      "scenario": "first_exhaustion",
+      "exhaustions": [
+        {
+          "at": "2026-09-02T08:30:00.000Z",
+          "failureClass": "runtime_unavailable",
+          "reason": "runtime unavailable"
+        }
+      ],
+      "observeAt": "2026-09-02T10:00:00.000Z",
+      "expected": {
+        "rowExists": true,
+        "consecutiveExhaustions": 1,
+        "quarantined": true,
+        "quarantinedAt": "2026-09-02T08:30:00.000Z",
+        "failureClass": "runtime_unavailable",
+        "reason": "runtime unavailable",
+        "releaseChanged": false,
+        "plannedCount": 0,
+        "claimedCount": 0
+      }
+    },
+    {
+      "caseId": "repeated-exhaustion-updates-latest-evidence",
+      "scenario": "repeated_exhaustion",
+      "exhaustions": [
+        {
+          "at": "2026-09-02T08:30:00.000Z",
+          "failureClass": "runtime_unavailable",
+          "reason": "runtime unavailable"
+        },
+        {
+          "at": "2026-09-02T08:45:00.000Z",
+          "failureClass": "lease_expired",
+          "reason": "lease expired"
+        }
+      ],
+      "observeAt": "2026-09-02T10:00:00.000Z",
+      "expected": {
+        "rowExists": true,
+        "consecutiveExhaustions": 2,
+        "quarantined": true,
+        "quarantinedAt": "2026-09-02T08:45:00.000Z",
+        "failureClass": "lease_expired",
+        "reason": "lease expired",
+        "releaseChanged": false,
+        "plannedCount": 0,
+        "claimedCount": 0
+      }
+    },
+    {
+      "caseId": "explicit-release-restores-scheduling",
+      "scenario": "explicit_release",
+      "exhaustions": [
+        {
+          "at": "2026-09-02T08:30:00.000Z",
+          "failureClass": "runtime_unavailable",
+          "reason": "runtime unavailable"
+        }
+      ],
+      "releaseAt": "2026-09-02T08:45:00.000Z",
+      "observeAt": "2026-09-02T10:00:00.000Z",
+      "expected": {
+        "rowExists": true,
+        "consecutiveExhaustions": 0,
+        "quarantined": false,
+        "quarantinedAt": null,
+        "failureClass": null,
+        "reason": null,
+        "releaseChanged": true,
+        "plannedCount": 1,
+        "claimedCount": 1
+      }
+    },
+    {
+      "caseId": "release-without-quarantine-is-noop",
+      "scenario": "release_without_quarantine",
+      "exhaustions": [],
+      "releaseAt": "2026-09-02T08:45:00.000Z",
+      "observeAt": "2026-09-02T10:00:00.000Z",
+      "expected": {
+        "rowExists": false,
+        "consecutiveExhaustions": 0,
+        "quarantined": false,
+        "quarantinedAt": null,
+        "failureClass": null,
+        "reason": null,
+        "releaseChanged": false,
+        "plannedCount": 1,
+        "claimedCount": 1
+      }
+    }
+  ]
+}

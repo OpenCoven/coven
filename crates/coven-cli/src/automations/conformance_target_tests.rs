@@ -33,6 +33,9 @@ const OVERLAP_FORBID_CLAIMING_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/overlap-forbid-claiming.vectors.json");
 const RETRY_BACKOFF_TIMING_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/retry-backoff-timing.vectors.json");
+const RETRY_QUARANTINE_RECOVERY_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/retry-quarantine-recovery.vectors.json"
+);
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
@@ -104,7 +107,8 @@ fn capability_advertises_the_native_structural_suites() {
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
                         OVERLAP_FORBID_CLAIMING_SUITE,
-                        "retry-backoff-timing"
+                        "retry-backoff-timing",
+                        "retry-quarantine-recovery"
                     ]
                 }
             ]
@@ -407,6 +411,95 @@ fn retry_backoff_timing_suite_requires_scheduler_profile() {
     let vectors: Value = serde_json::from_str(RETRY_BACKOFF_TIMING_VECTORS).unwrap();
     assert_eq!(
         evaluate(&request_for("retry-backoff-timing", vectors)).unwrap_err(),
+        "conformance suite is unsupported"
+    );
+}
+
+#[test]
+fn retry_quarantine_recovery_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(RETRY_QUARANTINE_RECOVERY_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "retry-quarantine-recovery",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 4);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 4);
+}
+
+#[test]
+fn retry_quarantine_recovery_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(RETRY_QUARANTINE_RECOVERY_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["reason"] = json!("different failure");
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "retry-quarantine-recovery",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn retry_quarantine_recovery_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 13] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
+        |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
+        |vectors| vectors["cases"][0]["exhaustions"][0]["at"] = json!("not-a-time"),
+        |vectors| vectors["cases"][0]["exhaustions"][0]["failureClass"] = json!("unknown"),
+        |vectors| vectors["cases"][0]["exhaustions"][0]["reason"] = json!(""),
+        |vectors| {
+            vectors["cases"][1]["exhaustions"][1]["failureClass"] =
+                vectors["cases"][1]["exhaustions"][0]["failureClass"].clone()
+        },
+        |vectors| {
+            vectors["cases"][1]["exhaustions"][1]["reason"] =
+                vectors["cases"][1]["exhaustions"][0]["reason"].clone()
+        },
+        |vectors| vectors["cases"][0]["releaseAt"] = json!("2026-09-02T08:45:00.000Z"),
+        |vectors| {
+            vectors["cases"][2]["expected"]["quarantinedAt"] = json!("2026-09-02T08:30:00.000Z")
+        },
+        |vectors| {
+            vectors["cases"][3]["observeAt"] = json!("2026-09-01T08:50:00.000Z");
+            vectors["cases"][3]["expected"]["plannedCount"] = json!(0);
+            vectors["cases"][3]["expected"]["claimedCount"] = json!(0);
+        },
+        |vectors| {
+            vectors["cases"][3]["observeAt"] = json!("2026-09-02T08:50:00.000Z");
+            vectors["cases"][3]["expected"]["plannedCount"] = json!(0);
+            vectors["cases"][3]["expected"]["claimedCount"] = json!(0);
+        },
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(RETRY_QUARANTINE_RECOVERY_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                "retry-quarantine-recovery",
+                vectors,
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn retry_quarantine_recovery_suite_requires_scheduler_profile() {
+    let vectors: Value = serde_json::from_str(RETRY_QUARANTINE_RECOVERY_VECTORS).unwrap();
+    assert_eq!(
+        evaluate(&request_for("retry-quarantine-recovery", vectors)).unwrap_err(),
         "conformance suite is unsupported"
     );
 }
