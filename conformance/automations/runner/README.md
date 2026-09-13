@@ -133,6 +133,7 @@ The checked-in
 [`occurrence-lease-recovery.vectors.json`](occurrence-lease-recovery.vectors.json),
 [`overlap-forbid-claiming.vectors.json`](overlap-forbid-claiming.vectors.json),
 [`retry-backoff-timing.vectors.json`](retry-backoff-timing.vectors.json),
+[`retry-quarantine-recovery.vectors.json`](retry-quarantine-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -170,7 +171,8 @@ The runner invokes the target directly without a shell.
         "misfire-latest-planning",
         "occurrence-lease-recovery",
         "overlap-forbid-claiming",
-        "retry-backoff-timing"
+        "retry-backoff-timing",
+        "retry-quarantine-recovery"
       ]
     }
   ]
@@ -183,7 +185,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements ten structural suites and five
+The native Coven target currently implements ten structural suites and six
 scheduler-reliability suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -232,6 +234,11 @@ stable for one run and attempt, and the ceiling is capped at one day.
 Exponential vectors pin the scheduled delay derived from the first eight bytes
 of `BLAKE3("<runId>:<nextAttemptNumber>")`, interpreted as an unsigned
 big-endian integer and mapped to `1..=ceiling` with modulo arithmetic.
+`retry-quarantine-recovery` executes fixed virtual-time cases through the
+production retry-state ledger and scheduler tick. It proves first and repeated
+exhaustions quarantine a routine with current failure evidence, quarantine
+blocks occurrence planning, explicit release clears the state and restores
+scheduling, and release without an existing quarantine is an idempotent no-op.
 `occurrence-fence-uniqueness` executes a portable three-case matrix against the
 production SQLite occurrence schema, proving that one automation cannot claim
 the same scheduled slot twice while different automations may share a slot and
