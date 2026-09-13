@@ -130,6 +130,7 @@ The checked-in
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
 [`misfire-latest-planning.vectors.json`](misfire-latest-planning.vectors.json),
 [`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
+[`occurrence-lease-recovery.vectors.json`](occurrence-lease-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -164,7 +165,8 @@ The runner invokes the target directly without a shell.
       "profile": "scheduler_reliability",
       "suites": [
         "calendar-schedule-resolution",
-        "misfire-latest-planning"
+        "misfire-latest-planning",
+        "occurrence-lease-recovery"
       ]
     }
   ]
@@ -177,7 +179,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements ten structural suites and two
+The native Coven target currently implements ten structural suites and three
 scheduler-reliability suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -209,6 +211,11 @@ timezones.
 production occurrence planner. It proves that downtime collapses daily work to
 the latest due slot, exact replay is idempotent, a clock rollback does not add
 an older fence, and paused definitions do not plan.
+`occurrence-lease-recovery` executes fixed virtual-time cases through the
+production expired-lease recovery path. It proves that pre-dispatch claims are
+recovered after and exactly at lease expiry, unexpired claims remain owned, and
+runtime-owned or runtime-evidenced work is never treated as safe to fail from a
+lease timeout alone.
 `occurrence-fence-uniqueness` executes a portable three-case matrix against the
 production SQLite occurrence schema, proving that one automation cannot claim
 the same scheduled slot twice while different automations may share a slot and
