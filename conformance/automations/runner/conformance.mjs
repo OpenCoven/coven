@@ -23,7 +23,11 @@ const SUITE_REQUEST_SCHEMA_VERSION =
 const SUITE_RESULT_SCHEMA_VERSION =
   "coven.automations.conformance-suite-result.v1";
 const CONTRACT_PROFILE = "coven.automations.v1";
-const TARGET_TIMEOUT_MS = 2_000;
+const TARGET_SCRATCH_ENV = "COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH";
+const DEFAULT_TARGET_TIMEOUT_MS = 2_000;
+// Two cases may each use a 5-second synchronization guard, and a failed
+// shutdown gets one separate 5-second cleanup window.
+const STARTUP_WAKE_TARGET_TIMEOUT_MS = 20_000;
 const TARGET_KILL_GRACE_MS = 100;
 const TARGET_OUTPUT_LIMIT = 1024 * 1024;
 const MAX_JCS_DEPTH = 128;
@@ -392,12 +396,18 @@ async function invokeTarget(subject, operation, input) {
   chmodSync(target, subject.mode);
 
   try {
+    const targetTimeoutMs =
+      operation === "evaluate" &&
+      input?.suiteId === "startup-reconciliation-wake"
+        ? STARTUP_WAKE_TARGET_TIMEOUT_MS
+        : DEFAULT_TARGET_TIMEOUT_MS;
     return await new Promise((resolve) => {
       const child = spawn(
         target,
         ["automations", "conformance", operation],
         {
           detached: process.platform !== "win32",
+          env: { ...process.env, [TARGET_SCRATCH_ENV]: directory },
           stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
         },
@@ -469,7 +479,7 @@ async function invokeTarget(subject, operation, input) {
       };
       const timeout = setTimeout(
         () => terminate(new Error("target timed out"), "unavailable"),
-        TARGET_TIMEOUT_MS,
+        targetTimeoutMs,
       );
 
       child.stdout.on("data", (chunk) => {
