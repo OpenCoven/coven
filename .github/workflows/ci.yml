@@ -263,9 +263,8 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
-    # A healthy cached run is already about 15-16 minutes. Keep enough
-    # shared-runner headroom for the separate clock-feature build and daemon
-    # journeys to report failures without renewing their own startup budgets.
+    # Keep the two build profiles in separate required jobs so feature
+    # evidence cannot be cancelled after the workspace consumes its budget.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -288,6 +287,39 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
+      - name: Upload Threads daemon evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: threads-daemon-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+
+  threads-test-windows:
+    name: Threads daemon tests (Windows)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure Threads evidence directory
+        shell: pwsh
+        env:
+          COVEN_THREADS_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          "COVEN_THREADS_E2E_ARTIFACT_ROOT=$env:COVEN_THREADS_E2E_ARTIFACT_ROOT" >> $env:GITHUB_ENV
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
       - name: Exercise isolated Threads clock feature
         if: ${{ !cancelled() }}
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
@@ -298,7 +330,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: threads-daemon-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: threads-daemon-windows-feature-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 14
           if-no-files-found: error
@@ -683,6 +715,7 @@ jobs:
       - rust-lint-linux
       - rust-test-linux
       - rust-test-windows
+      - threads-test-windows
       - rust-test-macos
       - afs-mount-linux
       - afs-mount-macos
