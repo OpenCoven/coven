@@ -1644,7 +1644,7 @@ fn evaluate_cancellation_timeout_arbitration(vector: &Value) -> Result<bool, &'s
             || cancellation_at >= timeout_at
             || timeout_at >= timeout_observed_at
             || !case.expected.matches_scenario(case.scenario)
-            || case.expected.runtime_stop_count == 0
+            || case.expected.runtime_stop_count != 1
         {
             return Err("conformance vector is invalid");
         }

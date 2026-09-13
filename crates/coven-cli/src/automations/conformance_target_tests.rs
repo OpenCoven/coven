@@ -144,20 +144,20 @@ fn cancellation_timeout_arbitration_suite_executes_the_checked_in_vectors() {
 }
 
 #[test]
-fn cancellation_timeout_arbitration_suite_fails_closed_on_an_expectation_mismatch() {
+fn cancellation_timeout_arbitration_suite_rejects_a_weakened_stop_count() {
     let mut vectors: Value =
         serde_json::from_str(CANCELLATION_TIMEOUT_ARBITRATION_VECTORS).unwrap();
     vectors["cases"][0]["expected"]["runtimeStopCount"] = json!(2);
 
-    let response = evaluate(&request_for_profile(
-        "scheduler_reliability",
-        "cancellation-timeout-arbitration",
-        vectors,
-    ))
-    .unwrap();
-
-    assert_eq!(response.status, TargetSuiteStatus::Failed);
-    assert_eq!(response.evidence, None);
+    assert_eq!(
+        evaluate(&request_for_profile(
+            "scheduler_reliability",
+            "cancellation-timeout-arbitration",
+            vectors,
+        ))
+        .unwrap_err(),
+        "conformance vector is invalid"
+    );
 }
 
 #[test]
