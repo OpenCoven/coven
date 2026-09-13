@@ -42,6 +42,8 @@ const EVENT_REDUCER_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.event-reducer-determinism-vectors.v1";
 const MISFIRE_LATEST_PLANNING_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.misfire-latest-planning-vectors.v1";
+const OCCURRENCE_LEASE_RECOVERY_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.occurrence-lease-recovery-vectors.v1";
 const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
@@ -62,6 +64,7 @@ pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-t
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const MISFIRE_LATEST_PLANNING_SUITE: &str = "misfire-latest-planning";
+pub const OCCURRENCE_LEASE_RECOVERY_SUITE: &str = "occurrence-lease-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -537,6 +540,109 @@ enum CalendarScheduleRejection {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OccurrenceLeaseRecoveryVectorSet {
+    schema_version: String,
+    cases: Vec<OccurrenceLeaseRecoveryVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OccurrenceLeaseRecoveryVectorCase {
+    case_id: String,
+    scenario: OccurrenceLeaseRecoveryScenario,
+    now: String,
+    initial: InitialOccurrenceLease,
+    expected: ExpectedOccurrenceLeaseRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OccurrenceLeaseRecoveryScenario {
+    ExpiredBeforeDispatch,
+    ExactLeaseDeadline,
+    UnexpiredClaim,
+    RuntimeOwnedOccurrence,
+    ClaimedWithRuntimeEvidence,
+}
+
+impl OccurrenceLeaseRecoveryScenario {
+    const COUNT: usize = 5;
+
+    const fn input(self) -> (&'static str, LeaseOccurrenceState, &'static str, bool) {
+        match self {
+            Self::ExpiredBeforeDispatch => (
+                "2026-09-01T10:00:00.000Z",
+                LeaseOccurrenceState::Claimed,
+                "2026-09-01T09:59:59.999Z",
+                false,
+            ),
+            Self::ExactLeaseDeadline => (
+                "2026-09-01T10:00:00.000Z",
+                LeaseOccurrenceState::Claimed,
+                "2026-09-01T10:00:00.000Z",
+                false,
+            ),
+            Self::UnexpiredClaim => (
+                "2026-09-01T10:00:00.000Z",
+                LeaseOccurrenceState::Claimed,
+                "2026-09-01T10:00:00.001Z",
+                false,
+            ),
+            Self::RuntimeOwnedOccurrence => (
+                "2026-09-01T10:00:00.000Z",
+                LeaseOccurrenceState::Running,
+                "2026-09-01T09:59:59.999Z",
+                false,
+            ),
+            Self::ClaimedWithRuntimeEvidence => (
+                "2026-09-01T10:00:00.000Z",
+                LeaseOccurrenceState::Claimed,
+                "2026-09-01T09:59:59.999Z",
+                true,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InitialOccurrenceLease {
+    state: LeaseOccurrenceState,
+    lease_owner: String,
+    lease_expires_at: String,
+    running_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LeaseOccurrenceState {
+    Claimed,
+    Running,
+    Failed,
+}
+
+impl LeaseOccurrenceState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedOccurrenceLeaseRecovery {
+    recovered_count: usize,
+    state: LeaseOccurrenceState,
+    lease_owner: Option<String>,
+    lease_expires_at: Option<String>,
+    failure_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MisfireLatestPlanningVectorSet {
     schema_version: String,
     cases: Vec<MisfireLatestPlanningVectorCase>,
@@ -806,6 +912,7 @@ pub fn capability() -> TargetCapability {
                 suites: vec![
                     CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                     MISFIRE_LATEST_PLANNING_SUITE,
+                    OCCURRENCE_LEASE_RECOVERY_SUITE,
                 ],
             },
         ],
@@ -856,6 +963,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, MISFIRE_LATEST_PLANNING_SUITE) => {
             evaluate_misfire_latest_planning(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, OCCURRENCE_LEASE_RECOVERY_SUITE) => {
+            evaluate_occurrence_lease_recovery(&request.vector)?
         }
         _ => return Err("conformance suite is unsupported"),
     };
@@ -1477,6 +1587,150 @@ fn calendar_schedule_resolution_case_matches(
         }
         _ => false,
     })
+}
+
+fn evaluate_occurrence_lease_recovery(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: OccurrenceLeaseRecoveryVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != OCCURRENCE_LEASE_RECOVERY_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != OccurrenceLeaseRecoveryScenario::COUNT
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        let (now, state, lease_expires_at, running_run) = case.scenario.input();
+        let expected_is_coherent = match case.expected.state {
+            LeaseOccurrenceState::Failed => {
+                case.expected.lease_owner.is_none()
+                    && case.expected.lease_expires_at.is_none()
+                    && case.expected.failure_reason.as_deref() == Some("lease expired")
+            }
+            LeaseOccurrenceState::Claimed | LeaseOccurrenceState::Running => {
+                case.expected
+                    .lease_owner
+                    .as_deref()
+                    .is_some_and(|owner| !owner.is_empty())
+                    && case
+                        .expected
+                        .lease_expires_at
+                        .as_deref()
+                        .and_then(canonical_timestamp)
+                        .is_some()
+                    && case.expected.failure_reason.is_none()
+            }
+        };
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || case.now != now
+            || case.initial.state != state
+            || case.initial.lease_owner != "daemon-a"
+            || case.initial.lease_expires_at != lease_expires_at
+            || case.initial.running_run != running_run
+            || canonical_timestamp(&case.now).is_none()
+            || canonical_timestamp(&case.initial.lease_expires_at).is_none()
+            || case.expected.recovered_count > 1
+            || !expected_is_coherent
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != OccurrenceLeaseRecoveryScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut all_passed = true;
+    for (case_index, case) in vectors.cases.iter().enumerate() {
+        all_passed &= occurrence_lease_recovery_case_matches(case_index, case)?;
+    }
+    Ok(all_passed)
+}
+
+fn occurrence_lease_recovery_case_matches(
+    case_index: usize,
+    case: &OccurrenceLeaseRecoveryVectorCase,
+) -> Result<bool, &'static str> {
+    let conn = command_conformance_connection()?;
+    let automation_id = format!("lease-conformance-{case_index}");
+    let definition = super::definition::RoutineDefinition::from_json(&json!({
+        "schemaVersion": 1,
+        "id": automation_id,
+        "name": "Lease recovery conformance",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the occurrence lease recovery conformance probe.",
+        "tags": []
+    }))
+    .map_err(|_| "conformance suite execution failed")?;
+    super::store::insert_definition(&conn, &definition)
+        .map_err(|_| "conformance suite execution failed")?;
+    let occurrence_id = format!("lease-occurrence-{case_index}");
+    conn.execute(
+        "INSERT INTO automation_occurrences
+            (id, automation_id, automation_revision, definition_digest, scheduled_for,
+             kind, state, lease_owner, lease_expires_at, attempt, created_at, updated_at)
+         SELECT ?1, id, revision, definition_digest, '2026-09-01T09:00:00.000Z',
+                'scheduled', ?2, ?3, ?4, 1,
+                '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+         FROM automation_definitions
+         WHERE id = ?5",
+        rusqlite::params![
+            occurrence_id,
+            case.initial.state.as_str(),
+            case.initial.lease_owner,
+            case.initial.lease_expires_at,
+            automation_id,
+        ],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    if case.initial.running_run {
+        conn.execute(
+            "INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, status, started_at, timeout_at)
+             VALUES (?1, ?2, ?3, 'running',
+                     '2026-09-01T09:30:00.000Z', '2026-09-01T10:30:00.000Z')",
+            rusqlite::params![
+                format!("lease-run-{case_index}"),
+                automation_id,
+                occurrence_id,
+            ],
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+    }
+
+    let now = canonical_timestamp(&case.now).ok_or("conformance vector is invalid")?;
+    let recovered = super::occurrences::recover_expired_leases(&conn, now)
+        .map_err(|_| "conformance suite execution failed")?;
+    let observed = conn
+        .query_row(
+            "SELECT state, lease_owner, lease_expires_at, failure_reason
+             FROM automation_occurrences
+             WHERE id = ?1",
+            [&occurrence_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+
+    Ok(recovered == case.expected.recovered_count
+        && observed.0 == case.expected.state.as_str()
+        && observed.1 == case.expected.lease_owner
+        && observed.2 == case.expected.lease_expires_at
+        && observed.3 == case.expected.failure_reason)
 }
 
 fn evaluate_misfire_latest_planning(vector: &Value) -> Result<bool, &'static str> {
