@@ -191,6 +191,12 @@ or public state.
 | PUT | `/api/v1/familiars/:id/icon` | Update a familiar's icon glyph. | updated familiar | `400`, `404` |
 | POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). Tier-0 and `ward.toml` targets are refused before staging regardless of supplied fingerprints. Held Tier-1 writes stage with deterministic Gate-3 probe evidence; applied writes append `apply_audit` rows to the `ward_audit` ledger. | edit report | `400`, `403` (ward denial or `protected_proposal_forbidden`), `404`, `413 ward_apply_too_large`, `413 proposal_quota_exceeded`, `507 ward_audit_capacity_exceeded` |
 
+Ordinary direct writes retain their admitted Gate-2 destinations, file identities
+and ancestor handles through commit. A changed route, including an alias into a
+configured output-format surface, refuses or rolls back the batch rather than
+bypassing scheduled staging and regression probes. Stable ordinary aliases and
+new-file creation remain supported.
+
 Direct multi-edit requests stage every cleared Tier-2/Tier-3 change before
 commit and share one rollback boundary. Direct writes and proposal approvals
 share one commit-through-Gate-4 serialization boundary, so ledger order matches

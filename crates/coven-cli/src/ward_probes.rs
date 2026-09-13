@@ -1,8 +1,9 @@
 //! Deterministic, offline evidence for Ward Gate-3 review.
 //!
-//! Probes are advisory: their status is serialized beside a staged proposal,
-//! but no result applies or approves a write. Runtime/configuration failures
-//! become `unscored` evidence rather than an implicit pass.
+//! Probes are advisory except for explicitly opted-in, bounded output-format
+//! AutoRegression. That caller requires every applicable result to pass and
+//! binds the deterministic evidence; a probe alone never approves a write.
+//! Runtime/configuration failures are `unscored`, never an implicit pass.
 
 use std::path::Path;
 
@@ -56,7 +57,7 @@ pub(crate) struct ProbeResult {
     pub detail: Value,
 }
 
-/// A probe's deterministic outcome. No variant carries approval authority.
+/// A deterministic outcome; approval authority requires the caller's typed policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ProbeStatus {
@@ -223,21 +224,66 @@ fn run_surface(
             });
         }
     };
-    let baseline_bytes = baseline.as_deref().unwrap_or_default();
+    Ok(run_images(
+        &matching,
+        target,
+        surface,
+        baseline.as_deref(),
+        proposed,
+    ))
+}
+
+/// Execute the same deterministic probes against already committed images.
+/// The caller must independently establish those images' filesystem binding.
+pub(crate) fn run_materialized(
+    config: &WardConfig,
+    diff: &coven_threads_core::MaterializedDiff,
+) -> Result<Vec<SurfaceProbeReport>> {
+    let compiled = compile_probe_matchers(config)?;
+    diff.surfaces()
+        .iter()
+        .map(|surface| {
+            let matching = compiled
+                .iter()
+                .filter_map(|(probe, matcher)| {
+                    matcher.is_match(surface.surface.as_str()).then_some(*probe)
+                })
+                .collect::<Vec<_>>();
+            Ok(run_images(
+                &matching,
+                surface.surface.as_str(),
+                surface.surface.as_str(),
+                surface.before.as_deref(),
+                surface
+                    .after
+                    .as_deref()
+                    .context("probe end state is missing")?,
+            ))
+        })
+        .collect()
+}
+
+fn run_images(
+    matching: &[&ProbeConfig],
+    target: &str,
+    surface: &str,
+    baseline: Option<&[u8]>,
+    proposed: &[u8],
+) -> SurfaceProbeReport {
     let results: Vec<ProbeResult> = matching
-        .into_iter()
-        .map(|probe| run_probe(probe, baseline_bytes, proposed))
+        .iter()
+        .map(|probe| run_probe(probe, baseline.unwrap_or_default(), proposed))
         .collect();
     let status = aggregate_results(&results);
-    Ok(SurfaceProbeReport {
+    SurfaceProbeReport {
         target: target.to_string(),
         surface: surface.to_string(),
-        baseline_sha256: baseline.as_deref().map(sha256_hex),
-        proposed_sha256,
+        baseline_sha256: baseline.map(sha256_hex),
+        proposed_sha256: sha256_hex(proposed),
         status,
         error: None,
         results,
-    })
+    }
 }
 
 /// Result of reconciling persisted evidence with current deterministic output.

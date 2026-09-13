@@ -23,9 +23,10 @@ scheduled-proposal publication route.
 On Windows, the fixture owns a foreground `coven daemon serve` child and waits
 for authenticated health under a bounded startup guard. It uses the real
 `daemon stop` command and replaces the process before checking restart recovery.
-This covers server authority and durable recovery, not the separate two-second
-CLI launcher or atomic `daemon restart` contract. Dedicated lifecycle tests
-retain those contracts. Unix journeys continue to use the normal launcher.
+This covers server authority and durable recovery, not the separate
+[CLI lifecycle deadlines](../reference/threads-e2e.md#lifecycle-deadlines).
+Dedicated lifecycle tests retain those contracts, including the two-second
+standalone stop bound. Unix journeys continue to use the normal launcher.
 
 ## Terminal evidence
 
@@ -50,8 +51,9 @@ remains valid and does not fabricate close evidence.
 
 ## Recover without granting authority
 
-Scheduled publication binds the exact pending-file bytes, including identity and
-probe evidence, in a durable audit reservation before exposing the file. After
+Scheduled publication binds the exact pending-file bytes, including identity,
+AUTO regression, and probe evidence, in a durable audit reservation before
+exposing the file. After
 an interruption, scheduler and decision entry can reconstruct a missing
 submission receipt only from that binding. Changed bytes cannot acquire a new
 receipt through recovery, and existing duplicate or inconsistent receipts still
@@ -62,6 +64,31 @@ work, terminal cleanup, and cursor progression continue. A direct decision for
 the affected proposal reports the reconstruction failure instead of claiming it.
 Global database failures still fail the pass rather than masquerading as partial
 recovery.
+
+Normal publication and receipt reconstruction share the same canonical detail:
+the original `identity_evidence` and, for AUTO, `autoRegressionEvidence`. Recovery
+copies these commitments from the bound body; it never recomputes original
+authority from current configuration. An absent or null AUTO field is compatible
+only for non-AUTO receipts, without bypassing historical identity-proof bounds.
+
+Legacy-format intake also records a proposal-bound `proposal_submitted` row,
+for both authority and coherence review. Before creating a decision request or
+reservation, and again before execution, the daemon requires exactly one
+matching legacy receipt. It checks the familiar, thread, targets, channel,
+staging times, review lane, and the legacy tier/hash representation. A scheduled
+receipt cannot authorize an envelope relabelled as legacy. The authority lane
+remains unclassified at publication; its receipt never overrides protected
+floors or grants approval.
+
+Legacy receipts do not provide the scheduled protocol's exact-body recovery
+binding. If legacy publication succeeds but its audit insert fails, the pending
+file cannot be approved later or acquire an invented expiry terminal. The
+daemon quarantines an unapplied orphan without first rewriting its request.
+Existing applying state or any durable apply intent instead remains available
+for explicit review, with its reservation and bytes preserved. Database errors
+remain operational errors, not evidence for quarantine. Genuine matching legacy
+receipts and their historical recovery continue through the existing decision
+path; unknown review lanes retain the existing corrupt-envelope handling.
 
 An unapplied proposal with an existing window fails closed when its familiar,
 Ward configuration, or authoritative replay is confirmed absent or invalid.
@@ -96,6 +123,25 @@ their bound reservations retained, not reset for a fresh automatic decision.
 Any applying sidecar or durable apply intent excludes this proof, including
 an intent whose sidecar was removed. Malformed or unbound receipts, openings,
 or legacy lane sidecars remain corruption rather than a trusted close context.
+
+A missing or changed private AUTO commitment can likewise justify rejection,
+never approval, when the complete original receipt still passes fresh regression
+replay and any window has exactly one fully matching opening. A no-window AUTO
+refusal does not invent a typed close. This proof does not rewrite the executable
+envelope or receipt, and excludes applying state and orphaned durable apply
+intent. Malformed, duplicate, misbound, or unreplayable original evidence stays
+outside this exception. Origin validation still precedes cleanup and rejection.
+Once the AUTO commitments contradict, confirmed missing authority or failed
+original replay is invalid submission evidence, not ordinary expiry eligibility.
+Quarantine preserves the original request and reservation; retention must not
+replace them with a new server expiry request. Genuine I/O errors remain
+retriable, and an already-bound expiry transition retains its separate recovery
+path.
+
+A failed retained Ward-file guard can consult the final-authority callback to
+preserve the typed refusal cause. This is error classification only: it remains
+a proven no-write refusal even if the callback succeeds, never a retry that
+bypasses the retained-file guard.
 
 ## Quarantine is not a close
 

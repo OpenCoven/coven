@@ -65,6 +65,38 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn('timeout-minutes: 30', windows)
         self.assertNotIn('timeout-minutes: 20', windows)
 
+    def test_windows_rust_gate_restores_without_post_job_cache_packing(self) -> None:
+        windows = ci_job_block('rust-test-windows')
+        self.assertIn(f"uses: actions/cache/restore@{CACHE_SHA}", windows)
+        self.assertNotIn("uses: actions/cache@", windows)
+        self.assertNotIn("uses: actions/cache/save@", windows)
+        self.assertIn(
+            "key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}",
+            windows,
+        )
+        self.assertIn("${{ runner.os }}-rust-test-", windows)
+        self.assertIn("cargo test --workspace --locked", windows)
+        self.assertIn("timeout-minutes: 30", windows)
+        self.assertNotIn("continue-on-error:", windows)
+
+    def test_manual_windows_release_stress_owns_shared_test_cache_writes(self) -> None:
+        stress = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
+        triggers = stress.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertEqual(triggers.strip(), "workflow_dispatch:")
+        windows = stress.split("\n  windows:\n", 1)[1]
+        cache = windows.split(f"- uses: actions/cache@{CACHE_SHA}", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        self.assertIn(
+            "key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}",
+            cache,
+        )
+        self.assertIn("${{ runner.os }}-rust-test-", cache)
+        self.assertIn("${{ runner.os }}-release-stress-", cache)
+        self.assertIn("timeout-minutes: 45", windows)
+        self.assertIn("cargo test --workspace --locked --no-run", windows)
+        self.assertNotIn("continue-on-error:", windows)
+
     def test_ci_runs_expected_workflow_checks(self) -> None:
         for needle in [
             'python3 scripts/classify-ci-changes-test.py',
@@ -152,7 +184,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         )
         self.assertLess(
             steps.index("- name: Configure Threads evidence directory"),
-            steps.index("- uses: actions/cache@"),
+            steps.index("- uses: actions/cache/restore@"),
         )
         self.assertEqual(steps.count("COVEN_THREADS_E2E_ARTIFACT_ROOT:"), 1)
         self.assertNotIn("runner.", job_config)

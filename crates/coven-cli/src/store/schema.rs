@@ -12,7 +12,7 @@ const FTS_BACKFILL_COMPLETE_KEY: &str = "events_fts_backfill_complete";
 const WARD_AUDIT_WAL_AUTOCHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
 const WARD_AUDIT_JOURNAL_RETAIN_BYTES: u64 = 16 * 1024 * 1024;
 const WARD_AUDIT_ROW_OVERHEAD_PAGES: u64 = 4;
-const WARD_AUDIT_CAPACITY_TRIGGER: &str = "coven_ward_audit_capacity_insert";
+pub(super) const WARD_AUDIT_CAPACITY_TRIGGER: &str = "coven_ward_audit_capacity_insert";
 
 pub(super) fn load_ward_audit_schema_state(conn: &Connection) -> Result<String> {
     use coven_threads_core::WARD_AUDIT_SCHEMA_STATE_SQL;
@@ -78,10 +78,10 @@ fn ensure_ward_audit_schema(conn: &Connection) -> Result<()> {
     apply_ward_audit_schema_state(conn, &schema_state)
 }
 
-pub(super) fn initialize_store_with_observer(
+pub(super) fn initialize_store_connection(
     path: &Path,
     mut observe: impl FnMut(StoreInitializationPhase),
-) -> Result<()> {
+) -> Result<Connection> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -118,7 +118,7 @@ pub(super) fn initialize_store_with_observer(
             return Err(error);
         }
     }
-    Ok(())
+    Ok(conn)
 }
 
 pub(super) fn open_initialized_store(path: &Path) -> Result<Connection> {

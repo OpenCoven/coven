@@ -144,13 +144,15 @@ forbidden = ["(?i)ignore previous"]
         self.owned_daemon = Some(child);
         self.daemon_pid = Some(pid);
         self.stopped = false;
-        self.owned_daemon
+        let child = self
+            .owned_daemon
             .as_mut()
-            .context("owned fixture process")?
-            .admit(|child| child.wait_for_health(&self.coven_home))
+            .context("owned fixture process")?;
+        child.admit(|child| child.wait_for_health(&self.coven_home))
             .with_context(|| {
                 format!(
-                    "foreground fixture daemon {pid} failed readiness; stdout: {:?}; stderr: {:?}",
+                    "foreground fixture daemon {pid} failed readiness; exit: {:?}; stdout: {:?}; stderr: {:?}",
+                    self.owned_daemon.as_ref().and_then(|child| child.exit_evidence()),
                     fs::read_to_string(self.coven_home.join("fixture-serve.stdout.log")),
                     fs::read_to_string(self.coven_home.join("fixture-serve.stderr.log")),
                 )

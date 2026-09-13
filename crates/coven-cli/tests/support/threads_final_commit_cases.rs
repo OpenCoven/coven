@@ -311,7 +311,7 @@ fn final_commit_pause_dir(fixture: &ThreadsFixture) -> PathBuf {
 }
 
 #[cfg(feature = "threads-test-clock")]
-fn arm_final_commit_pause(fixture: &ThreadsFixture, capability: &str) -> Result<()> {
+pub(super) fn arm_final_commit_pause(fixture: &ThreadsFixture, capability: &str) -> Result<()> {
     write_private_fixture_file(
         &final_commit_pause_dir(fixture).join("pause-final-commit"),
         capability,
@@ -319,7 +319,7 @@ fn arm_final_commit_pause(fixture: &ThreadsFixture, capability: &str) -> Result<
 }
 
 #[cfg(feature = "threads-test-clock")]
-fn release_final_commit_pause(fixture: &ThreadsFixture, capability: &str) -> Result<()> {
+pub(super) fn release_final_commit_pause(fixture: &ThreadsFixture, capability: &str) -> Result<()> {
     write_private_fixture_file(
         &final_commit_pause_dir(fixture).join("pause-final-commit.release"),
         capability,
@@ -327,7 +327,7 @@ fn release_final_commit_pause(fixture: &ThreadsFixture, capability: &str) -> Res
 }
 
 #[cfg(feature = "threads-test-clock")]
-fn wait_for_final_commit_pause(fixture: &ThreadsFixture) -> Result<()> {
+pub(super) fn wait_for_final_commit_pause(fixture: &ThreadsFixture) -> Result<()> {
     let reached = final_commit_pause_dir(fixture).join("pause-final-commit.reached");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
