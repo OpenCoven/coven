@@ -6,7 +6,7 @@ read_when:
   - Approving or rejecting a Ward proposal
   - Auditing applied Ward writes
 title: "coven ward"
-description: "Reference for coven ward: inspect, approve, or reject pending Ward proposals, read the append-only ward_audit ledger, and migrate v0.1 ward.toml files to the Phase-2 WardConfig dialect."
+description: "Reference for coven ward: inspect, approve, or reject pending Ward proposals, read the append-only ward_audit ledger, inventory opened-window history, and migrate v0.1 ward.toml files to the Phase-2 WardConfig dialect."
 source_adjacent_reason: "Tracks the Ward CLI and security contracts implemented in this repository."
 ---
 
@@ -30,8 +30,30 @@ coven ward pending --json      # exact daemon body (GET /api/v1/threads/proposal
 coven ward approve <id>        # re-validate and atomically apply
 coven ward reject <id> [--note "reason"] # reject without applying
 coven ward audit <familiar>    # append-only ward_audit ledger, newest first
+coven ward audit-census --json # read-only opened-window history inventory
 coven ward migrate --apply     # migrate v0.1 ward.toml files to Phase-2
 ```
+
+## Opened-window history census
+
+`coven ward audit-census` reads the existing local store without starting a
+daemon, initializing a profile, migrating a schema, or consulting the current
+familiar registry. It reports typed terminal history, inconsistencies, retained
+artifact names, orphaned openings, and unprovable apply intent. It never repairs
+history, changes proposals, or grants execution authority.
+
+Use `--json` for the `coven.ward-window-census.v1` report. Exit zero and
+`complete: true` mean inventory completion, **not** universal closure or approval;
+inspect `unresolvedHistories`, each `classification`, and `issues`.
+`--max-audit-rows N` changes the default 10,000 relevant-row bound up to 100,000.
+The 32 MiB decoding and 4,096 artifact-entry bounds remain fixed. Unsupported
+schemas, read errors, and exceeded bounds fail rather than return a partial
+successful report.
+
+Audit reads share a SQLite snapshot. Pending/quarantine names are separate,
+non-atomic and unverified observations, not authority or a proof of absence.
+For the preservation procedure, exact classifications, and unresolved recovery
+obligations, see [read-only operator census](../design/threads-terminal-recovery.md#read-only-operator-census).
 
 ## Ward apply resource limits
 

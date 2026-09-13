@@ -64,6 +64,7 @@ enum Issue {
     MultipleTerminals,
     MissingTypedClose,
     TerminalBeforeOpening,
+    ApplyIntentOrderMismatch,
     FamiliarScopeMismatch,
     TargetScopeMismatch,
     ChannelScopeMismatch,
@@ -333,6 +334,13 @@ fn classify(proposal_id: Option<Uuid>, history: History, artifacts: Artifacts) -
         issues.push(Issue::TerminalBeforeOpening);
     }
     if history
+        .intents
+        .iter()
+        .any(|id| *id <= opening.id || history.terminals.iter().any(|terminal| *id >= terminal.id))
+    {
+        issues.push(Issue::ApplyIntentOrderMismatch);
+    }
+    if history
         .openings
         .iter()
         .chain(&history.terminals)
@@ -442,7 +450,7 @@ fn artifact_id(name: &str) -> Option<(Uuid, &str)> {
     let (stem, suffix) = name.rsplit_once(".json")?;
     let start = stem.len().checked_sub(36)?;
     let prefix = stem.get(..start)?;
-    if !prefix.ends_with('-') {
+    if !prefix.is_empty() && !prefix.ends_with('-') {
         return None;
     }
     Uuid::parse_str(stem.get(start..)?)
@@ -614,7 +622,7 @@ mod tests {
     fn duplicate_uuid_spellings_scope_and_order_are_inconsistent() -> Result<()> {
         let (home, conn) = store()?;
         let (event, detail) = close(WindowCloseReason::Superseded)?;
-        let id = Uuid::new_v4().to_string();
+        let id = Uuid::from_u128(0xabcdef).to_string();
         append(
             &conn,
             &id,

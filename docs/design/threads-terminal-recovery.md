@@ -201,9 +201,9 @@ target contents, approval rationale, or proposal bodies.
 | `typed_terminal_recorded` | Exactly one opening and one core-valid typed terminal, with consistent familiar/target context, compatible available channels, and append order. This is not independent proof of original submission authority, replay inputs, or applied bytes. Existing recovery may consume retained leftovers idempotently. |
 | `open_unverified` | No terminal; a pending/claim filename was observed. Its contents, eligibility, and authority were not validated. Use existing daemon recovery only under its own receipt and revalidation gates. |
 | `quarantined_opening` / `untrusted_artifacts` | No terminal; only quarantined or untrusted matching names were observed. Preserve evidence for explicit recovery; do not promote these artifacts into the active queue. |
-| `orphaned_opening` | No terminal or matching artifact name was observed. This is outside automatic per-item recovery; preserve the audit snapshot and investigate the missing proposal evidence. |
+| `orphaned_opening` | No terminal or recognized matching artifact name was observed. This is outside automatic per-item recovery; preserve the audit snapshot and investigate missing or unattributed proposal evidence. |
 | `unprovable_apply` | Apply intent exists without a terminal. Neither current bytes nor an absent claim proves that no write occurred. Preserve intent and before-image evidence for explicit recovery. |
-| `inconsistent_history` | Invalid records, missing typed closes, duplicate openings/terminals, reverse append order, or contradictory scope. Preserve the original rows; do not manufacture an approval or balancing rejection. |
+| `inconsistent_history` | Invalid records, missing typed closes, duplicate openings/terminals, reverse append order, apply intent outside its opening/terminal interval, or contradictory scope. Preserve the original rows; do not manufacture an approval or balancing rejection. |
 
 Audit reads and the canonical schema fingerprint share one SQLite read
 transaction. `throughAuditId` identifies its high-water mark. Pending and
