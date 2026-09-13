@@ -1,0 +1,95 @@
+{
+  "schemaVersion": "coven.automations.occurrence-lease-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "expired-before-dispatch",
+      "scenario": "expired_before_dispatch",
+      "now": "2026-09-01T10:00:00.000Z",
+      "initial": {
+        "state": "claimed",
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T09:59:59.999Z",
+        "runningRun": false
+      },
+      "expected": {
+        "recoveredCount": 1,
+        "state": "failed",
+        "leaseOwner": null,
+        "leaseExpiresAt": null,
+        "failureReason": "lease expired"
+      }
+    },
+    {
+      "caseId": "exact-lease-deadline",
+      "scenario": "exact_lease_deadline",
+      "now": "2026-09-01T10:00:00.000Z",
+      "initial": {
+        "state": "claimed",
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T10:00:00.000Z",
+        "runningRun": false
+      },
+      "expected": {
+        "recoveredCount": 1,
+        "state": "failed",
+        "leaseOwner": null,
+        "leaseExpiresAt": null,
+        "failureReason": "lease expired"
+      }
+    },
+    {
+      "caseId": "unexpired-claim",
+      "scenario": "unexpired_claim",
+      "now": "2026-09-01T10:00:00.000Z",
+      "initial": {
+        "state": "claimed",
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T10:00:00.001Z",
+        "runningRun": false
+      },
+      "expected": {
+        "recoveredCount": 0,
+        "state": "claimed",
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T10:00:00.001Z",
+        "failureReason": null
+      }
+    },
+    {
+      "caseId": "runtime-owned-occurrence",
+      "scenario": "runtime_owned_occurrence",
+      "now": "2026-09-01T10:00:00.000Z",
+      "initial": {
+        "state": "running",
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T09:59:59.999Z",
+        "runningRun": false
+      },
+      "expected": {
+        "recoveredCount": 0,
+        "state": "running",
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T09:59:59.999Z",
+        "failureReason": null
+      }
+    },
+    {
+      "caseId": "claimed-with-runtime-evidence",
+      "scenario": "claimed_with_runtime_evidence",
+      "now": "2026-09-01T10:00:00.000Z",
+      "initial": {
+        "state": "claimed",
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T09:59:59.999Z",
+        "runningRun": true
+      },
+      "expected": {
+        "recoveredCount": 0,
+        "state": "claimed",
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T09:59:59.999Z",
+        "failureReason": null
+      }
+    }
+  ]
+}

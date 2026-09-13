@@ -3,7 +3,8 @@ use serde_json::{json, Value};
 use super::conformance_target::{
     capability, evaluate, evaluate_run_terminal_monotonicity_case_counts, TargetSuiteStatus,
     CALENDAR_SCHEDULE_RESOLUTION_SUITE, CAPABILITY_NEGOTIATION_SUITE,
-    MISFIRE_LATEST_PLANNING_SUITE, RUN_TERMINAL_MONOTONICITY_SUITE,
+    MISFIRE_LATEST_PLANNING_SUITE, OCCURRENCE_LEASE_RECOVERY_SUITE,
+    RUN_TERMINAL_MONOTONICITY_SUITE,
 };
 
 const ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS: &str = include_str!(
@@ -25,6 +26,9 @@ const EVENT_REDUCER_DETERMINISM_VECTORS: &str = include_str!(
 );
 const MISFIRE_LATEST_PLANNING_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/misfire-latest-planning.vectors.json");
+const OCCURRENCE_LEASE_RECOVERY_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/occurrence-lease-recovery.vectors.json"
+);
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
@@ -93,7 +97,8 @@ fn capability_advertises_the_native_structural_suites() {
                     "profile": "scheduler_reliability",
                     "suites": [
                         CALENDAR_SCHEDULE_RESOLUTION_SUITE,
-                        MISFIRE_LATEST_PLANNING_SUITE
+                        MISFIRE_LATEST_PLANNING_SUITE,
+                        OCCURRENCE_LEASE_RECOVERY_SUITE
                     ]
                 }
             ]
@@ -170,6 +175,89 @@ fn calendar_schedule_resolution_suite_requires_scheduler_profile() {
     let vectors: Value = serde_json::from_str(CALENDAR_SCHEDULE_RESOLUTION_VECTORS).unwrap();
     assert_eq!(
         evaluate(&request_for(CALENDAR_SCHEDULE_RESOLUTION_SUITE, vectors)).unwrap_err(),
+        "conformance suite is unsupported"
+    );
+}
+
+#[test]
+fn occurrence_lease_recovery_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(OCCURRENCE_LEASE_RECOVERY_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        OCCURRENCE_LEASE_RECOVERY_SUITE,
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 5);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 5);
+}
+
+#[test]
+fn occurrence_lease_recovery_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_LEASE_RECOVERY_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["recoveredCount"] = json!(0);
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        OCCURRENCE_LEASE_RECOVERY_SUITE,
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn occurrence_lease_recovery_suite_accepts_portable_case_ids() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_LEASE_RECOVERY_VECTORS).unwrap();
+    vectors["cases"][0]["caseId"] = json!(format!("case:{}", "a".repeat(120)));
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        OCCURRENCE_LEASE_RECOVERY_SUITE,
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+}
+
+#[test]
+fn occurrence_lease_recovery_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 8] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
+        |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
+        |vectors| vectors["cases"][0]["now"] = json!("not-a-time"),
+        |vectors| vectors["cases"][0]["initial"]["leaseExpiresAt"] = json!("not-a-time"),
+        |vectors| vectors["cases"][0]["initial"]["runningRun"] = json!(true),
+        |vectors| vectors["cases"][4]["expected"]["state"] = json!("failed"),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(OCCURRENCE_LEASE_RECOVERY_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                OCCURRENCE_LEASE_RECOVERY_SUITE,
+                vectors,
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn occurrence_lease_recovery_suite_requires_scheduler_profile() {
+    let vectors: Value = serde_json::from_str(OCCURRENCE_LEASE_RECOVERY_VECTORS).unwrap();
+    assert_eq!(
+        evaluate(&request_for(OCCURRENCE_LEASE_RECOVERY_SUITE, vectors)).unwrap_err(),
         "conformance suite is unsupported"
     );
 }

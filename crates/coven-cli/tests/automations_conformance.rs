@@ -24,6 +24,8 @@ const EVENT_REDUCER_DETERMINISM_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/event-reducer-determinism.vectors.json");
 const MISFIRE_LATEST_PLANNING_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/misfire-latest-planning.vectors.json");
+const OCCURRENCE_LEASE_RECOVERY_VECTORS: &str =
+    include_str!("../../../conformance/automations/runner/occurrence-lease-recovery.vectors.json");
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
@@ -113,7 +115,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                     "profile": "scheduler_reliability",
                     "suites": [
                         "calendar-schedule-resolution",
-                        "misfire-latest-planning"
+                        "misfire-latest-planning",
+                        "occurrence-lease-recovery"
                     ]
                 }
             ]
@@ -201,6 +204,47 @@ fn native_target_evaluates_checked_in_misfire_latest_vectors() -> anyhow::Result
     assert_eq!(response["status"], "passed");
     assert_eq!(response["evidence"]["executedCases"], 4);
     assert_eq!(response["evidence"]["passedCases"], 4);
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_occurrence_lease_recovery_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(OCCURRENCE_LEASE_RECOVERY_VECTORS)?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "occurrence-lease-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "occurrence-lease-recovery");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 5);
+    assert_eq!(response["evidence"]["passedCases"], 5);
     assert!(!coven_home.exists());
     Ok(())
 }
