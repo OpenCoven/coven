@@ -1,0 +1,82 @@
+{
+  "schemaVersion": "coven.automations.startup-reconciliation-wake-vectors.v1",
+  "cases": [
+    {
+      "caseId": "startup-runs-due-work-before-first-wait",
+      "scenario": "startup_immediate_reconcile",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "startup-immediate",
+        "name": "Startup immediate",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "cwd": "/work/project",
+        "prompt": "Run the startup reconciliation probe.",
+        "tags": []
+      },
+      "createdAt": "2099-09-01T08:00:00.000Z",
+      "observedAt": "2099-09-03T12:00:00.000Z",
+      "expected": {
+        "outcome": "startup_reconciled",
+        "productionStartPath": true,
+        "systemWaitObserved": true,
+        "launchCount": 1,
+        "launchedBeforeFirstWait": true,
+        "lastPassTrigger": "startup",
+        "occurrenceState": "recovery_required"
+      }
+    },
+    {
+      "caseId": "definition-revision-wakes-sleeping-scheduler",
+      "scenario": "definition_change_wake",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "definition-wake",
+        "name": "Definition wake",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "cwd": "/work/project",
+        "prompt": "Run the definition wake probe.",
+        "tags": []
+      },
+      "revisedDefinition": {
+        "schemaVersion": 1,
+        "id": "definition-wake",
+        "name": "Definition wake",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "cwd": "/work/project",
+        "prompt": "Run the definition wake probe.",
+        "tags": []
+      },
+      "createdAt": "2099-09-01T08:00:00.000Z",
+      "observedAt": "2099-09-03T12:00:00.000Z",
+      "expected": {
+        "outcome": "definition_change_woke_scheduler",
+        "productionStartPath": true,
+        "systemWaitObserved": true,
+        "actionAccepted": true,
+        "wakeObserved": true,
+        "launchCount": 1,
+        "finalRevision": 2,
+        "lastPassTrigger": "wake",
+        "occurrenceState": "recovery_required"
+      }
+    }
+  ]
+}

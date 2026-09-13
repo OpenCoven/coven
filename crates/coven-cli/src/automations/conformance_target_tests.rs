@@ -39,6 +39,9 @@ const RETRY_QUARANTINE_RECOVERY_VECTORS: &str = include_str!(
 const SCHEDULER_LEADERSHIP_FENCING_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/scheduler-leadership-fencing.vectors.json"
 );
+const STARTUP_RECONCILIATION_WAKE_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/startup-reconciliation-wake.vectors.json"
+);
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
@@ -112,7 +115,8 @@ fn capability_advertises_the_native_structural_suites() {
                         OVERLAP_FORBID_CLAIMING_SUITE,
                         "retry-backoff-timing",
                         "retry-quarantine-recovery",
-                        "scheduler-leadership-fencing"
+                        "scheduler-leadership-fencing",
+                        "startup-reconciliation-wake"
                     ]
                 }
             ]
@@ -572,6 +576,78 @@ fn scheduler_leadership_fencing_suite_requires_scheduler_profile() {
     let vectors: Value = serde_json::from_str(SCHEDULER_LEADERSHIP_FENCING_VECTORS).unwrap();
     assert_eq!(
         evaluate(&request_for("scheduler-leadership-fencing", vectors)).unwrap_err(),
+        "conformance suite is unsupported"
+    );
+}
+
+#[test]
+fn startup_reconciliation_wake_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "startup-reconciliation-wake",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 2);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 2);
+}
+
+#[test]
+fn startup_reconciliation_wake_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
+    vectors["cases"][1]["expected"]["lastPassTrigger"] = json!("deadline");
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "startup-reconciliation-wake",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn startup_reconciliation_wake_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 12] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
+        |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
+        |vectors| vectors["cases"][0]["createdAt"] = json!("not-a-time"),
+        |vectors| vectors["cases"][0]["definition"]["status"] = json!("PAUSED"),
+        |vectors| vectors["cases"][1]["revisedDefinition"]["status"] = json!("PAUSED"),
+        |vectors| vectors["cases"][1]["expected"]["outcome"] = json!("startup_reconciled"),
+        |vectors| vectors["cases"][0]["expected"]["launchCount"] = json!(0),
+        |vectors| vectors["cases"][1]["expected"]["wakeObserved"] = json!(false),
+        |vectors| vectors["cases"][0]["expected"]["productionStartPath"] = json!(false),
+        |vectors| vectors["cases"][1]["expected"]["systemWaitObserved"] = json!(false),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                "startup-reconciliation-wake",
+                vectors,
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn startup_reconciliation_wake_suite_requires_scheduler_profile() {
+    let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
+    assert_eq!(
+        evaluate(&request_for("startup-reconciliation-wake", vectors)).unwrap_err(),
         "conformance suite is unsupported"
     );
 }

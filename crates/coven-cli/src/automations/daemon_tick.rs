@@ -18,7 +18,7 @@ const SCHEDULER_INTERVAL: Duration = Duration::from_secs(60);
 const SCHEDULER_SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct MonotonicInstant(Duration);
+pub(crate) struct MonotonicInstant(Duration);
 
 impl MonotonicInstant {
     #[cfg(test)]
@@ -34,13 +34,13 @@ impl MonotonicInstant {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WakeReason {
+pub(crate) enum WakeReason {
     Deadline,
     Signaled,
     Shutdown,
 }
 
-trait AutomationClock: Send + Sync {
+pub(crate) trait AutomationClock: Send + Sync {
     fn now_utc(&self) -> chrono::DateTime<chrono::Utc>;
     fn monotonic_now(&self) -> MonotonicInstant;
     fn sleep_until_or_wake(
@@ -51,14 +51,25 @@ trait AutomationClock: Send + Sync {
     ) -> WakeReason;
 }
 
-struct SystemAutomationClock {
+pub(crate) struct SystemAutomationClock {
     monotonic_origin: Instant,
+    wait_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for SystemAutomationClock {
     fn default() -> Self {
         Self {
             monotonic_origin: Instant::now(),
+            wait_observer: None,
+        }
+    }
+}
+
+impl SystemAutomationClock {
+    pub(crate) fn with_wait_observer(observer: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            monotonic_origin: Instant::now(),
+            wait_observer: Some(observer),
         }
     }
 }
@@ -93,6 +104,9 @@ impl AutomationClock for SystemAutomationClock {
             if remaining.is_zero() {
                 return WakeReason::Deadline;
             }
+            if let Some(observer) = &self.wait_observer {
+                observer();
+            }
             let waited = wake
                 .changed
                 .wait_timeout(state, remaining)
@@ -109,7 +123,7 @@ struct AutomationWakeState {
 }
 
 #[derive(Debug, Default)]
-struct AutomationWakeSignal {
+pub(crate) struct AutomationWakeSignal {
     state: Mutex<AutomationWakeState>,
     changed: Condvar,
 }
@@ -457,6 +471,16 @@ impl AutomationSchedulerHandle {
         self.request_shutdown();
         self.finish_shutdown(deadline)
     }
+
+    pub(crate) fn shutdown_and_join(mut self) -> Result<()> {
+        self.request_shutdown();
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("automations scheduler thread panicked during shutdown"))
+    }
 }
 
 impl Drop for AutomationSchedulerHandle {
@@ -568,12 +592,24 @@ pub fn start_automations_scheduler(
     coven_home: &Path,
     runtime: Arc<dyn crate::api::SessionRuntime + Send + Sync>,
 ) -> Result<AutomationSchedulerHandle> {
+    start_automations_scheduler_with_clock(
+        coven_home,
+        runtime,
+        Arc::new(SystemAutomationClock::default()),
+    )
+}
+
+pub(crate) fn start_automations_scheduler_with_clock(
+    coven_home: &Path,
+    runtime: Arc<dyn crate::api::SessionRuntime + Send + Sync>,
+    clock: Arc<dyn AutomationClock>,
+) -> Result<AutomationSchedulerHandle> {
     let wake = Arc::new(AutomationWakeSignal::default());
     let registration = register_scheduler_wake(coven_home, Arc::downgrade(&wake))?;
 
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
-    let recovery_now = chrono::Utc::now();
+    let recovery_now = clock.now_utc();
     let leadership =
         super::leadership::SchedulerLeadership::acquire(coven_home, &conn, recovery_now)?;
     super::runner::recover_no_process_preownership_launches(coven_home, &conn, recovery_now)
@@ -582,7 +618,6 @@ pub fn start_automations_scheduler(
         .map_err(anyhow::Error::msg)?;
     drop(conn);
 
-    let clock = Arc::new(SystemAutomationClock::default());
     let observed_generation = wake.generation();
 
     let home = coven_home.to_path_buf();
