@@ -441,6 +441,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             now,
         );
         let (pending_path, proposal_id) = stage_legacy_pending_proposal(
+            conn,
             coven_home,
             pending,
             None,
@@ -451,6 +452,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
                 config,
                 authorization,
             },
+            weave.weave_hash(),
         )?;
         GateOutcome::Staged {
             pending_path,
@@ -1219,6 +1221,7 @@ pub(crate) fn stage_coherence_proposal(
         )?,
         None => {
             let (pending_path, proposal_id) = stage_legacy_pending_proposal(
+                audit_reservation.connection(),
                 coven_home,
                 pending,
                 lane.review_kind,
@@ -1229,6 +1232,7 @@ pub(crate) fn stage_coherence_proposal(
                     config,
                     authorization,
                 },
+                &weave_hash,
             )?;
             StagedCoherenceProposal {
                 pending_path,
@@ -1238,38 +1242,6 @@ pub(crate) fn stage_coherence_proposal(
         }
     };
 
-    if staging.scheduled.is_none() {
-        let files_touched = serde_json::to_string(
-            &edits
-                .iter()
-                .map(|edit| edit.target.as_str())
-                .collect::<Vec<_>>(),
-        )?;
-        let format = time::format_description::well_known::Rfc3339;
-        let now_text = now.format(&format)?;
-        audit_reservation
-            .connection()
-            .execute(
-                "INSERT INTO ward_audit (
-                event_type, proposal_id, familiar_id, ward_version, ward_hash,
-                tier, decision, approver, diff_hash, files_touched, channel,
-                thread_id, submitted_at, decided_at, detail
-            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?10, ?9, ?9, NULL)",
-                rusqlite::params![
-                    threads::AuditEventType::ProposalSubmitted.tag(),
-                    staging.proposal_id.as_str(),
-                    familiar_id,
-                    &weave_hash,
-                    i64::from(u8::from(ward::Tier::Reviewed)),
-                    "staged:coherence",
-                    files_touched,
-                    format!("{:?}", threads::Channel::Mutation).to_lowercase(),
-                    now_text,
-                    thread_id.0.to_string(),
-                ],
-            )
-            .context("appending proposal_submitted audit for coherence staging")?;
-    }
     Ok(staging)
 }
 
@@ -1360,12 +1332,22 @@ fn pending_proposal(
 }
 
 fn stage_legacy_pending_proposal(
+    conn: &Connection,
     coven_home: &Path,
     pending: threads::PendingProposal,
     review_kind: Option<&'static str>,
     edits: &[ward::FileEdit],
     probe_context: StagingProbeContext<'_>,
+    weave_hash: &[u8],
 ) -> Result<(PathBuf, String)> {
+    let (decision, tier) = match review_kind {
+        Some("coherence") => (
+            "staged:coherence",
+            Some(i64::from(u8::from(ward::Tier::Reviewed))),
+        ),
+        None => ("staged:authority", None),
+        Some(_) => anyhow::bail!("unsupported legacy proposal review lane"),
+    };
     ward::validate_file_edit_budget(edits)?;
     let identity_evidence = staging_identity_evidence(coven_home, edits, &probe_context)?;
     let probes = crate::ward_probes::run_at_staging(
@@ -1382,6 +1364,36 @@ fn stage_legacy_pending_proposal(
         identity_evidence,
         &probes,
     )?;
+    let files_touched = serde_json::to_string(
+        &pending
+            .edits
+            .iter()
+            .map(|edit| edit.surface.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    let staged_at = pending
+        .staged_at
+        .format(&time::format_description::well_known::Rfc3339)?;
+    conn.execute(
+        "INSERT INTO ward_audit (
+            event_type, proposal_id, familiar_id, ward_version, ward_hash,
+            tier, decision, approver, diff_hash, files_touched, channel,
+            thread_id, submitted_at, decided_at, detail
+         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9, ?10, ?10, NULL)",
+        params![
+            threads::AuditEventType::ProposalSubmitted.tag(),
+            pending.id.to_string(),
+            probe_context.familiar_id,
+            weave_hash,
+            tier,
+            decision,
+            files_touched,
+            format!("{:?}", pending.channel).to_lowercase(),
+            pending.thread_id.0.to_string(),
+            staged_at,
+        ],
+    )
+    .context("appending proposal_submitted audit for legacy staging")?;
     Ok((path, pending.id.0.to_string()))
 }
 
@@ -2204,17 +2216,20 @@ coven = "OpenCoven"
             disk.contains("Mallory"),
             "staging must not write the surface"
         );
-        // Audit trail carries the degrade decision.
-        let decision: String = f
+        // Keep the original verdict before the proposal-bound submission.
+        let mut statement = f
             .conn
-            .query_row(
+            .prepare(
                 "SELECT decision FROM ward_audit WHERE familiar_id='sage' \
-                 ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
+                 ORDER BY id DESC LIMIT 2",
             )
             .unwrap();
-        assert_eq!(decision, "degrade_to_proposal");
+        let decisions = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(decisions, ["staged:authority", "degrade_to_proposal"]);
     }
 
     #[test]

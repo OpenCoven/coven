@@ -1201,7 +1201,7 @@ fn output_auto_rejection_proof_refuses_corrupt_or_unbound_original_evidence() ->
         if change == "opening-duplicate" {
             append_audit_copy(&conn, &id, "proposal_window_opened", &opening)?;
         }
-        let result = validate_scheduled_submission_document(home, &conn, &document);
+        let result = validate_proposal_submission_document(home, &conn, &document);
         if change == "valid" {
             assert!(matches!(
                 result?,

@@ -71,6 +71,25 @@ copies these commitments from the bound body; it never recomputes original
 authority from current configuration. An absent or null AUTO field is compatible
 only for non-AUTO receipts, without bypassing historical identity-proof bounds.
 
+Legacy-format intake also records a proposal-bound `proposal_submitted` row,
+for both authority and coherence review. Before creating a decision request or
+reservation, and again before execution, the daemon requires exactly one
+matching legacy receipt. It checks the familiar, thread, targets, channel,
+staging times, review lane, and the legacy tier/hash representation. A scheduled
+receipt cannot authorize an envelope relabelled as legacy. The authority lane
+remains unclassified at publication; its receipt never overrides protected
+floors or grants approval.
+
+Legacy receipts do not provide the scheduled protocol's exact-body recovery
+binding. If legacy publication succeeds but its audit insert fails, the pending
+file cannot be approved later or acquire an invented expiry terminal. The
+daemon quarantines an unapplied orphan without first rewriting its request.
+Existing applying state or any durable apply intent instead remains available
+for explicit review, with its reservation and bytes preserved. Database errors
+remain operational errors, not evidence for quarantine. Genuine matching legacy
+receipts and their historical recovery continue through the existing decision
+path; unknown review lanes retain the existing corrupt-envelope handling.
+
 An unapplied proposal with an existing window fails closed when its familiar,
 Ward configuration, or authoritative replay is confirmed absent or invalid.
 Its rejection uses `revalidation_failed` and `replay_hash_matched = false`. If

@@ -9801,6 +9801,18 @@ fn proposal_retention_expired(
     if bound_proposal_expiry_transition(coven_home, conn, document)?.is_some() {
         return Ok(true);
     }
+    if document.scheduled().is_none() {
+        match validate_legacy_submission_document(conn, document) {
+            Ok(()) => {}
+            Err(error)
+                if invalid_scheduled_submission_authority(&error)
+                    || error.is::<HistoricalDecisionReviewRequired>() =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+    }
     match rejection_only_submission_proof(coven_home, conn, document) {
         Ok(Some(_)) => return Ok(false),
         Ok(None) => {}
@@ -10127,8 +10139,21 @@ fn decide_threads_proposal_inner(
         effective_expired = true;
     }
     let (mut audit_reservation, mut claim, reservation_decision) = loop {
-        let (existing_claim, proposal_found, inspected_document) =
+        let (existing_claim, proposal_path, inspected_document) =
             inspect_proposal_decision_document(coven_home, proposal_uuid);
+        let proposal_found = proposal_path.is_some();
+        if let (Some(path), Some(document)) = (proposal_path.as_ref(), inspected_document.as_ref())
+        {
+            if document.scheduled().is_none()
+                && PendingReviewKind::from_stored_value(document.review_kind.as_deref()).is_some()
+            {
+                if let Some(response) =
+                    legacy_submission_preflight_response(coven_home, &conn, path, document)?
+                {
+                    return Ok(response);
+                }
+            }
+        }
         let existing_request = inspected_document
             .as_ref()
             .and_then(|document| document.decision_request.as_ref());
@@ -10384,8 +10409,11 @@ fn decide_threads_proposal_inner(
     }
     let mut opened_window_rejection = None;
     let mut auto_regression_rejection = None;
-    if document.scheduled().is_some() {
-        match validate_scheduled_submission_document(coven_home, &conn, &document) {
+    // Unknown legacy lanes still reach the existing corrupt-envelope handler below.
+    if document.scheduled().is_some()
+        || PendingReviewKind::from_stored_value(document.review_kind.as_deref()).is_some()
+    {
+        match validate_proposal_submission_document(coven_home, &conn, &document) {
             Ok(ScheduledSubmissionValidation::Verified) => {}
             Ok(ScheduledSubmissionValidation::Reject(
                 ScheduledSubmissionRejection::OpenedWindow(proof),
@@ -10402,7 +10430,7 @@ fn decide_threads_proposal_inner(
                     .downcast_ref::<HistoricalDecisionReviewRequired>()
                     .is_some() =>
             {
-                if document.decision_state.is_none() {
+                if document.decision_state.is_none() && document.scheduled().is_some() {
                     claim.restore_pending(&document)?;
                     audit_reservation.finish()?;
                 } else {
@@ -12861,8 +12889,10 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
         }
         let conn = store::open_store(&store_path(coven_home))?;
         let mut rejection_only = false;
-        if document.scheduled().is_some() {
-            match validate_scheduled_submission_document(coven_home, &conn, &document) {
+        if document.scheduled().is_some()
+            || PendingReviewKind::from_stored_value(document.review_kind.as_deref()).is_some()
+        {
+            match validate_proposal_submission_document(coven_home, &conn, &document) {
                 Ok(ScheduledSubmissionValidation::Verified) => {}
                 Ok(ScheduledSubmissionValidation::Reject(_)) => {
                     rejection_only = true;
@@ -13559,6 +13589,139 @@ fn invalid_scheduled_submission_authority(error: &anyhow::Error) -> bool {
         .is_some()
 }
 
+fn legacy_submission_authority(
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+) -> Result<()> {
+    let (decision, tier) =
+        match PendingReviewKind::from_stored_value(document.review_kind.as_deref()) {
+            Some(PendingReviewKind::Coherence) => (
+                "staged:coherence",
+                Some(u8::from(ward::Tier::Reviewed).to_string()),
+            ),
+            Some(PendingReviewKind::Authority) => ("staged:authority", None),
+            None => {
+                return Err(invalid_submission_authority(
+                    "legacy proposal review lane is invalid",
+                ))
+            }
+        };
+    if document.auto_regression_evidence.is_some() {
+        return Err(invalid_submission_authority(
+            "legacy proposals cannot carry AUTO submission authority",
+        ));
+    }
+    let pending = document.pending();
+    let targets = serde_json::to_string(
+        &pending
+            .edits
+            .iter()
+            .map(|edit| edit.surface.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    let staged_at = pending
+        .staged_at
+        .format(&time::format_description::well_known::Rfc3339)?;
+    let (count, familiar, matching): (i64, Option<String>, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(familiar_id), COALESCE(SUM(
+                 decision = ?2 AND approver IS NULL AND thread_id = ?3
+                 AND submitted_at = ?4 AND decided_at = ?4 AND channel = ?5
+                 AND files_touched = ?6 AND CAST(tier AS TEXT) IS ?7
+                 AND typeof(ward_hash) = 'blob' AND length(ward_hash) = 32
+                 AND detail IS NULL
+             ), 0)
+             FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+            rusqlite::params![
+                pending.id.to_string(),
+                decision,
+                pending.thread_id.0.to_string(),
+                staged_at,
+                format!("{:?}", pending.channel).to_lowercase(),
+                targets,
+                tier,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(submission_evidence_column_error)?;
+    if count != 1
+        || matching != 1
+        || familiar
+            .as_deref()
+            .is_none_or(|id| crate::threads_gate::familiar_weave_id(id) != pending.familiar_id)
+    {
+        return Err(invalid_submission_authority(
+            "legacy proposal requires exactly one matching original submission receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_legacy_submission_document(
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+) -> Result<()> {
+    match legacy_submission_authority(conn, document) {
+        Err(error)
+            if invalid_scheduled_submission_authority(&error)
+                && (document.decision_state.is_some()
+                    || conn.query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM ward_audit WHERE proposal_id = ?1
+                             AND decision = 'proposal-apply-intent'
+                         )",
+                        [document.pending().id.to_string()],
+                        |row| row.get::<_, bool>(0),
+                    )?) =>
+        {
+            Err(HistoricalDecisionReviewRequired(
+                "legacy submission receipt is invalid; existing apply evidence requires review",
+            )
+            .into())
+        }
+        result => result,
+    }
+}
+
+fn legacy_submission_preflight_response(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    path: &Path,
+    document: &ProposalEnvelopeDocument,
+) -> Result<Option<ApiResponse>> {
+    match validate_legacy_submission_document(conn, document) {
+        Ok(()) => Ok(None),
+        Err(error) if error.is::<HistoricalDecisionReviewRequired>() => json_response(
+            409,
+            &json!({
+                "blocked": true,
+                "why": "proposal-decision-review-required",
+                "proposalId": document.pending().id.to_string(),
+                "terminal": false,
+                "error": error.to_string(),
+            }),
+        )
+        .map(Some),
+        Err(error) if invalid_scheduled_submission_authority(&error) => {
+            let quarantine =
+                crate::proposal_store::quarantine(coven_home, path, "submission-receipt")?;
+            json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-submission-receipt-invalid",
+                    "proposalId": document.pending().id.to_string(),
+                    "quarantined": true,
+                    "quarantinePath": quarantine.map(|path| path.display().to_string()),
+                    "error": error.to_string(),
+                }),
+            )
+            .map(Some)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn scheduled_submission_authority(
     conn: &rusqlite::Connection,
     proposal: &crate::proposal_scheduler::ScheduledProposal,
@@ -13625,11 +13788,15 @@ struct RecordedOpenedWindow {
     thread_id: Option<String>,
 }
 
-fn validate_scheduled_submission_document(
+fn validate_proposal_submission_document(
     coven_home: &Path,
     conn: &rusqlite::Connection,
     document: &ProposalEnvelopeDocument,
 ) -> Result<ScheduledSubmissionValidation> {
+    if document.scheduled().is_none() {
+        validate_legacy_submission_document(conn, document)?;
+        return Ok(ScheduledSubmissionValidation::Verified);
+    }
     match scheduled_submission_authority_for_document(coven_home, conn, document) {
         Ok(_) => Ok(ScheduledSubmissionValidation::Verified),
         Err(error) if invalid_scheduled_submission_authority(&error) => {
@@ -13653,15 +13820,15 @@ fn rejection_only_submission_proof(
         .map(ScheduledSubmissionRejection::AutoRegression))
 }
 
-fn opened_window_evidence_column_error(error: rusqlite::Error) -> anyhow::Error {
+fn submission_evidence_column_error(error: rusqlite::Error) -> anyhow::Error {
     match error {
         error @ (rusqlite::Error::InvalidColumnType(..)
         | rusqlite::Error::FromSqlConversionFailure(..)
         | rusqlite::Error::IntegralValueOutOfRange(..)
         | rusqlite::Error::QueryReturnedNoRows) => invalid_submission_authority(format!(
-            "original opened-window evidence is invalid: {error}"
+            "original submission evidence is invalid: {error}"
         )),
-        error => anyhow::Error::new(error).context("loading original opened-window evidence"),
+        error => anyhow::Error::new(error).context("loading original submission evidence"),
     }
 }
 
@@ -13691,7 +13858,7 @@ fn original_submission_detail(
                 ))
             },
         )
-        .map_err(opened_window_evidence_column_error)?;
+        .map_err(submission_evidence_column_error)?;
     let staged_at = pending
         .staged_at
         .format(&time::format_description::well_known::Rfc3339)?;
@@ -13839,7 +14006,7 @@ fn original_opened_window_proof(
                 })
             },
         )
-        .map_err(opened_window_evidence_column_error)?;
+        .map_err(submission_evidence_column_error)?;
     let targets: Vec<String> = serde_json::from_str(&opened.files_touched).map_err(|error| {
         invalid_submission_authority(format!("original window targets are invalid: {error}"))
     })?;
@@ -14269,7 +14436,7 @@ impl std::error::Error for ProposalDecisionRequestPossiblyPersisted {}
 fn inspect_proposal_decision_document(
     coven_home: &Path,
     proposal_id: Uuid,
-) -> (bool, bool, Option<ProposalEnvelopeDocument>) {
+) -> (bool, Option<PathBuf>, Option<ProposalEnvelopeDocument>) {
     let claim = find_any_pending_decision_claim(coven_home, &proposal_id.to_string());
     let (is_claim, path) = match claim {
         Some((path, _)) => (true, Some(path)),
@@ -14280,11 +14447,11 @@ fn inspect_proposal_decision_document(
                 .flatten(),
         ),
     };
-    let found = path.is_some();
     let document = path
-        .and_then(|path| read_pending_proposal_file(&path).ok())
+        .as_ref()
+        .and_then(|path| read_pending_proposal_file(path).ok())
         .and_then(|raw| ProposalEnvelopeDocument::parse_preflighted(&raw).ok());
-    (is_claim, found, document)
+    (is_claim, path, document)
 }
 
 fn release_superseded_proposal_reservations(
@@ -35008,6 +35175,11 @@ tier = 0
         Ok(())
     }
 
+    mod legacy_submission_cases {
+        use super::*;
+        include!("api_legacy_submission_tests.rs");
+    }
+
     fn stage_coherence_edit(
         home: &Path,
         target: &str,
@@ -41928,19 +42100,20 @@ tier = 0
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         seed_warded_familiar(home)?;
-        let staged = post_edits(
+        let staged = crate::threads_clock::with_test_time(
             home,
-            r#"{"edits":[{"target":"reviewed/skill.md","contents":"expired change"}]}"#,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+            || {
+                post_edits(
+                    home,
+                    r#"{"edits":[{"target":"reviewed/skill.md","contents":"expired change"}]}"#,
+                )
+            },
         )?;
         assert_eq!(staged.status, 202, "got {}", staged.body);
         let staged: Value = serde_json::from_str(&staged.body)?;
         let proposal_id = staged["proposalId"].as_str().context("proposal id")?;
         let pending = PathBuf::from(staged["pendingPath"].as_str().context("pending path")?);
-        let mut value: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
-        value["staged_at"] =
-            serde_json::to_value(time::OffsetDateTime::now_utc() - time::Duration::days(31))?;
-        std::fs::write(&pending, serde_json::to_vec(&value)?)?;
-
         assert_eq!(process_due_threads_proposals(home)?, 1);
 
         assert!(!pending.exists());

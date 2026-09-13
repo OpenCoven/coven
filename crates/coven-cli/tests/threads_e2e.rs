@@ -100,6 +100,75 @@ fn smoke_bounded_ward_apply_over_real_daemon() -> Result<()> {
     })
 }
 
+#[cfg(feature = "threads-test-clock")]
+#[test]
+fn legacy_submission_insert_failure_cannot_be_approved_over_real_daemon() -> Result<()> {
+    run_clocked_journey(
+        "legacy-submission-insert-failure",
+        |_, workspace| {
+            fs::create_dir_all(workspace.join("reviewed"))?;
+            fs::write(workspace.join("reviewed/skill.md"), "legacy before")?;
+            Ok(())
+        },
+        |fixture, _| {
+            fixture.store()?.execute_batch(
+                "CREATE TRIGGER deny_legacy_submission BEFORE INSERT ON ward_audit
+                 WHEN NEW.event_type='proposal_submitted'
+                 BEGIN SELECT RAISE(ABORT, 'injected legacy submission failure'); END;",
+            )?;
+            let staged = fixture.request(
+                "POST",
+                "/api/v1/familiars/sage/edits",
+                Some(&json!({"edits":[{"target":"reviewed/skill.md","contents":"legacy after"}]})),
+            )?;
+            anyhow::ensure!(
+                staged.status == 500,
+                "receipt failure was hidden: {staged:?}"
+            );
+            fixture
+                .store()?
+                .execute_batch("DROP TRIGGER deny_legacy_submission")?;
+            let entries = fs::read_dir(fixture.coven_home.join("pending"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let path = entries
+                .iter()
+                .map(|entry| entry.path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .context("published legacy file")?;
+            let original = fs::read(&path)?;
+            let document: Value = serde_json::from_slice(&original)?;
+            let id = document["id"].as_str().context("legacy id")?;
+            let response = fixture.request(
+                "POST",
+                &format!("/api/v1/threads/proposals/{id}/approve"),
+                Some(&json!({})),
+            )?;
+            anyhow::ensure!(
+                response.status == 409,
+                "unaudited legacy proposal executed: {response:?}"
+            );
+            anyhow::ensure!(response.body["why"] == "proposal-submission-receipt-invalid");
+            anyhow::ensure!(
+                fs::read_to_string(fixture.workspace.join("reviewed/skill.md"))? == "legacy before"
+            );
+            anyhow::ensure!(
+                fs::read(
+                    response.body["quarantinePath"]
+                        .as_str()
+                        .context("quarantine")?
+                )? == original
+            );
+            let count: i64 = fixture.store()?.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE proposal_id=?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(count == 0, "receiptless execution invented audit authority");
+            Ok(())
+        },
+    )
+}
+
 #[test]
 fn smoke_unsigned_protected_rejection_over_real_daemon() -> Result<()> {
     run_journey("smoke-unsigned-protected-rejection", |fixture| {
