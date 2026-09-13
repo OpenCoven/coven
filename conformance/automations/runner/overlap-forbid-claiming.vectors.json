@@ -1,0 +1,96 @@
+{
+  "schemaVersion": "coven.automations.overlap-forbid-claiming-vectors.v1",
+  "cases": [
+    {
+      "caseId": "no-overlap-claims",
+      "scenario": "no_overlap",
+      "now": "2026-09-01T10:00:00.000Z",
+      "blocker": "none",
+      "expected": {
+        "claimed": true,
+        "targetState": "claimed",
+        "targetAttempt": 1,
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T11:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "claimed-occurrence-blocks",
+      "scenario": "claimed_occurrence",
+      "now": "2026-09-01T10:00:00.000Z",
+      "blocker": "claimed_occurrence",
+      "expected": {
+        "claimed": false,
+        "targetState": "planned",
+        "targetAttempt": 0,
+        "leaseOwner": null,
+        "leaseExpiresAt": null
+      }
+    },
+    {
+      "caseId": "running-occurrence-blocks",
+      "scenario": "running_occurrence",
+      "now": "2026-09-01T10:00:00.000Z",
+      "blocker": "running_occurrence",
+      "expected": {
+        "claimed": false,
+        "targetState": "planned",
+        "targetAttempt": 0,
+        "leaseOwner": null,
+        "leaseExpiresAt": null
+      }
+    },
+    {
+      "caseId": "running-run-blocks",
+      "scenario": "running_run",
+      "now": "2026-09-01T10:00:00.000Z",
+      "blocker": "running_run",
+      "expected": {
+        "claimed": false,
+        "targetState": "planned",
+        "targetAttempt": 0,
+        "leaseOwner": null,
+        "leaseExpiresAt": null
+      }
+    },
+    {
+      "caseId": "succeeded-occurrence-allows",
+      "scenario": "succeeded_occurrence",
+      "now": "2026-09-01T10:00:00.000Z",
+      "blocker": "succeeded_occurrence",
+      "expected": {
+        "claimed": true,
+        "targetState": "claimed",
+        "targetAttempt": 1,
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T11:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "failed-occurrence-allows",
+      "scenario": "failed_occurrence",
+      "now": "2026-09-01T10:00:00.000Z",
+      "blocker": "failed_occurrence",
+      "expected": {
+        "claimed": true,
+        "targetState": "claimed",
+        "targetAttempt": 1,
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T11:00:00.000Z"
+      }
+    },
+    {
+      "caseId": "cancelled-occurrence-allows",
+      "scenario": "cancelled_occurrence",
+      "now": "2026-09-01T10:00:00.000Z",
+      "blocker": "cancelled_occurrence",
+      "expected": {
+        "claimed": true,
+        "targetState": "claimed",
+        "targetAttempt": 1,
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T11:00:00.000Z"
+      }
+    }
+  ]
+}

@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use super::conformance_target::{
     capability, evaluate, evaluate_run_terminal_monotonicity_case_counts, TargetSuiteStatus,
     CALENDAR_SCHEDULE_RESOLUTION_SUITE, CAPABILITY_NEGOTIATION_SUITE,
-    MISFIRE_LATEST_PLANNING_SUITE, OCCURRENCE_LEASE_RECOVERY_SUITE,
+    MISFIRE_LATEST_PLANNING_SUITE, OCCURRENCE_LEASE_RECOVERY_SUITE, OVERLAP_FORBID_CLAIMING_SUITE,
     RUN_TERMINAL_MONOTONICITY_SUITE,
 };
 
@@ -29,6 +29,8 @@ const MISFIRE_LATEST_PLANNING_VECTORS: &str =
 const OCCURRENCE_LEASE_RECOVERY_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/occurrence-lease-recovery.vectors.json"
 );
+const OVERLAP_FORBID_CLAIMING_VECTORS: &str =
+    include_str!("../../../../conformance/automations/runner/overlap-forbid-claiming.vectors.json");
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
@@ -98,7 +100,8 @@ fn capability_advertises_the_native_structural_suites() {
                     "suites": [
                         CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                         MISFIRE_LATEST_PLANNING_SUITE,
-                        OCCURRENCE_LEASE_RECOVERY_SUITE
+                        OCCURRENCE_LEASE_RECOVERY_SUITE,
+                        OVERLAP_FORBID_CLAIMING_SUITE
                     ]
                 }
             ]
@@ -258,6 +261,80 @@ fn occurrence_lease_recovery_suite_requires_scheduler_profile() {
     let vectors: Value = serde_json::from_str(OCCURRENCE_LEASE_RECOVERY_VECTORS).unwrap();
     assert_eq!(
         evaluate(&request_for(OCCURRENCE_LEASE_RECOVERY_SUITE, vectors)).unwrap_err(),
+        "conformance suite is unsupported"
+    );
+}
+
+#[test]
+fn overlap_forbid_claiming_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(OVERLAP_FORBID_CLAIMING_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        OVERLAP_FORBID_CLAIMING_SUITE,
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 7);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 7);
+}
+
+#[test]
+fn overlap_forbid_claiming_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(OVERLAP_FORBID_CLAIMING_VECTORS).unwrap();
+    vectors["cases"][1]["expected"] = json!({
+        "claimed": true,
+        "targetState": "claimed",
+        "targetAttempt": 1,
+        "leaseOwner": "daemon-a",
+        "leaseExpiresAt": "2026-09-01T11:00:00.000Z"
+    });
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        OVERLAP_FORBID_CLAIMING_SUITE,
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn overlap_forbid_claiming_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 8] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
+        |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
+        |vectors| vectors["cases"][0]["now"] = json!("not-a-time"),
+        |vectors| vectors["cases"][2]["blocker"] = json!("claimed_occurrence"),
+        |vectors| vectors["cases"][0]["expected"]["leaseExpiresAt"] = Value::Null,
+        |vectors| vectors["cases"][1]["expected"]["targetAttempt"] = json!(1),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(OVERLAP_FORBID_CLAIMING_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                OVERLAP_FORBID_CLAIMING_SUITE,
+                vectors,
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn overlap_forbid_claiming_suite_requires_scheduler_profile() {
+    let vectors: Value = serde_json::from_str(OVERLAP_FORBID_CLAIMING_VECTORS).unwrap();
+    assert_eq!(
+        evaluate(&request_for(OVERLAP_FORBID_CLAIMING_SUITE, vectors)).unwrap_err(),
         "conformance suite is unsupported"
     );
 }

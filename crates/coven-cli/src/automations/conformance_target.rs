@@ -44,6 +44,8 @@ const MISFIRE_LATEST_PLANNING_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.misfire-latest-planning-vectors.v1";
 const OCCURRENCE_LEASE_RECOVERY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-lease-recovery-vectors.v1";
+const OVERLAP_FORBID_CLAIMING_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.overlap-forbid-claiming-vectors.v1";
 const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
@@ -65,6 +67,7 @@ pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const MISFIRE_LATEST_PLANNING_SUITE: &str = "misfire-latest-planning";
 pub const OCCURRENCE_LEASE_RECOVERY_SUITE: &str = "occurrence-lease-recovery";
+pub const OVERLAP_FORBID_CLAIMING_SUITE: &str = "overlap-forbid-claiming";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -643,6 +646,89 @@ struct ExpectedOccurrenceLeaseRecovery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OverlapForbidClaimingVectorSet {
+    schema_version: String,
+    cases: Vec<OverlapForbidClaimingVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OverlapForbidClaimingVectorCase {
+    case_id: String,
+    scenario: OverlapForbidClaimingScenario,
+    now: String,
+    blocker: OverlapBlocker,
+    expected: ExpectedOverlapForbidClaim,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OverlapForbidClaimingScenario {
+    NoOverlap,
+    ClaimedOccurrence,
+    RunningOccurrence,
+    RunningRun,
+    SucceededOccurrence,
+    FailedOccurrence,
+    CancelledOccurrence,
+}
+
+impl OverlapForbidClaimingScenario {
+    const COUNT: usize = 7;
+
+    const fn blocker(self) -> OverlapBlocker {
+        match self {
+            Self::NoOverlap => OverlapBlocker::None,
+            Self::ClaimedOccurrence => OverlapBlocker::ClaimedOccurrence,
+            Self::RunningOccurrence => OverlapBlocker::RunningOccurrence,
+            Self::RunningRun => OverlapBlocker::RunningRun,
+            Self::SucceededOccurrence => OverlapBlocker::SucceededOccurrence,
+            Self::FailedOccurrence => OverlapBlocker::FailedOccurrence,
+            Self::CancelledOccurrence => OverlapBlocker::CancelledOccurrence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OverlapBlocker {
+    None,
+    ClaimedOccurrence,
+    RunningOccurrence,
+    RunningRun,
+    SucceededOccurrence,
+    FailedOccurrence,
+    CancelledOccurrence,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedOverlapForbidClaim {
+    claimed: bool,
+    target_state: OverlapTargetState,
+    target_attempt: u8,
+    lease_owner: Option<String>,
+    lease_expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OverlapTargetState {
+    Planned,
+    Claimed,
+}
+
+impl OverlapTargetState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Claimed => "claimed",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MisfireLatestPlanningVectorSet {
     schema_version: String,
     cases: Vec<MisfireLatestPlanningVectorCase>,
@@ -913,6 +999,7 @@ pub fn capability() -> TargetCapability {
                     CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                     MISFIRE_LATEST_PLANNING_SUITE,
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
+                    OVERLAP_FORBID_CLAIMING_SUITE,
                 ],
             },
         ],
@@ -966,6 +1053,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, OCCURRENCE_LEASE_RECOVERY_SUITE) => {
             evaluate_occurrence_lease_recovery(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, OVERLAP_FORBID_CLAIMING_SUITE) => {
+            evaluate_overlap_forbid_claiming(&request.vector)?
         }
         _ => return Err("conformance suite is unsupported"),
     };
@@ -1731,6 +1821,177 @@ fn occurrence_lease_recovery_case_matches(
         && observed.1 == case.expected.lease_owner
         && observed.2 == case.expected.lease_expires_at
         && observed.3 == case.expected.failure_reason)
+}
+
+fn evaluate_overlap_forbid_claiming(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: OverlapForbidClaimingVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != OVERLAP_FORBID_CLAIMING_VECTOR_SCHEMA_VERSION
+        || vectors.cases.len() != OverlapForbidClaimingScenario::COUNT
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        let expected_is_coherent = if case.expected.claimed {
+            case.expected.target_state == OverlapTargetState::Claimed
+                && case.expected.target_attempt == 1
+                && case.expected.lease_owner.as_deref() == Some("daemon-a")
+                && case
+                    .expected
+                    .lease_expires_at
+                    .as_deref()
+                    .and_then(canonical_timestamp)
+                    .is_some()
+        } else {
+            case.expected.target_state == OverlapTargetState::Planned
+                && case.expected.target_attempt == 0
+                && case.expected.lease_owner.is_none()
+                && case.expected.lease_expires_at.is_none()
+        };
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || case.now != "2026-09-01T10:00:00.000Z"
+            || case.blocker != case.scenario.blocker()
+            || canonical_timestamp(&case.now).is_none()
+            || !expected_is_coherent
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != OverlapForbidClaimingScenario::COUNT {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut all_passed = true;
+    for (case_index, case) in vectors.cases.iter().enumerate() {
+        all_passed &= overlap_forbid_claiming_case_matches(case_index, case)?;
+    }
+    Ok(all_passed)
+}
+
+fn overlap_forbid_claiming_case_matches(
+    case_index: usize,
+    case: &OverlapForbidClaimingVectorCase,
+) -> Result<bool, &'static str> {
+    let conn = command_conformance_connection()?;
+    conn.execute_batch(super::leadership::AUTOMATION_SCHEDULER_AUTHORITY_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    let automation_id = format!("overlap-conformance-{case_index}");
+    let definition = super::definition::RoutineDefinition::from_json(&json!({
+        "schemaVersion": 1,
+        "id": automation_id,
+        "name": "Overlap claim conformance",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the overlap claim conformance probe.",
+        "tags": []
+    }))
+    .map_err(|_| "conformance suite execution failed")?;
+    super::store::insert_definition(&conn, &definition)
+        .map_err(|_| "conformance suite execution failed")?;
+    let target_id = format!("overlap-target-{case_index}");
+    conn.execute(
+        "INSERT INTO automation_occurrences
+            (id, automation_id, automation_revision, definition_digest, scheduled_for,
+             kind, state, attempt, created_at, updated_at)
+         SELECT ?1, id, revision, definition_digest, '2026-09-01T09:00:00.000Z',
+                'scheduled', 'planned', 0,
+                '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+         FROM automation_definitions
+         WHERE id = ?2",
+        rusqlite::params![target_id, automation_id],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+
+    if case.blocker != OverlapBlocker::None {
+        let blocker_id = format!("overlap-blocker-{case_index}");
+        let (state, lease_owner, lease_expires_at) = match case.blocker {
+            OverlapBlocker::ClaimedOccurrence => (
+                "claimed",
+                Some("daemon-b"),
+                Some("2026-09-01T12:00:00.000Z"),
+            ),
+            OverlapBlocker::RunningOccurrence => (
+                "running",
+                Some("daemon-b"),
+                Some("2026-09-01T12:00:00.000Z"),
+            ),
+            OverlapBlocker::RunningRun | OverlapBlocker::FailedOccurrence => ("failed", None, None),
+            OverlapBlocker::SucceededOccurrence => ("succeeded", None, None),
+            OverlapBlocker::CancelledOccurrence => ("cancelled", None, None),
+            OverlapBlocker::None => unreachable!(),
+        };
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, attempt, created_at, updated_at)
+             SELECT ?1, id, revision, definition_digest, '2026-09-01T08:00:00.000Z',
+                    'scheduled', ?2, ?3, ?4, 1,
+                    '2026-09-01T08:00:00.000Z', '2026-09-01T08:00:00.000Z'
+             FROM automation_definitions
+             WHERE id = ?5",
+            rusqlite::params![
+                blocker_id,
+                state,
+                lease_owner,
+                lease_expires_at,
+                automation_id,
+            ],
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+        if case.blocker == OverlapBlocker::RunningRun {
+            conn.execute(
+                "INSERT INTO automation_runs
+                    (id, automation_id, occurrence_id, status, started_at, timeout_at)
+                 VALUES (?1, ?2, ?3, 'running',
+                         '2026-09-01T08:00:00.000Z', '2026-09-01T10:30:00.000Z')",
+                rusqlite::params![
+                    format!("overlap-run-{case_index}"),
+                    automation_id,
+                    blocker_id,
+                ],
+            )
+            .map_err(|_| "conformance suite execution failed")?;
+        }
+    }
+
+    let now = canonical_timestamp(&case.now).ok_or("conformance vector is invalid")?;
+    let claimed =
+        super::occurrences::claim_due_occurrence(&conn, &automation_id, "daemon-a", 60, now)
+            .map_err(|_| "conformance suite execution failed")?;
+    let observed = conn
+        .query_row(
+            "SELECT state, attempt, lease_owner, lease_expires_at
+             FROM automation_occurrences
+             WHERE id = ?1",
+            [&target_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u8>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+
+    Ok(
+        claimed.as_deref() == case.expected.claimed.then_some(target_id.as_str())
+            && observed.0 == case.expected.target_state.as_str()
+            && observed.1 == case.expected.target_attempt
+            && observed.2 == case.expected.lease_owner
+            && observed.3 == case.expected.lease_expires_at,
+    )
 }
 
 fn evaluate_misfire_latest_planning(vector: &Value) -> Result<bool, &'static str> {
