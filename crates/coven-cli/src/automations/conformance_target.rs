@@ -1046,6 +1046,7 @@ struct ExpectedCancellationTimeoutArbitration {
     replay_outcome: ExpectedCancellationReplayOutcome,
     pre_competing_cancellation_state: String,
     pre_competing_stop_fence_owner: String,
+    competing_candidate_observed: bool,
     runtime_stop_count: usize,
     run_status: String,
     occurrence_state: String,
@@ -1062,6 +1063,7 @@ impl ExpectedCancellationTimeoutArbitration {
                     && self.replay_outcome == ExpectedCancellationReplayOutcome::Cancelled
                     && self.pre_competing_cancellation_state == "stopping"
                     && self.pre_competing_stop_fence_owner == "cancellation"
+                    && self.competing_candidate_observed
                     && self.run_status == "cancelled"
                     && self.occurrence_state == "cancelled"
                     && self.attempt_state == "cancelled"
@@ -1073,6 +1075,7 @@ impl ExpectedCancellationTimeoutArbitration {
                     && self.replay_outcome == ExpectedCancellationReplayOutcome::IllegalTransition
                     && self.pre_competing_cancellation_state == "requested"
                     && self.pre_competing_stop_fence_owner == "none"
+                    && self.competing_candidate_observed
                     && self.run_status == "failed"
                     && self.occurrence_state == "failed"
                     && self.attempt_state == "timed_out"
@@ -1853,6 +1856,7 @@ fn cancellation_timeout_arbitration_case_matches(
         competing_outcome,
         pre_competing_cancellation_state,
         pre_competing_stop_fence_owner,
+        competing_candidate_observed,
     ) = match case.scenario {
         CancellationTimeoutArbitrationScenario::CancellationWins => {
             let store_path = fixture.store_path.clone();
@@ -1881,8 +1885,17 @@ fn cancellation_timeout_arbitration_case_matches(
             let timeout_result = if started {
                 let conn = crate::store::open_store(&fixture.store_path)
                     .map_err(|_| "conformance suite execution failed")?;
-                super::runner::enforce_run_timeouts(&conn, runtime.as_ref(), timeout_observed_at)
-                    .map_err(|_| "conformance suite execution failed")
+                let mut observed_candidates = 0;
+                let result = super::runner::enforce_run_timeouts_with_observer(
+                    &conn,
+                    runtime.as_ref(),
+                    timeout_observed_at,
+                    |candidate_run_id| {
+                        observed_candidates += usize::from(candidate_run_id == fixture.run_id);
+                    },
+                )
+                .map_err(|_| "conformance suite execution failed");
+                result.map(|failures| (failures, observed_candidates))
             } else {
                 Err("conformance suite execution failed")
             };
@@ -1890,7 +1903,7 @@ fn cancellation_timeout_arbitration_case_matches(
             let cancellation_result = cancellation
                 .join()
                 .map_err(|_| "conformance suite execution failed")??;
-            let timeout_failures = timeout_result?;
+            let (timeout_failures, observed_candidates) = timeout_result?;
             let pre_competing_state = pre_competing_state?;
             (
                 cancellation_execution_outcome(&cancellation_result),
@@ -1899,6 +1912,7 @@ fn cancellation_timeout_arbitration_case_matches(
                     .then_some(ExpectedCompetingOutcome::Deferred),
                 pre_competing_state.0,
                 pre_competing_state.1,
+                observed_candidates == 1,
             )
         }
         CancellationTimeoutArbitrationScenario::TimeoutWins => {
@@ -1982,6 +1996,7 @@ fn cancellation_timeout_arbitration_case_matches(
                 (reconciled == 1).then_some(ExpectedCompetingOutcome::TimedOut),
                 pre_competing_state.0,
                 pre_competing_state.1,
+                reconciled == 1,
             )
         }
     };
@@ -2022,6 +2037,7 @@ fn cancellation_timeout_arbitration_case_matches(
             && cancellation_replay_outcome(&replay) == Some(case.expected.replay_outcome)
             && pre_competing_cancellation_state == case.expected.pre_competing_cancellation_state
             && pre_competing_stop_fence_owner == case.expected.pre_competing_stop_fence_owner
+            && competing_candidate_observed == case.expected.competing_candidate_observed
             && runtime.stops.load(Ordering::SeqCst) == case.expected.runtime_stop_count
             && lifecycle.0 == case.expected.run_status
             && lifecycle.1 == case.expected.occurrence_state

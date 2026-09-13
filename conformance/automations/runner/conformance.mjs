@@ -28,8 +28,9 @@ const DEFAULT_TARGET_TIMEOUT_MS = 2_000;
 // Two cases may each use a 5-second synchronization guard, and a failed
 // shutdown gets one separate 5-second cleanup window.
 const STARTUP_WAKE_TARGET_TIMEOUT_MS = 20_000;
-// Two race cases may each use a 5-second synchronization guard.
-const CANCELLATION_ARBITRATION_TARGET_TIMEOUT_MS = 15_000;
+// The two race cases can consume three 5-second synchronization guards; keep
+// additional time for fixture setup, SQLite settlement, and process cleanup.
+const CANCELLATION_ARBITRATION_TARGET_TIMEOUT_MS = 20_000;
 const TARGET_KILL_GRACE_MS = 100;
 const TARGET_OUTPUT_LIMIT = 1024 * 1024;
 const MAX_JCS_DEPTH = 128;

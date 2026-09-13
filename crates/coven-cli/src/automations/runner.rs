@@ -2691,6 +2691,15 @@ pub fn enforce_run_timeouts(
     runtime: &dyn SessionRuntime,
     now: DateTime<Utc>,
 ) -> Result<Vec<String>, String> {
+    enforce_run_timeouts_with_observer(conn, runtime, now, |_| {})
+}
+
+pub(crate) fn enforce_run_timeouts_with_observer(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    now: DateTime<Utc>,
+    mut observe_candidate: impl FnMut(&str),
+) -> Result<Vec<String>, String> {
     let waiting_candidates: Vec<(String, String)> = {
         let mut statement = conn
             .prepare(
@@ -2774,6 +2783,7 @@ pub fn enforce_run_timeouts(
 
     let mut failures = Vec::new();
     for (run_id, session_id, definition_name) in candidates {
+        observe_candidate(&run_id);
         if let Some(failure) =
             enforce_timeout_candidate(conn, runtime, &run_id, &session_id, &definition_name, now)?
         {

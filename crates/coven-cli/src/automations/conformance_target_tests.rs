@@ -162,7 +162,7 @@ fn cancellation_timeout_arbitration_suite_rejects_a_weakened_stop_count() {
 
 #[test]
 fn cancellation_timeout_arbitration_suite_rejects_invalid_vector_shapes() {
-    let invalid_mutations: [fn(&mut Value); 13] = [
+    let invalid_mutations: [fn(&mut Value); 14] = [
         |vectors| vectors["schemaVersion"] = json!("unsupported"),
         |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
         |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
@@ -178,6 +178,7 @@ fn cancellation_timeout_arbitration_suite_rejects_invalid_vector_shapes() {
             vectors["cases"][1]["expected"]["preCompetingCancellationState"] = json!("stopping")
         },
         |vectors| vectors["cases"][1]["expected"]["preCompetingStopFenceOwner"] = json!("timeout"),
+        |vectors| vectors["cases"][0]["expected"]["competingCandidateObserved"] = json!(false),
         |vectors| vectors["cases"][0]["expected"]["runtimeStopCount"] = json!(0),
         |vectors| vectors["cases"][1]["unexpected"] = json!(true),
     ];
