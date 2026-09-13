@@ -1912,52 +1912,51 @@ fn overlap_forbid_claiming_case_matches(
     )
     .map_err(|_| "conformance suite execution failed")?;
 
-    if case.blocker != OverlapBlocker::None {
-        let blocker_id = format!("overlap-blocker-{case_index}");
-        let (state, lease_owner, lease_expires_at) = match case.blocker {
-            OverlapBlocker::ClaimedOccurrence => (
-                "claimed",
-                Some("daemon-b"),
-                Some("2026-09-01T12:00:00.000Z"),
-            ),
-            OverlapBlocker::RunningOccurrence => (
-                "running",
-                Some("daemon-b"),
-                Some("2026-09-01T12:00:00.000Z"),
-            ),
-            OverlapBlocker::RunningRun | OverlapBlocker::FailedOccurrence => ("failed", None, None),
-            OverlapBlocker::SucceededOccurrence => ("succeeded", None, None),
-            OverlapBlocker::CancelledOccurrence => ("cancelled", None, None),
-            OverlapBlocker::None => unreachable!(),
-        };
-        conn.execute(
-            "INSERT INTO automation_occurrences
-                (id, automation_id, automation_revision, definition_digest, scheduled_for,
-                 kind, state, lease_owner, lease_expires_at, attempt, created_at, updated_at)
-             SELECT ?1, id, revision, definition_digest, '2026-09-01T08:00:00.000Z',
-                    'scheduled', ?2, ?3, ?4, 1,
-                    '2026-09-01T08:00:00.000Z', '2026-09-01T08:00:00.000Z'
-             FROM automation_definitions
-             WHERE id = ?5",
-            rusqlite::params![
-                blocker_id,
-                state,
-                lease_owner,
-                lease_expires_at,
-                automation_id,
-            ],
-        )
-        .map_err(|_| "conformance suite execution failed")?;
-        if case.blocker == OverlapBlocker::RunningRun {
+    match case.blocker {
+        OverlapBlocker::None => {}
+        OverlapBlocker::RunningRun => {
             conn.execute(
                 "INSERT INTO automation_runs
-                    (id, automation_id, occurrence_id, status, started_at, timeout_at)
-                 VALUES (?1, ?2, ?3, 'running',
+                    (id, automation_id, status, started_at, timeout_at)
+                 VALUES (?1, ?2, 'running',
                          '2026-09-01T08:00:00.000Z', '2026-09-01T10:30:00.000Z')",
+                rusqlite::params![format!("overlap-run-{case_index}"), automation_id],
+            )
+            .map_err(|_| "conformance suite execution failed")?;
+        }
+        blocker => {
+            let blocker_id = format!("overlap-blocker-{case_index}");
+            let (state, lease_owner, lease_expires_at) = match blocker {
+                OverlapBlocker::ClaimedOccurrence => (
+                    "claimed",
+                    Some("daemon-b"),
+                    Some("2026-09-01T12:00:00.000Z"),
+                ),
+                OverlapBlocker::RunningOccurrence => (
+                    "running",
+                    Some("daemon-b"),
+                    Some("2026-09-01T12:00:00.000Z"),
+                ),
+                OverlapBlocker::SucceededOccurrence => ("succeeded", None, None),
+                OverlapBlocker::FailedOccurrence => ("failed", None, None),
+                OverlapBlocker::CancelledOccurrence => ("cancelled", None, None),
+                OverlapBlocker::None | OverlapBlocker::RunningRun => unreachable!(),
+            };
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, lease_owner, lease_expires_at, attempt, created_at, updated_at)
+                 SELECT ?1, id, revision, definition_digest, '2026-09-01T08:00:00.000Z',
+                        'scheduled', ?2, ?3, ?4, 1,
+                        '2026-09-01T08:00:00.000Z', '2026-09-01T08:00:00.000Z'
+                 FROM automation_definitions
+                 WHERE id = ?5",
                 rusqlite::params![
-                    format!("overlap-run-{case_index}"),
-                    automation_id,
                     blocker_id,
+                    state,
+                    lease_owner,
+                    lease_expires_at,
+                    automation_id,
                 ],
             )
             .map_err(|_| "conformance suite execution failed")?;
