@@ -19,6 +19,40 @@ const EDITS: &str = "/api/v1/familiars/sage/edits";
 const PROPOSALS: &str = "/api/v1/threads/proposals";
 
 #[test]
+fn explicit_proposal_and_stage_routes_are_not_alternate_write_endpoints() -> Result<()> {
+    run_journey(|fixture| {
+        let contents = "forbidden explicit protected proposal";
+        // Submission and staging are daemon-owned branches of /edits, not
+        // public POST endpoints. Keep these unsupported spellings fail-closed.
+        for route in [
+            PROPOSALS,
+            "/api/v1/threads/proposals/stage",
+            "/api/v1/familiars/sage/proposals",
+            "/api/v1/familiars/sage/stage",
+        ] {
+            let response = fixture.request(
+                "POST",
+                route,
+                Some(&json!({
+                    "edits": [{"target": "SOUL.md", "contents": contents}],
+                    "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
+                    "approved": true,
+                    "disposition": "approved",
+                })),
+            )?;
+            assert_eq!(response.status, 404, "{route}: {response:?}");
+            assert!(!response.body.to_string().contains(contents));
+            assert_eq!(fs::read(fixture.workspace.join("SOUL.md"))?, b"# Sage\n");
+            assert!(!fixture.coven_home.join("pending").exists());
+            assert_no_write_authority(fixture)?;
+        }
+        fixture.restart_daemon()?;
+        assert_eq!(fs::read(fixture.workspace.join("SOUL.md"))?, b"# Sage\n");
+        assert_no_write_authority(fixture)
+    })
+}
+
+#[test]
 fn unsigned_protected_intake_is_refused_without_staging() -> Result<()> {
     run_journey(|fixture| {
         let response = fixture.request(
@@ -246,6 +280,213 @@ fn stale_staged_protected_proposal_is_rejected_after_daemon_restart() -> Result<
     assert_protected_promotion(true)
 }
 
+#[cfg(unix)]
+#[test]
+fn materialized_pending_target_retargeted_to_protected_is_rejected() -> Result<()> {
+    for restart_before_approval in [false, true] {
+        run_journey(|fixture| {
+            let target = fixture.workspace.join("reviewed/instructions.md");
+            fs::create_dir_all(target.parent().context("reviewed parent")?)?;
+            fs::write(&target, "# Instructions\n")?;
+            let staged = fixture.request(
+                "POST",
+                EDITS,
+                Some(&json!({
+                    "edits": [{"target": "reviewed/instructions.md", "contents": "# Revised\n"}],
+                })),
+            )?;
+            assert_eq!(staged.status, 202, "{staged:?}");
+            assert_eq!(staged.body["reviewKind"], "coherence", "{staged:?}");
+            let proposal_id = staged.body["proposalId"].as_str().context("proposal id")?;
+            let pending = PathBuf::from(
+                staged.body["pendingPath"]
+                    .as_str()
+                    .context("pending path")?,
+            );
+            assert!(pending.is_file());
+            assert_eq!(fs::read(&target)?, b"# Instructions\n");
+
+            if restart_before_approval {
+                fixture.stop_daemon()?;
+            }
+            fs::remove_file(&target)?;
+            std::os::unix::fs::symlink("../SOUL.md", &target)?;
+            if restart_before_approval {
+                fixture.start_daemon()?;
+                assert_one_rejection(fixture, proposal_id)?;
+                assert!(!pending.exists(), "startup left a protected alias pending");
+                assert_eq!(fs::read(&target)?, b"# Sage\n");
+                assert_no_write_authority(fixture)?;
+            }
+            let approval = format!("{PROPOSALS}/{proposal_id}/approve");
+            let refused = fixture.request(
+                "POST",
+                &approval,
+                Some(&json!({"principalKeyFingerprint": PRINCIPAL_FINGERPRINT})),
+            )?;
+            assert_eq!(refused.status, 409, "{refused:?}");
+            assert_one_rejection(fixture, proposal_id)?;
+            assert!(!pending.exists());
+            assert!(target.is_symlink());
+            assert_eq!(fs::read(&target)?, b"# Sage\n");
+            assert_eq!(fs::read(fixture.workspace.join("SOUL.md"))?, b"# Sage\n");
+            assert_no_write_authority(fixture)?;
+
+            fixture.restart_daemon()?;
+            let retry = fixture.request("POST", &approval, Some(&json!({})))?;
+            assert_eq!(retry.status, 409, "{retry:?}");
+            assert_one_rejection(fixture, proposal_id)?;
+            assert_eq!(fs::read(&target)?, b"# Sage\n");
+            assert!(!pending.exists());
+            assert_no_write_authority(fixture)
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn genuine_prior_approvals_cannot_authorize_other_familiar_project_or_target() -> Result<()> {
+    run_journey(|fixture| {
+        let second = fixture.coven_home.join("familiars/ember");
+        fs::create_dir_all(&second)?;
+        fs::write(second.join("SOUL.md"), "# Ember\n")?;
+        fs::copy(
+            fixture.workspace.join("ward.toml"),
+            second.join("ward.toml"),
+        )?;
+        let ward_before = fs::read(fixture.workspace.join("ward.toml"))?;
+        let registry = fixture.coven_home.join("familiars.toml");
+        let original = fs::read_to_string(&registry)?;
+        fs::write(
+            registry,
+            format!(
+                "{original}\n[[familiar]]\nid = \"ember\"\ndisplay_name = \"Ember\"\n\
+                 role = \"Research\"\ndescription = \"Synthetic second familiar.\"\n"
+            ),
+        )?;
+        let project = fixture.coven_home.join("unrelated-project");
+        fs::create_dir_all(&project)?;
+        fs::write(project.join("SOUL.md"), "# Unrelated project\n")?;
+        let mut approvals = Vec::new();
+        for (familiar, workspace) in [(FAMILIAR_ID, &fixture.workspace), ("ember", &second)] {
+            fs::create_dir_all(workspace.join("reviewed"))?;
+            fs::write(workspace.join("reviewed/instructions.md"), "# Before\n")?;
+            let staged = fixture.request(
+                "POST",
+                &format!("/api/v1/familiars/{familiar}/edits"),
+                Some(&json!({
+                    "edits": [{"target": "reviewed/instructions.md", "contents": "# Approved\n"}],
+                })),
+            )?;
+            assert_eq!(staged.status, 202, "{staged:?}");
+            assert_eq!(staged.body["reviewKind"], "coherence", "{staged:?}");
+            assert_eq!(
+                fs::read(workspace.join("reviewed/instructions.md"))?,
+                b"# Before\n"
+            );
+            let id = staged.body["proposalId"].as_str().context("proposal id")?;
+            let approved = fixture.request(
+                "POST",
+                &format!("{PROPOSALS}/{id}/approve"),
+                Some(&json!({})),
+            )?;
+            assert_eq!(approved.status, 200, "{approved:?}");
+            assert_eq!(approved.body["decision"], "approved", "{approved:?}");
+            assert_eq!(
+                fs::read(workspace.join("reviewed/instructions.md"))?,
+                b"# Approved\n"
+            );
+            approvals.push(id.to_owned());
+        }
+        let writes = write_authority_count(fixture)?;
+        assert!(
+            writes > 0,
+            "positive proposals did not produce authoritative evidence"
+        );
+        for after_restart in [false, true] {
+            if after_restart {
+                fixture.restart_daemon()?;
+            }
+            for id in &approvals {
+                for (familiar, root, target) in [
+                    (FAMILIAR_ID, &fixture.workspace, "SOUL.md"),
+                    ("ember", &second, "SOUL.md"),
+                    (FAMILIAR_ID, &project, "SOUL.md"),
+                    (FAMILIAR_ID, &fixture.workspace, "ward.toml"),
+                ] {
+                    let body = json!({
+                        "edits": [{"target": target, "contents": "forbidden replay"}],
+                        "approvalId": id,
+                        "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
+                        "familiarId": familiar,
+                        "projectRoot": root,
+                        "workspace": root,
+                        "approved": true,
+                    });
+                    let replay = fixture.request(
+                        "POST",
+                        &format!("{PROPOSALS}/{id}/approve"),
+                        Some(&body),
+                    )?;
+                    // Legacy retries return the original receipt, not a new
+                    // decision for the caller's replacement scope or edits.
+                    assert_eq!(replay.status, 200, "{replay:?}");
+                    assert_eq!(replay.body["idempotent"], true, "{replay:?}");
+                    assert_eq!(replay.body["proposalId"], *id, "{replay:?}");
+                    assert_eq!(
+                        replay.body["filesTouched"],
+                        json!(["reviewed/instructions.md"]),
+                        "{replay:?}"
+                    );
+                    let intake = fixture.request(
+                        "POST",
+                        &format!("/api/v1/familiars/{familiar}/edits"),
+                        Some(&body),
+                    )?;
+                    assert_protected_refusal(&intake, target);
+                    assert!(!intake.body.to_string().contains("forbidden replay"));
+                    assert_eq!(write_authority_count(fixture)?, writes);
+                    assert_eq!(fs::read(fixture.workspace.join("SOUL.md"))?, b"# Sage\n");
+                    assert_eq!(fs::read(second.join("SOUL.md"))?, b"# Ember\n");
+                    assert_eq!(fs::read(fixture.workspace.join("ward.toml"))?, ward_before);
+                    assert_eq!(fs::read(second.join("ward.toml"))?, ward_before);
+                    assert_eq!(fs::read(project.join("SOUL.md"))?, b"# Unrelated project\n");
+                    assert_eq!(
+                        fs::read(fixture.workspace.join("reviewed/instructions.md"))?,
+                        b"# Approved\n"
+                    );
+                    assert_eq!(
+                        fs::read(second.join("reviewed/instructions.md"))?,
+                        b"# Approved\n"
+                    );
+                    let pending = fixture.request("GET", PROPOSALS, None)?;
+                    assert_eq!(pending.status, 200, "{pending:?}");
+                    assert_eq!(pending.body["proposals"], json!([]), "{pending:?}");
+                }
+            }
+            for id in &approvals {
+                let approved: i64 = fixture.store()?.query_row(
+                    "SELECT COUNT(*) FROM ward_audit
+                     WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(approved, 1, "prior approval was duplicated");
+            }
+        }
+        Ok(())
+    })
+}
+
+fn write_authority_count(fixture: &ThreadsFixture) -> Result<i64> {
+    Ok(fixture.store()?.query_row(
+        "SELECT COUNT(*) FROM ward_audit
+         WHERE event_type IN ('apply_audit', 'proposal_approved', 'principal_authorized_write')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 fn assert_protected_promotion(restart_before_approval: bool) -> Result<()> {
     run_journey(|fixture| {
         let ward_path = fixture.workspace.join("ward.toml");
@@ -289,6 +530,15 @@ fn assert_protected_promotion(restart_before_approval: bool) -> Result<()> {
         fs::write(&ward_path, &protected_config)?;
         if restart_before_approval {
             fixture.start_daemon()?;
+            // Startup must retire stale protected history without relying on
+            // the following approval request to repair scheduler omissions.
+            assert_one_rejection(fixture, proposal_id)?;
+            assert!(
+                !pending.exists(),
+                "startup left a protected proposal pending"
+            );
+            assert_eq!(fs::read(fixture.workspace.join("SOUL.md"))?, b"# Sage\n");
+            assert_no_write_authority(fixture)?;
         }
         let approval_path = format!("{PROPOSALS}/{proposal_id}/approve");
         let refused = fixture.request("POST", &approval_path, Some(&json!({})))?;
@@ -377,7 +627,7 @@ fn assert_no_write_authority(fixture: &ThreadsFixture) -> Result<()> {
     assert_eq!(proposals.body["proposals"], json!([]), "{proposals:?}");
     let applied: i64 = fixture.store()?.query_row(
         "SELECT COUNT(*) FROM ward_audit WHERE familiar_id = ?1
-         AND event_type IN ('apply_audit', 'proposal_approved')",
+         AND event_type IN ('apply_audit', 'proposal_approved', 'principal_authorized_write')",
         [FAMILIAR_ID],
         |row| row.get(0),
     )?;
