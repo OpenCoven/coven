@@ -280,15 +280,27 @@ fn direct_identity_drift_at_commit_refuses_real_daemon_write() -> Result<()> {
                 )
             });
             let reached = control.join("pause-final-commit.reached");
-            let timeout = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let started = std::time::Instant::now();
+            // Test-only hang guard, not a readiness SLA. The daemon's separate
+            // ten-second release timeout starts after publishing this marker.
+            let timeout = started + std::time::Duration::from_secs(30);
             while !reached.try_exists()? {
-                anyhow::ensure!(
-                    !request.is_finished(),
-                    "direct apply skipped the final-commit barrier"
-                );
+                if request.is_finished() {
+                    let outcome = request.join().map_err(|_| {
+                        anyhow::anyhow!(
+                            "direct request panicked before the final-commit marker after {:?}",
+                            started.elapsed()
+                        )
+                    })?;
+                    anyhow::bail!(
+                        "direct request finished before the final-commit marker after {:?}: {outcome:?}",
+                        started.elapsed()
+                    );
+                }
                 anyhow::ensure!(
                     std::time::Instant::now() < timeout,
-                    "direct commit barrier was not reached"
+                    "direct commit barrier was not reached after {:?}",
+                    started.elapsed()
                 );
                 std::thread::yield_now();
             }
@@ -309,6 +321,14 @@ fn direct_identity_drift_at_commit_refuses_real_daemon_write() -> Result<()> {
             assert_eq!(
                 response.body["error"]["details"]["writeApplied"], false,
                 "{response:?}"
+            );
+            // A timeout in the fixture seam is not the identity regression.
+            assert!(
+                response.body["error"]["message"]
+                    .as_str()
+                    .context("Ward refusal message")?
+                    .contains("ordinary apply identity evidence changed after intake"),
+                "wrong refusal cause: {response:?}"
             );
             assert_eq!(actual, BEFORE);
             assert_eq!(fs::read_to_string(path)?, revised);

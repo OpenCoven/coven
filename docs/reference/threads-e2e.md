@@ -34,8 +34,9 @@ case and real `ward migrate --apply` path. It rejects the corpus's
 creating a backup, then confirms live intake cannot stage it. Its restarted
 pending case drives two daemon scheduler workers concurrently through the
 existing pass lock, requiring one apply intent, one typed approval, completion
-counts `[0, 1]`, and unchanged audit history after another restart. No positive
-pending record or terminal row is seeded by these journeys.
+counts of one `0` and one `1` in either response order, and unchanged audit history
+after another restart. No positive pending record or terminal row is seeded by
+these journeys.
 
 Successful corpus submissions retain their exact synthetic case, canonical
 pending envelope, retired-source hash, and active-Ward hash in
