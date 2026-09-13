@@ -359,8 +359,8 @@ pub struct WardConfig {
     /// Declared surface regions.
     #[serde(default)]
     pub surface: Vec<SurfaceEntry>,
-    /// Deterministic, advisory Gate-3 probes. The singular field name maps to
-    /// TOML's repeated `[[probe]]` tables.
+    /// Deterministic Gate-3 probes, advisory outside explicitly opted-in bounded
+    /// output-format auto approval. Maps to TOML's repeated `[[probe]]` tables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe: Vec<ProbeConfig>,
 }
@@ -871,6 +871,59 @@ pub struct Decision {
 pub struct Outcome {
     /// Per-target decisions.
     pub decisions: Vec<Decision>,
+}
+
+/// Gate-2 destinations and filesystem identities retained across API routing.
+pub(crate) struct DirectApplyAdmission {
+    pub(crate) outcome: Outcome,
+    home: AnchoredHome,
+    targets: BTreeMap<String, AdmittedDirectTarget>,
+}
+
+struct AdmittedDirectTarget {
+    parents: Vec<AnchoredParent>,
+    file: Option<std::fs::File>,
+}
+
+impl DirectApplyAdmission {
+    fn verify_routing(&self, ward: &Ward, proposal: &Proposal) -> Result<()> {
+        self.home.verify_path_unchanged()?;
+        if ward.evaluate_with_home(proposal, Some(&self.home.absolute)) != self.outcome {
+            bail!("ordinary apply admission changed Gate-2 routing; refusing the batch");
+        }
+        for target in self.targets.values() {
+            for parent in &target.parents {
+                if !directory_handle_matches_path(&parent.dir, &parent.absolute)? {
+                    bail!("ordinary apply admission parent identity changed; refusing the batch");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_target(
+        &self,
+        path: &AnchoredEntry,
+        target: &str,
+        before: Option<&OpenRegularFile>,
+    ) -> Result<()> {
+        let admitted = self
+            .targets
+            .get(target)
+            .context("missing ordinary admission identity")?;
+        let matches = match (admitted.file.as_ref(), before) {
+            (Some(file), Some(before)) => {
+                open_files_have_same_identity(file, &before.file)?
+                    && open_file_matches_path_if_present(file, path)?
+            }
+            (None, None) => open_regular_file_handle_without_following_links(path)?.is_none(),
+            _ => false,
+        };
+        if !matches {
+            bail!("ordinary apply admission file identity changed for `{target}`");
+        }
+        Ok(())
+    }
 }
 
 impl Outcome {
@@ -1392,8 +1445,49 @@ pub struct Ward {
 }
 
 #[cfg(test)]
+struct DirectCommitHook {
+    target: String,
+    callback: Box<dyn FnOnce()>,
+}
+
+#[cfg(test)]
 thread_local! {
     static EVALUATE_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DIRECT_COMMIT_HOOK: std::cell::RefCell<Option<DirectCommitHook>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(unix)]
+    static DIRECT_EVALUATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn set_direct_evaluation_hook(callback: impl FnOnce() + 'static) {
+    DIRECT_EVALUATION_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_direct_commit_hook(target: &str, callback: impl FnOnce() + 'static) {
+    DIRECT_COMMIT_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(DirectCommitHook {
+            target: target.to_owned(),
+            callback: Box::new(callback),
+        });
+    });
+}
+
+#[cfg(test)]
+fn run_direct_commit_hook(target: &str) {
+    let callback = DIRECT_COMMIT_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if hook.as_ref().is_some_and(|armed| armed.target == target) {
+            hook.take().map(|armed| armed.callback)
+        } else {
+            None
+        }
+    });
+    if let Some(callback) = callback {
+        callback();
+    }
 }
 
 #[cfg(test)]
@@ -1459,6 +1553,67 @@ impl Ward {
     /// (authorization) for each target.
     pub fn evaluate(&self, proposal: &Proposal) -> Outcome {
         self.evaluate_with_home(proposal, None)
+    }
+
+    pub(crate) fn admit_direct(&self, proposal: &Proposal) -> Result<DirectApplyAdmission> {
+        let home = AnchoredHome::open(&self.home)?;
+        let outcome = self.evaluate_with_home(proposal, Some(&home.absolute));
+        let mut targets = BTreeMap::new();
+        if outcome
+            .decisions
+            .iter()
+            .all(|decision| matches!(decision.verdict, Verdict::Allow | Verdict::AllowWithLog))
+        {
+            for decision in &outcome.decisions {
+                let relative = lexical_join(Path::new(""), &decision.resolved)
+                    .context("ordinary admission requires a confined destination")?;
+                let mut directory = Arc::clone(&home.dir);
+                let mut absolute = home.absolute.clone();
+                let mut parents = Vec::new();
+                let mut parent_exists = true;
+                for component in relative.parent().context("admitted parent")?.components() {
+                    let Component::Normal(part) = component else {
+                        bail!("ordinary admission parent contains a non-normal component");
+                    };
+                    let child = match open_child_dir_nofollow(&directory, part) {
+                        Ok(child) => child,
+                        Err(error) if error.kind() == ErrorKind::NotFound => {
+                            parent_exists = false;
+                            break;
+                        }
+                        Err(error) => {
+                            return Err(error).context("opening ordinary admission parent")
+                        }
+                    };
+                    directory = Arc::new(child);
+                    absolute.push(part);
+                    parents.push(AnchoredParent {
+                        dir: Arc::clone(&directory),
+                        absolute: absolute.clone(),
+                    });
+                }
+                let file = if parent_exists {
+                    open_regular_file_handle_without_following_links(&AnchoredEntry::new(
+                        directory,
+                        &absolute,
+                        relative.file_name().context("admitted leaf")?,
+                    ))?
+                } else {
+                    None
+                };
+                targets.insert(
+                    decision.target.clone(),
+                    AdmittedDirectTarget { parents, file },
+                );
+            }
+        }
+        let admission = DirectApplyAdmission {
+            outcome,
+            home,
+            targets,
+        };
+        admission.verify_routing(self, proposal)?;
+        Ok(admission)
     }
 
     pub(crate) fn declares_protected_target(&self, target: &str) -> bool {
@@ -1625,14 +1780,56 @@ impl Ward {
     /// target cloning or Gate 2; budget and I/O failures return `Err`, while a
     /// refusal or hold is a normal [`ApplyReport`].
     pub fn apply(&self, edits: &[FileEdit], authorization: &Authorization) -> Result<ApplyReport> {
+        self.apply_inner(edits, authorization, None, None)
+    }
+
+    pub(crate) fn apply_admitted(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        admission: &DirectApplyAdmission,
+        final_routing_check: ApprovedCommitCheck<'_>,
+    ) -> Result<ApplyReport> {
+        self.apply_inner(edits, authorization, Some(admission), final_routing_check)
+    }
+
+    fn apply_inner(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        admission: Option<&DirectApplyAdmission>,
+        mut final_routing_check: ApprovedCommitCheck<'_>,
+    ) -> Result<ApplyReport> {
         validate_file_edit_budget(edits)?;
-        let anchored_home = AnchoredHome::open(&self.home)?;
+        let opened_home;
+        let anchored_home = match admission {
+            Some(admission) => &admission.home,
+            None => {
+                opened_home = AnchoredHome::open(&self.home)?;
+                &opened_home
+            }
+        };
         let proposal = Proposal {
             targets: edits.iter().map(|e| e.target.clone()).collect(),
             authorization: authorization.clone(),
         };
-        let outcome = self.evaluate_with_home(&proposal, Some(&anchored_home.absolute));
+        let outcome = match admission {
+            Some(admission) => admission.outcome.clone(),
+            None => self.evaluate_with_home(&proposal, Some(&anchored_home.absolute)),
+        };
+        #[cfg(all(test, unix))]
+        DIRECT_EVALUATION_HOOK.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
         maybe_swap_evaluated_home(&self.home)?;
+        if let Some(admission) = admission {
+            admission
+                .verify_routing(self, &proposal)
+                .map_err(|error| direct_apply_error(error, DirectApplyFailure::RolledBack))?;
+        }
 
         // Decide the proposal-wide disposition before touching the filesystem.
         let unit = if outcome.is_blocked() {
@@ -1675,7 +1872,19 @@ impl Ward {
 
         // Every edit is Tier 2/3 and cleared. Stage and commit the batch as one
         // rollback unit so a later failure cannot strand an unaudited write.
-        write_direct_batch(&anchored_home, edits, outcome.decisions)
+        let mut commit_check = || {
+            if let Some(admission) = admission {
+                admission.verify_routing(self, &proposal)?;
+            }
+            run_approved_commit_check(&mut final_routing_check)
+        };
+        write_direct_batch(
+            anchored_home,
+            edits,
+            outcome.decisions,
+            admission,
+            Some(&mut commit_check),
+        )
     }
 
     /// Apply edits after an explicit principal proposal approval has cleared the
@@ -1885,14 +2094,25 @@ impl Ward {
         expected_before: &BTreeMap<String, Option<Vec<u8>>>,
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
-        final_authority_check: ApprovedCommitCheck<'_>,
+        mut final_authority_check: ApprovedCommitCheck<'_>,
     ) -> Result<ApplyReport> {
         validate_approved_edit_budget(edits, expected_before)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let anchored_home = AnchoredHome::open(&self.home)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
-        let ward_config = open_expected_ward_config(&anchored_home, &self.config)
-            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let ward_config =
+            open_expected_ward_config(&anchored_home, &self.config).map_err(|error| {
+                // Refine the refusal's cause without retrying preparation. Even a
+                // successful callback cannot override the failed retained-file guard.
+                let error = match final_authority_check.as_mut() {
+                    Some(check) => match check() {
+                        Err(authority_error) => authority_error.context(error),
+                        Ok(()) => error,
+                    },
+                    None => error,
+                };
+                approved_apply_error(error, ApprovedApplyFailure::NoWrite)
+            })?;
         let proposal = Proposal {
             targets: edits.iter().map(|edit| edit.target.clone()).collect(),
             authorization: authorization.clone(),
@@ -2028,6 +2248,114 @@ impl AnchoredHome {
         }
     }
 
+    fn existing_entry(&self, resolved: &str) -> Result<Option<AnchoredEntry>> {
+        let relative = lexical_join(Path::new(""), resolved)
+            .context("file identity requires a confined relative surface")?;
+        let name = relative
+            .file_name()
+            .context("file identity requires a leaf")?;
+        let mut directory = Arc::clone(&self.dir);
+        let mut absolute = self.absolute.clone();
+        for component in relative
+            .parent()
+            .context("relative surface parent")?
+            .components()
+        {
+            let Component::Normal(part) = component else {
+                bail!("file identity parent contains a non-normal component");
+            };
+            let child = match open_child_dir_nofollow(&directory, part) {
+                Ok(child) => child,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error).context("opening file identity parent"),
+            };
+            directory = Arc::new(child);
+            absolute.push(part);
+        }
+        Ok(Some(AnchoredEntry::new(directory, &absolute, name)))
+    }
+
+    fn confined_surface_destination(&self, surface: &str) -> Result<PathBuf> {
+        let relative = lexical_join(Path::new(""), surface)
+            .context("surface destination must be confined to the familiar home")?;
+        let mut pending: std::collections::VecDeque<_> = relative
+            .components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect();
+        let mut directories = vec![Arc::clone(&self.dir)];
+        let mut destination = PathBuf::new();
+        let mut links = 0;
+        // Walk links (including dangling ones) without following them on open.
+        // Parent components are interpreted after preceding directory links.
+        while let Some(name) = pending.pop_front() {
+            if name == OsStr::new(".") {
+                continue;
+            }
+            if name == OsStr::new("..") {
+                if directories.len() <= 1 || !destination.pop() {
+                    bail!("surface link escapes the familiar home");
+                }
+                directories.pop();
+                continue;
+            }
+            let directory = directories
+                .last()
+                .expect("confined root handle is retained");
+            let metadata = match directory.symlink_metadata(&name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    if pending.iter().any(|part| part == OsStr::new("..")) {
+                        bail!("missing ancestor prevents proving surface link destination");
+                    }
+                    destination.push(name);
+                    destination.extend(pending);
+                    return Ok(destination);
+                }
+                Err(error) => return Err(error).context("reading confined surface destination"),
+            };
+            if metadata.file_type().is_symlink() {
+                links += 1;
+                if links > 40 {
+                    bail!("surface link chain exceeds the bounded resolution limit");
+                }
+                let target = directory
+                    .read_link_contents(&name)
+                    .context("reading confined surface link")?;
+                let target = if target.is_absolute() {
+                    directories.truncate(1);
+                    destination.clear();
+                    target
+                        .strip_prefix(&self.absolute)
+                        .context("surface link leaves the familiar home")?
+                } else {
+                    &target
+                };
+                for component in target.components().rev() {
+                    match component {
+                        Component::Normal(_) | Component::CurDir | Component::ParentDir => {
+                            pending.push_front(component.as_os_str().to_os_string());
+                        }
+                        Component::RootDir | Component::Prefix(_) => {
+                            bail!("surface link is not confined to the familiar home");
+                        }
+                    }
+                }
+                continue;
+            }
+            destination.push(&name);
+            if !pending.is_empty() {
+                directories.push(Arc::new(
+                    open_child_dir_nofollow(directory, &name)
+                        .context("opening confined surface parent")?,
+                ));
+            }
+        }
+        if destination.as_os_str().is_empty() {
+            bail!("surface destination must name a file");
+        }
+        Ok(destination)
+    }
+
     fn binding_matches(&self) -> Result<bool> {
         let Ok(current_absolute) = self.configured.canonicalize() else {
             return Ok(false);
@@ -2091,6 +2419,61 @@ struct AnchoredEntry {
     parent: Arc<Dir>,
     name: OsString,
     absolute: PathBuf,
+}
+
+/// Compare the configured surface's confined destination and retained regular
+/// file identity. Missing destinations still participate in path comparisons.
+pub(crate) fn has_resolved_file_alias(
+    workspace: &Path,
+    canonical: &str,
+    decisions: &[Decision],
+) -> Result<bool> {
+    let home = AnchoredHome::open(workspace)?;
+    let destination = home.confined_surface_destination(canonical)?;
+    destination
+        .to_str()
+        .context("configured surface destination is not UTF-8")?;
+    let destination_key = portable_surface_key(&to_forward_slashes(&destination));
+    let canonical_entry = home.existing_entry(&to_forward_slashes(&destination))?;
+    let file = canonical_entry
+        .as_ref()
+        .map(open_regular_file_handle_without_following_links)
+        .transpose()?
+        .flatten();
+    let mut aliases = false;
+    for decision in decisions {
+        let candidate_destination = home.confined_surface_destination(&decision.resolved)?;
+        candidate_destination
+            .to_str()
+            .context("requested surface destination is not UTF-8")?;
+        let candidate_surface = to_forward_slashes(&candidate_destination);
+        aliases |= portable_surface_key(&candidate_surface) == destination_key;
+        if let (Some(file), Some(candidate)) =
+            (file.as_ref(), home.existing_entry(&candidate_surface)?)
+        {
+            aliases |= open_file_matches_path(file, &candidate)?;
+        }
+    }
+    home.verify_path_unchanged()?;
+    if home.confined_surface_destination(canonical)? != destination {
+        bail!("configured surface destination changed during alias comparison");
+    }
+    let current_entry = home.existing_entry(&to_forward_slashes(&destination))?;
+    if let (Some(file), Some(canonical)) = (file.as_ref(), current_entry.as_ref()) {
+        if !open_file_matches_path(file, canonical)? {
+            bail!("canonical surface identity changed during alias comparison");
+        }
+    } else if file.is_some()
+        || current_entry
+            .as_ref()
+            .map(open_regular_file_handle_without_following_links)
+            .transpose()?
+            .flatten()
+            .is_some()
+    {
+        bail!("canonical surface identity changed during alias comparison");
+    }
+    Ok(aliases)
 }
 
 impl AnchoredEntry {
@@ -2235,6 +2618,8 @@ fn write_direct_batch(
     home: &AnchoredHome,
     edits: &[FileEdit],
     decisions: Vec<Decision>,
+    admission: Option<&DirectApplyAdmission>,
+    mut final_routing_check: ApprovedCommitCheck<'_>,
 ) -> Result<ApplyReport> {
     let mut retained_bytes = validate_file_edit_budget(edits)?.retained_content_bytes();
     let mut prepared = Vec::with_capacity(edits.len());
@@ -2251,6 +2636,9 @@ fn write_direct_batch(
             let path = canonical_parent.entry(name);
             maybe_swap_prepared_parent(&path)?;
             let before = open_direct_before_image(&path, &decision.target, retained_bytes)?;
+            if let Some(admission) = admission {
+                admission.verify_target(&path, &decision.target, before.as_ref())?;
+            }
             if let Some(before) = &before {
                 retained_bytes = reserve_ward_content_bytes(
                     retained_bytes,
@@ -2287,6 +2675,11 @@ fn write_direct_batch(
     }
 
     let mut swapped = Vec::new();
+    if admission.is_some() {
+        if let Err(error) = verify_direct_parents(&prepared) {
+            return fail_after_direct_rollback(&prepared, &swapped, error);
+        }
+    }
     for index in 0..prepared.len() {
         let commit = {
             let write = &prepared[index];
@@ -2295,6 +2688,16 @@ fn write_direct_batch(
                 .as_ref()
                 .context("prepared direct write has no staging paths")?;
             if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
+                return fail_after_direct_rollback(&prepared, &swapped, error);
+            }
+            #[cfg(test)]
+            run_direct_commit_hook(&write.decision.target);
+            if admission.is_some() {
+                if let Err(error) = verify_direct_parents(&prepared) {
+                    return fail_after_direct_rollback(&prepared, &swapped, error);
+                }
+            }
+            if let Err(error) = run_approved_commit_check(&mut final_routing_check) {
                 return fail_after_direct_rollback(&prepared, &swapped, error);
             }
             if write.before.is_some() {
@@ -2381,6 +2784,10 @@ fn write_direct_batch(
     }
 
     let final_verification = (|| -> Result<()> {
+        run_approved_commit_check(&mut final_routing_check)?;
+        if admission.is_some() {
+            verify_direct_parents(&prepared)?;
+        }
         for write in &mut prepared {
             let installed = write
                 .installed
@@ -2425,6 +2832,22 @@ fn write_direct_batch(
         ));
     }
     Ok(report)
+}
+
+fn verify_direct_parents(prepared: &[PreparedDirectWrite<'_>]) -> Result<()> {
+    for write in prepared {
+        if !directory_handle_matches_path(
+            &write.path.parent,
+            write
+                .path
+                .absolute
+                .parent()
+                .context("prepared direct parent")?,
+        )? {
+            bail!("ordinary apply destination parent changed before batch finalization");
+        }
+    }
+    Ok(())
 }
 
 fn reserve_ward_content_bytes(retained: u64, additional: u64) -> Result<u64> {
@@ -3997,6 +4420,26 @@ fn rollback_replaced_regular_target(
         );
     }
     Ok(())
+}
+
+fn open_files_have_same_identity(left: &std::fs::File, right: &std::fs::File) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left = left.metadata()?;
+        let right = right.metadata()?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(windows)]
+    {
+        Ok(windows_file_identity_from_open_file(left)?
+            == windows_file_identity_from_open_file(right)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        bail!("ordinary admission file identity is unsupported on this platform")
+    }
 }
 
 fn open_file_matches_path_if_present(file: &std::fs::File, path: &AnchoredEntry) -> Result<bool> {
@@ -8756,6 +9199,8 @@ tier = 1
                 new_contents: b"leak".to_vec(),
             }],
             vec![decision],
+            None,
+            None,
         )
         .unwrap_err();
 

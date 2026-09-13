@@ -36,6 +36,11 @@ mod final_commit_cases {
 }
 
 #[cfg(feature = "threads-test-clock")]
+mod output_auto_cases {
+    include!("support/threads_output_auto_cases.rs");
+}
+
+#[cfg(feature = "threads-test-clock")]
 mod identity_replay_cases {
     include!("support/threads_identity_replay_cases.rs");
 }
@@ -93,6 +98,75 @@ fn smoke_bounded_ward_apply_over_real_daemon() -> Result<()> {
         );
         Ok(())
     })
+}
+
+#[cfg(feature = "threads-test-clock")]
+#[test]
+fn legacy_submission_insert_failure_cannot_be_approved_over_real_daemon() -> Result<()> {
+    run_clocked_journey(
+        "legacy-submission-insert-failure",
+        |_, workspace| {
+            fs::create_dir_all(workspace.join("reviewed"))?;
+            fs::write(workspace.join("reviewed/skill.md"), "legacy before")?;
+            Ok(())
+        },
+        |fixture, _| {
+            fixture.store()?.execute_batch(
+                "CREATE TRIGGER deny_legacy_submission BEFORE INSERT ON ward_audit
+                 WHEN NEW.event_type='proposal_submitted'
+                 BEGIN SELECT RAISE(ABORT, 'injected legacy submission failure'); END;",
+            )?;
+            let staged = fixture.request(
+                "POST",
+                "/api/v1/familiars/sage/edits",
+                Some(&json!({"edits":[{"target":"reviewed/skill.md","contents":"legacy after"}]})),
+            )?;
+            anyhow::ensure!(
+                staged.status == 500,
+                "receipt failure was hidden: {staged:?}"
+            );
+            fixture
+                .store()?
+                .execute_batch("DROP TRIGGER deny_legacy_submission")?;
+            let entries = fs::read_dir(fixture.coven_home.join("pending"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let path = entries
+                .iter()
+                .map(|entry| entry.path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .context("published legacy file")?;
+            let original = fs::read(&path)?;
+            let document: Value = serde_json::from_slice(&original)?;
+            let id = document["id"].as_str().context("legacy id")?;
+            let response = fixture.request(
+                "POST",
+                &format!("/api/v1/threads/proposals/{id}/approve"),
+                Some(&json!({})),
+            )?;
+            anyhow::ensure!(
+                response.status == 409,
+                "unaudited legacy proposal executed: {response:?}"
+            );
+            anyhow::ensure!(response.body["why"] == "proposal-submission-receipt-invalid");
+            anyhow::ensure!(
+                fs::read_to_string(fixture.workspace.join("reviewed/skill.md"))? == "legacy before"
+            );
+            anyhow::ensure!(
+                fs::read(
+                    response.body["quarantinePath"]
+                        .as_str()
+                        .context("quarantine")?
+                )? == original
+            );
+            let count: i64 = fixture.store()?.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE proposal_id=?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(count == 0, "receiptless execution invented audit authority");
+            Ok(())
+        },
+    )
 }
 
 #[test]
@@ -1004,18 +1078,22 @@ fn same_home_daemon_lifecycle_helpers_survive_restart_and_crash() -> Result<()> 
             })
             .collect::<Result<Vec<_>>>()?;
         anyhow::ensure!(
-            operations
-                == [
-                    "daemon start",
-                    "daemon restart",
-                    "daemon stop",
-                    "daemon start",
-                    "daemon stop",
-                    "daemon restart",
-                    "daemon crash",
-                    "daemon start",
-                    "daemon stop",
-                ],
+            manifest["daemon_launch"] == "detached_cli",
+            "CLI lifecycle evidence was mislabeled: {manifest}"
+        );
+        let expected = [
+            "daemon start",
+            "daemon restart",
+            "daemon stop",
+            "daemon start",
+            "daemon stop",
+            "daemon restart",
+            "daemon crash",
+            "daemon start",
+            "daemon stop",
+        ];
+        anyhow::ensure!(
+            operations == expected,
             "unexpected lifecycle sequence in success provenance: {operations:?}"
         );
 
@@ -1120,6 +1198,38 @@ fn foreground_daemon_lifecycle_retains_owned_replacements_and_evidence() -> Resu
 }
 
 #[test]
+fn request_observation_precedes_owned_child_cleanup() -> Result<()> {
+    let mut evidence = EvidenceContext::new("request-observation-before-cleanup");
+    evidence.foreground_daemon = true;
+    let mut fixture = ThreadsFixture::start(&evidence)?;
+    let journey = (|| {
+        for fail in [false, true] {
+            let response =
+                fixture.request("GET", if fail { "/invalid\npath" } else { "/health" }, None);
+            anyhow::ensure!(response.is_err() == fail);
+            fixture.write_run_provenance(None)?;
+            let manifest: Value =
+                serde_json::from_slice(&fs::read(fixture.artifact_dir.join("manifest.json"))?)?;
+            let observation = &manifest["last_rpc_observation"];
+            anyhow::ensure!(
+                observation["elapsed_us"].is_u64(),
+                "missing measured client elapsed time: {observation}"
+            );
+            anyhow::ensure!(observation["failed"] == fail);
+            anyhow::ensure!(observation["owned_child"]["state"] == "running");
+            anyhow::ensure!(observation["status_present"] == true);
+            anyhow::ensure!(observation["owned_child"]["exit_code"].is_null());
+            anyhow::ensure!(
+                observation.as_object().context("observation")?.len() == 5,
+                "request observation must contain only the fixed numeric/status fields"
+            );
+        }
+        Ok(())
+    })();
+    finalize_journey(&mut fixture, journey)
+}
+
+#[test]
 fn foreground_daemon_startup_failure_retains_exit_and_output() -> Result<()> {
     let artifacts = tempfile::tempdir()?;
     let mut evidence = EvidenceContext::new("foreground-startup-failure");
@@ -1147,11 +1257,59 @@ fn foreground_daemon_startup_failure_retains_exit_and_output() -> Result<()> {
             .is_some_and(|status| status != 0),
         "failed foreground child lost its exit status: {manifest}\nretained daemon output:\n{log}"
     );
+    let exit = &manifest["daemon_lifecycle"][0]["owned_child_exit"];
+    assert!(
+        exit["status"].is_string(),
+        "missing finalized exit: {manifest}"
+    );
+    assert_eq!(
+        exit["code"],
+        manifest["daemon_lifecycle"][0]["command_status"]
+    );
+    assert!(matches!(
+        exit["origin"].as_str(),
+        Some("observed_exit" | "fixture_termination_requested")
+    ));
     assert!(log.contains("foreground daemon stderr:"));
     assert!(
         log.contains("not a database"),
         "missing child error output: {log}"
     );
+    Ok(())
+}
+
+#[test]
+fn foreground_restart_failure_is_finalized_before_return() -> Result<()> {
+    let artifacts = tempfile::tempdir()?;
+    let mut evidence = EvidenceContext::new("foreground-restart-failure");
+    evidence.artifact_dir = artifacts.path().to_path_buf();
+    evidence.foreground_daemon = true;
+    let mut fixture = ThreadsFixture::start(&evidence)?;
+    fixture.stop_daemon()?;
+    fs::write(
+        fixture.coven_home.join("coven.sqlite3"),
+        b"synthetic invalid SQLite store",
+    )?;
+    let error = fixture
+        .restart_daemon()
+        .expect_err("invalid owned store must fail restart");
+    assert!(
+        fixture.owned_daemon.is_none() && fixture.stopped,
+        "failed owned restart returned before finalizing its child"
+    );
+    fixture.write_run_provenance(Some(&error))?;
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(artifacts.path().join("manifest.json"))?)?;
+    let event = manifest["daemon_lifecycle"]
+        .as_array()
+        .context("lifecycle events")?
+        .last()
+        .context("failed serve event")?;
+    assert_eq!(event["operation"], "daemon serve");
+    assert!(event["owned_child_exit"]["status"].is_string());
+    assert_eq!(event["command_status"], event["owned_child_exit"]["code"]);
+    let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
+    assert!(log.contains("not a database"));
     Ok(())
 }
 
@@ -1203,8 +1361,8 @@ fn fatal_probe_failure_retains_natural_exit_before_capturing_evidence() -> Resul
         event["command_status"], 1,
         "fatal probe failure was captured before the natural child exit: {manifest}\nretained daemon output:\n{log}"
     );
-    assert_eq!(event["owned_exit"]["termination_requested"], false);
-    assert_eq!(event["owned_exit"]["code"], 1);
+    assert_eq!(event["owned_child_exit"]["origin"], "observed_exit");
+    assert_eq!(event["owned_child_exit"]["code"], 1);
     assert!(manifest["failure"].as_str().unwrap().contains("109"));
     assert!(
         log.contains("not a database"),
@@ -1367,6 +1525,8 @@ fn owned_serve_failure_retains_provenance_and_reaps_before_home_cleanup() -> Res
     let artifacts = tempfile::tempdir()?;
     let mut evidence = EvidenceContext::new("owned-serve-startup-retention");
     evidence.artifact_dir = artifacts.path().to_path_buf();
+    // Explicit owned launch must correct the caller's initially detached mode.
+    evidence.foreground_daemon = false;
     let mut owned_pid = None;
     let mut fixture_home = None;
     let result = ThreadsFixture::start_with_setup_and_start(
@@ -1380,12 +1540,19 @@ fn owned_serve_failure_retains_provenance_and_reaps_before_home_cleanup() -> Res
                     home.join("fixture-serve.stderr.log"),
                     format!("synthetic admission failure at {}\n", home.display()),
                 )?;
-                anyhow::bail!("synthetic owned readiness failure before status publication")
+                Err(coven_client::ClientError::InvalidHttpResponse(
+                    "synthetic owned readiness failure before status publication".to_owned(),
+                )
+                .into())
             })
         },
     );
     let error = result.err().context("owned admission must fail")?;
     assert!(format!("{error:#}").contains("synthetic owned readiness failure"));
+    assert!(matches!(
+        error.downcast_ref::<coven_client::ClientError>(),
+        Some(coven_client::ClientError::InvalidHttpResponse(_))
+    ));
     assert!(!pid_is_alive(owned_pid.context("owned pid")?));
     assert!(!fixture_home.as_ref().context("fixture home")?.exists());
     evidence.write_setup_failure(&error)?;
@@ -1393,6 +1560,7 @@ fn owned_serve_failure_retains_provenance_and_reaps_before_home_cleanup() -> Res
         serde_json::from_slice(&fs::read(artifacts.path().join("manifest.json"))?)?;
     assert_eq!(manifest["result"], "failed");
     assert_eq!(manifest["setup_completed"], false);
+    assert_eq!(manifest["daemon_launch"], "owned_foreground");
     assert!(manifest["coven_commit"].is_string());
     assert_eq!(manifest["daemon_lifecycle"][0]["operation"], "daemon serve");
     assert_eq!(
@@ -1400,18 +1568,48 @@ fn owned_serve_failure_retains_provenance_and_reaps_before_home_cleanup() -> Res
         owned_pid.unwrap()
     );
     assert!(manifest["daemon_lifecycle"][0]["command_status"].is_null());
-    let exit = &manifest["daemon_lifecycle"][0]["owned_exit"];
-    assert_eq!(exit["termination_requested"], true);
-    assert!(
-        exit["status"].is_string(),
-        "cleanup exit was not captured: {manifest}"
-    );
+    let exit = &manifest["daemon_lifecycle"][0]["owned_child_exit"];
+    assert_eq!(exit["origin"], "fixture_termination_requested");
+    assert!(exit["status"].is_string());
     let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
     assert!(log.contains("synthetic owned readiness failure"));
     assert!(log.contains("synthetic admission failure at <coven-home>"));
     assert!(!log.contains(&fixture_home.unwrap().display().to_string()));
     assert!(artifacts.path().join("state/daemon-status.json").exists());
     Ok(())
+}
+
+#[test]
+fn owned_exit_receipt_distinguishes_natural_status_from_requested_termination() {
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(1 << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(1)
+    };
+    for termination_requested in [false, true] {
+        let exit = threads_admission::ExitEvidence {
+            status,
+            termination_requested,
+        };
+        let mut event = DaemonLifecycleEvent::note("daemon serve", None, "synthetic exit");
+        event.record_owned_exit(exit);
+        let receipt = event.as_json();
+        assert_eq!(
+            receipt["command_status"],
+            if termination_requested {
+                Value::Null
+            } else {
+                json!(1)
+            }
+        );
+        assert_eq!(receipt["owned_child_exit"]["code"], 1);
+        assert_eq!(receipt["owned_child_exit"]["origin"], exit.origin());
+    }
 }
 
 fn run_fixture_journey(
@@ -1871,7 +2069,7 @@ struct DaemonLifecycleEvent {
     pid_before: Option<u32>,
     pid_after: Option<u32>,
     command_status: Option<i32>,
-    owned_exit: Option<threads_admission::ExitObservation>,
+    owned_exit: Option<threads_admission::ExitEvidence>,
     stdout: Option<String>,
     stderr: Option<String>,
     note: Option<String>,
@@ -1916,16 +2114,16 @@ impl DaemonLifecycleEvent {
             "pid_before": self.pid_before,
             "pid_after": self.pid_after,
             "command_status": self.command_status,
-            "owned_exit": self.owned_exit.map(|exit| json!({
-                "code": exit.status.code(),
+            "owned_child_exit": self.owned_exit.map(|exit| json!({
                 "status": exit.status.to_string(),
-                "termination_requested": exit.termination_requested,
+                "code": exit.status.code(),
+                "origin": exit.origin(),
             })),
             "note": self.note,
         })
     }
 
-    fn record_owned_exit(&mut self, exit: threads_admission::ExitObservation) {
+    fn record_owned_exit(&mut self, exit: threads_admission::ExitEvidence) {
         // A cleanup kill can also report code 1 on Windows; it is not a natural
         // failed-command receipt. Preserve it separately, including signal exits.
         self.command_status = if exit.termination_requested {
@@ -1949,8 +2147,9 @@ impl DaemonLifecycleEvent {
         }
         if let Some(exit) = self.owned_exit {
             output.push_str(&format!(
-                "owned_exit: {}; termination_requested: {}\n",
-                exit.status, exit.termination_requested
+                "owned_child_exit: {}; origin={}\n",
+                exit.status,
+                exit.origin(),
             ));
         }
         if let Some(note) = &self.note {
@@ -1994,6 +2193,7 @@ struct ThreadsFixture {
     local_threads_override_active: bool,
     last_request: Option<Value>,
     last_response: Option<Value>,
+    last_rpc_observation: Option<Value>,
     daemon_events: Vec<DaemonLifecycleEvent>,
     daemon_pid: Option<u32>,
     stopped: bool,
@@ -2075,6 +2275,7 @@ impl ThreadsFixture {
             local_threads_override_active,
             last_request: None,
             last_response: None,
+            last_rpc_observation: None,
             daemon_events: Vec::new(),
             daemon_pid: None,
             stopped: true,
@@ -2083,6 +2284,12 @@ impl ThreadsFixture {
             _admission: admission,
         };
         if let Err(error) = start(&mut fixture) {
+            let error = match fixture.finalize_owned_startup_failure() {
+                Ok(()) => error,
+                Err(cleanup) => error.context(format!(
+                    "finalizing owned startup child also failed: {cleanup:#}"
+                )),
+            };
             let capture = (|| {
                 fixture.write_failure_evidence()?;
                 fixture.write_junit(Some(&error))?;
@@ -2114,7 +2321,30 @@ impl ThreadsFixture {
             "body": request,
         }));
         self.last_response = None;
-        let (status, response) = daemon_http_request(&self.coven_home, method, path, body)?;
+        let started = Instant::now();
+        let result = daemon_http_request(&self.coven_home, method, path, body);
+        let elapsed_us = started.elapsed().as_micros();
+        let owned_child = match self.owned_daemon.as_mut().map(|child| child.observe_exit()) {
+            Some(Ok(None)) => json!({"state": "running", "exit_code": null}),
+            Some(Ok(Some(status))) => json!({"state": "exited", "exit_code": status.code()}),
+            Some(Err(error)) => json!({"state": "probe-error", "os_error": error.raw_os_error()}),
+            None => json!({"state": "unowned", "exit_code": null}),
+        };
+        // Capture before propagating a client error or invoking any cleanup.
+        // Do not issue another RPC or copy endpoint/path fields into diagnostics.
+        let status_present = match fs::symlink_metadata(self.coven_home.join("daemon.json")) {
+            Ok(metadata) => json!(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!(false),
+            Err(error) => json!({"state": "probe-error", "os_error": error.raw_os_error()}),
+        };
+        self.last_rpc_observation = Some(json!({
+            "elapsed_us": elapsed_us,
+            "failed": result.is_err(),
+            "http_status": result.as_ref().ok().map(|(status, _)| *status),
+            "owned_child": owned_child,
+            "status_present": status_present,
+        }));
+        let (status, response) = result?;
         let parsed: Value = serde_json::from_str(&response)
             .with_context(|| format!("daemon returned non-JSON response: {response}"))?;
         self.last_response = Some(json!({
@@ -2150,7 +2380,8 @@ impl ThreadsFixture {
 
     fn start_daemon(&mut self) -> Result<()> {
         if self.foreground_daemon {
-            return self.start_owned_daemon();
+            return self
+                .start_owned_daemon_with_readiness(|child, home| child.wait_for_health(home));
         }
         let pid_before = self.current_daemon_pid();
         self.stopped = false;
@@ -2209,101 +2440,61 @@ impl ThreadsFixture {
                 .context("owned fixture daemon")?
                 .admit(|child| readiness(child, &self.coven_home))
         })();
-        if let Err(error) = &result {
-            self.daemon_events.last_mut().context("serve event")?.note =
-                Some(format!("owned daemon serve admission failed: {error:#}"));
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let event = self.daemon_events.last_mut().context("serve event")?;
+                event.note = Some(format!("owned daemon serve admission failed: {error:#}"));
+                Err(match self.finalize_owned_startup_failure() {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(format!(
+                        "finalizing owned startup child also failed: {cleanup:#}"
+                    )),
+                })
+            }
         }
-        if let Some(exit) = self
-            .owned_daemon
-            .as_ref()
-            .and_then(threads_admission::OwnedDaemon::exit_observation)
-        {
-            self.daemon_events
-                .last_mut()
-                .context("serve event")?
-                .record_owned_exit(exit);
+    }
+
+    fn record_owned_exit(
+        &mut self,
+        pid: u32,
+        exit: Option<threads_admission::ExitEvidence>,
+    ) -> Result<()> {
+        let event = self
+            .daemon_events
+            .iter_mut()
+            .rev()
+            .find(|event| event.operation == "daemon serve" && event.pid_after == Some(pid))
+            .context("owned serve event was not recorded")?;
+        if let Some(exit) = exit {
+            event.record_owned_exit(exit);
         }
-        result
+        Ok(())
+    }
+
+    fn finalize_owned_startup_failure(&mut self) -> Result<()> {
+        if let Some(child) = &mut self.owned_daemon {
+            let result = child.finalize_startup_failure();
+            let pid = child.id();
+            let exit = child.exit_evidence();
+            self.record_owned_exit(pid, exit)?;
+            result?;
+            self.owned_daemon = None;
+            self.daemon_pid = None;
+            self.stopped = true;
+        }
+        Ok(())
     }
 
     fn reap_owned_daemon(&mut self, terminate: bool) -> Result<()> {
         if let Some(child) = &mut self.owned_daemon {
             child.reap(terminate)?;
-            let exit = child
-                .exit_observation()
-                .context("reaped child exit status")?;
-            let event = self
-                .daemon_events
-                .iter_mut()
-                .rev()
-                .find(|event| {
-                    event.operation == "daemon serve" && event.pid_after == Some(child.id())
-                })
-                .context("reaped foreground daemon event")?;
-            event.record_owned_exit(exit);
+            let pid = child.id();
+            let exit = child.exit_evidence();
+            self.record_owned_exit(pid, exit)?;
             self.owned_daemon = None;
         }
         Ok(())
-    }
-
-    fn start_owned_daemon(&mut self) -> Result<()> {
-        #[cfg(windows)]
-        return self.start_owned_daemon_with_readiness(|child, home| child.wait_for_health(home));
-        #[cfg(unix)]
-        self.start_owned_daemon_with_readiness(Self::wait_for_owned_unix_health)
-    }
-
-    #[cfg(unix)]
-    fn wait_for_owned_unix_health(
-        child: &mut threads_admission::OwnedDaemon,
-        home: &Path,
-    ) -> Result<()> {
-        let pid = child.id();
-        let started = child.started();
-        let deadline = started + threads_admission::LIFECYCLE_TIMEOUT;
-        let endpoint = fs::canonicalize(home)?
-            .join("coven.sock")
-            .display()
-            .to_string();
-        loop {
-            child.ensure_running()?;
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "foreground fixture daemon {pid} did not become healthy after {:?}",
-                started.elapsed()
-            );
-            let ready = if home.join("daemon.json").exists() {
-                match daemon_http_request(home, "GET", "/health", None) {
-                    Ok((status, body)) => {
-                        let body: Value = serde_json::from_str(&body)?;
-                        validate_owned_daemon_health(status, &body, pid, &endpoint)?;
-                        true
-                    }
-                    Err(error)
-                        if error
-                            .downcast_ref::<coven_client::ClientError>()
-                            .is_some_and(is_pending_foreground_startup_error) =>
-                    {
-                        false
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                false
-            };
-            if ready {
-                child.mark_ready()?;
-                anyhow::ensure!(
-                    Instant::now() < deadline,
-                    "foreground fixture readiness exceeded its deadline after {:?}",
-                    started.elapsed()
-                );
-                return Ok(());
-            }
-            thread::sleep(
-                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
-            );
-        }
     }
 
     fn complete_daemon_start(&mut self, pid_before: Option<u32>, output: Output) -> Result<()> {
@@ -2499,6 +2690,7 @@ impl ThreadsFixture {
             "local_threads_override_active": self.local_threads_override_active,
             "authorization_limitation": "synthetic principal fingerprint uses the strongest current daemon-owned Ward path; signed principal proof is not yet available",
             "daemon_lifecycle": self.daemon_events.iter().map(DaemonLifecycleEvent::as_json).collect::<Vec<_>>(),
+            "last_rpc_observation": self.last_rpc_observation,
             "failure": error.map(|error| self.sanitize_fixture_text(&format!("{error:#}"))),
         });
         fs::write(
@@ -2952,88 +3144,6 @@ fn run_coven(coven: &Path, coven_home: &Path, path: &OsString, args: &[&str]) ->
         .env("PATH", path)
         .output()
         .map_err(Into::into)
-}
-
-fn validate_owned_daemon_health(status: u16, body: &Value, pid: u32, endpoint: &str) -> Result<()> {
-    anyhow::ensure!(
-        status == 200 && body["ok"] == true,
-        "foreground fixture returned invalid health: HTTP {status} {body}"
-    );
-    anyhow::ensure!(
-        body["daemon"]["pid"] == pid && body["daemon"]["socket"] == endpoint,
-        "foreground fixture health did not identify owned process {pid} and endpoint: {body}"
-    );
-    Ok(())
-}
-
-fn is_pending_foreground_startup_error(error: &coven_client::ClientError) -> bool {
-    match error {
-        coven_client::ClientError::Io { source, .. } => {
-            source.kind() == std::io::ErrorKind::TimedOut
-                || (cfg!(unix)
-                    && matches!(
-                        source.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                    ))
-        }
-        coven_client::ClientError::InvalidHttpResponse(message) => {
-            message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE
-        }
-        _ => false,
-    }
-}
-
-#[test]
-fn foreground_readiness_refuses_wrong_process_endpoint_or_health() -> Result<()> {
-    let healthy = json!({"ok": true, "daemon": {"pid": 42, "socket": "fixture-endpoint"}});
-    validate_owned_daemon_health(200, &healthy, 42, "fixture-endpoint")?;
-    for (status, body, pid, endpoint) in [
-        (503, healthy.clone(), 42, "fixture-endpoint"),
-        (200, json!({"ok": false}), 42, "fixture-endpoint"),
-        (200, healthy.clone(), 43, "fixture-endpoint"),
-        (200, healthy, 42, "another-endpoint"),
-    ] {
-        assert!(
-            validate_owned_daemon_health(status, &body, pid, endpoint).is_err(),
-            "invalid foreground health was accepted: HTTP {status} {body}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn foreground_readiness_retries_only_pending_transport_errors() {
-    use coven_client::ClientError;
-    assert!(is_pending_foreground_startup_error(&ClientError::Io {
-        operation: coven_client::WINDOWS_CONNECT_OPERATION,
-        source: std::io::ErrorKind::TimedOut.into(),
-    }));
-    assert!(is_pending_foreground_startup_error(
-        &ClientError::InvalidHttpResponse(coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE.into())
-    ));
-    for kind in [
-        std::io::ErrorKind::ConnectionRefused,
-        std::io::ErrorKind::NotFound,
-    ] {
-        assert_eq!(
-            is_pending_foreground_startup_error(&ClientError::Io {
-                operation: "connecting foreground fixture socket",
-                source: kind.into(),
-            }),
-            cfg!(unix)
-        );
-    }
-    for error in [
-        ClientError::DaemonInstanceChanged,
-        ClientError::Discovery("wrong owner".into()),
-        ClientError::InvalidHttpResponse("partial response timed out".into()),
-        ClientError::Io {
-            operation: coven_client::WINDOWS_CONNECT_OPERATION,
-            source: std::io::ErrorKind::PermissionDenied.into(),
-        },
-    ] {
-        assert!(!is_pending_foreground_startup_error(&error), "{error}");
-    }
 }
 
 fn wait_for_daemon_health(coven_home: &Path) -> Result<()> {

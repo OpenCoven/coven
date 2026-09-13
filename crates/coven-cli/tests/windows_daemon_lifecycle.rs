@@ -13,6 +13,9 @@ use interprocess::{
     ConnectWaitMode,
 };
 
+#[path = "fixtures/daemon_startup_diagnostics.rs"]
+mod daemon_startup_diagnostics;
+
 struct DaemonGuard {
     coven_home: PathBuf,
 }
@@ -138,6 +141,21 @@ fn captured_output_with_timeout(
     command: &mut Command,
     coven_home: &Path,
 ) -> Result<Output> {
+    let result = captured_output_with_timeout_inner(label, command, coven_home);
+    if !matches!(&result, Ok(output) if output.status.success()) {
+        eprintln!(
+            "[windows-daemon-lifecycle] startup failure checkpoints:\n{}",
+            daemon_startup_diagnostics::capture_startup_checkpoints(coven_home)
+        );
+    }
+    result
+}
+
+fn captured_output_with_timeout_inner(
+    label: &str,
+    command: &mut Command,
+    coven_home: &Path,
+) -> Result<Output> {
     // A hang guard, not a promptness contract. Nothing here asserts how fast
     // the launcher starts -- the two-second budget this suite enforces is on
     // `daemon stop`, not on start. This bound exists only so a wedged
@@ -146,6 +164,7 @@ fn captured_output_with_timeout(
     // far above anything ordinary runner load can produce. Fifteen seconds
     // did not: it flaked on windows-latest against Rust code identical to a
     // passing run.
+    // Production start/restart have their own five-second lifecycle budget.
     const LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
     const CAPTURE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
     const LAUNCHER_POLL_INTERVAL: Duration = Duration::from_millis(100);

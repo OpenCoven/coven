@@ -31,7 +31,7 @@ coven-runtime-spec = { git = "https://github.com/OpenCoven/coven-runtimes", tag 
 # (PHASE-0-DESIGN.md in OpenCoven/coven-threads; RFC-0001 §5). The daemon is
 # the only caller: familiar-controlled processes never reach this crate.
 # Pinned to the reviewed Phase 5 core revision until its 0.2 release tag lands.
-coven-threads-core = { git = "https://github.com/OpenCoven/coven-threads", rev = "c3bd46bcadb6396db8436c47411a4d0eac17192b", version = "0.2.0" }
+coven-threads-core = { git = "https://github.com/OpenCoven/coven-threads", rev = "0021fd2662d0b82328371ee3a6957d645f776fda", version = "0.2.0" }
 blake3 = "1"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
