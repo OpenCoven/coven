@@ -91,6 +91,12 @@ import { spawn } from "node:child_process";
 import { chmodSync, writeFileSync } from "node:fs";
 const mode = process.env.COVEN_TEST_TARGET_MODE ?? "pass";
 if (mode === "unavailable") process.exit(10);
+if (
+  mode === "require-runner-scratch" &&
+  !process.env.COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH
+) {
+  process.exit(11);
+}
 const operation = process.argv.at(-1);
 if (operation === "capability") {
   if (mode === "replace-source") {
@@ -132,7 +138,12 @@ if (operation === "evaluate") {
   }
   process.stdout.write(JSON.stringify({
     schemaVersion: "coven.automations.conformance-target-capability.v1",
-    profiles: [{ profile: "structural", suites: ["schema-validation"] }]
+    profiles: mode === "slow-stateful-suite"
+      ? [{
+          profile: "scheduler_reliability",
+          suites: ["startup-reconciliation-wake"],
+        }]
+      : [{ profile: "structural", suites: ["schema-validation"] }]
   }));
   process.exit(0);
 }
@@ -140,6 +151,9 @@ if (operation !== "evaluate") process.exit(3);
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
+if (mode === "slow-stateful-suite") {
+  await new Promise((resolve) => setTimeout(resolve, 8_500));
+}
 if (mode === "malformed") {
   process.stdout.write('{"credential":"SECRET-TARGET-OUTPUT"');
   process.exit(0);
@@ -203,7 +217,7 @@ async function runRunner({
   const result = spawnSync(process.execPath, args, {
       encoding: "utf8",
       env: { ...process.env, ...env },
-      timeout: 10_000,
+      timeout: 30_000,
   });
   return result;
 }
@@ -529,6 +543,44 @@ test("executes every target operation from the same staged subject bytes", async
   assert.equal(sha256(await readFile(target)), originalDigest);
   const report = JSON.parse(result.stdout);
   assert.equal(report.statement.subjectArtifact.sha256, originalDigest);
+});
+
+test("provides runner-owned scratch storage to every target invocation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  const target = await writeTarget(directory);
+
+  const result = await runRunner({
+    targetCommand: target,
+    env: { COVEN_TEST_TARGET_MODE: "require-runner-scratch" },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("allows the stateful startup wake suite to use its synchronization budget", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  const target = await writeTarget(directory);
+  const job = validJob({
+    suites: [
+      {
+        profile: "scheduler_reliability",
+        suiteId: "startup-reconciliation-wake",
+        vector: {
+          schemaVersion: "coven.automations.startup-reconciliation-wake-vectors.v1",
+          cases: [],
+        },
+      },
+    ],
+  });
+  job.runner.vectorSetSha256 = sha256(canonicalize(job.suites));
+
+  const result = await runRunner({
+    job,
+    targetCommand: target,
+    env: { COVEN_TEST_TARGET_MODE: "slow-stateful-suite" },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test("force-kills a target that ignores the graceful timeout", async () => {

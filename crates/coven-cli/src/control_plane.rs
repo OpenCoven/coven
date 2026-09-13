@@ -182,6 +182,15 @@ pub fn route_action(
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
 ) -> (u16, ControlActionResponse) {
+    route_action_at(payload, conn, runtime, &now_iso())
+}
+
+pub(crate) fn route_action_at(
+    payload: Value,
+    conn: &rusqlite::Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+    recorded_at: &str,
+) -> (u16, ControlActionResponse) {
     if !payload.is_object() {
         return (
             400,
@@ -270,7 +279,7 @@ pub fn route_action(
                         crate::automations::command_adoption::DefinitionCommand::LegacyCreate {
                             definition,
                         },
-                        &now_iso(),
+                        recorded_at,
                     ),
                 ),
                 Err(error) => (400, rejected_action(action, error)),
@@ -289,7 +298,7 @@ pub fn route_action(
                         crate::automations::command_adoption::DefinitionCommand::LegacyRevise {
                             definition,
                         },
-                        &now_iso(),
+                        recorded_at,
                     ),
                 ),
                 Err(error) => (400, rejected_action(action, error)),
@@ -308,7 +317,7 @@ pub fn route_action(
                         crate::automations::command_adoption::DefinitionCommand::LegacyDelete {
                             automation_id: id,
                         },
-                        &now_iso(),
+                        recorded_at,
                     ),
                 ),
                 Err(error) => (400, rejected_action(action, error)),
@@ -366,7 +375,7 @@ pub fn route_action(
                             conn,
                             &adoption_key,
                             command,
-                            &now_iso(),
+                            recorded_at,
                         ),
                     )
                 }
@@ -405,7 +414,7 @@ pub fn route_action(
                             conn,
                             &adoption_key,
                             command,
-                            &now_iso(),
+                            recorded_at,
                         ),
                     )
                 }
@@ -444,7 +453,7 @@ pub fn route_action(
                             conn,
                             &adoption_key,
                             command,
-                            &now_iso(),
+                            recorded_at,
                         ),
                     )
                 }
@@ -485,7 +494,7 @@ pub fn route_action(
                             conn,
                             &adoption_key,
                             command,
-                            &now_iso(),
+                            recorded_at,
                         ),
                     )
                 }
@@ -552,7 +561,7 @@ pub fn route_action(
                         after,
                         from.as_deref(),
                         limit,
-                        &now_iso(),
+                        recorded_at,
                     ),
                 ),
                 (Err(error), _, _, _)
@@ -582,7 +591,7 @@ pub fn route_action(
                                 &kind,
                                 &id,
                                 100,
-                                &now_iso(),
+                                recorded_at,
                             )
                         }
                     } else {
@@ -593,7 +602,7 @@ pub fn route_action(
                             after,
                             None,
                             100,
-                            &now_iso(),
+                            recorded_at,
                         )
                     };
                     automation_event_store_result(action, origin, intent_id, result)

@@ -18,7 +18,7 @@ const SCHEDULER_INTERVAL: Duration = Duration::from_secs(60);
 const SCHEDULER_SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct MonotonicInstant(Duration);
+pub(crate) struct MonotonicInstant(Duration);
 
 impl MonotonicInstant {
     #[cfg(test)]
@@ -34,13 +34,13 @@ impl MonotonicInstant {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WakeReason {
+pub(crate) enum WakeReason {
     Deadline,
     Signaled,
     Shutdown,
 }
 
-trait AutomationClock: Send + Sync {
+pub(crate) trait AutomationClock: Send + Sync {
     fn now_utc(&self) -> chrono::DateTime<chrono::Utc>;
     fn monotonic_now(&self) -> MonotonicInstant;
     fn sleep_until_or_wake(
@@ -51,14 +51,25 @@ trait AutomationClock: Send + Sync {
     ) -> WakeReason;
 }
 
-struct SystemAutomationClock {
+pub(crate) struct SystemAutomationClock {
     monotonic_origin: Instant,
+    wait_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for SystemAutomationClock {
     fn default() -> Self {
         Self {
             monotonic_origin: Instant::now(),
+            wait_observer: None,
+        }
+    }
+}
+
+impl SystemAutomationClock {
+    pub(crate) fn with_wait_observer(observer: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            monotonic_origin: Instant::now(),
+            wait_observer: Some(observer),
         }
     }
 }
@@ -93,6 +104,9 @@ impl AutomationClock for SystemAutomationClock {
             if remaining.is_zero() {
                 return WakeReason::Deadline;
             }
+            if let Some(observer) = &self.wait_observer {
+                observer();
+            }
             let waited = wake
                 .changed
                 .wait_timeout(state, remaining)
@@ -109,7 +123,7 @@ struct AutomationWakeState {
 }
 
 #[derive(Debug, Default)]
-struct AutomationWakeSignal {
+pub(crate) struct AutomationWakeSignal {
     state: Mutex<AutomationWakeState>,
     changed: Condvar,
 }
@@ -457,6 +471,23 @@ impl AutomationSchedulerHandle {
         self.request_shutdown();
         self.finish_shutdown(deadline)
     }
+
+    pub(crate) fn shutdown_and_join_until(&mut self, deadline: Instant) -> Result<()> {
+        self.request_shutdown();
+        let Some(thread) = self.thread.as_ref() else {
+            return Ok(());
+        };
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !thread.is_finished() {
+            anyhow::bail!("automations scheduler did not stop before the conformance deadline");
+        }
+        let thread = self.thread.take().expect("scheduler thread is present");
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("automations scheduler thread panicked during shutdown"))
+    }
 }
 
 impl Drop for AutomationSchedulerHandle {
@@ -568,12 +599,24 @@ pub fn start_automations_scheduler(
     coven_home: &Path,
     runtime: Arc<dyn crate::api::SessionRuntime + Send + Sync>,
 ) -> Result<AutomationSchedulerHandle> {
+    start_automations_scheduler_with_clock(
+        coven_home,
+        runtime,
+        Arc::new(SystemAutomationClock::default()),
+    )
+}
+
+pub(crate) fn start_automations_scheduler_with_clock(
+    coven_home: &Path,
+    runtime: Arc<dyn crate::api::SessionRuntime + Send + Sync>,
+    clock: Arc<dyn AutomationClock>,
+) -> Result<AutomationSchedulerHandle> {
     let wake = Arc::new(AutomationWakeSignal::default());
     let registration = register_scheduler_wake(coven_home, Arc::downgrade(&wake))?;
 
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
-    let recovery_now = chrono::Utc::now();
+    let recovery_now = clock.now_utc();
     let leadership =
         super::leadership::SchedulerLeadership::acquire(coven_home, &conn, recovery_now)?;
     super::runner::recover_no_process_preownership_launches(coven_home, &conn, recovery_now)
@@ -582,7 +625,6 @@ pub fn start_automations_scheduler(
         .map_err(anyhow::Error::msg)?;
     drop(conn);
 
-    let clock = Arc::new(SystemAutomationClock::default());
     let observed_generation = wake.generation();
 
     let home = coven_home.to_path_buf();
@@ -966,6 +1008,67 @@ mod tests {
             self.system
                 .sleep_until_or_wake(deadline, wake, observed_generation)
         }
+    }
+
+    struct ControlledShutdownClock {
+        now: chrono::DateTime<Utc>,
+        wait_started: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl AutomationClock for ControlledShutdownClock {
+        fn now_utc(&self) -> chrono::DateTime<Utc> {
+            self.now
+        }
+
+        fn monotonic_now(&self) -> MonotonicInstant {
+            MonotonicInstant::ZERO
+        }
+
+        fn sleep_until_or_wake(
+            &self,
+            _deadline: MonotonicInstant,
+            _wake: &AutomationWakeSignal,
+            _observed_generation: u64,
+        ) -> WakeReason {
+            let _ = self.wait_started.send(());
+            let _ = self.release.lock().unwrap().recv();
+            WakeReason::Shutdown
+        }
+    }
+
+    #[test]
+    fn strict_scheduler_shutdown_reports_a_join_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::daemon::ensure_private_coven_home(temp.path()).unwrap();
+        let (wait_started_tx, wait_started_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let clock = Arc::new(ControlledShutdownClock {
+            now: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+            wait_started: wait_started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let mut handle = start_automations_scheduler_with_clock(
+            temp.path(),
+            Arc::new(crate::api::NoopSessionRuntime),
+            clock,
+        )
+        .unwrap();
+        wait_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("scheduler should reach its wait");
+
+        let error = handle
+            .shutdown_and_join_until(Instant::now() + Duration::from_millis(25))
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("did not stop before the conformance deadline"));
+        release_tx.send(()).unwrap();
+        handle
+            .shutdown_and_join_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
     }
 
     struct BlockingFirstLaunchRuntime {
