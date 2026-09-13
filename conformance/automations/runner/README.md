@@ -243,9 +243,9 @@ blocks occurrence planning, explicit release clears the state and restores
 scheduling, and release without an existing quarantine is an idempotent no-op.
 `scheduler-leadership-fencing` executes fixed virtual-time cases through the
 production filesystem leadership lock, durable scheduler generation, and
-fenced scheduler tick. It proves a concurrent scheduler is refused, a restart
-advances the generation and invalidates the prior fence, and stale leaders
-cannot tick while the current leader can.
+fenced scheduler tick. It proves a concurrent scheduler process is refused, a
+restart advances the generation and invalidates the prior fence, and stale
+leaders cannot tick while the current leader can.
 `occurrence-fence-uniqueness` executes a portable three-case matrix against the
 production SQLite occurrence schema, proving that one automation cannot claim
 the same scheduled slot twice while different automations may share a slot and

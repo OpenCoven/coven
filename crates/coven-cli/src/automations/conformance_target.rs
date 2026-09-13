@@ -894,6 +894,12 @@ struct SchedulerLeadershipFencingVectorSet {
     cases: Vec<SchedulerLeadershipFencingVectorCase>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SchedulerLeadershipProbeResult {
+    acquired: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SchedulerLeadershipFencingVectorCase {
@@ -2612,7 +2618,10 @@ fn evaluate_scheduler_leadership_fencing(vector: &Value) -> Result<bool, &'stati
 fn scheduler_leadership_fencing_case_matches(
     case: &SchedulerLeadershipFencingVectorCase,
 ) -> Result<bool, &'static str> {
-    let scheduler_home = tempfile::tempdir().map_err(|_| "conformance suite execution failed")?;
+    let scheduler_home = tempfile::Builder::new()
+        .prefix("coven-automations-leadership-")
+        .tempdir()
+        .map_err(|_| "conformance suite execution failed")?;
     crate::daemon::ensure_private_coven_home(scheduler_home.path())
         .map_err(|_| "conformance suite execution failed")?;
     let store_path = scheduler_home.path().join("coven.sqlite3");
@@ -2635,16 +2644,11 @@ fn scheduler_leadership_fencing_case_matches(
             first_generation,
             first_fence_current,
         } => {
-            let second_refused = match super::leadership::SchedulerLeadership::acquire(
+            let second_refused = !scheduler_leadership_contender_acquired(
                 scheduler_home.path(),
                 &conn,
                 second_attempt_at,
-            ) {
-                Ok(_) => false,
-                Err(error) => error
-                    .to_string()
-                    .starts_with("automations scheduler leadership is already held for "),
-            };
+            )?;
             let first_is_current = first_fence
                 .is_current(&conn)
                 .map_err(|_| "conformance suite execution failed")?;
@@ -2715,6 +2719,101 @@ fn scheduler_leadership_fencing_case_matches(
                 && current_accepted == *current_tick_accepted)
         }
     }
+}
+
+#[cfg(not(test))]
+fn scheduler_leadership_contender_acquired(
+    scheduler_home: &std::path::Path,
+    _conn: &Connection,
+    second_attempt_at: DateTime<Utc>,
+) -> Result<bool, &'static str> {
+    let output = std::process::Command::new(
+        std::env::current_exe().map_err(|_| "conformance suite execution failed")?,
+    )
+    .args([
+        "automations",
+        "conformance",
+        "scheduler-leadership-probe",
+        "--home",
+    ])
+    .arg(scheduler_home)
+    .args([
+        "--at",
+        &second_attempt_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    ])
+    .output()
+    .map_err(|_| "conformance suite execution failed")?;
+    if !output.status.success() {
+        return Err("conformance suite execution failed");
+    }
+    let response: SchedulerLeadershipProbeResult =
+        serde_json::from_slice(&output.stdout).map_err(|_| "conformance suite execution failed")?;
+    Ok(response.acquired)
+}
+
+#[cfg(test)]
+fn scheduler_leadership_contender_acquired(
+    scheduler_home: &std::path::Path,
+    conn: &Connection,
+    second_attempt_at: DateTime<Utc>,
+) -> Result<bool, &'static str> {
+    match super::leadership::SchedulerLeadership::acquire(scheduler_home, conn, second_attempt_at) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error
+                .to_string()
+                .starts_with("automations scheduler leadership is already held for ") =>
+        {
+            Ok(false)
+        }
+        Err(_) => Err("conformance suite execution failed"),
+    }
+}
+
+pub fn scheduler_leadership_probe(
+    scheduler_home: &std::path::Path,
+    acquired_at: &str,
+) -> Result<SchedulerLeadershipProbeResult, &'static str> {
+    let acquired_at = canonical_timestamp(acquired_at).ok_or("conformance probe is invalid")?;
+    let first_at =
+        canonical_timestamp(SCHEDULER_LEADERSHIP_FIRST_AT).ok_or("conformance probe is invalid")?;
+    let second_at = canonical_timestamp(SCHEDULER_LEADERSHIP_SECOND_AT)
+        .ok_or("conformance probe is invalid")?;
+    let canonical_home =
+        std::fs::canonicalize(scheduler_home).map_err(|_| "conformance probe is invalid")?;
+    let canonical_temp =
+        std::fs::canonicalize(std::env::temp_dir()).map_err(|_| "conformance probe is invalid")?;
+    let valid_fixture_home = canonical_home.parent() == Some(canonical_temp.as_path())
+        && canonical_home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("coven-automations-leadership-"));
+    let store_path = canonical_home.join("coven.sqlite3");
+    if (acquired_at != first_at && acquired_at != second_at)
+        || !valid_fixture_home
+        || !store_path.is_file()
+    {
+        return Err("conformance probe is invalid");
+    }
+
+    let conn = crate::store::open_initialized_store(&store_path)
+        .map_err(|_| "conformance probe execution failed")?;
+    let acquired = match super::leadership::SchedulerLeadership::acquire(
+        &canonical_home,
+        &conn,
+        acquired_at,
+    ) {
+        Ok(_) => true,
+        Err(error)
+            if error
+                .to_string()
+                .starts_with("automations scheduler leadership is already held for ") =>
+        {
+            false
+        }
+        Err(_) => return Err("conformance probe execution failed"),
+    };
+    Ok(SchedulerLeadershipProbeResult { acquired })
 }
 
 fn evaluate_misfire_latest_planning(vector: &Value) -> Result<bool, &'static str> {
