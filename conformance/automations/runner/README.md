@@ -222,9 +222,10 @@ timezones.
 `cancellation-timeout-arbitration` executes two synchronized races through the
 production cancellation and timeout stop-fence paths. It proves that an
 in-flight cancellation prevents timeout from issuing a duplicate runtime stop,
-that an in-flight timeout rejects a stale cancellation executor, that each race
-issues exactly one runtime stop, and that replay plus durable run, occurrence,
-attempt, and cancellation states preserve the winning authority.
+that timeout reconciliation rejects a pre-existing requested cancellation
+before a paused stale executor can claim stop ownership, that each race issues
+exactly one runtime stop, and that replay plus durable run, occurrence, attempt,
+and cancellation states preserve the winning authority.
 `misfire-latest-planning` executes fixed virtual-time cases through the
 production occurrence planner. It proves that downtime collapses daily work to
 the latest due slot, exact replay is idempotent, a clock rollback does not add

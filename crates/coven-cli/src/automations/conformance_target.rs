@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -1021,6 +1021,7 @@ impl CancellationTimeoutArbitrationScenario {
 enum ExpectedCancellationOutcome {
     Cancelled,
     CancelPending,
+    IllegalTransition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1043,6 +1044,8 @@ struct ExpectedCancellationTimeoutArbitration {
     cancellation_outcome: ExpectedCancellationOutcome,
     competing_outcome: ExpectedCompetingOutcome,
     replay_outcome: ExpectedCancellationReplayOutcome,
+    pre_competing_cancellation_state: String,
+    pre_competing_stop_fence_owner: String,
     runtime_stop_count: usize,
     run_status: String,
     occurrence_state: String,
@@ -1057,15 +1060,19 @@ impl ExpectedCancellationTimeoutArbitration {
                 self.cancellation_outcome == ExpectedCancellationOutcome::Cancelled
                     && self.competing_outcome == ExpectedCompetingOutcome::Deferred
                     && self.replay_outcome == ExpectedCancellationReplayOutcome::Cancelled
+                    && self.pre_competing_cancellation_state == "stopping"
+                    && self.pre_competing_stop_fence_owner == "cancellation"
                     && self.run_status == "cancelled"
                     && self.occurrence_state == "cancelled"
                     && self.attempt_state == "cancelled"
                     && self.cancellation_state == "cancelled"
             }
             CancellationTimeoutArbitrationScenario::TimeoutWins => {
-                self.cancellation_outcome == ExpectedCancellationOutcome::CancelPending
+                self.cancellation_outcome == ExpectedCancellationOutcome::IllegalTransition
                     && self.competing_outcome == ExpectedCompetingOutcome::TimedOut
                     && self.replay_outcome == ExpectedCancellationReplayOutcome::IllegalTransition
+                    && self.pre_competing_cancellation_state == "requested"
+                    && self.pre_competing_stop_fence_owner == "none"
                     && self.run_status == "failed"
                     && self.occurrence_state == "failed"
                     && self.attempt_state == "timed_out"
@@ -1781,6 +1788,11 @@ fn cancellation_execution_outcome(
         {
             Some(ExpectedCancellationOutcome::CancelPending)
         }
+        super::cancellation::CancellationExecution::Rejected(error)
+            if error.code() == ErrorCode::IllegalTransition =>
+        {
+            Some(ExpectedCancellationOutcome::IllegalTransition)
+        }
         _ => None,
     }
 }
@@ -1803,6 +1815,23 @@ fn cancellation_replay_outcome(
     }
 }
 
+fn cancellation_pre_competing_state(
+    store_path: &Path,
+    run_id: &str,
+) -> Result<(String, String), &'static str> {
+    let conn =
+        crate::store::open_store(store_path).map_err(|_| "conformance suite execution failed")?;
+    conn.query_row(
+        "SELECT c.state, COALESCE(f.owner, 'none')
+         FROM automation_cancellations AS c
+         LEFT JOIN automation_stop_fences AS f ON f.run_id = c.run_id
+         WHERE c.run_id = ?1",
+        [run_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .map_err(|_| "conformance suite execution failed")
+}
+
 fn cancellation_timeout_arbitration_case_matches(
     case: &CancellationTimeoutArbitrationVectorCase,
 ) -> Result<bool, &'static str> {
@@ -1819,7 +1848,12 @@ fn cancellation_timeout_arbitration_case_matches(
         release: Mutex::new(release_rx),
     });
 
-    let (cancellation_outcome, competing_outcome) = match case.scenario {
+    let (
+        cancellation_outcome,
+        competing_outcome,
+        pre_competing_cancellation_state,
+        pre_competing_stop_fence_owner,
+    ) = match case.scenario {
         CancellationTimeoutArbitrationScenario::CancellationWins => {
             let store_path = fixture.store_path.clone();
             let request = fixture.request.clone();
@@ -1839,6 +1873,11 @@ fn cancellation_timeout_arbitration_case_matches(
             let started = started_rx
                 .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
                 .is_ok();
+            let pre_competing_state = if started {
+                cancellation_pre_competing_state(&fixture.store_path, &fixture.run_id)
+            } else {
+                Err("conformance suite execution failed")
+            };
             let timeout_result = if started {
                 let conn = crate::store::open_store(&fixture.store_path)
                     .map_err(|_| "conformance suite execution failed")?;
@@ -1852,22 +1891,70 @@ fn cancellation_timeout_arbitration_case_matches(
                 .join()
                 .map_err(|_| "conformance suite execution failed")??;
             let timeout_failures = timeout_result?;
+            let pre_competing_state = pre_competing_state?;
             (
                 cancellation_execution_outcome(&cancellation_result),
                 timeout_failures
                     .is_empty()
                     .then_some(ExpectedCompetingOutcome::Deferred),
+                pre_competing_state.0,
+                pre_competing_state.1,
             )
         }
         CancellationTimeoutArbitrationScenario::TimeoutWins => {
-            let store_path = fixture.store_path.clone();
-            let runtime_for_timeout = Arc::clone(&runtime);
-            let timeout = std::thread::spawn(move || {
-                let conn = crate::store::open_store(&store_path)
+            let (reservation_ready_tx, reservation_ready_rx) = sync_channel(1);
+            let (reservation_release_tx, reservation_release_rx) = sync_channel(1);
+            let cancellation_store_path = fixture.store_path.clone();
+            let request = fixture.request.clone();
+            let runtime_for_cancellation = Arc::clone(&runtime);
+            let cancellation = std::thread::spawn(move || {
+                let conn = crate::store::open_store(&cancellation_store_path)
                     .map_err(|_| "conformance suite execution failed")?;
-                super::runner::enforce_run_timeouts(
+                super::cancellation::execute_run_cancellation_at_stop_fence_with_observer(
                     &conn,
-                    runtime_for_timeout.as_ref(),
+                    runtime_for_cancellation.as_ref(),
+                    request,
+                    cancellation_at,
+                    cancellation_at,
+                    Box::new(move || {
+                        reservation_ready_tx.send(()).map_err(|_| {
+                            "cancellation reservation observer is unavailable".to_string()
+                        })?;
+                        reservation_release_rx.recv().map_err(|_| {
+                            "cancellation reservation release is unavailable".to_string()
+                        })
+                    }),
+                )
+                .map_err(|_| "conformance suite execution failed")
+            });
+            if reservation_ready_rx
+                .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
+                .is_err()
+            {
+                let _ = reservation_release_tx.send(());
+                let _ = release_tx.send(());
+                let _ = cancellation.join();
+                return Err("conformance suite execution failed");
+            }
+            let pre_competing_state =
+                match cancellation_pre_competing_state(&fixture.store_path, &fixture.run_id) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        let _ = reservation_release_tx.send(());
+                        let _ = release_tx.send(());
+                        let _ = cancellation.join();
+                        return Err(error);
+                    }
+                };
+
+            let reconciliation_store_path = fixture.store_path.clone();
+            let runtime_for_reconciliation = Arc::clone(&runtime);
+            let reconciliation = std::thread::spawn(move || {
+                let conn = crate::store::open_store(&reconciliation_store_path)
+                    .map_err(|_| "conformance suite execution failed")?;
+                super::cancellation::reconcile_expired_cancellations(
+                    &conn,
+                    runtime_for_reconciliation.as_ref(),
                     timeout_observed_at,
                 )
                 .map_err(|_| "conformance suite execution failed")
@@ -1875,38 +1962,26 @@ fn cancellation_timeout_arbitration_case_matches(
             let started = started_rx
                 .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
                 .is_ok();
-            let cancellation_result = if started {
-                let conn = crate::store::open_store(&fixture.store_path)
-                    .map_err(|_| "conformance suite execution failed")?;
-                super::cancellation::execute_run_cancellation_at_stop_fence(
-                    &conn,
-                    runtime.as_ref(),
-                    fixture.request.clone(),
-                    cancellation_at,
-                    cancellation_at,
-                )
-                .map_err(|_| "conformance suite execution failed")
-            } else {
-                Err("conformance suite execution failed")
-            };
+            let _ = reservation_release_tx.send(());
+            if !started {
+                let _ = release_tx.send(());
+                let _ = cancellation.join();
+                let _ = reconciliation.join();
+                return Err("conformance suite execution failed");
+            }
+            let cancellation_result = cancellation
+                .join()
+                .map_err(|_| "conformance suite execution failed")?;
             let _ = release_tx.send(());
-            let timeout_failures = timeout
+            let reconciled = reconciliation
                 .join()
                 .map_err(|_| "conformance suite execution failed")??;
             let cancellation_result = cancellation_result?;
-            let conn = crate::store::open_store(&fixture.store_path)
-                .map_err(|_| "conformance suite execution failed")?;
-            super::cancellation::reconcile_expired_cancellations(
-                &conn,
-                runtime.as_ref(),
-                timeout_observed_at,
-            )
-            .map_err(|_| "conformance suite execution failed")?;
             (
                 cancellation_execution_outcome(&cancellation_result),
-                timeout_failures
-                    .is_empty()
-                    .then_some(ExpectedCompetingOutcome::TimedOut),
+                (reconciled == 1).then_some(ExpectedCompetingOutcome::TimedOut),
+                pre_competing_state.0,
+                pre_competing_state.1,
             )
         }
     };
@@ -1945,6 +2020,8 @@ fn cancellation_timeout_arbitration_case_matches(
         cancellation_outcome == Some(case.expected.cancellation_outcome)
             && competing_outcome == Some(case.expected.competing_outcome)
             && cancellation_replay_outcome(&replay) == Some(case.expected.replay_outcome)
+            && pre_competing_cancellation_state == case.expected.pre_competing_cancellation_state
+            && pre_competing_stop_fence_owner == case.expected.pre_competing_stop_fence_owner
             && runtime.stops.load(Ordering::SeqCst) == case.expected.runtime_stop_count
             && lifecycle.0 == case.expected.run_status
             && lifecycle.1 == case.expected.occurrence_state

@@ -664,7 +664,7 @@ pub fn execute_run_cancellation(
     body: Value,
     now: DateTime<Utc>,
 ) -> Result<CancellationExecution, String> {
-    execute_run_cancellation_with_stop_fence_time(conn, runtime, body, now, None)
+    execute_run_cancellation_with_stop_fence_time(conn, runtime, body, now, None, None)
 }
 
 pub(crate) fn execute_run_cancellation_at_stop_fence(
@@ -674,7 +674,32 @@ pub(crate) fn execute_run_cancellation_at_stop_fence(
     now: DateTime<Utc>,
     stop_fence_at: DateTime<Utc>,
 ) -> Result<CancellationExecution, String> {
-    execute_run_cancellation_with_stop_fence_time(conn, runtime, body, now, Some(stop_fence_at))
+    execute_run_cancellation_with_stop_fence_time(
+        conn,
+        runtime,
+        body,
+        now,
+        Some(stop_fence_at),
+        None,
+    )
+}
+
+pub(crate) fn execute_run_cancellation_at_stop_fence_with_observer(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+    stop_fence_at: DateTime<Utc>,
+    before_stop_fence: Box<dyn FnOnce() -> Result<(), String>>,
+) -> Result<CancellationExecution, String> {
+    execute_run_cancellation_with_stop_fence_time(
+        conn,
+        runtime,
+        body,
+        now,
+        Some(stop_fence_at),
+        Some(before_stop_fence),
+    )
 }
 
 fn execute_run_cancellation_with_stop_fence_time(
@@ -683,6 +708,7 @@ fn execute_run_cancellation_with_stop_fence_time(
     body: Value,
     now: DateTime<Utc>,
     stop_fence_at: Option<DateTime<Utc>>,
+    before_stop_fence: Option<Box<dyn FnOnce() -> Result<(), String>>>,
 ) -> Result<CancellationExecution, String> {
     let digest = sha256_hex(
         &canonicalize(&body)
@@ -759,7 +785,15 @@ fn execute_run_cancellation_with_stop_fence_time(
             return Ok(CancellationExecution::Rejected(error));
         }
     };
-    execute_reserved_cancellation(conn, runtime, reservation, now, false, stop_fence_at)
+    execute_reserved_cancellation(
+        conn,
+        runtime,
+        reservation,
+        now,
+        false,
+        stop_fence_at,
+        before_stop_fence,
+    )
 }
 
 fn execute_reserved_cancellation(
@@ -769,6 +803,7 @@ fn execute_reserved_cancellation(
     now: DateTime<Utc>,
     replayed: bool,
     stop_fence_at: Option<DateTime<Utc>>,
+    before_stop_fence: Option<Box<dyn FnOnce() -> Result<(), String>>>,
 ) -> Result<CancellationExecution, String> {
     if let Some(replay) =
         load_adopted_response(conn, &reservation.request.adoption_key, &reservation.digest)?
@@ -806,6 +841,9 @@ fn execute_reserved_cancellation(
         }));
     }
     before_stop_fence_test_hook();
+    if let Some(before_stop_fence) = before_stop_fence {
+        before_stop_fence()?;
+    }
     let claim_now = stop_fence_at.unwrap_or_else(stop_fence_clock);
     if reserved_deadline_expired(conn, &reservation, claim_now)? {
         let error = illegal_transition_error(
@@ -1084,7 +1122,7 @@ pub(crate) fn reconcile_expired_cancellations(
             reconciled += 1;
             continue;
         }
-        execute_reserved_cancellation(conn, runtime, reservation, now, true, None)?;
+        execute_reserved_cancellation(conn, runtime, reservation, now, true, None, None)?;
         reconciled += 1;
     }
     Ok(reconciled)
