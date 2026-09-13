@@ -45,6 +45,11 @@ mod identity_replay_cases {
     include!("support/threads_identity_replay_cases.rs");
 }
 
+#[cfg(feature = "threads-test-clock")]
+mod corpus_closure_cases {
+    include!("support/threads_corpus_closure_cases.rs");
+}
+
 #[test]
 fn smoke_bounded_ward_apply_over_real_daemon() -> Result<()> {
     run_journey("smoke-bounded-ward-apply", |fixture| {
@@ -1762,6 +1767,23 @@ fn retired_review_case(corpus: &Value) -> Result<&Value> {
 
 #[cfg(feature = "threads-test-clock")]
 fn seed_retired_review_case(home: &Path, workspace: &Path, case: &Value) -> Result<()> {
+    let legacy = seed_retired_review_source(home, workspace, case)?;
+    let migrated = migrate_retired_review_source(home)?;
+    anyhow::ensure!(
+        migrated.status.success(),
+        "real migration rejected the corpus: {} {}",
+        String::from_utf8_lossy(&migrated.stdout),
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    anyhow::ensure!(
+        fs::read_to_string(workspace.join("ward.toml.v01.bak"))? == legacy,
+        "migration did not preserve the exact original declaration"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn seed_retired_review_source(home: &Path, workspace: &Path, case: &Value) -> Result<String> {
     let facts = case["candidate_facts"]
         .as_array()
         .context("candidate facts")?;
@@ -1832,7 +1854,12 @@ fn seed_retired_review_case(home: &Path, workspace: &Path, case: &Value) -> Resu
         duration / 3600,
     );
     fs::write(workspace.join("ward.toml"), &legacy)?;
-    let migrated = run_coven(
+    Ok(legacy)
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn migrate_retired_review_source(home: &Path) -> Result<Output> {
+    run_coven(
         Path::new(env!("CARGO_BIN_EXE_coven")),
         home,
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -1845,18 +1872,7 @@ fn seed_retired_review_case(home: &Path, workspace: &Path, case: &Value) -> Resu
             PRINCIPAL_FINGERPRINT,
             "--apply",
         ],
-    )?;
-    anyhow::ensure!(
-        migrated.status.success(),
-        "real migration rejected the corpus: {} {}",
-        String::from_utf8_lossy(&migrated.stdout),
-        String::from_utf8_lossy(&migrated.stderr)
-    );
-    anyhow::ensure!(
-        fs::read_to_string(workspace.join("ward.toml.v01.bak"))? == legacy,
-        "migration did not preserve the exact original declaration"
-    );
-    Ok(())
+    )
 }
 
 #[cfg(feature = "threads-test-clock")]
@@ -1906,6 +1922,26 @@ fn submit_retired_case(fixture: &mut ThreadsFixture, case: &Value) -> Result<Val
             && response.body["scheduledProposal"]["schema"] == "phase5_v1",
         "supported intake did not publish canonical scheduled evidence: {response:?}"
     );
+    let id = response.body["proposalId"]
+        .as_str()
+        .context("corpus proposal id")?;
+    let pending: Value = serde_json::from_slice(&fs::read(
+        response.body["pendingPath"]
+            .as_str()
+            .context("corpus pending path")?,
+    )?)?;
+    fs::create_dir_all(&fixture.artifact_dir)?;
+    fs::write(
+        fixture
+            .artifact_dir
+            .join(format!("corpus-intake-{id}.json")),
+        fixture.sanitize_fixture_text(&serde_json::to_string_pretty(&json!({
+            "case": case,
+            "pending": pending,
+            "retired_source_sha256": file_sha256(&fixture.workspace.join("ward.toml.v01.bak"))?,
+            "active_ward_sha256": file_sha256(&fixture.workspace.join("ward.toml"))?,
+        }))?),
+    )?;
     Ok(response.body)
 }
 
@@ -2021,6 +2057,27 @@ fn assert_window_terminal(
             && close["replay_hash_matched"] == replay_matched,
         "wrong typed terminal family: {rows:?}"
     );
+    let typed: coven_threads_core::ProposalWindowCloseAuditDetail =
+        serde_json::from_value(close.clone())?;
+    anyhow::ensure!(
+        typed.reason.tag() == reason,
+        "non-normative terminal reason"
+    );
+    let forbidden: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
+         AND (event_type = 'proposal_expired' OR decision = 'proposal-expired')",
+        [id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(forbidden == 0, "deadline emitted an expiry terminal");
+    let state = fixture.artifact_dir.join("state");
+    fs::create_dir_all(&state)?;
+    fs::write(
+        state.join("ward-audit.jsonl"),
+        fixture.sanitize_fixture_text(&ward_audit_jsonl(
+            &fixture.coven_home.join("coven.sqlite3"),
+        )?),
+    )?;
     Ok(())
 }
 

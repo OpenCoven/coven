@@ -65,6 +65,23 @@ Updates cannot move time backwards. A tick returns the number of completed
 proposals from one bounded `process_due_threads_proposals` pass; it does not
 manufacture pending envelopes, verdicts, or audit rows.
 
+For duplicate-worker coverage, a tick may include `"workers":2`. It starts
+exactly two concurrent calls to the same production scheduler and returns
+their completion counts in `workerResults`, with their sum in `processed`.
+Omitting `workers` retains the single-pass response. Counts other than one or
+two are rejected. The control lock remains held across both workers so time
+cannot change between them; the production scheduler pass lock and decision
+claims are not bypassed. Two separate tick requests would instead serialize
+at the control lock and would not exercise scheduler contention.
+
+Active fixtures record `threads_scheduler_checkpoint phase=pass-lock-wait`
+before each production scheduler pass acquires its lock. The corpus contention
+journey combines these observations with the existing final-commit pause:
+both workers must enter before release, while candidate bytes and terminal
+rows remain unchanged. This is bounded same-daemon recovery evidence, not
+Automations leadership conformance, an OS-level write counter, or proof of
+every process-crash interleaving.
+
 Restart with the same disposable home to retain logical time and exercise
 normal proposal recovery. Advance to just before `min_visible`, exactly the
 earliest close, and beyond the deadline. Submit proposals through supported

@@ -12916,6 +12916,13 @@ fn pending_document_protected_targets(
 /// Process one deterministic round-robin batch. The persistent filename cursor
 /// prevents a prefix of human-only proposals from starving later due work.
 pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> {
+    #[cfg(feature = "threads-test-clock")]
+    if crate::threads_clock::fixture_mode_enabled(coven_home)? {
+        crate::daemon::append_daemon_recovery_log(
+            coven_home,
+            "threads_scheduler_checkpoint phase=pass-lock-wait",
+        );
+    }
     let _pass_guard = threads_scheduler_pass_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("threads proposal scheduler lock is poisoned"))?;
@@ -15226,6 +15233,8 @@ struct DeterministicThreadsClockRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeterministicThreadsTickRequest {
     capability: String,
+    #[serde(default)]
+    workers: Option<u8>,
 }
 
 #[cfg(test)]
@@ -17090,19 +17099,49 @@ fn deterministic_threads_tick_response(
                 );
             }
         };
+    let workers = request.workers.unwrap_or(1);
+    if !matches!(workers, 1 | 2) {
+        return api_error(
+            400,
+            "invalid_request",
+            "Deterministic Threads ticks support one or two recovery workers.",
+            None,
+        );
+    }
     let _clock_guard = crate::threads_clock::fixture_control_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("deterministic Threads clock lock is poisoned"))?;
     match crate::threads_clock::authorize_fixture(coven_home, &request.capability) {
-        Ok(snapshot) => json_response(
-            200,
-            &json!({
+        Ok(snapshot) => {
+            let worker_results = if workers == 2 {
+                std::thread::scope(|scope| -> Result<Vec<usize>> {
+                    let first = scope.spawn(|| process_due_threads_proposals(coven_home));
+                    let second = scope.spawn(|| process_due_threads_proposals(coven_home));
+                    let first = first.join();
+                    let second = second.join();
+                    Ok(vec![
+                        first.map_err(|_| {
+                            anyhow::anyhow!("first Threads recovery worker panicked")
+                        })??,
+                        second.map_err(|_| {
+                            anyhow::anyhow!("second Threads recovery worker panicked")
+                        })??,
+                    ])
+                })?
+            } else {
+                vec![process_due_threads_proposals(coven_home)?]
+            };
+            let mut body = json!({
                 "ok": true,
-                "processed": process_due_threads_proposals(coven_home)?,
+                "processed": worker_results.iter().sum::<usize>(),
                 "now": snapshot.now.format(&time::format_description::well_known::Rfc3339)?,
                 "source": snapshot.source.as_str(),
-            }),
-        ),
+            });
+            if workers == 2 {
+                body["workerResults"] = json!(worker_results);
+            }
+            json_response(200, &body)
+        }
         Err(error) => map_deterministic_threads_clock_error(error),
     }
 }
@@ -39193,6 +39232,36 @@ tier = 0
                 );
             }
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn deterministic_threads_recovery_workers_are_bounded_and_authorized() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        for workers in [json!(0), json!(3), json!(256), json!(-1), json!("2")] {
+            let response = deterministic_threads_tick_response(
+                home,
+                Some(&json!({"capability": "fixture-cap", "workers": workers}).to_string()),
+            )?;
+            assert_eq!(response.status, 400, "{workers}: {}", response.body);
+        }
+        let denied = deterministic_threads_tick_response(
+            home,
+            Some(r#"{"capability":"wrong-cap","workers":2}"#),
+        )?;
+        assert_eq!(denied.status, 403, "{}", denied.body);
+        let inactive = deterministic_threads_tick_response(
+            tempfile::tempdir()?.path(),
+            Some(r#"{"capability":"fixture-cap","workers":2}"#),
+        )?;
+        assert_eq!(inactive.status, 404, "{}", inactive.body);
+        assert!(
+            !home.join("daemon-recovery.log").exists(),
+            "refused control started a recovery worker"
+        );
         Ok(())
     }
 
