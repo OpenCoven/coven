@@ -163,7 +163,8 @@ historical database corruption or infer missing close evidence for past writes.
 ## Deployed-history classification boundary
 
 Startup and decision recovery classify retained pending items; they do not
-perform a one-time census of every historical `ward_audit` opening.
+perform a census of every historical `ward_audit` opening. The separate operator
+command below inventories that history without changing recovery behavior.
 
 | Evidence available | Existing recovery disposition |
 | --- | --- |
@@ -174,13 +175,64 @@ perform a one-time census of every historical `ward_audit` opening.
 | Interrupted apply, corrupt/misbound receipt, unprovable original opening, or invalid decision origin | Preserve/quarantine evidence for explicit recovery; no fabricated no-write assertion or close. |
 | Audit opening without any retained pending/claim item | Outside the pending-item classifier; not automatically repaired or certified closed. |
 
-A deployed-history migration must first inventory the last two classes and
+### Read-only operator census
+
+```sh
+coven ward audit-census --json
+coven ward audit-census --max-audit-rows 100000 --json
+```
+
+This offline-capable command reads the selected `COVEN_HOME/coven.sqlite3`
+without starting a daemon, initializing a profile, installing/migrating a schema,
+or consulting the current familiar registry. Deleted familiars and openings
+without retained proposals therefore remain visible. Only the exact canonical
+`current_v020` audit schema is accepted; missing, legacy, or unknown schemas
+produce an explicit error, not a successful empty report.
+
+The JSON format is `coven.ward-window-census.v1`. `complete: true` and exit status
+zero mean the **bounded audit inventory completed**, not that every window is
+closed or that engineering/release acceptance has been granted. Inspect
+`unresolvedHistories`, each `classification`, and its `issues`. The report includes
+audit row ids and proposal UUIDs, not private detail text, familiar declarations,
+target contents, approval rationale, or proposal bodies.
+
+| Classification | Meaning and permitted next action |
+| --- | --- |
+| `typed_terminal_recorded` | Exactly one opening and one core-valid typed terminal, with consistent familiar/target context, compatible available channels, and append order. This is not independent proof of original submission authority, replay inputs, or applied bytes. Existing recovery may consume retained leftovers idempotently. |
+| `open_unverified` | No terminal; a pending/claim filename was observed. Its contents, eligibility, and authority were not validated. Use existing daemon recovery only under its own receipt and revalidation gates. |
+| `quarantined_opening` / `untrusted_artifacts` | No terminal; only quarantined or untrusted matching names were observed. Preserve evidence for explicit recovery; do not promote these artifacts into the active queue. |
+| `orphaned_opening` | No terminal or recognized matching artifact name was observed. This is outside automatic per-item recovery; preserve the audit snapshot and investigate missing or unattributed proposal evidence. |
+| `unprovable_apply` | Apply intent exists without a terminal. Neither current bytes nor an absent claim proves that no write occurred. Preserve intent and before-image evidence for explicit recovery. |
+| `inconsistent_history` | Invalid records, missing typed closes, duplicate openings/terminals, reverse append order, apply intent outside its opening/terminal interval, or contradictory scope. Preserve the original rows; do not manufacture an approval or balancing rejection. |
+
+Audit reads and the canonical schema fingerprint share one SQLite read
+transaction. `throughAuditId` identifies its high-water mark. Pending and
+quarantine observations are a **separate, non-atomic filename census**; they
+never establish submission or execution authority. They do not read proposal
+bodies or intentionally follow symlink entries. For a stable operational packet,
+stop the daemon using its supported command and preserve a consistent SQLite
+backup together with pending, quarantine, and intent evidence before inspection.
+Ordinary SQLite reads may use WAL/SHM sidecars; read-only here means no audit,
+schema, proposal, or authority mutations, not zero filesystem metadata activity.
+
+The default bound is 10,000 relevant audit rows, configurable up to 100,000.
+Relevant rows are openings, normative terminals, historical expiry tags, and
+durable apply intents, including human no-window terminals (which are excluded
+from the resulting opened-window histories). Decoded data is capped at 32 MiB
+and filesystem enumeration at 4,096 entries. Exceeding any bound, an inaccessible
+artifact directory, or a database read failure aborts without publishing a
+partial `complete` report. There is no paging or repair mode. A larger history
+requires separately scoped inventory work; do not certify it from a failed scan.
+
+A deployed-history migration must first inventory unresolved classes and
 preserve the original database and pending/intent evidence. Do not update old
 rows, infer approval from final file bytes, or append rejection merely to make
-counts balance. The current per-item policy is not evidence that a complete
-one-time classifier, repair tool, or operator resolution procedure has run.
-That remaining migration obligation is separate from the supported nine-case
-terminal matrix and keeps the universal historical closure claim open.
+counts balance. Publication of this diagnostic is not evidence that a deployed
+census or manual resolution has run. Unprovable interrupted apply and orphaned
+history still require evidence-backed disposition; this remaining migration
+obligation is separate from the supported nine-case terminal matrix and keeps
+the universal historical closure claim open. Rollback is to stop using the
+diagnostic; it installs no schema or persistent state to undo.
 
 For deterministic scheduler deadlines, use the opt-in
 [Threads test clock](threads-test-clock.md). Neither the clock nor seeded

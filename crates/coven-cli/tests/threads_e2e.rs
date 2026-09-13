@@ -2078,6 +2078,22 @@ fn assert_window_terminal(
             &fixture.coven_home.join("coven.sqlite3"),
         )?),
     )?;
+    let output = fixture.daemon_command(&["ward", "audit-census", "--json"])?;
+    anyhow::ensure!(output.status.success(), "census command failed: {output:?}");
+    let census: Value = serde_json::from_slice(&output.stdout)?;
+    let window = census["windows"]
+        .as_array()
+        .context("census windows")?
+        .iter()
+        .find(|window| window["proposalId"] == id)
+        .context("census omitted the real opened window")?;
+    anyhow::ensure!(
+        census["complete"] == true
+            && window["classification"] == "typed_terminal_recorded"
+            && window["closeReason"] == reason,
+        "census disagrees with the real daemon's terminal: {census}"
+    );
+    fs::write(state.join("ward-window-census.json"), &output.stdout)?;
     Ok(())
 }
 

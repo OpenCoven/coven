@@ -31,6 +31,103 @@ const AFTER: &str = "after";
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[test]
+fn census_reports_orphaned_opening_without_familiar_or_pending_and_never_repairs() -> Result<()> {
+    run_journey(|fixture| {
+        let proposal = stage_public_coherence_edit(fixture)?;
+        seed_synthetic_legacy_opened_history(fixture, &proposal)?;
+        fs::remove_file(&proposal.pending)?;
+        fs::remove_file(fixture.coven_home.join("familiars.toml"))?;
+        let before = audit_rows(fixture, &proposal)?;
+        let report = census_report(fixture)?;
+        assert_eq!(report["complete"], true, "{report}");
+        assert_eq!(report["windows"].as_array().context("windows")?.len(), 1);
+        assert_eq!(report["windows"][0]["proposalId"], proposal.id);
+        assert_eq!(report["windows"][0]["classification"], "orphaned_opening");
+        assert_eq!(report["windows"][0]["terminalRows"], json!([]));
+        assert_eq!(audit_rows(fixture, &proposal)?, before);
+        assert!(!proposal.pending.exists());
+        assert_eq!(fs::read(fixture.workspace.join(TARGET))?, BEFORE);
+        Ok(())
+    })
+}
+
+#[test]
+fn census_reports_retained_claim_and_unprovable_apply_without_inventing_terminal() -> Result<()> {
+    run_journey(|fixture| {
+        let proposal = stage_public_coherence_edit(fixture)?;
+        seed_synthetic_legacy_opened_history(fixture, &proposal)?;
+        let claim = proposal.pending.with_extension("json.approve.deciding");
+        fs::rename(&proposal.pending, &claim)?;
+        let claim_before = fs::read(&claim)?;
+        let conn = Connection::open_with_flags(
+            fixture.coven_home.join("coven.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, proposal_id, familiar_id, ward_hash, decision,
+                files_touched, submitted_at, decided_at
+             )
+             SELECT 'validation_verdict', proposal_id, familiar_id, ward_hash,
+                    'proposal-apply-intent', files_touched, submitted_at, decided_at
+             FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+            [&proposal.id],
+        )?;
+        drop(conn);
+        let before = audit_rows(fixture, &proposal)?;
+        let report = census_report(fixture)?;
+        assert_eq!(report["windows"][0]["classification"], "unprovable_apply");
+        assert_eq!(report["windows"][0]["artifacts"]["claims"], 1);
+        assert_eq!(report["windows"][0]["terminalRows"], json!([]));
+        assert_eq!(audit_rows(fixture, &proposal)?, before);
+        assert_eq!(fs::read(&claim)?, claim_before);
+        assert_eq!(fs::read(fixture.workspace.join(TARGET))?, BEFORE);
+        Ok(())
+    })
+}
+
+#[test]
+fn census_recognizes_real_recovery_close_and_does_not_create_missing_store() -> Result<()> {
+    run_journey(|fixture| {
+        let proposal = stage_public_coherence_edit(fixture)?;
+        seed_synthetic_legacy_opened_history(fixture, &proposal)?;
+        fixture.start_daemon()?;
+        wait_for_startup_terminal(fixture, &proposal)?;
+        fixture.stop_daemon()?;
+        let before = audit_rows(fixture, &proposal)?;
+        let report = census_report(fixture)?;
+        assert_eq!(
+            report["windows"][0]["classification"],
+            "typed_terminal_recorded"
+        );
+        assert_eq!(report["windows"][0]["closeReason"], "revalidation_failed");
+        assert_eq!(audit_rows(fixture, &proposal)?, before);
+
+        let missing_home = fixture.coven_home.join("absent-census-profile");
+        let output = fixture
+            .cli_command_builder(&["ward", "audit-census", "--json"])
+            .env("COVEN_HOME", &missing_home)
+            .output()?;
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("existing Coven store"),
+            "{output:?}"
+        );
+        assert!(!missing_home.exists(), "diagnostic initialized a profile");
+        Ok(())
+    })
+}
+
+fn census_report(fixture: &ThreadsFixture) -> Result<Value> {
+    let output = fixture
+        .cli_command_builder(&["ward", "audit-census", "--json"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).context("census JSON")
+}
+
+#[test]
 fn public_coherence_approval_has_no_fabricated_window_close() -> Result<()> {
     run_journey(|fixture| {
         let proposal = stage_public_coherence_edit(fixture)?;
