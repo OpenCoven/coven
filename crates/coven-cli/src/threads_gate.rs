@@ -91,6 +91,8 @@ pub struct GateReport {
     pub verdicts: Vec<(String, threads::Verdict)>,
     /// The unit outcome.
     pub outcome: GateOutcome,
+    /// Exact identity evidence evaluated by this gate, not a later reread.
+    pub(crate) identity_evidence: Option<[u8; 32]>,
 }
 
 impl GateReport {
@@ -348,6 +350,10 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         return Ok(GateReport {
             verdicts: Vec::new(),
             outcome: GateOutcome::Permitted,
+            identity_evidence: crate::ward_identity::candidate_binding(
+                config,
+                identity_context.as_ref(),
+            )?,
         });
     }
 
@@ -390,6 +396,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         return Ok(GateReport {
             verdicts,
             outcome: GateOutcome::Rejected,
+            identity_evidence: None,
         });
     }
 
@@ -462,7 +469,14 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         GateOutcome::Permitted
     };
 
-    Ok(GateReport { verdicts, outcome })
+    Ok(GateReport {
+        verdicts,
+        outcome,
+        identity_evidence: crate::ward_identity::candidate_binding(
+            config,
+            identity_context.as_ref(),
+        )?,
+    })
 }
 
 /// Build the daemon's authoritative weave view for a familiar.

@@ -21,6 +21,365 @@ const BEFORE: &str = "before";
 const AFTER: &str = "after";
 
 #[test]
+fn known_intake_routes_share_identity_refusal_and_exact_source_acceptance() -> Result<()> {
+    for route in [
+        "logged",
+        "free",
+        "legacy-coherence",
+        "scheduled-human",
+        "scheduled-rationale",
+        "scheduled-coherence",
+        "auto",
+        "auto-window",
+    ] {
+        for valid in [true, false] {
+            run_journey(|fixture| {
+                configure_identity(fixture, true)?;
+                let (target, before, after, extra) = match route {
+                    "logged" => (NOTE, BEFORE, AFTER, String::new()),
+                    "free" => (NOTE, BEFORE, AFTER, format!("\n[[surface]]\npath='{NOTE}'\ntier=3\n")),
+                    "legacy-coherence" => (REVIEWED, BEFORE, AFTER, String::new()),
+                    "auto" | "auto-window" => (
+                        "output-format.json",
+                        r#"{"schema":"coven.output-format/v1","indent":2,"final_newline":true}"#,
+                        r#"{"schema":"coven.output-format/v1","indent":4,"final_newline":false}"#,
+                        format!(
+                            "\n[[surface]]\npath='output-format.json'\ntier=2\n\
+                             [editable]\nharness_blocks=['output_format']\n\
+                             [approval_tiers.auto]\nblocks=['output_format']\ngate='regression_suite'\n{}\
+                             [[probe]]\nsurface='output-format.json'\nid='parse'\nformat='json'\n",
+                            if route == "auto-window" { "human_veto_window_hours=1\nmin_visible_seconds=1\n" } else { "" },
+                        ),
+                    ),
+                    _ => {
+                        let (lane, gate, veto) = match route {
+                            "scheduled-human" => ("human_review", "human_approval", ""),
+                            "scheduled-rationale" => ("human_required", "human_approval_with_rationale", ""),
+                            _ => ("familiar_review", "familiar_coherence_check", "human_veto_window_hours=1\nmin_visible_seconds=1\n"),
+                        };
+                        ("TOOLS.md", BEFORE, AFTER, format!(
+                            "\n[[surface]]\npath='TOOLS.md'\ntier=1\n\
+                             [editable]\nharness_blocks=['tool_defaults']\n\
+                             [approval_tiers.{lane}]\nblocks=['tool_defaults']\ngate='{gate}'\n{veto}\
+                             [[probe]]\nsurface='TOOLS.md'\nid='size-delta'\n",
+                        ))
+                    }
+                };
+                let ward_path = fixture.workspace.join("ward.toml");
+                let ward = fs::read_to_string(&ward_path)?;
+                fs::write(ward_path, format!("{ward}{extra}"))?;
+                fs::create_dir_all(
+                    fixture
+                        .workspace
+                        .join(target)
+                        .parent()
+                        .context("route parent")?,
+                )?;
+                fs::write(fixture.workspace.join(target), before)?;
+                if !valid {
+                    IdentityChange::Purpose.apply(fixture)?;
+                }
+                let sources = source_snapshot(fixture)?;
+                let response = fixture.request(
+                    "POST",
+                    EDITS,
+                    Some(&json!({
+                        "edits":[{"target":target,"contents":after}],
+                    })),
+                )?;
+                eprintln!(
+                    "identity route={route} valid={valid}: HTTP {}",
+                    response.status
+                );
+                if !valid {
+                    assert_eq!(response.status, 403, "{route}: {response:?}");
+                    assert_eq!(response.body["error"]["code"], "ward_refused");
+                    assert!(response
+                        .body
+                        .to_string()
+                        .contains(IdentityChange::Purpose.intake_reason()));
+                    assert_eq!(fs::read_to_string(fixture.workspace.join(target))?, before);
+                    assert_no_pending(fixture)?;
+                    assert_no_write_authority(fixture)?;
+                    assert_eq!(audit_count(fixture, "proposal_submitted")?, 0);
+                } else if matches!(route, "logged" | "free") {
+                    assert_eq!(response.status, 200, "{route}: {response:?}");
+                    assert_eq!(fs::read_to_string(fixture.workspace.join(target))?, after);
+                    assert_no_pending(fixture)?;
+                } else {
+                    assert_eq!(response.status, 202, "{route}: {response:?}");
+                    assert_eq!(response.body["disposition"], "staged");
+                    assert_eq!(audit_count(fixture, "proposal_submitted")?, 1);
+                    // Immediate scheduled lanes may commit before this observer
+                    // rereads the file; HTTP admission still must be staged.
+                    let actual = fs::read_to_string(fixture.workspace.join(target))?;
+                    if route == "auto" {
+                        assert!(actual == before || actual == after);
+                    } else {
+                        assert_eq!(actual, before);
+                        assert!(std::path::Path::new(
+                            response.body["pendingPath"].as_str().context("pending")?
+                        )
+                        .is_file());
+                    }
+                }
+                assert_eq!(source_snapshot(fixture)?, sources);
+                assert_no_reservations(fixture)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "threads-test-clock")]
+fn scheduled_identity_replay_covers_manual_and_immediate_routes() -> Result<()> {
+    for lane in ["human_review", "human_required", "auto"] {
+        for restart in [false, true] {
+            for drift in [false, true] {
+                run_journey(|fixture| {
+                    configure_identity(fixture, true)?;
+                    let (target, before, after, region, gate) = match lane {
+                        "auto" => (
+                            "output-format.json",
+                            r#"{"schema":"coven.output-format/v1","indent":2,"final_newline":true}"#,
+                            r#"{"schema":"coven.output-format/v1","indent":4,"final_newline":false}"#,
+                            "output_format",
+                            "regression_suite",
+                        ),
+                        "human_required" => (
+                            "TOOLS.md",
+                            BEFORE,
+                            AFTER,
+                            "tool_defaults",
+                            "human_approval_with_rationale",
+                        ),
+                        _ => ("TOOLS.md", BEFORE, AFTER, "tool_defaults", "human_approval"),
+                    };
+                    let ward_path = fixture.workspace.join("ward.toml");
+                    let ward = fs::read_to_string(&ward_path)?;
+                    let probe = if lane == "auto" {
+                        "id='parse'\nformat='json'"
+                    } else {
+                        "id='size-delta'"
+                    };
+                    let tier = if lane == "auto" { 2 } else { 1 };
+                    fs::write(
+                        ward_path,
+                        format!(
+                            "{ward}\n[[surface]]\npath='{target}'\ntier={tier}\n\
+                         [editable]\nharness_blocks=['{region}']\n\
+                         [approval_tiers.{lane}]\nblocks=['{region}']\ngate='{gate}'\n\
+                         [[probe]]\nsurface='{target}'\n{probe}\n"
+                        ),
+                    )?;
+                    fs::write(fixture.workspace.join(target), before)?;
+                    let (_, capability) = configure_identity_clock(fixture)?;
+                    // Disable the background scheduler before staging an immediate lane.
+                    fixture.restart_daemon()?;
+                    let staged = fixture.request(
+                        "POST",
+                        EDITS,
+                        Some(&json!({
+                            "edits":[{"target":target,"contents":after}],
+                        })),
+                    )?;
+                    assert_eq!(staged.status, 202, "{staged:?}");
+                    let id = staged.body["proposalId"].as_str().context("scheduled id")?;
+                    let detail = fixture.request("GET", &format!("{PROPOSALS}/{id}"), None)?;
+                    assert_eq!(detail.status, 200, "{detail:?}");
+                    let revision = detail.body["proposal"]["proposalRevision"]
+                        .as_str()
+                        .context("scheduled revision")?;
+                    if drift {
+                        IdentityChange::IdentityBytes.apply(fixture)?;
+                    }
+                    let sources = source_snapshot(fixture)?;
+                    if restart {
+                        fixture.restart_daemon()?;
+                    }
+                    let response = if lane == "auto" {
+                        fixture.request(
+                            "POST",
+                            "/api/v1/internal/threads/test-clock/tick",
+                            Some(&json!({"capability":capability})),
+                        )?
+                    } else {
+                        fixture.request("POST", &format!("{PROPOSALS}/{id}/approve"),
+                            Some(&json!({"expectedRevision":revision,"note":"Synthetic identity replay rationale"})))?
+                    };
+                    eprintln!(
+                        "identity replay lane={lane} restart={restart} drift={drift}: HTTP {}",
+                        response.status
+                    );
+                    assert_eq!(
+                        response.status,
+                        if drift && lane != "auto" { 409 } else { 200 },
+                        "{response:?}"
+                    );
+                    if drift && lane != "auto" {
+                        assert_eq!(response.body["why"], "proposal-identity-evidence-diverged");
+                    }
+                    assert_eq!(
+                        fs::read_to_string(fixture.workspace.join(target))?,
+                        if drift { before } else { after }
+                    );
+                    assert_eq!(source_snapshot(fixture)?, sources);
+                    assert_eq!(audit_count(fixture, "proposal_submitted")?, 1);
+                    assert_eq!(audit_count(fixture, "proposal_window_opened")?, 0);
+                    assert_eq!(
+                        audit_count(fixture, "proposal_approved")?,
+                        i64::from(!drift)
+                    );
+                    assert_eq!(audit_count(fixture, "proposal_rejected")?, i64::from(drift));
+                    if drift {
+                        assert_no_write_authority(fixture)?;
+                    }
+                    assert_no_pending(fixture)?;
+                    fixture.restart_daemon()?;
+                    let tick = fixture.request(
+                        "POST",
+                        "/api/v1/internal/threads/test-clock/tick",
+                        Some(&json!({"capability":capability})),
+                    )?;
+                    assert_eq!(tick.status, 200, "{tick:?}");
+                    assert_eq!(tick.body["processed"], 0);
+                    assert_eq!(
+                        audit_count(fixture, "proposal_approved")?,
+                        i64::from(!drift)
+                    );
+                    assert_eq!(audit_count(fixture, "proposal_rejected")?, i64::from(drift));
+                    assert_eq!(
+                        fs::read_to_string(fixture.workspace.join(target))?,
+                        if drift { before } else { after }
+                    );
+                    assert_no_pending(fixture)
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "threads-test-clock")]
+fn direct_identity_drift_at_commit_refuses_real_daemon_write() -> Result<()> {
+    run_journey(|fixture| {
+        configure_identity(fixture, true)?;
+        fs::create_dir_all(fixture.workspace.join("notes"))?;
+        fs::write(fixture.workspace.join(NOTE), BEFORE)?;
+        let (control, capability) = configure_identity_clock(fixture)?;
+        publish_identity_marker(&control.join("pause-final-commit"), capability)?;
+        std::thread::scope(|scope| -> Result<()> {
+            let current = &*fixture;
+            let request = scope.spawn(move || {
+                current.request(
+                    "POST",
+                    EDITS,
+                    Some(&json!({"edits":[{"target":NOTE,"contents":AFTER}]})),
+                )
+            });
+            let reached = control.join("pause-final-commit.reached");
+            let started = std::time::Instant::now();
+            // Test-only hang guard, not a readiness SLA. The daemon's separate
+            // ten-second release timeout starts after publishing this marker.
+            let timeout = started + std::time::Duration::from_secs(30);
+            while !reached.try_exists()? {
+                if request.is_finished() {
+                    let outcome = request.join().map_err(|_| {
+                        anyhow::anyhow!(
+                            "direct request panicked before the final-commit marker after {:?}",
+                            started.elapsed()
+                        )
+                    })?;
+                    anyhow::bail!(
+                        "direct request finished before the final-commit marker after {:?}: {outcome:?}",
+                        started.elapsed()
+                    );
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < timeout,
+                    "direct commit barrier was not reached after {:?}",
+                    started.elapsed()
+                );
+                std::thread::yield_now();
+            }
+            let path = fixture.workspace.join("IDENTITY.md");
+            let original = fs::read_to_string(&path)?;
+            let revised = format!("{original}\n<!-- Synthetic source revision. -->\n");
+            fs::write(&path, &revised)?;
+            publish_identity_marker(&control.join("pause-final-commit.release"), capability)?;
+            let response = request
+                .join()
+                .map_err(|_| anyhow::anyhow!("direct request panicked"))??;
+            let actual = fs::read_to_string(fixture.workspace.join(NOTE))?;
+            eprintln!(
+                "direct identity final-commit response={response:?}; actual={actual:?}; applies={}",
+                audit_count(fixture, "apply_audit")?
+            );
+            assert_ne!(response.status, 200, "{response:?}");
+            assert_eq!(
+                response.body["error"]["details"]["writeApplied"], false,
+                "{response:?}"
+            );
+            // A timeout in the fixture seam is not the identity regression.
+            assert!(
+                response.body["error"]["message"]
+                    .as_str()
+                    .context("Ward refusal message")?
+                    .contains("ordinary apply identity evidence changed after intake"),
+                "wrong refusal cause: {response:?}"
+            );
+            assert_eq!(actual, BEFORE);
+            assert_eq!(fs::read_to_string(path)?, revised);
+            assert_no_write_authority(fixture)?;
+            assert_no_pending(fixture)?;
+            assert_no_reservations(fixture)?;
+            Ok(())
+        })?;
+        fixture.restart_daemon()?;
+        assert_eq!(fs::read_to_string(fixture.workspace.join(NOTE))?, BEFORE);
+        assert_note_applies(fixture)
+    })
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn configure_identity_clock(fixture: &ThreadsFixture) -> Result<(PathBuf, &'static str)> {
+    let control = fixture
+        .coven_home
+        .join("test-fixtures/threads-deterministic-clock");
+    fs::create_dir_all(&control)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(
+            control.parent().context("fixture root")?,
+            fs::Permissions::from_mode(0o700),
+        )?;
+    }
+    let capability = "synthetic-identity-commit-capability";
+    for (name, value) in [
+        ("capability", capability),
+        ("state.json", r#"{"now":"2026-09-13T00:00:00Z"}"#),
+        ("enabled", "threads_test_clock_v1"),
+    ] {
+        publish_identity_marker(&control.join(name), value)?;
+    }
+    Ok((control, capability))
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn publish_identity_marker(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut staged = tempfile::NamedTempFile::new_in(path.parent().context("marker parent")?)?;
+    staged.write_all(contents.as_bytes())?;
+    staged.as_file().sync_all()?;
+    staged.persist_noclobber(path)?;
+    Ok(())
+}
+
+#[test]
 fn active_identity_allows_public_tier_two_write_across_restart() -> Result<()> {
     run_journey(|fixture| {
         configure_identity(fixture, true)?;
