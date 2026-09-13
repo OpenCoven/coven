@@ -59,6 +59,12 @@ fn run_target(coven_home: &Path, operation: &str, input: Option<&Value>) -> anyh
     command
         .args(["automations", "conformance", operation])
         .env("COVEN_HOME", coven_home)
+        .env(
+            "COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH",
+            coven_home
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("conformance home requires a parent directory"))?,
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if input.is_some() {
@@ -79,6 +85,12 @@ fn run_target_bytes(coven_home: &Path, operation: &str, input: &[u8]) -> anyhow:
     let mut child = Command::new(coven_bin())
         .args(["automations", "conformance", operation])
         .env("COVEN_HOME", coven_home)
+        .env(
+            "COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH",
+            coven_home
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("conformance home requires a parent directory"))?,
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

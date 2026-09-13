@@ -596,6 +596,67 @@ fn startup_reconciliation_wake_suite_executes_the_checked_in_vectors() {
 }
 
 #[test]
+fn startup_reconciliation_wake_suite_uses_a_vector_bound_definition_change_time() {
+    let mut vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
+    vectors["cases"][1]["changedAt"] = json!("2099-09-02T08:30:00.000Z");
+
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "startup-reconciliation-wake",
+        vectors,
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 2);
+}
+
+#[test]
+fn automation_action_time_override_is_persisted_by_the_native_api_route() {
+    let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
+    let case = &vectors["cases"][1];
+    let temp = tempfile::tempdir().unwrap();
+    crate::daemon::ensure_private_coven_home(temp.path()).unwrap();
+    let store_path = temp.path().join("coven.sqlite3");
+    let conn = crate::store::open_store(&store_path).unwrap();
+    let definition = super::definition::RoutineDefinition::from_json(&case["definition"]).unwrap();
+    super::store::insert_definition(&conn, &definition).unwrap();
+    conn.execute(
+        "UPDATE automation_definitions
+         SET created_at = ?1, updated_at = ?1
+         WHERE id = ?2",
+        rusqlite::params![case["createdAt"].as_str().unwrap(), definition.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let body = json!({
+        "action": "coven.automations.definition.revise.v1",
+        "adoptionKey": "adopt:revise:definition-wake:timestamp",
+        "expectedRevision": 1,
+        "definition": case["revisedDefinition"],
+    })
+    .to_string();
+    let changed_at = case["changedAt"].as_str().unwrap();
+    let response = crate::api::handle_request_with_body_at(
+        "POST",
+        "/api/v1/actions",
+        temp.path(),
+        None,
+        Some(&body),
+        changed_at,
+    )
+    .unwrap();
+
+    assert_eq!(response.status, 200);
+    let conn = crate::store::open_store(&store_path).unwrap();
+    let record = super::store::get_definition(&conn, &definition.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.updated_at, changed_at);
+}
+
+#[test]
 fn startup_reconciliation_wake_suite_fails_closed_on_an_expectation_mismatch() {
     let mut vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
     vectors["cases"][1]["expected"]["lastPassTrigger"] = json!("deadline");
@@ -613,12 +674,23 @@ fn startup_reconciliation_wake_suite_fails_closed_on_an_expectation_mismatch() {
 
 #[test]
 fn startup_reconciliation_wake_suite_rejects_invalid_vector_shapes() {
-    let invalid_mutations: [fn(&mut Value); 12] = [
+    let invalid_mutations: [fn(&mut Value); 16] = [
         |vectors| vectors["schemaVersion"] = json!("unsupported"),
         |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
         |vectors| vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone(),
         |vectors| vectors["cases"][1]["scenario"] = vectors["cases"][0]["scenario"].clone(),
         |vectors| vectors["cases"][0]["createdAt"] = json!("not-a-time"),
+        |vectors| {
+            vectors["cases"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("changedAt")
+                .map(|_| ())
+                .unwrap()
+        },
+        |vectors| vectors["cases"][1]["changedAt"] = json!("not-a-time"),
+        |vectors| vectors["cases"][1]["changedAt"] = vectors["cases"][1]["observedAt"].clone(),
+        |vectors| vectors["cases"][0]["changedAt"] = json!("2099-09-02T08:00:00.000Z"),
         |vectors| vectors["cases"][0]["definition"]["status"] = json!("PAUSED"),
         |vectors| vectors["cases"][1]["revisedDefinition"]["status"] = json!("PAUSED"),
         |vectors| vectors["cases"][1]["expected"]["outcome"] = json!("startup_reconciled"),

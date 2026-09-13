@@ -64,6 +64,7 @@
         "prompt": "Run the definition wake probe.",
         "tags": []
       },
+      "changedAt": "2099-09-02T08:00:00.000Z",
       "createdAt": "2099-09-01T08:00:00.000Z",
       "observedAt": "2099-09-03T12:00:00.000Z",
       "expected": {

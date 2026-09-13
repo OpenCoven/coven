@@ -252,7 +252,9 @@ leaders cannot tick while the current leader can.
 production daemon scheduler loop and control action route. It proves due work
 is reconciled and dispatched before the scheduler's first wait, and that an
 accepted definition revision wakes the sleeping scheduler for an immediate
-pass rather than waiting for the periodic deadline.
+pass rather than waiting for the periodic deadline. The definition-change
+case binds its mutation timestamp in the vector, so evaluation is independent
+of the target host's wall clock.
 `occurrence-fence-uniqueness` executes a portable three-case matrix against the
 production SQLite occurrence schema, proving that one automation cannot claim
 the same scheduled slot twice while different automations may share a slot and

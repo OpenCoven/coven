@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -30,6 +30,9 @@ use super::runs::{
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
 const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-request.v1";
 const SUITE_RESULT_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-result.v1";
+#[cfg(not(test))]
+const CONFORMANCE_SCRATCH_ENV: &str = "COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH";
+const SCHEDULER_CONFORMANCE_SYNC_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const CAPABILITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.capability-negotiation-vectors.v1";
 const CALENDAR_SCHEDULE_RESOLUTION_VECTOR_SCHEMA_VERSION: &str =
@@ -995,6 +998,8 @@ struct StartupReconciliationWakeVectorCase {
     definition: Value,
     #[serde(default)]
     revised_definition: Option<Value>,
+    #[serde(default)]
+    changed_at: Option<String>,
     created_at: String,
     observed_at: String,
     expected: ExpectedStartupReconciliationWake,
@@ -2910,10 +2915,12 @@ fn evaluate_startup_reconciliation_wake(vector: &Value) -> Result<bool, &'static
             canonical_timestamp(&case.created_at).ok_or("conformance vector is invalid")?;
         let observed_at =
             canonical_timestamp(&case.observed_at).ok_or("conformance vector is invalid")?;
+        let changed_at = case.changed_at.as_deref().and_then(canonical_timestamp);
         let valid_definition = match case.scenario {
             StartupReconciliationWakeScenario::StartupImmediateReconcile => {
                 definition.status == super::definition::RoutineStatus::Active
                     && case.revised_definition.is_none()
+                    && case.changed_at.is_none()
             }
             StartupReconciliationWakeScenario::DefinitionChangeWake => {
                 let revised = case
@@ -2927,6 +2934,9 @@ fn evaluate_startup_reconciliation_wake(vector: &Value) -> Result<bool, &'static
                 definition.status == super::definition::RoutineStatus::Paused
                     && revised.status == super::definition::RoutineStatus::Active
                     && revised.id == definition.id
+                    && changed_at.is_some_and(|changed_at| {
+                        created_at < changed_at && changed_at < observed_at
+                    })
             }
         };
         if !valid_case_id(&case.case_id)
@@ -2958,6 +2968,18 @@ struct SchedulerConformanceRuntime {
     started: SyncSender<()>,
 }
 
+impl SchedulerConformanceRuntime {
+    fn record_launch(&self) -> anyhow::Result<()> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        match self.started.try_send(()) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(())) => Err(anyhow::anyhow!(
+                "scheduler conformance observer is unavailable"
+            )),
+        }
+    }
+}
+
 impl crate::api::SessionRuntime for SchedulerConformanceRuntime {
     fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
         Err(anyhow::anyhow!(
@@ -2972,11 +2994,7 @@ impl crate::api::SessionRuntime for SchedulerConformanceRuntime {
         ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         ownership_established()?;
-        self.launches.fetch_add(1, Ordering::SeqCst);
-        self.started
-            .send(())
-            .map_err(|_| anyhow::anyhow!("scheduler conformance observer is unavailable"))?;
-        Ok(())
+        self.record_launch()
     }
 
     fn send_input(&self, _session_id: &str, _payload: &Value) -> anyhow::Result<()> {
@@ -3052,7 +3070,7 @@ impl super::daemon_tick::AutomationClock for SchedulerConformanceClock {
 fn startup_reconciliation_wake_case_matches(
     case: &StartupReconciliationWakeVectorCase,
 ) -> Result<bool, &'static str> {
-    let scheduler_home = tempfile::tempdir().map_err(|_| "conformance suite execution failed")?;
+    let scheduler_home = scheduler_conformance_tempdir()?;
     crate::daemon::ensure_private_coven_home(scheduler_home.path())
         .map_err(|_| "conformance suite execution failed")?;
     let store_path = scheduler_home.path().join("coven.sqlite3");
@@ -3094,15 +3112,16 @@ fn startup_reconciliation_wake_case_matches(
         waits: AtomicUsize::new(0),
         first_reason: Mutex::new(None),
     });
-    let handle = super::daemon_tick::start_automations_scheduler_with_clock(
+    let mut handle = super::daemon_tick::start_automations_scheduler_with_clock(
         scheduler_home.path(),
         runtime.clone(),
         clock.clone(),
     )
     .map_err(|_| "conformance suite execution failed")?;
 
+    let synchronization_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
     let system_wait_observed = wait_ready_rx
-        .recv_timeout(StdDuration::from_secs(1))
+        .recv_timeout(synchronization_deadline.saturating_duration_since(StdInstant::now()))
         .is_ok();
     let launches_before_first_wait = runtime.launches.load(Ordering::SeqCst);
     let _ = wait_release_tx.send(());
@@ -3119,12 +3138,15 @@ fn startup_reconciliation_wake_case_matches(
             "definition": revised_definition
         })
         .to_string();
-        let response = crate::api::handle_request_with_body(
+        let response = crate::api::handle_request_with_body_at(
             "POST",
             "/api/v1/actions",
             scheduler_home.path(),
             None,
             Some(&body),
+            case.changed_at
+                .as_deref()
+                .ok_or("conformance vector is invalid")?,
         );
         action_accepted = response.as_ref().is_ok_and(|response| {
             response.status == 200
@@ -3133,11 +3155,20 @@ fn startup_reconciliation_wake_case_matches(
                     .and_then(|body| body["accepted"].as_bool())
                     == Some(true)
         });
-        let _ = started_rx.recv_timeout(StdDuration::from_secs(1));
+        let _ = started_rx
+            .recv_timeout(synchronization_deadline.saturating_duration_since(StdInstant::now()));
     }
-    handle
-        .shutdown_and_join()
-        .map_err(|_| "conformance suite execution failed")?;
+    if handle
+        .shutdown_and_join_until(synchronization_deadline)
+        .is_err()
+    {
+        let cleanup_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
+        if handle.shutdown_and_join_until(cleanup_deadline).is_err() {
+            std::mem::forget(handle);
+            std::mem::forget(scheduler_home);
+        }
+        return Err("conformance suite execution failed");
+    }
 
     let first_wait_reason = *clock
         .first_reason
@@ -3205,6 +3236,25 @@ fn startup_reconciliation_wake_case_matches(
                 && occurrence_state.as_deref() == Some(expected_state.as_str())
         }
     })
+}
+
+fn scheduler_conformance_tempdir() -> Result<tempfile::TempDir, &'static str> {
+    #[cfg(test)]
+    {
+        tempfile::Builder::new()
+            .prefix("coven-automations-conformance-")
+            .tempdir()
+            .map_err(|_| "conformance suite execution failed")
+    }
+    #[cfg(not(test))]
+    {
+        let scratch = std::env::var_os(CONFORMANCE_SCRATCH_ENV)
+            .ok_or("conformance suite execution failed")?;
+        tempfile::Builder::new()
+            .prefix("scheduler-home-")
+            .tempdir_in(scratch)
+            .map_err(|_| "conformance suite execution failed")
+    }
 }
 
 #[cfg(not(test))]
@@ -4059,4 +4109,37 @@ fn valid_sha256_digest(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     })
+}
+
+#[cfg(test)]
+mod scheduler_conformance_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn launch_observation_does_not_block_when_the_notification_channel_is_full() {
+        let (started, _started_rx) = sync_channel(1);
+        let runtime = Arc::new(SchedulerConformanceRuntime {
+            launches: AtomicUsize::new(0),
+            started,
+        });
+        runtime.record_launch().unwrap();
+
+        let (finished_tx, finished_rx) = sync_channel(1);
+        let second_runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            let _ = finished_tx.send(second_runtime.record_launch());
+        });
+
+        let started_at = StdInstant::now();
+        let result = finished_rx
+            .recv_timeout(SCHEDULER_CONFORMANCE_SYNC_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "launch observation did not complete within the hang guard after {:?}: {error}",
+                    started_at.elapsed()
+                )
+            });
+        assert!(result.is_ok());
+        assert_eq!(runtime.launches.load(Ordering::SeqCst), 2);
+    }
 }
