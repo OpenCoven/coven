@@ -6236,7 +6236,34 @@ fn apply_familiar_edits(
     #[cfg(test)]
     tests::output_auto_cases::run_ordinary_admission_hook();
     let apply_now = crate::threads_clock::now(coven_home)?;
+    let admitted_config = serde_json::to_vec(&config)?;
     let mut final_routing_check = || {
+        pause_threads_final_commit_fixture(coven_home)?;
+        let current_config = ward::WardConfig::load(&workspace)?
+            .context("ordinary apply Ward configuration is unavailable")?;
+        anyhow::ensure!(
+            serde_json::to_vec(&current_config)? == admitted_config,
+            "ordinary apply Ward authority changed after intake"
+        );
+        let current_identity = crate::ward_identity::candidate_identity_context(
+            coven_home,
+            familiar_id,
+            &workspace,
+            &current_config,
+            &edits,
+            &authorization,
+            Some(&adjudication.decisions),
+        );
+        anyhow::ensure!(
+            crate::ward_identity::candidate_rejection(&current_config, current_identity.as_ref())?
+                .is_none(),
+            "ordinary apply identity predicates no longer hold"
+        );
+        anyhow::ensure!(
+            crate::ward_identity::candidate_binding(&current_config, current_identity.as_ref())?
+                == gate_report.identity_evidence,
+            "ordinary apply identity evidence changed after intake"
+        );
         anyhow::ensure!(
             !crate::output_format_auto::intercepts(&workspace, &config, &adjudication.decisions)?,
             "ordinary apply admission changed to configured output-format routing"
@@ -17138,6 +17165,10 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod identity_route_cases {
+        use super::*;
+        include!("api_identity_route_tests.rs");
+    }
     pub(super) mod output_auto_cases {
         use super::*;
         include!("api_output_auto_tests.rs");
