@@ -10,8 +10,9 @@ import {
   writeFileSync
 } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
+import { isMainModule } from './script-entrypoint.mjs';
 
 const BASE_PROFILE_CONFIG = {
   contractProfile: 'coven.automations.v1',
@@ -625,7 +626,7 @@ function main() {
   );
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+if (isMainModule(import.meta.url)) {
   try {
     main();
   } catch (error) {
