@@ -513,8 +513,11 @@ pub fn initialize_store(path: &Path) -> Result<()> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum StoreInitializationPhase {
+    ConnectionOpened,
     ConnectionConfigured,
+    WardClassified,
     WardComplete,
+    RuntimeFailureClassComplete,
     RuntimeComplete,
     MainLockAcquired,
     MainSchemaComplete,
@@ -603,6 +606,8 @@ pub fn ward_audit_reservation_bytes(
     row_count: usize,
     variable_payload_bytes: u64,
 ) -> Result<u64> {
+    use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
+    checkpoint(Phase::ReservationSizeBegin);
     let row_overhead: i64 = conn
         .query_row(
             "SELECT row_overhead_bytes
@@ -618,10 +623,12 @@ pub fn ward_audit_reservation_bytes(
         .checked_add(4096)
         .and_then(|bytes| bytes.checked_mul(u64::try_from(row_count).ok()?))
         .context("Ward audit row reservation overflowed")?;
-    variable_payload_bytes
+    let bytes = variable_payload_bytes
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(row_bytes))
-        .context("Ward audit byte reservation overflowed")
+        .context("Ward audit byte reservation overflowed");
+    checkpoint(Phase::ReservationSizeReady);
+    bytes
 }
 
 pub struct WardAuditReservation<'a> {
@@ -641,6 +648,7 @@ impl<'a> WardAuditReservation<'a> {
         purpose: &str,
         required_bytes: u64,
     ) -> Result<Self> {
+        use crate::threads_clock::request_diagnostics::{checkpoint as trace, Phase};
         anyhow::ensure!(
             required_bytes > 0,
             "Ward audit reservation must be non-zero"
@@ -654,12 +662,14 @@ impl<'a> WardAuditReservation<'a> {
             !reservation_token.trim().is_empty(),
             "Ward audit reservation token is empty"
         );
+        trace(Phase::ReservationIdentityBegin);
         let store_id = get_or_insert_store_meta(
             conn,
             STORE_INSTANCE_ID_KEY,
             &uuid::Uuid::new_v4().to_string(),
         )
         .context("failed to initialize Ward audit store identity")?;
+        trace(Phase::ReservationIdentityReady);
         let owns_transaction = conn.is_autocommit();
         let active_token: Option<String> = conn
             .query_row(
@@ -675,6 +685,7 @@ impl<'a> WardAuditReservation<'a> {
             active_token.is_none(),
             "a Ward audit reservation is already active on this connection"
         );
+        trace(Phase::ReservationActiveCheckReady);
 
         let checkpoint = |mode: &str| {
             conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
@@ -685,7 +696,9 @@ impl<'a> WardAuditReservation<'a> {
                 ))
             })
         };
+        trace(Phase::ReservationPassiveBegin);
         let _ = checkpoint("PASSIVE");
+        trace(Phase::ReservationPassiveReady);
         let configured_wal_limit: Option<i64> = conn
             .query_row(
                 "SELECT wal_limit_bytes
@@ -703,11 +716,16 @@ impl<'a> WardAuditReservation<'a> {
                 wal_bytes > limit || required_bytes > limit.saturating_sub(wal_bytes)
             })
         {
+            trace(Phase::ReservationTruncateBegin);
             let _ = checkpoint("TRUNCATE");
+            trace(Phase::ReservationTruncateReady);
         }
+        trace(Phase::ReservationWalCheckReady);
         if owns_transaction {
+            trace(Phase::ReservationLockWait);
             conn.execute_batch("BEGIN IMMEDIATE")
                 .context("failed to serialize Ward audit capacity admission")?;
+            trace(Phase::ReservationLockAcquired);
         }
         let admitted = (|| -> Result<Option<u64>> {
             let existing: Option<i64> = conn
@@ -773,6 +791,7 @@ impl<'a> WardAuditReservation<'a> {
                 }
                 .into());
             }
+            trace(Phase::ReservationLedgerReady);
             if let Some(existing_bytes) = existing {
                 let required = i64::try_from(required_bytes)
                     .context("Ward audit reservation exceeds SQLite integer range")?;
@@ -799,10 +818,12 @@ impl<'a> WardAuditReservation<'a> {
         let previous_reserved_bytes = match admitted {
             Ok(previous_reserved_bytes) => {
                 if owns_transaction {
+                    trace(Phase::ReservationCommitBegin);
                     if let Err(error) = conn.execute_batch("COMMIT") {
                         let _ = conn.execute_batch("ROLLBACK");
                         return Err(error).context("failed to commit Ward audit reservation");
                     }
+                    trace(Phase::ReservationCommitReady);
                 }
                 previous_reserved_bytes
             }
@@ -867,6 +888,7 @@ impl<'a> WardAuditReservation<'a> {
                 )),
             };
         }
+        trace(Phase::ReservationActivationReady);
         Ok(Self {
             conn,
             reservation_id: reservation_token,
@@ -942,20 +964,25 @@ impl<'a> WardAuditReservation<'a> {
     }
 
     pub fn finish(mut self) -> Result<()> {
+        use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
         self.preserve_on_drop = true;
+        checkpoint(Phase::ReservationReleaseLockWait);
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .context("failed to serialize Ward audit reservation release")?;
+        checkpoint(Phase::ReservationReleaseLockAcquired);
         let released = self.conn.execute(
             "DELETE FROM coven_ward_audit_reservations WHERE token = ?1",
             [&self.reservation_id],
         );
+        checkpoint(Phase::ReservationReleaseDeleteReady);
         match released {
             Ok(_) => {
                 if let Err(error) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     return Err(error).context("failed to commit Ward audit reservation release");
                 }
+                checkpoint(Phase::ReservationReleaseCommitReady);
             }
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
@@ -963,6 +990,7 @@ impl<'a> WardAuditReservation<'a> {
             }
         }
         self.clear_active()?;
+        checkpoint(Phase::ReservationReleaseActiveReady);
         self.finished = true;
         let _ = self
             .conn
@@ -973,6 +1001,7 @@ impl<'a> WardAuditReservation<'a> {
                     row.get::<_, i64>(2)?,
                 ))
             });
+        checkpoint(Phase::ReservationReleasePassiveReady);
         Ok(())
     }
 
