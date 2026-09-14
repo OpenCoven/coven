@@ -115,7 +115,7 @@ jobs:
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/package-automations-protocol.test.mjs
       - run: node --test scripts/package-automations-authority-profile.test.mjs
-      - run: node --test conformance/automations/runner/conformance.test.mjs
+      - run: node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs
       - run: node --test scripts/release-stress-test.mjs
       # The benchmark harness tests also run inside `performance-baseline`,
       # but that job is push-only, so until this step existed a pull request
@@ -240,18 +240,37 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Keep build outputs outside the audited source
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/coven-target" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
+            ${{ runner.temp }}/coven-target
           key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - name: Install native link dependencies
         run: bash scripts/install-native-link-dependencies.sh
+      # Some workspace fixtures retain ignored evidence inside the checkout.
+      # Audit the clean source first; its own build cache stays outside it.
+      - name: Audit native Automations against the exact checkout
+        env:
+          AUTOMATIONS_AUDIT_DIR: ${{ runner.temp }}/automations-audit
+        run: node conformance/automations/runner/audit.mjs --output "$AUTOMATIONS_AUDIT_DIR"
+      - name: Upload native Automations audit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: automations-audit-linux-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/automations-audit
+          retention-days: 14
+          if-no-files-found: error
       - run: cargo test --workspace --locked
       - name: Exercise isolated Threads clock feature
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_

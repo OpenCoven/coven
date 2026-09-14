@@ -81,6 +81,26 @@ cargo test -p coven-cli --test smoke -- --nocapture
 
 The smoke test uses an isolated temporary `COVEN_HOME` and injects a fake `codex` executable into `PATH`, so it does not require private Codex or Claude credentials.
 
+For Automations changes, run the source-bound native audit from a clean,
+committed checkout with Node.js 24 and a credential-free GitHub `origin`
+(fork origins are preserved):
+
+```bash
+node conformance/automations/runner/audit.mjs --output /tmp/coven-automations-audit
+```
+
+Use a new output directory outside the checkout. This builds the native target
+with locked dependencies and retains the protocol bundle, job, and audit result.
+The source check includes ignored files: use a clean task worktree and keep
+`CARGO_TARGET_DIR` outside it when reusing a build cache. The audit itself
+defaults to temporary external build storage. It requires no provider
+credentials. The host compiler, flags, wrappers and Cargo configuration remain
+caller-trusted: this is not a hermetic or reproducible-build attestation, and
+configured origin is not proof of remote commit membership.
+Passing the enumerated audit suites is
+not production certification; see the
+[native readiness gates](docs/roadmaps/coven-automations-readiness.md).
+
 5. Exercise the CLI manually from a disposable project when changing runtime behavior:
 
 ```bash

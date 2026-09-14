@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +14,12 @@ const SHA_B = "b".repeat(64);
 const SHA_C = "c".repeat(64);
 const SHA_D = "d".repeat(64);
 const SHA_E = "e".repeat(64);
+const STARTUP_DELAY_MS = 3_000;
+const SYNCHRONIZED_SUITE_DELAY_MS = 12_500;
+const FIXTURE_SELF_EXIT_MS = 60_000;
+// Midpoint between the 10-second audit watchdog and fixture self-exit, not a
+// product latency assertion. A missed force-kill must not pass via self-exit.
+const FORCED_STOP_CUTOFF_MS = 35_000;
 
 function canonicalize(value) {
   if (value === null || typeof value !== "object") {
@@ -88,8 +94,11 @@ async function writeTarget(directory) {
     path,
     `#!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { chmodSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, writeFileSync } from "node:fs";
 const mode = process.env.COVEN_TEST_TARGET_MODE ?? "pass";
+if (mode === "slow-startup") {
+  await new Promise((resolve) => setTimeout(resolve, ${STARTUP_DELAY_MS}));
+}
 if (mode === "unavailable") process.exit(10);
 if (
   mode === "require-runner-scratch" &&
@@ -116,16 +125,28 @@ if (operation === "evaluate") {
 \`);
     chmodSync(process.argv[1], 0o755);
   }
-  if (mode === "ignore-timeout") {
-    process.on("SIGTERM", () => {});
-    setTimeout(() => process.exit(10), 5_000);
-    await new Promise(() => {});
-  }
-  if (mode === "descendant-timeout") {
-    spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
-      stdio: ["ignore", process.stdout, process.stderr]
-    });
-    process.on("SIGTERM", () => {});
+  if (mode === "ignore-timeout" || mode === "descendant-timeout") {
+    const record = (event) => appendFileSync(process.env.COVEN_TEST_LIFECYCLE_FILE, event + "\\n");
+    process.on("SIGTERM", () => record("parent-sigterm"));
+    record("parent-ready");
+    setTimeout(() => {
+      record("parent-self-exit");
+      process.exit(10);
+    }, ${FIXTURE_SELF_EXIT_MS});
+    if (mode === "descendant-timeout") {
+      spawn(process.execPath, ["-e", \`
+        const { appendFileSync } = require("node:fs");
+        const record = (event) => appendFileSync(process.env.COVEN_TEST_LIFECYCLE_FILE, event + "\\\\n");
+        process.on("SIGTERM", () => record("child-sigterm"));
+        record("child-ready");
+        setTimeout(() => {
+          record("child-self-exit");
+          process.exit(10);
+        }, ${FIXTURE_SELF_EXIT_MS});
+      \`], {
+        stdio: ["ignore", process.stdout, process.stderr]
+      });
+    }
     await new Promise(() => {});
   }
   if (mode === "malformed-capability") {
@@ -156,11 +177,8 @@ if (operation !== "evaluate") process.exit(3);
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
-if (mode === "slow-stateful-suite") {
-  await new Promise((resolve) => setTimeout(resolve, 8_500));
-}
-if (mode === "slow-cancellation-suite") {
-  await new Promise((resolve) => setTimeout(resolve, 2_500));
+if (mode === "slow-stateful-suite" || mode === "slow-cancellation-suite") {
+  await new Promise((resolve) => setTimeout(resolve, ${SYNCHRONIZED_SUITE_DELAY_MS}));
 }
 if (mode === "malformed") {
   process.stdout.write('{"credential":"SECRET-TARGET-OUTPUT"');
@@ -194,7 +212,11 @@ process.stdout.write(JSON.stringify({
   schemaVersion: "coven.automations.conformance-suite-result.v1",
   suiteId: request.suiteId,
   status: "passed",
-  evidence: { assertion: "native-target-ran", count: 1 }
+  evidence: {
+    assertion: "native-target-ran",
+    count: 1,
+    ...(mode === "slow-startup" ? { startupDelayMs: ${STARTUP_DELAY_MS} } : {})
+  }
 }));
 `,
     { mode: 0o755 },
@@ -225,7 +247,9 @@ async function runRunner({
   const result = spawnSync(process.execPath, args, {
       encoding: "utf8",
       env: { ...process.env, ...env },
-      timeout: 30_000,
+      // Covers capability (10s), a synchronized suite (20s), cleanup, and even
+      // the 60s fixture fallback when force-kill is broken. Only a hang guard.
+      timeout: 90_000,
   });
   return result;
 }
@@ -565,6 +589,28 @@ test("provides runner-owned scratch storage to every target invocation", async (
   assert.equal(result.status, 0, result.stderr);
 });
 
+test("allows startup beyond the old two-second limit without treating it as a hang", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const target = await writeTarget(directory);
+  const result = await runRunner({
+    targetCommand: target,
+    env: { COVEN_TEST_TARGET_MODE: "slow-startup" },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.statement.overallStatus, "passed");
+  assert.equal(
+    report.statement.profileResults[0].suiteResults[0].evidenceDigest.value,
+    sha256(canonicalize({
+      assertion: "native-target-ran",
+      count: 1,
+      startupDelayMs: STARTUP_DELAY_MS,
+    })),
+  );
+});
+
 test("allows the stateful startup wake suite to use its synchronization budget", async () => {
   const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
   const target = await writeTarget(directory);
@@ -617,41 +663,63 @@ test("allows cancellation arbitration to use its synchronization budget", async 
   assert.equal(result.status, 0, result.stderr);
 });
 
-test("force-kills a target that ignores the graceful timeout", async () => {
+test("force-kills a target that ignores the graceful timeout", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
   const target = await writeTarget(directory);
+  const lifecycleFile = join(directory, "lifecycle.log");
   const startedAt = Date.now();
 
   const result = await runRunner({
     targetCommand: target,
-    env: { COVEN_TEST_TARGET_MODE: "ignore-timeout" },
+    env: {
+      COVEN_TEST_TARGET_MODE: "ignore-timeout",
+      COVEN_TEST_LIFECYCLE_FILE: lifecycleFile,
+    },
   });
 
   const elapsedMs = Date.now() - startedAt;
   assert.equal(result.status, 1);
   assert.equal(result.stderr, "conformance target unavailable\n");
   assert.ok(
-    elapsedMs < 3_500,
+    elapsedMs < FORCED_STOP_CUTOFF_MS,
     `hard timeout took ${elapsedMs}ms`,
+  );
+  // Readiness follows SIGTERM-handler installation. A callback need not be
+  // scheduled within the 100ms grace, but self-exit must never complete the test.
+  assert.deepEqual(
+    (await readFile(lifecycleFile, "utf8")).trim().split("\n")
+      .filter((event) => event !== "parent-sigterm"),
+    ["parent-ready"],
   );
 });
 
-test("force-kills descendants that retain the target pipes", async () => {
+test("force-kills descendants that retain the target pipes", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
   const target = await writeTarget(directory);
+  const lifecycleFile = join(directory, "lifecycle.log");
   const startedAt = Date.now();
 
   const result = await runRunner({
     targetCommand: target,
-    env: { COVEN_TEST_TARGET_MODE: "descendant-timeout" },
+    env: {
+      COVEN_TEST_TARGET_MODE: "descendant-timeout",
+      COVEN_TEST_LIFECYCLE_FILE: lifecycleFile,
+    },
   });
 
   const elapsedMs = Date.now() - startedAt;
   assert.equal(result.status, 1);
   assert.equal(result.stderr, "conformance target unavailable\n");
   assert.ok(
-    elapsedMs < 3_500,
+    elapsedMs < FORCED_STOP_CUTOFF_MS,
     `process-tree timeout took ${elapsedMs}ms`,
+  );
+  assert.deepEqual(
+    (await readFile(lifecycleFile, "utf8")).trim().split("\n")
+      .filter((event) => !["parent-sigterm", "child-sigterm"].includes(event)).sort(),
+    ["child-ready", "parent-ready"],
   );
 });
 

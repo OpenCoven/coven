@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "coven.automations.audit-inventory.v1",
+  "decisionScope": { "kind": "audit_only" },
+  "suites": [
+    { "profile": "structural", "suiteId": "attempt-terminal-immutability", "vectorFile": "attempt-terminal-immutability.vectors.json" },
+    { "profile": "structural", "suiteId": "capability-negotiation", "vectorFile": "capability-negotiation.vectors.json" },
+    { "profile": "structural", "suiteId": "command-adoption-idempotency", "vectorFile": "command-adoption-idempotency.vectors.json" },
+    { "profile": "structural", "suiteId": "definition-lifecycle-transitions", "vectorFile": "definition-lifecycle-transitions.vectors.json" },
+    { "profile": "structural", "suiteId": "definition-validation", "vectorFile": "definition-validation.vectors.json" },
+    { "profile": "structural", "suiteId": "event-reducer-determinism", "vectorFile": "event-reducer-determinism.vectors.json" },
+    { "profile": "structural", "suiteId": "occurrence-fence-uniqueness", "vectorFile": "occurrence-fence-uniqueness.vectors.json" },
+    { "profile": "structural", "suiteId": "receipt-integrity-validation", "vectorFile": "receipt-integrity-validation.vectors.json" },
+    { "profile": "structural", "suiteId": "rrule-vocabulary", "vectorFile": "rrule-vocabulary.vectors.json" },
+    { "profile": "structural", "suiteId": "run-terminal-monotonicity", "vectorFile": "run-terminal-monotonicity.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "calendar-schedule-resolution", "vectorFile": "calendar-schedule-resolution.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "cancellation-timeout-arbitration", "vectorFile": "cancellation-timeout-arbitration.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "misfire-latest-planning", "vectorFile": "misfire-latest-planning.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "occurrence-lease-recovery", "vectorFile": "occurrence-lease-recovery.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "overlap-forbid-claiming", "vectorFile": "overlap-forbid-claiming.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "retry-backoff-timing", "vectorFile": "retry-backoff-timing.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "retry-quarantine-recovery", "vectorFile": "retry-quarantine-recovery.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "scheduler-leadership-fencing", "vectorFile": "scheduler-leadership-fencing.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "startup-reconciliation-wake", "vectorFile": "startup-reconciliation-wake.vectors.json" },
+    { "profile": "runtime_authority", "suiteId": "runtime-authority-terminal-recovery", "vectorFile": "runtime-authority-terminal-recovery.vectors.json" }
+  ]
+}
