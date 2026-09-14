@@ -4920,6 +4920,9 @@ enum StartupCheckpoint {
     DaemonStoreBegin,
     StoreInitializeBegin,
     StoreInitializeEnd,
+    HubIdentityReady,
+    HubStatusReturned,
+    StorageHealthReturned,
     StoreCloseBegin,
     DaemonStoreEnd,
     StatusPublicationBegin,
@@ -4930,10 +4933,17 @@ impl StartupCheckpoint {
     fn label(self) -> &'static str {
         match self {
             Self::StorePhase(phase) => match phase {
+                crate::store::StoreInitializationPhase::ConnectionOpened => {
+                    "store-connection-opened"
+                }
                 crate::store::StoreInitializationPhase::ConnectionConfigured => {
                     "store-connection-configured"
                 }
+                crate::store::StoreInitializationPhase::WardClassified => "store-ward-classified",
                 crate::store::StoreInitializationPhase::WardComplete => "store-ward-complete",
+                crate::store::StoreInitializationPhase::RuntimeFailureClassComplete => {
+                    "store-runtime-failure-class-complete"
+                }
                 crate::store::StoreInitializationPhase::RuntimeComplete => "store-runtime-complete",
                 crate::store::StoreInitializationPhase::MainLockAcquired => {
                     "store-main-lock-acquired"
@@ -4946,6 +4956,9 @@ impl StartupCheckpoint {
             Self::DaemonStoreBegin => "daemon-store-begin",
             Self::StoreInitializeBegin => "store-initialize-begin",
             Self::StoreInitializeEnd => "store-initialize-end",
+            Self::HubIdentityReady => "hub-identity-ready",
+            Self::HubStatusReturned => "hub-status-returned",
+            Self::StorageHealthReturned => "storage-health-returned",
             Self::StoreCloseBegin => "store-close-begin",
             Self::DaemonStoreEnd => "daemon-store-end",
             Self::StatusPublicationBegin => "status-publication-begin",
@@ -4956,6 +4969,7 @@ impl StartupCheckpoint {
 
 struct StartupCheckpointObserver {
     started: Instant,
+    previous_append_end: Instant,
     completed_appends: Duration,
 }
 
@@ -4963,6 +4977,7 @@ impl StartupCheckpointObserver {
     fn new(started: Instant) -> Self {
         Self {
             started,
+            previous_append_end: started,
             completed_appends: Duration::ZERO,
         }
     }
@@ -4981,14 +4996,21 @@ impl StartupCheckpointObserver {
     ) {
         let observed = now();
         write(&format!(
-            "startup_checkpoint phase={} elapsed_ms={} prior_observer_ms={}",
+            "startup_checkpoint phase={} elapsed_ms={} prior_observer_ms={} interval_us={}",
             phase.label(),
             observed.saturating_duration_since(self.started).as_millis(),
             self.completed_appends.as_millis(),
+            observed
+                .saturating_duration_since(self.previous_append_end)
+                .as_micros(),
         ));
         // Includes formatting, lock/file operations, and scheduling during prior
         // checkpoint appends. A visible line does not prove its own append returned.
-        self.completed_appends += now().saturating_duration_since(observed);
+        let append_end = now();
+        self.completed_appends += append_end.saturating_duration_since(observed);
+        // This interval excludes completed observer appends, not descheduling
+        // between checkpoints; it is wall time, not SQLite or kernel CPU time.
+        self.previous_append_end = append_end;
     }
 }
 
@@ -5020,12 +5042,14 @@ fn initialize_daemon_store_with_observer(
     observe(StartupCheckpoint::StoreInitializeEnd);
     crate::hub::initialize_hub_identity(&conn)
         .context("failed to initialize hub identity during daemon startup")?;
+    observe(StartupCheckpoint::HubIdentityReady);
     if let Err(error) = crate::hub::refresh_status_snapshot_from_connection(coven_home, &conn) {
         append_daemon_recovery_log(
             coven_home,
             &format!("hub status snapshot refresh failed during daemon startup: {error:#}"),
         );
     }
+    observe(StartupCheckpoint::HubStatusReturned);
     if let Err(error) =
         crate::store::refresh_storage_health_snapshot_from_connection(coven_home, &conn, None)
     {
@@ -5043,6 +5067,7 @@ fn initialize_daemon_store_with_observer(
             );
         }
     }
+    observe(StartupCheckpoint::StorageHealthReturned);
     // Finish the one normal last-connection checkpoint before publishing readiness.
     observe(StartupCheckpoint::StoreCloseBegin);
     conn.close()
@@ -13874,9 +13899,9 @@ mod tests {
         assert_eq!(
             records,
             [
-                "startup_checkpoint phase=store-initialize-begin elapsed_ms=100 prior_observer_ms=0",
-                "startup_checkpoint phase=store-initialize-end elapsed_ms=5108 prior_observer_ms=5000",
-                "startup_checkpoint phase=daemon-store-end elapsed_ms=5137 prior_observer_ms=5017",
+                "startup_checkpoint phase=store-initialize-begin elapsed_ms=100 prior_observer_ms=0 interval_us=100000",
+                "startup_checkpoint phase=store-initialize-end elapsed_ms=5108 prior_observer_ms=5000 interval_us=8000",
+                "startup_checkpoint phase=daemon-store-end elapsed_ms=5137 prior_observer_ms=5017 interval_us=12000",
             ]
         );
         // The last line cannot report the cost of its own still-in-progress append.
@@ -13896,12 +13921,18 @@ mod tests {
                 |record| other_records.push(record.to_owned()),
             );
         }
-        for (record, other_record) in records.iter().zip(&other_records) {
+        for ((record, other_record), interval_us) in records
+            .iter()
+            .zip(&other_records)
+            .zip([100000, 5008000, 29000])
+        {
             assert_eq!(
                 record.split_once(" prior_observer_ms=").unwrap().0,
                 other_record.split_once(" prior_observer_ms=").unwrap().0
             );
-            assert!(other_record.ends_with("prior_observer_ms=0"));
+            assert!(
+                other_record.ends_with(&format!("prior_observer_ms=0 interval_us={interval_us}"))
+            );
         }
     }
 
@@ -13952,13 +13983,19 @@ mod tests {
         let phases = [
             "daemon-store-begin",
             "store-initialize-begin",
+            "store-connection-opened",
             "store-connection-configured",
+            "store-ward-classified",
             "store-ward-complete",
+            "store-runtime-failure-class-complete",
             "store-runtime-complete",
             "store-main-lock-acquired",
             "store-main-schema-complete",
             "store-commit-complete",
             "store-initialize-end",
+            "hub-identity-ready",
+            "hub-status-returned",
+            "storage-health-returned",
             "store-close-begin",
             "daemon-store-end",
         ];
@@ -13970,13 +14007,44 @@ mod tests {
             let (elapsed, observer) = elapsed
                 .split_once(" prior_observer_ms=")
                 .context("missing checkpoint observer accounting")?;
+            let (observer, interval) = observer
+                .split_once(" interval_us=")
+                .context("missing checkpoint interval")?;
             let elapsed = elapsed.parse::<u128>()?;
             let observer = observer.parse::<u128>()?;
+            let interval = interval.parse::<u128>()?;
             assert!(elapsed >= previous);
             assert!(observer >= previous_observer && observer <= elapsed);
+            assert!(interval <= elapsed * 1000 + 999);
             previous = elapsed;
             previous_observer = observer;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_checkpoints_stop_after_unsupported_ward_classification() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = rusqlite::Connection::open(home.path().join("coven.sqlite3"))?;
+        conn.execute_batch("CREATE TABLE ward_audit (synthetic_unknown TEXT)")?;
+        conn.close().map_err(|(_, error)| error)?;
+        let mut phases = Vec::new();
+        let error = initialize_daemon_store_with_observer(home.path(), |phase| {
+            phases.push(phase.label());
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("unsupported ward_audit schema"));
+        assert_eq!(
+            phases,
+            [
+                "daemon-store-begin",
+                "store-initialize-begin",
+                "store-connection-opened",
+                "store-connection-configured",
+                "store-ward-classified",
+            ]
+        );
+        assert!(!daemon_status_path(home.path()).exists());
         Ok(())
     }
 
@@ -14008,10 +14076,15 @@ mod tests {
                 let (elapsed, observer) = elapsed
                     .split_once(" prior_observer_ms=")
                     .context("missing status checkpoint observer accounting")?;
+                let (observer, interval) = observer
+                    .split_once(" interval_us=")
+                    .context("missing status checkpoint interval")?;
                 let elapsed = elapsed.parse::<u128>()?;
                 let observer = observer.parse::<u128>()?;
+                let interval = interval.parse::<u128>()?;
                 assert!(elapsed >= previous);
                 assert!(observer >= previous_observer && observer <= elapsed);
+                assert!(interval <= elapsed * 1000 + 999);
                 previous = elapsed;
                 previous_observer = observer;
             }

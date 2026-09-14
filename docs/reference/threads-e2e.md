@@ -142,7 +142,7 @@ failure cleanup.
 The dedicated Windows CLI fixture captures allowlisted startup phases and
 numeric timing fields before temporary-home cleanup on failure. This diagnostic
 read uses at most 16 KiB and a one-second caller guard, preserves the original
-command result, and reports missing or delayed data explicitly. Its five helper
+command result, and reports missing or delayed data explicitly. Its six helper
 tests are diagnostic coverage, not additional CLI or authority journeys.
 
 Startup retains the initialized, runtime-guarded SQLite connection through
@@ -155,6 +155,18 @@ pure disk time and excludes the current append. A visible line does not prove
 its own append returned. The new `store-initialize-end` marks the retained
 connection, so its timing is not directly comparable with the older
 post-close boundary.
+
+The normal daemon-store segment emits 17 fixed checkpoints. Additional
+boundaries separate connection opening from configuration, Ward classification
+from application, the two runtime schema routines, and hub identity/status/
+storage-health setup. `hub-status-returned` and `storage-health-returned` do not
+claim snapshot success; existing advisory error handling is unchanged.
+`interval_us` measures wall time since the previous observer append returned
+(since observer construction for the first record). It excludes completed
+checkpoint appends, but includes descheduling and all work between those
+boundaries; it is not SQLite CPU, kernel, fsync, or lock-wait attribution.
+The six additional appends can perturb timing. Legacy observations without
+`interval_us` remain accepted by the bounded diagnostic reader.
 
 Windows authority journeys serialize admission and retain an owned
 `coven daemon serve` child, using the same native helper as the smaller Threads
@@ -324,8 +336,9 @@ include a bounded last-probe category and observation of the retained child
 handle, without changing the startup deadline or identity checks.
 The existing recovery log also records fixed-category remaining-budget samples
 immediately before and after the launch call, plus elapsed store-initialization
-checkpoints (connection configured, Ward complete, runtime schema complete,
-main lock acquired, main schema complete, commit complete). Remaining budgets
+checkpoints (connection opened/configured, Ward classified/complete, runtime
+failure-class/schema complete, main lock acquired, main schema complete, commit
+complete). Remaining budgets
 saturate at zero; they do not renew the deadline. Both launch samples are
 written after launch, so their log timestamps are write times, not sample times.
 Store checkpoints share the daemon-store elapsed-time origin.

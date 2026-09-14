@@ -77,6 +77,7 @@ fn startup_observation(line: &str) -> Option<String> {
     let phase = fields.next()?.strip_prefix("phase=")?;
     let (measurement, value) = fields.next()?.split_once('=')?;
     let observer = fields.next();
+    let interval = fields.next();
     if fields.next().is_some() {
         return None;
     }
@@ -87,13 +88,19 @@ fn startup_observation(line: &str) -> Option<String> {
             phase,
             "daemon-store-begin"
                 | "store-initialize-begin"
+                | "store-connection-opened"
                 | "store-connection-configured"
+                | "store-ward-classified"
                 | "store-ward-complete"
+                | "store-runtime-failure-class-complete"
                 | "store-runtime-complete"
                 | "store-main-lock-acquired"
                 | "store-main-schema-complete"
                 | "store-commit-complete"
                 | "store-initialize-end"
+                | "hub-identity-ready"
+                | "hub-status-returned"
+                | "storage-health-returned"
                 | "store-close-begin"
                 | "daemon-store-end"
                 | "status-publication-begin"
@@ -113,6 +120,17 @@ fn startup_observation(line: &str) -> Option<String> {
         }
         record.push_str(&format!(" prior_observer_ms={observer}"));
     }
+    if let Some(interval) = interval {
+        let interval = interval
+            .strip_prefix("interval_us=")?
+            .parse::<u128>()
+            .ok()?;
+        let max_interval = value.checked_mul(1000)?.checked_add(999)?;
+        if kind != "startup_checkpoint" || observer.is_none() || interval > max_interval {
+            return None;
+        }
+        record.push_str(&format!(" interval_us={interval}"));
+    }
     Some(record)
 }
 
@@ -120,6 +138,42 @@ fn startup_observation(line: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn startup_failure_checkpoints_accept_split_phases_and_bounded_intervals() {
+        for phase in [
+            "store-connection-opened",
+            "store-ward-classified",
+            "store-runtime-failure-class-complete",
+            "hub-identity-ready",
+            "hub-status-returned",
+            "storage-health-returned",
+        ] {
+            let record = format!(
+                "startup_checkpoint phase={phase} elapsed_ms=100 prior_observer_ms=50 interval_us=12345"
+            );
+            assert_eq!(
+                startup_observation(&format!("[synthetic] {record}")),
+                Some(record)
+            );
+        }
+        let submillisecond = "startup_checkpoint phase=daemon-store-end elapsed_ms=0 prior_observer_ms=0 interval_us=999";
+        assert_eq!(
+            startup_observation(&format!("[synthetic] {submillisecond}")),
+            Some(submillisecond.to_owned())
+        );
+        for invalid in [
+            "startup_checkpoint phase=synthetic-private-value elapsed_ms=100 prior_observer_ms=0 interval_us=0",
+            "startup_checkpoint phase=daemon-store-end elapsed_ms=100 interval_us=0",
+            "startup_checkpoint phase=daemon-store-end elapsed_ms=100 prior_observer_ms=0 interval_us=101000",
+            "startup_checkpoint phase=daemon-store-end elapsed_ms=100 prior_observer_ms=0 interval_us=synthetic-private-value",
+            "startup_checkpoint phase=daemon-store-end elapsed_ms=100 prior_observer_ms=0 interval_us=1 extra=synthetic-private-value",
+            "startup_checkpoint phase=daemon-store-end elapsed_ms=340282366920938463463374607431768211455 prior_observer_ms=0 interval_us=0",
+            "startup_budget phase=before-spawn remaining_ms=100 prior_observer_ms=0 interval_us=0",
+        ] {
+            assert_eq!(startup_observation(&format!("[synthetic] {invalid}")), None);
+        }
+    }
 
     #[test]
     fn startup_failure_checkpoints_preserve_timings_without_private_log_text() -> io::Result<()> {
