@@ -53,6 +53,9 @@ const RECEIPT_INTEGRITY_VALIDATION_VECTORS: &str = include_str!(
 );
 const RRULE_VOCABULARY_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/rrule-vocabulary.vectors.json");
+const RUNTIME_AUTHORITY_TERMINAL_RECOVERY_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/runtime-authority-terminal-recovery.vectors.json"
+);
 
 fn request_for_profile(profile: &str, suite_id: &str, vector: Value) -> Value {
     json!({
@@ -122,10 +125,121 @@ fn capability_advertises_the_native_structural_suites() {
                         "scheduler-leadership-fencing",
                         "startup-reconciliation-wake"
                     ]
+                },
+                {
+                    "profile": "runtime_authority",
+                    "suites": ["runtime-authority-terminal-recovery"]
                 }
             ]
         })
     );
+}
+
+fn runtime_terminal_recovery_request() -> Value {
+    request_for_profile(
+        "runtime_authority",
+        "runtime-authority-terminal-recovery",
+        serde_json::from_str(RUNTIME_AUTHORITY_TERMINAL_RECOVERY_VECTORS).unwrap(),
+    )
+}
+
+#[test]
+fn runtime_authority_terminal_recovery_executes_checked_in_vectors() {
+    let response = evaluate(&runtime_terminal_recovery_request()).unwrap();
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    let evidence = response.evidence.unwrap();
+    assert_eq!(evidence["executedCases"], 5);
+    assert_eq!(evidence["passedCases"], 5);
+    assert_eq!(evidence.as_object().unwrap().len(), 3);
+    assert!(evidence["vectorDigest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+}
+
+#[test]
+fn runtime_authority_terminal_recovery_expectations_drive_every_assertion() {
+    let baseline = runtime_terminal_recovery_request();
+    for (key, value) in baseline["vector"]["cases"][0]["expected"]
+        .as_object()
+        .unwrap()
+    {
+        let mut request = baseline.clone();
+        request["vector"]["cases"][0]["expected"][key] = match value {
+            Value::Bool(value) => json!(!value),
+            Value::Number(value) => json!(value.as_u64().unwrap() + 1),
+            Value::String(_) => json!("failed"),
+            _ => panic!("unexpected expectation shape: {key}"),
+        };
+        let response = evaluate(&request).unwrap();
+        assert_eq!(response.status, TargetSuiteStatus::Failed, "{key}");
+        assert_eq!(response.evidence, None, "{key}");
+    }
+}
+
+#[test]
+fn runtime_authority_terminal_recovery_rejects_invalid_shapes_and_inputs() {
+    let invalid_mutations: &[fn(&mut Value)] = &[
+        |v| v["schemaVersion"] = json!("unsupported"),
+        |v| v["unexpected"] = json!(true),
+        |v| v["cases"] = json!([]),
+        |v| v["cases"].as_array_mut().unwrap().truncate(4),
+        |v| v["cases"] = json!(vec![v["cases"][0].clone(); 129]),
+        |v| v["cases"][0]["caseId"] = json!(""),
+        |v| v["cases"][0]["caseId"] = json!("-bad"),
+        |v| v["cases"][0]["caseId"] = json!("a".repeat(129)),
+        |v| v["cases"][1]["caseId"] = v["cases"][0]["caseId"].clone(),
+        |v| v["cases"][1]["scenario"] = v["cases"][0]["scenario"].clone(),
+        |v| v["cases"][0]["scenario"] = json!("unknown"),
+        |v| v["cases"][0]["startedAt"] = json!("not-a-time"),
+        |v| v["cases"][0]["startedAt"] = json!("2026-09-03T12:00:01.000Z"),
+        |v| v["cases"][0]["terminalAt"] = json!("2026-09-03T12:00:06.000Z"),
+        |v| v["cases"][0]["reconcileAt"] = json!([]),
+        |v| v["cases"][0]["reconcileAt"][2] = json!("2026-09-03T12:00:07.000Z"),
+        |v| v["cases"][0]["sessionStatus"] = json!("failed"),
+        |v| v["cases"][0]["exitCode"] = json!(1),
+        |v| {
+            v["cases"][2]
+                .as_object_mut()
+                .unwrap()
+                .remove("exitCode")
+                .map(|_| ())
+                .unwrap()
+        },
+        |v| v["cases"][0]["evidenceShapedOutput"] = json!(false),
+        |v| v["cases"][0]["unexpected"] = json!(true),
+        |v| v["cases"][0]["expected"]["unexpected"] = json!(true),
+        |v| v["cases"][0]["expected"]["runState"] = json!("unknown"),
+        |v| v["cases"][0]["expected"]["runRows"] = json!(-1),
+        |v| v["cases"][0]["expected"]["runUnresolved"] = json!("true"),
+        |v| {
+            v["cases"][0]["expected"]
+                .as_object_mut()
+                .unwrap()
+                .remove("bindingPreserved");
+        },
+    ];
+    for (index, mutate) in invalid_mutations.iter().enumerate() {
+        let mut request = runtime_terminal_recovery_request();
+        mutate(&mut request["vector"]);
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid",
+            "{index}"
+        );
+    }
+}
+
+#[test]
+fn runtime_authority_terminal_recovery_requires_runtime_authority_profile() {
+    for profile in ["structural", "scheduler_reliability"] {
+        let mut request = runtime_terminal_recovery_request();
+        request["profile"] = json!(profile);
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance suite is unsupported"
+        );
+    }
 }
 
 #[test]

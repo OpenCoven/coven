@@ -11,6 +11,10 @@ description: "The OpenCoven public roadmap for CastCodes as the primary public w
 
 _Last updated: 2026-05-26_
 
+Native Automations readiness was reviewed separately on 2026-09-14. Its
+[source readiness map](roadmaps/coven-automations-readiness.md) supersedes this
+older product snapshot for automation status and release gates.
+
 This roadmap is the public progress ledger for **OpenCoven**, **CastCodes**, and **Coven**.
 
 It is intentionally written as a community-facing map, not an internal promise sheet. Items move when they are designed, implemented, tested, released, or deliberately cut. Dates are avoided unless a release is already scheduled.
@@ -113,6 +117,10 @@ Shipped:
 
 Now:
 
+- **Native Automations v1:** durable local scheduling exists; trusted
+  production authority, launched-run receipts, and full certification remain
+  gated. See the [source readiness map](roadmaps/coven-automations-readiness.md)
+  for executable audit evidence and dependency-ordered work under #854.
 - **Cast launcher redesign** (Phases 1–6 on `cast/*` branches): collapses the Coven launcher chrome into a single-prompt surface with a two-lane Commands + Snapshot body, plan/outcome cards for every spell, and a sequential quest flow that hands off between phases with deterministic sub-prompts. The repo-local design notes live under `docs/design/`. PR #99 is the current review slice (Phase 6 verification + readiness).
 - Keep the versioned daemon API contract and CastCodes integration work aligned. See [`docs/API-CONTRACT.md`](/API-CONTRACT).
 - Keep the public docs aligned with the actual CLI/API surface.

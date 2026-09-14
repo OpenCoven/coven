@@ -28,6 +28,8 @@ use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
 };
 
+mod runtime_authority_terminal_recovery;
+
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
 const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-request.v1";
 const SUITE_RESULT_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-result.v1";
@@ -80,6 +82,7 @@ const RUN_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.run-terminal-monotonicity-vectors.v1";
 const STRUCTURAL_PROFILE: &str = "structural";
 const SCHEDULER_RELIABILITY_PROFILE: &str = "scheduler_reliability";
+const RUNTIME_AUTHORITY_PROFILE: &str = "runtime_authority";
 const MAX_CASES: usize = 128;
 
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
@@ -101,6 +104,7 @@ pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
 pub const RUN_TERMINAL_MONOTONICITY_SUITE: &str = "run-terminal-monotonicity";
+pub const RUNTIME_AUTHORITY_TERMINAL_RECOVERY_SUITE: &str = "runtime-authority-terminal-recovery";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1555,6 +1559,10 @@ pub fn capability() -> TargetCapability {
                     STARTUP_RECONCILIATION_WAKE_SUITE,
                 ],
             },
+            TargetProfileCapability {
+                profile: RUNTIME_AUTHORITY_PROFILE,
+                suites: vec![RUNTIME_AUTHORITY_TERMINAL_RECOVERY_SUITE],
+            },
         ],
     }
 }
@@ -1624,6 +1632,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, STARTUP_RECONCILIATION_WAKE_SUITE) => {
             evaluate_startup_reconciliation_wake(&request.vector)?
+        }
+        (RUNTIME_AUTHORITY_PROFILE, RUNTIME_AUTHORITY_TERMINAL_RECOVERY_SUITE) => {
+            runtime_authority_terminal_recovery::evaluate(&request.vector)?
         }
         _ => return Err("conformance suite is unsupported"),
     };

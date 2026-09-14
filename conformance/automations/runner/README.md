@@ -19,6 +19,48 @@ trusted authentication and a release policy.
 
 ## Run
 
+To build and audit every checked-in native suite from one clean, committed
+checkout, use Node.js 24 and the repository's Rust build prerequisites:
+
+```sh
+node conformance/automations/runner/audit.mjs \
+  --output /tmp/coven-automations-audit
+```
+
+Choose a new output directory outside the checkout. The audit retains the
+source-bound protocol bundle, generated job, result, build provenance, and tested
+binary. It builds the binary
+with locked dependencies rather than assigning the current Git revision to an
+unrelated installed executable. Compilation, protocol packaging, vectors, and
+the independent runner all come from a private checkout of the pinned commit.
+Editing and restoring your working files during a build cannot replace those
+inputs. The reviewed `inventory.json`, not the target's
+capability response, selects the required suites. Missing or non-passing suites
+fail the audit. Linux CI runs this command and retains its evidence.
+
+The clean-source guard also rejects ignored files. Keep build outputs outside
+your audited checkout: set `CARGO_TARGET_DIR` to an external cache directory
+before building or testing there. The audit treats it as a cache root and uses
+a dedicated namespace for the canonical checkout and exact source commit;
+it never trusts unscoped build artifacts from another checkout or revision.
+The first audit of each source identity therefore requires a cold build.
+Without that variable, the audit uses temporary private build storage.
+Some workspace tests retain ignored fixture
+evidence inside the checkout even with an external build cache, so CI audits
+before running those tests. Locally, use a fresh task worktree rather than
+deleting unrelated local files to satisfy the guard.
+
+The process watchdog is an audit hang guard, not a runtime SLO. It allows for
+host startup of each freshly staged executable; it does not change Coven's
+daemon deadlines or certify dispatch latency.
+
+This is debug-build, native-source audit evidence, not a packed npm release,
+production Runtime Authority activation, or full-profile certification. The
+[readiness map](../../../docs/roadmaps/coven-automations-readiness.md) lists the
+remaining gates.
+
+To audit a separately prepared, explicitly bound job:
+
 ```sh
 node conformance/automations/runner/conformance.mjs \
   --job /absolute/path/to/audit-job.json \
@@ -135,6 +177,7 @@ The checked-in
 [`overlap-forbid-claiming.vectors.json`](overlap-forbid-claiming.vectors.json),
 [`retry-backoff-timing.vectors.json`](retry-backoff-timing.vectors.json),
 [`retry-quarantine-recovery.vectors.json`](retry-quarantine-recovery.vectors.json),
+[`runtime-authority-terminal-recovery.vectors.json`](runtime-authority-terminal-recovery.vectors.json),
 [`scheduler-leadership-fencing.vectors.json`](scheduler-leadership-fencing.vectors.json),
 [`startup-reconciliation-wake.vectors.json`](startup-reconciliation-wake.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
@@ -180,6 +223,10 @@ The runner invokes the target directly without a shell.
         "scheduler-leadership-fencing",
         "startup-reconciliation-wake"
       ]
+    },
+    {
+      "profile": "runtime_authority",
+      "suites": ["runtime-authority-terminal-recovery"]
     }
   ]
 }
@@ -191,8 +238,8 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements ten structural suites and nine
-scheduler-reliability suites.
+The native Coven target currently implements ten structural suites, nine
+scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
@@ -264,6 +311,16 @@ accepted definition revision wakes the sleeping scheduler for an immediate
 pass rather than waiting for the periodic deadline. The definition-change
 case binds its mutation timestamp in the vector, so evaluation is independent
 of the target host's wall clock.
+`runtime-authority-terminal-recovery` covers five terminal observations:
+completed with exit zero, failed with a nonzero exit, confirmed cancellation,
+confirmed timeout, and idle with unknown exit. It starts from a fixed,
+correlated post-launch fixture persisted through the production store APIs,
+then invokes production reconciliation, confirmed-stop settlement, and scheduler
+dispatch probes. Repeated passes and store reopen must preserve recovery hold
+and unresolved run/attempt state, without fabricating receipts, sidecars, or
+receipt events, or creating automatic retries or duplicate launches. This
+fixture does not exercise an actual authority launch, harness process, trusted
+authentication adapter, or evidence consumer.
 `occurrence-fence-uniqueness` executes a portable three-case matrix against the
 production SQLite occurrence schema, proving that one automation cannot claim
 the same scheduled slot twice while different automations may share a slot and

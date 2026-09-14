@@ -24,7 +24,9 @@ const SUITE_RESULT_SCHEMA_VERSION =
   "coven.automations.conformance-suite-result.v1";
 const CONTRACT_PROFILE = "coven.automations.v1";
 const TARGET_SCRATCH_ENV = "COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH";
-const DEFAULT_TARGET_TIMEOUT_MS = 2_000;
+// Bounded audit hang guard, including fresh-executable startup on a busy host.
+// This is not a daemon/runtime SLO and does not change any product deadline.
+const DEFAULT_TARGET_HANG_GUARD_MS = 10_000;
 // Two cases may each use a 5-second synchronization guard, and a failed
 // shutdown gets one separate 5-second cleanup window.
 const STARTUP_WAKE_TARGET_TIMEOUT_MS = 20_000;
@@ -271,7 +273,7 @@ function validateJob(job) {
   }
 }
 
-function canonicalize(value) {
+export function canonicalize(value) {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
   }
@@ -333,7 +335,7 @@ function isPortableJcsValue(value) {
   return true;
 }
 
-function digestCanonical(value) {
+export function digestCanonical(value) {
   return {
     algorithm: "sha256",
     canonicalization: "jcs-rfc8785",
@@ -341,7 +343,7 @@ function digestCanonical(value) {
   };
 }
 
-function digestBytes(value) {
+export function digestBytes(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
@@ -406,7 +408,7 @@ async function invokeTarget(subject, operation, input) {
         : operation === "evaluate" &&
             input?.suiteId === "cancellation-timeout-arbitration"
           ? CANCELLATION_ARBITRATION_TARGET_TIMEOUT_MS
-        : DEFAULT_TARGET_TIMEOUT_MS;
+        : DEFAULT_TARGET_HANG_GUARD_MS;
     return await new Promise((resolve) => {
       const child = spawn(
         target,
@@ -760,4 +762,11 @@ async function main() {
   }
 }
 
-await main();
+const entryPath = process.argv[1] === undefined ? undefined :
+  await realpath(process.argv[1]).catch((error) => {
+    if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+    return undefined;
+  });
+if (entryPath === RUNNER_PATH) {
+  await main();
+}

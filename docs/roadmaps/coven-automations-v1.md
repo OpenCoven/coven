@@ -12,6 +12,11 @@ description: "Delivery roadmap for Coven Automations v1: tracker roles, ownershi
 
 _Last synchronized: 2026-09-03T06:09:12Z (see the sync metadata block below)_
 
+For current source-level implementation gaps and the executable audit path,
+read [Native Automations readiness](coven-automations-readiness.md).
+The generated tracker dispositions below are the dated synchronization
+snapshot, not a claim that closed profile issues completed native v1 readiness.
+
 > [!WARNING]
 > **Generated content.** The mapping table in the marked block below is generated from
 > `docs/roadmaps/coven-automations-v1.mapping.json` by

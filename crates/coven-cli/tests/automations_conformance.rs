@@ -51,6 +51,9 @@ const RRULE_VOCABULARY_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/rrule-vocabulary.vectors.json");
 const RUN_TERMINAL_MONOTONICITY_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/run-terminal-monotonicity.vectors.json");
+const RUNTIME_AUTHORITY_TERMINAL_RECOVERY_VECTORS: &str = include_str!(
+    "../../../conformance/automations/runner/runtime-authority-terminal-recovery.vectors.json"
+);
 const MAX_CONFORMANCE_REQUEST_BYTES: usize = 1024 * 1024;
 
 fn coven_bin() -> PathBuf {
@@ -151,11 +154,62 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "scheduler-leadership-fencing",
                         "startup-reconciliation-wake"
                     ]
+                },
+                {
+                    "profile": "runtime_authority",
+                    "suites": ["runtime-authority-terminal-recovery"]
                 }
             ]
         })
     );
     assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_runtime_authority_terminal_recovery_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let mut request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "runtime_authority",
+        "suiteId": "runtime-authority-terminal-recovery",
+        "protocolArtifact": {},
+        "subjectArtifact": {},
+        "vector": serde_json::from_str::<Value>(RUNTIME_AUTHORITY_TERMINAL_RECOVERY_VECTORS)?
+    });
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "runtime-authority-terminal-recovery");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 5);
+    assert_eq!(response["evidence"]["passedCases"], 5);
+    assert_eq!(response["evidence"].as_object().unwrap().len(), 3);
+    assert!(!coven_home.exists());
+    assert_eq!(std::fs::read_dir(temp_dir.path())?.count(), 0);
+
+    request["vector"]["cases"][0]["expected"]["baseReceiptRows"] = json!(1);
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+    assert!(output.status.success());
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["status"], "failed");
+    assert!(response.get("evidence").is_none());
+    assert_eq!(std::fs::read_dir(temp_dir.path())?.count(), 0);
+
+    request["vector"]["cases"][0]["unexpected"] = json!("must-not-appear-in-errors");
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "Error: conformance vector is invalid\n"
+    );
+    assert_eq!(std::fs::read_dir(temp_dir.path())?.count(), 0);
     Ok(())
 }
 

@@ -154,6 +154,45 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", CI_TEXT)
 
+    def test_linux_automation_audit_runs_and_retains_exact_source_evidence(self) -> None:
+        linux = ci_job_block("rust-test-linux")
+        command = "node conformance/automations/runner/audit.mjs"
+        self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", linux)
+        self.assertIn(
+            'echo "CARGO_TARGET_DIR=${{ runner.temp }}/coven-target" >> "$GITHUB_ENV"',
+            linux,
+        )
+        self.assertIn("            ${{ runner.temp }}/coven-target", linux)
+        self.assertNotIn("            target\n", linux)
+        self.assertLess(
+            linux.index("CARGO_TARGET_DIR="),
+            linux.index("- uses: actions/cache@"),
+        )
+        self.assertIn(command, linux)
+        self.assertLess(
+            linux.index(command),
+            linux.index("cargo test --workspace --locked"),
+        )
+        self.assertIn('--output "$AUTOMATIONS_AUDIT_DIR"', linux)
+        self.assertIn(
+            "AUTOMATIONS_AUDIT_DIR: ${{ runner.temp }}/automations-audit",
+            linux,
+        )
+        self.assertIn("name: Upload native Automations audit", linux)
+        upload = linux.split("- name: Upload native Automations audit\n", 1)[1]
+        self.assertIn("if: ${{ always() }}", upload)
+        self.assertIn(
+            "name: automations-audit-linux-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            upload,
+        )
+        self.assertIn("path: ${{ runner.temp }}/automations-audit", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        self.assertNotIn("continue-on-error:", linux)
+        self.assertIn(
+            "conformance/automations/runner/audit.test.mjs",
+            ci_job_block("policy-guard"),
+        )
+
     def test_all_platforms_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
         command = (
             "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock "
