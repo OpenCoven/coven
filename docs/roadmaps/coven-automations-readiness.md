@@ -89,10 +89,11 @@ Do not count that broader coverage as an independently certified profile until
 the corresponding exact-artifact evidence is included.
 
 Platform investigations #1047, #1050, and #1051 remain separate release-evidence
-risks; later green CI does not establish their cause or resolution. #1053
-records a local parallel setup-test failure that passed unchanged in serial.
-Keep those observations visible rather than loosening deadlines or privacy
-guards to make a readiness run pass.
+risks; later green CI does not establish their cause or resolution. #1053 was
+resolved by #1057, which separates positive-process hang guards from the
+unchanged deadline contracts and proves the hostile output was actually
+observed. Keep unresolved observations visible rather than loosening product
+deadlines or privacy guards to make a readiness run pass.
 
 #1055 separately records an inherited `COVEN_MAINTENANCE_PARTICIPANT` entering
 a different disposable test repository. Its maintenance guard correctly refuses
