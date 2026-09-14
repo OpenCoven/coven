@@ -113,7 +113,7 @@ jobs:
       - run: python3 scripts/check-ci-workflow-test.py
       - run: python3 scripts/install-native-link-dependencies-test.py
       - run: node --test scripts/package-github-release-test.mjs
-      - run: node --test scripts/package-automations-protocol.test.mjs
+      - run: node --test scripts/package-automations-protocol.test.mjs scripts/script-entrypoint.test.mjs
       - run: node --test scripts/package-automations-authority-profile.test.mjs
       - run: node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs
       - run: node --test scripts/release-stress-test.mjs
