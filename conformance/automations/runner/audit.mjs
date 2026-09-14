@@ -92,6 +92,18 @@ function assertCleanSource(commit, repoRoot = ROOT) {
   );
 }
 
+function sourceRepository() {
+  const origin = git(["config", "--get", "remote.origin.url"], ROOT, {
+    failure: "source origin must be configured as a credential-free GitHub remote",
+  }).trim();
+  const match = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9_.-]{1,104})\/?$/i.exec(origin);
+  requireAudit(match !== null, "source origin must be a credential-free GitHub HTTPS or SSH remote");
+  const repository = match[2].replace(/\.git$/i, "");
+  requireAudit(repository.length > 0 && repository.length <= 100 &&
+    repository !== "." && repository !== "..", "source origin repository is invalid");
+  return `https://github.com/${match[1]}/${repository}`;
+}
+
 function snapshotSource(root, commit, directory) {
   const sourceRoot = path.join(directory, "checkout");
   const options = {
@@ -369,6 +381,7 @@ export function runAudit({ outputDir }) {
   const commit = git(["rev-parse", "HEAD"]).trim();
   requireAudit(/^[0-9a-f]{40}$/.test(commit), "source HEAD is not a supported Git commit");
   assertCleanSource(commit);
+  const repository = sourceRepository();
   // Fail input preflight before reserving output; the job uses snapshot vectors.
   loadInventory();
   const borrowedTarget = process.env.CARGO_TARGET_DIR
@@ -422,7 +435,7 @@ export function runAudit({ outputDir }) {
       schemaVersion: "coven.automations.conformance-job.v1",
       resultId: `native-audit-${commit}`,
       decisionScope: { kind: "audit_only" },
-      source: { repository: "https://github.com/OpenCoven/coven", commit },
+      source: { repository, commit },
       protocolArtifact: { bundleSchemaVersion: "coven.automations.bundle.v1", ...verified },
       runner: {
         name: "coven-automations-conformance-runner",
@@ -447,6 +460,8 @@ export function runAudit({ outputDir }) {
       schemaVersion: "coven.automations.audit-provenance.v1",
       decisionScope: job.decisionScope,
       source: job.source,
+      sourceRepositoryInput: "origin_configuration",
+      remoteCommitVerified: false,
       sourceTree: git(["rev-parse", "HEAD^{tree}"], sourceRoot).trim(),
       cargoLockSha256: digestBytes(readFileSync(path.join(sourceRoot, "Cargo.lock"))),
       auditSha256: digestBytes(readFileSync(path.join(sourceRunnerDir, "audit.mjs"))),
@@ -458,6 +473,10 @@ export function runAudit({ outputDir }) {
         command: ["cargo", ...BUILD_ARGS], profile: "debug", locked: true,
         versionStamp: `audit-${commit}`, commitStamp: commit,
         sourceInput: "private_pinned_git_checkout",
+        trust: "caller_environment",
+        hermetic: false,
+        toolchainAttested: false,
+        reproducibility: "not_assessed",
       },
       protocolArtifact: job.protocolArtifact,
       runner: job.runner,

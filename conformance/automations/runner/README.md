@@ -31,12 +31,31 @@ Choose a new output directory outside the checkout. The audit retains the
 source-bound protocol bundle, generated job, result, build provenance, and tested
 binary. It builds the binary
 with locked dependencies rather than assigning the current Git revision to an
-unrelated installed executable. Compilation, protocol packaging, vectors, and
+unrelated installed executable. Repository inputs to compilation, protocol packaging, vectors, and
 the independent runner all come from a private checkout of the pinned commit.
 Editing and restoring your working files during a build cannot replace those
 inputs. The reviewed `inventory.json`, not the target's
 capability response, selects the required suites. Missing or non-passing suites
 fail the audit. Linux CI runs this command and retains its evidence.
+
+Source repository metadata comes from the checkout's configured `origin`,
+normalized to a credential-free GitHub HTTPS URL. GitHub HTTPS, scp-style SSH
+and `ssh://git@github.com/` origins are supported, including forks; missing,
+local-path, credential-bearing or unsupported origins fail before building.
+This local audit does not contact GitHub or prove the commit belongs to the
+remote. Provenance records `sourceRepositoryInput: origin_configuration` and
+`remoteCommitVerified: false`; unpublished local commits remain auditable.
+
+The host build environment is a **caller trust assumption**, not an audited
+toolchain. Cargo, rustc, wrappers, flags, Rustup selection, Cargo-home
+configuration and external dependency/tool inputs are neither isolated nor
+fingerprinted. Provenance explicitly records `hermetic: false`,
+`toolchainAttested: false` and `reproducibility: not_assessed`; it does not echo
+potentially sensitive environment values. The command is repeatable, but it
+does not establish bit-for-bit reproducibility or compiler-origin attestation.
+The private snapshot fixes repository inputs, and artifact digests identify
+the bytes tested. Neither makes an untrusted host/toolchain trustworthy.
+Trusted build and release attestation remains a separate #805 gate.
 
 The clean-source guard also rejects ignored files. Keep build outputs outside
 your audited checkout: set `CARGO_TARGET_DIR` to an external cache directory
@@ -54,7 +73,7 @@ The process watchdog is an audit hang guard, not a runtime SLO. It allows for
 host startup of each freshly staged executable; it does not change Coven's
 daemon deadlines or certify dispatch latency.
 
-This is debug-build, native-source audit evidence, not a packed npm release,
+This is debug-build, source-snapshot audit evidence, not a packed npm release,
 production Runtime Authority activation, or full-profile certification. The
 [readiness map](../../../docs/roadmaps/coven-automations-readiness.md) lists the
 remaining gates.

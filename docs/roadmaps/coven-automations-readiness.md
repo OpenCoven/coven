@@ -17,8 +17,11 @@ Choose an unused output directory outside the checkout. The command builds the
 native target with locked dependencies, packages the source-bound protocol,
 and runs the reviewed suite inventory through the independent audit runner.
 It retains the job, result, and protocol artifacts without changing tracked
-files. Build and audit inputs come from one private checkout of the pinned
-commit, not mutable working files. A missing suite cannot silently disappear because the target stops
+files. Repository build and audit inputs come from one private checkout of the
+pinned commit, not mutable working files. The host toolchain/configuration is
+caller-trusted, not isolated or attested; byte-for-byte build reproducibility
+is not assessed. Source repository metadata is derived from configured GitHub
+`origin`, not proof of remote commit membership. A missing suite cannot silently disappear because the target stops
 advertising it. See the [audit runner contract](../../conformance/automations/runner/README.md)
 for the artifact and platform limits.
 
@@ -50,12 +53,14 @@ owns the distinction between authorization, execution, and verification.
 
 ## Progress added by this revision
 
-- A reproducible native audit runs every suite in the checked-in inventory,
+- A repeatable native audit runs every suite in the checked-in inventory,
   binds the result to source/protocol/runner/vector/binary digests, and retains
   machine-readable evidence. Linux PR CI runs it as a required Rust-job step
   and uploads the evidence, including non-passing results. Source-isolated
   build caches, native binary architecture, provenance integrity, and actual
-  symlink entrypoint execution are part of the audit boundary.
+  symlink entrypoint execution are part of the audit boundary. Toolchain trust
+  and remote membership are explicitly unverified, not implied by those
+  digests; trusted release/build attestation remains under #805.
 - The `runtime-authority-terminal-recovery` suite makes the existing
   fail-closed reconciliation boundary independently executable in five
   terminal-observation cases, with repeated settlement and store reopen. It

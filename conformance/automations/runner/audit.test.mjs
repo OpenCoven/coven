@@ -121,6 +121,7 @@ function fixture(t, {
   subjectPlatform = { os: process.platform, arch: process.arch },
   subjectTransform = (bytes) => bytes,
   nativeCompilerProbe = false,
+  origin = "https://github.com/OpenCoven/coven.git",
 } = {}) {
   const directory = realpathSync(mkdtempSync(path.join(tmpdir(), "coven-audit-test-")));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -161,6 +162,7 @@ function fixture(t, {
   git(repo, ["init", "--quiet"]);
   git(repo, ["config", "user.name", "Audit Test"]);
   git(repo, ["config", "user.email", "audit-test@users.noreply.github.com"]);
+  if (origin !== null) git(repo, ["remote", "add", "origin", origin]);
   const head = commit(repo);
   const tools = path.join(directory, "tools");
   const cache = path.join(directory, "cache");
@@ -367,7 +369,7 @@ test("runner digest imports are safe and preserve the canonicalization implement
   assert.equal(result.stdout, '{"a":0,"z":[1,{"a":"test","b":2}]}\n');
 });
 
-test("CLI packages, builds, binds and retains reproducible all-suite audit artifacts", (t) => {
+test("CLI packages, builds, binds and retains repeatable all-suite audit artifacts", (t) => {
   const f = fixture(t);
   const first = run(f);
   assert.equal(first.status, 0, first.diagnostics);
@@ -403,10 +405,16 @@ test("CLI packages, builds, binds and retains reproducible all-suite audit artif
   assert.equal(provenance.inventorySha256, digestBytes(readFileSync(path.join(f.runnerDir, "inventory.json"))));
   assert.equal(provenance.auditSha256, digestBytes(readFileSync(path.join(f.runnerDir, "audit.mjs"))));
   assert.equal(provenance.packagerSha256, digestBytes(readFileSync(path.join(f.repo, "scripts/package-automations-protocol.mjs"))));
+  assert.equal(provenance.sourceRepositoryInput, "origin_configuration");
+  assert.equal(provenance.remoteCommitVerified, false);
   assert.deepEqual(provenance.build, {
     command: ["cargo", ...BUILD_ARGS], profile: "debug", locked: true,
     versionStamp: `audit-${f.head}`, commitStamp: f.head,
     sourceInput: "private_pinned_git_checkout",
+    trust: "caller_environment",
+    hermetic: false,
+    toolchainAttested: false,
+    reproducibility: "not_assessed",
   });
   assert.deepEqual(provenance.subjectArtifact, job.subjectArtifact);
   assert.equal(provenance.sourceTree, git(f.repo, ["rev-parse", "HEAD^{tree}"]));
@@ -425,6 +433,60 @@ test("CLI packages, builds, binds and retains reproducible all-suite audit artif
   assert.ok(existsSync(path.join(borrowedTarget, "debug/coven")), "borrowed cache must survive");
   assert.ok(!existsSync(readFileSync(path.join(f.directory, "build-target"), "utf8")),
     "privately created build cache must be removed");
+});
+
+test("audit attributes fork source to its configured GitHub origin, not Coven upstream", (t) => {
+  for (const origin of [
+    "https://github.com/AuditFork/coven.git",
+    "git@github.com:AuditFork/coven.git",
+    "ssh://git@github.com/AuditFork/coven.git",
+  ]) {
+    const f = fixture(t, { origin });
+    const result = run(f);
+    assert.equal(result.status, 0, result.diagnostics);
+    const report = JSON.parse(result.stdout);
+    assert.deepEqual(report.statement.source, {
+      repository: "https://github.com/AuditFork/coven",
+      commit: f.head,
+    });
+    const provenance = json(path.join(result.outputDir, "provenance.json"));
+    assert.deepEqual(provenance.source, report.statement.source);
+    assert.equal(provenance.sourceRepositoryInput, "origin_configuration");
+    assert.equal(provenance.remoteCommitVerified, false);
+  }
+});
+
+test("missing, private or credential-bearing origins refuse before building without echoing input", (t) => {
+  for (const origin of [
+    null,
+    `/private/${MARKER}`,
+    `https://user:${MARKER}@github.com/AuditFork/coven`,
+    `https://github.com/AuditFork/coven?token=${MARKER}`,
+    "https://github.com/AuditFork/..",
+  ]) {
+    const f = fixture(t, { origin });
+    const result = run(f);
+    assert.equal(result.status, 2, result.diagnostics);
+    assert.match(result.stderr, /source origin/);
+    assert.equal(result.stdout, "");
+    assert.ok(!existsSync(result.outputDir));
+    assert.ok(!existsSync(path.join(f.directory, "build-invoked")));
+  }
+});
+
+test("caller build overrides are not echoed or represented as an attested toolchain", (t) => {
+  const f = fixture(t);
+  const result = run(f, { env: {
+    RUSTC_WRAPPER: `/private/${MARKER}`,
+    RUSTFLAGS: `--cfg ${MARKER}`,
+  } });
+  assert.equal(result.status, 0, result.diagnostics);
+  const provenance = json(path.join(result.outputDir, "provenance.json"));
+  assert.equal(provenance.build.trust, "caller_environment");
+  assert.equal(provenance.build.hermetic, false);
+  assert.equal(provenance.build.toolchainAttested, false);
+  assert.equal(provenance.build.reproducibility, "not_assessed");
+  assert.ok(!JSON.stringify(provenance).includes(MARKER));
 });
 
 test("shared Cargo cache is source-isolated and never consumes unscoped workspace artifacts", (t) => {
