@@ -22,6 +22,9 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from './script-entrypoint.mjs';
+
+export { isMainModule };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -62,10 +65,6 @@ const STRIP_ENV_EXACT = [
   'USERPROFILE',
   'XDG_CONFIG_HOME'
 ];
-
-export function isMainModule(importMetaUrl) {
-  return Boolean(process.argv[1]) && path.resolve(fileURLToPath(importMetaUrl)) === path.resolve(process.argv[1]);
-}
 
 export function fail(message) {
   throw new Error(message);
