@@ -513,8 +513,11 @@ pub fn initialize_store(path: &Path) -> Result<()> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum StoreInitializationPhase {
+    ConnectionOpened,
     ConnectionConfigured,
+    WardClassified,
     WardComplete,
+    RuntimeFailureClassComplete,
     RuntimeComplete,
     MainLockAcquired,
     MainSchemaComplete,

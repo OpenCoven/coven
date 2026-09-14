@@ -73,8 +73,12 @@ pub(super) fn apply_ward_audit_schema_state(conn: &Connection, schema_state: &st
     }
 }
 
-fn ensure_ward_audit_schema(conn: &Connection) -> Result<()> {
+fn ensure_ward_audit_schema(
+    conn: &Connection,
+    observe: &mut impl FnMut(StoreInitializationPhase),
+) -> Result<()> {
     let schema_state = load_ward_audit_schema_state(conn)?;
+    observe(StoreInitializationPhase::WardClassified);
     apply_ward_audit_schema_state(conn, &schema_state)
 }
 
@@ -92,14 +96,16 @@ pub(super) fn initialize_store_connection(
 
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
+    observe(StoreInitializationPhase::ConnectionOpened);
     configure_initializing_connection(&conn)?;
     observe(StoreInitializationPhase::ConnectionConfigured);
     // Table-rebuild migrators own their transactions so they can change SQLite
     // foreign-key mode safely and roll back atomically. Run them before the
     // transaction for the remaining idempotent schema work.
-    ensure_ward_audit_schema(&conn)?;
+    ensure_ward_audit_schema(&conn, &mut observe)?;
     observe(StoreInitializationPhase::WardComplete);
     crate::automations::runs::ensure_runtime_authority_unsupported_failure_class(&conn)?;
+    observe(StoreInitializationPhase::RuntimeFailureClassComplete);
     crate::automations::runtime_terminal_evidence::ensure_runtime_terminal_evidence_schema(&conn)?;
     observe(StoreInitializationPhase::RuntimeComplete);
     conn.execute_batch("BEGIN IMMEDIATE")
