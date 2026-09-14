@@ -9860,7 +9860,12 @@ fn decide_threads_proposal_automatic(
     decision: &str,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
-    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, false, false, None)
+    use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
+    checkpoint(Phase::SchedulerDecisionBegin);
+    let response =
+        decide_threads_proposal_inner(coven_home, proposal_id, decision, body, false, false, None);
+    checkpoint(Phase::SchedulerDecisionReturned);
+    response
 }
 
 fn expire_threads_proposal(coven_home: &Path, proposal_id: &str) -> Result<ApiResponse> {
@@ -12916,6 +12921,8 @@ fn pending_document_protected_targets(
 /// Process one deterministic round-robin batch. The persistent filename cursor
 /// prevents a prefix of human-only proposals from starving later due work.
 pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> {
+    use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
+    checkpoint(Phase::SchedulerPassLockWait);
     #[cfg(feature = "threads-test-clock")]
     if crate::threads_clock::fixture_mode_enabled(coven_home)? {
         crate::daemon::append_daemon_recovery_log(
@@ -12926,13 +12933,18 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
     let _pass_guard = threads_scheduler_pass_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("threads proposal scheduler lock is poisoned"))?;
+    checkpoint(Phase::SchedulerPassLockAcquired);
     let deferred = {
+        checkpoint(Phase::SchedulerAuditLockWait);
         let _audit_guard = ward_write_audit_lock()
             .lock()
             .map_err(|_| anyhow::anyhow!("Ward write/audit lock is poisoned"))?;
+        checkpoint(Phase::SchedulerAuditLockAcquired);
         reconcile_scheduled_submission_reservations(coven_home)?
     };
+    checkpoint(Phase::SchedulerReconcileReady);
     let candidates = scheduler_candidate_batch(coven_home)?;
+    checkpoint(Phase::SchedulerCandidatesReady);
     let last_cursor = candidates.last().map(|(name, _)| name.clone());
     let mut completed = 0;
     let now = crate::threads_clock::now(coven_home)?;
@@ -12965,11 +12977,13 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             continue;
         }
 
+        checkpoint(Phase::SchedulerAuditLockWait);
         let mut proposal_guard = Some(
             ward_write_audit_lock()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Ward write/audit lock is poisoned"))?,
         );
+        checkpoint(Phase::SchedulerAuditLockAcquired);
         let document = match read_pending_proposal_document(&path) {
             Ok(document) => document,
             Err(error) => {
@@ -12980,7 +12994,9 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
         if deferred.proposal_ids.contains(&document.pending().id.0) {
             continue;
         }
+        checkpoint(Phase::SchedulerDocumentReady);
         let conn = store::open_store(&store_path(coven_home))?;
+        checkpoint(Phase::SchedulerStoreReady);
         let mut rejection_only = false;
         if document.scheduled().is_some()
             || PendingReviewKind::from_stored_value(document.review_kind.as_deref()).is_some()
@@ -13018,11 +13034,14 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                 }
             }
         }
+        checkpoint(Phase::SchedulerValidationReady);
         let mut opened_window =
             proposal_window_opened(&conn, &document.pending().id.0.to_string())?;
         let retention_expired =
             !rejection_only && proposal_retention_expired(coven_home, &conn, &document, now)?;
+        checkpoint(Phase::SchedulerStoreCloseBegin);
         drop(conn);
+        checkpoint(Phase::SchedulerStoreCloseReady);
         if document
             .scheduled()
             .is_some_and(|proposal| proposal.veto_deadline().is_some())
@@ -13255,8 +13274,11 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
         }
     }
     if let Some(cursor) = last_cursor {
+        checkpoint(Phase::SchedulerCursorBegin);
         write_scheduler_cursor(coven_home, &cursor)?;
+        checkpoint(Phase::SchedulerCursorReady);
     }
+    checkpoint(Phase::SchedulerPassReady);
     Ok(completed)
 }
 
@@ -17087,6 +17109,7 @@ fn deterministic_threads_tick_response(
     coven_home: &Path,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
+    use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
     let request: DeterministicThreadsTickRequest =
         match serde_json::from_str(body.unwrap_or_default()) {
             Ok(request) => request,
@@ -17108,11 +17131,14 @@ fn deterministic_threads_tick_response(
             None,
         );
     }
+    checkpoint(Phase::TickLockWait);
     let _clock_guard = crate::threads_clock::fixture_control_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("deterministic Threads clock lock is poisoned"))?;
+    checkpoint(Phase::TickLockAcquired);
     match crate::threads_clock::authorize_fixture(coven_home, &request.capability) {
         Ok(snapshot) => {
+            checkpoint(Phase::TickAuthorized);
             let worker_results = if workers == 2 {
                 std::thread::scope(|scope| -> Result<Vec<usize>> {
                     let first = scope.spawn(|| process_due_threads_proposals(coven_home));
@@ -17131,6 +17157,7 @@ fn deterministic_threads_tick_response(
             } else {
                 vec![process_due_threads_proposals(coven_home)?]
             };
+            checkpoint(Phase::TickWorkersReady);
             let mut body = json!({
                 "ok": true,
                 "processed": worker_results.iter().sum::<usize>(),

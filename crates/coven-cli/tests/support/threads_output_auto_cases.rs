@@ -129,11 +129,24 @@ fn output_auto_submission_records_bounded_request_phases() -> Result<()> {
             }
             for phase in [
                 "request-begin", "body-read", "intake", "lock-wait", "lock-acquired",
-                "store-open", "store-ready", "reservation-begin", "reservation-ready",
+                "store-open", "store-ready", "reservation-begin",
+                "reservation-size-begin", "reservation-size-ready",
+                "reservation-identity-begin", "reservation-identity-ready",
+                "reservation-active-check-ready",
+                "reservation-passive-begin", "reservation-passive-ready",
+                "reservation-wal-check-ready",
+                "reservation-lock-wait", "reservation-lock-acquired",
+                "reservation-ledger-ready",
+                "reservation-commit-begin", "reservation-commit-ready",
+                "reservation-activation-ready", "reservation-ready",
                 "gate-ready", "identity-begin", "identity-ready", "probes-begin",
                 "probes-ready", "submission-binding-begin", "submission-binding-ready",
                 "stage-begin", "stage-ready", "receipt-begin", "receipt-ready",
-                "finalize-begin", "finalize-ready", "handler-returned", "response-begin",
+                "finalize-begin",
+                "reservation-release-lock-wait", "reservation-release-lock-acquired",
+                "reservation-release-delete-ready", "reservation-release-commit-ready",
+                "reservation-release-active-ready", "reservation-release-passive-ready",
+                "finalize-ready", "handler-returned", "response-begin",
             ] {
                 anyhow::ensure!(phases.first() == Some(&phase), "missing/out-of-order {phase}: {phases:?}");
                 phases.remove(0);
