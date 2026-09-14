@@ -246,7 +246,8 @@ fn request_retaining_connection_bound(
     // read phase was bounded, so a daemon that accepted a connection but
     // never read from it (or a socket whose listen backlog was full) could
     // block the caller indefinitely.
-    let deadline = Instant::now().checked_add(options.timeout).ok_or_else(|| {
+    let started = Instant::now();
+    let deadline = started.checked_add(options.timeout).ok_or_else(|| {
         ClientError::InvalidHttpResponse("request deadline overflowed".to_owned())
     })?;
     let body = body.unwrap_or_default();
@@ -275,7 +276,13 @@ fn request_retaining_connection_bound(
             source,
         })?;
 
-    let framed = read_framed_response(&mut stream, deadline, options.max_response_body_bytes)?;
+    let framed = read_framed_response(
+        &mut stream,
+        started,
+        deadline,
+        response_request_kind(method, path),
+        options.max_response_body_bytes,
+    )?;
     Ok(AuthenticatedUnixResponse {
         response: framed.response,
         peer_identity,
@@ -765,11 +772,85 @@ fn connected_peer_credentials(_stream: &UnixStream) -> std::io::Result<UnixPeerC
     ))
 }
 
+struct ResponseReadDeadline {
+    started: Instant,
+    read_started: Instant,
+    deadline: Instant,
+    request_kind: &'static str,
+}
+
+fn response_request_kind(method: &str, path: &str) -> &'static str {
+    match (method, path) {
+        ("GET", "/health") => "lifecycle-health",
+        ("GET", "/api/v1/health") => "api-health",
+        _ => "request",
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResponseReadProgress {
+    phase: &'static str,
+    received_bytes: usize,
+    expected_body_bytes: Option<usize>,
+}
+
+impl ResponseReadDeadline {
+    fn remaining(
+        &self,
+        now: Instant,
+        progress: ResponseReadProgress,
+    ) -> Result<Duration, ClientError> {
+        read_timeout_until(self.deadline, now).map_err(|_| {
+            // Counts and monotonic durations only: never include wire bytes,
+            // routes, profile paths, or peer identity in timeout diagnostics.
+            ClientError::InvalidHttpResponse(format!(
+                "timed out reading Coven daemon response (request_kind={}; phase={}; received_bytes={}; \
+                 expected_body_bytes={:?}; request_budget_us={}; request_elapsed_us={}; \
+                 read_elapsed_us={}; deadline_overrun_us={})",
+                self.request_kind,
+                progress.phase,
+                progress.received_bytes,
+                progress.expected_body_bytes,
+                self.deadline.saturating_duration_since(self.started).as_micros(),
+                now.saturating_duration_since(self.started).as_micros(),
+                now.saturating_duration_since(self.read_started).as_micros(),
+                now.saturating_duration_since(self.deadline).as_micros(),
+            ))
+        })
+    }
+}
+
 fn read_framed_response<R: Read>(
     stream: &mut R,
+    started: Instant,
     deadline: Instant,
+    request_kind: &'static str,
     max_response_body_bytes: usize,
 ) -> Result<FramedResponse, ClientError> {
+    read_framed_response_with_clock(
+        stream,
+        started,
+        deadline,
+        request_kind,
+        max_response_body_bytes,
+        Instant::now,
+    )
+}
+
+fn read_framed_response_with_clock<R: Read>(
+    stream: &mut R,
+    started: Instant,
+    deadline: Instant,
+    request_kind: &'static str,
+    max_response_body_bytes: usize,
+    mut now: impl FnMut() -> Instant,
+) -> Result<FramedResponse, ClientError> {
+    let timing = ResponseReadDeadline {
+        started,
+        read_started: now(),
+        deadline,
+        request_kind,
+    };
     let mut received = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 4096];
     let (status, body_start, content_length) = loop {
@@ -792,19 +873,48 @@ fn read_framed_response<R: Read>(
                 "response headers exceeded {MAX_RESPONSE_HEADERS_BYTES} bytes"
             )));
         }
-        read_with_deadline(stream, &mut chunk, deadline, &mut received)?;
+        let progress = ResponseReadProgress {
+            phase: "headers",
+            received_bytes: received.len(),
+            expected_body_bytes: None,
+        };
+        read_with_deadline(
+            stream,
+            &mut chunk,
+            &timing,
+            &mut received,
+            progress,
+            &mut now,
+        )?;
     };
 
     while received.len().saturating_sub(body_start) < content_length {
         let remaining = content_length - (received.len() - body_start);
         let read_len = remaining.saturating_add(1).min(chunk.len());
-        read_with_deadline(stream, &mut chunk[..read_len], deadline, &mut received)?;
+        let progress = ResponseReadProgress {
+            phase: "body",
+            received_bytes: received.len() - body_start,
+            expected_body_bytes: Some(content_length),
+        };
+        read_with_deadline(
+            stream,
+            &mut chunk[..read_len],
+            &timing,
+            &mut received,
+            progress,
+            &mut now,
+        )?;
     }
 
     let mut body_and_remainder = received.split_off(body_start);
     let mut buffered_remainder = body_and_remainder.split_off(content_length);
     if buffered_remainder.is_empty() {
-        if let Some(byte) = nonblocking_boundary_probe(stream, deadline)? {
+        let progress = ResponseReadProgress {
+            phase: "boundary",
+            received_bytes: content_length,
+            expected_body_bytes: Some(content_length),
+        };
+        if let Some(byte) = nonblocking_boundary_probe(stream, &timing, progress, &mut now)? {
             buffered_remainder.push(byte);
         }
     }
@@ -819,7 +929,9 @@ fn read_framed_response<R: Read>(
 
 fn nonblocking_boundary_probe<R: Read>(
     stream: &mut R,
-    deadline: Instant,
+    timing: &ResponseReadDeadline,
+    progress: ResponseReadProgress,
+    now: &mut impl FnMut() -> Instant,
 ) -> Result<Option<u8>, ClientError> {
     let mut byte = [0_u8; 1];
     loop {
@@ -835,7 +947,7 @@ fn nonblocking_boundary_probe<R: Read>(
                 return Ok(None);
             }
             Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {
-                read_timeout_until(deadline, Instant::now())?;
+                timing.remaining(now(), progress)?;
             }
             Err(source) => {
                 return Err(ClientError::Io {
@@ -850,10 +962,12 @@ fn nonblocking_boundary_probe<R: Read>(
 fn read_with_deadline<R: Read>(
     stream: &mut R,
     chunk: &mut [u8],
-    deadline: Instant,
+    timing: &ResponseReadDeadline,
     received: &mut Vec<u8>,
+    progress: ResponseReadProgress,
+    now: &mut impl FnMut() -> Instant,
 ) -> Result<(), ClientError> {
-    let timeout = read_timeout_until(deadline, Instant::now())?;
+    let timeout = timing.remaining(now(), progress)?;
     match stream.read(chunk) {
         Ok(0) => Err(ClientError::InvalidHttpResponse(
             "connection closed before response completed".to_owned(),
@@ -971,6 +1085,156 @@ mod tests {
     }
 
     #[test]
+    fn response_timeout_reports_empty_header_progress_without_reading_after_expiry() {
+        struct MustNotRead;
+        impl Read for MustNotRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("an expired deadline must not perform another read");
+            }
+        }
+
+        let error = read_framed_response(
+            &mut MustNotRead,
+            Instant::now(),
+            Instant::now(),
+            "request",
+            super::MAX_RESPONSE_BODY_BYTES,
+        )
+        .err()
+        .expect("expired response deadline");
+        let crate::ClientError::InvalidHttpResponse(message) = error else {
+            panic!("read expiry must retain its fatal response classification");
+        };
+        assert!(
+            message.contains("phase=headers; received_bytes=0"),
+            "response progress is missing: {message}"
+        );
+    }
+
+    #[test]
+    fn response_timeout_distinguishes_progress_under_the_original_request_deadline() {
+        use std::cell::Cell;
+
+        struct TimedReader<'a> {
+            response: Cursor<&'static [u8]>,
+            clock: &'a Cell<Instant>,
+            expires_at: Instant,
+            expire_after_data: bool,
+            reads: usize,
+        }
+
+        impl Read for TimedReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let read = self.response.read(buffer)?;
+                if read == 0 || self.expire_after_data {
+                    self.clock.set(self.expires_at);
+                }
+                if read == 0 {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(read)
+                }
+            }
+        }
+
+        let cases = [
+            (b"".as_slice(), "headers", 0, None, false, 1),
+            (b"private-header".as_slice(), "headers", 14, None, true, 1),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n".as_slice(),
+                "body",
+                0,
+                Some(12),
+                true,
+                1,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nsecret".as_slice(),
+                "body",
+                6,
+                Some(12),
+                true,
+                1,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecret".as_slice(),
+                "boundary",
+                6,
+                Some(6),
+                false,
+                2,
+            ),
+        ];
+        for budget in [Duration::from_millis(250), super::RESPONSE_TIMEOUT] {
+            for &(response, phase, received, expected, expire_after_data, reads) in &cases {
+                let started = Instant::now();
+                let deadline = started + budget;
+                let clock = Cell::new(started + Duration::from_millis(50));
+                let mut reader = TimedReader {
+                    response: Cursor::new(response),
+                    clock: &clock,
+                    expires_at: deadline + Duration::from_micros(17),
+                    expire_after_data,
+                    reads: 0,
+                };
+                let error = super::read_framed_response_with_clock(
+                    &mut reader,
+                    started,
+                    deadline,
+                    "lifecycle-health",
+                    super::MAX_RESPONSE_BODY_BYTES,
+                    || clock.get(),
+                )
+                .err()
+                .expect("scripted read expires at the original request deadline");
+                assert!(
+                    !error.request_was_definitely_not_sent(),
+                    "read expiry must not become permission to replay"
+                );
+                let crate::ClientError::InvalidHttpResponse(message) = error else {
+                    panic!("read expiry must retain its fatal response classification");
+                };
+                assert_eq!(
+                    message,
+                    format!(
+                        "timed out reading Coven daemon response (request_kind=lifecycle-health; phase={phase}; \
+                         received_bytes={received}; expected_body_bytes={expected:?}; \
+                         request_budget_us={}; request_elapsed_us={}; read_elapsed_us={}; \
+                         deadline_overrun_us=17)",
+                        budget.as_micros(),
+                        budget.as_micros() + 17,
+                        budget.as_micros() - 50_000 + 17,
+                    )
+                );
+                assert_eq!(reader.reads, reads, "expiry must not renew the read budget");
+                assert!(!message.contains("secret") && !message.contains("private-header"));
+                assert!(message.len() < 400, "diagnostics must remain bounded");
+            }
+        }
+    }
+
+    #[test]
+    fn response_timeout_request_kind_only_names_exact_health_routes() {
+        assert_eq!(
+            super::response_request_kind("GET", "/health"),
+            "lifecycle-health"
+        );
+        assert_eq!(
+            super::response_request_kind("GET", "/api/v1/health"),
+            "api-health"
+        );
+        for (method, path) in [
+            ("POST", "/health"),
+            ("GET", "/health?private-query"),
+            ("POST", "/api/v1/protected/private-route"),
+            ("private-method", "private-path"),
+        ] {
+            assert_eq!(super::response_request_kind(method, path), "request");
+        }
+    }
+
+    #[test]
     fn stalled_connect_receives_only_the_absolute_deadline_budget() {
         let observed = std::cell::Cell::new(None);
         let deadline = Instant::now() + Duration::from_millis(25);
@@ -1069,7 +1333,9 @@ mod tests {
 
         let framed = read_framed_response(
             &mut reader,
+            Instant::now(),
             Instant::now() + Duration::from_secs(1),
+            "request",
             super::MAX_RESPONSE_BODY_BYTES,
         )
         .expect("an interrupted read must be retried under the same deadline");
@@ -1090,7 +1356,9 @@ mod tests {
 
         let framed = read_framed_response(
             &mut reader,
+            Instant::now(),
             Instant::now() + Duration::from_secs(1),
+            "request",
             super::MAX_RESPONSE_BODY_BYTES,
         )
         .expect("read a body split across the header read and a later read");
@@ -1107,7 +1375,9 @@ mod tests {
 
         let framed = read_framed_response(
             &mut reader,
+            Instant::now(),
             Instant::now() + Duration::from_secs(1),
+            "request",
             super::MAX_RESPONSE_BODY_BYTES,
         )
         .expect("read the complete frame and buffered remainder");
@@ -1142,7 +1412,9 @@ mod tests {
 
         let framed = read_framed_response(
             &mut reader,
+            Instant::now(),
             Instant::now() + Duration::from_secs(1),
+            "request",
             super::MAX_RESPONSE_BODY_BYTES,
         )
         .expect("read framed socket response");
@@ -1172,7 +1444,9 @@ mod tests {
 
         let framed = read_framed_response(
             &mut reader,
+            Instant::now(),
             Instant::now() + Duration::from_secs(1),
+            "request",
             super::MAX_RESPONSE_BODY_BYTES,
         )
         .expect("read zero-length socket response");
