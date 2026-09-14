@@ -11,7 +11,53 @@ pub(crate) enum Phase {
     StoreOpen,
     StoreReady,
     ReservationBegin,
+    ReservationSizeBegin,
+    ReservationSizeReady,
+    ReservationIdentityBegin,
+    ReservationIdentityReady,
+    ReservationActiveCheckReady,
+    ReservationPassiveBegin,
+    ReservationPassiveReady,
+    ReservationWalCheckReady,
+    ReservationTruncateBegin,
+    ReservationTruncateReady,
+    ReservationLockWait,
+    ReservationLockAcquired,
+    ReservationLedgerReady,
+    ReservationCommitBegin,
+    ReservationCommitReady,
+    ReservationActivationReady,
+    ReservationReleaseLockWait,
+    ReservationReleaseLockAcquired,
+    ReservationReleaseDeleteReady,
+    ReservationReleaseCommitReady,
+    ReservationReleaseActiveReady,
+    ReservationReleasePassiveReady,
     ReservationReady,
+    SchedulerPassLockWait,
+    SchedulerPassLockAcquired,
+    SchedulerAuditLockWait,
+    SchedulerAuditLockAcquired,
+    SchedulerReconcileReady,
+    SchedulerCandidatesReady,
+    SchedulerDocumentReady,
+    SchedulerStoreReady,
+    SchedulerValidationReady,
+    SchedulerStoreCloseBegin,
+    SchedulerStoreCloseReady,
+    SchedulerDecisionBegin,
+    SchedulerDecisionReturned,
+    SchedulerCursorBegin,
+    SchedulerCursorReady,
+    SchedulerPassReady,
+    #[cfg(feature = "threads-test-clock")]
+    TickLockWait,
+    #[cfg(feature = "threads-test-clock")]
+    TickLockAcquired,
+    #[cfg(feature = "threads-test-clock")]
+    TickAuthorized,
+    #[cfg(feature = "threads-test-clock")]
+    TickWorkersReady,
     GateReady,
     IdentityBegin,
     IdentityReady,
@@ -44,7 +90,49 @@ impl Phase {
             Self::StoreOpen => "store-open",
             Self::StoreReady => "store-ready",
             Self::ReservationBegin => "reservation-begin",
+            Self::ReservationSizeBegin => "reservation-size-begin",
+            Self::ReservationSizeReady => "reservation-size-ready",
+            Self::ReservationIdentityBegin => "reservation-identity-begin",
+            Self::ReservationIdentityReady => "reservation-identity-ready",
+            Self::ReservationActiveCheckReady => "reservation-active-check-ready",
+            Self::ReservationPassiveBegin => "reservation-passive-begin",
+            Self::ReservationPassiveReady => "reservation-passive-ready",
+            Self::ReservationWalCheckReady => "reservation-wal-check-ready",
+            Self::ReservationTruncateBegin => "reservation-truncate-begin",
+            Self::ReservationTruncateReady => "reservation-truncate-ready",
+            Self::ReservationLockWait => "reservation-lock-wait",
+            Self::ReservationLockAcquired => "reservation-lock-acquired",
+            Self::ReservationLedgerReady => "reservation-ledger-ready",
+            Self::ReservationCommitBegin => "reservation-commit-begin",
+            Self::ReservationCommitReady => "reservation-commit-ready",
+            Self::ReservationActivationReady => "reservation-activation-ready",
+            Self::ReservationReleaseLockWait => "reservation-release-lock-wait",
+            Self::ReservationReleaseLockAcquired => "reservation-release-lock-acquired",
+            Self::ReservationReleaseDeleteReady => "reservation-release-delete-ready",
+            Self::ReservationReleaseCommitReady => "reservation-release-commit-ready",
+            Self::ReservationReleaseActiveReady => "reservation-release-active-ready",
+            Self::ReservationReleasePassiveReady => "reservation-release-passive-ready",
             Self::ReservationReady => "reservation-ready",
+            Self::SchedulerPassLockWait => "scheduler-pass-lock-wait",
+            Self::SchedulerPassLockAcquired => "scheduler-pass-lock-acquired",
+            Self::SchedulerAuditLockWait => "scheduler-audit-lock-wait",
+            Self::SchedulerAuditLockAcquired => "scheduler-audit-lock-acquired",
+            Self::SchedulerReconcileReady => "scheduler-reconcile-ready",
+            Self::SchedulerCandidatesReady => "scheduler-candidates-ready",
+            Self::SchedulerDocumentReady => "scheduler-document-ready",
+            Self::SchedulerStoreReady => "scheduler-store-ready",
+            Self::SchedulerValidationReady => "scheduler-validation-ready",
+            Self::SchedulerStoreCloseBegin => "scheduler-store-close-begin",
+            Self::SchedulerStoreCloseReady => "scheduler-store-close-ready",
+            Self::SchedulerDecisionBegin => "scheduler-decision-begin",
+            Self::SchedulerDecisionReturned => "scheduler-decision-returned",
+            Self::SchedulerCursorBegin => "scheduler-cursor-begin",
+            Self::SchedulerCursorReady => "scheduler-cursor-ready",
+            Self::SchedulerPassReady => "scheduler-pass-ready",
+            Self::TickLockWait => "tick-lock-wait",
+            Self::TickLockAcquired => "tick-lock-acquired",
+            Self::TickAuthorized => "tick-authorized",
+            Self::TickWorkersReady => "tick-workers-ready",
             Self::GateReady => "gate-ready",
             Self::IdentityBegin => "identity-begin",
             Self::IdentityReady => "identity-ready",
@@ -88,7 +176,10 @@ pub(crate) struct RequestTrace {
 
 pub(crate) fn begin(home: &Path, method: &str, path: &str) -> RequestTrace {
     #[cfg(feature = "threads-test-clock")]
-    if method == "POST" && path.starts_with("/api/v1/familiars/") && path.ends_with("/edits") {
+    if method == "POST"
+        && ((path.starts_with("/api/v1/familiars/") && path.ends_with("/edits"))
+            || path == "/api/v1/internal/threads/test-clock/tick")
+    {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
         let started = std::time::Instant::now();
@@ -176,10 +267,201 @@ mod tests {
     #[test]
     fn request_diagnostics_require_fixture_activation() {
         let home = tempfile::tempdir().unwrap();
-        let trace = begin(home.path(), "POST", "/api/v1/familiars/sage/edits");
-        checkpoint(Phase::Intake);
-        drop(trace);
+        for path in [
+            "/api/v1/familiars/sage/edits",
+            "/api/v1/internal/threads/test-clock/tick",
+        ] {
+            let trace = begin(home.path(), "POST", path);
+            checkpoint(Phase::Intake);
+            drop(trace);
+        }
         assert!(!home.path().join("daemon-recovery.log").exists());
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    fn fixture_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        super::super::seed_fixture_for_tests(
+            home.path(),
+            "synthetic-diagnostic-capability",
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        home
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    fn phases(home: &Path) -> Vec<String> {
+        std::fs::read_to_string(home.join("daemon-recovery.log"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                line.split_once(" phase=")
+                    .map(|(_, tail)| tail.split_whitespace().next().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn request_diagnostics_trace_tick_through_response_without_private_fields() {
+        let home = fixture_home();
+        let trace = begin(
+            home.path(),
+            "POST",
+            "/api/v1/internal/threads/test-clock/tick",
+        );
+        checkpoint(Phase::HandlerReturned);
+        checkpoint(Phase::ResponseBegin);
+        checkpoint(Phase::ResponseReady);
+        drop(trace);
+        assert_eq!(
+            phases(home.path()),
+            [
+                "request-begin",
+                "handler-returned",
+                "response-begin",
+                "response-ready",
+                "request-end",
+            ]
+        );
+        let log = std::fs::read_to_string(home.path().join("daemon-recovery.log")).unwrap();
+        assert!(!log.contains("synthetic-diagnostic-capability"));
+        assert!(!log.contains(&*home.path().to_string_lossy()));
+        assert!(!log.contains("/api/v1"));
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn request_diagnostics_ignore_unselected_routes_in_active_fixture() {
+        let home = fixture_home();
+        for (method, path) in [
+            ("GET", "/api/v1/internal/threads/test-clock/tick"),
+            ("POST", "/api/v1/internal/threads/test-clock"),
+            ("POST", "/api/v1/internal/threads/test-clock/tick/extra"),
+            ("POST", "/api/v1/automations/tick"),
+        ] {
+            let trace = begin(home.path(), method, path);
+            checkpoint(Phase::Intake);
+            drop(trace);
+        }
+        assert!(!home.path().join("daemon-recovery.log").exists());
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn request_diagnostics_append_failure_does_not_change_reservation_outcome() {
+        let home = fixture_home();
+        let path = home.path().join("coven.sqlite3");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        std::fs::create_dir(home.path().join("daemon-recovery.log")).unwrap();
+        let trace = begin(home.path(), "POST", "/api/v1/familiars/sage/edits");
+        let required = crate::store::ward_audit_reservation_bytes(&conn, 1, 0).unwrap();
+        crate::store::WardAuditReservation::acquire(
+            &conn,
+            &path,
+            "synthetic-append-failure",
+            "diagnostic-test",
+            required,
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        drop(trace);
+        let reserved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reserved, 0);
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn request_diagnostics_partition_real_reservation_acquisition_and_release() {
+        let home = fixture_home();
+        let path = home.path().join("coven.sqlite3");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let trace = begin(home.path(), "POST", "/api/v1/familiars/sage/edits");
+        let required = crate::store::ward_audit_reservation_bytes(&conn, 1, 0).unwrap();
+        crate::store::WardAuditReservation::acquire(
+            &conn,
+            &path,
+            "synthetic-private-reservation",
+            "synthetic-private-purpose",
+            required,
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        drop(trace);
+        let observed = phases(home.path());
+        let expected = [
+            "reservation-size-begin",
+            "reservation-size-ready",
+            "reservation-identity-begin",
+            "reservation-identity-ready",
+            "reservation-active-check-ready",
+            "reservation-passive-begin",
+            "reservation-passive-ready",
+            "reservation-wal-check-ready",
+            "reservation-lock-wait",
+            "reservation-lock-acquired",
+            "reservation-ledger-ready",
+            "reservation-commit-begin",
+            "reservation-commit-ready",
+            "reservation-activation-ready",
+            "reservation-release-lock-wait",
+            "reservation-release-lock-acquired",
+            "reservation-release-delete-ready",
+            "reservation-release-commit-ready",
+            "reservation-release-active-ready",
+            "reservation-release-passive-ready",
+        ];
+        let actual: Vec<_> = observed
+            .iter()
+            .filter(|phase| phase.starts_with("reservation-"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(actual, expected);
+        let log = std::fs::read_to_string(home.path().join("daemon-recovery.log")).unwrap();
+        assert!(!log.contains("synthetic-private-"));
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn request_diagnostics_partition_empty_scheduler_pass() {
+        let home = fixture_home();
+        crate::store::initialize_store(&home.path().join("coven.sqlite3")).unwrap();
+        let trace = begin(
+            home.path(),
+            "POST",
+            "/api/v1/internal/threads/test-clock/tick",
+        );
+        assert_eq!(
+            crate::api::process_due_threads_proposals(home.path()).unwrap(),
+            0
+        );
+        drop(trace);
+        let observed = phases(home.path());
+        for phase in [
+            "scheduler-pass-lock-wait",
+            "scheduler-pass-lock-acquired",
+            "scheduler-audit-lock-wait",
+            "scheduler-audit-lock-acquired",
+            "scheduler-reconcile-ready",
+            "scheduler-candidates-ready",
+            "scheduler-pass-ready",
+        ] {
+            assert!(
+                observed.iter().any(|value| value == phase),
+                "{phase}: {observed:?}"
+            );
+        }
     }
 
     #[cfg(feature = "threads-test-clock")]
