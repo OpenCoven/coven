@@ -6095,8 +6095,12 @@ mod tests {
         let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
 
         process_tree.terminate_and_wait(Duration::from_secs(2))?;
+        #[cfg(target_os = "macos")]
+        let descendant_exited = super::process_exit_test::macos_process_has_exited(descendant_pid)?;
+        #[cfg(not(target_os = "macos"))]
+        let descendant_exited = wait_for_piped_process_exit(descendant_pid, Duration::ZERO);
         assert!(
-            wait_for_piped_process_exit(descendant_pid, Duration::ZERO),
+            descendant_exited,
             "strict termination returned while closed-pipe descendant {descendant_pid} remained"
         );
         assert_eq!(std::fs::read(receipt_path)?, CONTAINMENT_QUIESCENT_RECEIPT);

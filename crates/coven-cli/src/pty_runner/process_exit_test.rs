@@ -1,17 +1,12 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
+// The existing delayed reaping assertions still require PID disappearance.
 pub(super) fn wait_for_piped_process_exit(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        #[cfg(target_os = "macos")]
-        let exited = macos_process_has_exited(pid).expect("observe fixture process exit");
-        #[cfg(not(target_os = "macos"))]
-        let exited = {
-            let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-            result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        };
-        if exited {
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -22,7 +17,7 @@ pub(super) fn wait_for_piped_process_exit(pid: u32, timeout: Duration) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_has_exited(pid: u32) -> std::io::Result<bool> {
+pub(super) fn macos_process_has_exited(pid: u32) -> std::io::Result<bool> {
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -96,7 +91,8 @@ fn process_exit_observation_distinguishes_live_unreaped_and_reaped_children() ->
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()?;
-    let live = wait_for_piped_process_exit(child.id(), Duration::ZERO);
+    let live_exited = macos_process_has_exited(child.id());
+    let live_reaped = wait_for_piped_process_exit(child.id(), Duration::ZERO);
     child.kill()?;
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
     // Hold the exited child unreaped so launchd scheduling cannot affect this case.
@@ -117,16 +113,30 @@ fn process_exit_observation_distinguishes_live_unreaped_and_reaped_children() ->
             break Err(error);
         }
     };
-    let unreaped = wait_for_piped_process_exit(child.id(), Duration::ZERO);
+    let unreaped_exited = macos_process_has_exited(child.id());
+    let unreaped_reaped = wait_for_piped_process_exit(child.id(), Duration::ZERO);
     child.wait()?;
     waited?;
-    let reaped = wait_for_piped_process_exit(child.id(), Duration::ZERO);
+    let reaped_exited = macos_process_has_exited(child.id())?;
+    let reaped_reaped = wait_for_piped_process_exit(child.id(), Duration::ZERO);
 
-    assert!(!live, "a running child must not be reported as exited");
     assert!(
-        unreaped,
+        !live_exited?,
+        "a running child must not be reported as exited"
+    );
+    assert!(
+        !live_reaped,
+        "a running child must not be reported as reaped"
+    );
+    assert!(
+        unreaped_exited?,
         "exit must not depend on reaping an already-dead child"
     );
-    assert!(reaped, "a reaped child must be reported as exited");
+    assert!(
+        !unreaped_reaped,
+        "a reaping assertion must still reject an unreaped zombie"
+    );
+    assert!(reaped_exited, "a reaped child must be reported as exited");
+    assert!(reaped_reaped, "a reaped child must be reported as reaped");
     Ok(())
 }
