@@ -13425,13 +13425,24 @@ mod tests {
 
         let home = temp_dir.path().to_path_buf();
         let server_status = status.clone();
+        let started = std::time::Instant::now();
+        let trace = move |phase: &str, connection: usize| {
+            eprintln!(
+                "legacy_pipe_fixture phase={phase} connection={connection} elapsed_us={}",
+                started.elapsed().as_micros()
+            );
+        };
         let server = thread::spawn(move || {
-            // Legacy discovery authenticates status with health, opens a
-            // metadata-only connection to validate the pipe ACL, then the
-            // caller performs its own health negotiation.
-            for serves_health in [true, false, true] {
+            // This is the fixture's assumed sequence, not an observation of
+            // the accepted handles. Keep ordinals and client phases to
+            // distinguish discovery failure from caller-health failure.
+            for (index, serves_health) in [true, false, true].into_iter().enumerate() {
+                let ordinal = index + 1;
+                trace("accept-begin", ordinal);
                 let conn = listener.incoming().next().expect("accept").expect("stream");
+                trace("accept-ready", ordinal);
                 if serves_health {
+                    trace("health-handler-begin", ordinal);
                     handle_http_stream(
                         &conn,
                         &conn,
@@ -13440,16 +13451,29 @@ mod tests {
                         &LiveSessionRuntime::default(),
                         None,
                         HostGuard::Disabled,
-                    )?;
+                    )
+                    .with_context(|| format!("legacy fixture health connection {ordinal}"))?;
+                    trace("health-handler-ready", ordinal);
+                } else {
+                    trace("drop-without-read", ordinal);
                 }
+                drop(conn);
+                trace("connection-dropped", ordinal);
             }
             Ok::<_, anyhow::Error>(())
         });
 
-        let endpoint = DaemonEndpoint::discover(temp_dir.path()).map_err(anyhow::Error::new)?;
+        trace("client-discovery-begin", 0);
+        let endpoint = DaemonEndpoint::discover(temp_dir.path())
+            .map_err(anyhow::Error::new)
+            .context("legacy fixture client discovery")?;
+        trace("client-discovery-ready", 0);
+        trace("client-health-begin", 0);
         let health = DaemonClient::new(endpoint)
             .health()
-            .map_err(anyhow::Error::new)?;
+            .map_err(anyhow::Error::new)
+            .context("legacy fixture caller health")?;
+        trace("client-health-ready", 0);
         assert_eq!(health.api_version, "coven.daemon.v1");
         server.join().expect("server thread")?;
         Ok(())

@@ -1381,8 +1381,8 @@ fn discovered_endpoint_is_stable_after_the_process_changes_directory() {
     // This test mutates the process-wide cwd, which is unsafe to do
     // concurrently with other cwd-sensitive tests. Serialize via a
     // process-wide lock and always restore the original cwd through a
-    // panic-safe guard; no other test in this binary depends on the cwd, so
-    // this cannot make unrelated parallel tests flaky.
+    // panic-safe guard. Relative-socket readers must hold this same lock
+    // from path construction through the lifecycle request.
     let guard = PROCESS_CWD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1701,8 +1701,15 @@ fn lifecycle_probe_rejects_a_forged_pid_from_the_connected_peer() {
 
 #[test]
 fn lifecycle_probe_accepts_and_canonicalizes_a_relative_same_profile_socket() {
+    assert_relative_same_profile_socket(|| {});
+}
+
+fn assert_relative_same_profile_socket(before_probe: impl FnOnce()) {
     use std::time::Duration;
 
+    let _cwd_guard = PROCESS_CWD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let home = TestHome::new();
     let canonical_socket = fs::canonicalize(home.path.join("coven.sock"))
         .unwrap_or_else(|_| home.path.join("coven.sock"));
@@ -1715,12 +1722,67 @@ fn lifecycle_probe_accepts_and_canonicalizes_a_relative_same_profile_socket() {
         vec![("/health".to_owned(), 200, lifecycle_health(&reported))],
     );
 
+    before_probe();
     let actual = probe_unix_daemon_health(&home.path, Duration::from_secs(1))
         .expect("probe same-profile relative socket")
         .expect("health included daemon identity");
 
     assert_eq!(Path::new(&actual.socket), canonical_socket);
     server.join().expect("server thread");
+}
+
+#[test]
+fn relative_socket_fixture_excludes_a_competing_cwd_change() {
+    use std::{ffi::OsStr, process::Command, sync::TryLockError};
+
+    const CHILD_FLAG: &str = "COVEN_TEST_RELATIVE_SOCKET_CWD_INTERLEAVING";
+    if std::env::var_os(CHILD_FLAG).as_deref() != Some(OsStr::new("1")) {
+        // A deeper cwd than the sibling socket allocator prevents the
+        // endpoint-ancestor fallback from masking an intervening cwd change.
+        let root = TestHome::new();
+        let cwd = root.path.join("cwd/a/b/c");
+        let temp = root.path.join("t");
+        fs::create_dir_all(&cwd).expect("create isolated working directory");
+        fs::create_dir(&temp).expect("create isolated socket allocator");
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "relative_socket_fixture_excludes_a_competing_cwd_change",
+                "--nocapture",
+            ])
+            .current_dir(&cwd)
+            .env("TMPDIR", &temp)
+            .env(CHILD_FLAG, "1")
+            .output()
+            .expect("run isolated cwd interleaving");
+        assert!(
+            output.status.success(),
+            "isolated cwd interleaving failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let competing_cwd = TestHome::new();
+    let mut restore = None;
+    let mut competitor_blocked = false;
+    assert_relative_same_profile_socket(|| match PROCESS_CWD_LOCK.try_lock() {
+        Ok(guard) => {
+            restore = Some(RestoreCwd {
+                original: std::env::current_dir().expect("original cwd"),
+                _guard: guard,
+            });
+            std::env::set_current_dir(&competing_cwd.path)
+                .expect("interleave competing cwd change");
+        }
+        Err(TryLockError::WouldBlock) => competitor_blocked = true,
+        Err(TryLockError::Poisoned(error)) => panic!("cwd lock poisoned: {error}"),
+    });
+    assert!(
+        competitor_blocked,
+        "the relative socket fixture must exclude a cooperating cwd writer"
+    );
 }
 
 #[test]
@@ -1939,6 +2001,9 @@ fn lifecycle_shutdown_sends_and_validates_the_canonical_socket_identity() {
         time::Duration,
     };
 
+    let _cwd_guard = PROCESS_CWD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let home = TestHome::new();
     let canonical = lifecycle_status(&home.path);
     let socket = home.path.join("coven.sock");
