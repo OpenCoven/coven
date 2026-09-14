@@ -42,11 +42,15 @@ fn descriptor(id: ProviderId) -> ProviderDescriptor {
     .with_verification(CommandSpec::new(["verify"]))
 }
 
+// Positive subprocess cases assert I/O, privacy, and isolation, not startup speed.
+// Cold helpers exceeded two seconds under parallel load; deadline tests override this guard.
+const POSITIVE_PROCESS_HANG_GUARD: Duration = Duration::from_secs(30);
+
 fn options(selector: Selector) -> SetupOptions {
     SetupOptions {
         selector,
         mode: SetupMode::Login,
-        timeout: Duration::from_secs(2),
+        timeout: POSITIVE_PROCESS_HANG_GUARD,
         report_json: None,
         candidate_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
     }
@@ -1475,7 +1479,7 @@ fn provider_matrix_helper() -> Result<()> {
     setup_options.timeout = if std::env::var("COVEN_SETUP_PROBE_MODE").as_deref() == Ok("timeout") {
         Duration::from_secs(1)
     } else {
-        Duration::from_secs(2)
+        POSITIVE_PROCESS_HANG_GUARD
     };
     setup_options.report_json = std::env::var_os("COVEN_SETUP_MATRIX_REPORT").map(PathBuf::from);
     let mut runtime = SetupRuntime {
@@ -1676,11 +1680,13 @@ fn version_probe_rejects_contextual_account_identifier() -> Result<()> {
     let temp = test_tempdir()?;
     let fake_codex = temp.path().join("codex");
     let report_path = temp.path().join("report.json");
+    let version_marker = temp.path().join("version-ran");
     fs::write(
         &fake_codex,
         concat!(
             "#!/bin/sh\n",
             "if [ \"$1\" = \"--version\" ]; then\n",
+            "  printf 'probed\\n' > \"${0%/*}/version-ran\"\n",
             "  printf 'Authenticated account 123.456.789\\n'\n",
             "fi\n",
         ),
@@ -1711,6 +1717,11 @@ fn version_probe_rejects_contextual_account_identifier() -> Result<()> {
 
     assert!(matches!(error, SetupError::Rejected));
     assert!(!report_path.exists());
+    assert_eq!(
+        fs::read_to_string(version_marker)?,
+        "probed\n",
+        "privacy refusal must exercise the hostile version output, not an earlier timeout"
+    );
     Ok(())
 }
 
