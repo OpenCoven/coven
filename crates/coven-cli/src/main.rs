@@ -127,6 +127,15 @@ struct Cli {
     )]
     color: String,
     #[arg(
+        long,
+        global = true,
+        value_name = "APPEARANCE",
+        value_parser = ["auto", "light", "dark"],
+        default_value = "auto",
+        help = "Palette for your terminal background; auto honors COVEN_THEME and COLORFGBG"
+    )]
+    theme: String,
+    #[arg(
         value_name = "PROMPT",
         num_args = 0..,
         trailing_var_arg = true,
@@ -1459,6 +1468,15 @@ fn main() -> Result<()> {
         "never" => theme::ColorChoice::Never,
         _ => theme::ColorChoice::Auto,
     });
+    // Resolve the light/dark appearance here too, for the same reason and
+    // one step further: `theme::appearance()` deliberately does no detection
+    // of its own, because it is first touched deep inside rendering and
+    // probing a terminal background is not safe to do there.
+    theme::set_appearance(theme::detect_appearance(match cli.theme.as_str() {
+        "light" => theme::AppearanceChoice::Light,
+        "dark" => theme::AppearanceChoice::Dark,
+        _ => theme::AppearanceChoice::Auto,
+    }));
     let _state_lock = if matches!(&cli.command, Some(Command::Reset { .. })) {
         None
     } else {
