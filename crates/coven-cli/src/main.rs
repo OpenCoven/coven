@@ -531,27 +531,85 @@ fn legacy_tui_opted_in() -> bool {
 
 /// Locate the `coven-code` binary on PATH or in `~/.coven-code/bin/`.
 fn coven_code_binary() -> Option<PathBuf> {
+    let name = coven_code_binary_name();
     if let Ok(path_var) = std::env::var("PATH") {
-        let suffix = if cfg!(windows) { ".exe" } else { "" };
-        let name = format!("coven-code{suffix}");
         for dir in std::env::split_paths(&path_var) {
+            // Do not honor empty or relative PATH entries here. Interactive
+            // delegation replaces this process with coven-code, so accepting
+            // cwd-relative locations would let an untrusted checkout shadow the
+            // official helper with a planted executable.
+            if !dir.is_absolute() {
+                continue;
+            }
             let candidate = dir.join(&name);
-            if is_executable_file(&candidate) {
+            if is_trusted_coven_code_binary(&candidate) {
                 return Some(candidate);
             }
         }
     }
     if let Some(home) = dirs_next::home_dir() {
-        let suffix = if cfg!(windows) { ".exe" } else { "" };
-        let candidate = home
-            .join(".coven-code")
-            .join("bin")
-            .join(format!("coven-code{suffix}"));
-        if is_executable_file(&candidate) {
+        let candidate = home.join(".coven-code").join("bin").join(&name);
+        if is_trusted_coven_code_binary(&candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+fn coven_code_binary_name() -> String {
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    format!("coven-code{suffix}")
+}
+
+fn is_trusted_coven_code_binary(path: &Path) -> bool {
+    if !is_executable_file(path) {
+        return false;
+    }
+
+    let Ok(candidate) = path.canonicalize() else {
+        return false;
+    };
+    has_trusted_ownership_and_permissions(&candidate) && !is_in_current_workspace(&candidate)
+}
+
+#[cfg(unix)]
+fn has_trusted_ownership_and_permissions(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let euid = unsafe { libc::geteuid() };
+    for component in path.ancestors() {
+        let Ok(metadata) = std::fs::metadata(component) else {
+            return false;
+        };
+        let owner_is_trusted = metadata.uid() == euid || metadata.uid() == 0;
+        let group_or_world_writable = metadata.mode() & 0o022 != 0;
+        if !owner_is_trusted || group_or_world_writable {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn has_trusted_ownership_and_permissions(_path: &Path) -> bool {
+    true
+}
+
+fn is_in_current_workspace(candidate: &Path) -> bool {
+    let Ok(current_dir) = std::env::current_dir().and_then(|p| p.canonicalize()) else {
+        return false;
+    };
+    let Some(workspace_root) = nearest_workspace_root(&current_dir) else {
+        return candidate.parent() == Some(current_dir.as_path());
+    };
+    candidate.starts_with(workspace_root)
+}
+
+fn nearest_workspace_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -2892,6 +2950,68 @@ mod tests {
             std::env::set_var("HOME", h);
         } else {
             std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn coven_code_binary_lookup_ignores_relative_path_entries() {
+        let prev_path = std::env::var("PATH").ok();
+        let prev_home = std::env::var("HOME").ok();
+        let prev_dir = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_test_executable(&bin_dir.join(coven_code_binary_name()));
+        std::env::set_current_dir(tmp.path()).unwrap();
+        std::env::set_var("PATH", "node_modules/.bin");
+        std::env::set_var("HOME", tmp.path().join("empty-home"));
+        assert!(coven_code_binary().is_none());
+        std::env::set_current_dir(prev_dir).unwrap();
+        restore_env_var("PATH", prev_path);
+        restore_env_var("HOME", prev_home);
+    }
+
+    #[test]
+    fn coven_code_binary_lookup_ignores_current_workspace_entries() {
+        let prev_path = std::env::var("PATH").ok();
+        let prev_home = std::env::var("HOME").ok();
+        let prev_dir = std::env::current_dir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        let bin_dir = workspace.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_test_executable(&bin_dir.join(coven_code_binary_name()));
+        std::env::set_current_dir(workspace.path()).unwrap();
+        std::env::set_var("PATH", &bin_dir);
+        std::env::set_var("HOME", workspace.path().join("empty-home"));
+        assert!(coven_code_binary().is_none());
+        std::env::set_current_dir(prev_dir).unwrap();
+        restore_env_var("PATH", prev_path);
+        restore_env_var("HOME", prev_home);
+    }
+
+    fn write_test_executable(path: &Path) {
+        std::fs::write(
+            path,
+            b"#!/bin/sh
+exit 0
+",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    fn restore_env_var(name: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
         }
     }
 }
