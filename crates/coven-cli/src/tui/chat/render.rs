@@ -272,6 +272,11 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
 fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap_width: usize) {
     let text_style = theme::ratatui_style(TEXT);
     let dim_style = theme::ratatui_style(TEXT_DIM);
+    // Fenced code renders on a lifted surface rather than a bare gutter, so a
+    // block reads as one slab instead of bleeding into the prose around it.
+    let code_surface = theme::ratatui_color(SURFACE_STRONG);
+    let code_text_style = text_style.bg(code_surface);
+    let code_gutter_style = dim_style.bg(code_surface);
 
     let mut in_code_block = false;
     let mut code_lang: Option<highlight::Lang> = None;
@@ -287,13 +292,29 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
                 // Opening fence — language tag is the first whitespace-delimited
                 // word after the backticks (e.g. ```rust, ```ts {filename=…}).
                 let tag = trimmed.trim_start_matches('`');
-                code_lang = tag
-                    .split_whitespace()
-                    .next()
-                    .and_then(highlight::tokenizer_for);
+                let first = tag.split_whitespace().next();
+                code_lang = first.and_then(highlight::tokenizer_for);
                 // Fresh comment/string state per block — never let one block
                 // bleed into the next.
                 code_state = highlight::TokenizerState::default();
+                // The chip shows the author's own tag, not the normalized
+                // `Lang` — a ```ts block must not announce itself as JS, and
+                // a block with no tokenizer (```toml) still deserves a label.
+                if let Some(label) = first.and_then(code_block_label) {
+                    lines.push(code_surface_line(
+                        vec![
+                            Span::styled("  \u{2502} ", code_gutter_style),
+                            Span::styled(
+                                label,
+                                theme::ratatui_style(PRIMARY)
+                                    .bg(code_surface)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ],
+                        wrap_width,
+                        code_surface,
+                    ));
+                }
             } else {
                 code_lang = None;
             }
@@ -308,18 +329,24 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
             // With a known language tag, hand the visible line to the syntax
             // tokenizer so keywords/strings/numbers/comments pick up brand
             // tints; without one, fall back to a single text-styled span.
-            let mut spans = vec![Span::styled("  \u{2502} ", dim_style)];
+            let mut spans = vec![Span::styled("  \u{2502} ", code_gutter_style)];
             if let Some(lang) = code_lang {
-                spans.extend(highlight::highlight_line(
-                    &visible,
-                    lang,
-                    text_style,
-                    &mut code_state,
-                ));
+                // `highlight` builds each token style from its own semantic
+                // token and knows nothing about surfaces, so the background
+                // is patched on here — otherwise every keyword and string
+                // would punch a transparent hole in the slab.
+                spans.extend(
+                    highlight::highlight_line(&visible, lang, code_text_style, &mut code_state)
+                        .into_iter()
+                        .map(|mut span| {
+                            span.style = span.style.bg(code_surface);
+                            span
+                        }),
+                );
             } else {
-                spans.push(Span::styled(visible, text_style));
+                spans.push(Span::styled(visible, code_text_style));
             }
-            lines.push(Line::from(spans));
+            lines.push(code_surface_line(spans, wrap_width, code_surface));
             last_was_blank = false;
             continue;
         }
@@ -444,8 +471,49 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
     if in_code_block {
         // A fence opened mid-stream and hasn't closed yet; leave a subtle
         // marker so the reader knows the code block is still flowing.
-        lines.push(Line::from(Span::styled("  \u{2502} \u{2026}", dim_style)));
+        lines.push(code_surface_line(
+            vec![Span::styled("  \u{2502} \u{2026}", code_gutter_style)],
+            wrap_width,
+            code_surface,
+        ));
     }
+}
+
+/// Pad a fenced-code row with surface-colored blanks out to `wrap_width` so
+/// the block renders as one continuous slab. Without the pad, ratatui paints
+/// the background only as far as the glyphs reach and the block's right edge
+/// follows the ragged shape of the code.
+fn code_surface_line<'a>(
+    mut spans: Vec<Span<'a>>,
+    wrap_width: usize,
+    surface: ratatui::style::Color,
+) -> Line<'a> {
+    let used: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if used < wrap_width {
+        spans.push(Span::styled(
+            " ".repeat(wrap_width - used),
+            Style::default().bg(surface),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Normalize an author-supplied fence tag into a short ALL-CAPS chip label.
+///
+/// The tag arrives verbatim from model output, so it is untrusted: anything
+/// outside a conservative identifier set is rejected rather than rendered,
+/// and the result is length-capped so a long tag cannot eat the row.
+fn code_block_label(tag: &str) -> Option<String> {
+    const MAX_LABEL_CHARS: usize = 12;
+    let accepted =
+        |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '#' | '.' | '_');
+    if tag.is_empty() || tag.chars().count() > MAX_LABEL_CHARS || !tag.chars().all(accepted) {
+        return None;
+    }
+    Some(tag.to_ascii_uppercase())
 }
 
 /// Map a heading level (1..=4) to a distinct style so the visual hierarchy
@@ -1507,13 +1575,34 @@ mod tests {
     }
 
     /// Helper: pull a code line out of rendered output. A code-block row
-    /// starts with the bar-prefix span "  │ "; the search needle matches
-    /// against any of the tokenized spans on that row.
+    /// starts with the bar-prefix span "  │ "; the needle is matched against
+    /// the row's joined text, since highlighting splits it across spans.
     fn find_code_line<'a>(lines: &'a [Line<'a>], needle: &str) -> Option<&'a Line<'a>> {
         lines.iter().find(|line| {
+            let row: String = line
+                .spans
+                .iter()
+                .skip(1)
+                .map(|s| s.content.as_ref())
+                .collect();
             line.spans.first().map(|s| s.content.as_ref()) == Some("  \u{2502} ")
-                && line.spans.iter().any(|s| s.content.contains(needle))
+                && row.contains(needle)
         })
+    }
+
+    /// Helper: the code text spans of a rendered code row — everything after
+    /// the `  │ ` gutter and before the surface pad that squares off the
+    /// right edge. Span *count* here is the tokenizer signal: one span means
+    /// the line was emitted verbatim, many means it was highlighted.
+    fn code_content_spans<'a>(line: &'a Line<'a>) -> Vec<&'a Span<'a>> {
+        let mut spans: Vec<&Span<'_>> = line.spans.iter().skip(1).collect();
+        if spans
+            .last()
+            .is_some_and(|s| !s.content.is_empty() && s.content.chars().all(|c| c == ' '))
+        {
+            spans.pop();
+        }
+        spans
     }
 
     #[test]
@@ -1576,9 +1665,9 @@ mod tests {
         append_agent_content_lines(&mut lines, content, 60);
         let code_line = find_code_line(&lines, "let").expect("code line emitted");
         assert_eq!(
-            code_line.spans.len(),
-            2,
-            "plain code block should be bar + verbatim text only"
+            code_content_spans(code_line).len(),
+            1,
+            "plain code block should be verbatim text in a single span"
         );
 
         // Unknown language → same fallback.
@@ -1586,7 +1675,70 @@ mod tests {
         let content = "```cobol\nDISPLAY 'hi'.\n```";
         append_agent_content_lines(&mut lines, content, 60);
         let code_line = find_code_line(&lines, "DISPLAY").expect("code line emitted");
-        assert_eq!(code_line.spans.len(), 2);
+        assert_eq!(code_content_spans(code_line).len(), 1);
+    }
+
+    #[test]
+    fn agent_lines_render_code_block_on_a_padded_surface_with_language_chip() {
+        let wrap_width = 40usize;
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "```rust\nlet a = 1;\n```", wrap_width);
+
+        let surface = theme::ratatui_color(SURFACE_STRONG);
+
+        // The chip announces the author's tag on its own row above the code.
+        let chip = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|s| s.content == "RUST"))
+            .expect("language chip row emitted");
+        assert!(
+            chip.spans
+                .iter()
+                .find(|s| s.content == "RUST")
+                .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "chip label carries weight"
+        );
+
+        // Every row of the block is filled to the wrap width, so the slab has
+        // a square right edge instead of following the code's ragged shape.
+        for line in [chip, find_code_line(&lines, "let a").expect("code row")] {
+            let width: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert_eq!(width, wrap_width, "row padded to the wrap width");
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(surface)),
+                "every span on a code row sits on the code surface"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_lines_omit_language_chip_when_the_fence_is_untagged() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "```\nplain\n```", 40);
+        assert!(
+            find_code_line(&lines, "plain").is_some(),
+            "code still renders"
+        );
+        assert_eq!(
+            lines.len(),
+            1,
+            "an untagged fence gets no chip row: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn agent_lines_reject_untrusted_or_oversized_fence_tags_as_chips() {
+        // The fence tag is model output. A tag carrying punctuation or an
+        // absurd length must not reach the chip.
+        for tag in ["\u{1b}[31mred", "a".repeat(64).as_str(), "c++/cli"] {
+            let mut lines: Vec<Line<'_>> = Vec::new();
+            append_agent_content_lines(&mut lines, &format!("```{tag}\nbody\n```"), 40);
+            assert_eq!(lines.len(), 1, "tag {tag:?} must not produce a chip row");
+        }
     }
 
     #[test]
@@ -1597,15 +1749,17 @@ mod tests {
         let content = "```rust\nlet a = 1;\n```\n\n```\nlet b = 2;\n```";
         append_agent_content_lines(&mut lines, content, 60);
 
-        let mut code_lines: Vec<&Line<'_>> = lines
-            .iter()
-            .filter(|line| line.spans.first().map(|s| s.content.as_ref()) == Some("  \u{2502} "))
-            .collect();
-        assert_eq!(code_lines.len(), 2, "expected two code rows");
-        let plain = code_lines.pop().unwrap();
-        let rust = code_lines.pop().unwrap();
-        assert!(rust.spans.len() > 2, "rust row should be tokenized");
-        assert_eq!(plain.spans.len(), 2, "second (unlabeled) row should not");
+        let rust = find_code_line(&lines, "let a").expect("rust code row emitted");
+        let plain = find_code_line(&lines, "let b").expect("unlabeled code row emitted");
+        assert!(
+            code_content_spans(rust).len() > 1,
+            "rust row should be tokenized"
+        );
+        assert_eq!(
+            code_content_spans(plain).len(),
+            1,
+            "second (unlabeled) row should not"
+        );
     }
 
     #[test]
