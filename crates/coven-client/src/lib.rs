@@ -21,7 +21,8 @@ pub use discovery::{
     supported_windows_pipe_names, validate_windows_daemon_pipe_name,
 };
 pub use error::{
-    ClientError, DaemonError, EMPTY_RESPONSE_TIMEOUT_MESSAGE, WINDOWS_CONNECT_OPERATION,
+    is_response_deadline_timeout, ClientError, DaemonError, EMPTY_RESPONSE_TIMEOUT_MESSAGE,
+    RESPONSE_READ_TIMEOUT_PREFIX, WINDOWS_CONNECT_OPERATION,
 };
 pub use http::{DaemonClient, DaemonHttpResponse};
 #[cfg(unix)]
