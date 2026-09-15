@@ -135,10 +135,9 @@ function fixture(t, {
   write(path.join(runnerDir, "conformance.mjs"),
     runnerTransform(readFileSync(path.join(runnerDir, "conformance.mjs"), "utf8")) + runnerSuffix);
   mkdirSync(path.join(repo, "scripts"));
-  copyFileSync(
-    path.join(ROOT, "scripts/package-automations-protocol.mjs"),
-    path.join(repo, "scripts/package-automations-protocol.mjs"),
-  );
+  for (const name of ["package-automations-protocol.mjs", "script-entrypoint.mjs"]) {
+    copyFileSync(path.join(ROOT, "scripts", name), path.join(repo, "scripts", name));
+  }
   write(path.join(repo, "spec/coven-automations/v1/protocol-version.json"),
     '{"contractProfile":"coven.automations.v1","productionReady":false}\n');
   write(path.join(repo, "Cargo.lock"), "# Locked fixture dependencies\nversion = 4\n");

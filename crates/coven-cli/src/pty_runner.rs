@@ -5548,10 +5548,15 @@ fn env_u16(name: &str) -> Option<u16> {
         .filter(|value| *value > 0)
 }
 
+#[cfg(all(test, unix))]
+mod process_exit_test;
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
 
+    #[cfg(unix)]
+    use super::process_exit_test::wait_for_piped_process_exit;
     use super::*;
 
     fn pty_size(rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> PtySize {
@@ -6090,8 +6095,12 @@ mod tests {
         let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
 
         process_tree.terminate_and_wait(Duration::from_secs(2))?;
+        #[cfg(target_os = "macos")]
+        let descendant_exited = super::process_exit_test::macos_process_has_exited(descendant_pid)?;
+        #[cfg(not(target_os = "macos"))]
+        let descendant_exited = wait_for_piped_process_exit(descendant_pid, Duration::ZERO);
         assert!(
-            wait_for_piped_process_exit(descendant_pid, Duration::ZERO),
+            descendant_exited,
             "strict termination returned while closed-pipe descendant {descendant_pid} remained"
         );
         assert_eq!(std::fs::read(receipt_path)?, CONTAINMENT_QUIESCENT_RECEIPT);
@@ -6606,21 +6615,6 @@ mod tests {
             "fixture did not publish readiness marker {}",
             path.display()
         )
-    }
-
-    #[cfg(unix)]
-    fn wait_for_piped_process_exit(pid: u32, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
     }
 
     #[cfg(windows)]
