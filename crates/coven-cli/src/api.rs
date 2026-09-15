@@ -25,10 +25,10 @@ use crate::{
     privacy, project, session_launch, store, ward,
 };
 
+#[cfg(test)]
+pub use crate::api_health::coven_version;
 pub(crate) use crate::api_health::health_response_for_authority;
 use crate::api_health::HealthResponse;
-#[cfg(test)]
-pub use crate::api_health::COVEN_VERSION;
 pub use crate::api_health::{health_response, COVEN_API_NAMED_VERSION};
 pub use crate::api_response::ApiResponse;
 pub(crate) use crate::api_response::{api_error, json_response};

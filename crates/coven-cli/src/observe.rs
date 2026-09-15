@@ -286,6 +286,26 @@ pub(crate) fn run_status(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The daemon build identity to show on the status card, or `unknown`.
+///
+/// Defensive, and separate from the build-stamp fix in `api_health`: a daemon
+/// built before that fix still answers `/api/v1/health` with the `0.0.0`
+/// manifest placeholder, which reads as a real release while naming no build.
+/// Treat it — and an absent, non-string, or blank field — as "the daemon did
+/// not report a version" so the card never prints a meaningless `0.0.0`.
+fn status_version(health: &Value) -> &str {
+    let reported = health
+        .get("covenVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if reported.is_empty() || reported == "0.0.0" {
+        "unknown"
+    } else {
+        reported
+    }
+}
+
 fn render_status(
     p: theme::Palette,
     daemon_state: Option<&daemon::DaemonStatusState>,
@@ -323,10 +343,7 @@ fn render_status(
     out.push_str(&format!(
         "{}    {}\n",
         field(p, "version"),
-        health
-            .get("covenVersion")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
+        status_version(health)
     ));
 
     let count = |key: &str| overview.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -2019,6 +2036,50 @@ mod tests {
         assert!(out.contains("research   5 iterations (last Δ 2)"));
         assert!(out.contains("hub        1/2 nodes available"));
         assert!(out.contains("Next: coven sessions"));
+    }
+
+    /// Regression for the `coven status` version line reading `0.0.0`.
+    ///
+    /// A daemon predating the build-stamp fix answers health with the `0.0.0`
+    /// manifest placeholder. The card must say the version is unknown rather
+    /// than present the placeholder as a release.
+    #[test]
+    fn render_status_reports_placeholder_version_as_unknown() {
+        let overview = json!({ "open_sessions": 0, "total_familiars": 0, "skills_count": 0 });
+
+        for health in [
+            json!({ "covenVersion": "0.0.0" }),
+            json!({ "covenVersion": "  0.0.0  " }),
+            json!({ "covenVersion": "" }),
+            json!({ "covenVersion": null }),
+            json!({}),
+        ] {
+            let out = render_status(plain(), None, &health, &overview);
+            assert!(
+                out.contains("version    unknown"),
+                "expected an unknown version line for {health}, got:\n{out}"
+            );
+            assert!(
+                !out.contains("0.0.0"),
+                "placeholder version leaked for {health}, got:\n{out}"
+            );
+        }
+    }
+
+    /// A real build identity is passed through verbatim, including the
+    /// `git describe` distance/commit/dirty suffix a source build carries.
+    #[test]
+    fn render_status_passes_through_real_versions() {
+        let overview = json!({ "open_sessions": 0, "total_familiars": 0, "skills_count": 0 });
+
+        for version in ["0.4.2", "0.4.2-14-g3eb633b2-dirty", "unknown"] {
+            let health = json!({ "covenVersion": version });
+            let out = render_status(plain(), None, &health, &overview);
+            assert!(
+                out.contains(&format!("version    {version}")),
+                "expected `{version}` on the status card, got:\n{out}"
+            );
+        }
     }
 
     #[test]
