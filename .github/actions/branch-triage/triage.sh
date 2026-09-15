@@ -46,8 +46,20 @@ git pull -q
 
 # ── Step 1 — collect PR data ──────────────────────────────────────────────────
 log "Loading open and merged PR data from GitHub…"
-OPEN_PR_JSON=$(gh pr list --state open  --json number,title,headRefName --limit 200)
-MRGD_PR_JSON=$(gh pr list --state merged --json headRefName            --limit 500)
+REPO_NWO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+REPO_OWNER=${REPO_NWO%%/*}
+REPO_NAME=${REPO_NWO#*/}
+
+OPEN_PR_JSON=$(gh pr list --state open \
+  --json number,title,headRefName,headRefOid,headRepository,headRepositoryOwner \
+  --limit 200 \
+  | jq --arg owner "$REPO_OWNER" --arg name "$REPO_NAME" \
+      '[.[] | select(.headRepositoryOwner.login == $owner and .headRepository.name == $name)]')
+MRGD_PR_JSON=$(gh pr list --state merged \
+  --json headRefName,headRepository,headRepositoryOwner \
+  --limit 500 \
+  | jq --arg owner "$REPO_OWNER" --arg name "$REPO_NAME" \
+      '[.[] | select(.headRepositoryOwner.login == $owner and .headRepository.name == $name)]')
 
 open_branches()  { echo "$OPEN_PR_JSON" | jq -r '.[].headRefName'; }
 merged_branches(){ echo "$MRGD_PR_JSON" | jq -r '.[].headRefName'; }
@@ -60,6 +72,11 @@ pr_number_for() {
 pr_title_for() {
   local branch="$1"
   echo "$OPEN_PR_JSON" | jq -r --arg b "$branch" '.[] | select(.headRefName==$b) | .title'
+}
+
+pr_head_oid_for() {
+  local branch="$1"
+  echo "$OPEN_PR_JSON" | jq -r --arg b "$branch" '.[] | select(.headRefName==$b) | .headRefOid'
 }
 
 branch_is_open_pr()   { open_branches  | grep -qxF "$1"; }
@@ -83,13 +100,14 @@ last_commit_days_ago() {
 # except this gate stands between a red or contested PR and the default branch.
 # Fail closed: anything we cannot positively confirm as green and uncontested
 # is reported and left for a human.
-merge_block_reason() {
-  local pr="$1" json
-  json=$(gh pr view "$pr" \
-    --json isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup 2>/dev/null) || {
-    echo "could not read PR state"
-    return 0
-  }
+merge_state_json() {
+  local pr="$1"
+  gh pr view "$pr" \
+    --json headRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup 2>/dev/null
+}
+
+merge_block_reason_from_json() {
+  local json="$1"
 
   jq -r '
     def named: (.name // .context // "check");
@@ -198,12 +216,28 @@ log "Merging open PRs that pass the gate (one at a time)…"
 for branch in "${OPEN_LIST[@]}"; do
   pr=$(pr_number_for "$branch")
   title=$(pr_title_for "$branch")
+  expected_head_oid=$(pr_head_oid_for "$branch")
   log "  PR #$pr — $title"
 
   # Gate first: never touch a PR we would not be allowed to merge. Rebasing and
   # force-pushing a blocked PR is itself destructive, so this runs before any
   # write to the branch.
-  reason=$(merge_block_reason "$pr")
+  state_json=$(merge_state_json "$pr") || state_json=''
+  if [[ -z "$state_json" ]]; then
+    reason="could not read PR state"
+  else
+    actual_head_oid=$(jq -r '.headRefOid // ""' <<<"$state_json")
+    origin_head_oid=$(git rev-parse "origin/$branch" 2>/dev/null || true)
+    if [[ -z "$expected_head_oid" || "$expected_head_oid" == "null" ]]; then
+      reason="could not read PR head commit"
+    elif [[ "$actual_head_oid" != "$expected_head_oid" ]]; then
+      reason="PR head changed since classification"
+    elif [[ "$origin_head_oid" != "$expected_head_oid" ]]; then
+      reason="PR head does not match origin/$branch"
+    else
+      reason=$(merge_block_reason_from_json "$state_json")
+    fi
+  fi
   if [[ -n "$reason" ]]; then
     warn "  $(yellow 'skipped') #$pr — $reason"
     SKIPPED_LIST+=("#$pr ($branch) — $reason")
@@ -217,7 +251,7 @@ for branch in "${OPEN_LIST[@]}"; do
   fi
 
   merge_flag="--$STRATEGY"
-  if gh pr merge "$pr" "$merge_flag" --delete-branch 2>&1; then
+  if gh pr merge "$pr" "$merge_flag" --match-head-commit "$expected_head_oid" --delete-branch 2>&1; then
     log "  $(green '✓') merged #$pr"
     (( merged_count++ )) || true
   else

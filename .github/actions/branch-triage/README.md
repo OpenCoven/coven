@@ -10,7 +10,7 @@ branches and need periodic cleanup.
 
    | Category | Definition | Action |
    |---|---|---|
-   | OPEN | Has an open PR | Merge if it passes the gate below |
+   | OPEN | Has an open PR from this repository whose branch name matches the origin branch | Merge if it passes the gate below |
    | MERGED | Has a merged PR | Delete local + remote |
    | SUPERSEDED | No PR, 0 unique commits vs base | Delete |
    | REVIEW | No PR, >0 unique commits | Skip — report only |
@@ -52,8 +52,8 @@ on:
         default: "false"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: write       # delete merged/superseded branches
+  pull-requests: write  # merge gated same-repository PRs
 
 jobs:
   triage:
@@ -72,8 +72,11 @@ jobs:
 
 This action runs unattended, and on a repository without branch protection it
 is the only thing standing between a red or contested PR and the default
-branch. It therefore fails closed: a PR is merged only when **every** condition
-below holds, and is otherwise reported in the job summary and left alone.
+branch. It only considers PRs whose head repository is this repository (not a
+fork), whose head branch name matches the origin branch being triaged, and
+whose head commit still matches that origin branch. It therefore fails closed:
+a PR is merged only when **every** condition below holds, and is otherwise
+reported in the job summary and left alone.
 
 | Condition | Skipped when |
 |---|---|
@@ -84,12 +87,15 @@ below holds, and is otherwise reported in the job summary and left alone.
 | No in-flight checks | any check is `QUEUED`, `IN_PROGRESS`, `WAITING`, or `PENDING` |
 | CI actually ran | the check rollup is empty — no CI ran at all |
 | Merge state is clean | `mergeStateStatus` is anything other than `CLEAN` |
+| Same-repository head | the PR comes from a fork or the head commit differs from `origin/<branch>` |
 
 Mergeability that GitHub has not finished computing counts as a skip, not a
 pass — a PR held for that reason merges on the next run.
 
 The gate is evaluated **before** the action writes anything to the branch, so a
-blocked PR is never rebased or force-pushed.
+blocked PR is never rebased or force-pushed. The merge call also uses GitHub
+CLI's `--match-head-commit` option to bind the merge to the exact commit that
+passed the gate.
 
 ## Why there is no rebase step
 
