@@ -1410,8 +1410,12 @@ fn first_chars(value: &str, limit: usize) -> String {
 
 fn coven_store_path() -> Result<PathBuf> {
     let home = coven_home_dir()?;
-    std::fs::create_dir_all(&home)
-        .with_context(|| format!("failed to create Coven home directory {}", home.display()))?;
+    store::ensure_private_store_directory(&home).with_context(|| {
+        format!(
+            "failed to create private Coven home directory {}",
+            home.display()
+        )
+    })?;
     Ok(home.join(STORE_FILE_NAME))
 }
 

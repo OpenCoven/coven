@@ -1,9 +1,12 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use crate::{
     encrypted_artifacts::{EncryptedPayload, SensitiveArtifactStore},
@@ -87,17 +90,126 @@ pub struct EventsQueryOptions {
     pub limit: Option<i64>,
 }
 
+pub fn ensure_private_store_directory(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create store directory {}", path.display()))?;
+    harden_store_directory(path)
+}
+
+#[cfg(unix)]
+fn harden_store_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect store directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to use symlinked Coven store directory {}",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "Coven store directory {} is not a directory",
+            path.display()
+        );
+    }
+    if metadata.mode() & 0o077 != 0 {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).with_context(|| {
+            format!(
+                "failed to restrict Coven store directory permissions for {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_store_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to inspect store directory {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!(
+            "Coven store directory {} is not a directory",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_private_store_file(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => harden_existing_store_file(path, metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("failed to create Coven store at {}", path.display()))?;
+            harden_existing_store_file(
+                path,
+                std::fs::symlink_metadata(path).with_context(|| {
+                    format!("failed to inspect Coven store at {}", path.display())
+                })?,
+            )
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to inspect Coven store at {}", path.display()))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn harden_existing_store_file(path: &Path, metadata: std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to use symlinked Coven store file {}",
+            path.display()
+        );
+    }
+    if !metadata.is_file() {
+        bail!("Coven store path {} is not a regular file", path.display());
+    }
+    if metadata.mode() & 0o077 != 0 {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions).with_context(|| {
+            format!(
+                "failed to restrict Coven store file permissions for {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_store_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("failed to inspect Coven store at {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("Coven store path {} is not a regular file", path.display());
+        }
+    }
+    Ok(())
+}
+
 pub fn open_store(path: &Path) -> Result<Connection> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create store directory {}", parent.display()))?;
+        ensure_private_store_directory(parent)?;
     }
+    ensure_private_store_file(path)?;
 
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
+    ensure_private_store_file(path)?;
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
 
@@ -1068,6 +1180,87 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "session-1");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_store_restricts_directory_and_database_permissions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let store_dir = temp_dir.path().join("public-coven");
+        std::fs::create_dir(&store_dir)?;
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o755))?;
+        let path = store_dir.join("coven.db");
+
+        let conn = open_store(&path)?;
+        drop(conn);
+
+        let dir_mode = std::fs::symlink_metadata(&store_dir)?.permissions().mode() & 0o777;
+        let file_mode = std::fs::symlink_metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_store_repairs_existing_world_readable_database() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        std::fs::write(&path, b"")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        let conn = open_store(&path)?;
+        drop(conn);
+
+        let file_mode = std::fs::symlink_metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_store_refuses_symlinked_database() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir()?;
+        let target = temp_dir.path().join("target.db");
+        let link = temp_dir.path().join("coven.db");
+        std::fs::write(&target, b"")?;
+        symlink(&target, &link)?;
+
+        let error = open_store(&link).unwrap_err();
+
+        assert!(
+            error.to_string().contains("symlinked Coven store file"),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_store_directory_refuses_symlinked_directory() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir()?;
+        let target = temp_dir.path().join("target-dir");
+        let link = temp_dir.path().join("coven-home");
+        std::fs::create_dir(&target)?;
+        symlink(&target, &link)?;
+
+        let error = ensure_private_store_directory(&link).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("symlinked Coven store directory"),
+            "unexpected error: {error:?}"
+        );
         Ok(())
     }
 
