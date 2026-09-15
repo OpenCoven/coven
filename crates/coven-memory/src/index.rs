@@ -1,9 +1,9 @@
 //! TurboVec IdMapIndex wrapper — persistent 4-bit compressed ANN index with stable ids
 
+use crate::{embed::DIM, fs_security};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use turbovec::IdMapIndex;
-use crate::embed::DIM;
 
 pub const BIT_WIDTH: usize = 4;
 
@@ -15,9 +15,8 @@ pub struct VecIndex {
 impl VecIndex {
     /// Load from disk if it exists, otherwise create a fresh index
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        fs_security::ensure_private_parent(path)?;
+        fs_security::validate_existing_private_file(path)?;
         let inner = if path.exists() {
             IdMapIndex::load(path)
                 .with_context(|| format!("loading index from {}", path.display()))?
@@ -25,7 +24,10 @@ impl VecIndex {
             IdMapIndex::new(DIM, BIT_WIDTH)
                 .map_err(|e| anyhow::anyhow!("creating index: {:?}", e))?
         };
-        Ok(Self { inner, path: path.to_owned() })
+        Ok(Self {
+            inner,
+            path: path.to_owned(),
+        })
     }
 
     /// Add a batch of (id, embedding) pairs (flat row-major: each embedding is DIM f32s)
@@ -61,8 +63,10 @@ impl VecIndex {
 
     /// Persist to disk
     pub fn save(&self) -> Result<()> {
-        self.inner.write(&self.path)
+        self.inner
+            .write(&self.path)
             .with_context(|| format!("saving index to {}", self.path.display()))?;
+        fs_security::set_private_file(&self.path)?;
         Ok(())
     }
 
