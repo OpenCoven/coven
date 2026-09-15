@@ -1920,11 +1920,13 @@ fn run_tui_help() -> Result<()> {
 }
 
 /// Render a read-only observability view inline. Same single render path
-/// as the matching `coven <view>` command (`observe::view_text`), so the
-/// shell and the CLI can never disagree.
+/// as the matching `coven <view>` command, so the shell and the CLI can
+/// never disagree. This shell writes to raw stdout, so it takes the styled
+/// entry point; the chat TUI's ratatui transcript takes the plain
+/// `observe::view_text` instead.
 fn run_observe_view(view: cast::ObserveView) -> Result<()> {
     let coven_home = crate::coven_home_dir()?;
-    print!("{}", crate::observe::view_text(&coven_home, view)?);
+    print!("{}", crate::observe::view_text_styled(&coven_home, view)?);
     Ok(())
 }
 

@@ -61,12 +61,34 @@ impl ObserveView {
     }
 }
 
-/// Render a view's human text against an explicit Coven home. For every
-/// view in [`ObserveView`] this is the single render path — the CLI
-/// command, the Cast shell, and the chat UI all call it, so the surfaces
-/// cannot drift. (CLI-only leaves like `hub nodes/jobs/routing` and the
-/// `calls <id>` detail live outside the view enum and render directly.)
+/// Render a view's human text against an explicit Coven home, **plain**:
+/// the returned string carries no ANSI escapes whatsoever.
+///
+/// This is deliberately the escape-free half of a two-entry-point split.
+/// `tui::chat::app` pushes this text into the ratatui transcript, and
+/// ratatui renders the bytes it is handed without interpreting ANSI — an
+/// escape in here reaches the user as literal `[38;2;154;142;205m` garbage.
+/// Stdout callers want the styled twin, [`view_text_styled`]. Do not
+/// collapse the two by emitting escapes here and stripping them at the chat
+/// call site: the plain payload has to stay plain at the source.
 pub(crate) fn view_text(coven_home: &Path, view: ObserveView) -> Result<String> {
+    view_text_with(coven_home, view, theme::Palette::plain())
+}
+
+/// [`view_text`] for a raw-stdout consumer: identical layout, brand-tinted
+/// for the terminal's detected color mode. Under `NO_COLOR`,
+/// `--color=never`, or a pipe the mode resolves to `NoColor`, every escape
+/// wrapper renders empty, and the bytes match [`view_text`] exactly.
+pub(crate) fn view_text_styled(coven_home: &Path, view: ObserveView) -> Result<String> {
+    view_text_with(coven_home, view, theme::palette())
+}
+
+/// The single render path behind both entry points. For every view in
+/// [`ObserveView`] the CLI command, the Cast shell, and the chat UI all land
+/// here, so the surfaces cannot drift. (CLI-only leaves like
+/// `hub nodes/jobs/routing` and the `calls <id>` detail live outside the
+/// view enum and render directly.)
+fn view_text_with(coven_home: &Path, view: ObserveView, p: theme::Palette) -> Result<String> {
     Ok(match view {
         ObserveView::Status => {
             let daemon_state = daemon::background_server_status(coven_home)?;
@@ -76,14 +98,14 @@ pub(crate) fn view_text(coven_home: &Path, view: ObserveView) -> Result<String> 
             };
             let health = api_get_with_daemon(coven_home, "/api/v1/health", live)?;
             let overview = api_get(coven_home, "/api/v1/overview")?;
-            render_status(daemon_state.as_ref(), &health, &overview)
+            render_status(p, daemon_state.as_ref(), &health, &overview)
         }
-        ObserveView::Familiars => render_familiars(&api_get(coven_home, "/api/v1/familiars")?),
-        ObserveView::Skills => render_skills(&api_get(coven_home, "/api/v1/skills")?),
-        ObserveView::Memory => render_memory(&api_get(coven_home, "/api/v1/memory")?),
-        ObserveView::Research => render_research(&api_get(coven_home, "/api/v1/research")?),
-        ObserveView::Calls => render_calls(&api_get(coven_home, "/api/v1/coven-calls")?),
-        ObserveView::HubStatus => render_hub_status(&api_get(coven_home, "/api/v1/hub/status")?),
+        ObserveView::Familiars => render_familiars(p, &api_get(coven_home, "/api/v1/familiars")?),
+        ObserveView::Skills => render_skills(p, &api_get(coven_home, "/api/v1/skills")?),
+        ObserveView::Memory => render_memory(p, &api_get(coven_home, "/api/v1/memory")?),
+        ObserveView::Research => render_research(p, &api_get(coven_home, "/api/v1/research")?),
+        ObserveView::Calls => render_calls(p, &api_get(coven_home, "/api/v1/coven-calls")?),
+        ObserveView::HubStatus => render_hub_status(p, &api_get(coven_home, "/api/v1/hub/status")?),
     })
 }
 
@@ -127,7 +149,27 @@ fn print_json(body: &Value) -> Result<()> {
 
 /// Render fixed-width columns with two-space gutters. Widths fit the widest
 /// cell so full ids always survive; pass pre-truncated cells for free text.
-fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+fn render_table(p: theme::Palette, headers: &[&str], rows: &[Vec<String>]) -> String {
+    render_table_tinted(p, headers, rows, |_, _| None)
+}
+
+/// [`render_table`] with a per-cell brand tint: `tint(column, plain_cell)`
+/// names the token to paint that cell with, or `None` to leave it at the
+/// terminal's default foreground.
+///
+/// `headers` and `rows` are **plain** text and must stay that way. Column
+/// widths are measured here with `chars().count()`, and ANSI escapes are
+/// chars: a pre-decorated cell would inflate its own measured width and
+/// shear every column after it. The escape pair is wrapped around each cell
+/// *after* the measurement, and the gutter padding is written outside that
+/// pair, so a styled table and its `NoColor` twin put every column stop at
+/// the same visible position.
+fn render_table_tinted(
+    p: theme::Palette,
+    headers: &[&str],
+    rows: &[Vec<String>],
+    tint: impl Fn(usize, &str) -> Option<theme::Rgb>,
+) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -137,30 +179,80 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
         }
     }
     let mut out = String::new();
-    let render_row = |cells: Vec<String>| -> String {
-        let mut line = String::new();
-        let last = cells.len().saturating_sub(1);
-        for (i, cell) in cells.iter().enumerate() {
-            if i == last {
-                // No trailing padding on the final column.
-                line.push_str(cell);
-            } else {
-                let pad = widths[i].saturating_sub(cell.chars().count());
-                line.push_str(cell);
-                line.extend(std::iter::repeat_n(' ', pad + 2));
+    let render_row =
+        |cells: &[String], tint: &dyn Fn(usize, &str) -> Option<theme::Rgb>| -> String {
+            let mut line = String::new();
+            let last = cells.len().saturating_sub(1);
+            for (i, cell) in cells.iter().enumerate() {
+                match tint(i, cell) {
+                    // The pair always closes, so an escape smuggled in through a
+                    // daemon-supplied cell cannot outlive that cell.
+                    Some(rgb) => line.push_str(&format!("{}{cell}{}", p.tint(rgb), p.reset)),
+                    None => line.push_str(cell),
+                }
+                if i != last {
+                    // No trailing padding on the final column.
+                    let pad = widths[i].saturating_sub(cell.chars().count());
+                    line.extend(std::iter::repeat_n(' ', pad + 2));
+                }
             }
-        }
-        line.trim_end().to_string()
-    };
-    out.push_str(&render_row(
-        headers.iter().map(|h| h.to_string()).collect::<Vec<_>>(),
-    ));
+            line.trim_end().to_string()
+        };
+    // The header row is our own text, top to bottom, so it takes the brand's
+    // primary tint as one escape pair around the finished line.
+    let headers: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    let header_line = render_row(&headers, &|_, _| None);
+    out.push_str(&format!("{}{header_line}{}", p.primary, p.reset));
     out.push('\n');
     for row in rows {
-        out.push_str(&render_row(row.clone()));
+        out.push_str(&render_row(row, &tint));
         out.push('\n');
     }
     out
+}
+
+/// Brand tint for a lifecycle word the daemon reports. The vocabulary is
+/// closed on purpose: a value outside it renders at the terminal default
+/// rather than guessing, so an unexpected string can never claim the
+/// "healthy" token.
+fn status_tint(value: &str) -> Option<theme::Rgb> {
+    let status = match value {
+        "active" | "available" | "completed" | "online" | "true" => theme::Status::Ready,
+        "assigned" | "running" | "working" => theme::Status::Working,
+        "false" | "held" | "stale" => theme::Status::Warning,
+        "error" | "failed" => theme::Status::Error,
+        "cancelled" | "idle" | "offline" | "queued" => theme::Status::Idle,
+        _ => return None,
+    };
+    Some(theme::status_token(status))
+}
+
+/// A [`render_table_tinted`] tint that paints exactly one column — the one
+/// holding a lifecycle word — and leaves every other cell at the default.
+fn tint_status_column(column: usize) -> impl Fn(usize, &str) -> Option<theme::Rgb> {
+    move |index, cell| (index == column).then(|| status_tint(cell)).flatten()
+}
+
+/// A status word rendered for a detail line — tinted when [`status_tint`]
+/// recognizes it, verbatim otherwise.
+fn status_value(p: theme::Palette, value: &str) -> String {
+    match status_tint(value) {
+        Some(rgb) => format!("{}{value}{}", p.tint(rgb), p.reset),
+        None => value.to_string(),
+    }
+}
+
+/// The `  label` prefix of a `  label   value` detail line, carrying the
+/// brand's field-label tint. Callers keep their literal gutter spacing, so
+/// the plain and styled renders land every value in the same column.
+fn field(p: theme::Palette, label: &str) -> String {
+    format!("  {}{label}{}", p.field_label, p.reset)
+}
+
+/// A view's title line. Only the static phrase is tinted; any id spliced in
+/// after it stays at the terminal default, because it is not our text.
+fn title(p: theme::Palette, text: &str) -> String {
+    format!("{}{text}{}", p.primary_strong, p.reset)
 }
 
 fn str_cell(value: &Value, key: &str) -> String {
@@ -190,31 +282,47 @@ pub(crate) fn run_status(json: bool) -> Result<()> {
             "overview": overview,
         }));
     }
-    print!("{}", view_text(&coven_home, ObserveView::Status)?);
+    print!("{}", view_text_styled(&coven_home, ObserveView::Status)?);
     Ok(())
 }
 
 fn render_status(
+    p: theme::Palette,
     daemon_state: Option<&daemon::DaemonStatusState>,
     health: &Value,
     overview: &Value,
 ) -> String {
     let mut out = String::new();
-    out.push_str("Coven status\n\n");
+    out.push_str(&format!("{}\n\n", title(p, "Coven status")));
 
-    let daemon_line = match daemon_state {
-        Some(daemon::DaemonStatusState::Running(status)) => {
-            format!("running (pid {}, socket {})", status.pid, status.socket)
-        }
-        Some(daemon::DaemonStatusState::Stale(status)) => format!(
-            "stale (pid {} is gone) — run `coven daemon restart`",
-            status.pid
+    // The daemon state is a closed enum here, so it picks its brand status
+    // semantic directly rather than round-tripping through a printed word.
+    let (daemon_line, daemon_status) = match daemon_state {
+        Some(daemon::DaemonStatusState::Running(status)) => (
+            format!("running (pid {}, socket {})", status.pid, status.socket),
+            theme::Status::Ready,
         ),
-        None => "not running — start it with `coven daemon start`".to_string(),
+        Some(daemon::DaemonStatusState::Stale(status)) => (
+            format!(
+                "stale (pid {} is gone) — run `coven daemon restart`",
+                status.pid
+            ),
+            theme::Status::Warning,
+        ),
+        None => (
+            "not running — start it with `coven daemon start`".to_string(),
+            theme::Status::Idle,
+        ),
     };
-    out.push_str(&format!("  daemon     {daemon_line}\n"));
     out.push_str(&format!(
-        "  version    {}\n",
+        "{}     {}{daemon_line}{}\n",
+        field(p, "daemon"),
+        p.status(daemon_status),
+        p.reset
+    ));
+    out.push_str(&format!(
+        "{}    {}\n",
+        field(p, "version"),
         health
             .get("covenVersion")
             .and_then(Value::as_str)
@@ -222,25 +330,35 @@ fn render_status(
     ));
 
     let count = |key: &str| overview.get(key).and_then(Value::as_u64).unwrap_or(0);
-    out.push_str(&format!("  sessions   {} open\n", count("open_sessions")));
+    out.push_str(&format!(
+        "{}   {} open\n",
+        field(p, "sessions"),
+        count("open_sessions")
+    ));
     let total_familiars = count("total_familiars");
     if total_familiars == 0 {
-        out.push_str("  familiars  none — add [[familiar]] entries to ~/.coven/familiars.toml\n");
+        out.push_str(&format!(
+            "{}  none — add [[familiar]] entries to ~/.coven/familiars.toml\n",
+            field(p, "familiars")
+        ));
     } else {
         out.push_str(&format!(
-            "  familiars  {} active / {} total\n",
+            "{}  {} active / {} total\n",
+            field(p, "familiars"),
             count("active_familiars"),
             total_familiars
         ));
     }
     out.push_str(&format!(
-        "  skills     {} installed\n",
+        "{}     {} installed\n",
+        field(p, "skills"),
         count("skills_count")
     ));
     let research_iterations = count("research_iterations");
     if research_iterations > 0 {
         out.push_str(&format!(
-            "  research   {} iterations (last Δ {})\n",
+            "{}   {} iterations (last Δ {})\n",
+            field(p, "research"),
             research_iterations,
             overview
                 .get("last_research_delta")
@@ -252,7 +370,8 @@ fn render_status(
         let nodes_total = hub.get("nodesTotal").and_then(Value::as_u64).unwrap_or(0);
         if nodes_total > 0 {
             out.push_str(&format!(
-                "  hub        {}/{} nodes available (details: coven hub status)\n",
+                "{}        {}/{} nodes available (details: coven hub status)\n",
+                field(p, "hub"),
                 hub.get("nodesAvailable")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
@@ -275,13 +394,13 @@ pub(crate) fn run_familiars(id: Option<&str>, json: bool) -> Result<()> {
             if json {
                 return print_json(&body);
             }
-            print!("{}", render_familiar_ward(&body));
+            print!("{}", render_familiar_ward(theme::palette(), &body));
         }
         None => {
             if json {
                 return print_json(&api_get(&coven_home, "/api/v1/familiars")?);
             }
-            print!("{}", view_text(&coven_home, ObserveView::Familiars)?);
+            print!("{}", view_text_styled(&coven_home, ObserveView::Familiars)?);
         }
     }
     Ok(())
@@ -298,25 +417,32 @@ fn tier_label(tier: u64) -> &'static str {
     }
 }
 
-fn render_familiar_ward(body: &Value) -> String {
+fn render_familiar_ward(p: theme::Palette, body: &Value) -> String {
     let familiar = body
         .get("familiarId")
         .and_then(Value::as_str)
         .unwrap_or("?");
     let ward = body.get("ward").cloned().unwrap_or(Value::Null);
     let mut out = String::new();
-    out.push_str(&format!("Familiar {familiar} — Ward surface\n\n"));
     out.push_str(&format!(
-        "  workspace  {}\n",
+        "{} {familiar} {}\n\n",
+        title(p, "Familiar"),
+        title(p, "— Ward surface")
+    ));
+    out.push_str(&format!(
+        "{}  {}\n",
+        field(p, "workspace"),
         body.get("workspace").and_then(Value::as_str).unwrap_or("?")
     ));
     out.push_str(&format!(
-        "  principal  {}\n",
+        "{}  {}\n",
+        field(p, "principal"),
         str_cell(&ward, "principalKeyFingerprint")
     ));
     if let Some(tier) = ward.get("defaultTier").and_then(Value::as_u64) {
         out.push_str(&format!(
-            "  unmatched  tier {tier} ({})\n",
+            "{}  tier {tier} ({})\n",
+            field(p, "unmatched"),
             tier_label(tier)
         ));
     }
@@ -325,7 +451,10 @@ fn render_familiar_ward(body: &Value) -> String {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    out.push_str(&format!("\n  {:<6} {:<10} path\n", "tier", ""));
+    // Hand-laid header rather than `render_table`, so it takes the same
+    // primary tint by hand.
+    let surface_header = format!("{:<6} {:<10} path", "tier", "");
+    out.push_str(&format!("\n  {}{surface_header}{}\n", p.primary, p.reset));
     for entry in &surface {
         let tier = entry
             .get("tier")
@@ -353,7 +482,11 @@ fn render_familiar_ward(body: &Value) -> String {
     out
 }
 
-fn render_familiars(body: &Value) -> String {
+/// Column index of the roster's STATUS cell, the one cell here that carries
+/// a lifecycle word.
+const FAMILIARS_STATUS_COLUMN: usize = 3;
+
+fn render_familiars(p: theme::Palette, body: &Value) -> String {
     let familiars = body.as_array().cloned().unwrap_or_default();
     if familiars.is_empty() {
         return "No familiars configured.\n\
@@ -373,9 +506,11 @@ fn render_familiars(body: &Value) -> String {
             ]
         })
         .collect();
-    let mut out = render_table(
+    let mut out = render_table_tinted(
+        p,
         &["ID", "NAME", "ROLE", "STATUS", "MEMORY", "DESCRIPTION"],
         &rows,
+        tint_status_column(FAMILIARS_STATUS_COLUMN),
     );
     out.push_str(&format!(
         "\n{} familiar(s) · roster file: ~/.coven/familiars.toml\n",
@@ -389,11 +524,11 @@ pub(crate) fn run_skills(json: bool) -> Result<()> {
     if json {
         return print_json(&api_get(&coven_home, "/api/v1/skills")?);
     }
-    print!("{}", view_text(&coven_home, ObserveView::Skills)?);
+    print!("{}", view_text_styled(&coven_home, ObserveView::Skills)?);
     Ok(())
 }
 
-fn render_skills(body: &Value) -> String {
+fn render_skills(p: theme::Palette, body: &Value) -> String {
     let skills = body.as_array().cloned().unwrap_or_default();
     if skills.is_empty() {
         return "No skills installed.\n\
@@ -413,6 +548,7 @@ fn render_skills(body: &Value) -> String {
         })
         .collect();
     let mut out = render_table(
+        p,
         &["ID", "VERSION", "CATEGORY", "OWNER", "DESCRIPTION"],
         &rows,
     );
@@ -425,11 +561,11 @@ pub(crate) fn run_memory(json: bool) -> Result<()> {
     if json {
         return print_json(&api_get(&coven_home, "/api/v1/memory")?);
     }
-    print!("{}", view_text(&coven_home, ObserveView::Memory)?);
+    print!("{}", view_text_styled(&coven_home, ObserveView::Memory)?);
     Ok(())
 }
 
-fn render_memory(body: &Value) -> String {
+fn render_memory(p: theme::Palette, body: &Value) -> String {
     let files = body.as_array().cloned().unwrap_or_default();
     if files.is_empty() {
         return "No memory files.\n\
@@ -447,7 +583,7 @@ fn render_memory(body: &Value) -> String {
             ]
         })
         .collect();
-    let mut out = render_table(&["FAMILIAR", "TITLE", "UPDATED", "EXCERPT"], &rows);
+    let mut out = render_table(p, &["FAMILIAR", "TITLE", "UPDATED", "EXCERPT"], &rows);
     out.push_str(&format!("\n{} memory file(s)\n", files.len()));
     out
 }
@@ -457,11 +593,11 @@ pub(crate) fn run_research(json: bool) -> Result<()> {
     if json {
         return print_json(&api_get(&coven_home, "/api/v1/research")?);
     }
-    print!("{}", view_text(&coven_home, ObserveView::Research)?);
+    print!("{}", view_text_styled(&coven_home, ObserveView::Research)?);
     Ok(())
 }
 
-fn render_research(body: &Value) -> String {
+fn render_research(p: theme::Palette, body: &Value) -> String {
     let rows_json = body.as_array().cloned().unwrap_or_default();
     if rows_json.is_empty() {
         return "No research log.\n\
@@ -485,6 +621,7 @@ fn render_research(body: &Value) -> String {
         })
         .collect();
     let mut out = render_table(
+        p,
         &["ITER", "TOPIC", "SCORE", "DELTA", "DECISION", "SOURCE"],
         &rows,
     );
@@ -753,7 +890,11 @@ fn render_ward_audit(body: &Value) -> String {
             ]
         })
         .collect();
+    // Deliberately plain: the Ward surfaces are outside this change's scope
+    // (their sibling views hand-lay their own columns), so they keep the
+    // byte-for-byte output they have today until they are styled as a set.
     let mut out = render_table(
+        theme::Palette::plain(),
         &["ID", "EVENT", "TIER", "DECISION", "SURFACES", "DECIDED"],
         &rows,
     );
@@ -771,19 +912,22 @@ pub(crate) fn run_calls(id: Option<&str>, json: bool) -> Result<()> {
             if json {
                 return print_json(&body);
             }
-            print!("{}", render_call_detail(&body));
+            print!("{}", render_call_detail(theme::palette(), &body));
         }
         None => {
             if json {
                 return print_json(&api_get(&coven_home, "/api/v1/coven-calls")?);
             }
-            print!("{}", view_text(&coven_home, ObserveView::Calls)?);
+            print!("{}", view_text_styled(&coven_home, ObserveView::Calls)?);
         }
     }
     Ok(())
 }
 
-fn render_calls(body: &Value) -> String {
+/// Column index of the delegation ledger's STATUS cell.
+const CALLS_STATUS_COLUMN: usize = 2;
+
+fn render_calls(p: theme::Palette, body: &Value) -> String {
     let calls = body
         .get("calls")
         .and_then(Value::as_array)
@@ -810,7 +954,12 @@ fn render_calls(body: &Value) -> String {
             ]
         })
         .collect();
-    let mut out = render_table(&["ID", "CALL", "STATUS", "CREATED", "REQUEST"], &rows);
+    let mut out = render_table_tinted(
+        p,
+        &["ID", "CALL", "STATUS", "CREATED", "REQUEST"],
+        &rows,
+        tint_status_column(CALLS_STATUS_COLUMN),
+    );
     out.push_str(&format!(
         "\n{} call(s) · detail: coven calls <id>\n",
         calls.len()
@@ -818,34 +967,54 @@ fn render_calls(body: &Value) -> String {
     out
 }
 
-fn render_call_detail(body: &Value) -> String {
+fn render_call_detail(p: theme::Palette, body: &Value) -> String {
     let call = body.get("call").cloned().unwrap_or(Value::Null);
     let mut out = String::new();
-    out.push_str(&format!("Coven call {}\n\n", str_cell(&call, "id")));
     out.push_str(&format!(
-        "  caller     {}\n",
+        "{} {}\n\n",
+        title(p, "Coven call"),
+        str_cell(&call, "id")
+    ));
+    out.push_str(&format!(
+        "{}     {}\n",
+        field(p, "caller"),
         str_cell(&call, "callerFamiliarId")
     ));
     out.push_str(&format!(
-        "  callee     {}\n",
+        "{}     {}\n",
+        field(p, "callee"),
         str_cell(&call, "calleeFamiliarId")
     ));
-    out.push_str(&format!("  status     {}\n", str_cell(&call, "status")));
-    out.push_str(&format!("  created    {}\n", str_cell(&call, "createdAt")));
+    out.push_str(&format!(
+        "{}     {}\n",
+        field(p, "status"),
+        status_value(p, &str_cell(&call, "status"))
+    ));
+    out.push_str(&format!(
+        "{}    {}\n",
+        field(p, "created"),
+        str_cell(&call, "createdAt")
+    ));
     if call.get("endedAt").and_then(Value::as_str).is_some() {
-        out.push_str(&format!("  ended      {}\n", str_cell(&call, "endedAt")));
+        out.push_str(&format!(
+            "{}      {}\n",
+            field(p, "ended"),
+            str_cell(&call, "endedAt")
+        ));
     }
     if let Some(session) = call.get("sessionId").and_then(Value::as_str) {
         out.push_str(&format!(
-            "  session    {session} (coven sessions show {session})\n"
+            "{}    {session} (coven sessions show {session})\n",
+            field(p, "session")
         ));
     }
     out.push_str(&format!(
-        "\n  request\n    {}\n",
+        "\n{}\n    {}\n",
+        field(p, "request"),
         str_cell(&call, "request")
     ));
     if let Some(artifact) = call.get("artifact").and_then(Value::as_str) {
-        out.push_str(&format!("\n  artifact\n    {artifact}\n"));
+        out.push_str(&format!("\n{}\n    {artifact}\n", field(p, "artifact")));
     }
     out
 }
@@ -857,25 +1026,40 @@ pub(crate) fn run_hub_status(json: bool) -> Result<()> {
     if json {
         return print_json(&api_get(&coven_home, "/api/v1/hub/status")?);
     }
-    print!("{}", view_text(&coven_home, ObserveView::HubStatus)?);
+    print!("{}", view_text_styled(&coven_home, ObserveView::HubStatus)?);
     Ok(())
 }
 
-fn render_hub_status(body: &Value) -> String {
+/// Column index of the hub overview node table's AVAILABLE cell.
+const HUB_STATUS_AVAILABLE_COLUMN: usize = 1;
+
+fn render_hub_status(p: theme::Palette, body: &Value) -> String {
     let mut out = String::new();
-    out.push_str("Hub status\n\n");
-    out.push_str(&format!("  role       {}\n", str_cell(body, "role")));
-    out.push_str(&format!("  hub id     {}\n", str_cell(body, "hubId")));
+    out.push_str(&format!("{}\n\n", title(p, "Hub status")));
+    out.push_str(&format!(
+        "{}       {}\n",
+        field(p, "role"),
+        str_cell(body, "role")
+    ));
+    out.push_str(&format!(
+        "{}     {}\n",
+        field(p, "hub id"),
+        str_cell(body, "hubId")
+    ));
     let total = body.get("nodesTotal").and_then(Value::as_u64).unwrap_or(0);
     let available = body
         .get("nodesAvailable")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    out.push_str(&format!("  nodes      {available}/{total} available\n"));
+    out.push_str(&format!(
+        "{}      {available}/{total} available\n",
+        field(p, "nodes")
+    ));
     if let Some(queue) = body.get("globalQueue") {
         let n = |key: &str| queue.get(key).and_then(Value::as_u64).unwrap_or(0);
         out.push_str(&format!(
-            "  queue      {} queued · {} assigned · {} held ({} total)\n",
+            "{}      {} queued · {} assigned · {} held ({} total)\n",
+            field(p, "queue"),
             n("queued"),
             n("assigned"),
             n("held"),
@@ -906,9 +1090,11 @@ fn render_hub_status(body: &Value) -> String {
         })
         .collect();
     out.push('\n');
-    out.push_str(&render_table(
+    out.push_str(&render_table_tinted(
+        p,
         &["NODE", "AVAILABLE", "PRESSURE", "LAST HEALTH"],
         &rows,
+        tint_status_column(HUB_STATUS_AVAILABLE_COLUMN),
     ));
     out
 }
@@ -921,20 +1107,23 @@ pub(crate) fn run_hub_nodes(id: Option<&str>, json: bool) -> Result<()> {
             if json {
                 return print_json(&body);
             }
-            print!("{}", render_hub_node_detail(&body));
+            print!("{}", render_hub_node_detail(theme::palette(), &body));
         }
         None => {
             let body = api_get(&coven_home, "/api/v1/hub/nodes")?;
             if json {
                 return print_json(&body);
             }
-            print!("{}", render_hub_nodes(&body));
+            print!("{}", render_hub_nodes(theme::palette(), &body));
         }
     }
     Ok(())
 }
 
-fn render_hub_nodes(body: &Value) -> String {
+/// Column index of the node table's AVAILABLE cell.
+const HUB_NODES_AVAILABLE_COLUMN: usize = 3;
+
+fn render_hub_nodes(p: theme::Palette, body: &Value) -> String {
     let nodes = body
         .get("nodes")
         .and_then(Value::as_array)
@@ -969,7 +1158,8 @@ fn render_hub_nodes(body: &Value) -> String {
             ]
         })
         .collect();
-    let mut out = render_table(
+    let mut out = render_table_tinted(
+        p,
         &[
             "NODE",
             "ROLE",
@@ -980,6 +1170,7 @@ fn render_hub_nodes(body: &Value) -> String {
             "UPDATED",
         ],
         &rows,
+        tint_status_column(HUB_NODES_AVAILABLE_COLUMN),
     );
     out.push_str(&format!(
         "\n{} node(s) · detail: coven hub nodes <id>\n",
@@ -1004,43 +1195,55 @@ fn list_cell(value: &Value, key: &str) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn render_hub_node_detail(node: &Value) -> String {
+fn render_hub_node_detail(p: theme::Palette, node: &Value) -> String {
     let node_id = str_cell(node, "nodeId");
     let mut out = String::new();
-    out.push_str(&format!("Hub node {node_id}\n\n"));
-    out.push_str(&format!("  role          {}\n", str_cell(node, "role")));
+    out.push_str(&format!("{} {node_id}\n\n", title(p, "Hub node")));
     out.push_str(&format!(
-        "  transport     {}\n",
+        "{}          {}\n",
+        field(p, "role"),
+        str_cell(node, "role")
+    ));
+    out.push_str(&format!(
+        "{}     {}\n",
+        field(p, "transport"),
         str_cell(node, "transport")
     ));
     out.push_str(&format!(
-        "  available     {}\n",
-        str_cell(node, "available")
+        "{}     {}\n",
+        field(p, "available"),
+        status_value(p, &str_cell(node, "available"))
     ));
     out.push_str(&format!(
-        "  pressure      {}\n",
+        "{}      {}\n",
+        field(p, "pressure"),
         str_cell(node, "queuePressure")
     ));
     out.push_str(&format!(
-        "  capabilities  {}\n",
+        "{}  {}\n",
+        field(p, "capabilities"),
         list_cell(node, "capabilities")
     ));
     out.push_str(&format!(
-        "  last health   {}\n",
+        "{}   {}\n",
+        field(p, "last health"),
         str_cell(node, "lastHealthAt")
     ));
     if node.get("lastError").and_then(Value::as_str).is_some() {
         out.push_str(&format!(
-            "  last error    {}\n",
+            "{}    {}\n",
+            field(p, "last error"),
             str_cell(node, "lastError")
         ));
     }
     out.push_str(&format!(
-        "  registered    {}\n",
+        "{}    {}\n",
+        field(p, "registered"),
         str_cell(node, "registeredAt")
     ));
     out.push_str(&format!(
-        "  updated       {}\n",
+        "{}       {}\n",
+        field(p, "updated"),
         str_cell(node, "updatedAt")
     ));
     out.push_str(&format!(
@@ -1056,7 +1259,7 @@ pub(crate) fn run_hub_jobs(id: Option<&str>, state: Option<&str>, json: bool) ->
         if json {
             return print_json(&body);
         }
-        print!("{}", render_hub_job_detail(&body));
+        print!("{}", render_hub_job_detail(theme::palette(), &body));
         return Ok(());
     }
     let path = match state {
@@ -1067,11 +1270,14 @@ pub(crate) fn run_hub_jobs(id: Option<&str>, state: Option<&str>, json: bool) ->
     if json {
         return print_json(&body);
     }
-    print!("{}", render_hub_jobs(&body));
+    print!("{}", render_hub_jobs(theme::palette(), &body));
     Ok(())
 }
 
-fn render_hub_jobs(body: &Value) -> String {
+/// Column index of the job table's STATE cell.
+const HUB_JOBS_STATE_COLUMN: usize = 1;
+
+fn render_hub_jobs(p: theme::Palette, body: &Value) -> String {
     let jobs = body
         .get("jobs")
         .and_then(Value::as_array)
@@ -1095,9 +1301,11 @@ fn render_hub_jobs(body: &Value) -> String {
             ]
         })
         .collect();
-    let mut out = render_table(
+    let mut out = render_table_tinted(
+        p,
         &["JOB", "STATE", "PRIORITY", "NODE", "LOOP", "UPDATED"],
         &rows,
+        tint_status_column(HUB_JOBS_STATE_COLUMN),
     );
     out.push_str(&format!(
         "\n{} job(s) · detail: coven hub jobs <id> · filter with --state <queued|assigned|held|completed|failed|cancelled>\n",
@@ -1111,38 +1319,67 @@ fn render_hub_jobs(body: &Value) -> String {
 /// escape hatch for the full record.
 const DETAIL_TEXT_LIMIT: usize = 160;
 
-fn render_hub_job_detail(job: &Value) -> String {
+fn render_hub_job_detail(p: theme::Palette, job: &Value) -> String {
     let job_id = str_cell(job, "jobId");
     let mut out = String::new();
-    out.push_str(&format!("Hub job {job_id}\n\n"));
-    out.push_str(&format!("  state      {}\n", str_cell(job, "state")));
-    out.push_str(&format!("  priority   {}\n", str_cell(job, "priority")));
+    out.push_str(&format!("{} {job_id}\n\n", title(p, "Hub job")));
     out.push_str(&format!(
-        "  requires   {}\n",
+        "{}      {}\n",
+        field(p, "state"),
+        status_value(p, &str_cell(job, "state"))
+    ));
+    out.push_str(&format!(
+        "{}   {}\n",
+        field(p, "priority"),
+        str_cell(job, "priority")
+    ));
+    out.push_str(&format!(
+        "{}   {}\n",
+        field(p, "requires"),
         list_cell(job, "requiredCapabilities")
     ));
     out.push_str(&format!(
-        "  node       {}\n",
+        "{}       {}\n",
+        field(p, "node"),
         str_cell(job, "assignedNodeId")
     ));
-    out.push_str(&format!("  loop       {}\n", str_cell(job, "loopId")));
-    out.push_str(&format!("  created    {}\n", str_cell(job, "createdAt")));
-    out.push_str(&format!("  updated    {}\n", str_cell(job, "updatedAt")));
+    out.push_str(&format!(
+        "{}       {}\n",
+        field(p, "loop"),
+        str_cell(job, "loopId")
+    ));
+    out.push_str(&format!(
+        "{}    {}\n",
+        field(p, "created"),
+        str_cell(job, "createdAt")
+    ));
+    out.push_str(&format!(
+        "{}    {}\n",
+        field(p, "updated"),
+        str_cell(job, "updatedAt")
+    ));
     if let Some(route) = job.get("route").filter(|route| !route.is_null()) {
-        out.push_str("\n  route\n");
-        out.push_str(&format!("    node       {}\n", str_cell(route, "nodeId")));
+        out.push_str(&format!("\n{}\n", field(p, "route")));
         out.push_str(&format!(
-            "    decision   {}\n",
+            "  {}       {}\n",
+            field(p, "node"),
+            str_cell(route, "nodeId")
+        ));
+        out.push_str(&format!(
+            "  {}   {}\n",
+            field(p, "decision"),
             str_cell(route, "decisionId")
         ));
         out.push_str(&format!(
-            "    reason     {}\n",
+            "  {}     {}\n",
+            field(p, "reason"),
             theme::fit_chars(&str_cell(route, "reason"), DETAIL_TEXT_LIMIT)
         ));
     }
     if let Some(payload) = job.get("payload").filter(|payload| !payload.is_null()) {
         out.push_str(&format!(
-            "\n  payload\n    {}\n",
+            "\n{}\n    {}\n",
+            field(p, "payload"),
             theme::fit_chars(&payload.to_string(), DETAIL_TEXT_LIMIT)
         ));
     }
@@ -1160,30 +1397,51 @@ pub(crate) fn run_hub_dispatch(job_id: &str, json: bool) -> Result<()> {
     if json {
         return print_json(&body);
     }
-    print!("{}", render_hub_dispatch(&body));
+    print!("{}", render_hub_dispatch(theme::palette(), &body));
     Ok(())
 }
 
-fn render_hub_dispatch(body: &Value) -> String {
+fn render_hub_dispatch(p: theme::Palette, body: &Value) -> String {
     let job_id = str_cell(body, "jobId");
     let mut out = String::new();
-    out.push_str(&format!("Executor dispatch {job_id}\n\n"));
-    out.push_str(&format!("  node       {}\n", str_cell(body, "nodeId")));
-    out.push_str(&format!("  status     {}\n", str_cell(body, "status")));
-    out.push_str(&format!("  created    {}\n", str_cell(body, "createdAt")));
-    out.push_str(&format!("  updated    {}\n", str_cell(body, "updatedAt")));
+    out.push_str(&format!("{} {job_id}\n\n", title(p, "Executor dispatch")));
+    out.push_str(&format!(
+        "{}       {}\n",
+        field(p, "node"),
+        str_cell(body, "nodeId")
+    ));
+    out.push_str(&format!(
+        "{}     {}\n",
+        field(p, "status"),
+        status_value(p, &str_cell(body, "status"))
+    ));
+    out.push_str(&format!(
+        "{}    {}\n",
+        field(p, "created"),
+        str_cell(body, "createdAt")
+    ));
+    out.push_str(&format!(
+        "{}    {}\n",
+        field(p, "updated"),
+        str_cell(body, "updatedAt")
+    ));
     if let Some(job) = body.get("job").filter(|job| !job.is_null()) {
         out.push_str(&format!(
-            "\n  job spec\n    {}\n",
+            "\n{}\n    {}\n",
+            field(p, "job spec"),
             theme::fit_chars(&job.to_string(), DETAIL_TEXT_LIMIT)
         ));
     }
     match body.get("envelope").filter(|envelope| !envelope.is_null()) {
         Some(envelope) => out.push_str(&format!(
-            "\n  result envelope\n    {}\n",
+            "\n{}\n    {}\n",
+            field(p, "result envelope"),
             theme::fit_chars(&envelope.to_string(), DETAIL_TEXT_LIMIT)
         )),
-        None => out.push_str("\n  result envelope\n    — (no result reported yet)\n"),
+        None => out.push_str(&format!(
+            "\n{}\n    — (no result reported yet)\n",
+            field(p, "result envelope")
+        )),
     }
     out.push_str(&format!(
         "\n  full record: coven hub dispatch {job_id} --json\n"
@@ -1196,11 +1454,11 @@ pub(crate) fn run_hub_routing(json: bool) -> Result<()> {
     if json {
         return print_json(&body);
     }
-    print!("{}", render_hub_routing(&body));
+    print!("{}", render_hub_routing(theme::palette(), &body));
     Ok(())
 }
 
-fn render_hub_routing(body: &Value) -> String {
+fn render_hub_routing(p: theme::Palette, body: &Value) -> String {
     let routes = body
         .get("routes")
         .and_then(Value::as_array)
@@ -1221,7 +1479,7 @@ fn render_hub_routing(body: &Value) -> String {
             ]
         })
         .collect();
-    let mut out = render_table(&["JOB", "NODE", "DECISION", "REASON", "UPDATED"], &rows);
+    let mut out = render_table(p, &["JOB", "NODE", "DECISION", "REASON", "UPDATED"], &rows);
     out.push_str(&format!("\n{} route(s)\n", routes.len()));
     out
 }
@@ -1490,7 +1748,13 @@ fn render_session_events(body: &Value) -> String {
             ]
         })
         .collect();
-    let mut out = render_table(&["SEQ", "CREATED", "KIND", "PAYLOAD"], &rows);
+    // Deliberately plain: the `sessions` views are outside this change's
+    // scope and keep the byte-for-byte output they have today.
+    let mut out = render_table(
+        theme::Palette::plain(),
+        &["SEQ", "CREATED", "KIND", "PAYLOAD"],
+        &rows,
+    );
     let mut footer = format!("\n{} event(s)", events.len());
     if body.get("hasMore").and_then(Value::as_bool) == Some(true) {
         if let Some(cursor) = body.pointer("/nextCursor/afterSeq").and_then(Value::as_i64) {
@@ -1543,6 +1807,13 @@ fn resolve_full_session_id(reference: &str) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Every renderer test drives the escape-free palette, so these
+    /// assertions describe the exact bytes a pipe or `NO_COLOR` terminal
+    /// sees. The styled counterparts have their own tests below.
+    fn plain() -> theme::Palette {
+        theme::Palette::plain()
+    }
 
     #[test]
     fn ward_pending_renderer_surfaces_probe_summary() {
@@ -1712,6 +1983,7 @@ mod tests {
     #[test]
     fn render_table_pads_columns_and_trims_trailing_space() {
         let out = render_table(
+            plain(),
             &["ID", "NAME"],
             &[
                 vec!["a".to_string(), "Alpha".to_string()],
@@ -1738,7 +2010,7 @@ mod tests {
             "research_iterations": 5,
             "last_research_delta": 2
         });
-        let out = render_status(None, &health, &overview);
+        let out = render_status(plain(), None, &health, &overview);
         assert!(out.contains("daemon     not running — start it with `coven daemon start`"));
         assert!(out.contains("version    1.2.3"));
         assert!(out.contains("sessions   3 open"));
@@ -1760,7 +2032,7 @@ mod tests {
             "research_iterations": 0,
             "last_research_delta": 0
         });
-        let out = render_status(None, &health, &overview);
+        let out = render_status(plain(), None, &health, &overview);
         assert!(out.contains("familiars  none — add [[familiar]] entries"));
         // Zero-iteration research and zero-node hub stay quiet.
         assert!(!out.contains("research"));
@@ -1779,7 +2051,7 @@ mod tests {
                 "description": "keeps the hearth"
             }
         ]);
-        let out = render_familiars(&body);
+        let out = render_familiars(plain(), &body);
         assert!(out.contains("ID"));
         assert!(out.contains("charm"));
         assert!(out.contains("steward"));
@@ -1789,7 +2061,7 @@ mod tests {
 
     #[test]
     fn render_familiars_empty_state_teaches_setup() {
-        let out = render_familiars(&json!([]));
+        let out = render_familiars(plain(), &json!([]));
         assert!(out.contains("No familiars configured."));
         assert!(out.contains("familiars.toml"));
     }
@@ -1805,15 +2077,15 @@ mod tests {
                 "description": "run the eval loop"
             }
         ]);
-        let out = render_skills(&body);
+        let out = render_skills(plain(), &body);
         assert!(out.contains("eval-loop"));
         assert!(out.contains("1 skill(s)"));
     }
 
     #[test]
     fn render_memory_and_research_have_empty_hints() {
-        assert!(render_memory(&json!([])).contains("~/.coven/memory/"));
-        assert!(render_research(&json!([])).contains("results.tsv"));
+        assert!(render_memory(plain(), &json!([])).contains("~/.coven/memory/"));
+        assert!(render_research(plain(), &json!([])).contains("results.tsv"));
     }
 
     #[test]
@@ -1829,7 +2101,7 @@ mod tests {
                 "request": "summarize the release notes"
             }]
         });
-        let out = render_calls(&body);
+        let out = render_calls(plain(), &body);
         assert!(out.contains("nova → sage"));
         assert!(out.contains("running"));
         assert!(out.contains("coven calls <id>"));
@@ -1852,7 +2124,7 @@ mod tests {
                 "protectedSurface": ["SOUL.md"]
             }
         });
-        let text = render_familiar_ward(&body);
+        let text = render_familiar_ward(plain(), &body);
 
         assert!(text.contains("Familiar sage — Ward surface"));
         assert!(text.contains("/var/tmp/coven-test/familiars/sage"));
@@ -1881,7 +2153,7 @@ mod tests {
                 "artifact": "done"
             }
         });
-        let out = render_call_detail(&body);
+        let out = render_call_detail(plain(), &body);
         assert!(out.contains("caller     nova"));
         assert!(out.contains("ended      2026-01-01T01:00:00Z"));
         assert!(out.contains("coven sessions show sess-9"));
@@ -1898,7 +2170,7 @@ mod tests {
             "globalQueue": { "queued": 0, "assigned": 0, "held": 0, "total": 0 },
             "nodes": []
         });
-        let out = render_hub_status(&body);
+        let out = render_hub_status(plain(), &body);
         assert!(out.contains("single-host"));
         assert!(out.contains("docs/HUB-OPERATIONS.md"));
     }
@@ -1918,7 +2190,7 @@ mod tests {
                 "lastHealthAt": "2026-01-01T00:00:00Z"
             }]
         });
-        let out = render_hub_status(&body);
+        let out = render_hub_status(plain(), &body);
         assert!(out.contains("nodes      1/1 available"));
         assert!(out.contains("2 queued · 1 assigned · 0 held (3 total)"));
         assert!(out.contains("node_a"));
@@ -1936,7 +2208,7 @@ mod tests {
                 "updatedAt": "2026-01-01T00:00:00Z"
             }]
         });
-        let out = render_hub_jobs(&body);
+        let out = render_hub_jobs(plain(), &body);
         assert!(out.contains("job-1"));
         assert!(out.contains("--state <queued|assigned|held|completed|failed|cancelled>"));
     }
@@ -2022,7 +2294,7 @@ mod tests {
              description = \"keeps the hearth\"\n",
         )?;
         let body = get_body(temp.path(), "/api/v1/familiars")?;
-        let out = render_familiars(&body);
+        let out = render_familiars(plain(), &body);
         assert!(out.contains("charm"), "id column lost: {out}");
         assert!(out.contains("Charm"), "display_name column lost: {out}");
         assert!(out.contains("steward"), "role column lost: {out}");
@@ -2040,7 +2312,7 @@ mod tests {
             r#"{"name":"eval-loop","description":"run the loop","version":"2.0.0","author":"coven","category":"ops"}"#,
         )?;
         let body = get_body(temp.path(), "/api/v1/skills")?;
-        let out = render_skills(&body);
+        let out = render_skills(plain(), &body);
         assert!(out.contains("eval-loop"), "id lost: {out}");
         assert!(out.contains("2.0.0"), "version lost: {out}");
         assert!(out.contains("ops"), "category lost: {out}");
@@ -2055,7 +2327,7 @@ mod tests {
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("hearth-notes.md"), "# Hearth\nembers burning\n")?;
         let body = get_body(temp.path(), "/api/v1/memory")?;
-        let out = render_memory(&body);
+        let out = render_memory(plain(), &body);
         assert!(out.contains("charm"), "familiar_id lost: {out}");
         assert!(out.contains("hearth-notes"), "title lost: {out}");
         Ok(())
@@ -2071,7 +2343,7 @@ mod tests {
             "3\tstream continuity\t9.0\t2.5\tadopt\tnotes.md\n",
         )?;
         let body = get_body(temp.path(), "/api/v1/research")?;
-        let out = render_research(&body);
+        let out = render_research(plain(), &body);
         assert!(out.contains("stream continuity"), "topic lost: {out}");
         assert!(out.contains("adopt"), "decision lost: {out}");
         assert!(out.contains("2.5"), "delta lost: {out}");
@@ -2089,12 +2361,12 @@ mod tests {
             Some("sess-9"),
         )?;
         let list = get_body(temp.path(), "/api/v1/coven-calls")?;
-        let out = render_calls(&list);
+        let out = render_calls(plain(), &list);
         assert!(out.contains("nova → sage"), "caller/callee lost: {out}");
         assert!(out.contains("running"), "status lost: {out}");
 
         let detail = get_body(temp.path(), &format!("/api/v1/coven-calls/{call_id}"))?;
-        let out = render_call_detail(&detail);
+        let out = render_call_detail(plain(), &detail);
         assert!(out.contains("caller     nova"), "caller lost: {out}");
         assert!(
             out.contains("coven sessions show sess-9"),
@@ -2126,7 +2398,7 @@ mod tests {
         anyhow::ensure!(enqueue.status == 201, "enqueue: {}", enqueue.body);
 
         let status = get_body(temp.path(), "/api/v1/hub/status")?;
-        let out = render_hub_status(&status);
+        let out = render_hub_status(plain(), &status);
         assert!(out.contains("role       hub"), "role lost: {out}");
         assert!(
             out.contains("nodes      1/1 available"),
@@ -2136,18 +2408,18 @@ mod tests {
         assert!(out.contains("node_a"), "node row lost: {out}");
 
         let nodes = get_body(temp.path(), "/api/v1/hub/nodes")?;
-        let out = render_hub_nodes(&nodes);
+        let out = render_hub_nodes(plain(), &nodes);
         assert!(out.contains("node_a"), "nodeId lost: {out}");
         assert!(out.contains("compute_executor"), "role lost: {out}");
         assert!(out.contains("gpu"), "capabilities lost: {out}");
 
         let jobs = get_body(temp.path(), "/api/v1/hub/jobs?state=queued")?;
-        let out = render_hub_jobs(&jobs);
+        let out = render_hub_jobs(plain(), &jobs);
         assert!(out.contains("job-1"), "jobId lost: {out}");
         assert!(out.contains("queued"), "state lost: {out}");
 
         let routing = get_body(temp.path(), "/api/v1/hub/routing")?;
-        let out = render_hub_routing(&routing);
+        let out = render_hub_routing(plain(), &routing);
         assert!(
             out.contains("No routing decisions recorded."),
             "unexpected routing render: {out}"
@@ -2165,12 +2437,12 @@ mod tests {
         anyhow::ensure!(assign.status == 200, "assign: {}", assign.body);
 
         let routing = get_body(temp.path(), "/api/v1/hub/routing")?;
-        let out = render_hub_routing(&routing);
+        let out = render_hub_routing(plain(), &routing);
         assert!(out.contains("job-1"), "routed jobId lost: {out}");
         assert!(out.contains("node_a"), "routed nodeId lost: {out}");
 
         let assigned = get_body(temp.path(), "/api/v1/hub/jobs?state=assigned")?;
-        let out = render_hub_jobs(&assigned);
+        let out = render_hub_jobs(plain(), &assigned);
         assert!(out.contains("job-1"), "assigned job lost: {out}");
         assert!(out.contains("node_a"), "assigned node lost: {out}");
         Ok(())
@@ -2207,7 +2479,7 @@ mod tests {
         anyhow::ensure!(assign.status == 200, "assign: {}", assign.body);
 
         let node = get_body(temp.path(), "/api/v1/hub/nodes/node_a")?;
-        let out = render_hub_node_detail(&node);
+        let out = render_hub_node_detail(plain(), &node);
         assert!(out.contains("Hub node node_a"), "node id lost: {out}");
         assert!(out.contains("compute_executor"), "role lost: {out}");
         assert!(out.contains("gpu"), "capabilities lost: {out}");
@@ -2217,7 +2489,7 @@ mod tests {
         );
 
         let job = get_body(temp.path(), "/api/v1/hub/jobs/job-1")?;
-        let out = render_hub_job_detail(&job);
+        let out = render_hub_job_detail(plain(), &job);
         assert!(out.contains("Hub job job-1"), "job id lost: {out}");
         assert!(out.contains("assigned"), "state lost: {out}");
         assert!(out.contains("node_a"), "assigned node lost: {out}");
@@ -2245,7 +2517,7 @@ mod tests {
             },
         )?;
         let dispatch = get_body(temp.path(), "/api/v1/hub/dispatches/job-1")?;
-        let out = render_hub_dispatch(&dispatch);
+        let out = render_hub_dispatch(plain(), &dispatch);
         assert!(
             out.contains("Executor dispatch job-1"),
             "dispatch id lost: {out}"
@@ -2258,15 +2530,18 @@ mod tests {
 
     #[test]
     fn render_hub_dispatch_marks_missing_envelope() {
-        let out = render_hub_dispatch(&json!({
-            "jobId": "job-2",
-            "nodeId": "node_a",
-            "status": "dispatched",
-            "job": {"command": ["true"]},
-            "envelope": null,
-            "createdAt": "2026-01-01T00:00:00Z",
-            "updatedAt": "2026-01-01T00:00:00Z",
-        }));
+        let out = render_hub_dispatch(
+            plain(),
+            &json!({
+                "jobId": "job-2",
+                "nodeId": "node_a",
+                "status": "dispatched",
+                "job": {"command": ["true"]},
+                "envelope": null,
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+            }),
+        );
         assert!(
             out.contains("no result reported yet"),
             "missing-envelope state lost: {out}"
@@ -2487,5 +2762,492 @@ mod tests {
         let out = render_session_log(&log);
         assert!(out.contains("2026-01-01T00:01:00Z"), "ts lost: {out}");
         Ok(())
+    }
+
+    // ── Plain / styled split ─────────────────────────────────────────────
+    //
+    // `view_text` and every renderer behind it has two call shapes: the
+    // escape-free one that feeds the ratatui chat transcript, and the
+    // brand-tinted one that goes to raw stdout. These tests pin both halves:
+    // the plain half must keep the exact bytes it shipped with, and the
+    // styled half must differ from it by escapes alone.
+
+    /// Drop SGR escape sequences, leaving the visible characters. Used to
+    /// prove a styled render and its plain twin occupy the same columns.
+    fn strip_ansi(value: &str) -> String {
+        let mut out = String::new();
+        let mut chars = value.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Every in-scope observe surface rendered from one fixture set, so the
+    /// plain and styled renders can be compared surface by surface.
+    fn observe_surfaces(p: theme::Palette) -> Vec<(&'static str, String)> {
+        let health = json!({
+            "covenVersion": "1.2.3",
+            "hub": { "nodesTotal": 2, "nodesAvailable": 1 }
+        });
+        let overview = json!({
+            "open_sessions": 3,
+            "active_familiars": 1,
+            "total_familiars": 2,
+            "skills_count": 4,
+            "research_iterations": 5,
+            "last_research_delta": 2
+        });
+        let familiars = json!([
+            { "id": "charm", "display_name": "Charm", "role": "steward",
+              "status": "offline", "memory_freshness": "2d ago",
+              "description": "keeps the hearth" },
+            { "id": "sage", "display_name": "Sage", "role": "researcher",
+              "status": "active", "memory_freshness": "—",
+              "description": "reads everything" }
+        ]);
+        let skills = json!([
+            { "id": "eval-loop", "version": "1.0.0", "category": "general",
+              "owner": "coven", "description": "run the eval loop" }
+        ]);
+        let memory = json!([
+            { "familiar_id": "sage", "title": "notes", "updated_at": "2026-01-01T00:00:00Z",
+              "excerpt": "a note" }
+        ]);
+        let research = json!([
+            { "iteration": 1, "topic": "colors", "score": "0.5", "delta": "0.1",
+              "decision": "keep", "source": "local" }
+        ]);
+        let calls = json!({ "ok": true, "calls": [
+            { "id": "call-1", "callerFamiliarId": "nova", "calleeFamiliarId": "sage",
+              "status": "running", "createdAt": "2026-01-01T00:00:00Z",
+              "request": "summarize the release notes" },
+            { "id": "call-2", "callerFamiliarId": "nova", "calleeFamiliarId": "sage",
+              "status": "failed", "createdAt": "2026-01-01T00:00:00Z",
+              "request": "explode" }
+        ]});
+        let call_detail = json!({ "ok": true, "call": {
+            "id": "call-1", "callerFamiliarId": "nova", "calleeFamiliarId": "sage",
+            "status": "completed", "createdAt": "2026-01-01T00:00:00Z",
+            "endedAt": "2026-01-01T01:00:00Z", "sessionId": "sess-9",
+            "request": "summarize", "artifact": "done" }});
+        let hub_status = json!({
+            "role": "hub", "hubId": "hub_1", "nodesTotal": 1, "nodesAvailable": 1,
+            "globalQueue": { "queued": 2, "assigned": 1, "held": 0, "total": 3 },
+            "nodes": [{ "nodeId": "node_a", "available": true, "queuePressure": 0,
+                        "lastHealthAt": "2026-01-01T00:00:00Z" }]
+        });
+        let hub_single = json!({
+            "role": "hub", "hubId": "hub_1", "nodesTotal": 0, "nodesAvailable": 0,
+            "globalQueue": { "queued": 0, "assigned": 0, "held": 0, "total": 0 },
+            "nodes": []
+        });
+        let hub_nodes = json!({ "nodes": [{
+            "nodeId": "node_a", "role": "executor", "transport": "tcp",
+            "available": false, "queuePressure": 1, "capabilities": ["codex"],
+            "updatedAt": "2026-01-01T00:00:00Z" }]});
+        let hub_node_detail = json!({
+            "nodeId": "node_a", "role": "executor", "transport": "tcp",
+            "available": true, "queuePressure": 0, "capabilities": ["codex"],
+            "lastHealthAt": "2026-01-01T00:00:00Z", "lastError": "boom",
+            "registeredAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+        });
+        let hub_jobs = json!({ "jobs": [
+            { "jobId": "job-1", "state": "queued", "priority": 5,
+              "assignedNodeId": null, "loopId": null, "updatedAt": "2026-01-01T00:00:00Z" },
+            { "jobId": "job-2", "state": "failed", "priority": 1,
+              "assignedNodeId": "node_a", "loopId": "loop-1", "updatedAt": "2026-01-01T00:00:00Z" }
+        ]});
+        let hub_job_detail = json!({
+            "jobId": "job-1", "state": "assigned", "priority": 5,
+            "requiredCapabilities": ["codex"], "assignedNodeId": "node_a",
+            "loopId": "loop-1", "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "route": { "nodeId": "node_a", "decisionId": "dec-1", "reason": "least pressure" },
+            "payload": { "task": "x" }
+        });
+        let hub_dispatch = json!({
+            "jobId": "job-1", "nodeId": "node_a", "status": "completed",
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+            "job": { "task": "x" }, "envelope": null
+        });
+        let hub_routing = json!({ "routes": [{
+            "jobId": "job-1", "nodeId": "node_a", "decisionId": "dec-1",
+            "reason": "least pressure", "updatedAt": "2026-01-01T00:00:00Z" }]});
+        let familiar_ward = json!({
+            "ok": true, "familiarId": "sage",
+            "workspace": "/var/tmp/coven-test/familiars/sage",
+            "ward": {
+                "principalKeyFingerprint": "SHA256:principal-key",
+                "defaultTier": 2,
+                "surface": [
+                    { "path": "SOUL.md", "tier": 0 },
+                    { "path": "memory/", "tier": 2 }
+                ],
+                "protectedSurface": ["SOUL.md"]
+            }
+        });
+
+        vec![
+            ("status", render_status(p, None, &health, &overview)),
+            ("familiars", render_familiars(p, &familiars)),
+            ("familiars_empty", render_familiars(p, &json!([]))),
+            ("familiar_ward", render_familiar_ward(p, &familiar_ward)),
+            ("skills", render_skills(p, &skills)),
+            ("memory", render_memory(p, &memory)),
+            ("research", render_research(p, &research)),
+            ("calls", render_calls(p, &calls)),
+            ("call_detail", render_call_detail(p, &call_detail)),
+            ("hub_status", render_hub_status(p, &hub_status)),
+            ("hub_status_single", render_hub_status(p, &hub_single)),
+            ("hub_nodes", render_hub_nodes(p, &hub_nodes)),
+            (
+                "hub_node_detail",
+                render_hub_node_detail(p, &hub_node_detail),
+            ),
+            ("hub_jobs", render_hub_jobs(p, &hub_jobs)),
+            ("hub_job_detail", render_hub_job_detail(p, &hub_job_detail)),
+            ("hub_dispatch", render_hub_dispatch(p, &hub_dispatch)),
+            ("hub_routing", render_hub_routing(p, &hub_routing)),
+        ]
+    }
+
+    fn transcript(surfaces: &[(&'static str, String)]) -> String {
+        let mut out = String::new();
+        for (name, text) in surfaces {
+            out.push_str(&format!("### {name}\n{text}@@@END@@@\n"));
+        }
+        out
+    }
+
+    /// The bytes every observe surface produced before color existed,
+    /// captured from `main`. `TerminalMode::NoColor` must still reproduce
+    /// them exactly: `--json`, pipes, `NO_COLOR`, `--color=never`, the Cast
+    /// shell's plain path, the chat transcript, and the smoke tests all read
+    /// this output, and none of them may see an escape or a shifted column.
+    const NO_COLOR_BASELINE: &str = r##"### status
+Coven status
+
+  daemon     not running — start it with `coven daemon start`
+  version    1.2.3
+  sessions   3 open
+  familiars  1 active / 2 total
+  skills     4 installed
+  research   5 iterations (last Δ 2)
+  hub        1/2 nodes available (details: coven hub status)
+
+Next: coven sessions · coven familiars · coven run <harness> "<task>"
+@@@END@@@
+### familiars
+ID     NAME   ROLE        STATUS   MEMORY  DESCRIPTION
+charm  Charm  steward     offline  2d ago  keeps the hearth
+sage   Sage   researcher  active   —       reads everything
+
+2 familiar(s) · roster file: ~/.coven/familiars.toml
+@@@END@@@
+### familiars_empty
+No familiars configured.
+Add [[familiar]] entries to ~/.coven/familiars.toml to build your roster.
+@@@END@@@
+### familiar_ward
+Familiar sage — Ward surface
+
+  workspace  /var/tmp/coven-test/familiars/sage
+  principal  SHA256:principal-key
+  unmatched  tier 2 (logged)
+
+  tier              path
+  0      protected  SOUL.md
+  2      logged     memory/
+
+  protected: SOUL.md
+@@@END@@@
+### skills
+ID         VERSION  CATEGORY  OWNER  DESCRIPTION
+eval-loop  1.0.0    general   coven  run the eval loop
+
+1 skill(s)
+@@@END@@@
+### memory
+FAMILIAR  TITLE  UPDATED               EXCERPT
+sage      notes  2026-01-01T00:00:00Z  a note
+
+1 memory file(s)
+@@@END@@@
+### research
+ITER  TOPIC   SCORE  DELTA  DECISION  SOURCE
+1     colors  0.5    0.1    keep      local
+
+1 research iteration(s)
+@@@END@@@
+### calls
+ID      CALL         STATUS   CREATED               REQUEST
+call-1  nova → sage  running  2026-01-01T00:00:00Z  summarize the release notes
+call-2  nova → sage  failed   2026-01-01T00:00:00Z  explode
+
+2 call(s) · detail: coven calls <id>
+@@@END@@@
+### call_detail
+Coven call call-1
+
+  caller     nova
+  callee     sage
+  status     completed
+  created    2026-01-01T00:00:00Z
+  ended      2026-01-01T01:00:00Z
+  session    sess-9 (coven sessions show sess-9)
+
+  request
+    summarize
+
+  artifact
+    done
+@@@END@@@
+### hub_status
+Hub status
+
+  role       hub
+  hub id     hub_1
+  nodes      1/1 available
+  queue      2 queued · 1 assigned · 0 held (3 total)
+
+NODE    AVAILABLE  PRESSURE  LAST HEALTH
+node_a  true       0         2026-01-01T00:00:00Z
+@@@END@@@
+### hub_status_single
+Hub status
+
+  role       hub
+  hub id     hub_1
+  nodes      0/0 available
+  queue      0 queued · 0 assigned · 0 held (0 total)
+
+No executor nodes registered — this daemon is running single-host.
+See docs/HUB-OPERATIONS.md to register nodes.
+@@@END@@@
+### hub_nodes
+NODE    ROLE      TRANSPORT  AVAILABLE  PRESSURE  CAPABILITIES  UPDATED
+node_a  executor  tcp        false      1         codex         2026-01-01T00:00:00Z
+
+1 node(s) · detail: coven hub nodes <id>
+@@@END@@@
+### hub_node_detail
+Hub node node_a
+
+  role          executor
+  transport     tcp
+  available     true
+  pressure      0
+  capabilities  codex
+  last health   2026-01-01T00:00:00Z
+  last error    boom
+  registered    2026-01-01T00:00:00Z
+  updated       2026-01-01T00:00:00Z
+
+  jobs: coven hub jobs --state assigned · full record: coven hub nodes node_a --json
+@@@END@@@
+### hub_jobs
+JOB    STATE   PRIORITY  NODE    LOOP    UPDATED
+job-1  queued  5         —       —       2026-01-01T00:00:00Z
+job-2  failed  1         node_a  loop-1  2026-01-01T00:00:00Z
+
+2 job(s) · detail: coven hub jobs <id> · filter with --state <queued|assigned|held|completed|failed|cancelled>
+@@@END@@@
+### hub_job_detail
+Hub job job-1
+
+  state      assigned
+  priority   5
+  requires   codex
+  node       node_a
+  loop       loop-1
+  created    2026-01-01T00:00:00Z
+  updated    2026-01-01T00:00:00Z
+
+  route
+    node       node_a
+    decision   dec-1
+    reason     least pressure
+
+  payload
+    {"task":"x"}
+
+  dispatch record: coven hub dispatch job-1 · full record: coven hub jobs job-1 --json
+@@@END@@@
+### hub_dispatch
+Executor dispatch job-1
+
+  node       node_a
+  status     completed
+  created    2026-01-01T00:00:00Z
+  updated    2026-01-01T00:00:00Z
+
+  job spec
+    {"task":"x"}
+
+  result envelope
+    — (no result reported yet)
+
+  full record: coven hub dispatch job-1 --json
+@@@END@@@
+### hub_routing
+JOB    NODE    DECISION  REASON          UPDATED
+job-1  node_a  dec-1     least pressure  2026-01-01T00:00:00Z
+
+1 route(s)
+@@@END@@@
+"##;
+
+    #[test]
+    fn no_color_render_is_byte_identical_to_the_pre_color_baseline() {
+        assert_eq!(transcript(&observe_surfaces(plain())), NO_COLOR_BASELINE);
+    }
+
+    #[test]
+    fn no_color_render_emits_no_escape_bytes_at_all() {
+        for (name, text) in observe_surfaces(plain()) {
+            assert!(
+                !text.contains('\x1b'),
+                "{name} leaked an escape into the plain render: {text:?}"
+            );
+        }
+        assert_eq!(theme::Palette::plain().mode, theme::TerminalMode::NoColor);
+    }
+
+    /// Column math runs on plain cells and the escapes are wrapped around
+    /// them afterwards, so stripping the escapes back out of a styled render
+    /// has to land on the plain render character for character — same column
+    /// stops, same line breaks, same trailing-space trimming.
+    #[test]
+    fn styled_render_keeps_the_plain_column_positions() {
+        let styled = observe_surfaces(theme::palette_for(theme::TerminalMode::TrueColor));
+        let plain = observe_surfaces(plain());
+        assert_eq!(styled.len(), plain.len());
+        for ((name, styled), (_, plain)) in styled.iter().zip(plain.iter()) {
+            // Empty-state surfaces are pure teaching prose: no header row, no
+            // field label, no status word, so there is nothing to tint.
+            if *name != "familiars_empty" {
+                assert_ne!(
+                    styled, plain,
+                    "{name} rendered identically in truecolor — it never got styled"
+                );
+            }
+            assert_eq!(
+                strip_ansi(styled),
+                *plain,
+                "{name} shifted columns between the styled and plain renders"
+            );
+        }
+    }
+
+    /// The restrained palette: header rows and field labels carry brand
+    /// tokens, status words carry their status semantic, and body text keeps
+    /// the terminal's default foreground.
+    #[test]
+    fn styled_render_tints_headers_labels_and_status_words() {
+        let p = theme::palette_for(theme::TerminalMode::TrueColor);
+        let surfaces: std::collections::HashMap<_, _> = observe_surfaces(p).into_iter().collect();
+        let primary = p.primary.to_string();
+        let label = p.field_label.to_string();
+        let reset = p.reset.to_string();
+
+        let familiars = &surfaces["familiars"];
+        assert!(
+            familiars.starts_with(&format!("{primary}ID     NAME")),
+            "roster header is not brand-tinted: {familiars:?}"
+        );
+        // A recognized lifecycle word takes its status token; an unknown one
+        // would stay at the default foreground.
+        let ready = p.status(theme::Status::Ready).to_string();
+        let idle = p.status(theme::Status::Idle).to_string();
+        assert!(familiars.contains(&format!("{idle}offline{reset}")));
+        assert!(familiars.contains(&format!("{ready}active{reset}")));
+        // Free text is never tinted.
+        assert!(familiars.contains("keeps the hearth"));
+        assert!(!familiars.contains(&format!("{primary}keeps the hearth")));
+
+        let status = &surfaces["status"];
+        assert!(status.contains(&format!("  {label}daemon{reset}     {idle}not running")));
+        assert!(status.contains(&format!("  {label}version{reset}    1.2.3")));
+
+        let jobs = &surfaces["hub_jobs"];
+        assert!(jobs.contains(&format!("{}failed{reset}", p.status(theme::Status::Error))));
+        assert!(jobs.contains(&format!("{idle}queued{reset}")));
+    }
+
+    /// Every escape this renderer opens is closed on the same cell, so a
+    /// daemon-supplied value that smuggles in an escape of its own cannot
+    /// repaint anything past its own column.
+    #[test]
+    fn styled_cells_always_close_their_escape_pair() {
+        let p = theme::palette_for(theme::TerminalMode::TrueColor);
+        let hostile = "\x1b[48;2;255;0;0m";
+        let body = json!([{
+            "id": "charm",
+            "display_name": hostile,
+            "role": "steward",
+            "status": "active",
+            "memory_freshness": "—",
+            "description": "keeps the hearth"
+        }]);
+        let out = render_familiars(p, &body);
+        let reset = p.reset.to_string();
+        // The tinted status cell closes, and the untrusted display name is
+        // passed through unstyled rather than being wrapped by us.
+        assert!(out.contains(&format!("{}active{reset}", p.status(theme::Status::Ready))));
+        assert_eq!(
+            out.matches(&reset).count(),
+            // One for the header row, one for the tinted status cell.
+            2,
+            "unbalanced escape pairs: {out:?}"
+        );
+    }
+
+    /// `render_table` measures with `chars().count()`, and escapes are
+    /// chars — a tinted cell must not widen its own column.
+    #[test]
+    fn render_table_measures_columns_before_tinting_them() {
+        let p = theme::palette_for(theme::TerminalMode::TrueColor);
+        let rows = vec![
+            vec!["a".to_string(), "running".to_string()],
+            vec!["longer-id".to_string(), "failed".to_string()],
+        ];
+        let styled = render_table_tinted(p, &["ID", "STATE"], &rows, tint_status_column(1));
+        let plain = render_table_tinted(plain(), &["ID", "STATE"], &rows, tint_status_column(1));
+        assert_eq!(strip_ansi(&styled), plain);
+        let lines: Vec<String> = styled.lines().map(strip_ansi).collect();
+        assert_eq!(lines[0], "ID         STATE");
+        assert_eq!(lines[1], "a          running");
+        assert_eq!(lines[2], "longer-id  failed");
+    }
+
+    #[test]
+    fn status_tint_vocabulary_is_closed() {
+        assert_eq!(
+            status_tint("running"),
+            Some(theme::status_token(theme::Status::Working))
+        );
+        assert_eq!(
+            status_tint("failed"),
+            Some(theme::status_token(theme::Status::Error))
+        );
+        assert_eq!(
+            status_tint("held"),
+            Some(theme::status_token(theme::Status::Warning))
+        );
+        // Unknown, mixed-case, and decorated words stay at the terminal
+        // default rather than guessing a semantic.
+        assert_eq!(status_tint("RUNNING"), None);
+        assert_eq!(status_tint("—"), None);
+        assert_eq!(status_tint("running \x1b[31m"), None);
+        assert_eq!(status_tint(""), None);
     }
 }

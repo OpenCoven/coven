@@ -184,19 +184,15 @@ pub const SYNTAX_REMOVED: Rgb = brand::DANGER;
 
 /// What a status indicator is communicating. Drives the color of "ready",
 /// "working", "error" etc. across the TUI so renderers never pick a raw
-/// `Color::Green` again. `Ready` is consumed today by the chat status bar;
-/// the other variants are pre-wired for the screen renderers landing in the
-/// next phase and are reachable via `status_token` / `status_style`.
+/// `Color::Green` again. `Ready` is consumed by the chat status bar; the
+/// full set is consumed by the observe CLI surfaces, which map a closed
+/// vocabulary of daemon lifecycle words onto these semantics.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Ready,
-    #[allow(dead_code)]
     Working,
-    #[allow(dead_code)]
     Warning,
-    #[allow(dead_code)]
     Error,
-    #[allow(dead_code)]
     Idle,
 }
 
@@ -535,8 +531,29 @@ pub struct Palette {
     pub reset: Reset,
 }
 
+impl Palette {
+    /// Palette that renders no escapes at all. The plain-text entry points
+    /// (notably `observe::view_text`, whose output is fed to ratatui, which
+    /// does not interpret ANSI) take this so their bytes stay escape-free.
+    pub fn plain() -> Self {
+        palette_for(TerminalMode::NoColor)
+    }
+
+    /// Foreground escape for an arbitrary brand token in this palette's mode.
+    /// Keeps callers from reaching for `Fg::with_mode` and re-deriving the
+    /// mode by hand.
+    pub fn tint(self, rgb: Rgb) -> Fg {
+        Fg::with_mode(rgb, self.mode)
+    }
+
+    /// Foreground escape for a status semantic — the only sanctioned way for
+    /// a renderer to color "running" / "failed" / "idle".
+    pub fn status(self, status: Status) -> Fg {
+        self.tint(status_token(status))
+    }
+}
+
 /// Palette for the active terminal mode.
-#[allow(dead_code)]
 pub fn palette() -> Palette {
     palette_for(mode())
 }
