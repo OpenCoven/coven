@@ -1,6 +1,6 @@
 //! TurboVec IdMapIndex wrapper — persistent 4-bit compressed ANN index with stable ids
 
-use crate::embed::DIM;
+use crate::{embed::DIM, fs_security};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use turbovec::IdMapIndex;
@@ -15,9 +15,8 @@ pub struct VecIndex {
 impl VecIndex {
     /// Load from disk if it exists, otherwise create a fresh index
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        fs_security::ensure_private_parent(path)?;
+        fs_security::validate_existing_private_file(path)?;
         let inner = if path.exists() {
             IdMapIndex::load(path)
                 .with_context(|| format!("loading index from {}", path.display()))?
@@ -67,6 +66,7 @@ impl VecIndex {
         self.inner
             .write(&self.path)
             .with_context(|| format!("saving index to {}", self.path.display()))?;
+        fs_security::set_private_file(&self.path)?;
         Ok(())
     }
 

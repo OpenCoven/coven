@@ -888,6 +888,7 @@ dependencies = [
  "clap",
  "dirs-next",
  "fastembed",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
