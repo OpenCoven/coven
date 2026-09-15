@@ -2,12 +2,14 @@
 //! fixed lease and owner-death fencing, and survives controller/driver loss.
 //!
 //! Protocol (trusted backend IPC, never worker-visible):
-//! * argv: `owner_pid remaining_ms executable_path`
-//! * stdin line 1: the single-line Seatbelt profile; later lines: `spawn`,
-//!   `kill`, `release`. EOF is treated as owner loss.
+//! * argv: `owner_pid executable_path`
+//! * stdin line 1: `lease <remaining_ms>` (the deadline starts on receipt so
+//!   handoff latency only shortens the lease); line 2: the single-line Seatbelt
+//!   profile; later lines: `spawn`, `kill`, `release`. EOF is owner loss.
 //! * fds 3/4/5: the controller-owned worker stdin/stdout/stderr pipes.
 //! * stdout lines: `ready`, `spawned <pid>`, `spawn-failed`, `terminated`,
-//!   `pending`.
+//!   `pending`. After `pending` the guardian keeps killing the group and
+//!   only exits once it can say `terminated`.
 
 use std::ffi::{c_char, c_int, CString};
 use std::io::{self, Read, Write};
@@ -16,6 +18,10 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// `sandbox_init`/`sandbox_free_error` live in libsystem_sandbox, which is
+// re-exported by libSystem; the explicit link attribute records that
+// dependency instead of relying on it implicitly.
+#[link(name = "System", kind = "dylib")]
 extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
     fn sandbox_free_error(errorbuf: *mut c_char);
@@ -124,6 +130,9 @@ impl Stdin {
 struct Worker {
     child: Child,
     pgid: i32,
+    /// Set once `try_wait` has collected the leader's exit status. std caches
+    /// the status internally, but the flag keeps the reaping contract explicit.
+    reaped: bool,
 }
 
 impl Worker {
@@ -154,7 +163,18 @@ impl Worker {
         }
         let child = command.spawn()?;
         let pgid = c_int::try_from(child.id()).map_err(|_| io::Error::other("pid"))?;
-        Ok(Self { child, pgid })
+        Ok(Self {
+            child,
+            pgid,
+            reaped: false,
+        })
+    }
+
+    fn reap(&mut self) -> bool {
+        if !self.reaped && matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.reaped = true;
+        }
+        self.reaped
     }
 
     /// SIGKILLs the whole group until no member remains and the leader is
@@ -166,8 +186,7 @@ impl Worker {
             unsafe {
                 libc::killpg(self.pgid, libc::SIGKILL);
             }
-            let reaped = matches!(self.child.try_wait(), Ok(Some(_)));
-            if reaped && !group_alive(self.pgid) {
+            if self.reap() && !group_alive(self.pgid) {
                 return true;
             }
             if start.elapsed() > KILL_BUDGET {
@@ -179,23 +198,35 @@ impl Worker {
 
     /// Natural exit of the leader plus an empty group is confirmed termination.
     fn finished(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_))) && !group_alive(self.pgid)
+        self.reap() && !group_alive(self.pgid)
     }
 }
 
+/// Terminates the group and exits. If the first bounded attempt fails the
+/// guardian reports `pending` once, then stays alive and keeps killing until
+/// the group is gone so a stuck worker is never orphaned by its own guardian.
 fn finish(worker: Option<&mut Worker>) -> ! {
-    let terminated = worker.is_none_or(Worker::terminate);
-    say(if terminated { "terminated" } else { "pending" });
-    std::process::exit(if terminated { 0 } else { 2 })
+    let Some(worker) = worker else {
+        say("terminated");
+        std::process::exit(0)
+    };
+    if !worker.terminate() {
+        say("pending");
+        while !worker.terminate() {
+            std::thread::sleep(TICK);
+        }
+    }
+    say("terminated");
+    std::process::exit(0)
 }
 
 /// Entry point for a host binary that detects `Role::Guardian`. Never returns.
 pub fn guardian_main() -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (owner, remaining_ms, executable) = match args.as_slice() {
-        [owner, remaining, executable] => match (owner.parse::<i32>(), remaining.parse::<u64>()) {
-            (Ok(owner), Ok(remaining)) => (owner, remaining, executable.clone()),
-            _ => std::process::exit(64),
+    let (owner, executable) = match args.as_slice() {
+        [owner, executable] => match owner.parse::<i32>() {
+            Ok(owner) => (owner, executable.clone()),
+            Err(_) => std::process::exit(64),
         },
         _ => std::process::exit(64),
     };
@@ -218,6 +249,16 @@ pub fn guardian_main() -> ! {
     close_inheritable_from(6);
 
     let mut stdin = Stdin::new();
+    let remaining_ms = match stdin
+        .wait_line(Duration::from_secs(5))
+        .as_deref()
+        .and_then(|line| line.strip_prefix("lease "))
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        Some(ms) if ms > 0 => ms,
+        _ => std::process::exit(65),
+    };
+    let deadline = Instant::now() + Duration::from_millis(remaining_ms);
     let profile = match stdin
         .wait_line(Duration::from_secs(5))
         .and_then(|line| CString::new(line).ok())
@@ -225,7 +266,6 @@ pub fn guardian_main() -> ! {
         Some(profile) => profile,
         None => std::process::exit(65),
     };
-    let deadline = Instant::now() + Duration::from_millis(remaining_ms);
     say("ready");
 
     let mut stdio = Some(stdio);

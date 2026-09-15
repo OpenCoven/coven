@@ -34,13 +34,8 @@ mod target {
         let _ = writeln!(out, "{name}:{}", if ok { "allowed" } else { "denied" });
     }
 
-    /// Never reads the environment; the only argument it honours is its own
-    /// `nested` marker for the exec-self probe.
+    /// Never reads the environment or its arguments beyond argv[0].
     pub fn run() {
-        if std::env::args_os().nth(1).is_some() {
-            println!("nested");
-            return;
-        }
         let exe = PathBuf::from(std::env::args_os().next().expect("argv0"));
         let workspace = exe
             .parent()
@@ -58,13 +53,7 @@ mod target {
             && inside == "sealed\n";
         report(&mut out, "inside-read", inside_ok);
         report(&mut out, "outside-read", File::open("/etc/hosts").is_ok());
-        report(
-            &mut out,
-            "home-read",
-            std::fs::read_dir("/Users")
-                .map(|d| d.count() > 0)
-                .unwrap_or(false),
-        );
+        report(&mut out, "home-read", std::fs::read_dir("/Users").is_ok());
         report(
             &mut out,
             "inside-write",
@@ -80,15 +69,9 @@ mod target {
             "exec-other",
             Command::new("/bin/ls").output().is_ok(),
         );
-        report(
-            &mut out,
-            "exec-self",
-            Command::new(&exe)
-                .arg("nested")
-                .output()
-                .map(|o| o.status.success() && o.stdout == b"nested\n")
-                .unwrap_or(false),
-        );
+        // Spawning anything, even its own image, needs `process-fork`, which
+        // the profile denies: one worker, no children.
+        report(&mut out, "spawn-child", Command::new(&exe).output().is_ok());
         let _ = out.flush();
         drop(out);
 
@@ -109,7 +92,7 @@ mod suite {
     use coven_restricted_runtime::{CleanupState, Controller, Error, Execution, State, Status};
     use coven_restricted_runtime_macos::{
         ControllerStdio, InstantClock, SealError, SeatbeltConfig, SeatbeltDriver, WorkerStdio,
-        TARGET_NAME,
+        GUARDIAN_NAME, TARGET_NAME,
     };
 
     /// Hang guard only: far above anything load can produce.
@@ -129,9 +112,12 @@ mod suite {
             fs::create_dir_all(root.join("bin")).unwrap();
             fs::create_dir_all(root.join("closure")).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-            let target = root.join("bin").join(TARGET_NAME);
-            fs::copy(std::env::current_exe().unwrap(), &target).unwrap();
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(root.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
+            for name in [TARGET_NAME, GUARDIAN_NAME] {
+                let staged = root.join("bin").join(name);
+                fs::copy(std::env::current_exe().unwrap(), &staged).unwrap();
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             fs::write(root.join("closure").join("note.txt"), "sealed\n").unwrap();
             if linger {
                 fs::write(root.join("closure").join("linger"), "").unwrap();
@@ -146,7 +132,6 @@ mod suite {
         fn config(&self) -> SeatbeltConfig {
             SeatbeltConfig {
                 workspace: self.root.clone(),
-                guardian: std::env::current_exe().unwrap(),
             }
         }
     }
@@ -191,7 +176,8 @@ mod suite {
     fn read_report(stdout: &mut fs::File) -> String {
         let mut text = Vec::new();
         let mut byte = [0u8; 1];
-        while !text.ends_with(b"exec-self:allowed\n") && !text.ends_with(b"exec-self:denied\n") {
+        while !text.ends_with(b"spawn-child:allowed\n") && !text.ends_with(b"spawn-child:denied\n")
+        {
             match stdout.read(&mut byte) {
                 Ok(1) => text.push(byte[0]),
                 _ => break,
@@ -238,7 +224,7 @@ mod suite {
         assert_line(&report, "inside-write:denied");
         assert_line(&report, "outside-write:denied");
         assert_line(&report, "exec-other:denied");
-        assert_line(&report, "exec-self:allowed");
+        assert_line(&report, "spawn-child:denied");
         assert!(!Path::new("/tmp/coven-seatbelt-escape").exists());
         assert!(!ws.root.join("closure").join("scratch").exists());
 
@@ -374,12 +360,28 @@ mod suite {
         ));
         fs::create_dir_all(ws.root.join("closure")).unwrap();
 
+        let guardian = ws.root.join("bin").join(GUARDIAN_NAME);
+        fs::set_permissions(&guardian, fs::Permissions::from_mode(0o722)).unwrap();
         let (worker, _ends) = WorkerStdio::pipes().unwrap();
-        let mut config = ws.config();
-        config.guardian = PathBuf::from("bin/does-not-exist");
         assert!(matches!(
-            SeatbeltDriver::seal(config, worker).map(|_| ()),
+            SeatbeltDriver::seal(ws.config(), worker).map(|_| ()),
             Err(SealError::Guardian)
+        ));
+        fs::remove_file(&guardian).unwrap();
+        let (worker, _ends) = WorkerStdio::pipes().unwrap();
+        assert!(matches!(
+            SeatbeltDriver::seal(ws.config(), worker).map(|_| ()),
+            Err(SealError::Guardian)
+        ));
+
+        // A symlinked `bin/` must not be followed even though the leaf exists.
+        let real_bin = ws.root.join("bin-real");
+        fs::rename(ws.root.join("bin"), &real_bin).unwrap();
+        std::os::unix::fs::symlink(&real_bin, ws.root.join("bin")).unwrap();
+        let (worker, _ends) = WorkerStdio::pipes().unwrap();
+        assert!(matches!(
+            SeatbeltDriver::seal(ws.config(), worker).map(|_| ()),
+            Err(SealError::Executable)
         ));
     }
 

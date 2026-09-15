@@ -18,11 +18,15 @@ obligations below are closed.
 `SeatbeltDriver::seal(config, stdio)` takes custody of:
 
 - a **private workspace** (`0700`, owned by the caller) opened as a directory
-  with `O_NOFOLLOW`;
-- the pinned **executable** `workspace/bin/coven-worker-target` (regular file,
+  with `O_NOFOLLOW`; every child below is then opened with `openat` relative
+  to a held directory descriptor and `O_NOFOLLOW`, so no path component can be
+  swapped for a symlink;
+- the private **`bin/` directory** (`0700`, caller-owned, same filesystem);
+- the pinned **executable** `bin/coven-worker-target` (regular file,
   caller-owned, executable, not group/world-writable, same filesystem);
-- the **closure directory** `workspace/closure/` (same filesystem);
-- the trusted **guardian binary** (absolute, caller-owned, executable);
+- the staged **guardian binary** `bin/coven-worker-guardian` (same checks; the
+  caller copies its trusted host binary there before sealing);
+- the **closure directory** `closure/` (same filesystem);
 - the three **controller-owned stdio pipes** from `WorkerStdio::pipes()`.
 
 It returns the driver plus an `InstantClock` sharing the backend's monotonic
@@ -34,10 +38,10 @@ descriptors, a hash of the fixed profile, and fresh random attempt/worker IDs.
 | --- | --- |
 | `prepare` | Re-`fstat`s every held descriptor and `lstat`s its path; both must still name the sealed inode. |
 | `install_restrictions` | Pins the single-line Seatbelt profile (below). The kernel install happens inside the forked worker **before its `execve`**, so no target code can run unrestricted; a profile that fails to compile aborts the exec. |
-| `retain_lifetime` | Spawns the **guardian** (`Role::Guardian`, own process group, empty environment, stderr discarded) with the owner PID, the remaining lease, and the executable path. The worker pipes travel as fds 3-5; every other inheritable descriptor is closed. Refuses if the lease already expired. |
+| `retain_lifetime` | Spawns the **guardian** (`Role::Guardian`, own process group, empty environment, stderr discarded) with the owner PID and the executable path. The worker pipes travel as fds 3-5; every other inheritable descriptor is closed. The remaining lease is measured immediately before it is written as the first stdin line (`lease <ms>`), and the guardian starts its deadline on receipt, so handoff latency can only shorten the lease. Refuses if the lease already expired. |
 | `revalidate` | Same physical checks as `prepare`, plus the guardian must still be alive. |
-| `execute` | Refuses if the stop signal fired. Tells the guardian to `spawn`; the guardian forks the worker in a **new process group**, closes inheritable descriptors, calls `sandbox_init`, then execs with an empty environment. `spawned <pid>` completes the handoff. |
-| `request_cleanup` | Sends `kill`; the guardian `SIGKILL`s the whole group until `killpg(pgid, 0)` reports no member and the leader is reaped (2 s budget). `Released` only when that completes; otherwise `Pending`. With no guardian, nothing was launched and cleanup is `Released`. |
+| `execute` | Re-checks the stop signal immediately before the irreversible `spawn` send and again after `spawned`; a cancel landing in between kills the fresh worker and returns `Rejected`. Tells the guardian to `spawn`; the guardian forks the worker in a **new process group**, closes inheritable descriptors, calls `sandbox_init`, then execs with an empty environment. `spawned <pid>` completes the handoff. |
+| `request_cleanup` | Sends `kill`; the guardian `SIGKILL`s the whole group until `killpg(pgid, 0)` reports no member and the leader is reaped (2 s budget). `Released` only when that completes; otherwise `Pending`, in which case the guardian stays alive and keeps killing until it can report `terminated`. With no guardian, nothing was launched and cleanup is `Released`. |
 | `observe_termination` | `Confirmed` only after the guardian reported `terminated` (leader reaped **and** group empty). A guardian that exited without that report is `Unavailable`, which fences and remains retryable as an observation. |
 
 ### Seatbelt profile
@@ -47,28 +51,33 @@ descriptors, a hash of the fixed profile, and fresh random attempt/worker IDs.
 (allow process-exec (literal "<workspace>/bin/coven-worker-target"))
 (allow file-read* (subpath "<workspace>"))
 (allow file-read* (subpath "/usr/lib") (literal "/dev/null"))
-(allow sysctl-read) (allow process-fork) (allow signal (target same-sandbox))
+(allow sysctl-read)
 ```
 
 `dyld-support.sb` is Apple's own read-only shared-cache/loader rule set; a
 Mach-O cannot start without it. `/usr/lib` covers `libSystem`; `sysctl-read`
-is required by the Rust runtime's stack-guard setup. Paths with `"`, `\`, NUL
+is required by the Rust runtime's stack-guard setup. `process-fork` is denied,
+so the worker cannot spawn anything, not even its own image. Paths with `"`, `\`, NUL
 or line breaks are refused at seal time. Everything else — home directories,
-`/etc`, writes anywhere (including the workspace), exec of any other image,
-network, Mach lookups — is denied by default and inherited by descendants.
+`/etc`, writes anywhere (including the workspace), exec of any image, fork,
+network, Mach lookups — is denied by default.
 
 ### Guardian
 
 The guardian is a separate process, so it survives controller drop, driver
 drop, a blocked caller, and owner death. It fences autonomously on:
 
-- **lease expiry** (its own monotonic deadline from the remaining lease);
+- **lease expiry** (its own monotonic deadline, started when the `lease` line
+  arrives);
 - **owner death** (`kill(owner, 0)` → `ESRCH`, or EOF on its command pipe);
 - explicit `kill`.
 
 Every fence is a `SIGKILL` of the whole process group until empty. The
-guardian exits after reporting `terminated`/`pending`, or on `release`. It is
-single-threaded (nonblocking stdin) so the fork/`sandbox_init` path stays safe.
+guardian exits after reporting `terminated`, or on `release`. If the first
+bounded attempt (2 s) fails it reports `pending` once, then stays alive and
+keeps killing until the group is gone rather than orphaning a live worker. It
+is single-threaded (nonblocking stdin) so the fork/`sandbox_init` path stays
+safe. `sandbox_init` is linked explicitly from `libSystem`.
 
 ## Conformance evidence
 
@@ -79,11 +88,11 @@ one line per probe. The test asserts, through the real controller:
 
 | Case | Evidence |
 | --- | --- |
-| `kernel_denies_everything_outside_the_sealed_closure` | `env:0`, `inside-read:allowed`, `outside-read:denied`, `home-read:denied`, `inside-write:denied`, `outside-write:denied`, `exec-other:denied`, `exec-self:allowed`; no escape file appears; natural exit → `Terminated`; cleanup `Released`. |
+| `kernel_denies_everything_outside_the_sealed_closure` | `env:0`, `inside-read:allowed`, `outside-read:denied`, `home-read:denied`, `inside-write:denied`, `outside-write:denied`, `exec-other:denied`, `spawn-child:denied`; no escape file appears; natural exit → `Terminated`; cleanup `Released`. |
 | `guardian_kills_the_group_when_the_lease_expires` | A worker sleeping 120 s dies between 600 ms and 10 s; status reason `Expired`. |
 | `explicit_cancel_cleanup_terminates_the_group` | `cancel` → `poll` fences `Stopping`; cleanup `Pending` while possibly live; observation confirms `Terminated` with `Released`; execution stays `PossiblyStarted`. |
 | `guardian_kills_the_group_when_the_owner_dies` | A child owner launches a lingering worker and exits with no fence or cleanup; the worker dies anyway. |
-| `seal_refuses_unsafe_workspaces` | `0755` workspace, group/world-writable target, missing closure, relative guardian path → typed `SealError`s. |
+| `seal_refuses_unsafe_workspaces` | `0755` workspace, group/world-writable target, missing closure, group/world-writable or missing staged guardian, symlinked `bin/` → typed `SealError`s. |
 | `substituted_executable_is_refused_before_execution` | Swapping the inode at the pinned path fails `Revalidate`; state `Refused`, execution `NotStarted`. |
 
 ```sh
@@ -98,19 +107,19 @@ produce this evidence — it must be run on macOS.
 
 ## Obligations still open before v1 can leave refusal-only
 
-- **No `fexecve` on macOS.** The worker is exec'd by pathname immediately after
-  `lstat`/`fstat` agree with the held inode, and the profile pins that literal
-  path. The residual rename race is limited to same-UID processes because the
-  workspace is `0700`; it is not eliminated.
+- **No `fexecve` on macOS.** The worker and the guardian are exec'd by
+  pathname immediately after `lstat`/`fstat` agree with the held inodes, and
+  the profile pins the worker's literal path. Both images live inside the
+  `0700` workspace, so the residual rename race is limited to same-UID
+  processes; it is not eliminated.
 - **Guardian handoff is not a kernel-atomic gate.** The worker's process group
   exists before its exec (std sets `setpgid` in the child), and the guardian is
   the parent, so it knows the pid at fork. A guardian crash in that
   microsecond window would orphan a restricted worker until lease expiry has
   nobody to enforce it.
-- **Descendant tracking is process-group based.** A worker that `setsid`s or
-  `setpgid`s out of its group would escape `killpg`; Seatbelt does not deny
-  those calls here. A follow-up should add a `(deny process-*)` audit or move
-  to a kernel-tracked mechanism.
+- **Descendant tracking is process-group based.** `process-fork` is denied so
+  no descendants can exist, but the worker itself could `setsid`/`setpgid` out
+  of its group and escape `killpg`; Seatbelt does not deny those calls here.
 - **Sealed closure is read-only, not a verified manifest.** The backend pins
   identities of the workspace, executable and closure directory, not a hash of
   every file inside `closure/`.
