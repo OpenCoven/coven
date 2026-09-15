@@ -60,15 +60,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6.0.0
         with:
           fetch-depth: 0
-      - name: Derive stable or recovery release context
-        id: release-context
-        run: node scripts/release-npm-context.mjs "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
       - name: Confirm tag is annotated, signer-authorized, and points to main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_RELEASE_ALLOWED_SIGNERS: ${{ vars.NPM_RELEASE_ALLOWED_SIGNERS }}
-          RELEASE_MODE: ${{ steps.release-context.outputs.release_mode }}
-          RELEASE_TAG: ${{ steps.release-context.outputs.release_tag }}
         run: |
           set -euo pipefail
           TAG_NAME="${GITHUB_REF#refs/tags/}"
@@ -120,9 +115,25 @@ jobs:
             echo "::error::Refusing release: tagged commit $TAGGED_COMMIT_SHA is not contained in origin/main."
             exit 1
           fi
-          if [ "$RELEASE_MODE" != "recovery" ]; then
-            exit 0
-          fi
+      - name: Derive stable or recovery release context
+        id: release-context
+        run: node scripts/release-npm-context.mjs "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+      - name: Confirm recovery tag and release-only changes
+        if: steps.release-context.outputs.release_mode == 'recovery'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_RELEASE_ALLOWED_SIGNERS: ${{ vars.NPM_RELEASE_ALLOWED_SIGNERS }}
+          RELEASE_TAG: ${{ steps.release-context.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          TAG_OBJECT_SHA=$(git rev-parse "$TAG_NAME")
+          payload=$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA")
+          TAGGED_COMMIT_SHA=$(jq -r '.object.sha // ""' <<<"$payload")
+          allowed_signers_file="$RUNNER_TEMP/coven-release-allowed-signers"
+          printf '%s\n' "$NPM_RELEASE_ALLOWED_SIGNERS" > "$allowed_signers_file"
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$allowed_signers_file"
           if ! BASE_TAG_OBJECT_SHA=$(git rev-parse "$RELEASE_TAG^{tag}" 2>/dev/null); then
             echo "::error::Base release tag $RELEASE_TAG is missing or is not annotated."
             exit 1

@@ -611,6 +611,11 @@ test('release workflow verifies the signed release tag before building or publis
     /git verify-tag "\$TAG_NAME"/,
     'verify-tag must locally verify the tag against the SSH allowed signers file'
   );
+  assert.ok(
+    workflow.indexOf('git verify-tag "$TAG_NAME"') <
+      workflow.indexOf('node scripts/release-npm-context.mjs "$GITHUB_REF_NAME"'),
+    'verify-tag must authorize the pushed tag before executing repository-controlled release code'
+  );
   assert.match(
     workflow,
     /gpg\.format ssh[\s\S]*git tag -s/,
