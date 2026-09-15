@@ -90,13 +90,15 @@ setting any of them requests the envelope.
 
 ## `GET /api/v1/health`
 
-`GET /api/v1/health` returns daemon reachability, the named contract version, coven version, and machine-readable capabilities:
+`GET /api/v1/health` returns daemon reachability, the named contract version, coven version, and machine-readable capabilities.
+`covenVersion` is the daemon's **build identity** — the release tag the binary was stamped with, carrying any `git describe` distance/commit/dirty suffix for a source build, or `unknown` when no version could be resolved. Treat it as an opaque build label, not a contract version: negotiate compatibility on `apiVersion` and `capabilities`.
+
 
 ```json
 {
   "ok": true,
   "apiVersion": "coven.daemon.v1",
-  "covenVersion": "0.0.0",
+  "covenVersion": "0.4.2",
   "capabilities": {
     "sessions": true,
     "events": true,
