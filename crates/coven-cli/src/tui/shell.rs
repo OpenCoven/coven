@@ -85,6 +85,27 @@ pub(crate) struct MagicalTuiItem {
     pub(crate) action: MagicalTuiAction,
 }
 
+/// The OpenCoven crown, downsampled from `brand/logo/opencoven-mark.svg` to
+/// half-block cells. Foreground glyphs only — no surface fill, so the canvas
+/// stays `--oc-surface-0` per the Cast TUI contract §2.4.
+const MASTHEAD_ART: [&str; 5] = [
+    "          \u{2584}\u{2584}          ",
+    "        \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2584}        ",
+    "\u{2588}\u{2588}\u{2588}\u{2588}\u{2584}\u{2584}\u{2588}\u{2588}\u{2580}\u{2580}  \u{2580}\u{2580}\u{2588}\u{2588}\u{2584}\u{2584}\u{2588}\u{2588}\u{2588}\u{2588}",
+    " \u{2588}\u{2588}  \u{2580}\u{2580}\u{2588}\u{2588}\u{2584}  \u{2584}\u{2588}\u{2588}\u{2580}\u{2580} \u{2584}\u{2588}\u{2588} ",
+    "  \u{2580}\u{2580}\u{2588}\u{2588}\u{2584}\u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2584}\u{2584}\u{2588}\u{2588}\u{2580}\u{2580}  ",
+];
+const MASTHEAD_WIDTH: usize = 22;
+
+/// Terminal rows needed before the masthead earns its space. Below this the
+/// launcher keeps the single-line identity from contract §2.5 — density wins
+/// on a small terminal.
+const MASTHEAD_MIN_ROWS: usize = 30;
+
+/// Rows assumed by the plain/test renderers, which have no terminal to ask.
+/// Deliberately below `MASTHEAD_MIN_ROWS` so plain output stays masthead-free.
+const MAGICAL_TUI_DEFAULT_ROWS: usize = 24;
+
 const MAGICAL_TUI_DEFAULT_INNER_WIDTH: usize = 76;
 pub(crate) const MAGICAL_TUI_MAX_INNER_WIDTH: usize = 96;
 const MAGICAL_TUI_MIN_INNER_WIDTH: usize = 40;
@@ -2047,6 +2068,7 @@ fn render_magical_tui_frame(selection: usize, input: &str) -> String {
         &resolve_launcher_snapshot(),
         theme::mode(),
         magical_tui_inner_width(),
+        magical_tui_rows(),
     )
 }
 
@@ -2062,6 +2084,7 @@ pub(crate) fn render_magical_tui_frame_plain(selection: usize) -> String {
         &LauncherSnapshot::placeholder(),
         theme::TerminalMode::NoColor,
         MAGICAL_TUI_DEFAULT_INNER_WIDTH,
+        MAGICAL_TUI_DEFAULT_ROWS,
     )
 }
 
@@ -2076,6 +2099,7 @@ pub(crate) fn render_magical_tui_frame_plain_with_width(
         &LauncherSnapshot::placeholder(),
         theme::TerminalMode::NoColor,
         inner_width,
+        MAGICAL_TUI_DEFAULT_ROWS,
     )
 }
 
@@ -2091,6 +2115,7 @@ pub(crate) fn render_magical_tui_frame_plain_with_input(
         &LauncherSnapshot::placeholder(),
         theme::TerminalMode::NoColor,
         inner_width,
+        MAGICAL_TUI_DEFAULT_ROWS,
     )
 }
 
@@ -2100,6 +2125,7 @@ fn render_magical_tui_frame_with_mode_and_width(
     snapshot: &LauncherSnapshot,
     mode: theme::TerminalMode,
     inner_width: usize,
+    rows: usize,
 ) -> String {
     let inner_width = normalized_magical_tui_inner_width(inner_width);
     let palette = theme::palette_for(mode);
@@ -2110,7 +2136,13 @@ fn render_magical_tui_frame_with_mode_and_width(
 
     let mut frame = String::new();
 
-    // 1. Identity
+    // 1. Identity — optionally crowned. The masthead is the ambient-backdrop
+    //    exception from DESIGN.md §6, not a general license to decorate: it
+    //    only renders where there is color to carry the ramp and vertical room
+    //    to spend, and it never fills a surface.
+    if masthead_is_visible(mode, inner_width, rows) {
+        push_masthead(&mut frame, mode, inner_width);
+    }
     push_line(
         &mut frame,
         "Cast",
@@ -2311,6 +2343,48 @@ fn magical_tui_command_row(selected: bool, item: &MagicalTuiItem) -> String {
     format!("{pointer} {:<10} {}", item.slash, item.label)
 }
 
+/// Whether the launcher has both the color and the room to crown itself.
+///
+/// `NoColor` is a hard no: the ramp is the whole point, and the plain frame is
+/// a documented line-oriented contract that piped output and the design tests
+/// depend on staying austere.
+fn masthead_is_visible(mode: theme::TerminalMode, inner_width: usize, rows: usize) -> bool {
+    mode != theme::TerminalMode::NoColor
+        && rows >= MASTHEAD_MIN_ROWS
+        && inner_width >= MASTHEAD_WIDTH
+}
+
+/// Push the crown, one row per ramp step.
+///
+/// Left-aligned on the same grid as every other row in the frame: the launcher
+/// is a left-aligned field manual, and a centered mark above a left-aligned
+/// `Cast` reads as two competing layouts. The art carries its own internal
+/// padding, so the spire still sits over the wordmark.
+///
+/// The ramp runs `PURPLE_1 → PURPLE_3` top to bottom — the terminal analog of
+/// `--oc-gradient-signature`.
+fn push_masthead(frame: &mut String, mode: theme::TerminalMode, inner_width: usize) {
+    let reset = theme::Reset::with_mode(mode);
+    let last = MASTHEAD_ART.len().saturating_sub(1).max(1);
+    for (index, art) in MASTHEAD_ART.iter().enumerate() {
+        let tint = theme::brand::PURPLE_1.lerp(theme::brand::PURPLE_3, index as f32 / last as f32);
+        push_line(
+            frame,
+            art,
+            theme::Fg::with_mode(tint, mode),
+            reset,
+            inner_width,
+        );
+    }
+    push_line(frame, "", reset, reset, inner_width);
+}
+
+fn magical_tui_rows() -> usize {
+    crossterm::terminal::size()
+        .map(|(_, rows)| rows as usize)
+        .unwrap_or(MAGICAL_TUI_DEFAULT_ROWS)
+}
+
 fn magical_tui_inner_width() -> usize {
     crossterm::terminal::size()
         .map(|(columns, _)| magical_tui_inner_width_for_columns(columns as usize))
@@ -2393,6 +2467,95 @@ mod guided_harness_option_tests {
             format_guided_harness_options(crate::engine::ENGINE_HARNESS_ID, Vec::new()),
             crate::engine::ENGINE_HARNESS_ID
         );
+    }
+}
+
+#[cfg(test)]
+mod masthead_tests {
+    use super::*;
+
+    fn frame(mode: theme::TerminalMode, inner_width: usize, rows: usize) -> String {
+        render_magical_tui_frame_with_mode_and_width(
+            0,
+            "",
+            &LauncherSnapshot::placeholder(),
+            mode,
+            inner_width,
+            rows,
+        )
+    }
+
+    fn has_crown(frame: &str) -> bool {
+        frame.contains('\u{2588}') || frame.contains('\u{2580}') || frame.contains('\u{2584}')
+    }
+
+    #[test]
+    fn masthead_renders_on_a_tall_color_terminal() {
+        let rendered = frame(theme::TerminalMode::TrueColor, 76, 40);
+        assert!(has_crown(&rendered), "crown should render: {rendered:?}");
+        // The crown sits above the identity line, not instead of it.
+        let crown_at = rendered.find('\u{2588}').expect("crown row");
+        let cast_at = rendered.find("Cast").expect("identity line");
+        assert!(crown_at < cast_at, "crown precedes the identity line");
+    }
+
+    #[test]
+    fn masthead_is_absent_without_color() {
+        // NoColor is the documented plain contract: piped output and the
+        // design tests both depend on it staying austere.
+        let rendered = frame(theme::TerminalMode::NoColor, 76, 40);
+        assert!(
+            !has_crown(&rendered),
+            "no crown without color: {rendered:?}"
+        );
+        assert!(rendered.contains("Cast"), "identity line survives");
+    }
+
+    #[test]
+    fn masthead_yields_to_a_short_terminal() {
+        let rendered = frame(theme::TerminalMode::TrueColor, 76, MASTHEAD_MIN_ROWS - 1);
+        assert!(!has_crown(&rendered), "density wins on a short terminal");
+    }
+
+    #[test]
+    fn masthead_yields_to_a_narrow_terminal() {
+        let rendered = frame(theme::TerminalMode::TrueColor, MASTHEAD_WIDTH - 1, 40);
+        assert!(!has_crown(&rendered), "crown never renders clipped");
+    }
+
+    #[test]
+    fn masthead_ramp_spans_the_signature_gradient() {
+        let rendered = frame(theme::TerminalMode::TrueColor, 76, 40);
+        let first = theme::Fg::with_mode(theme::brand::PURPLE_1, theme::TerminalMode::TrueColor);
+        let last = theme::Fg::with_mode(theme::brand::PURPLE_3, theme::TerminalMode::TrueColor);
+        assert!(
+            rendered.contains(&first.to_string()),
+            "ramp starts at PURPLE_1"
+        );
+        assert!(
+            rendered.contains(&last.to_string()),
+            "ramp ends at PURPLE_3"
+        );
+    }
+
+    #[test]
+    fn masthead_art_rows_share_one_width() {
+        for art in MASTHEAD_ART {
+            assert_eq!(
+                art.chars().count(),
+                MASTHEAD_WIDTH,
+                "every art row is exactly MASTHEAD_WIDTH: {art:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_frame_is_unchanged_by_the_masthead_feature() {
+        // The Phase 1 glyph whitelist (main.rs) runs against the plain
+        // renderer. Guard the same property here, next to the feature that
+        // would break it.
+        let rendered = render_magical_tui_frame_plain(0);
+        assert!(!has_crown(&rendered));
     }
 }
 

@@ -11,6 +11,29 @@ pub struct Rgb {
     pub b: u8,
 }
 
+impl Rgb {
+    /// Linear interpolation toward `other`. `t` is clamped to `0.0..=1.0`, so
+    /// `lerp` at 0 is `self` and at 1 is `other`.
+    ///
+    /// This exists for the launcher masthead's vertical ramp — the terminal
+    /// analog of `--oc-gradient-signature`. It is deliberately not a general
+    /// license to gradient UI chrome: `DESIGN.md` §3 keeps normal surfaces
+    /// flat and reserves ramps for the ambient-backdrop exception.
+    pub fn lerp(self, other: Rgb, t: f32) -> Rgb {
+        let t = t.clamp(0.0, 1.0);
+        let channel = |a: u8, b: u8| -> u8 {
+            let a = f32::from(a);
+            let b = f32::from(b);
+            (a + (b - a) * t).round().clamp(0.0, 255.0) as u8
+        };
+        Rgb {
+            r: channel(self.r, other.r),
+            g: channel(self.g, other.g),
+            b: channel(self.b, other.b),
+        }
+    }
+}
+
 /// Raw brand tokens, mirroring `brand/ui/color-tokens.css`.
 /// Enforced by the `brand_tokens_mirror_color_tokens_css` test.
 pub mod brand {
@@ -732,6 +755,51 @@ mod tests {
         assert_eq!(SYNTAX_COMMENT, brand::TEXT_FAINT);
         assert_eq!(SYNTAX_ATTRIBUTE, brand::PURPLE_3);
         assert_eq!(SYNTAX_REMOVED, brand::DANGER);
+    }
+
+    #[test]
+    fn rgb_lerp_clamps_and_hits_both_endpoints() {
+        let a = Rgb {
+            r: 0,
+            g: 10,
+            b: 200,
+        };
+        let b = Rgb {
+            r: 200,
+            g: 20,
+            b: 0,
+        };
+        assert_eq!(a.lerp(b, 0.0), a, "t=0 is the start token");
+        assert_eq!(a.lerp(b, 1.0), b, "t=1 is the end token");
+        assert_eq!(a.lerp(b, -5.0), a, "t below range clamps to the start");
+        assert_eq!(a.lerp(b, 5.0), b, "t above range clamps to the end");
+        let mid = a.lerp(b, 0.5);
+        assert_eq!(
+            mid,
+            Rgb {
+                r: 100,
+                g: 15,
+                b: 100
+            },
+            "midpoint rounds per channel"
+        );
+    }
+
+    #[test]
+    fn rgb_lerp_is_monotonic_across_the_brand_ramp() {
+        // The masthead ramp must never step backwards, or the crown reads as
+        // banded rather than lit.
+        let steps: Vec<Rgb> = (0..5)
+            .map(|i| brand::PURPLE_1.lerp(brand::PURPLE_3, i as f32 / 4.0))
+            .collect();
+        for pair in steps.windows(2) {
+            assert!(
+                pair[1].r >= pair[0].r && pair[1].g >= pair[0].g && pair[1].b >= pair[0].b,
+                "ramp must not step backwards: {pair:?}"
+            );
+        }
+        assert_eq!(steps[0], brand::PURPLE_1);
+        assert_eq!(steps[4], brand::PURPLE_3);
     }
 
     #[test]

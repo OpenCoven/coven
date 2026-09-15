@@ -79,7 +79,8 @@ Surfaces stay `--oc-surface-0` (pure black). `SURFACE_1`/`SURFACE_2` are not use
 
 Every Cast frame reads top‑to‑bottom in this order; sections may be omitted but never reordered:
 
-1. **Identity** — one line. `Cast` in `PRIMARY_STRONG`, nothing else.
+1. **Identity** — one line. `Cast` in `PRIMARY_STRONG`, nothing else. A
+   masthead may sit directly above it under §2.9, and only under §2.9.
 2. **Context** — at most three field rows: `project`, `harness`, `daemon`. Single column.
 3. **Body** — one of:
    - Plan: `spell`, `harness`, `risk` (+ optional reason line), then a numbered step list (max 4 visible).
@@ -116,6 +117,35 @@ The current `Welcome back to the Coven.` / `OpenCoven terminal home for local ag
 
 The current `! reason — suggestion` and `X reason — alternative` lines drop the leading glyph entirely; the chip carries the semantic, the reason line is plain prose under it.
 
+### 2.9 Masthead (the ambient‑backdrop exception)
+
+`DESIGN.md` §6 permits one narrow exception to the flat‑and‑undecorated rule: a
+restrained ambient backdrop in *hero* compositions. The launcher is the only
+frame in this contract that is a hero — it is the screen Coven opens to — so it
+may carry the crown from `brand/logo/opencoven-mark.svg`, rendered in half‑block
+glyphs with a vertical `PURPLE_1 → PURPLE_3` ramp: the terminal analog of
+`--oc-gradient-signature`.
+
+This exception is deliberately hard to satisfy. All of the following hold, or
+the masthead does not render and §2.5's single identity line stands alone:
+
+- **Color is available.** `TerminalMode::NoColor` renders no masthead, ever. The
+  ramp is the entire justification; without it the crown is just ASCII art, and
+  the plain frame is a line‑oriented contract that piped output and the Phase 1
+  glyph‑whitelist test depend on staying austere.
+- **There is vertical room.** The terminal reports at least 30 rows. §2.2's
+  generous‑negative‑space rule and §5's 22‑line budget both describe the
+  *compact* frame; the masthead is additive and only spends rows a tall
+  terminal already has. Density wins on a small terminal.
+- **There is horizontal room.** The frame's inner width is at least the art's
+  width. A clipped crown never renders.
+- **It fills nothing.** The glyphs are foreground‑only. The canvas stays
+  `--oc-surface-0` per §2.4, so §3.10 is untouched.
+
+The masthead is an identity moment, not a license. It does not generalize to the
+Cast plan/outcome cards, to the session browser, or to any other frame, and
+ramps remain forbidden on ordinary chrome.
+
 ## 3. Anti‑patterns — what NOT to build
 
 These exist in the current code and must not survive Phase 2.
@@ -125,7 +155,7 @@ These exist in the current code and must not survive Phase 2.
 3. **Fake task inboxes**: `[ ] inspect repo  [ ] launch harness` — these are not real tasks and they imply state we do not track. Delete.
 4. **Multiple stacked section headers** ("Status", "Task inbox", "Slash commands", "Selected command") on the same frame. Collapse to the §2.5 hierarchy.
 5. **Repeated brand voice**: `Cast — your Coven familiar` header *and* `Cast, your Coven familiar, is ready…` salute on the same screen. Choose one identity line.
-6. **Emojis or pictographs in UI text**: per memory rule (2026‑05‑17). The current code does not use any, but Phase 2 must not introduce sigil glyphs, sparkles, or check‑mark glyphs.
+6. **Emojis or pictographs in UI text**: per memory rule (2026‑05‑17). The current code does not use any, but Phase 2 must not introduce sigil glyphs, sparkles, or check‑mark glyphs. The §2.9 masthead is not an exception to this — it is a logo rendered in block glyphs, not a sigil decorating text, and it is confined to the identity slot.
 7. **Glyph‑prefixed risk lines** (`!`, `X`): semantics belong in a typed chip, not a punctuation mark.
 8. **`=>` and `|` separators** in copy: `/start => coven doctor`, `… | …`. Replace with column gap or a thin middle dot (`·`).
 9. **Two visual languages in one product**: heavy ASCII boxes in the launcher next to plain key:value cards from Cast plan/outcome. They must share one chrome system.
@@ -146,7 +176,7 @@ No other crate is touched in Phase 2. `brand/ui/*.css` is canonical and stays as
 
 ## 5. Done‑when checklist (for the implementer in Phase 2)
 
-- [ ] Launcher renders ≤ 22 lines on an 80‑column terminal with default content.
+- [ ] Launcher renders ≤ 22 lines on an 80‑column terminal with default content, excluding the §2.9 masthead where it applies.
 - [ ] No `+`, `|`, `\`, `/` ASCII corner art remains in any rendered frame.
 - [ ] Every accent color comes from a semantic theme token; `rg "Rgb \{" crates/coven-cli/src/tui` returns nothing.
 - [ ] Cast plan, outcome, and launcher frames all use the 14‑char label column.
