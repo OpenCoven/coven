@@ -1,0 +1,22 @@
+[package]
+name = "coven-restricted-runtime-macos"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "macOS Seatbelt backend for the restricted worker controller; conformance evidence, not session-policy support"
+
+[dependencies]
+coven-restricted-runtime = { path = "../coven-restricted-runtime" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
+
+[[test]]
+name = "seatbelt"
+harness = false
