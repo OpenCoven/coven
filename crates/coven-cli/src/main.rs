@@ -1168,12 +1168,12 @@ enum DaemonCommand {
         #[arg(
             long = "allow-host",
             value_name = "HOST",
-            help = "Also accept this Host/Origin header on the --tcp listener, in \
-                    addition to loopback (repeatable). For a trusted reverse proxy \
-                    that forwards a fixed hostname it cannot rewrite — e.g. a \
-                    Tailscale-served FQDN. Exact host match. The API is still \
-                    unauthenticated, so only add a host fronted by an authenticated \
-                    transport (Tailscale/SSH); the bind stays loopback."
+            help = "Also accept this Host header and matching HTTPS Origin on the \
+                    --tcp listener, in addition to loopback (repeatable). For a \
+                    trusted reverse proxy that forwards a fixed hostname it cannot \
+                    rewrite — e.g. a Tailscale-served FQDN. Exact host match. The \
+                    API is still unauthenticated, so only add a host fronted by an \
+                    authenticated transport (Tailscale/SSH); the bind stays loopback."
         )]
         allow_host: Vec<String>,
     },
