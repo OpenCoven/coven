@@ -937,6 +937,10 @@ fn materialize(
 ) -> AfsResult<String> {
     let base = binding.base_commit.clone().unwrap_or_default();
     let add = std::process::Command::new("git")
+        // Repository configuration and hook files are untrusted. Git's
+        // documented /dev/null hooks path disables every hook, including
+        // post-checkout, without relying on individual --no-verify flags.
+        .args(["-c", "core.hooksPath=/dev/null"])
         .arg("-C")
         .arg(project_root)
         .args(["worktree", "add", "-b", branch])
@@ -971,6 +975,7 @@ fn materialize(
     // §5.6 — signed, always. A signing failure is surfaced, never worked
     // around by dropping -S.
     let commit = std::process::Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null"])
         .arg("-C")
         .arg(worktree_path)
         .args([
@@ -1500,6 +1505,44 @@ mod tests {
             commits[0].provenance_high_water,
             committed.provenance_high_water
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_does_not_run_repository_configured_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let hooks = root.join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+
+        let checkout_marker = dir.path().join("post-checkout-ran");
+        let commit_marker = dir.path().join("pre-commit-ran");
+        for (name, marker) in [
+            ("post-checkout", &checkout_marker),
+            ("pre-commit", &commit_marker),
+        ] {
+            let hook = hooks.join(name);
+            std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+            let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&hook, permissions).unwrap();
+        }
+        git_ok(
+            &root,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        );
+
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/added.rs", b"// new");
+
+        store.commit(&view.id, &CommitRequest::default()).unwrap();
+
+        assert!(!checkout_marker.exists(), "post-checkout hook must not run");
+        assert!(!commit_marker.exists(), "pre-commit hook must not run");
     }
 
     #[test]
