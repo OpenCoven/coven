@@ -39,9 +39,18 @@ pub(super) fn render_ui(f: &mut Frame, app: &mut App) {
     );
 
     let input_height = input_height(app);
+    // The activity rail only exists while a response is in flight, and only
+    // where there is height to spare. A zero-length constraint renders
+    // nothing, so an idle frame is laid out exactly as it was before.
+    let rail_height = u16::from(activity_rail_is_visible(
+        theme::mode(),
+        app.is_responding,
+        area.height,
+    ));
     let chunks = Layout::vertical([
         Constraint::Length(1), // top status bar
         Constraint::Min(6),    // chat messages
+        Constraint::Length(rail_height),
         Constraint::Length(input_height),
         Constraint::Length(1), // bottom hint bar
     ])
@@ -49,14 +58,17 @@ pub(super) fn render_ui(f: &mut Frame, app: &mut App) {
 
     render_status_bar(f, app, chunks[0]);
     render_messages(f, app, chunks[1]);
-    render_input(f, app, chunks[2]);
-    render_hint_bar(f, app, chunks[3]);
+    if rail_height > 0 {
+        render_activity_rail(f, app, chunks[2], theme::mode());
+    }
+    render_input(f, app, chunks[3]);
+    render_hint_bar(f, app, chunks[4]);
 
     // Slash popup floats just above the input box so it never overlaps the
     // composer. Drawn before help/session overlays so those still take
     // precedence when both would be visible.
     if app.slash_popup_is_open() {
-        render_slash_popup(f, app, chunks[2]);
+        render_slash_popup(f, app, chunks[3]);
     }
 
     if app.show_help {
@@ -145,6 +157,115 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let status =
         Paragraph::new(status_line).style(Style::default().bg(theme::ratatui_color(SURFACE)));
     f.render_widget(status, area);
+}
+
+/// Rows below which the activity rail is not worth its line.
+const MIN_HEIGHT_FOR_ACTIVITY_RAIL: u16 = 12;
+
+/// Cells in the travelling band of the indeterminate progress sweep.
+const ACTIVITY_BAND_CELLS: usize = 8;
+
+/// Milliseconds the sweep spends per cell. The chat tick is 120 ms, so this
+/// advances the band a few cells per redraw: fast enough to read as motion,
+/// slow enough not to strobe.
+const SWEEP_MS_PER_CELL: usize = 40;
+
+/// Whether the activity rail earns its row.
+///
+/// `NoColor` is a hard no, for the same reason as the launcher masthead: the
+/// ramp is the entire signal. Without color every cell resolves to the same
+/// `Reset` and the rail degrades into a solid wall of blocks that says less
+/// than the spinner already in the status bar.
+fn activity_rail_is_visible(mode: theme::TerminalMode, is_responding: bool, height: u16) -> bool {
+    is_responding && mode != theme::TerminalMode::NoColor && height >= MIN_HEIGHT_FOR_ACTIVITY_RAIL
+}
+
+/// Leading edge of the sweep, in cells, for a turn that has run `elapsed`.
+/// Wraps every `span_len` cells.
+fn sweep_head(elapsed: std::time::Duration, span_len: usize) -> usize {
+    if span_len == 0 {
+        return 0;
+    }
+    (elapsed.as_millis() as usize / SWEEP_MS_PER_CELL) % span_len
+}
+
+/// How far `cell` sits behind the band's leading edge, or `None` when the
+/// cell is outside the band entirely.
+fn band_depth(cell: usize, head: usize, band: usize) -> Option<usize> {
+    (cell + band)
+        .checked_sub(head)
+        .filter(|depth| *depth <= band)
+}
+
+/// A one-row rail shown only while a response is streaming: the harness, how
+/// long the turn has been running, and an indeterminate sweep.
+///
+/// The sweep is deliberately indeterminate. Nothing in the stream reports a
+/// total — token counts are filtered out of harness output upstream — so a
+/// determinate bar would be inventing progress it cannot know. A travelling
+/// band says "still alive" without claiming to know how far along it is.
+///
+/// It is driven by `spinner_frame`, which the existing 120 ms tick already
+/// advances while responding, so this costs no new wakeups and stops dead
+/// when the turn ends.
+fn render_activity_rail(f: &mut Frame, app: &App, area: Rect, mode: theme::TerminalMode) {
+    let tint = |c: theme::Rgb| theme::ratatui_color_with_mode(c, mode);
+    let elapsed = app
+        .responding_since
+        .map(|since| format_elapsed(since.elapsed()))
+        .unwrap_or_default();
+    let label = if elapsed.is_empty() {
+        format!(" {} ", app.active_agent_harness())
+    } else {
+        format!(" {} \u{00b7} {elapsed} ", app.active_agent_harness())
+    };
+
+    let mut spans = vec![Span::styled(
+        label.clone(),
+        Style::default().fg(tint(TEXT_DIM)),
+    )];
+
+    let track_width = (area.width as usize).saturating_sub(UnicodeWidthStr::width(label.as_str()));
+    if track_width > 0 {
+        let band = ACTIVITY_BAND_CELLS.min(track_width);
+        // The band travels across the track and wraps. Position comes from
+        // elapsed time, not `spinner_frame`: the spinner has only ten states,
+        // which would quantize the sweep into ten jumps across the whole
+        // track. Time is continuous, so the band advances evenly at whatever
+        // rate the tick actually redraws.
+        let span_len = track_width + band;
+        let head = app
+            .responding_since
+            .map(|since| sweep_head(since.elapsed(), span_len))
+            .unwrap_or(0);
+        for cell in 0..track_width {
+            let color = match band_depth(cell, head, band) {
+                Some(depth) => {
+                    let t = 1.0 - (depth as f32 / band as f32);
+                    tint(theme::brand::PURPLE_1.lerp(theme::brand::PURPLE_3, t))
+                }
+                None => tint(theme::BORDER_SUBTLE),
+            };
+            spans.push(Span::styled(
+                "\u{2588}",
+                Style::default().fg(color).bg(tint(BACKDROP)),
+            ));
+        }
+    }
+
+    let rail = Paragraph::new(Line::from(spans)).style(Style::default().bg(tint(BACKDROP)));
+    f.render_widget(rail, area);
+}
+
+/// Render a turn duration the way a person reads a stopwatch: sub-minute in
+/// tenths so short turns still visibly move, minutes and seconds past that.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{:.1}s", elapsed.as_secs_f32())
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 
 fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1552,6 +1673,150 @@ mod tests {
     fn status_bar_advertises_current_streaming_mode() {
         let frame = render_chat_frame_plain_for_test(80, 20);
         assert!(frame.contains("stream: live"));
+    }
+
+    fn responding_app(elapsed_ms: u64) -> App {
+        use super::super::{app::AgentInfo, client::DaemonChatClient};
+        let agents = vec![AgentInfo {
+            id: "claude".to_string(),
+            label: "claude".to_string(),
+            harness: "claude".to_string(),
+            available: true,
+            supports_chat_resume: true,
+        }];
+        let mut app = App::new_with_state(
+            agents,
+            Some(0),
+            Box::new(DaemonChatClient::with_coven_home(std::env::temp_dir())),
+            Some(std::env::temp_dir()),
+        );
+        app.is_responding = true;
+        app.responding_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(elapsed_ms));
+        app
+    }
+
+    #[test]
+    fn activity_rail_paints_a_ramped_band_and_names_the_turn() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = responding_app(12_400);
+        let backend = TestBackend::new(64, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_activity_rail(f, &app, area, theme::TerminalMode::TrueColor);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+
+        let row: String = (0..64u16).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            row.contains("claude"),
+            "the rail names the harness: {row:?}"
+        );
+        assert!(row.contains("12.4s"), "the rail shows elapsed: {row:?}");
+
+        let track =
+            theme::ratatui_color_with_mode(theme::BORDER_SUBTLE, theme::TerminalMode::TrueColor);
+        let band: Vec<_> = (0..64u16)
+            .filter(|x| buf[(*x, 0)].symbol() == "\u{2588}" && buf[(*x, 0)].fg != track)
+            .collect();
+        assert!(!band.is_empty(), "a lit band is painted");
+        assert!(
+            band.len() <= ACTIVITY_BAND_CELLS + 1,
+            "the band stays its configured width: {}",
+            band.len()
+        );
+
+        // The ramp must actually ramp — a flat band is just a block.
+        let colors: std::collections::HashSet<_> = band
+            .iter()
+            .map(|x| format!("{:?}", buf[(*x, 0)].fg))
+            .collect();
+        assert!(colors.len() > 1, "the band is ramped, not flat: {colors:?}");
+
+        // Idle turns spend no row at all.
+        app.is_responding = false;
+        assert!(!activity_rail_is_visible(
+            theme::TerminalMode::TrueColor,
+            app.is_responding,
+            40
+        ));
+    }
+
+    #[test]
+    fn sweep_band_travels_and_wraps() {
+        use std::time::Duration;
+        const TRACK: usize = 48;
+        const BAND: usize = ACTIVITY_BAND_CELLS;
+        let span = TRACK + BAND;
+
+        let lit = |ms: u64| -> Vec<usize> {
+            let head = sweep_head(Duration::from_millis(ms), span);
+            (0..TRACK)
+                .filter(|c| band_depth(*c, head, BAND).is_some())
+                .collect()
+        };
+
+        // The band never exceeds its width, at any point in the cycle.
+        for step in 0..span {
+            let ms = (step * SWEEP_MS_PER_CELL) as u64;
+            assert!(
+                lit(ms).len() <= BAND + 1,
+                "band overflows at step {step}: {:?}",
+                lit(ms)
+            );
+        }
+
+        // It advances one cell per SWEEP_MS_PER_CELL.
+        let a = lit(20 * SWEEP_MS_PER_CELL as u64);
+        let b = lit(24 * SWEEP_MS_PER_CELL as u64);
+        assert_ne!(a, b, "the band moves as the turn runs");
+        assert_eq!(
+            b.first().copied().unwrap_or(0),
+            a.first().copied().unwrap_or(0) + 4,
+            "four cells of travel in four cell-times"
+        );
+
+        // And it wraps rather than running off the end forever.
+        let wrapped = sweep_head(
+            Duration::from_millis((span * SWEEP_MS_PER_CELL) as u64),
+            span,
+        );
+        assert_eq!(wrapped, 0, "the sweep returns to the start of the cycle");
+    }
+
+    #[test]
+    fn activity_rail_requires_color_responding_and_room() {
+        use theme::TerminalMode::{NoColor, TrueColor};
+        assert!(activity_rail_is_visible(
+            TrueColor,
+            true,
+            MIN_HEIGHT_FOR_ACTIVITY_RAIL
+        ));
+        assert!(
+            !activity_rail_is_visible(NoColor, true, 40),
+            "without color the ramp carries nothing and the rail is a solid wall"
+        );
+        assert!(
+            !activity_rail_is_visible(TrueColor, false, 40),
+            "an idle turn spends no row"
+        );
+        assert!(
+            !activity_rail_is_visible(TrueColor, true, MIN_HEIGHT_FOR_ACTIVITY_RAIL - 1),
+            "a short terminal keeps its rows for the transcript"
+        );
+    }
+
+    #[test]
+    fn elapsed_reads_like_a_stopwatch() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_millis(400)), "0.4s");
+        assert_eq!(format_elapsed(Duration::from_millis(12_400)), "12.4s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59.0s");
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m00s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
     }
 
     #[test]
