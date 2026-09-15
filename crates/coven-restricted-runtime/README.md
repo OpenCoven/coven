@@ -174,6 +174,9 @@ There is no support flag or verified-permissions constructor in this crate.
 Next integration obligations are to implement and review a real backend,
 prove its sealed offline closure and release/guardian/termination behavior,
 and coordinate OS conformance with the existing OpenCoven/coven#858 owner.
+[`coven-restricted-runtime-macos`](../coven-restricted-runtime-macos/README.md)
+is the first such backend (Seatbelt plus an independent guardian process) with
+whole-process conformance tests; its README lists the obligations still open.
 Only a separately reviewed integration can change production discovery or
 launch behavior. The fake sequencing tests here are not that evidence.
 
