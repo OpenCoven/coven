@@ -3,6 +3,7 @@ summary: "Read-path observability commands: status, familiars, skills, memory, r
 read_when:
   - Checking what your coven is doing from a terminal
   - Scripting against Cave-parity read views
+source_adjacent_reason: "Documents the observe command surfaces implemented in this repository, including their terminal rendering contract."
 title: "coven observability commands"
 description: "Reference for coven status, familiars, skills, memory, research, calls, hub, scheduler, travel, and sessions show/events/log: terminal parity with the CovenCave dashboard and the daemon API."
 ---
