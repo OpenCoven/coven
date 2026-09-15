@@ -35,27 +35,11 @@ The current implementation expects the prompt to be the final command argument a
 
 New harnesses should not be added as one-off special cases across the daemon, TUI, docs, OpenClaw plugin, and package READMEs. Add a reusable adapter description first, then wire the daemon and clients against that description.
 
-For now, Codex and Claude Code remain the compatibility defaults. Additional harnesses can be tested through an explicit adapter manifest by setting `COVEN_HARNESS_ADAPTER_MANIFEST` to a JSON file:
+For now, Codex and Claude Code remain the compatibility defaults. Additional harnesses can be tested through an explicit adapter manifest by setting `COVEN_HARNESS_ADAPTER_MANIFEST` to a JSON file. The manifest is not an arbitrary command registry: Coven only loads harness ids with an approved adapter contract in the binary, and the executable plus prompt prefix args must match that approved contract.
 
-```json
-{
-  "adapters": [
-    {
-      "id": "example",
-      "label": "Example Harness",
-      "executable": "example",
-      "interactive_prompt_prefix_args": [],
-      "non_interactive_prompt_prefix_args": ["run", "--quiet"],
-      "install_hint": "Install Example Harness and make sure `example` is on PATH.",
-      "system_prompt_flag": null
-    }
-  ]
-}
-```
+The prompt is appended as the final command argument after the approved prefix args. Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
 
-The prompt is appended as the final command argument after the configured prefix args. Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
-
-This manifest path is for explicit integration work. It is not a public support claim for every adapter listed in a maintainer's local manifest.
+This manifest path is for explicit integration work. It is not a public support claim for every adapter listed in a maintainer's local manifest, and it intentionally rejects generic shell/interpreter adapters such as `sh -c` because they would turn prompt text into executable code.
 
 A code-backed adapter should still be shaped as data plus narrow translation functions. The adapter registry/manifest can describe:
 

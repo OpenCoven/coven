@@ -30,7 +30,7 @@ Set `COVEN_HARNESS_ADAPTER_MANIFEST` to a JSON file like this while testing:
 }
 ```
 
-The manifest only proves command construction and explicit opt-in loading. It does not make Hermes a default adapter.
+The manifest only proves command construction and explicit opt-in loading. It does not make Hermes a default adapter. Coven validates this manifest against the approved Hermes adapter contract in the binary, so changing the executable or prompt prefix args will be rejected.
 
 ## Promotion checklist
 

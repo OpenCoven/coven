@@ -225,6 +225,36 @@ fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
     load_external_harness_specs(Path::new(&manifest_path))
 }
 
+fn approved_external_harness_specs() -> Vec<HarnessCommandSpec> {
+    vec![HarnessCommandSpec {
+        id: "hermes".to_string(),
+        label: "Hermes Agent".to_string(),
+        executable: "hermes".to_string(),
+        interactive_prompt_prefix_args: vec![
+            "chat".to_string(),
+            "--source".to_string(),
+            "coven".to_string(),
+            "-q".to_string(),
+        ],
+        non_interactive_prompt_prefix_args: vec![
+            "chat".to_string(),
+            "--source".to_string(),
+            "coven".to_string(),
+            "-Q".to_string(),
+            "-q".to_string(),
+        ],
+        install_hint: "Install Hermes Agent and configure it before using this adapter."
+            .to_string(),
+        system_prompt_flag: None,
+    }]
+}
+
+fn approved_external_harness_spec(id: &str) -> Option<HarnessCommandSpec> {
+    approved_external_harness_specs()
+        .into_iter()
+        .find(|spec| spec.id == id)
+}
+
 fn load_external_harness_specs(path: &Path) -> Result<Vec<HarnessCommandSpec>> {
     let raw = fs::read_to_string(path).map_err(|err| {
         anyhow!(
@@ -286,6 +316,12 @@ impl ExternalHarnessAdapterSpec {
                 manifest_path.display()
             );
         }
+        let Some(approved) = approved_external_harness_spec(&id) else {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} is not approved; only known harness adapters may be loaded",
+                manifest_path.display()
+            );
+        };
         let executable = self.executable.trim().to_string();
         if executable.is_empty()
             || executable.contains('/')
@@ -296,6 +332,35 @@ impl ExternalHarnessAdapterSpec {
                 "external harness adapter `{id}` in {} has an invalid executable `{}`",
                 manifest_path.display(),
                 self.executable
+            );
+        }
+        if executable != approved.executable {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} must use executable `{}`",
+                manifest_path.display(),
+                approved.executable
+            );
+        }
+        if self.interactive_prompt_prefix_args != approved.interactive_prompt_prefix_args {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} has unsupported interactive_prompt_prefix_args",
+                manifest_path.display()
+            );
+        }
+        if self.non_interactive_prompt_prefix_args != approved.non_interactive_prompt_prefix_args {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} has unsupported non_interactive_prompt_prefix_args",
+                manifest_path.display()
+            );
+        }
+        let system_prompt_flag = self
+            .system_prompt_flag
+            .map(|flag| flag.trim().to_string())
+            .filter(|flag| !flag.is_empty());
+        if system_prompt_flag != approved.system_prompt_flag {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} has an unsupported system_prompt_flag",
+                manifest_path.display()
             );
         }
         if self.label.trim().is_empty() {
@@ -314,13 +379,10 @@ impl ExternalHarnessAdapterSpec {
             id,
             label: self.label.trim().to_string(),
             executable,
-            interactive_prompt_prefix_args: self.interactive_prompt_prefix_args,
-            non_interactive_prompt_prefix_args: self.non_interactive_prompt_prefix_args,
+            interactive_prompt_prefix_args: approved.interactive_prompt_prefix_args,
+            non_interactive_prompt_prefix_args: approved.non_interactive_prompt_prefix_args,
             install_hint: self.install_hint.trim().to_string(),
-            system_prompt_flag: self
-                .system_prompt_flag
-                .map(|flag| flag.trim().to_string())
-                .filter(|flag| !flag.is_empty()),
+            system_prompt_flag,
         })
     }
 }
@@ -787,6 +849,62 @@ mod tests {
         assert!(!built_in_harnesses()
             .iter()
             .any(|harness| harness.id == "hermes"));
+        Ok(())
+    }
+
+    #[test]
+    fn external_manifest_rejects_unapproved_shell_adapter() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "pwn",
+                  "label": "Shell",
+                  "executable": "sh",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["-c"],
+                  "install_hint": "Do not use.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let error = load_external_harness_specs(&manifest)
+            .expect_err("unapproved shell adapters must be rejected");
+        assert!(error.to_string().contains("is not approved"));
+        Ok(())
+    }
+
+    #[test]
+    fn external_manifest_rejects_approved_adapter_with_unsafe_prefix_args() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "hermes",
+                  "label": "Hermes Agent",
+                  "executable": "hermes",
+                  "interactive_prompt_prefix_args": ["chat", "--source", "coven", "-q"],
+                  "non_interactive_prompt_prefix_args": ["-c"],
+                  "install_hint": "Install Hermes Agent and configure it before using this adapter.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let error = load_external_harness_specs(&manifest)
+            .expect_err("approved adapters must use approved argv prefixes");
+        assert!(error
+            .to_string()
+            .contains("unsupported non_interactive_prompt_prefix_args"));
         Ok(())
     }
 
