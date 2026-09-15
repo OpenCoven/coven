@@ -20,7 +20,7 @@
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -177,15 +177,66 @@ pub fn build_transport(config: &TransportConfig) -> Result<Box<dyn ExecutorTrans
             remote_program.as_deref(),
         )?)),
         TransportConfig::Local { program, args } => {
-            if program.trim().is_empty() {
-                bail!("local transport program must not be empty");
-            }
+            let program = validate_local_program(program, args)?;
             Ok(Box::new(LocalProcessTransport {
-                program: program.clone(),
+                program: program.display().to_string(),
                 args: args.clone(),
             }))
         }
     }
+}
+
+fn validate_local_program(program: &str, args: &[String]) -> Result<PathBuf> {
+    let program = program.trim();
+    if program.is_empty() {
+        bail!("local transport program must not be empty");
+    }
+    if !args.is_empty() {
+        bail!("local transport args must be empty; executor protocol arguments are appended by the hub");
+    }
+    #[cfg(test)]
+    {
+        // Unit tests use temporary scripted executors as a deterministic
+        // local transport seam. Production builds below only accept the
+        // running Coven executable.
+        Ok(PathBuf::from(program))
+    }
+    #[cfg(not(test))]
+    {
+        let configured = Path::new(program).canonicalize().with_context(|| {
+            format!(
+                "local transport program must resolve to the running coven executable: {program}"
+            )
+        })?;
+        let current = std::env::current_exe()
+            .context("failed to resolve running coven executable for local transport validation")?
+            .canonicalize()
+            .context(
+                "failed to canonicalize running coven executable for local transport validation",
+            )?;
+        if configured != current {
+            bail!(
+                "local transport program must be the running coven executable; got {}",
+                configured.display()
+            );
+        }
+        Ok(configured)
+    }
+}
+
+fn validate_remote_program(remote_program: &str) -> Result<()> {
+    if remote_program.is_empty() || remote_program.starts_with('-') {
+        bail!("ssh transport remote program must not be empty or start with '-'");
+    }
+    if !remote_program
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "ssh transport remote program must contain only ASCII letters, digits, '/', '.', '_', or '-'"
+        );
+    }
+    Ok(())
 }
 
 /// Hub-owned SSH dispatcher transport. Connections are always outbound
@@ -225,9 +276,7 @@ impl SshTransport {
             bail!("ssh transport identity file must not be empty or start with '-'");
         }
         let remote_program = remote_program.map_or("coven", str::trim);
-        if remote_program.is_empty() || remote_program.starts_with('-') {
-            bail!("ssh transport remote program must not be empty or start with '-'");
-        }
+        validate_remote_program(remote_program)?;
         Ok(Self {
             host: host.to_string(),
             user: user.map(str::to_string),
@@ -959,6 +1008,8 @@ mod tests {
         assert!(SshTransport::new("host", Some("-badflag"), None, None, None).is_err());
         assert!(SshTransport::new("host", None, None, Some("-i-evil"), None).is_err());
         assert!(SshTransport::new("host", None, None, None, Some("-notaprogram")).is_err());
+        assert!(SshTransport::new("host", None, None, None, Some("coven;id")).is_err());
+        assert!(SshTransport::new("host", None, None, None, Some("coven wrapper")).is_err());
         assert!(SshTransport::new("", None, None, None, None).is_err());
         // Whitespace-only values must fail closed too.
         assert!(SshTransport::new("host", Some("  "), None, None, None).is_err());
@@ -973,12 +1024,20 @@ mod tests {
         )?;
         assert!(matches!(ssh, TransportConfig::Ssh { .. }));
 
-        let local: TransportConfig =
-            serde_json::from_str(r#"{"kind":"local","program":"/usr/local/bin/coven"}"#)?;
+        let local_program = std::env::current_exe()?;
+        let local: TransportConfig = serde_json::from_value(serde_json::json!({
+            "kind": "local",
+            "program": local_program,
+        }))?;
         assert!(matches!(local, TransportConfig::Local { .. }));
 
         assert!(build_transport(&ssh).is_ok());
         assert!(build_transport(&local).is_ok());
+        assert!(build_transport(&TransportConfig::Local {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "id".to_string()],
+        })
+        .is_err());
         assert!(build_transport(&TransportConfig::Local {
             program: "  ".to_string(),
             args: vec![],
