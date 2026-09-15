@@ -594,21 +594,22 @@ mod tests {
     #[cfg(unix)]
     impl LifecycleTestHome {
         fn new() -> Self {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::DirBuilderExt;
 
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .ancestors()
-                .nth(2)
-                .expect("workspace root");
-            let path = workspace.join("c").join(format!(
-                "r{:x}{:x}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).expect("create lifecycle test home");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                .expect("make lifecycle test home private");
+            // Neither checkout depth nor an inherited TMPDIR may consume SUN_LEN.
+            let path = loop {
+                let candidate = std::path::Path::new("/tmp").join(format!(
+                    "coven-lc-{:x}-{:x}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("create lifecycle test home: {error}"),
+                }
+            };
             Self(path)
         }
     }
@@ -618,6 +619,52 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_test_home_is_socket_safe() {
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+        let home = LifecycleTestHome::new();
+        let path = std::fs::canonicalize(&home.0).expect("canonicalize lifecycle test home");
+        let workspace = std::fs::canonicalize(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .expect("workspace root"),
+        )
+        .expect("canonicalize workspace root");
+        assert!(
+            !path.starts_with(workspace),
+            "lifecycle test home must not inherit checkout depth: {}",
+            path.display()
+        );
+        let socket = path.join("coven.sock");
+        let capacity = std::mem::size_of::<libc::sockaddr_un>()
+            - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        assert!(
+            socket.as_os_str().as_bytes().len() + 1 + 16 <= capacity,
+            "canonical lifecycle socket must retain 16 bytes of SUN_LEN headroom: {}",
+            socket.display()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let parent = path
+            .parent()
+            .expect("lifecycle fixture allocator base")
+            .to_path_buf();
+        drop(home);
+        assert!(
+            !path.exists(),
+            "dropping the fixture must remove its owned home"
+        );
+        assert!(
+            parent.is_dir(),
+            "dropping the fixture must retain the allocator base"
+        );
     }
 
     #[cfg(unix)]
