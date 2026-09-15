@@ -1139,6 +1139,10 @@ impl App {
                     "Quest planned for: {goal}. Cast will run each phase through this composer; start with the design phase prompt when ready."
                 ));
             }
+            // `view_text`, not `view_text_styled`: this text becomes a
+            // ratatui transcript message, and ratatui does not interpret
+            // ANSI — an escape here renders as literal `[38;2;…m` garbage.
+            // The styled twin is for raw-stdout callers only.
             CastIntent::Observe { view } => match self.resolved_coven_home() {
                 Some(home) => match crate::observe::view_text(&home, view) {
                     Ok(text) => {

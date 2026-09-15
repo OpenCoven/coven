@@ -33,6 +33,23 @@ table.
 | `coven sessions events <id>` | Recorded events (redacted) | `GET /api/v1/sessions/:id/events` |
 | `coven sessions log <id>` | Log lines | `GET /api/v1/sessions/:id/log` |
 
+## Color
+
+On a color-capable terminal the human views carry the Coven brand palette:
+table header rows and field labels take the brand tokens, and status words
+(`running`, `failed`, `queued`, `offline`, …) take their status color. Body
+text, free-text columns, and every value the daemon supplies keep the
+terminal's default foreground, and the layout is identical either way.
+
+Color is suppressed — byte-for-byte identical to the uncolored output — when
+stdout is not a terminal, when `NO_COLOR` is set, or with `--color=never`.
+`CLICOLOR_FORCE=1` and `--color=always` force it back on through a pipe.
+`--json` output is never colored. Scripts that parse the human tables see the
+same bytes they always have, because they read from a pipe.
+
+`coven doctor` is not covered by this: its prose report stays plain text
+under all color settings (see [`cli-doctor.md`](cli-doctor.md)).
+
 ## coven memory open
 
 `coven memory open` starts or reuses the local Coven daemon, then launches the
