@@ -346,7 +346,7 @@ fn list_worktrees() -> Result<Vec<Worktree>> {
 
 fn worktree_dirty(path: &Path) -> Result<bool> {
     let output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["-c", "core.fsmonitor=", "status", "--porcelain"])
         .current_dir(path)
         .output()
         .with_context(|| format!("failed to inspect {}", path.display()))?;

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -25,6 +26,32 @@ fn wt_creates_sibling_worktree_and_lists_protocol_state() -> anyhow::Result<()> 
     assert_success("coven wt --list", &list);
     assert_stdout_contains("coven wt --list", &list, "feature/demo");
     assert_stdout_contains("coven wt --list", &list, "feature-demo");
+    Ok(())
+}
+
+#[test]
+fn wt_list_does_not_run_repo_local_fsmonitor_hook() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let create = repo.coven(["wt", "feature/demo"])?;
+    assert_success("coven wt feature/demo", &create);
+
+    let marker = repo.path.join("fsmonitor-ran");
+    let hook = repo.path.join("fsmonitor-hook.sh");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf ran > {}\n", marker.display()),
+    )?;
+    let mut permissions = fs::metadata(&hook)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&hook, permissions)?;
+    repo.git_os(["config", "core.fsmonitor"], [&hook])?;
+
+    let list = repo.coven(["wt", "--list"])?;
+    assert_success("coven wt --list", &list);
+    assert!(
+        !marker.exists(),
+        "coven wt --list must not execute repo-local core.fsmonitor hooks"
+    );
     Ok(())
 }
 
