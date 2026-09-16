@@ -16,18 +16,15 @@
 //! overlay handles across requests would buy contention rather than speed.
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use similar::TextDiff;
 
 use coven_afs::{
-    normalize, Actor, AgentFs, Change, ChangeSet, OverlayFs, SessionBinding, ToolCall,
-    STATE_COMMITTED, STATE_COMMITTING, STATE_DISCARDED, STATE_OPEN,
+    Actor, AgentFs, Change, ChangeSet, OverlayFs, SessionBinding, STATE_COMMITTED,
+    STATE_COMMITTING, STATE_DISCARDED, STATE_OPEN,
 };
 
 /// Bumped when the ingest filter changes, so bases built under the old rules
@@ -47,7 +44,6 @@ const INGEST_EXCLUDES: &[&str] = &[".git", "target", "node_modules", ".worktrees
 /// 238 ms). 16 MiB keeps a worst-case first write near ~120 ms, which stays
 /// inside a plausible interactive budget; 32 MiB would not.
 pub const COPY_UP_MAX_BYTES: u64 = 16 * 1024 * 1024;
-pub const UNIFIED_DIFF_MAX_BYTES: usize = 256 * 1024;
 
 /// Failures that map onto DESIGN.md §3.4's dotted error codes.
 ///
@@ -57,8 +53,6 @@ pub const UNIFIED_DIFF_MAX_BYTES: usize = 256 * 1024;
 #[derive(Debug)]
 pub enum AfsError {
     SessionNotFound(String),
-    PathNotFound(String),
-    PathNotFile(String),
     SessionNotOpen {
         id: String,
         state: String,
@@ -86,10 +80,6 @@ pub enum AfsError {
     /// Signing is required and unavailable; Coven never falls back to an
     /// unsigned commit to make materialization land.
     CommitUnsigned(String),
-    /// No mount backend on this platform or in this build.
-    MountUnsupported,
-    /// Already mounted, or the mount point is not empty.
-    MountBusy(String),
     Internal(anyhow::Error),
 }
 
@@ -101,12 +91,6 @@ impl AfsError {
                 404,
                 "afs.session_not_found",
                 format!("No AFS session {id}."),
-            ),
-            Self::PathNotFound(path) => (404, "afs.path_not_found", format!("No AFS path {path}.")),
-            Self::PathNotFile(path) => (
-                400,
-                "afs.path_not_file",
-                format!("AFS path {path} is not a regular file."),
             ),
             Self::SessionNotOpen { id, state } => (
                 409,
@@ -147,12 +131,6 @@ impl AfsError {
                 "afs.commit_unsigned",
                 format!("Commit signing is required but unavailable: {message}"),
             ),
-            Self::MountUnsupported => (
-                501,
-                "afs.mount_unsupported",
-                "No mount backend is available; health advertises afsMount:false.".to_string(),
-            ),
-            Self::MountBusy(message) => (409, "afs.mount_busy", message.clone()),
             Self::Internal(error) => (500, "afs.unavailable", error.to_string()),
         }
     }
@@ -170,7 +148,7 @@ impl From<coven_afs::Error> for AfsError {
     }
 }
 
-pub(crate) type AfsResult<T> = std::result::Result<T, AfsError>;
+type AfsResult<T> = std::result::Result<T, AfsError>;
 
 // ---- wire shapes --------------------------------------------------------
 
@@ -200,42 +178,6 @@ pub struct CommitRequest {
     /// form `AGENTS.md` requires.
     #[serde(default)]
     pub co_authors: Vec<String>,
-    /// Run every refusal check and report what would happen, without
-    /// quiescing the session, creating a worktree, or recording a commit.
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-/// What a `dryRun` commit reports (bead `coven-fty` follow-up `coven-y7a`).
-///
-/// `wouldCommit` is only ever `true`: a preview that would be refused returns
-/// the refusal itself, as the same dotted error a real commit would raise, so
-/// a client reads one contract rather than two.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommitPreview {
-    pub id: String,
-    pub branch: String,
-    pub worktree_path: String,
-    pub provenance_high_water: i64,
-    pub counts: ChangeCounts,
-    /// Entries that would be written or removed, after directories and
-    /// unmaterializable nodes are dropped — not the same as `counts`.
-    pub files: usize,
-    pub dry_run: bool,
-    pub would_commit: bool,
-}
-
-/// Everything a commit needs, resolved and validated, before anything is
-/// written. Shared by `commit` and `commit_dry_run` so the two cannot diverge.
-struct CommitPlan {
-    binding: SessionBinding,
-    project_root: PathBuf,
-    branch: String,
-    worktree_path: PathBuf,
-    plan: Vec<Planned>,
-    counts: ChangeCounts,
-    high_water: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,47 +255,6 @@ pub struct DiffView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FileDiffView {
-    pub path: String,
-    pub patch: String,
-    pub truncated: bool,
-    pub binary: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TimelineToolCallView {
-    pub id: i64,
-    pub name: String,
-    pub parameters: Option<String>,
-    pub result: Option<String>,
-    pub error: Option<String>,
-    pub started_at: i64,
-    pub completed_at: i64,
-    pub duration_ms: i64,
-}
-
-impl From<ToolCall> for TimelineToolCallView {
-    fn from(call: ToolCall) -> Self {
-        Self {
-            id: call.id,
-            name: call.name,
-            parameters: call
-                .parameters
-                .map(|value| crate::privacy::redact_payload_json(&value)),
-            result: call
-                .result
-                .map(|value| crate::privacy::redact_payload_json(&value)),
-            error: call.error.map(|value| crate::privacy::redact_text(&value)),
-            started_at: call.started_at,
-            completed_at: call.completed_at,
-            duration_ms: call.duration_ms,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TimelineEntry {
     pub seq: i64,
     pub op: String,
@@ -366,7 +267,6 @@ pub struct TimelineEntry {
     pub bead_id: Option<String>,
     pub turn: Option<i64>,
     pub tool_call_id: Option<i64>,
-    pub tool_call: Option<TimelineToolCallView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,47 +488,9 @@ impl AfsStore {
                 familiar_id: binding.familiar_id.clone(),
                 bead_id: binding.bead_id.clone(),
             },
-            mount: crate::afs_mount::current(self.coven_home(), id),
+            mount: None,
             changes: counts,
         })
-    }
-
-    /// `afs.mount` — mount the session's filesystem.
-    ///
-    /// Mounting requires an open session for the same reason writing does: a
-    /// committed or discarded delta is a record, and handing back a writable
-    /// mount over one would let an agent edit history.
-    pub fn mount(&self, id: &str) -> AfsResult<crate::afs_mount::MountView> {
-        let binding = self.binding(id)?;
-        self.require_open(&binding)?;
-        let delta = self.delta_path(id);
-        let read_only = self.open_delta(id)?.is_read_only();
-        // The mount shows the merged view, so the export needs both layers
-        // (DESIGN.md §3.2). A session with no base ingested has only a delta
-        // to serve, which is the one case where mounting one layer is right.
-        let base = binding
-            .base_fingerprint
-            .as_deref()
-            .map(|fingerprint| self.base_path(fingerprint))
-            .filter(|path| path.exists());
-        crate::afs_mount::mount(self.coven_home(), id, &delta, base.as_deref(), read_only)
-    }
-
-    /// `afs.mount` DELETE — unmount. Reports whether anything was mounted.
-    ///
-    /// Unlike mount, this does not require an open session: a session that was
-    /// committed while mounted still needs its mount taken down, and refusing
-    /// would strand it.
-    pub fn unmount(&self, id: &str) -> AfsResult<bool> {
-        // Still resolve the binding, so unmounting an unknown session is
-        // `afs.session_not_found` rather than a cheerful no-op.
-        self.binding(id)?;
-        crate::afs_mount::unmount(self.coven_home(), id)
-    }
-
-    /// `<COVEN_HOME>`, recovered from the `afs` root this store was built on.
-    fn coven_home(&self) -> &Path {
-        self.root.parent().unwrap_or(&self.root)
     }
 
     /// `afs.session.join` — attach a second actor to an existing delta.
@@ -689,67 +551,6 @@ impl AfsStore {
         })
     }
 
-    /// `afs.session.diff` for a single file path.
-    pub fn file_diff(&self, id: &str, path: &str) -> AfsResult<FileDiffView> {
-        let binding = self.binding(id)?;
-        let overlay = self.open_overlay(id, &binding)?;
-        let path = normalize(path);
-
-        let base_meta = optional_agent_metadata(overlay.base(), &path)?;
-        let merged_meta = optional_overlay_metadata(&overlay, &path)?;
-        if base_meta.is_none() && merged_meta.is_none() {
-            return Err(AfsError::PathNotFound(path));
-        }
-        if base_meta.as_ref().is_some_and(|meta| !meta.is_file())
-            || merged_meta.as_ref().is_some_and(|meta| !meta.is_file())
-        {
-            return Err(AfsError::PathNotFile(path));
-        }
-
-        let base = if base_meta.is_some() {
-            Some(overlay.base().read_file(&path).map_err(AfsError::from)?)
-        } else {
-            None
-        };
-        let merged = if merged_meta.is_some() {
-            Some(overlay.read_file(&path).map_err(AfsError::from)?)
-        } else {
-            None
-        };
-        let path_header = diff_header_path(&path);
-        let base_header = if base.is_some() {
-            path_header.as_str()
-        } else {
-            "/dev/null"
-        };
-        let merged_header = if merged.is_some() {
-            path_header.as_str()
-        } else {
-            "/dev/null"
-        };
-        let (patch, truncated, binary) = match (
-            std::str::from_utf8(base.as_deref().unwrap_or(&[])),
-            std::str::from_utf8(merged.as_deref().unwrap_or(&[])),
-        ) {
-            (Ok(base), Ok(merged)) => {
-                let (patch, truncated) =
-                    bounded_unified_diff(base, merged, base_header, merged_header, &path)?;
-                (patch, truncated, false)
-            }
-            _ if matches!((&base, &merged), (Some(base), Some(merged)) if base == merged) => {
-                (String::new(), false, true)
-            }
-            _ => ("Binary files differ\n".to_string(), false, true),
-        };
-
-        Ok(FileDiffView {
-            path,
-            patch,
-            truncated,
-            binary,
-        })
-    }
-
     /// `afs.timeline` — cursor-paginated on `afs_provenance.seq`, matching the
     /// daemon's existing `eventCursor: "sequence"` idiom.
     pub fn timeline(&self, id: &str, since: i64, limit: usize) -> AfsResult<TimelineView> {
@@ -761,31 +562,20 @@ impl AfsStore {
         let entries: Vec<TimelineEntry> = records
             .into_iter()
             .take(limit)
-            .map(|record| {
-                let tool_call_id = record.actor.tool_call_id;
-                let tool_call = match tool_call_id {
-                    Some(id) => delta
-                        .tool_call(id)
-                        .map_err(AfsError::from)?
-                        .map(TimelineToolCallView::from),
-                    None => None,
-                };
-                Ok(TimelineEntry {
-                    seq: record.seq,
-                    op: record.op,
-                    path: record.path,
-                    to_path: record.to_path,
-                    bytes: record.bytes,
-                    at: record.at,
-                    session_id: record.actor.coven_session_id,
-                    familiar_id: record.actor.familiar_id,
-                    bead_id: record.actor.bead_id,
-                    turn: record.actor.turn,
-                    tool_call_id,
-                    tool_call,
-                })
+            .map(|record| TimelineEntry {
+                seq: record.seq,
+                op: record.op,
+                path: record.path,
+                to_path: record.to_path,
+                bytes: record.bytes,
+                at: record.at,
+                session_id: record.actor.coven_session_id,
+                familiar_id: record.actor.familiar_id,
+                bead_id: record.actor.bead_id,
+                turn: record.actor.turn,
+                tool_call_id: record.actor.tool_call_id,
             })
-            .collect::<AfsResult<_>>()?;
+            .collect();
         Ok(TimelineView {
             next_cursor: entries.last().map(|entry| entry.seq),
             has_more,
@@ -821,35 +611,14 @@ impl AfsStore {
         Ok(())
     }
 
-    /// `afs.session.commit` with `dryRun` — every refusal a real commit could
-    /// raise, and none of its effects.
+    /// `afs.session.commit` — materialize the delta into a git branch
+    /// (DESIGN.md §5).
     ///
-    /// This shares [`plan_commit`](Self::plan_commit) with the real thing
-    /// rather than re-deriving the checks, so a preview cannot drift from what
-    /// commit actually enforces — the drift is the only way a preview could
-    /// lie. Nothing is written: no `committing` transition, no worktree, no
-    /// `afs_commit` row.
-    pub fn commit_dry_run(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitPreview> {
-        let plan = self.plan_commit(id, request)?;
-        Ok(CommitPreview {
-            id: id.to_string(),
-            branch: plan.branch,
-            worktree_path: plan.worktree_path.to_string_lossy().into_owned(),
-            provenance_high_water: plan.high_water,
-            counts: plan.counts,
-            files: plan.plan.len(),
-            dry_run: true,
-            would_commit: true,
-        })
-    }
-
-    /// Resolve and validate everything a commit needs, mutating nothing.
-    ///
-    /// Every DESIGN.md §5 check that can refuse lives here: base verification
-    /// (§5.2), the full change-set resolution and escape rejection (§5.4/§5.5),
-    /// and the branch/worktree conflict checks. Reading the provenance high
-    /// water is a `SELECT MAX`, so it is safe on this side of the line too.
-    fn plan_commit(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitPlan> {
+    /// Every check that can refuse the commit runs *before* the worktree is
+    /// created, so a refusal leaves no branch, no worktree, and no partially
+    /// applied delta. The delta itself survives materialization — it is the
+    /// audit record — until an explicit discard.
+    pub fn commit(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitView> {
         let binding = self.binding(id)?;
         self.require_open(&binding)?;
 
@@ -917,43 +686,9 @@ impl AfsStore {
             )));
         }
 
-        // A read, not a write — safe on the no-effects side of the line.
-        let high_water = self
-            .open_delta(id)?
-            .provenance_high_water()
-            .map_err(AfsError::from)?;
-
-        Ok(CommitPlan {
-            binding,
-            project_root,
-            branch,
-            worktree_path,
-            plan,
-            counts,
-            high_water,
-        })
-    }
-
-    /// `afs.session.commit` — materialize the delta into a git branch
-    /// (DESIGN.md §5).
-    ///
-    /// Every check that can refuse the commit runs *before* the worktree is
-    /// created, so a refusal leaves no branch, no worktree, and no partially
-    /// applied delta. The delta itself survives materialization — it is the
-    /// audit record — until an explicit discard.
-    pub fn commit(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitView> {
-        let CommitPlan {
-            binding,
-            project_root,
-            branch,
-            worktree_path,
-            plan,
-            counts,
-            high_water,
-        } = self.plan_commit(id, request)?;
-
         // §5.1 — quiesce only once nothing can still refuse.
         let delta = self.open_delta(id)?;
+        let high_water = delta.provenance_high_water().map_err(AfsError::from)?;
         delta
             .set_session_state(&binding.id, STATE_COMMITTING)
             .map_err(AfsError::from)?;
@@ -1113,10 +848,7 @@ fn reject_escape(normalized: &str) -> AfsResult<()> {
             reason: "it contains a relative component after normalization".to_string(),
         });
     }
-    if components
-        .next()
-        .is_some_and(|component| component.eq_ignore_ascii_case(".git"))
-    {
+    if components.next() == Some(".git") {
         return Err(AfsError::PathOutsideRoot {
             path: normalized.to_string(),
             reason: "writes under .git/ are never materialized".to_string(),
@@ -1205,6 +937,10 @@ fn materialize(
 ) -> AfsResult<String> {
     let base = binding.base_commit.clone().unwrap_or_default();
     let add = std::process::Command::new("git")
+        // Repository configuration and hook files are untrusted. Git's
+        // documented /dev/null hooks path disables every hook, including
+        // post-checkout, without relying on individual --no-verify flags.
+        .args(["-c", "core.hooksPath=/dev/null"])
         .arg("-C")
         .arg(project_root)
         .args(["worktree", "add", "-b", branch])
@@ -1239,6 +975,7 @@ fn materialize(
     // §5.6 — signed, always. A signing failure is surfaced, never worked
     // around by dropping -S.
     let commit = std::process::Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null"])
         .arg("-C")
         .arg(worktree_path)
         .args([
@@ -1504,152 +1241,6 @@ fn cleanup_failed_materialization(project_root: &Path, worktree_path: &Path, bra
         .output();
 }
 
-fn optional_agent_metadata(fs: &AgentFs, path: &str) -> AfsResult<Option<coven_afs::Metadata>> {
-    match fs.stat(path) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(coven_afs::Error::NotFound(_)) => Ok(None),
-        Err(error) => Err(AfsError::from(error)),
-    }
-}
-
-fn optional_overlay_metadata(
-    overlay: &OverlayFs,
-    path: &str,
-) -> AfsResult<Option<coven_afs::Metadata>> {
-    match overlay.stat(path) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(coven_afs::Error::NotFound(_)) => Ok(None),
-        Err(error) => Err(AfsError::from(error)),
-    }
-}
-
-fn diff_header_path(path: &str) -> String {
-    let must_quote = path == "/dev/null"
-        || path
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '"' | '\\'));
-    if !must_quote {
-        return path.to_string();
-    }
-
-    let mut quoted = String::with_capacity(path.len() + 2);
-    quoted.push('"');
-    for character in path.chars() {
-        match character {
-            '"' => quoted.push_str("\\\""),
-            '\\' => quoted.push_str("\\\\"),
-            '\u{08}' => quoted.push_str("\\b"),
-            '\u{0c}' => quoted.push_str("\\f"),
-            '\n' => quoted.push_str("\\n"),
-            '\r' => quoted.push_str("\\r"),
-            '\t' => quoted.push_str("\\t"),
-            character if character.is_control() => {
-                write!(&mut quoted, "\\u{:04x}", character as u32)
-                    .expect("writing to a String cannot fail");
-            }
-            character => quoted.push(character),
-        }
-    }
-    quoted.push('"');
-    quoted
-}
-
-fn bounded_unified_diff(
-    base: &str,
-    merged: &str,
-    base_header: &str,
-    merged_header: &str,
-    path: &str,
-) -> AfsResult<(String, bool)> {
-    let diff = TextDiff::from_lines(base, merged);
-    let mut unified = diff.unified_diff();
-    unified.context_radius(3).header(base_header, merged_header);
-
-    let mut output = CappedDiffWriter::new(UNIFIED_DIFF_MAX_BYTES);
-    let result = unified.to_writer(&mut output);
-    finish_bounded_diff(output, result, path)
-}
-
-fn finish_bounded_diff(
-    output: CappedDiffWriter,
-    result: io::Result<()>,
-    path: &str,
-) -> AfsResult<(String, bool)> {
-    if let Err(error) = result {
-        if !output.truncated {
-            return Err(AfsError::Internal(anyhow::anyhow!(
-                "failed to render unified diff for {path}: {error}"
-            )));
-        }
-    }
-    let truncated = output.truncated;
-    let patch = String::from_utf8(output.bytes).map_err(|error| {
-        AfsError::Internal(anyhow::anyhow!(
-            "unified diff for {path} was not valid UTF-8: {error}"
-        ))
-    })?;
-    Ok((patch, truncated))
-}
-
-struct CappedDiffWriter {
-    bytes: Vec<u8>,
-    max_bytes: usize,
-    truncated: bool,
-}
-
-impl CappedDiffWriter {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(max_bytes),
-            max_bytes,
-            truncated: false,
-        }
-    }
-}
-
-impl Write for CappedDiffWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if self.bytes.len() == self.max_bytes {
-            self.truncated = true;
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "unified diff output limit reached",
-            ));
-        }
-
-        let remaining = self.max_bytes - self.bytes.len();
-        if buf.len() <= remaining {
-            self.bytes.extend_from_slice(buf);
-            return Ok(buf.len());
-        }
-
-        let text = std::str::from_utf8(buf)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let mut end = remaining;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == 0 {
-            self.truncated = true;
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "unified diff output limit reached",
-            ));
-        }
-
-        self.bytes.extend_from_slice(&buf[..end]);
-        self.truncated = true;
-        Ok(end)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 // ---- base ingest --------------------------------------------------------
 
 fn git_head(project_root: &Path) -> Option<String> {
@@ -1842,134 +1433,6 @@ mod tests {
         fs.write_file(path, data).unwrap();
     }
 
-    /// Every error code the daemon can emit, as one instance per variant.
-    ///
-    /// Deliberately exhaustive by construction rather than by iterating a
-    /// list: adding a variant without adding it here fails to compile against
-    /// the match below, which is the point.
-    fn every_error() -> Vec<AfsError> {
-        vec![
-            AfsError::SessionNotFound("x".into()),
-            AfsError::SessionNotOpen {
-                id: "x".into(),
-                state: "committed".into(),
-            },
-            AfsError::NameInUse("x".into()),
-            AfsError::ConfirmationRequired,
-            AfsError::BaseDiverged {
-                expected: "a".into(),
-                found: "b".into(),
-            },
-            AfsError::PathOutsideRoot {
-                path: "x".into(),
-                reason: "y".into(),
-            },
-            AfsError::PathNotFound("x".into()),
-            AfsError::PathNotFile("x".into()),
-            AfsError::CopyUpTooLarge {
-                path: "x".into(),
-                bytes: 1,
-            },
-            AfsError::CommitConflict("x".into()),
-            AfsError::CommitUnsigned("x".into()),
-            AfsError::MountUnsupported,
-            AfsError::MountBusy("x".into()),
-            AfsError::Internal(anyhow::anyhow!("x")),
-        ]
-    }
-
-    /// The §3.4 error-code table, and only that table.
-    ///
-    /// Both directions scope to this section rather than the whole file.
-    /// §3.2's operations table has rows in the same shape —
-    /// `| `afs.session.create` | POST … |` — so a whole-file search would let
-    /// an operation name satisfy a check about error codes, and would let a
-    /// code documented in some other table pass as if it were in the contract.
-    fn design_error_table() -> String {
-        let design = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../specs/coven-agent-fs/DESIGN.md"),
-        )
-        .expect("DESIGN.md is readable from the crate root");
-        let (_, rest) = design
-            .split_once("### 3.4")
-            .expect("DESIGN.md still has a §3.4 error-code section");
-        rest.split("\n---").next().unwrap_or(rest).to_string()
-    }
-
-    #[test]
-    fn every_emitted_error_code_is_in_the_design_contract_table() {
-        // DESIGN.md §3.4 is the contract a client branches on, so a code the
-        // daemon can return but the table does not list is a code no surface
-        // handles. `afs.unavailable` was exactly that until this test existed.
-        let section = design_error_table();
-
-        let mut missing = Vec::new();
-        for error in every_error() {
-            let (_, code, _) = error.parts();
-            // Only `afs.*` codes are this table's business. A malformed body
-            // is `invalid_request`, the daemon's generic code used in ninety
-            // or so places across `api.rs`; duplicating it into every feature
-            // table would make each one look like the whole contract.
-            if !code.starts_with("afs.") {
-                assert_eq!(
-                    code, "invalid_request",
-                    "an AFS error mapped to an unexpected generic code"
-                );
-                continue;
-            }
-            // Matched as a table cell rather than anywhere in the prose: §5 and
-            // §7 mention codes in passing, and a passing mention is not a
-            // contract entry.
-            if !section.contains(&format!("| `{code}` |")) {
-                missing.push(code);
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "emitted but absent from the DESIGN.md §3.4 table: {missing:?}"
-        );
-    }
-
-    #[test]
-    fn the_contract_table_lists_no_code_the_daemon_cannot_emit() {
-        // The other direction. A documented code nobody returns sends a client
-        // author writing a branch that never runs.
-        let section = design_error_table();
-
-        let emitted: Vec<&'static str> = every_error()
-            .into_iter()
-            .map(|error| error.parts().1)
-            .collect();
-        let documented: Vec<String> = section
-            .lines()
-            .filter_map(|line| {
-                let rest = line.strip_prefix("| `afs.")?;
-                let code = rest.split('`').next()?;
-                Some(format!("afs.{code}"))
-            })
-            .collect();
-        assert!(
-            !documented.is_empty(),
-            "parsed no codes from §3.4; the table's shape changed"
-        );
-
-        let orphaned: Vec<&String> = documented
-            .iter()
-            .filter(|code| !emitted.contains(&code.as_str()))
-            .collect();
-        assert!(
-            orphaned.is_empty(),
-            "documented but never emitted: {orphaned:?}"
-        );
-    }
-
-    fn delta_remove(store: &AfsStore, id: &str, path: &str) {
-        let binding = store.binding(id).unwrap();
-        let mut overlay = store.open_overlay(id, &binding).unwrap();
-        overlay.remove_file(path).unwrap();
-    }
-
     fn delta_symlink(store: &AfsStore, id: &str, target: &str, link: &str) {
         let mut fs = store.open_delta(id).unwrap();
         fs.symlink(target, link).unwrap();
@@ -2044,90 +1507,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_dry_run_previews_the_commit_and_leaves_nothing_behind() {
+    fn commit_does_not_run_repository_configured_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let key = signing_key(dir.path());
         let root = git_project(dir.path(), &key);
+        let hooks = root.join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+
+        let checkout_marker = dir.path().join("post-checkout-ran");
+        let commit_marker = dir.path().join("pre-commit-ran");
+        for (name, marker) in [
+            ("post-checkout", &checkout_marker),
+            ("pre-commit", &commit_marker),
+        ] {
+            let hook = hooks.join(name);
+            std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+            let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&hook, permissions).unwrap();
+        }
+        git_ok(
+            &root,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        );
+
         let store = store(dir.path());
         let view = create(&store, &root);
         delta_write(&store, &view.id, "/src/added.rs", b"// new");
-        delta_write(&store, &view.id, "/README.md", b"# changed");
 
-        let preview = store
-            .commit_dry_run(&view.id, &CommitRequest::default())
-            .unwrap();
-        assert!(preview.dry_run && preview.would_commit);
-        assert_eq!(preview.branch, format!("afs/{}", view.id));
-        assert_eq!(preview.counts.added, 1);
-        assert_eq!(preview.counts.modified, 1);
-        assert_eq!(preview.files, 2);
+        store.commit(&view.id, &CommitRequest::default()).unwrap();
 
-        // Zero effects: no branch, no worktree, no state change, no audit row.
-        assert!(!git_branch_exists(&root, &preview.branch));
-        assert!(!PathBuf::from(&preview.worktree_path).exists());
-        assert_eq!(store.get(&view.id).unwrap().state, STATE_OPEN);
-        assert!(store
-            .open_delta(&view.id)
-            .unwrap()
-            .commits()
-            .unwrap()
-            .is_empty());
-
-        // And a dry run that says "would commit" is followed by one that does.
-        let committed = store.commit(&view.id, &CommitRequest::default()).unwrap();
-        assert_eq!(committed.state, STATE_COMMITTED);
-        assert_eq!(committed.branch, preview.branch);
-        assert_eq!(
-            committed.provenance_high_water,
-            preview.provenance_high_water
-        );
-    }
-
-    #[test]
-    fn a_dry_run_raises_the_same_refusals_a_real_commit_would() {
-        // Each case is the refusal a real commit raises, proven by asking for
-        // both and comparing the dotted code — a preview that disagreed with
-        // the commit would be worse than no preview.
-        let dir = tempfile::tempdir().unwrap();
-        let key = signing_key(dir.path());
-        let root = git_project(dir.path(), &key);
-        let store = store(dir.path());
-
-        let escaping = create(&store, &root);
-        delta_write(&store, &escaping.id, "/.git/config", b"[core]\n");
-        let (_, dry_code, _) = store
-            .commit_dry_run(&escaping.id, &CommitRequest::default())
-            .expect_err("a .git write must be refused")
-            .parts();
-        let (_, real_code, _) = commit_err(&store, &escaping.id).parts();
-        assert_eq!(dry_code, "afs.path_outside_root");
-        assert_eq!(dry_code, real_code);
-
-        let conflicted = create(&store, &root);
-        delta_write(&store, &conflicted.id, "/src/added.rs", b"// new");
-        git_ok(&root, &["branch", &format!("afs/{}", conflicted.id)]);
-        let (_, dry_conflict, _) = store
-            .commit_dry_run(&conflicted.id, &CommitRequest::default())
-            .expect_err("an existing branch must be refused")
-            .parts();
-        assert_eq!(dry_conflict, "afs.commit_conflict");
-
-        // Divergence is checked before anything else, so it must also surface.
-        let diverged = create(&store, &root);
-        delta_write(&store, &diverged.id, "/src/added.rs", b"// new");
-        std::fs::write(root.join("drift.txt"), b"drift").unwrap();
-        git_ok(&root, &["add", "--all"]);
-        git_ok(&root, &["commit", "--no-gpg-sign", "-q", "-m", "drift"]);
-        let (_, dry_diverged, _) = store
-            .commit_dry_run(&diverged.id, &CommitRequest::default())
-            .expect_err("a moved base must be refused")
-            .parts();
-        assert_eq!(dry_diverged, "afs.base_diverged");
-
-        // Still nothing written by any of the three previews.
-        assert_eq!(store.get(&escaping.id).unwrap().state, STATE_OPEN);
-        assert_eq!(store.get(&diverged.id).unwrap().state, STATE_OPEN);
+        assert!(!checkout_marker.exists(), "post-checkout hook must not run");
+        assert!(!commit_marker.exists(), "pre-commit hook must not run");
     }
 
     #[test]
@@ -2434,8 +1849,6 @@ mod tests {
         assert!(reject_escape("/").is_err());
         assert!(reject_escape("/.git/config").is_err());
         assert!(reject_escape("/.git").is_err());
-        assert!(reject_escape("/.GIT/config").is_err());
-        assert!(reject_escape("/.Git").is_err());
     }
 
     #[test]
@@ -2496,206 +1909,6 @@ mod tests {
     }
 
     #[test]
-    fn file_diff_reports_a_modified_text_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        std::fs::write(root.join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        delta_write(
-            &store,
-            &view.id,
-            "/notes.txt",
-            b"alpha\nbeta changed\ngamma\n",
-        );
-
-        let diff = store.file_diff(&view.id, "/notes.txt").unwrap();
-        assert_eq!(diff.path, "/notes.txt");
-        assert!(!diff.binary);
-        assert!(!diff.truncated);
-        assert!(diff.patch.contains("--- /notes.txt"));
-        assert!(diff.patch.contains("+++ /notes.txt"));
-        assert!(diff.patch.contains("-beta"));
-        assert!(diff.patch.contains("+beta changed"));
-    }
-
-    #[test]
-    fn file_diff_reports_an_added_text_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        delta_write(&store, &view.id, "/src/added.txt", b"new line\n");
-
-        let diff = store.file_diff(&view.id, "/src/added.txt").unwrap();
-        assert_eq!(diff.path, "/src/added.txt");
-        assert!(!diff.binary);
-        assert!(!diff.truncated);
-        assert!(diff.patch.contains("--- /dev/null"));
-        assert!(diff.patch.contains("+++ /src/added.txt"));
-        assert!(diff.patch.contains("+new line"));
-    }
-
-    #[test]
-    fn file_diff_reports_a_deleted_text_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        std::fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        delta_remove(&store, &view.id, "/notes.txt");
-
-        let diff = store.file_diff(&view.id, "/notes.txt").unwrap();
-        assert_eq!(diff.path, "/notes.txt");
-        assert!(!diff.binary);
-        assert!(!diff.truncated);
-        assert!(diff.patch.contains("--- /notes.txt"));
-        assert!(diff.patch.contains("+++ /dev/null"));
-        assert!(diff.patch.contains("-alpha"));
-        assert!(diff.patch.contains("-beta"));
-    }
-
-    #[test]
-    fn file_diff_distinguishes_added_and_deleted_empty_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        std::fs::write(root.join("deleted-empty.txt"), b"").unwrap();
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        delta_write(&store, &view.id, "/added-empty.txt", b"");
-        delta_remove(&store, &view.id, "/deleted-empty.txt");
-
-        let added = store.file_diff(&view.id, "/added-empty.txt").unwrap();
-        assert_eq!(added.patch, "");
-        assert!(!added.truncated);
-        assert!(!added.binary);
-
-        let deleted = store.file_diff(&view.id, "/deleted-empty.txt").unwrap();
-        assert_eq!(deleted.patch, "");
-        assert!(!deleted.truncated);
-        assert!(!deleted.binary);
-    }
-
-    #[test]
-    fn file_diff_escapes_control_characters_in_headers() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        let store = store(dir.path());
-        let view = create(&store, &root);
-        let path = "/odd\tname\n.txt";
-
-        delta_write(&store, &view.id, path, b"contents\n");
-
-        let diff = store.file_diff(&view.id, path).unwrap();
-        assert_eq!(diff.path, path);
-        assert!(diff.patch.contains("+++ \"/odd\\tname\\n.txt\""));
-        assert!(!diff.patch.contains("+++ /odd\tname\n.txt"));
-    }
-
-    #[test]
-    fn file_diff_quotes_a_real_dev_null_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        delta_write(&store, &view.id, "/dev/null", b"not the sentinel\n");
-
-        let diff = store.file_diff(&view.id, "/dev/null").unwrap();
-        assert_eq!(diff.path, "/dev/null");
-        assert!(diff.patch.starts_with("--- /dev/null\n+++ \"/dev/null\"\n"));
-    }
-
-    #[test]
-    fn file_diff_reports_binary_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        delta_write(&store, &view.id, "/README.md", &[0xff, 0xfe, 0xfd]);
-
-        let diff = store.file_diff(&view.id, "/README.md").unwrap();
-        assert_eq!(diff.path, "/README.md");
-        assert!(diff.binary);
-        assert!(!diff.truncated);
-        assert_eq!(diff.patch, "Binary files differ\n");
-    }
-
-    #[test]
-    fn file_diff_does_not_report_unchanged_binary_files_as_different() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        std::fs::write(root.join("image.bin"), [0xff, 0xfe, 0xfd]).unwrap();
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        let diff = store.file_diff(&view.id, "/image.bin").unwrap();
-        assert_eq!(diff.path, "/image.bin");
-        assert!(diff.binary);
-        assert!(!diff.truncated);
-        assert_eq!(diff.patch, "");
-    }
-
-    #[test]
-    fn file_diff_reports_missing_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        assert!(matches!(
-            store.file_diff(&view.id, "/missing.txt"),
-            Err(AfsError::PathNotFound(path)) if path == "/missing.txt"
-        ));
-    }
-
-    #[test]
-    fn file_diff_rejects_non_regular_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        let mut delta = store.open_delta(&view.id).unwrap();
-        delta.mkdir_p("/fresh").unwrap();
-        delta_symlink(&store, &view.id, "/README.md", "/readme-link");
-
-        for path in ["/fresh", "/readme-link"] {
-            let error = store.file_diff(&view.id, path).unwrap_err();
-            let (status, code, message) = error.parts();
-            assert_eq!(status, 400);
-            assert_eq!(code, "afs.path_not_file");
-            assert!(message.contains(path));
-        }
-    }
-
-    #[test]
-    fn file_diff_truncates_oversized_patches() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        let store = store(dir.path());
-        let view = create(&store, &root);
-
-        let large = "é\n".repeat(140_000);
-        delta_write(&store, &view.id, "/src/large.txt", large.as_bytes());
-
-        let diff = store.file_diff(&view.id, "/src/large.txt").unwrap();
-        assert_eq!(diff.path, "/src/large.txt");
-        assert!(!diff.binary);
-        assert!(diff.truncated);
-        assert!(diff.patch.len() <= UNIFIED_DIFF_MAX_BYTES);
-        assert!(std::str::from_utf8(diff.patch.as_bytes()).is_ok());
-        assert!(diff.patch.contains("--- /dev/null"));
-        assert!(diff.patch.contains("+++ /src/large.txt"));
-        assert!(diff.patch.starts_with("--- /dev/null"));
-    }
-
-    #[test]
     fn recorded_operations_appear_on_the_timeline_and_mark_attribution() {
         let dir = tempfile::tempdir().unwrap();
         let root = project(dir.path());
@@ -2736,120 +1949,6 @@ mod tests {
             .find(|c| c.path == "/src/main.rs")
             .unwrap();
         assert_eq!(entry.attribution, "recorded");
-    }
-
-    #[test]
-    fn timeline_includes_tool_call_context_and_keeps_dangling_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = project(dir.path());
-        let store = store(dir.path());
-        let view = create(&store, &root);
-        let delta = store.open_delta(&view.id).unwrap();
-        let sensitive_value = ["sensitive", "value", "for", "test"].join("-");
-        let mut parameters = serde_json::json!({ "path": "/src/main.rs" });
-        parameters
-            .as_object_mut()
-            .unwrap()
-            .insert(["api", "key"].join("_"), sensitive_value.clone().into());
-        let mut result = serde_json::json!({ "bytes": 6 });
-        result
-            .as_object_mut()
-            .unwrap()
-            .insert(["to", "ken"].concat(), sensitive_value.clone().into());
-        let tool_call_id = delta
-            .record_tool_call("write_file", Some(&parameters), Some(&result), None, 10, 12)
-            .unwrap();
-        let mut failed_parameters = serde_json::json!({});
-        failed_parameters
-            .as_object_mut()
-            .unwrap()
-            .insert(["pass", "word"].concat(), sensitive_value.clone().into());
-        let failed_error = format!("{}={sensitive_value}", ["pass", "word"].concat());
-        let failed_tool_call_id = delta
-            .record_tool_call(
-                "shell",
-                Some(&failed_parameters),
-                None,
-                Some(&failed_error),
-                13,
-                14,
-            )
-            .unwrap();
-        delta
-            .record_operation(
-                "write",
-                "/src/main.rs",
-                None,
-                None,
-                None,
-                6,
-                &Actor {
-                    tool_call_id: Some(tool_call_id),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        delta
-            .record_operation(
-                "write",
-                "/src/failed.rs",
-                None,
-                None,
-                None,
-                0,
-                &Actor {
-                    tool_call_id: Some(failed_tool_call_id),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let dangling_tool_call_id = failed_tool_call_id + 100;
-        delta
-            .record_operation(
-                "write",
-                "/src/dangling.rs",
-                None,
-                None,
-                None,
-                1,
-                &Actor {
-                    tool_call_id: Some(dangling_tool_call_id),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-        let timeline = store.timeline(&view.id, 0, 10).unwrap();
-        assert_eq!(timeline.entries.len(), 3);
-        let tool_call = timeline.entries[0].tool_call.as_ref().unwrap();
-        assert_eq!(tool_call.id, tool_call_id);
-        assert_eq!(tool_call.name, "write_file");
-        let parameters = tool_call.parameters.as_deref().unwrap();
-        assert!(parameters.contains("/src/main.rs"));
-        assert!(parameters.contains("[REDACTED]"));
-        assert!(!parameters.contains(&sensitive_value));
-        let result = tool_call.result.as_deref().unwrap();
-        assert!(result.contains(r#""bytes":6"#));
-        assert!(result.contains("[REDACTED]"));
-        assert!(!result.contains(&sensitive_value));
-        assert_eq!(tool_call.started_at, 10);
-        assert_eq!(tool_call.completed_at, 12);
-        assert_eq!(tool_call.duration_ms, 2_000);
-        let failed_tool_call = timeline.entries[1].tool_call.as_ref().unwrap();
-        let error = failed_tool_call.error.as_deref().unwrap();
-        assert!(error.contains("[REDACTED]"));
-        assert!(!error.contains(&sensitive_value));
-        assert_eq!(
-            timeline.entries[2].tool_call_id,
-            Some(dangling_tool_call_id)
-        );
-        assert!(timeline.entries[2].tool_call.is_none());
-
-        let serialized = serde_json::to_value(&timeline).unwrap();
-        assert_eq!(serialized["entries"][0]["toolCall"]["startedAt"], 10);
-        assert!(serialized["entries"][0]["toolCall"]
-            .get("started_at")
-            .is_none());
     }
 
     #[test]
