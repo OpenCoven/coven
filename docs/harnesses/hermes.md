@@ -5,6 +5,7 @@ read_when:
   - Reviewing Hermes model and prompt forwarding
 title: "Hermes (recipe)"
 description: "Install and use Coven's trusted Hermes 1.0.3 adapter recipe. Hermes is not a bundled default harness."
+source_adjacent_reason: "Tracks the trusted Hermes adapter recipe and manifest validation implemented in this repository."
 ---
 
 Hermes is available through a trusted, installable adapter recipe. It is
@@ -34,6 +35,13 @@ If Hermes is installed outside the daemon's `PATH`, add its directory to
 `PATH` before starting Coven. For example, an install at
 `$HOME/.local/bin/hermes` should expose `$HOME/.local/bin` to the Coven daemon;
 adapter manifests intentionally take executable names, not absolute paths.
+
+That name is also checked against the interpreter denylist described in
+[`../HARNESS-ADAPTERS.md`](../HARNESS-ADAPTERS.md): a manifest may not point
+`executable` at a shell or language interpreter, because Coven appends the
+prompt as a trailing argument and an interpreter would run it as code. Wrapping
+Hermes in a `sh -c` shim is rejected for that reason — put the real `hermes`
+binary on `PATH` instead.
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"

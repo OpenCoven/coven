@@ -89,6 +89,13 @@ Coven does not auto-discover adapter manifests from `COVEN_HOME`, `~/.coven`, or
 
 The prompt is appended as the final command argument after the configured prefix args (bound to the declared `prompt_flag` when the adapter has one). Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
 
+Because the prompt is appended as an argument, the manifest must not be able to name something that treats an argument as code. Two rules enforce that:
+
+- **The executable may not be a shell or language interpreter** (`sh`, `bash`, `zsh`, `python`, `node`, `perl`, `env`, `powershell`, …, matched case-insensitively and ignoring a `.exe` suffix). `sh -c <prompt>` would execute prompt text, so the name is rejected outright regardless of the argv declared beside it.
+- **Neither prompt-prefix vector may contain a prompt-evaluating flag** (`-c`, `-e`, `--eval`, `--command`, `/c`). These are the argv the prompt is appended to.
+
+Both checks are scoped to those two concerns. `-c` stays legal everywhere else — `model_arg_template: "-c model={model}"` is Codex's documented config-override form and keeps working, because a non-interpreter executable does not evaluate its arguments.
+
 ### Declared capabilities, sandbox, and stream args
 
 A manifest adapter can additionally declare what it *can do*, using the same
@@ -161,7 +168,7 @@ adapters deserialize unchanged with everything off):
 Accepted, conformance-tested manifests for real runtimes live in the
 [coven-runtimes canonical registry](https://github.com/OpenCoven/coven-runtimes).
 
-This manifest path is for explicit integration work. It is not a public support claim for every adapter listed in a maintainer's local manifest.
+This manifest path is for explicit integration work. It is not a public support claim for every adapter listed in a maintainer's local manifest, and it intentionally rejects generic shell/interpreter adapters such as `sh -c` because they would turn prompt text into executable code.
 
 ## Model selection (`coven run --model`)
 
