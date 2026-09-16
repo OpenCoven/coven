@@ -32,7 +32,7 @@
     "!src/**/*.test.ts"
   ],
   "dependencies": {
-    "zod": "4.4.3"
+    "zod": "4.6.4"
   },
   "peerDependencies": {
     "openclaw": ">=2026.4.26"
