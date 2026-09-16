@@ -121,7 +121,23 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("\n  npm-onboarding-pr:\n", CI_TEXT)
         self.assertIn("\n  npm-onboarding-main:\n", CI_TEXT)
         self.assertIn(
-            "if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.npm_packaging == 'true' }}",
+            "if: ${{ (github.event_name == 'pull_request'"
+            " || github.event_name == 'merge_group')"
+            " && needs.changes.outputs.npm_packaging == 'true' }}",
+            CI_TEXT,
+        )
+
+    def test_ci_subscribes_to_merge_group_events(self) -> None:
+        # A merge queue raises merge_group events. Without this trigger no
+        # workflow starts for a queue entry, PR gate never reports, and every
+        # merge into main stalls.
+        self.assertIn("\non:\n  pull_request:\n  merge_group:\n", CI_TEXT)
+        self.assertIn(
+            'elif [[ "$EVENT_NAME" == "merge_group" ]]; then',
+            CI_TEXT,
+        )
+        self.assertIn(
+            'range="${MG_BASE_SHA}...${MG_HEAD_SHA}"',
             CI_TEXT,
         )
 

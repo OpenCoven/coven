@@ -1459,6 +1459,76 @@ pub fn known_adapter_recipe_names() -> &'static [&'static str] {
     &["grok", "hermes", "opencode"]
 }
 
+/// Executables that treat a following argument as a program to run.
+///
+/// A manifest declares `executable` plus argv prefixes, and Coven appends the
+/// user's prompt as the trailing argument. For an ordinary harness binary that
+/// prompt is inert data; for a shell or a language interpreter it is source
+/// code, so `sh -c <prompt>` turns any prompt into command execution. The
+/// trusted `COVEN_HOME/adapters` path is already pinned by byte-equality
+/// against a shipped recipe, but manifests reaching us through
+/// `COVEN_HARNESS_ADAPTER_MANIFEST` / `COVEN_HARNESS_ADAPTER_DIRS` are
+/// arbitrary, so the interpreter check is what keeps that path safe.
+///
+/// This deliberately keys on the executable rather than on argv tokens: `-c`
+/// is legitimate argv for non-interpreter runtimes (Codex-style
+/// `-c model=<value>` via `model_arg_template`), so banning the token would
+/// break working adapters while banning the interpreter does not.
+const INTERPRETER_EXECUTABLES: &[&str] = &[
+    "ash",
+    "bash",
+    "busybox",
+    "cmd",
+    "command",
+    "csh",
+    "dash",
+    "deno",
+    "bun",
+    "env",
+    "eval",
+    "exec",
+    "fish",
+    "ksh",
+    "lua",
+    "node",
+    "osascript",
+    "perl",
+    "php",
+    "powershell",
+    "pwsh",
+    "python",
+    "python2",
+    "python3",
+    "rscript",
+    "ruby",
+    "sh",
+    "tcsh",
+    "wish",
+    "zsh",
+];
+
+/// Flags that make the next argv token a program to evaluate.
+///
+/// Scoped to the two prompt-prefix vectors, which are the argv Coven appends
+/// the prompt to. Other manifest argv (`model_arg_template`, sandbox mappings)
+/// legitimately uses `-c` for non-interpreter runtimes and is not checked here.
+const PROMPT_EVALUATING_FLAGS: &[&str] = &["-c", "-e", "--eval", "--command", "-command", "/c"];
+
+fn is_interpreter_executable(executable: &str) -> bool {
+    let lowered = executable.trim().to_ascii_lowercase();
+    let stem = lowered.strip_suffix(".exe").unwrap_or(lowered.as_str());
+    INTERPRETER_EXECUTABLES.contains(&stem)
+}
+
+fn prompt_evaluating_flag(args: &[String]) -> Option<&String> {
+    args.iter().find(|arg| {
+        let trimmed = arg.trim();
+        PROMPT_EVALUATING_FLAGS
+            .iter()
+            .any(|flag| trimmed.eq_ignore_ascii_case(flag))
+    })
+}
+
 fn load_external_harness_specs(
     path: &Path,
     built_ins: &[HarnessCommandSpec],
@@ -1586,6 +1656,33 @@ impl ExternalHarnessAdapterSpec {
                 manifest_path.display(),
                 self.executable
             );
+        }
+        if is_interpreter_executable(&executable) {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} declares interpreter executable \
+                 `{executable}`; Coven appends the prompt as a trailing argument, so an \
+                 interpreter would execute it as code",
+                manifest_path.display()
+            );
+        }
+        for (field, args) in [
+            (
+                "interactive_prompt_prefix_args",
+                &self.interactive_prompt_prefix_args,
+            ),
+            (
+                "non_interactive_prompt_prefix_args",
+                &self.non_interactive_prompt_prefix_args,
+            ),
+        ] {
+            if let Some(flag) = prompt_evaluating_flag(args) {
+                anyhow::bail!(
+                    "external harness adapter `{id}` in {} has `{field}` containing \
+                     prompt-evaluating flag `{flag}`; the prompt is appended to these args \
+                     and must not be passed as code",
+                    manifest_path.display()
+                );
+            }
         }
         if self.label.trim().is_empty() {
             anyhow::bail!(
@@ -6260,5 +6357,132 @@ mod tests {
             harness_available_with("coven-code", engine_resolves),
             "should be available via managed engine"
         );
+    }
+
+    #[test]
+    fn external_manifest_rejects_interpreter_executable() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "pwn",
+                  "label": "Shell",
+                  "executable": "sh",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": [],
+                  "install_hint": "Do not use.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let error = load_external_harness_specs(&manifest, &built_in_harness_specs())
+            .expect_err("interpreter executables must be rejected");
+        assert!(
+            error.to_string().contains("interpreter executable"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_manifest_rejects_prompt_evaluating_prefix_args() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "sneaky",
+                  "label": "Sneaky",
+                  "executable": "sneaky",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["-c"],
+                  "install_hint": "Do not use.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let error = load_external_harness_specs(&manifest, &built_in_harness_specs())
+            .expect_err("prompt-evaluating prefix args must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("non_interactive_prompt_prefix_args"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_manifest_rejects_interpreter_executable_case_and_exe_suffix() -> anyhow::Result<()>
+    {
+        for executable in ["SH", "Python3", "node.exe", "PowerShell.EXE"] {
+            let temp_dir = tempfile::tempdir()?;
+            let manifest = temp_dir.path().join("adapters.json");
+            fs::write(
+                &manifest,
+                format!(
+                    r#"{{
+                      "adapters": [
+                        {{
+                          "id": "pwn",
+                          "label": "Shell",
+                          "executable": "{executable}",
+                          "interactive_prompt_prefix_args": [],
+                          "non_interactive_prompt_prefix_args": [],
+                          "install_hint": "Do not use.",
+                          "system_prompt_flag": null
+                        }}
+                      ]
+                    }}"#
+                ),
+            )?;
+
+            let error = load_external_harness_specs(&manifest, &built_in_harness_specs())
+                .expect_err("interpreter executables must be rejected regardless of spelling");
+            assert!(
+                error.to_string().contains("interpreter executable"),
+                "`{executable}` was not rejected: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_manifest_still_allows_model_arg_template_config_flag() -> anyhow::Result<()> {
+        // `-c` is legitimate argv for a non-interpreter runtime (Codex-style
+        // `-c model=<value>`), so the guard must not reject it outside the
+        // prompt-prefix vectors.
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "templated",
+                  "label": "Templated",
+                  "executable": "templated",
+                  "interactive_prompt_prefix_args": ["run"],
+                  "non_interactive_prompt_prefix_args": ["run"],
+                  "install_hint": "Install templated.",
+                  "model_arg_template": "-c model={model}",
+                  "model_id_transform": "preserve"
+                }
+              ]
+            }"#,
+        )?;
+
+        let specs = load_external_harness_specs(&manifest, &built_in_harness_specs())?;
+        assert!(specs.iter().any(|spec| spec.id == "templated"));
+        Ok(())
     }
 }
