@@ -14,6 +14,43 @@ path = "src/main.rs"
 default = []
 threads-test-clock = ["time/serde-well-known"]
 
+# `threads_e2e` drives a real daemon through full lifecycle journeys, and it is
+# the heaviest fixture in the suite. It used to run twice per platform: once
+# here via `cargo test --workspace`, and again from the explicit
+# `--features threads-test-clock` step in the same CI job. The `--workspace`
+# copy is the one that flakes (#1116): it competes with the rest of the
+# workspace suite for the runner, so daemon startup exceeds its health budget
+# and fails with `child=still-running ... last_readiness=connect-timeout`.
+#
+# Requiring the feature removes that duplicate run without losing coverage.
+# Every gate inside the file is a positive `cfg(feature = "threads-test-clock")`
+# and there are no `cfg(not(...))` gates, so the feature-enabled run is a strict
+# superset of what `--workspace` was executing. All three platforms keep a
+# feature-enabled run: Linux and macOS in `rust-test-*`, Windows in
+# `threads-test-windows`.
+[[test]]
+name = "threads_e2e"
+required-features = ["threads-test-clock"]
+
+# The sibling real-daemon journeys ran twice for the same reason and add the
+# same kind of contention: 11, 4 and 8 daemon call sites respectively. Neither
+# they nor `threads_e2e` contain a single `cfg(not(...))` gate, so the
+# feature-enabled run is a superset for `threads_identity_invariants` (4 gated
+# items) and behaviourally identical for the other two (no feature-conditional
+# code at all). All four are launched together by the one CI command that
+# passes `--features threads-test-clock`.
+[[test]]
+name = "threads_identity_invariants"
+required-features = ["threads-test-clock"]
+
+[[test]]
+name = "threads_protected_intake"
+required-features = ["threads-test-clock"]
+
+[[test]]
+name = "threads_terminal_recovery"
+required-features = ["threads-test-clock"]
+
 [dependencies]
 coven-afs = { path = "../coven-afs", version = "0.1.0" }
 coven-client = { path = "../coven-client", version = "0.1.0" }
