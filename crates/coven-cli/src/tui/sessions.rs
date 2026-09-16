@@ -52,6 +52,18 @@ pub(crate) struct SessionBrowserAction {
 pub(crate) const SESSION_BROWSER_FIRST_SESSION_ROW: usize = 5;
 const SESSION_BROWSER_MAX_VISIBLE_SESSIONS: usize = 8;
 const PLAIN_SESSION_ID_COLUMN_WIDTH: usize = 36;
+const PLAIN_SESSION_STATUS_COLUMN_WIDTH: usize = 10;
+/// Floor, not a cap: harness ids are open-ended (adapters declare their own,
+/// and the built-in engine already ships `coven-code`, which is 10 characters),
+/// so the printed width is measured from the rows themselves in
+/// [`PlainSessionColumnWidths::for_sessions`].
+const PLAIN_SESSION_HARNESS_MIN_COLUMN_WIDTH: usize = 8;
+const PLAIN_SESSION_STATE_COLUMN_WIDTH: usize = 8;
+/// Titles default to the first `DEFAULT_TITLE_CHARS` characters of the prompt,
+/// but `--title` accepts any length. Cap the trailing column at the same width
+/// so an over-long title is cut *honestly* — `fit_chars` marks the cut with `…`
+/// instead of leaving a complete-looking line.
+const PLAIN_SESSION_TITLE_COLUMN_WIDTH: usize = crate::DEFAULT_TITLE_CHARS;
 
 /// Restores raw mode and mouse capture on all exit paths for the session browser.
 struct BrowserTerminalGuard {
@@ -134,25 +146,7 @@ fn list_sessions_plain(include_archived: bool) -> Result<()> {
         }
         eprintln!("  coven sessions --all");
     } else {
-        println!(
-            "{:<id_width$} {:<10} {:<8} {:<8} TITLE",
-            "SESSION",
-            "STATUS",
-            "HARNESS",
-            "STATE",
-            id_width = PLAIN_SESSION_ID_COLUMN_WIDTH
-        );
-        println!(
-            "{:<id_width$} {:<10} {:<8} {:<8} -----",
-            "-------",
-            "------",
-            "-------",
-            "-----",
-            id_width = PLAIN_SESSION_ID_COLUMN_WIDTH
-        );
-        for session in sessions {
-            println!("{}", format_session_line(&session));
-        }
+        println!("{}", render_plain_session_table(&sessions));
         // Cheat-sheet goes to stderr so the stdout table stays parseable.
         eprintln!("\nRituals:");
         eprintln!(
@@ -617,20 +611,116 @@ pub(crate) fn session_browser_action_row_to_index(
     let index = row.checked_sub(first_action_row)?;
     (index < action_count).then_some(index)
 }
-pub(crate) fn format_session_line(session: &store::SessionRecord) -> String {
-    let ritual = if session.archived_at.is_some() {
+
+/// Render a cell of the plain table safely.
+///
+/// Session titles come straight from user prompts, so they can carry anything —
+/// a raw newline would split one row across two lines and a raw escape would
+/// rewrite the whole table. This follows `main.rs::doctor_prose_line`, the same
+/// treatment Doctor gives user-controlled config values: control characters are
+/// rendered visibly instead of being passed through to the terminal.
+fn plain_table_cell(value: &str) -> String {
+    crate::doctor_prose_line(value)
+}
+
+fn plain_table_cell_width(value: &str) -> usize {
+    plain_table_cell(value).chars().count()
+}
+
+fn session_ritual(session: &store::SessionRecord) -> &'static str {
+    if session.archived_at.is_some() {
         "archived"
     } else {
         "active"
-    };
+    }
+}
+
+/// Column widths for one rendering of the plain session table.
+///
+/// `coven sessions --plain` is a machine-readable surface — the hints are
+/// pushed to stderr precisely so stdout stays a clean table — which makes
+/// alignment a contract rather than a cosmetic. Each width is therefore the
+/// larger of its historical minimum and the widest sanitized cell actually
+/// printed, so no value can shear the columns that follow it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlainSessionColumnWidths {
+    id: usize,
+    status: usize,
+    harness: usize,
+    state: usize,
+}
+
+impl PlainSessionColumnWidths {
+    pub(crate) fn for_sessions(sessions: &[store::SessionRecord]) -> Self {
+        let mut widths = Self {
+            id: PLAIN_SESSION_ID_COLUMN_WIDTH,
+            status: PLAIN_SESSION_STATUS_COLUMN_WIDTH,
+            harness: PLAIN_SESSION_HARNESS_MIN_COLUMN_WIDTH,
+            state: PLAIN_SESSION_STATE_COLUMN_WIDTH,
+        };
+        for session in sessions {
+            widths.id = widths.id.max(plain_table_cell_width(&session.id));
+            widths.status = widths.status.max(plain_table_cell_width(&session.status));
+            widths.harness = widths.harness.max(plain_table_cell_width(&session.harness));
+            widths.state = widths
+                .state
+                .max(plain_table_cell_width(session_ritual(session)));
+        }
+        widths
+    }
+}
+
+pub(crate) fn render_plain_session_table(sessions: &[store::SessionRecord]) -> String {
+    let widths = PlainSessionColumnWidths::for_sessions(sessions);
+    let mut lines = Vec::with_capacity(sessions.len() + 2);
+    lines.push(format!(
+        "{:<id_width$} {:<status_width$} {:<harness_width$} {:<state_width$} TITLE",
+        "SESSION",
+        "STATUS",
+        "HARNESS",
+        "STATE",
+        id_width = widths.id,
+        status_width = widths.status,
+        harness_width = widths.harness,
+        state_width = widths.state
+    ));
+    lines.push(format!(
+        "{:<id_width$} {:<status_width$} {:<harness_width$} {:<state_width$} -----",
+        "-------",
+        "------",
+        "-------",
+        "-----",
+        id_width = widths.id,
+        status_width = widths.status,
+        harness_width = widths.harness,
+        state_width = widths.state
+    ));
+    lines.extend(
+        sessions
+            .iter()
+            .map(|session| format_session_line(session, widths)),
+    );
+    lines.join("\n")
+}
+
+pub(crate) fn format_session_line(
+    session: &store::SessionRecord,
+    widths: PlainSessionColumnWidths,
+) -> String {
     format!(
-        "{:<id_width$} {:<10} {:<8} {:<8} {}",
-        session.id,
-        session.status,
-        session.harness,
-        ritual,
-        session.title,
-        id_width = PLAIN_SESSION_ID_COLUMN_WIDTH
+        "{:<id_width$} {:<status_width$} {:<harness_width$} {:<state_width$} {}",
+        plain_table_cell(&session.id),
+        plain_table_cell(&session.status),
+        plain_table_cell(&session.harness),
+        session_ritual(session),
+        // Fit first, then escape: `…` then means the stored title really was
+        // longer than the column, rather than merely containing a control
+        // character whose escape expansion crowded the tail out.
+        plain_table_cell(&fit_chars(&session.title, PLAIN_SESSION_TITLE_COLUMN_WIDTH)),
+        id_width = widths.id,
+        status_width = widths.status,
+        harness_width = widths.harness,
+        state_width = widths.state
     )
 }
 
@@ -687,5 +777,159 @@ mod tests {
             sacrifice.help,
             "Delete eligible non-running; adopted/reserved sessions are retained"
         );
+    }
+
+    fn plain_table_session(id: &str, harness: &str, title: &str) -> store::SessionRecord {
+        store::SessionRecord {
+            id: id.to_string(),
+            project_root: "/repo".to_string(),
+            harness: harness.to_string(),
+            title: title.to_string(),
+            status: "completed".to_string(),
+            exit_code: Some(0),
+            archived_at: None,
+            created_at: "2026-08-16T00:00:00Z".to_string(),
+            updated_at: "2026-08-16T00:00:00Z".to_string(),
+            conversation_id: None,
+            familiar_id: None,
+            execution_binding: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
+        }
+    }
+
+    /// Character offsets at which each space-delimited field of a table line
+    /// starts. Only the first five are column starts — the title column is last
+    /// and may itself contain spaces.
+    fn column_offsets(line: &str) -> Vec<usize> {
+        let mut offsets = Vec::new();
+        let mut previous_was_space = true;
+        for (index, character) in line.chars().enumerate() {
+            if character == ' ' {
+                previous_was_space = true;
+            } else {
+                if previous_was_space {
+                    offsets.push(index);
+                }
+                previous_was_space = false;
+            }
+        }
+        offsets
+    }
+
+    const PLAIN_TABLE_COLUMN_COUNT: usize = 5;
+
+    fn assert_columns_aligned(table: &str) {
+        let mut lines = table.lines();
+        let header = lines.next().expect("table has a header row");
+        let expected = column_offsets(header);
+        assert_eq!(
+            expected.len(),
+            PLAIN_TABLE_COLUMN_COUNT,
+            "header should declare exactly five columns: {header:?}"
+        );
+        for line in lines {
+            let offsets = column_offsets(line);
+            assert!(
+                offsets.len() >= PLAIN_TABLE_COLUMN_COUNT,
+                "row is missing columns: {line:?}"
+            );
+            assert_eq!(
+                &offsets[..PLAIN_TABLE_COLUMN_COUNT],
+                &expected[..],
+                "row columns drifted from the header: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_session_table_stays_aligned_when_a_harness_id_outgrows_the_header() {
+        let sessions = vec![
+            plain_table_session(
+                "78f5627d-0000-4000-8000-000000000001",
+                "coven-code",
+                "howdy",
+            ),
+            plain_table_session("a6a93bbf-0000-4000-8000-000000000002", "copilot", "wand"),
+        ];
+
+        let table = render_plain_session_table(&sessions);
+
+        assert_columns_aligned(&table);
+        // The widened harness column must be measured from the rows, not from
+        // the header: `coven-code` is ten characters.
+        let harness_column = column_offsets(table.lines().next().expect("header"))[2];
+        let state_column = column_offsets(table.lines().next().expect("header"))[3];
+        assert_eq!(state_column - harness_column, "coven-code".len() + 1);
+    }
+
+    #[test]
+    fn plain_session_table_keeps_a_control_character_title_on_one_row() {
+        let sessions = vec![plain_table_session(
+            "5135804f-0000-4000-8000-000000000003",
+            "copilot",
+            "patrch this\nCount\r\u{1b}[31mred",
+        )];
+
+        let table = render_plain_session_table(&sessions);
+
+        // Header, separator, and exactly one row — the newline in the title
+        // must not open a second line.
+        assert_eq!(table.lines().count(), 3, "table was split: {table:?}");
+        assert_columns_aligned(&table);
+        let row = table.lines().nth(2).expect("session row");
+        assert!(row.contains("\\u{a}"), "newline not escaped: {row:?}");
+        assert!(
+            row.contains("\\u{d}"),
+            "carriage return not escaped: {row:?}"
+        );
+        assert!(
+            !row.contains('\u{1b}'),
+            "escape character passed through: {row:?}"
+        );
+        // Escaping renders the controls visibly; it must not cost the title any
+        // of its own characters.
+        assert!(row.ends_with("red"), "title tail was eaten: {row:?}");
+        assert!(
+            !row.contains('…'),
+            "a title within the column was marked truncated: {row:?}"
+        );
+    }
+
+    #[test]
+    fn plain_session_table_marks_a_truncated_title_with_an_ellipsis() {
+        let long_title = "t".repeat(PLAIN_SESSION_TITLE_COLUMN_WIDTH * 2);
+        let sessions = vec![plain_table_session(
+            "6d1b0a2c-0000-4000-8000-000000000004",
+            "codex",
+            &long_title,
+        )];
+
+        let table = render_plain_session_table(&sessions);
+        let row = table.lines().nth(2).expect("session row");
+        let title_start = column_offsets(row)[4];
+        let title: String = row.chars().skip(title_start).collect();
+
+        assert!(
+            row.ends_with('…'),
+            "truncated title lost its marker: {row:?}"
+        );
+        assert_eq!(title.chars().count(), PLAIN_SESSION_TITLE_COLUMN_WIDTH);
+    }
+
+    #[test]
+    fn plain_session_table_leaves_a_short_title_whole() {
+        let sessions = vec![plain_table_session(
+            "6d1b0a2c-0000-4000-8000-000000000005",
+            "codex",
+            "A useful session",
+        )];
+
+        let table = render_plain_session_table(&sessions);
+        let row = table.lines().nth(2).expect("session row");
+
+        assert!(row.ends_with("A useful session"), "{row:?}");
     }
 }

@@ -256,6 +256,30 @@ class CovenPrivacyPatternTests(unittest.TestCase):
 
         self.assertEqual(hits, [("docs/example.md", 1, "phone_number")])
 
+    def test_unicode_codepoint_reference_is_allowed(self) -> None:
+        # `U+203A` and friends match the E.164 shape but are glyph citations.
+        # Design docs are full of them; before this they blocked the commit.
+        text = "the thin `\u203a` (U+203A) marker and the U+2500 rule"
+
+        hits = check_coven_privacy.scan_text(text, "docs/design/example.md")
+
+        self.assertEqual(hits, [])
+
+    def test_phone_like_run_glued_to_a_non_codepoint_word_is_still_blocked(self) -> None:
+        # The U+ exemption must stay narrow: any other letter still scans.
+        text = "version" + "+" + "1" + "312" + "555" + "0100"
+
+        hits = check_coven_privacy.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "phone_number")])
+
+    def test_phone_number_after_punctuation_is_still_blocked(self) -> None:
+        text = "call (" + "+" + "1" + "312" + "555" + "0100" + ")"
+
+        hits = check_coven_privacy.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "phone_number")])
+
     def test_pnpm_integrity_digest_phone_like_substring_is_allowed(self) -> None:
         digest = phone_like_sha512_digest()
         text = f"resolution: {{integrity: {digest}}}"

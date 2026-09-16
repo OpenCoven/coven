@@ -11387,7 +11387,7 @@ mod tests {
                         let body = serde_json::json!({
                             "ok": true,
                             "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
-                            "covenVersion": crate::api::COVEN_VERSION,
+                            "covenVersion": crate::api::coven_version(),
                             "capabilities": {
                                 "sessions": true,
                                 "events": true,
@@ -11592,7 +11592,7 @@ mod tests {
                         serde_json::json!({
                             "ok": true,
                             "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
-                            "covenVersion": crate::api::COVEN_VERSION,
+                            "covenVersion": crate::api::coven_version(),
                             "capabilities": { "structuredErrors": true },
                             "daemon": server_status,
                         })

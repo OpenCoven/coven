@@ -25,10 +25,10 @@ use crate::{
     privacy, project, session_launch, store, ward,
 };
 
+#[cfg(test)]
+pub use crate::api_health::coven_version;
 pub(crate) use crate::api_health::health_response_for_authority;
 use crate::api_health::HealthResponse;
-#[cfg(test)]
-pub use crate::api_health::COVEN_VERSION;
 pub use crate::api_health::{health_response, COVEN_API_NAMED_VERSION};
 pub use crate::api_response::ApiResponse;
 pub(crate) use crate::api_response::{api_error, json_response};
@@ -42050,37 +42050,65 @@ tier = 0
     fn threads_stale_preapply_recovery_state_expires_without_reapplying() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
-        let staged_at =
-            time::OffsetDateTime::now_utc() - time::Duration::days(30) + time::Duration::seconds(5);
-        let (_, proposal_id) = stage_scheduled_reviewed_edit(
-            home,
-            coven_threads_core::ApprovalPath::HumanApproval,
-            staged_at,
-        )?;
-        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        // The proposal must be live when the interrupted approve runs and
+        // expired when the scheduler sweeps, and it is staged 30 days back so
+        // the recovery state is genuinely stale by the time it is swept.
+        //
+        // This used to be arranged against the wall clock: staged at
+        // `now - 30d + 5s`, leaving five real seconds for staging, body
+        // construction and the approve before the proposal expired, then
+        // sleeping out the remainder. Staging and signing are real I/O, so on
+        // a loaded runner they overran the five seconds, the approve arrived
+        // after expiry and took the expiry path instead of the failpoint, and
+        // `interrupted.is_err()` flipped. See issue #1109.
+        //
+        // The clock is now pinned instead, so the sequence is exact and the
+        // sleep is gone.
+        let approve_at = time::OffsetDateTime::now_utc();
+        let staged_at = approve_at - time::Duration::days(30) + time::Duration::seconds(5);
+        let expires_at = staged_at + time::Duration::days(30);
+
+        let (_, proposal_id) = crate::threads_clock::with_test_time(home, approve_at, || {
+            stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                staged_at,
+            )
+        })?;
+        let decision_body = crate::threads_clock::with_test_time(home, approve_at, || {
+            scheduled_decision_body(home, &proposal_id, None)
+        })?;
         set_proposal_decision_failpoint(Some((
             ProposalDecisionFailpoint::ApplyBeforeAudit,
             proposal_id.clone(),
         )));
-        let interrupted = handle_request_with_body(
-            "POST",
-            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
-            home,
-            None,
-            Some(&decision_body),
+        let interrupted = crate::threads_clock::with_test_time(home, approve_at, || {
+            handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some(&decision_body),
+            )
+        });
+        assert!(
+            interrupted.is_err(),
+            "the approve must be interrupted by the failpoint while the \
+             proposal is still live, not answered by the expiry path"
         );
-        assert!(interrupted.is_err());
         let claim = find_pending_decision_claim(home, &proposal_id, "approve")
             .context("interrupted approval leaves a recovery claim")?;
         let target = home.join("familiars/sage/reviewed/skill.md");
         std::fs::write(&target, b"before")?;
-        let deadline = staged_at + time::Duration::days(30);
-        let remaining = deadline - time::OffsetDateTime::now_utc();
-        if remaining.is_positive() {
-            std::thread::sleep(remaining.unsigned_abs() + std::time::Duration::from_millis(20));
-        }
 
-        assert_eq!(process_due_threads_proposals(home)?, 1);
+        crate::threads_clock::with_test_time(
+            home,
+            expires_at + time::Duration::seconds(1),
+            || -> Result<()> {
+                assert_eq!(process_due_threads_proposals(home)?, 1);
+                Ok(())
+            },
+        )?;
 
         assert!(!claim.exists());
         assert_proposal_expired_without_apply(home, &proposal_id)?;
