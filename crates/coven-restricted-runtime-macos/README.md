@@ -29,6 +29,16 @@ obligations below are closed.
 - the **closure directory** `closure/` (same filesystem);
 - the three **controller-owned stdio pipes** from `WorkerStdio::pipes()`.
 
+Every privacy check above also refuses an **extended ACL**. Mode bits are not
+the whole access story on Darwin: an ACL entry can grant another principal
+write or traverse while `stat` still reports caller ownership and `0700`, so a
+mode-only check would call a shared path private and let a non-owner replace
+the staged target or guardian. `acl_get_fd_np(fd, ACL_TYPE_EXTENDED)` runs on
+the descriptor already held, and any ACL at all is refused — an owner-only ACL
+would be redundant with the mode bits already required. `closure/` needs no
+check of its own: it is only reachable by traversing the workspace, which is
+now proven owner-only.
+
 It returns the driver plus an `InstantClock` sharing the backend's monotonic
 origin, so the controller lease and the guardian deadline live in one domain.
 `Binding` identities are the physical `(dev, ino)` pairs of the held
@@ -57,7 +67,9 @@ descriptors, a hash of the fixed profile, and fresh random attempt/worker IDs.
 `dyld-support.sb` is Apple's own read-only shared-cache/loader rule set; a
 Mach-O cannot start without it. `/usr/lib` covers `libSystem`; `sysctl-read`
 is required by the Rust runtime's stack-guard setup. `process-fork` is denied,
-so the worker cannot spawn anything, not even its own image. Paths with `"`, `\`, NUL
+so the worker cannot spawn anything, not even its own image. `process-exec` is
+pinned to the one literal path, and the `exec-other` probe proves that
+separately from fork (below). Paths with `"`, `\`, NUL
 or line breaks are refused at seal time. Everything else — home directories,
 `/etc`, writes anywhere (including the workspace), exec of any image, fork,
 network, Mach lookups — is denied by default.
@@ -84,7 +96,18 @@ safe. `sandbox_init` is linked explicitly from `libSystem`.
 `tests/seatbelt.rs` (`harness = false`) plays three roles chosen only by
 `argv[0]`: the test, the guardian, and the sealed worker. The worker is a copy
 of the test binary placed under the workspace; it probes the kernel and prints
-one line per probe. The test asserts, through the real controller:
+one line per probe.
+
+`exec-other` is a bare `execv` of `/bin/ls`, not a `Command`. A `Command` must
+fork before it can exec, and `process-fork` is denied, so it would report
+`denied` even if `process-exec` wrongly allowed `/bin/ls` — no evidence for the
+exec restriction at all. The bare `execv` returns only when the kernel refuses
+it; were it allowed, `/bin/ls` would replace the worker and neither that line
+nor `spawn-child` would reach the test. `spawn-child` remains the fork
+evidence. Adding `(literal "/bin/ls")` to the profile's `process-exec` rule
+fails three cases, and failed none before this change.
+
+The test asserts, through the real controller:
 
 | Case | Evidence |
 | --- | --- |
@@ -93,6 +116,7 @@ one line per probe. The test asserts, through the real controller:
 | `explicit_cancel_cleanup_terminates_the_group` | `cancel` → `poll` fences `Stopping`; cleanup `Pending` while possibly live; observation confirms `Terminated` with `Released`; execution stays `PossiblyStarted`. |
 | `guardian_kills_the_group_when_the_owner_dies` | A child owner launches a lingering worker and exits with no fence or cleanup; the worker dies anyway. |
 | `seal_refuses_unsafe_workspaces` | `0755` workspace, group/world-writable target, missing closure, group/world-writable or missing staged guardian, symlinked `bin/` → typed `SealError`s. |
+| `seal_refuses_an_extended_acl` | An `everyone allow write` ACL on the workspace, then on the target, with mode bits asserted still `0700`: `SealError::Workspace` / `SealError::Executable`. Removing the ACL — the only change — seals again. |
 | `substituted_executable_is_refused_before_execution` | Swapping the inode at the pinned path fails `Revalidate`; state `Refused`, execution `NotStarted`. |
 
 ```sh

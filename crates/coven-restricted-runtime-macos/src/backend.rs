@@ -1,7 +1,7 @@
 //! `SeatbeltDriver`: the macOS backend behind the restricted worker controller.
 
 use std::collections::hash_map::RandomState;
-use std::ffi::CString;
+use std::ffi::{c_int, c_void, CString};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
@@ -21,6 +21,18 @@ use coven_restricted_runtime::{
 use crate::{GUARDIAN_NAME, TARGET_NAME};
 
 const IPC_BUDGET: Duration = Duration::from_secs(3);
+
+// `acl_get_fd_np`/`acl_free` live in libsystem_c, re-exported by libSystem.
+// `libc` carries no Darwin ACL bindings, so they are declared here the way
+// `guardian.rs` declares `sandbox_init`.
+#[link(name = "System", kind = "dylib")]
+extern "C" {
+    fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
+    fn acl_free(obj: *mut c_void) -> c_int;
+}
+
+/// `ACL_TYPE_EXTENDED` from `<sys/acl.h>`: the only ACL type Darwin stores.
+const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
 
 /// Process-local monotonic clock. The backend and controller must share one
 /// instance's origin; `SeatbeltDriver::seal` hands back that clock.
@@ -93,14 +105,16 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 /// Reasons sealing refused. No paths or OS diagnostics are carried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealError {
-    /// Workspace is not a private (`0700`), caller-owned directory.
+    /// Workspace is not a private (`0700`), caller-owned directory, or an
+    /// extended ACL grants another principal access to it.
     Workspace,
-    /// `bin/coven-worker-target` is missing, not a private executable file, or
-    /// not on the workspace filesystem.
+    /// `bin/coven-worker-target` is missing, not a private executable file, on
+    /// another filesystem, or widened by an extended ACL.
     Executable,
     /// `closure/` is missing or not on the workspace filesystem.
     Closure,
-    /// Guardian binary is not an absolute, caller-owned, executable file.
+    /// Guardian binary is not an absolute, caller-owned, executable file, or
+    /// an extended ACL widens it.
     Guardian,
     /// A path contains characters the profile cannot quote.
     Path,
@@ -179,14 +193,47 @@ impl Held {
     }
 
     /// A regular, caller-owned, executable file that only its owner can write,
-    /// on the workspace filesystem.
+    /// on the workspace filesystem, with no extended ACL widening that.
     fn private_executable(&self, workspace: &fs::Metadata) -> io::Result<bool> {
         let meta = self.file.metadata()?;
         Ok(meta.is_file()
             && meta.mode() & 0o100 != 0
             && meta.mode() & 0o022 == 0
             && meta.uid() == workspace.uid()
-            && meta.dev() == workspace.dev())
+            && meta.dev() == workspace.dev()
+            && self.owner_only_acl())
+    }
+
+    /// A caller-owned object no other principal can open: owner-only mode bits
+    /// and no extended ACL.
+    fn private_to_caller(&self) -> io::Result<bool> {
+        let meta = self.file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        Ok(meta.uid() == uid && meta.mode() & 0o077 == 0 && self.owner_only_acl())
+    }
+
+    /// True when the kernel holds no extended ACL for this object.
+    ///
+    /// Mode bits are not the whole access story on Darwin: an ACL entry can
+    /// grant another principal write or traverse while `stat` still reports
+    /// caller ownership and `0700`, so a mode-only check would call a shared
+    /// path private and let a non-owner replace the staged target or guardian.
+    /// Any ACL at all is refused — an owner-only ACL would be redundant with
+    /// the mode bits already required here, so there is nothing to allow.
+    fn owner_only_acl(&self) -> bool {
+        // SAFETY: acl_get_fd_np on a descriptor this driver owns. A non-null
+        // return is a fresh allocation, freed here before the value is dropped.
+        unsafe {
+            let acl = acl_get_fd_np(self.file.as_raw_fd(), ACL_TYPE_EXTENDED);
+            if acl.is_null() {
+                // Darwin reports "no ACL" as ENOENT; any other errno leaves
+                // the access set unproven, which is not private enough.
+                return io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT);
+            }
+            acl_free(acl);
+            false
+        }
     }
 
     /// Physical revalidation: the retained descriptor and the pathname the
@@ -196,12 +243,6 @@ impl Held {
         let by_path = fs::symlink_metadata(&self.path).map(|m| Identity::of(&m));
         matches!((by_fd, by_path), (Ok(a), Ok(b)) if a == self.identity && b == self.identity)
     }
-}
-
-fn private_to_caller(metadata: &fs::Metadata) -> bool {
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
-    metadata.uid() == uid && metadata.mode() & 0o077 == 0
 }
 
 fn fresh_id() -> u128 {
@@ -306,14 +347,21 @@ impl SeatbeltDriver {
             .file
             .metadata()
             .map_err(|_| SealError::Workspace)?;
-        if !ws_meta.is_dir() || !private_to_caller(&ws_meta) {
+        if !ws_meta.is_dir()
+            || !workspace
+                .private_to_caller()
+                .map_err(|_| SealError::Workspace)?
+        {
             return Err(SealError::Workspace);
         }
 
         let bin = Held::open_at(&workspace, "bin", libc::O_DIRECTORY)
             .map_err(|_| SealError::Executable)?;
         let bin_meta = bin.file.metadata().map_err(|_| SealError::Executable)?;
-        if !bin_meta.is_dir() || bin_meta.dev() != ws_meta.dev() || !private_to_caller(&bin_meta) {
+        if !bin_meta.is_dir()
+            || bin_meta.dev() != ws_meta.dev()
+            || !bin.private_to_caller().map_err(|_| SealError::Executable)?
+        {
             return Err(SealError::Executable);
         }
         let executable = Held::open_at(&bin, TARGET_NAME, 0).map_err(|_| SealError::Executable)?;

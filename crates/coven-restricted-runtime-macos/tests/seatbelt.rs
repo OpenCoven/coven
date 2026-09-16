@@ -25,6 +25,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod target {
+    use std::ffi::CString;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::path::PathBuf;
@@ -32,6 +33,26 @@ mod target {
 
     fn report(out: &mut impl Write, name: &str, ok: bool) {
         let _ = writeln!(out, "{name}:{}", if ok { "allowed" } else { "denied" });
+    }
+
+    /// Replaces this image with `/bin/ls` through a bare `execv` — no fork, so
+    /// the kernel's answer is about `process-exec` alone.
+    ///
+    /// Returns only when the exec was refused, so the caller reports `denied`.
+    /// A profile that wrongly allowed the exec would leave `/bin/ls` running in
+    /// the worker's place and neither this probe's line nor any line after it
+    /// would reach the test, which asserts on both.
+    fn exec_other_allowed() -> bool {
+        let Ok(path) = CString::new("/bin/ls") else {
+            return false;
+        };
+        let argv = [path.as_ptr(), std::ptr::null()];
+        // SAFETY: execv with a NUL-terminated path and a NULL-terminated argv
+        // that both outlive the call. It returns only on failure.
+        unsafe {
+            libc::execv(path.as_ptr(), argv.as_ptr());
+        }
+        false
     }
 
     /// Never reads the environment or its arguments beyond argv[0].
@@ -64,13 +85,13 @@ mod target {
             "outside-write",
             File::create("/tmp/coven-seatbelt-escape").is_ok(),
         );
-        report(
-            &mut out,
-            "exec-other",
-            Command::new("/bin/ls").output().is_ok(),
-        );
+        // Flushed first so the probes above survive if the exec below is ever
+        // allowed and discards this process's buffered stdout.
+        let _ = out.flush();
+        report(&mut out, "exec-other", exec_other_allowed());
         // Spawning anything, even its own image, needs `process-fork`, which
-        // the profile denies: one worker, no children.
+        // the profile denies: one worker, no children. This is fork evidence,
+        // not exec evidence — `exec-other` above carries that on its own.
         report(&mut out, "spawn-child", Command::new(&exe).output().is_ok());
         let _ = out.flush();
         drop(out);
@@ -87,6 +108,7 @@ mod suite {
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     use coven_restricted_runtime::{CleanupState, Controller, Error, Execution, State, Status};
@@ -385,6 +407,47 @@ mod suite {
         ));
     }
 
+    /// Edits the extended ACL with `/bin/chmod`. Not a shell: the tool is
+    /// exec'd directly, and Darwin exposes no libc binding for this.
+    fn acl(path: &Path, edit: &[&str]) {
+        let status = Command::new("/bin/chmod")
+            .args(edit)
+            .arg(path)
+            .status()
+            .expect("chmod");
+        assert!(status.success(), "chmod {edit:?} on {}", path.display());
+    }
+
+    /// Mode bits say `0700`, caller-owned — the state the old check called
+    /// private — while an extended ACL hands another principal write access.
+    fn seal_refuses_an_extended_acl() {
+        let ws = Workspace::create("acl", false);
+        let target = ws.root.join("bin").join(TARGET_NAME);
+
+        for (path, expected) in [
+            (ws.root.clone(), SealError::Workspace),
+            (target.clone(), SealError::Executable),
+        ] {
+            acl(&path, &["+a", "everyone allow write"]);
+            // The widening must be invisible to a mode-only check, or this
+            // case would prove nothing about the ACL.
+            let meta = fs::metadata(&path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{path:?}");
+
+            let (worker, _ends) = WorkerStdio::pipes().unwrap();
+            let refused = SeatbeltDriver::seal(ws.config(), worker).map(|_| ());
+            assert_eq!(refused, Err(expected), "{path:?}");
+
+            // Removing the ACL restores the seal: nothing else changed.
+            acl(&path, &["-N"]);
+            let (worker, _ends) = WorkerStdio::pipes().unwrap();
+            assert!(
+                SeatbeltDriver::seal(ws.config(), worker).is_ok(),
+                "{path:?}"
+            );
+        }
+    }
+
     fn substituted_executable_is_refused_before_execution() {
         let ws = Workspace::create("swap", false);
         let (worker, _ends) = WorkerStdio::pipes().unwrap();
@@ -423,7 +486,7 @@ mod suite {
         if args.next().is_some_and(|a| a == "--owner-probe") {
             owner_probe(PathBuf::from(args.next().expect("workspace path")));
         }
-        let cases: [(&str, fn()); 6] = [
+        let cases: [(&str, fn()); 7] = [
             (
                 "kernel_denies_everything_outside_the_sealed_closure",
                 kernel_denies_everything_outside_the_sealed_closure,
@@ -444,6 +507,7 @@ mod suite {
                 "seal_refuses_unsafe_workspaces",
                 seal_refuses_unsafe_workspaces,
             ),
+            ("seal_refuses_an_extended_acl", seal_refuses_an_extended_acl),
             (
                 "substituted_executable_is_refused_before_execution",
                 substituted_executable_is_refused_before_execution,
