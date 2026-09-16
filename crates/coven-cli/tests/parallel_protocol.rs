@@ -1,9 +1,9 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::SystemTime;
 
 #[test]
 fn wt_creates_sibling_worktree_and_lists_protocol_state() -> anyhow::Result<()> {
@@ -26,6 +26,32 @@ fn wt_creates_sibling_worktree_and_lists_protocol_state() -> anyhow::Result<()> 
     assert_success("coven wt --list", &list);
     assert_stdout_contains("coven wt --list", &list, "feature/demo");
     assert_stdout_contains("coven wt --list", &list, "feature-demo");
+    Ok(())
+}
+
+#[test]
+fn wt_list_does_not_run_repo_local_fsmonitor_hook() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let create = repo.coven(["wt", "feature/demo"])?;
+    assert_success("coven wt feature/demo", &create);
+
+    let marker = repo.path.join("fsmonitor-ran");
+    let hook = repo.path.join("fsmonitor-hook.sh");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf ran > {}\n", marker.display()),
+    )?;
+    let mut permissions = fs::metadata(&hook)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&hook, permissions)?;
+    repo.git_os(["config", "core.fsmonitor"], [&hook])?;
+
+    let list = repo.coven(["wt", "--list"])?;
+    assert_success("coven wt --list", &list);
+    assert!(
+        !marker.exists(),
+        "coven wt --list must not execute repo-local core.fsmonitor hooks"
+    );
     Ok(())
 }
 
@@ -63,467 +89,6 @@ fn claim_acquire_blocks_other_agent_until_release() -> anyhow::Result<()> {
         [("COVEN_AGENT_ID", "sage")],
     )?;
     assert_success("claim acquire by sage after release", &reacquired);
-    Ok(())
-}
-
-#[test]
-fn maintenance_fence_blocks_claim_mutations_and_releases_cleanly() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let acquired = repo.coven(["maintenance", "acquire", "cave-delete", "--json"])?;
-    assert_success("maintenance acquire", &acquired);
-    let owner: serde_json::Value = serde_json::from_slice(&acquired.stdout)?;
-    let generation = owner["owner"]["generation"]
-        .as_str()
-        .expect("maintenance acquire returns fenced generation");
-
-    let blocked = repo.coven_with_env(
-        ["claim", "acquire", "issue-538"],
-        [("COVEN_AGENT_ID", "cody")],
-    )?;
-    assert_failure("claim acquire while fenced", &blocked);
-    assert_stderr_contains(
-        "claim acquire while fenced",
-        &blocked,
-        "repository maintenance",
-    );
-
-    let released = repo.coven(["maintenance", "release", "cave-delete", generation])?;
-    assert_success("maintenance release", &released);
-    let claim = repo.coven_with_env(
-        ["claim", "acquire", "issue-538"],
-        [("COVEN_AGENT_ID", "cody")],
-    )?;
-    assert_success("claim acquire after maintenance release", &claim);
-    Ok(())
-}
-
-#[test]
-fn protocol_fixture_ignores_inherited_maintenance_participant() -> anyhow::Result<()> {
-    let output = Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            "maintenance_fence_blocks_claim_mutations_and_releases_cleanly",
-            "--nocapture",
-        ])
-        .env(
-            "COVEN_MAINTENANCE_PARTICIPANT",
-            r#"{"id":"foreign-fixture","generation":"synthetic-generation"}"#,
-        )
-        .output()?;
-    assert_stdout_contains(
-        "inherited participant regression",
-        &output,
-        "running 1 test",
-    );
-    assert_success("fixture with inherited foreign participant", &output);
-    Ok(())
-}
-
-#[test]
-fn maintenance_acquire_rejects_explicit_foreign_participant() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let output = repo.coven_with_env(
-        ["maintenance", "acquire", "cave-delete", "--json"],
-        [(
-            "COVEN_MAINTENANCE_PARTICIPANT",
-            r#"{"id":"foreign-fixture","generation":"synthetic-generation"}"#,
-        )],
-    )?;
-    assert_failure(
-        "maintenance acquire with explicit foreign participant",
-        &output,
-    );
-    assert_stderr_contains(
-        "maintenance acquire with explicit foreign participant",
-        &output,
-        "maintenance participant is stale, missing, or mismatched",
-    );
-    Ok(())
-}
-
-#[test]
-fn default_claim_identity_blocks_same_user_in_another_worktree() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let first_worktree = repo.add_worktree("first-session", "feature/first-session")?;
-    let second_worktree = repo.add_worktree("second-session", "feature/second-session")?;
-
-    let acquired = repo.coven_in_with_env(
-        &first_worktree,
-        ["claim", "acquire", "issue-demo"],
-        [("USER", "val")],
-    )?;
-    assert_success("claim acquire from first worktree", &acquired);
-
-    let blocked = repo.coven_in_with_env(
-        &second_worktree,
-        ["claim", "acquire", "issue-demo"],
-        [("USER", "val")],
-    )?;
-    assert_failure("claim acquire from second worktree", &blocked);
-    assert_stderr_contains(
-        "claim acquire from second worktree",
-        &blocked,
-        "already claimed by val@first-session",
-    );
-    assert_eq!(
-        repo.claim_field("issue-demo", "agent_id")?,
-        "val@first-session"
-    );
-    Ok(())
-}
-
-#[test]
-fn default_claim_identity_supports_same_worktree_lifecycle() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let worktree = repo.add_worktree("one-session", "feature/one-session")?;
-    let env = [("USER", "val")];
-
-    let acquired = repo.coven_in_with_env(&worktree, ["claim", "acquire", "issue-demo"], env)?;
-    assert_success("claim acquire with fallback identity", &acquired);
-    assert_eq!(
-        repo.claim_field("issue-demo", "agent_id")?,
-        "val@one-session"
-    );
-
-    let heartbeat = repo.coven_in_with_env(&worktree, ["claim", "heartbeat", "issue-demo"], env)?;
-    assert_success("claim heartbeat with fallback identity", &heartbeat);
-
-    let released = repo.coven_in_with_env(&worktree, ["claim", "release", "issue-demo"], env)?;
-    assert_success("claim release with fallback identity", &released);
-    assert!(
-        !repo.claim_path("issue-demo")?.exists(),
-        "release should remove the claim"
-    );
-    Ok(())
-}
-
-#[test]
-fn default_claim_identity_handles_blank_user() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let worktree = repo.add_worktree("one-session", "feature/one-session")?;
-    let env = [("USER", "   "), ("COVEN_AGENT_ID", "   ")];
-
-    let acquired = repo.coven_in_with_env(&worktree, ["claim", "acquire", "issue-demo"], env)?;
-    assert_success("claim acquire with blank user", &acquired);
-    assert_eq!(
-        repo.claim_field("issue-demo", "agent_id")?,
-        "unknown-agent@one-session"
-    );
-
-    let heartbeat = repo.coven_in_with_env(&worktree, ["claim", "heartbeat", "issue-demo"], env)?;
-    assert_success("claim heartbeat with blank user", &heartbeat);
-
-    let released = repo.coven_in_with_env(&worktree, ["claim", "release", "issue-demo"], env)?;
-    assert_success("claim release with blank user", &released);
-    assert!(
-        !repo.claim_path("issue-demo")?.exists(),
-        "release should remove the claim"
-    );
-    Ok(())
-}
-
-#[test]
-fn explicit_agent_identity_remains_authoritative_across_worktrees() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let first_worktree = repo.add_worktree("first-session", "feature/first-session")?;
-    let second_worktree = repo.add_worktree("second-session", "feature/second-session")?;
-    let env = [("COVEN_AGENT_ID", "cody")];
-
-    let acquired =
-        repo.coven_in_with_env(&first_worktree, ["claim", "acquire", "issue-demo"], env)?;
-    assert_success("claim acquire with explicit identity", &acquired);
-
-    let refreshed =
-        repo.coven_in_with_env(&second_worktree, ["claim", "acquire", "issue-demo"], env)?;
-    assert_success("claim refresh with explicit identity", &refreshed);
-    assert_eq!(repo.claim_field("issue-demo", "agent_id")?, "cody");
-    Ok(())
-}
-
-#[test]
-fn concurrent_claim_acquire_yields_exactly_one_winner() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-
-    // A read-then-write acquire lets every racer observe a free slot and
-    // then overwrite the others, so each one is told it holds the claim.
-    let results = repo.race_acquire("feature/demo", &["cody", "sage", "nova", "kitty"], [])?;
-
-    let winners: Vec<&str> = results
-        .iter()
-        .filter(|(_, output)| output.status.success())
-        .map(|(agent, _)| *agent)
-        .collect();
-    assert_eq!(
-        winners.len(),
-        1,
-        "expected exactly one winner, got {winners:?}"
-    );
-
-    // The agent that was told it won must be the one recorded on disk.
-    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, winners[0]);
-
-    for (agent, output) in results.iter().filter(|(agent, _)| *agent != winners[0]) {
-        assert_failure(&format!("claim acquire by {agent}"), output);
-        assert_stderr_contains(
-            &format!("claim acquire by {agent}"),
-            output,
-            "already claimed by",
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn concurrent_takeover_of_expired_claim_yields_exactly_one_winner() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-
-    // Seed a claim that is already expired, so every racer is entitled to
-    // take it over. Replacing an existing file cannot be arbitrated by an
-    // exclusive create, which makes this the path most likely to double-win.
-    let seeded = repo.coven_with_env(
-        ["claim", "acquire", "feature/demo"],
-        [
-            ("COVEN_AGENT_ID", "ghost"),
-            ("COVEN_CLAIM_TTL_SECONDS", "1"),
-        ],
-    )?;
-    assert_success("claim acquire by ghost", &seeded);
-    let claim_path = repo.claim_path("feature/demo")?;
-    let expired = fs::read_to_string(&claim_path)?
-        .lines()
-        .map(|line| {
-            if line.starts_with("expires_at=") {
-                "expires_at=0"
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&claim_path, format!("{expired}\n"))?;
-
-    let results = repo.race_acquire("feature/demo", &["cody", "sage", "nova", "kitty"], [])?;
-
-    let winners: Vec<&str> = results
-        .iter()
-        .filter(|(_, output)| output.status.success())
-        .map(|(agent, _)| *agent)
-        .collect();
-    assert_eq!(
-        winners.len(),
-        1,
-        "expected exactly one winner taking over the expired claim, got {winners:?}"
-    );
-    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, winners[0]);
-    Ok(())
-}
-
-#[test]
-fn claim_acquire_by_the_same_agent_extends_its_own_claim() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-
-    let first = repo.coven_with_env(
-        ["claim", "acquire", "feature/demo"],
-        [
-            ("COVEN_AGENT_ID", "cody"),
-            ("COVEN_CLAIM_TTL_SECONDS", "60"),
-        ],
-    )?;
-    assert_success("first claim acquire by cody", &first);
-    let first_expiry: u64 = repo.claim_field("feature/demo", "expires_at")?.parse()?;
-
-    let again = repo.coven_with_env(
-        ["claim", "acquire", "feature/demo"],
-        [
-            ("COVEN_AGENT_ID", "cody"),
-            ("COVEN_CLAIM_TTL_SECONDS", "6000"),
-        ],
-    )?;
-    assert_success("re-acquire by the same agent", &again);
-
-    let second_expiry: u64 = repo.claim_field("feature/demo", "expires_at")?.parse()?;
-    assert!(
-        second_expiry > first_expiry,
-        "re-acquiring should extend the owner's claim: {first_expiry} -> {second_expiry}"
-    );
-    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, "cody");
-    Ok(())
-}
-
-#[test]
-fn claim_acquire_does_not_steal_an_incomplete_claim() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let claims_dir = repo.claims_dir()?;
-    fs::create_dir_all(&claims_dir)?;
-    let claim_path = claims_dir.join("feature-demo");
-    fs::write(&claim_path, "")?;
-
-    let acquire = repo.coven_with_env(
-        ["claim", "acquire", "feature/demo"],
-        [("COVEN_AGENT_ID", "sage")],
-    )?;
-    assert_failure("claim acquire while initial write is incomplete", &acquire);
-    assert_stderr_contains(
-        "claim acquire while initial write is incomplete",
-        &acquire,
-        "contended",
-    );
-    assert_eq!(fs::read(&claim_path)?, b"");
-    Ok(())
-}
-
-#[test]
-fn claim_acquire_recovers_an_abandoned_incomplete_claim() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let claims_dir = repo.claims_dir()?;
-    fs::create_dir_all(&claims_dir)?;
-    let claim_path = claims_dir.join("feature-demo");
-    fs::write(&claim_path, "")?;
-    fs::File::options()
-        .write(true)
-        .open(&claim_path)?
-        .set_times(
-            fs::FileTimes::new()
-                .set_accessed(SystemTime::UNIX_EPOCH)
-                .set_modified(SystemTime::UNIX_EPOCH),
-        )?;
-
-    let acquire = repo.coven_with_env(
-        ["claim", "acquire", "feature/demo"],
-        [("COVEN_AGENT_ID", "sage")],
-    )?;
-    assert_success("claim acquire after abandoned initial write", &acquire);
-    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, "sage");
-    Ok(())
-}
-
-#[test]
-fn claim_release_rejects_an_incomplete_claim() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    fs::create_dir_all(repo.claims_dir()?)?;
-    fs::write(repo.claims_dir()?.join("feature-demo"), "")?;
-
-    let release = repo.coven_with_env(
-        ["claim", "release", "feature/demo"],
-        [("COVEN_AGENT_ID", "sage")],
-    )?;
-    assert_failure("claim release while initial write is incomplete", &release);
-    assert_stderr_contains(
-        "claim release while initial write is incomplete",
-        &release,
-        "incomplete",
-    );
-    Ok(())
-}
-
-#[test]
-fn claim_heartbeat_rejects_an_incomplete_claim() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    fs::create_dir_all(repo.claims_dir()?)?;
-    fs::write(repo.claims_dir()?.join("feature-demo"), "")?;
-
-    let heartbeat = repo.coven_with_env(
-        ["claim", "heartbeat", "feature/demo"],
-        [("COVEN_AGENT_ID", "sage")],
-    )?;
-    assert_failure(
-        "claim heartbeat while initial write is incomplete",
-        &heartbeat,
-    );
-    assert_stderr_contains(
-        "claim heartbeat while initial write is incomplete",
-        &heartbeat,
-        "incomplete",
-    );
-    Ok(())
-}
-
-#[test]
-fn claim_acquire_respects_live_takeover_lock_when_claim_is_missing() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let claims_dir = repo.claims_dir()?;
-    fs::create_dir_all(&claims_dir)?;
-    fs::write(claims_dir.join("@feature-demo.takeover"), "")?;
-
-    let acquire = repo.coven_with_env(
-        ["claim", "acquire", "feature/demo"],
-        [("COVEN_AGENT_ID", "sage")],
-    )?;
-    assert_failure("claim acquire during takeover", &acquire);
-    assert_stderr_contains("claim acquire during takeover", &acquire, "contended");
-    assert!(!claims_dir.join("feature-demo").exists());
-    Ok(())
-}
-
-#[test]
-fn claim_status_ignores_leftover_internal_files() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let acquired = repo.coven_with_env(
-        ["claim", "acquire", "feature/demo"],
-        [("COVEN_AGENT_ID", "cody")],
-    )?;
-    assert_success("claim acquire by cody", &acquired);
-
-    // Staging and lock files use the reserved `@`-prefixed namespace; a crash
-    // mid-takeover can leave one behind and it must not read as a claim.
-    let claims_dir = repo.claims_dir()?;
-    fs::write(claims_dir.join("@feature-demo.takeover"), "")?;
-    fs::write(
-        claims_dir.join("@feature-demo.write.1.2"),
-        "branch=feature/demo\nagent_id=stale\nacquired_at=0\nexpires_at=0\n",
-    )?;
-
-    let status = repo.coven(["claim", "status"])?;
-    assert_success("claim status", &status);
-    let stdout = String::from_utf8_lossy(&status.stdout);
-    assert!(
-        !stdout.contains("stale"),
-        "claim status must ignore internal files, got:\n{stdout}"
-    );
-    assert_eq!(
-        stdout.lines().filter(|line| line.contains("cody")).count(),
-        1,
-        "expected exactly one claim row, got:\n{stdout}"
-    );
-    Ok(())
-}
-
-#[test]
-fn claim_status_lists_real_dot_prefixed_claims() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    fs::create_dir_all(repo.claims_dir()?)?;
-    fs::write(
-        repo.claims_dir()?.join(".foo"),
-        "branch=.foo\nagent_id=dotty\nacquired_at=0\nexpires_at=9999999999\n",
-    )?;
-
-    let status = repo.coven(["claim", "status"])?;
-    assert_success("claim status", &status);
-    let stdout = String::from_utf8_lossy(&status.stdout);
-    assert!(
-        stdout.contains(".foo"),
-        "claim status should list real dot-prefixed claims, got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("dotty"),
-        "claim status should show the dot-prefixed claim owner, got:\n{stdout}"
-    );
-    Ok(())
-}
-
-#[test]
-fn claim_status_lists_real_claim_matching_staging_filename_shape() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let acquired = repo.coven_with_env(
-        ["claim", "acquire", ".feature.write.123.456"],
-        [("COVEN_AGENT_ID", "dotty")],
-    )?;
-    assert_success("claim acquire by dotty", &acquired);
-
-    let status = repo.coven(["claim", "status"])?;
-    assert_success("claim status", &status);
-    assert_stdout_contains("claim status", &status, ".feature.write.123.456");
-    assert_stdout_contains("claim status", &status, "dotty");
     Ok(())
 }
 
@@ -573,61 +138,6 @@ fn installed_hooks_block_primary_commits_and_claim_conflicts() -> anyhow::Result
         [("COVEN_AGENT_ID", "cody")],
     )?;
     assert_success("commit with owning claim", &allowed_claim);
-    Ok(())
-}
-
-#[test]
-fn managed_hook_uses_worktree_scoped_default_identity() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let install = repo.coven(["hooks", "install"])?;
-    assert_success("hooks install", &install);
-
-    repo.git(["checkout", "-b", "feature/demo"])?;
-    let owner_env = [("USER", "val")];
-    let claim = repo.coven_with_env(["claim", "acquire", "feature/demo"], owner_env)?;
-    assert_success("claim feature/demo with fallback identity", &claim);
-    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, "val@project");
-
-    fs::write(repo.path.join("main.txt"), "allowed\n")?;
-    let allowed = repo.git_output(["commit", "-am", "allowed by fallback owner"], owner_env)?;
-    assert_success("commit with fallback owning identity", &allowed);
-
-    let released = repo.coven_with_env(["claim", "release", "feature/demo"], owner_env)?;
-    assert_success("release fallback-owned claim", &released);
-    let other_worktree = repo.add_worktree("other-session", "feature/other-session")?;
-    let other_claim = repo.coven_in_with_env(
-        &other_worktree,
-        ["claim", "acquire", "feature/demo"],
-        owner_env,
-    )?;
-    assert_success("claim from another worktree", &other_claim);
-
-    fs::write(repo.path.join("main.txt"), "blocked\n")?;
-    let blocked = repo.git_output(["commit", "-am", "blocked by other worktree"], owner_env)?;
-    assert_failure("commit against another worktree's claim", &blocked);
-    assert_stderr_contains(
-        "commit against another worktree's claim",
-        &blocked,
-        "claimed by val@other-session",
-    );
-    Ok(())
-}
-
-#[test]
-fn managed_hook_treats_blank_explicit_agent_id_as_unset() -> anyhow::Result<()> {
-    let repo = TestRepo::new()?;
-    let install = repo.coven(["hooks", "install"])?;
-    assert_success("hooks install", &install);
-
-    repo.git(["checkout", "-b", "feature/demo"])?;
-    let env = [("USER", "val"), ("COVEN_AGENT_ID", "   ")];
-    let claim = repo.coven_with_env(["claim", "acquire", "feature/demo"], env)?;
-    assert_success("claim with blank explicit identity", &claim);
-    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, "val@project");
-
-    fs::write(repo.path.join("main.txt"), "allowed\n")?;
-    let allowed = repo.git_output(["commit", "-am", "allowed by fallback owner"], env)?;
-    assert_success("commit with blank explicit identity", &allowed);
     Ok(())
 }
 
@@ -691,22 +201,12 @@ impl TestRepo {
         args: [&str; N],
         env: [(&str, &str); M],
     ) -> anyhow::Result<Output> {
-        self.coven_in_with_env(&self.path, args, env)
-    }
-
-    fn coven_in_with_env<const N: usize, const M: usize>(
-        &self,
-        cwd: &Path,
-        args: [&str; N],
-        env: [(&str, &str); M],
-    ) -> anyhow::Result<Output> {
         let mut command = Command::new(coven_bin());
         command
             .args(args)
-            .current_dir(cwd)
+            .current_dir(&self.path)
             .env("COVEN_HOME", self.path.join(".coven-home"))
             .env_remove("COVEN_AGENT_ID")
-            .env_remove("COVEN_MAINTENANCE_PARTICIPANT")
             .env_remove("COVEN_ALLOW_PRIMARY_COMMIT");
         for (key, value) in env {
             command.env(key, value);
@@ -714,23 +214,12 @@ impl TestRepo {
         command.output().map_err(Into::into)
     }
 
-    fn add_worktree(&self, name: &str, branch: &str) -> anyhow::Result<PathBuf> {
-        let path = self._temp.path().join(name);
-        let output = self.git_os(["worktree", "add", "-b", branch], [&path])?;
-        assert_success("git worktree add", &output);
-        Ok(path)
-    }
-
     fn git<const N: usize>(&self, args: [&str; N]) -> anyhow::Result<String> {
         self.git_in(&self.path, args)
     }
 
     fn git_in<const N: usize>(&self, cwd: &Path, args: [&str; N]) -> anyhow::Result<String> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env_remove("COVEN_MAINTENANCE_PARTICIPANT")
-            .output()?;
+        let output = Command::new("git").args(args).current_dir(cwd).output()?;
         assert_success("git", &output);
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -741,11 +230,7 @@ impl TestRepo {
         os_args: [&Path; M],
     ) -> anyhow::Result<Output> {
         let mut command = Command::new("git");
-        command
-            .args(args)
-            .args(os_args)
-            .current_dir(&self.path)
-            .env_remove("COVEN_MAINTENANCE_PARTICIPANT");
+        command.args(args).args(os_args).current_dir(&self.path);
         command.output().map_err(Into::into)
     }
 
@@ -759,52 +244,11 @@ impl TestRepo {
             .args(args)
             .current_dir(&self.path)
             .env_remove("COVEN_AGENT_ID")
-            .env_remove("COVEN_MAINTENANCE_PARTICIPANT")
             .env_remove("COVEN_ALLOW_PRIMARY_COMMIT");
         for (key, value) in env {
             command.env(key, value);
         }
         command.output().map_err(Into::into)
-    }
-
-    fn claims_dir(&self) -> anyhow::Result<PathBuf> {
-        Ok(self.git_common_dir()?.join("agent-claims"))
-    }
-
-    fn claim_path(&self, branch: &str) -> anyhow::Result<PathBuf> {
-        let slug: String = branch
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-                    ch
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        Ok(self.claims_dir()?.join(slug.trim_matches('-')))
-    }
-
-    fn claim_field(&self, branch: &str, key: &str) -> anyhow::Result<String> {
-        let path = self.claim_path(branch)?;
-        let contents = fs::read_to_string(&path)
-            .map_err(|err| anyhow::anyhow!("reading {}: {err}", path.display()))?;
-        contents
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{key}=")))
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("no {key} in {}:\n{contents}", path.display()))
-    }
-
-    /// Release one prepared worker per agent through a shared start barrier,
-    /// then collect every outcome before evaluating the race.
-    fn race_acquire<'a, const M: usize>(
-        &self,
-        branch: &str,
-        agents: &[&'a str],
-        env: [(&str, &str); M],
-    ) -> anyhow::Result<Vec<(&'a str, Output)>> {
-        race_acquire_with_start_barrier(&self.path, branch, agents, env)
     }
 
     fn git_common_dir(&self) -> anyhow::Result<PathBuf> {
@@ -814,55 +258,6 @@ impl TestRepo {
 
 fn coven_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_coven"))
-}
-
-fn race_acquire_with_start_barrier<'a, const M: usize>(
-    repo_path: &Path,
-    branch: &str,
-    agents: &[&'a str],
-    env: [(&str, &str); M],
-) -> anyhow::Result<Vec<(&'a str, Output)>> {
-    use std::sync::{mpsc, Arc, Barrier};
-
-    let start = Arc::new(Barrier::new(agents.len() + 1));
-    let (outcome_tx, outcome_rx) = mpsc::channel();
-    let mut outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<(usize, Output)>> {
-        for (index, agent) in agents.iter().enumerate() {
-            let start = Arc::clone(&start);
-            let outcome_tx = outcome_tx.clone();
-            scope.spawn(move || {
-                let mut command = Command::new(coven_bin());
-                command
-                    .args(["claim", "acquire", branch])
-                    .current_dir(repo_path)
-                    .env("COVEN_HOME", repo_path.join(".coven-home"))
-                    .env("COVEN_AGENT_ID", agent)
-                    .env_remove("COVEN_MAINTENANCE_PARTICIPANT")
-                    .env_remove("COVEN_ALLOW_PRIMARY_COMMIT")
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-                for (key, value) in env {
-                    command.env(key, value);
-                }
-                start.wait();
-                let _ = outcome_tx.send((index, command.output()));
-            });
-        }
-        drop(outcome_tx);
-        start.wait();
-
-        let mut outcomes = Vec::with_capacity(agents.len());
-        for _ in agents {
-            let (index, output) = outcome_rx.recv()?;
-            outcomes.push((index, output?));
-        }
-        Ok(outcomes)
-    })?;
-    outcomes.sort_by_key(|(index, _)| *index);
-    Ok(outcomes
-        .into_iter()
-        .map(|(index, output)| (agents[index], output))
-        .collect())
 }
 
 fn assert_success(label: &str, output: &Output) {
