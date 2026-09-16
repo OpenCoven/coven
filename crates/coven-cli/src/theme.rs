@@ -38,10 +38,15 @@ impl Rgb {
 /// Enforced by the `brand_tokens_mirror_color_tokens_css` test.
 pub mod brand {
     use super::Rgb;
+    /// `--oc-purple-dark` / `--oc-purple-1`. Lightened from `#7A6DAA` for
+    /// WCAG AA: as `USER_LABEL` this is body text, and at `#7A6DAA` it
+    /// measured 4.28:1 on `SURFACE_1` and 3.83:1 on `SURFACE_2`, below the
+    /// 4.5:1 bar. Same hue (253deg) and saturation; it now clears 4.63:1 on
+    /// the darkest text surface.
     pub const PURPLE_1: Rgb = Rgb {
-        r: 0x7A,
-        g: 0x6D,
-        b: 0xAA,
+        r: 0x87,
+        g: 0x7C,
+        b: 0xB3,
     };
     pub const PURPLE_2: Rgb = Rgb {
         r: 0x9A,
@@ -1588,7 +1593,13 @@ mod tests {
     fn nearest_256_brand_tokens() {
         assert_eq!(nearest_256(brand::PURPLE_3), 183);
         assert_eq!(nearest_256(brand::PURPLE_2), 104);
-        assert_eq!(nearest_256(brand::PURPLE_1), 97);
+        // 103 (#8787AF), up from 97 (#875FAF) when PURPLE_1 was #7A6DAA.
+        // Note this sits beside PURPLE_2's 104 (#8787D7): on a 256-color
+        // terminal USER_LABEL and AGENT_LABEL now differ only in the blue
+        // channel, where they used to differ in green as well. The xterm cube
+        // has no other index at this hue that clears AA, and truecolor keeps
+        // the full separation.
+        assert_eq!(nearest_256(brand::PURPLE_1), 103);
         assert_eq!(nearest_256(brand::ACCENT_BLUE), 33);
         assert_eq!(nearest_256(brand::DANGER), 203);
         assert_eq!(nearest_256(brand::SUCCESS), 77);
@@ -1999,25 +2010,10 @@ mod tests {
         ("SUCCESS", brand::SUCCESS, AA_NORMAL),
     ];
 
-    /// The one pre-existing sub-AA pair, recorded as data so a *new* one
-    /// cannot slip in behind a blanket-weakened bar.
-    ///
-    /// `brand::PURPLE_1` (#7A6DAA) is `USER_LABEL`. It measures 4.60 / 4.28 /
-    /// 3.83 against dark `SURFACE_0` / `SURFACE_1` / `SURFACE_2`, so it has
-    /// been below AA on the two panel surfaces since the theme module
-    /// landed. Raising it means changing a *dark* brand value, which would
-    /// break the byte-identical dark path this module asserts, so it is
-    /// tracked separately rather than fixed here. The light appearance has
-    /// no entries.
-    const LEGACY_SUB_AA: &[(Appearance, Rgb)] = &[(Appearance::Dark, brand::PURPLE_1)];
-
     #[test]
     fn text_tokens_clear_their_contrast_bar_in_both_appearances() {
         for appearance in [Appearance::Dark, Appearance::Light] {
             for (token_name, token, bar) in TEXT_TOKENS {
-                if LEGACY_SUB_AA.contains(&(appearance, *token)) {
-                    continue;
-                }
                 let fg = for_appearance(*token, appearance);
                 for (surface_name, surface) in text_surfaces(appearance) {
                     let ratio = contrast_ratio(fg, surface);
@@ -2031,27 +2027,44 @@ mod tests {
         }
     }
 
-    /// The exception list must stay exactly one entry, and that entry must
-    /// still be a real exception — otherwise it rots into a silent carve-out.
+    /// `USER_LABEL` was the one token that never cleared AA, and the reason
+    /// this module used to carry an exception list at all.
+    ///
+    /// It is pinned by name rather than left to the sweep above so a future
+    /// palette change cannot quietly walk it back under the bar: the sweep
+    /// would still fail, but this says what broke and why it mattered.
     #[test]
-    fn legacy_sub_aa_exception_list_is_exactly_the_known_pair() {
-        assert_eq!(
-            LEGACY_SUB_AA,
-            &[(Appearance::Dark, brand::PURPLE_1)],
-            "the sub-AA exception list changed; a new sub-AA token needs a \
-             decision, not an entry here",
+    fn user_label_clears_aa_on_every_dark_text_surface() {
+        let worst = text_surfaces(Appearance::Dark)
+            .into_iter()
+            .map(|(_, surface)| contrast_ratio(USER_LABEL, surface))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            worst >= AA_NORMAL,
+            "USER_LABEL measures {worst:.2}:1 on its worst dark surface, below \
+             the {AA_NORMAL:.1}:1 bar. It read 3.83:1 before #7A6DAA was \
+             lightened; do not walk it back.",
         );
-        for (appearance, token) in LEGACY_SUB_AA {
-            let fg = for_appearance(*token, *appearance);
-            let worst = text_surfaces(*appearance)
-                .into_iter()
-                .map(|(_, surface)| contrast_ratio(fg, surface))
-                .fold(f64::INFINITY, f64::min);
-            assert!(
-                worst < AA_NORMAL,
-                "{appearance:?} {token:?} now measures {worst:.2}:1 and clears AA — \
-                 drop it from LEGACY_SUB_AA",
-            );
+    }
+
+    /// Nothing is exempt from the contrast sweep any more. If a token cannot
+    /// clear its bar, that is a palette decision, not a list entry.
+    #[test]
+    fn no_text_token_needs_a_contrast_exemption() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            for (token_name, token, bar) in TEXT_TOKENS {
+                let fg = for_appearance(*token, appearance);
+                let worst = text_surfaces(appearance)
+                    .into_iter()
+                    .map(|(_, surface)| contrast_ratio(fg, surface))
+                    .fold(f64::INFINITY, f64::min);
+                assert!(
+                    worst >= *bar,
+                    "{appearance:?} {token_name} needs an exemption at \
+                     {worst:.2}:1 against a {bar:.1}:1 bar — decide on the \
+                     palette instead of re-introducing a carve-out",
+                );
+            }
         }
     }
 
@@ -2089,13 +2102,7 @@ mod tests {
                     .into_iter()
                     .map(|(_, surface)| contrast_ratio(fg, surface))
                     .fold(f64::INFINITY, f64::min);
-                let verdict = if LEGACY_SUB_AA.contains(&(appearance, *token)) {
-                    "LEGACY EXCEPTION"
-                } else if worst >= *bar {
-                    "ok"
-                } else {
-                    "FAIL"
-                };
+                let verdict = if worst >= *bar { "ok" } else { "FAIL" };
                 println!(
                     "  {token_name:<12} #{:02X}{:02X}{:02X}  {}  bar {bar:.1}  {verdict}",
                     fg.r,

@@ -73,7 +73,7 @@ Honour the 90/10 rule. The renderer must use **only** these semantic tokens; raw
 
 Surfaces stay `--oc-surface-0` (pure black). `SURFACE_1`/`SURFACE_2` are not used by the TUI in Phase 2; they exist for future ratatui panels.
 
-`USER_LABEL` (`#7A6DAA`) loses its current launcher role (it is currently used for everything from welcome to input‑box rows) — in the new contract it is reserved for differentiating the *user prompt line* from agent output inside the transcript only.
+`USER_LABEL` (`#877CB3`) loses its current launcher role (it is currently used for everything from welcome to input‑box rows) — in the new contract it is reserved for differentiating the *user prompt line* from agent output inside the transcript only.
 
 ### 2.5 Hierarchy
 
