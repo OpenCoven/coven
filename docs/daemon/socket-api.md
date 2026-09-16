@@ -33,7 +33,7 @@ GET /api/v1/health
 {
   "ok": true,
   "apiVersion": "coven.daemon.v1",
-  "covenVersion": "0.0.0",
+  "covenVersion": "0.4.2",
   "capabilities": {
     "sessions": true,
     "events": true,

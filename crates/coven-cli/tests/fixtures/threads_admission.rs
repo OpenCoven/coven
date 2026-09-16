@@ -10,6 +10,13 @@ use coven_client::ClientError;
 use serde_json::Value;
 
 // Fixture hang guard, independent of production CLI lifecycle deadlines.
+//
+// NOTE: this constant is shared with `threads_daemon.rs`, where it also bounds
+// `exchange_http` and several waits that deliberately run it out. Raising it
+// therefore costs real wall time in those tests, not just headroom here — a
+// bump to 60s added 45s to this binary. If the Windows startup guard needs
+// more headroom (see issue #1106), give the readiness waits their own
+// constant rather than widening this one.
 pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn start_operation(windows: bool) -> &'static str {
@@ -416,18 +423,32 @@ fn wait_for_readiness(
     }
 }
 
+/// Whether a probe error means "the daemon is not up yet, keep waiting"
+/// rather than "this run is broken".
+///
+/// `wait_for_readiness` gives each probe a 250 ms slice of the outer
+/// `LIFECYCLE_TIMEOUT` so it can re-check the child between attempts. A slice
+/// expiring is therefore the *expected* outcome of a slow probe, not a
+/// failure — `LIFECYCLE_TIMEOUT` is the real hang guard.
+///
+/// This used to compare the message against `EMPTY_RESPONSE_TIMEOUT_MESSAGE`
+/// by equality, which only ever matched the Windows transport's spelling. The
+/// Unix transport reports the same condition with a diagnostic carrying phase
+/// and elapsed micros, so on Unix every expired slice was misclassified as
+/// fatal and failed the run — reliably on a loaded runner, invisibly
+/// otherwise. One CI failure overran the 250 ms slice by 32 microseconds.
+/// `coven_client::is_response_deadline_timeout` now owns that judgement,
+/// beside the code that builds both messages.
 fn is_pending_startup_error(error: &ClientError, unix: bool) -> bool {
+    if coven_client::is_response_deadline_timeout(error) {
+        return true;
+    }
     match error {
         ClientError::Io { source, .. } => {
-            source.kind() == std::io::ErrorKind::TimedOut
-                || (unix
-                    && matches!(
-                        source.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                    ))
-        }
-        ClientError::InvalidHttpResponse(message) => {
-            message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE
+            unix && matches!(
+                source.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
         }
         _ => false,
     }
@@ -569,7 +590,9 @@ mod tests {
             |delay| clock.set(clock.get() + delay),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("not reaped after 15s"));
+        assert!(error
+            .to_string()
+            .contains(&format!("not reaped after {LIFECYCLE_TIMEOUT:?}")));
         assert_eq!(clock.get(), started + 2 * LIFECYCLE_TIMEOUT);
         assert_eq!(exit.teardown_started, Some(started + LIFECYCLE_TIMEOUT));
         assert_eq!(child.kills, 1);
@@ -843,7 +866,9 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(clock.get(), start + LIFECYCLE_TIMEOUT);
-        assert!(error.to_string().contains("15s"));
+        assert!(error
+            .to_string()
+            .contains(&format!("{LIFECYCLE_TIMEOUT:?}")));
         assert!(error.to_string().contains("endpoint not yet available"));
     }
 
@@ -870,7 +895,9 @@ mod tests {
             .unwrap_err();
             assert_eq!(clock.get(), deadline);
             assert_eq!(probes.get(), usize::from(!remaining.is_zero()));
-            assert!(error.to_string().contains("15s"));
+            assert!(error
+                .to_string()
+                .contains(&format!("{LIFECYCLE_TIMEOUT:?}")));
         }
     }
 
@@ -1013,6 +1040,33 @@ mod tests {
             observed_exit.get(),
             "exit during the fatal probe was not observed"
         );
+    }
+
+    #[test]
+    fn startup_wait_retries_an_expired_unix_probe_slice() {
+        // Regression: the Unix transport reports an expired read deadline with
+        // a diagnostic, not the bare Windows message, so the old equality
+        // check treated every expired 250 ms slice as fatal. Verbatim from the
+        // CI failure that overran the slice by 32 microseconds.
+        let expired = ClientError::InvalidHttpResponse(
+            "timed out reading Coven daemon response (request_kind=lifecycle-health; \
+             phase=headers; received_bytes=0; expected_body_bytes=None; \
+             request_budget_us=249999; request_elapsed_us=250031; read_elapsed_us=82767; \
+             deadline_overrun_us=32)"
+                .to_owned(),
+        );
+        for unix in [false, true] {
+            assert!(
+                is_pending_startup_error(&expired, unix),
+                "an expired probe slice is pending, not fatal (unix={unix})"
+            );
+        }
+
+        // A malformed response is still fatal on both platforms.
+        let malformed = ClientError::InvalidHttpResponse("missing status line".to_owned());
+        for unix in [false, true] {
+            assert!(!is_pending_startup_error(&malformed, unix));
+        }
     }
 
     #[test]

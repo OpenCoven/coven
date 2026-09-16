@@ -37,7 +37,24 @@
   --oc-text-muted: rgba(255, 255, 255, 0.64);
   --oc-text-faint: rgba(255, 255, 255, 0.42);
 
-  /* Light mode overrides */
+  /* Light mode overrides.
+
+     Surfaces, borders, and the text family invert directly: the same alpha
+     stops, composited over the light --oc-surface-0 (#FAFBFD) instead of
+     over black.
+
+     The violet spectrum and the three controlled accents are re-pitched
+     rather than reused. Reusing the dark values here would render
+     --oc-purple-3 at 1.64:1 on --oc-surface-1 - invisible. Every value
+     below holds the brand violet hue and clears WCAG AA (4.5:1) against
+     all four light surfaces.
+
+     The ramp inverts BY ROLE, not by lightness. In dark, --oc-purple-3 is
+     the lightest member and carries the most prominent UI (headings, the
+     PRIMARY token); --oc-purple-1 is the dim/secondary label. On a light
+     ground prominence reads as darker, so the role order is preserved
+     while the lightness order flips: -3 becomes the darkest, -1 the
+     lightest. #C5BDED -> #493B84 is therefore correct, not a transposition. */
   @media (prefers-color-scheme: light) {
     --oc-surface-0: #FAFBFD;
     --oc-surface-1: #F5F6F9;
@@ -48,7 +65,28 @@
     --oc-border-purple: rgba(154, 142, 205, 0.25);
     --oc-text: rgba(15, 10, 20, 0.94);
     --oc-text-muted: rgba(15, 10, 20, 0.64);
-    --oc-text-faint: rgba(15, 10, 20, 0.42);
+    /* 0.50, not the 0.42 the dark stop uses: 0.42 over a light ground lands
+       at 2.72:1. 0.50 restores the ~3:1 tier that dark --oc-text-faint
+       already occupies (3.67:1 on --oc-surface-0) while keeping a visible
+       gap to --oc-text-muted. Raising it to AA (0.58) would collapse faint
+       into muted and destroy the tier. */
+    --oc-text-faint: rgba(15, 10, 20, 0.50);
+
+    /* Violet spectrum - role-preserving, lightness-inverting. See above.
+       Ratios are against --oc-surface-0 .. --oc-surface-3.
+
+       Only the role-named -1/-2/-3 aliases are overridden. The descriptive
+       --oc-purple-light / --oc-purple-dark / --oc-purple-primary names above
+       are named for lightness, not role, so inverting them would make the
+       names lie; nothing consumes them on a light ground today. */
+    --oc-purple-1: #6B59B6;     /* dim / secondary label - 5.44 .. 4.52 */
+    --oc-purple-2: #5A48A4;     /* primary UI accent     - 7.00 .. 5.81 */
+    --oc-purple-3: #493B84;     /* strongest / headings  - 9.05 .. 7.51 */
+
+    /* Controlled accents, re-pitched for a light ground. */
+    --oc-danger: #D00B00;       /* 5.44 .. 4.52 */
+    --oc-success: #1B7732;      /* 5.44 .. 4.51 */
+    --oc-accent-blue: #0065CB;  /* 5.45 .. 4.52 */
   }
 
   /* Signature treatments: use sparingly */
