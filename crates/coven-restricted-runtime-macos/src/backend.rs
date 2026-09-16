@@ -592,7 +592,8 @@ impl Driver for SeatbeltDriver {
             return Err(BackendError::Rejected);
         }
         guardian.send("spawn")?;
-        match guardian.next_line(IPC_BUDGET) {
+        let reply = guardian.next_line(IPC_BUDGET);
+        match reply {
             Some(line) if line.starts_with("spawned ") => {
                 if request.stop_signal().reason().is_some() {
                     let _ = guardian.send("kill");
@@ -600,7 +601,17 @@ impl Driver for SeatbeltDriver {
                 }
                 Ok(receipt)
             }
-            Some(_) => Err(BackendError::Rejected),
+            // The guardian may answer `terminated` instead: it re-read the
+            // owner/lease boundary after the fork and killed a worker that
+            // crossed it mid-spawn. That line is the only proof the group is
+            // empty, so absorb it here rather than dropping it with the
+            // rejection -- otherwise cleanup reports `Pending` and
+            // `observe_termination` reports `Unavailable` for a group this
+            // guardian had already proven gone.
+            Some(line) => {
+                self.absorb(&[line]);
+                Err(BackendError::Rejected)
+            }
             None => Err(BackendError::Unavailable),
         }
     }

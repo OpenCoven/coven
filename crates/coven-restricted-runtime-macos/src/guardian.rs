@@ -9,7 +9,10 @@
 //! * fds 3/4/5: the controller-owned worker stdin/stdout/stderr pipes.
 //! * stdout lines: `ready`, `spawned <pid>`, `spawn-failed`, `terminated`,
 //!   `pending`. After `pending` the guardian keeps killing the group and
-//!   only exits once it can say `terminated`.
+//!   only exits once it can say `terminated`. A `spawn` may answer
+//!   `terminated` rather than `spawned <pid>`: the owner/lease boundary is
+//!   re-read after the fork and a worker that crossed it mid-spawn is killed
+//!   before it is ever reported as running.
 
 use std::ffi::{c_char, c_int, CString};
 use std::io::{self, Read, Write};
@@ -59,6 +62,16 @@ fn owner_alive(pid: i32) -> bool {
     // SAFETY: kill with signal 0 only probes for existence.
     let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// The owner/lease boundary this attempt is authorised against.
+///
+/// Read once before the fork and again after it: the guardian is
+/// single-threaded, so nothing can fence it while it is inside
+/// `fork`/`sandbox_init`/`exec`, and the boundary it checked may have passed
+/// by the time the worker exists.
+fn boundary_open(deadline: Instant, owner: i32) -> bool {
+    Instant::now() < deadline && owner_alive(owner)
 }
 
 fn say(line: &str) {
@@ -275,9 +288,20 @@ pub fn guardian_main() -> ! {
         while let Some(line) = stdin.line() {
             match line.as_str() {
                 "spawn" if worker.is_none() => match stdio.take() {
-                    Some(fds) if Instant::now() < deadline && owner_alive(owner) => {
+                    Some(fds) if boundary_open(deadline, owner) => {
                         match Worker::spawn(&executable, profile.clone(), fds) {
-                            Ok(spawned) => {
+                            Ok(mut spawned) => {
+                                // The boundary was open when the fork was
+                                // authorised; re-read it now the worker
+                                // exists. A worker whose owner exited or whose
+                                // lease expired during the spawn is killed
+                                // here and never reported as running. `finish`
+                                // rather than `spawn-failed`: the group must
+                                // still be proven empty, and only `terminated`
+                                // carries that proof to the controller.
+                                if !boundary_open(deadline, owner) {
+                                    finish(Some(&mut spawned));
+                                }
                                 say(&format!("spawned {}", spawned.child.id()));
                                 worker = Some(spawned);
                             }
@@ -297,7 +321,7 @@ pub fn guardian_main() -> ! {
                 _ => {}
             }
         }
-        if stdin.eof || !owner_alive(owner) || Instant::now() >= deadline {
+        if stdin.eof || !boundary_open(deadline, owner) {
             finish(worker.as_mut());
         }
         if let Some(active) = worker.as_mut() {
@@ -307,5 +331,26 @@ pub fn guardian_main() -> ! {
             }
         }
         std::thread::sleep(TICK);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::boundary_open;
+    use std::time::{Duration, Instant};
+
+    /// A pid far above `kern.maxproc`, so `kill` can only answer `ESRCH`.
+    const ABSENT_OWNER: i32 = i32::MAX;
+
+    #[test]
+    fn boundary_is_open_only_while_both_halves_hold() {
+        let owner = std::process::id() as i32;
+        let future = Instant::now() + Duration::from_secs(60);
+        let past = Instant::now() - Duration::from_secs(1);
+
+        assert!(boundary_open(future, owner));
+        assert!(!boundary_open(past, owner), "expired lease");
+        assert!(!boundary_open(future, ABSENT_OWNER), "dead owner");
+        assert!(!boundary_open(past, ABSENT_OWNER));
     }
 }
