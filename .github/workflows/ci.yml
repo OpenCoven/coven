@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
@@ -40,12 +41,16 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           BEFORE_SHA: ${{ github.event.before }}
           AFTER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             range="${PR_BASE_SHA}...${PR_HEAD_SHA}"
+          elif [[ "$EVENT_NAME" == "merge_group" ]]; then
+            range="${MG_BASE_SHA}...${MG_HEAD_SHA}"
           elif git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
             range="${BEFORE_SHA}..${AFTER_SHA}"
           else
@@ -82,9 +87,12 @@ jobs:
       - run: python3 scripts/check-theme-tokens-test.py
       - run: python3 scripts/check-theme-tokens.py
       - run: python scripts/check-secrets.py
-      - name: Documentation ownership guard (pull request changes)
-        if: github.event_name == 'pull_request'
-        run: python3 scripts/check-docs-ownership.py --range "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+      - name: Documentation ownership guard (pull request and merge queue changes)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: python3 scripts/check-docs-ownership.py --range "${BASE_SHA}...${HEAD_SHA}"
       - name: Documentation ownership guard (pushed changes)
         if: github.event_name == 'push'
         env:
@@ -95,9 +103,12 @@ jobs:
             BEFORE_SHA="$(git hash-object -t tree -w --stdin </dev/null)"
           fi
           python3 scripts/check-docs-ownership.py --range "${BEFORE_SHA}..${AFTER_SHA}"
-      - name: Coven privacy guard (pull request changes)
-        if: github.event_name == 'pull_request'
-        run: python scripts/check-coven-privacy.py --range "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+      - name: Coven privacy guard (pull request and merge queue changes)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: python scripts/check-coven-privacy.py --range "${BASE_SHA}...${HEAD_SHA}"
       - name: Coven privacy guard (pushed changes)
         if: github.event_name == 'push'
         env:
@@ -589,7 +600,7 @@ jobs:
   npm-onboarding-pr:
     name: npm onboarding smoke (${{ matrix.npm-target }})
     needs: changes
-    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.npm_packaging == 'true' }}
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changes.outputs.npm_packaging == 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
