@@ -117,8 +117,16 @@ forbidden = ["(?i)ignore previous"]
         {
             self.stopped = false;
             self.daemon_command("start")?;
-            self.wait_for_health()?;
         }
+        // Both platforms, and the reason this is not inside the branches:
+        // Windows previously stopped at `OwnedDaemon::wait_for_health`, a
+        // lifecycle *probe*, while Unix went on to prove the daemon answers a
+        // real request. A probe-ready daemon that is still warming up will
+        // blow the client's 5s response budget on the first write, which is
+        // how `POST /api/v1/familiars/sage/edits` kept failing across restarts
+        // on loaded Windows runners with "no response bytes arrived before
+        // the deadline". See issue #1106.
+        self.wait_for_health()?;
         self.daemon_pid = Some(self.read_daemon_pid()?);
         Ok(())
     }
@@ -293,7 +301,14 @@ forbidden = ["(?i)ignore previous"]
             .or_else(|| self.read_daemon_pid().ok().filter(|pid| pid_is_alive(*pid)))
     }
 
-    #[cfg(unix)]
+    /// Block until the daemon answers a real request on the same path the
+    /// tests use.
+    ///
+    /// This is deliberately not the lifecycle health *probe*. The probe proves
+    /// the process is up and owns its endpoint; this proves the daemon will
+    /// actually serve an HTTP request end to end. Those are different
+    /// readiness claims, and the gap between them is where a just-restarted
+    /// daemon still loading state lives.
     fn wait_for_health(&self) -> Result<()> {
         let started = Instant::now();
         loop {
