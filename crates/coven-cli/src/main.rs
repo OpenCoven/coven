@@ -127,6 +127,15 @@ struct Cli {
     )]
     color: String,
     #[arg(
+        long,
+        global = true,
+        value_name = "APPEARANCE",
+        value_parser = ["auto", "light", "dark"],
+        default_value = "auto",
+        help = "Palette for your terminal background; auto honors COVEN_THEME and COLORFGBG"
+    )]
+    theme: String,
+    #[arg(
         value_name = "PROMPT",
         num_args = 0..,
         trailing_var_arg = true,
@@ -1459,6 +1468,15 @@ fn main() -> Result<()> {
         "never" => theme::ColorChoice::Never,
         _ => theme::ColorChoice::Auto,
     });
+    // Resolve the light/dark appearance here too, for the same reason and
+    // one step further: `theme::appearance()` deliberately does no detection
+    // of its own, because it is first touched deep inside rendering and
+    // probing a terminal background is not safe to do there.
+    theme::set_appearance(theme::detect_appearance(match cli.theme.as_str() {
+        "light" => theme::AppearanceChoice::Light,
+        "dark" => theme::AppearanceChoice::Dark,
+        _ => theme::AppearanceChoice::Auto,
+    }));
     let _state_lock = if matches!(&cli.command, Some(Command::Reset { .. })) {
         None
     } else {
@@ -5587,8 +5605,8 @@ mod tests {
     use crate::tui::sessions::{
         format_session_line, render_session_browser_frame_plain, render_sessions_json,
         session_browser_action_row_to_index, session_browser_actions,
-        session_browser_session_row_to_index, sessions_command_mode, SessionsCommandMode,
-        SESSION_BROWSER_FIRST_SESSION_ROW,
+        session_browser_session_row_to_index, sessions_command_mode, PlainSessionColumnWidths,
+        SessionsCommandMode, SESSION_BROWSER_FIRST_SESSION_ROW,
     };
     use crate::tui::shell::{
         cast_non_interactive_frame_for_test, magical_tui_inner_width_for_columns,
@@ -7934,8 +7952,10 @@ mod tests {
             transcript_path: None,
         };
 
+        let widths = PlainSessionColumnWidths::for_sessions(std::slice::from_ref(&session));
+
         assert_eq!(
-            format_session_line(&session),
+            format_session_line(&session, widths),
             "550e8400-e29b-41d4-a716-446655440000 created    codex    active   A useful session"
         );
     }

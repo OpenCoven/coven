@@ -98,6 +98,50 @@ fn maintenance_fence_blocks_claim_mutations_and_releases_cleanly() -> anyhow::Re
 }
 
 #[test]
+fn protocol_fixture_ignores_inherited_maintenance_participant() -> anyhow::Result<()> {
+    let output = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "maintenance_fence_blocks_claim_mutations_and_releases_cleanly",
+            "--nocapture",
+        ])
+        .env(
+            "COVEN_MAINTENANCE_PARTICIPANT",
+            r#"{"id":"foreign-fixture","generation":"synthetic-generation"}"#,
+        )
+        .output()?;
+    assert_stdout_contains(
+        "inherited participant regression",
+        &output,
+        "running 1 test",
+    );
+    assert_success("fixture with inherited foreign participant", &output);
+    Ok(())
+}
+
+#[test]
+fn maintenance_acquire_rejects_explicit_foreign_participant() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let output = repo.coven_with_env(
+        ["maintenance", "acquire", "cave-delete", "--json"],
+        [(
+            "COVEN_MAINTENANCE_PARTICIPANT",
+            r#"{"id":"foreign-fixture","generation":"synthetic-generation"}"#,
+        )],
+    )?;
+    assert_failure(
+        "maintenance acquire with explicit foreign participant",
+        &output,
+    );
+    assert_stderr_contains(
+        "maintenance acquire with explicit foreign participant",
+        &output,
+        "maintenance participant is stale, missing, or mismatched",
+    );
+    Ok(())
+}
+
+#[test]
 fn default_claim_identity_blocks_same_user_in_another_worktree() -> anyhow::Result<()> {
     let repo = TestRepo::new()?;
     let first_worktree = repo.add_worktree("first-session", "feature/first-session")?;
@@ -662,6 +706,7 @@ impl TestRepo {
             .current_dir(cwd)
             .env("COVEN_HOME", self.path.join(".coven-home"))
             .env_remove("COVEN_AGENT_ID")
+            .env_remove("COVEN_MAINTENANCE_PARTICIPANT")
             .env_remove("COVEN_ALLOW_PRIMARY_COMMIT");
         for (key, value) in env {
             command.env(key, value);
@@ -681,7 +726,11 @@ impl TestRepo {
     }
 
     fn git_in<const N: usize>(&self, cwd: &Path, args: [&str; N]) -> anyhow::Result<String> {
-        let output = Command::new("git").args(args).current_dir(cwd).output()?;
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env_remove("COVEN_MAINTENANCE_PARTICIPANT")
+            .output()?;
         assert_success("git", &output);
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -692,7 +741,11 @@ impl TestRepo {
         os_args: [&Path; M],
     ) -> anyhow::Result<Output> {
         let mut command = Command::new("git");
-        command.args(args).args(os_args).current_dir(&self.path);
+        command
+            .args(args)
+            .args(os_args)
+            .current_dir(&self.path)
+            .env_remove("COVEN_MAINTENANCE_PARTICIPANT");
         command.output().map_err(Into::into)
     }
 
@@ -706,6 +759,7 @@ impl TestRepo {
             .args(args)
             .current_dir(&self.path)
             .env_remove("COVEN_AGENT_ID")
+            .env_remove("COVEN_MAINTENANCE_PARTICIPANT")
             .env_remove("COVEN_ALLOW_PRIMARY_COMMIT");
         for (key, value) in env {
             command.env(key, value);
@@ -783,6 +837,7 @@ fn race_acquire_with_start_barrier<'a, const M: usize>(
                     .current_dir(repo_path)
                     .env("COVEN_HOME", repo_path.join(".coven-home"))
                     .env("COVEN_AGENT_ID", agent)
+                    .env_remove("COVEN_MAINTENANCE_PARTICIPANT")
                     .env_remove("COVEN_ALLOW_PRIMARY_COMMIT")
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());

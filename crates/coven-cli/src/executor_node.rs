@@ -509,7 +509,9 @@ pub fn build_probe(coven_home: &Path) -> Result<ExecutorProbe> {
         // Stateless executors run dispatched jobs synchronously per
         // connection and hold no durable queue; the hub owns queues.
         queue_pressure: 0,
-        coven_version: env!("CARGO_PKG_VERSION").to_string(),
+        // Same source as `/api/v1/health`: the manifest version is pinned to
+        // 0.0.0 and is never the build identity.
+        coven_version: crate::api_health::coven_version().to_string(),
         probed_at: current_timestamp(),
     })
 }
@@ -770,6 +772,31 @@ mod tests {
     }
 
     #[test]
+    fn probe_reports_the_real_build_identity_not_the_manifest_placeholder() -> Result<()> {
+        // `crates/coven-cli/Cargo.toml` pins `version = "0.0.0"`; the build
+        // identity comes from the release tag via `COVEN_VERSION_DESC`. A
+        // probe that reports the manifest version tells a hub nothing about
+        // which build answered.
+        let temp_dir = tempfile::tempdir()?;
+        let probe = build_probe(temp_dir.path())?;
+
+        assert_ne!(
+            probe.coven_version, "0.0.0",
+            "the probe must not republish the manifest placeholder"
+        );
+        assert_eq!(
+            probe.coven_version,
+            crate::api_health::coven_version(),
+            "the probe and /api/v1/health report one build identity"
+        );
+        assert!(
+            !probe.coven_version.is_empty(),
+            "the probe always carries some identity"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn probe_rejects_unknown_role() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         std::fs::write(
@@ -924,7 +951,7 @@ mod tests {
             "executor.internal",
             Some("coven"),
             Some(2222),
-            Some("/home/coven/.ssh/id_ed25519"),
+            Some("/etc/coven/executor_id_ed25519"),
             None,
         )?;
 
@@ -943,7 +970,7 @@ mod tests {
                 "-p",
                 "2222",
                 "-i",
-                "/home/coven/.ssh/id_ed25519",
+                "/etc/coven/executor_id_ed25519",
                 "coven@executor.internal",
                 "coven",
                 "executor",

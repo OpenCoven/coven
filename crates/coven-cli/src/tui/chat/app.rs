@@ -223,6 +223,10 @@ pub(super) struct App {
     pub(super) help_scroll: u16,
     pub(super) spinner_frame: usize,
     pub(super) is_responding: bool,
+    /// When the current response began. Paired with every production
+    /// assignment to `is_responding` so the activity rail can show elapsed
+    /// time; `None` whenever we are not responding.
+    pub(super) responding_since: Option<Instant>,
     pub(super) last_tick: Instant,
     pub(super) active_session_id: Option<String>,
     pub(super) last_event_seq: Option<i64>,
@@ -464,6 +468,7 @@ impl App {
             spinner_frame: 0,
             is_responding: false,
             last_tick: Instant::now(),
+            responding_since: None,
             active_session_id: None,
             last_event_seq: None,
             event_poll_backoff_until: None,
@@ -909,6 +914,7 @@ impl App {
                 self.active_session_harness = None;
                 self.chat_owns_active_session = false;
                 self.is_responding = false;
+                self.responding_since = None;
             }
         }
         self.harness_stream_session_ids.clear();
@@ -1133,6 +1139,10 @@ impl App {
                     "Quest planned for: {goal}. Cast will run each phase through this composer; start with the design phase prompt when ready."
                 ));
             }
+            // `view_text`, not `view_text_styled`: this text becomes a
+            // ratatui transcript message, and ratatui does not interpret
+            // ANSI — an escape here renders as literal `[38;2;…m` garbage.
+            // The styled twin is for raw-stdout callers only.
             CastIntent::Observe { view } => match self.resolved_coven_home() {
                 Some(home) => match crate::observe::view_text(&home, view) {
                     Ok(text) => {
@@ -1340,6 +1350,7 @@ impl App {
 
     fn run_harness_prompt(&mut self, harness: &str, prompt: &str) -> Option<store::SessionRecord> {
         self.is_responding = true;
+        self.responding_since = Some(Instant::now());
         self.agent_output_mode = AgentOutputMode::Unknown;
         // Stash the prompt so stale-id recovery can auto-resend it without
         // making the user retype.
@@ -1403,6 +1414,7 @@ impl App {
             }
             Err(error) => {
                 self.is_responding = false;
+                self.responding_since = None;
                 self.push_system_message(&format!(
                     "Daemon launch failed: {error}. Run `coven daemon status` to inspect it; use `coven daemon restart` if it remains unreachable."
                 ));
@@ -1495,6 +1507,7 @@ impl App {
     /// `SessionRecord` so the daemon is the source of truth.
     fn forward_input_to_session(&mut self, session_id: &str, raw: &str) {
         self.is_responding = true;
+        self.responding_since = Some(Instant::now());
         let is_stream = self
             .harness_stream_session_ids
             .values()
@@ -1511,6 +1524,7 @@ impl App {
             }
             Err(error) => {
                 self.is_responding = false;
+                self.responding_since = None;
                 self.push_system_message(&format!("Input rejected: {error}"));
                 // For stream-mode failures, the long-lived child is
                 // almost certainly dead (daemon returns NotLiveError
@@ -1953,6 +1967,7 @@ impl App {
                 // and the chat wedges with `is_responding == true`
                 // forever.
                 self.is_responding = false;
+                self.responding_since = None;
                 self.active_session_id = None;
                 self.active_session_harness = None;
                 self.chat_owns_active_session = false;
@@ -2108,6 +2123,7 @@ impl App {
                 "result" => {
                     self.flush_pending_agent_buffer();
                     self.is_responding = false;
+                    self.responding_since = None;
                     // A turn can die (rate limit, auth expiry, max-turns
                     // abort) — surface why instead of letting the spinner
                     // vanish silently (#468). Clean the harness-supplied
@@ -2453,6 +2469,7 @@ impl App {
                 let status =
                     event_payload_text(event, "status").unwrap_or_else(|| "exited".to_string());
                 self.is_responding = false;
+                self.responding_since = None;
                 // Resolve the delegation call status from the session exit status.
                 if let (Some(call_id), Some(home)) =
                     (self.active_call_id.take(), self.coven_home.as_deref())
@@ -2521,6 +2538,7 @@ impl App {
                     self.active_session_harness = None;
                     self.chat_owns_active_session = false;
                     self.is_responding = false;
+                    self.responding_since = None;
                 }
                 self.harness_stream_session_ids
                     .retain(|_, id| id != &event.session_id);

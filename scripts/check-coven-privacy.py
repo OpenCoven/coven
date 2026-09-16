@@ -46,7 +46,13 @@ RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"[^\s\"']*"
         ),
     ),
-    ("phone_number", re.compile(r"(?<!\d)\+[1-9]\d{1,14}(?!\d)")),
+    # The `U` in the lookbehind exempts Unicode codepoint references: `U+203A`
+    # and `U+2500` have exactly the E.164 shape and were being read as phone
+    # numbers, which blocked any commit touching a design doc that cites a
+    # glyph. The exemption is deliberately limited to that one convention --
+    # widening it to all word characters would also exempt the phone-like runs
+    # inside integrity digests, which stay scannable outside integrity fields.
+    ("phone_number", re.compile(r"(?<![\dUu])\+[1-9]\d{1,14}(?!\d)")),
     (
         "invite_or_handoff_url",
         re.compile(r"https?://[^\s\"']*(?:invite|handoff|ts\.net)[^\s\"']*token[^\s\"']*"),

@@ -39,9 +39,18 @@ pub(super) fn render_ui(f: &mut Frame, app: &mut App) {
     );
 
     let input_height = input_height(app);
+    // The activity rail only exists while a response is in flight, and only
+    // where there is height to spare. A zero-length constraint renders
+    // nothing, so an idle frame is laid out exactly as it was before.
+    let rail_height = u16::from(activity_rail_is_visible(
+        theme::mode(),
+        app.is_responding,
+        area.height,
+    ));
     let chunks = Layout::vertical([
         Constraint::Length(1), // top status bar
         Constraint::Min(6),    // chat messages
+        Constraint::Length(rail_height),
         Constraint::Length(input_height),
         Constraint::Length(1), // bottom hint bar
     ])
@@ -49,14 +58,17 @@ pub(super) fn render_ui(f: &mut Frame, app: &mut App) {
 
     render_status_bar(f, app, chunks[0]);
     render_messages(f, app, chunks[1]);
-    render_input(f, app, chunks[2]);
-    render_hint_bar(f, app, chunks[3]);
+    if rail_height > 0 {
+        render_activity_rail(f, app, chunks[2], theme::mode());
+    }
+    render_input(f, app, chunks[3]);
+    render_hint_bar(f, app, chunks[4]);
 
     // Slash popup floats just above the input box so it never overlaps the
     // composer. Drawn before help/session overlays so those still take
     // precedence when both would be visible.
     if app.slash_popup_is_open() {
-        render_slash_popup(f, app, chunks[2]);
+        render_slash_popup(f, app, chunks[3]);
     }
 
     if app.show_help {
@@ -145,6 +157,115 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let status =
         Paragraph::new(status_line).style(Style::default().bg(theme::ratatui_color(SURFACE)));
     f.render_widget(status, area);
+}
+
+/// Rows below which the activity rail is not worth its line.
+const MIN_HEIGHT_FOR_ACTIVITY_RAIL: u16 = 12;
+
+/// Cells in the travelling band of the indeterminate progress sweep.
+const ACTIVITY_BAND_CELLS: usize = 8;
+
+/// Milliseconds the sweep spends per cell. The chat tick is 120 ms, so this
+/// advances the band a few cells per redraw: fast enough to read as motion,
+/// slow enough not to strobe.
+const SWEEP_MS_PER_CELL: usize = 40;
+
+/// Whether the activity rail earns its row.
+///
+/// `NoColor` is a hard no, for the same reason as the launcher masthead: the
+/// ramp is the entire signal. Without color every cell resolves to the same
+/// `Reset` and the rail degrades into a solid wall of blocks that says less
+/// than the spinner already in the status bar.
+fn activity_rail_is_visible(mode: theme::TerminalMode, is_responding: bool, height: u16) -> bool {
+    is_responding && mode != theme::TerminalMode::NoColor && height >= MIN_HEIGHT_FOR_ACTIVITY_RAIL
+}
+
+/// Leading edge of the sweep, in cells, for a turn that has run `elapsed`.
+/// Wraps every `span_len` cells.
+fn sweep_head(elapsed: std::time::Duration, span_len: usize) -> usize {
+    if span_len == 0 {
+        return 0;
+    }
+    (elapsed.as_millis() as usize / SWEEP_MS_PER_CELL) % span_len
+}
+
+/// How far `cell` sits behind the band's leading edge, or `None` when the
+/// cell is outside the band entirely.
+fn band_depth(cell: usize, head: usize, band: usize) -> Option<usize> {
+    (cell + band)
+        .checked_sub(head)
+        .filter(|depth| *depth <= band)
+}
+
+/// A one-row rail shown only while a response is streaming: the harness, how
+/// long the turn has been running, and an indeterminate sweep.
+///
+/// The sweep is deliberately indeterminate. Nothing in the stream reports a
+/// total — token counts are filtered out of harness output upstream — so a
+/// determinate bar would be inventing progress it cannot know. A travelling
+/// band says "still alive" without claiming to know how far along it is.
+///
+/// It is driven by `spinner_frame`, which the existing 120 ms tick already
+/// advances while responding, so this costs no new wakeups and stops dead
+/// when the turn ends.
+fn render_activity_rail(f: &mut Frame, app: &App, area: Rect, mode: theme::TerminalMode) {
+    let tint = |c: theme::Rgb| theme::ratatui_color_with_mode(c, mode);
+    let elapsed = app
+        .responding_since
+        .map(|since| format_elapsed(since.elapsed()))
+        .unwrap_or_default();
+    let label = if elapsed.is_empty() {
+        format!(" {} ", app.active_agent_harness())
+    } else {
+        format!(" {} \u{00b7} {elapsed} ", app.active_agent_harness())
+    };
+
+    let mut spans = vec![Span::styled(
+        label.clone(),
+        Style::default().fg(tint(TEXT_DIM)),
+    )];
+
+    let track_width = (area.width as usize).saturating_sub(UnicodeWidthStr::width(label.as_str()));
+    if track_width > 0 {
+        let band = ACTIVITY_BAND_CELLS.min(track_width);
+        // The band travels across the track and wraps. Position comes from
+        // elapsed time, not `spinner_frame`: the spinner has only ten states,
+        // which would quantize the sweep into ten jumps across the whole
+        // track. Time is continuous, so the band advances evenly at whatever
+        // rate the tick actually redraws.
+        let span_len = track_width + band;
+        let head = app
+            .responding_since
+            .map(|since| sweep_head(since.elapsed(), span_len))
+            .unwrap_or(0);
+        for cell in 0..track_width {
+            let color = match band_depth(cell, head, band) {
+                Some(depth) => {
+                    let t = 1.0 - (depth as f32 / band as f32);
+                    tint(theme::brand::PURPLE_1.lerp(theme::brand::PURPLE_3, t))
+                }
+                None => tint(theme::BORDER_SUBTLE),
+            };
+            spans.push(Span::styled(
+                "\u{2588}",
+                Style::default().fg(color).bg(tint(BACKDROP)),
+            ));
+        }
+    }
+
+    let rail = Paragraph::new(Line::from(spans)).style(Style::default().bg(tint(BACKDROP)));
+    f.render_widget(rail, area);
+}
+
+/// Render a turn duration the way a person reads a stopwatch: sub-minute in
+/// tenths so short turns still visibly move, minutes and seconds past that.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{:.1}s", elapsed.as_secs_f32())
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 
 fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
@@ -272,6 +393,11 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
 fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap_width: usize) {
     let text_style = theme::ratatui_style(TEXT);
     let dim_style = theme::ratatui_style(TEXT_DIM);
+    // Fenced code renders on a lifted surface rather than a bare gutter, so a
+    // block reads as one slab instead of bleeding into the prose around it.
+    let code_surface = theme::ratatui_color(SURFACE_STRONG);
+    let code_text_style = text_style.bg(code_surface);
+    let code_gutter_style = dim_style.bg(code_surface);
 
     let mut in_code_block = false;
     let mut code_lang: Option<highlight::Lang> = None;
@@ -287,13 +413,29 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
                 // Opening fence — language tag is the first whitespace-delimited
                 // word after the backticks (e.g. ```rust, ```ts {filename=…}).
                 let tag = trimmed.trim_start_matches('`');
-                code_lang = tag
-                    .split_whitespace()
-                    .next()
-                    .and_then(highlight::tokenizer_for);
+                let first = tag.split_whitespace().next();
+                code_lang = first.and_then(highlight::tokenizer_for);
                 // Fresh comment/string state per block — never let one block
                 // bleed into the next.
                 code_state = highlight::TokenizerState::default();
+                // The chip shows the author's own tag, not the normalized
+                // `Lang` — a ```ts block must not announce itself as JS, and
+                // a block with no tokenizer (```toml) still deserves a label.
+                if let Some(label) = first.and_then(code_block_label) {
+                    lines.push(code_surface_line(
+                        vec![
+                            Span::styled("  \u{2502} ", code_gutter_style),
+                            Span::styled(
+                                label,
+                                theme::ratatui_style(PRIMARY)
+                                    .bg(code_surface)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ],
+                        wrap_width,
+                        code_surface,
+                    ));
+                }
             } else {
                 code_lang = None;
             }
@@ -308,18 +450,24 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
             // With a known language tag, hand the visible line to the syntax
             // tokenizer so keywords/strings/numbers/comments pick up brand
             // tints; without one, fall back to a single text-styled span.
-            let mut spans = vec![Span::styled("  \u{2502} ", dim_style)];
+            let mut spans = vec![Span::styled("  \u{2502} ", code_gutter_style)];
             if let Some(lang) = code_lang {
-                spans.extend(highlight::highlight_line(
-                    &visible,
-                    lang,
-                    text_style,
-                    &mut code_state,
-                ));
+                // `highlight` builds each token style from its own semantic
+                // token and knows nothing about surfaces, so the background
+                // is patched on here — otherwise every keyword and string
+                // would punch a transparent hole in the slab.
+                spans.extend(
+                    highlight::highlight_line(&visible, lang, code_text_style, &mut code_state)
+                        .into_iter()
+                        .map(|mut span| {
+                            span.style = span.style.bg(code_surface);
+                            span
+                        }),
+                );
             } else {
-                spans.push(Span::styled(visible, text_style));
+                spans.push(Span::styled(visible, code_text_style));
             }
-            lines.push(Line::from(spans));
+            lines.push(code_surface_line(spans, wrap_width, code_surface));
             last_was_blank = false;
             continue;
         }
@@ -444,8 +592,49 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
     if in_code_block {
         // A fence opened mid-stream and hasn't closed yet; leave a subtle
         // marker so the reader knows the code block is still flowing.
-        lines.push(Line::from(Span::styled("  \u{2502} \u{2026}", dim_style)));
+        lines.push(code_surface_line(
+            vec![Span::styled("  \u{2502} \u{2026}", code_gutter_style)],
+            wrap_width,
+            code_surface,
+        ));
     }
+}
+
+/// Pad a fenced-code row with surface-colored blanks out to `wrap_width` so
+/// the block renders as one continuous slab. Without the pad, ratatui paints
+/// the background only as far as the glyphs reach and the block's right edge
+/// follows the ragged shape of the code.
+fn code_surface_line<'a>(
+    mut spans: Vec<Span<'a>>,
+    wrap_width: usize,
+    surface: ratatui::style::Color,
+) -> Line<'a> {
+    let used: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if used < wrap_width {
+        spans.push(Span::styled(
+            " ".repeat(wrap_width - used),
+            Style::default().bg(surface),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Normalize an author-supplied fence tag into a short ALL-CAPS chip label.
+///
+/// The tag arrives verbatim from model output, so it is untrusted: anything
+/// outside a conservative identifier set is rejected rather than rendered,
+/// and the result is length-capped so a long tag cannot eat the row.
+fn code_block_label(tag: &str) -> Option<String> {
+    const MAX_LABEL_CHARS: usize = 12;
+    let accepted =
+        |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '#' | '.' | '_');
+    if tag.is_empty() || tag.chars().count() > MAX_LABEL_CHARS || !tag.chars().all(accepted) {
+        return None;
+    }
+    Some(tag.to_ascii_uppercase())
 }
 
 /// Map a heading level (1..=4) to a distinct style so the visual hierarchy
@@ -1486,6 +1675,150 @@ mod tests {
         assert!(frame.contains("stream: live"));
     }
 
+    fn responding_app(elapsed_ms: u64) -> App {
+        use super::super::{app::AgentInfo, client::DaemonChatClient};
+        let agents = vec![AgentInfo {
+            id: "claude".to_string(),
+            label: "claude".to_string(),
+            harness: "claude".to_string(),
+            available: true,
+            supports_chat_resume: true,
+        }];
+        let mut app = App::new_with_state(
+            agents,
+            Some(0),
+            Box::new(DaemonChatClient::with_coven_home(std::env::temp_dir())),
+            Some(std::env::temp_dir()),
+        );
+        app.is_responding = true;
+        app.responding_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(elapsed_ms));
+        app
+    }
+
+    #[test]
+    fn activity_rail_paints_a_ramped_band_and_names_the_turn() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = responding_app(12_400);
+        let backend = TestBackend::new(64, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_activity_rail(f, &app, area, theme::TerminalMode::TrueColor);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+
+        let row: String = (0..64u16).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            row.contains("claude"),
+            "the rail names the harness: {row:?}"
+        );
+        assert!(row.contains("12.4s"), "the rail shows elapsed: {row:?}");
+
+        let track =
+            theme::ratatui_color_with_mode(theme::BORDER_SUBTLE, theme::TerminalMode::TrueColor);
+        let band: Vec<_> = (0..64u16)
+            .filter(|x| buf[(*x, 0)].symbol() == "\u{2588}" && buf[(*x, 0)].fg != track)
+            .collect();
+        assert!(!band.is_empty(), "a lit band is painted");
+        assert!(
+            band.len() <= ACTIVITY_BAND_CELLS + 1,
+            "the band stays its configured width: {}",
+            band.len()
+        );
+
+        // The ramp must actually ramp — a flat band is just a block.
+        let colors: std::collections::HashSet<_> = band
+            .iter()
+            .map(|x| format!("{:?}", buf[(*x, 0)].fg))
+            .collect();
+        assert!(colors.len() > 1, "the band is ramped, not flat: {colors:?}");
+
+        // Idle turns spend no row at all.
+        app.is_responding = false;
+        assert!(!activity_rail_is_visible(
+            theme::TerminalMode::TrueColor,
+            app.is_responding,
+            40
+        ));
+    }
+
+    #[test]
+    fn sweep_band_travels_and_wraps() {
+        use std::time::Duration;
+        const TRACK: usize = 48;
+        const BAND: usize = ACTIVITY_BAND_CELLS;
+        let span = TRACK + BAND;
+
+        let lit = |ms: u64| -> Vec<usize> {
+            let head = sweep_head(Duration::from_millis(ms), span);
+            (0..TRACK)
+                .filter(|c| band_depth(*c, head, BAND).is_some())
+                .collect()
+        };
+
+        // The band never exceeds its width, at any point in the cycle.
+        for step in 0..span {
+            let ms = (step * SWEEP_MS_PER_CELL) as u64;
+            assert!(
+                lit(ms).len() <= BAND + 1,
+                "band overflows at step {step}: {:?}",
+                lit(ms)
+            );
+        }
+
+        // It advances one cell per SWEEP_MS_PER_CELL.
+        let a = lit(20 * SWEEP_MS_PER_CELL as u64);
+        let b = lit(24 * SWEEP_MS_PER_CELL as u64);
+        assert_ne!(a, b, "the band moves as the turn runs");
+        assert_eq!(
+            b.first().copied().unwrap_or(0),
+            a.first().copied().unwrap_or(0) + 4,
+            "four cells of travel in four cell-times"
+        );
+
+        // And it wraps rather than running off the end forever.
+        let wrapped = sweep_head(
+            Duration::from_millis((span * SWEEP_MS_PER_CELL) as u64),
+            span,
+        );
+        assert_eq!(wrapped, 0, "the sweep returns to the start of the cycle");
+    }
+
+    #[test]
+    fn activity_rail_requires_color_responding_and_room() {
+        use theme::TerminalMode::{NoColor, TrueColor};
+        assert!(activity_rail_is_visible(
+            TrueColor,
+            true,
+            MIN_HEIGHT_FOR_ACTIVITY_RAIL
+        ));
+        assert!(
+            !activity_rail_is_visible(NoColor, true, 40),
+            "without color the ramp carries nothing and the rail is a solid wall"
+        );
+        assert!(
+            !activity_rail_is_visible(TrueColor, false, 40),
+            "an idle turn spends no row"
+        );
+        assert!(
+            !activity_rail_is_visible(TrueColor, true, MIN_HEIGHT_FOR_ACTIVITY_RAIL - 1),
+            "a short terminal keeps its rows for the transcript"
+        );
+    }
+
+    #[test]
+    fn elapsed_reads_like_a_stopwatch() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_millis(400)), "0.4s");
+        assert_eq!(format_elapsed(Duration::from_millis(12_400)), "12.4s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59.0s");
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m00s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
+    }
+
     #[test]
     fn agent_lines_render_fenced_code_blocks_with_bar_prefix() {
         let mut lines: Vec<Line<'_>> = Vec::new();
@@ -1507,13 +1840,34 @@ mod tests {
     }
 
     /// Helper: pull a code line out of rendered output. A code-block row
-    /// starts with the bar-prefix span "  │ "; the search needle matches
-    /// against any of the tokenized spans on that row.
+    /// starts with the bar-prefix span "  │ "; the needle is matched against
+    /// the row's joined text, since highlighting splits it across spans.
     fn find_code_line<'a>(lines: &'a [Line<'a>], needle: &str) -> Option<&'a Line<'a>> {
         lines.iter().find(|line| {
+            let row: String = line
+                .spans
+                .iter()
+                .skip(1)
+                .map(|s| s.content.as_ref())
+                .collect();
             line.spans.first().map(|s| s.content.as_ref()) == Some("  \u{2502} ")
-                && line.spans.iter().any(|s| s.content.contains(needle))
+                && row.contains(needle)
         })
+    }
+
+    /// Helper: the code text spans of a rendered code row — everything after
+    /// the `  │ ` gutter and before the surface pad that squares off the
+    /// right edge. Span *count* here is the tokenizer signal: one span means
+    /// the line was emitted verbatim, many means it was highlighted.
+    fn code_content_spans<'a>(line: &'a Line<'a>) -> Vec<&'a Span<'a>> {
+        let mut spans: Vec<&Span<'_>> = line.spans.iter().skip(1).collect();
+        if spans
+            .last()
+            .is_some_and(|s| !s.content.is_empty() && s.content.chars().all(|c| c == ' '))
+        {
+            spans.pop();
+        }
+        spans
     }
 
     #[test]
@@ -1576,9 +1930,9 @@ mod tests {
         append_agent_content_lines(&mut lines, content, 60);
         let code_line = find_code_line(&lines, "let").expect("code line emitted");
         assert_eq!(
-            code_line.spans.len(),
-            2,
-            "plain code block should be bar + verbatim text only"
+            code_content_spans(code_line).len(),
+            1,
+            "plain code block should be verbatim text in a single span"
         );
 
         // Unknown language → same fallback.
@@ -1586,7 +1940,70 @@ mod tests {
         let content = "```cobol\nDISPLAY 'hi'.\n```";
         append_agent_content_lines(&mut lines, content, 60);
         let code_line = find_code_line(&lines, "DISPLAY").expect("code line emitted");
-        assert_eq!(code_line.spans.len(), 2);
+        assert_eq!(code_content_spans(code_line).len(), 1);
+    }
+
+    #[test]
+    fn agent_lines_render_code_block_on_a_padded_surface_with_language_chip() {
+        let wrap_width = 40usize;
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "```rust\nlet a = 1;\n```", wrap_width);
+
+        let surface = theme::ratatui_color(SURFACE_STRONG);
+
+        // The chip announces the author's tag on its own row above the code.
+        let chip = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|s| s.content == "RUST"))
+            .expect("language chip row emitted");
+        assert!(
+            chip.spans
+                .iter()
+                .find(|s| s.content == "RUST")
+                .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "chip label carries weight"
+        );
+
+        // Every row of the block is filled to the wrap width, so the slab has
+        // a square right edge instead of following the code's ragged shape.
+        for line in [chip, find_code_line(&lines, "let a").expect("code row")] {
+            let width: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert_eq!(width, wrap_width, "row padded to the wrap width");
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(surface)),
+                "every span on a code row sits on the code surface"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_lines_omit_language_chip_when_the_fence_is_untagged() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "```\nplain\n```", 40);
+        assert!(
+            find_code_line(&lines, "plain").is_some(),
+            "code still renders"
+        );
+        assert_eq!(
+            lines.len(),
+            1,
+            "an untagged fence gets no chip row: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn agent_lines_reject_untrusted_or_oversized_fence_tags_as_chips() {
+        // The fence tag is model output. A tag carrying punctuation or an
+        // absurd length must not reach the chip.
+        for tag in ["\u{1b}[31mred", "a".repeat(64).as_str(), "c++/cli"] {
+            let mut lines: Vec<Line<'_>> = Vec::new();
+            append_agent_content_lines(&mut lines, &format!("```{tag}\nbody\n```"), 40);
+            assert_eq!(lines.len(), 1, "tag {tag:?} must not produce a chip row");
+        }
     }
 
     #[test]
@@ -1597,15 +2014,17 @@ mod tests {
         let content = "```rust\nlet a = 1;\n```\n\n```\nlet b = 2;\n```";
         append_agent_content_lines(&mut lines, content, 60);
 
-        let mut code_lines: Vec<&Line<'_>> = lines
-            .iter()
-            .filter(|line| line.spans.first().map(|s| s.content.as_ref()) == Some("  \u{2502} "))
-            .collect();
-        assert_eq!(code_lines.len(), 2, "expected two code rows");
-        let plain = code_lines.pop().unwrap();
-        let rust = code_lines.pop().unwrap();
-        assert!(rust.spans.len() > 2, "rust row should be tokenized");
-        assert_eq!(plain.spans.len(), 2, "second (unlabeled) row should not");
+        let rust = find_code_line(&lines, "let a").expect("rust code row emitted");
+        let plain = find_code_line(&lines, "let b").expect("unlabeled code row emitted");
+        assert!(
+            code_content_spans(rust).len() > 1,
+            "rust row should be tokenized"
+        );
+        assert_eq!(
+            code_content_spans(plain).len(),
+            1,
+            "second (unlabeled) row should not"
+        );
     }
 
     #[test]
