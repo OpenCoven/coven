@@ -43,12 +43,26 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            '--range "${{ github.event.pull_request.base.sha }}...'
-            '${{ github.event.pull_request.head.sha }}"',
+            "BASE_SHA: ${{ github.event.pull_request.base.sha "
+            "|| github.event.merge_group.base_sha }}",
+            workflow,
+        )
+        self.assertIn(
+            "HEAD_SHA: ${{ github.event.pull_request.head.sha "
+            "|| github.event.merge_group.head_sha }}",
+            workflow,
+        )
+        self.assertIn(
+            'python scripts/check-coven-privacy.py'
+            ' --range "${BASE_SHA}...${HEAD_SHA}"',
             workflow,
         )
         self.assertNotIn(
             '${{ github.event.pull_request.base.sha }}...HEAD',
+            workflow,
+        )
+        self.assertNotIn(
+            '${BASE_SHA}...HEAD',
             workflow,
         )
 
