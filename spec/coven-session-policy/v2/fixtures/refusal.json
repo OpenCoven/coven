@@ -1,0 +1,1 @@
+{"contract":"coven.session-policy.v2","requestId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","invocationId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","requestDigest":"sha256:bed802052e0717763e35243bf80354efd1ea358b9374c64c2fe81d8da312a6b8","decision":"rejected","code":"enforcement_unavailable","admission":"not_started"}

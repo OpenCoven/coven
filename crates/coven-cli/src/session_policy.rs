@@ -324,6 +324,165 @@ mod tests {
         response
     }
 
+    const V2_MANIFEST: &str =
+        include_str!("../../../spec/coven-session-policy/v2/fixtures/manifest.json");
+    const V2_FIXTURES: [(&str, &[u8]); 5] = [
+        (
+            "request",
+            include_bytes!("../../../spec/coven-session-policy/v2/fixtures/request.json"),
+        ),
+        (
+            "accepted",
+            include_bytes!("../../../spec/coven-session-policy/v2/fixtures/accepted.json"),
+        ),
+        (
+            "refusal",
+            include_bytes!("../../../spec/coven-session-policy/v2/fixtures/refusal.json"),
+        ),
+        (
+            "discovery",
+            include_bytes!("../../../spec/coven-session-policy/v2/fixtures/discovery.json"),
+        ),
+        (
+            "receipts",
+            include_bytes!("../../../spec/coven-session-policy/v2/fixtures/receipts.json"),
+        ),
+    ];
+
+    /// The v2 revision is an accepted shape with no implementation. Its
+    /// fixtures are pinned byte-for-byte so a consumer can vendor them, and
+    /// its own invariants (digest correlation, ineligible matrix, required
+    /// receipt order) are checked here rather than trusted.
+    #[test]
+    fn v2_shared_fixtures_pin_bytes_digests_and_refusal_first_invariants() {
+        let manifest: Value = serde_json::from_str(V2_MANIFEST).unwrap();
+        assert_eq!(manifest["contract"], "coven.session-policy.v2");
+        assert_eq!(manifest["admissionTimeUnixMs"], NOW);
+        let profile = manifest["seatbeltProfile"]["text"].as_str().unwrap();
+        assert!(
+            profile.starts_with("(version 1) (deny default)"),
+            "{profile}"
+        );
+        assert!(!profile.contains("network"), "offline profile: {profile}");
+        assert_eq!(
+            manifest["seatbeltProfile"]["digest"],
+            format!("sha256:{}", sha256_hex(profile.as_bytes()))
+        );
+        let mut parsed = std::collections::BTreeMap::new();
+        for (name, bytes) in V2_FIXTURES {
+            assert_eq!(bytes.last(), Some(&b'\n'), "{name} lacks its trailing LF");
+            assert!(
+                !bytes.ends_with(b"\n\n"),
+                "{name} has more than one trailing LF"
+            );
+            assert!(bytes.len() <= 16_384, "{name} exceeds the response bound");
+            assert_eq!(manifest[name]["bytes"], bytes.len(), "{name}");
+            assert_eq!(
+                manifest[name]["digest"],
+                format!("sha256:{}", sha256_hex(bytes)),
+                "{name}"
+            );
+            let value: Value = serde_json::from_slice(bytes).unwrap();
+            // Receipts ride the existing events wire, which has no contract field.
+            if name != "receipts" {
+                assert_eq!(value["contract"], "coven.session-policy.v2", "{name}");
+            }
+            parsed.insert(name, value);
+        }
+        let request_digest = format!("sha256:{}", sha256_hex(V2_FIXTURES[0].1));
+        let accepted = &parsed["accepted"];
+        assert_eq!(accepted["requestDigest"], request_digest);
+        assert_eq!(parsed["refusal"]["requestDigest"], request_digest);
+        assert_eq!(accepted["decision"], "accepted");
+        assert_eq!(parsed["refusal"]["decision"], "rejected");
+        assert_eq!(parsed["refusal"]["admission"], "not_started");
+        let grant = &accepted["grant"];
+        assert_eq!(
+            grant["expiresAtUnixMs"].as_i64().unwrap() - grant["issuedAtUnixMs"].as_i64().unwrap(),
+            grant["leaseMs"].as_i64().unwrap()
+        );
+        assert_eq!(grant["leaseMs"], parsed["request"]["worker"]["leaseMs"]);
+        assert_eq!(
+            accepted["backend"]["profileDigest"],
+            manifest["seatbeltProfile"]["digest"]
+        );
+        assert!(
+            parsed["request"].get("launch").is_none(),
+            "v2 carries no harness launch"
+        );
+
+        let discovery = &parsed["discovery"];
+        assert_eq!(discovery["enforcement"], "unavailable");
+        assert_eq!(discovery["supportedProfiles"], json!([]));
+        let rows = discovery["supportMatrix"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        for row in rows {
+            assert_eq!(row["eligible"], false);
+            let dimensions = row["dimensions"].as_object().unwrap();
+            assert!(
+                dimensions.values().any(|state| state == "unknown"),
+                "an ineligible row must name an unknown dimension: {row}"
+            );
+            assert!(dimensions.values().all(
+                |state| ["supported", "rejected", "unknown"].contains(&state.as_str().unwrap())
+            ));
+            assert_eq!(row["backend"], accepted["backend"]);
+        }
+        // No vendored vector claims enforcement: the only row is ineligible,
+        // so the acceptance shape is carried with `enforced: false`, which a
+        // consumer treats as no authority.
+        assert_eq!(accepted["enforced"], false);
+
+        let events = parsed["receipts"]["events"].as_array().unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        let required: Vec<&str> = accepted["receipts"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        assert_eq!(&kinds[..required.len()], required.as_slice());
+        assert!(accepted["receipts"]["terminal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == kinds.last().unwrap()));
+        let sealed: Value =
+            serde_json::from_str(events[0]["payload_json"].as_str().unwrap()).unwrap();
+        assert_eq!(sealed["requestDigest"], request_digest);
+        assert_eq!(sealed["workspaceIdentity"], grant["workspaceIdentity"]);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["seq"], index as u64 + 1);
+            assert_eq!(event["session_id"], grant["sessionId"]);
+        }
+    }
+
+    /// v1 stays refusal-only and never admits the v2 contract literal or the
+    /// v2 envelope; the v2 routes do not exist.
+    #[test]
+    fn v2_contract_is_refused_by_v1_and_has_no_route() {
+        assert_invalid(V2_FIXTURES[0].1);
+        let mut downgraded: Value = serde_json::from_slice(V2_FIXTURES[0].1).unwrap();
+        downgraded["contract"] = json!(CONTRACT);
+        assert_invalid(downgraded.to_string().as_bytes());
+        let body = std::str::from_utf8(V2_FIXTURES[0].1).unwrap();
+        assert_error(
+            route_without_effects(
+                "POST",
+                "/api/v2/sessions/restricted",
+                Some(body),
+                RequestAuthority::OwnerLocalIpc,
+            ),
+            404,
+            "invalid_request",
+        );
+        assert_error(
+            route_without_effects("GET", "/api/v2/session-policy", None, RequestAuthority::Tcp),
+            404,
+            "invalid_request",
+        );
+    }
+
     #[test]
     fn valid_request_is_correlated_refusal_not_a_grant() {
         let response =

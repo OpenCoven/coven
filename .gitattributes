@@ -1,2 +1,3 @@
 # Session-policy fixtures are digest-pinned wire contracts.
 spec/coven-session-policy/v1/fixtures/*.json text eol=lf
+spec/coven-session-policy/v2/fixtures/*.json text eol=lf
