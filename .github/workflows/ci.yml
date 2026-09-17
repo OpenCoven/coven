@@ -382,7 +382,12 @@ jobs:
           key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-test-
-      - run: cargo test --workspace --locked
+      # `--no-fail-fast`: cargo stops after the first failing test target, and
+      # this job is the only place the macOS-only crates run at all. Without it
+      # one flaky target hides every target ordered after it -- the Seatbelt
+      # conformance suite in `coven-restricted-runtime-macos` had never once
+      # executed in CI, because runs kept dying earlier in `coven-client`.
+      - run: cargo test --workspace --locked --no-fail-fast
       - name: Exercise isolated Threads clock feature
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
       - name: Exercise real-daemon Threads journeys
