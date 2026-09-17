@@ -57,11 +57,50 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'rust-test-windows',
             'threads-test-windows',
             'rust-test-macos',
+            'restricted-runtime-macos',
             'afs-mount-linux',
             'afs-mount-macos',
         ]:
             self.assertIn(f"\n  {job_name}:\n", CI_TEXT)
         self.assertNotIn("\n  rust:\n", CI_TEXT)
+
+    def test_restricted_runtime_macos_gate_is_pull_request_only_and_path_scoped(self) -> None:
+        # This job is the only pre-merge coverage for a crate that compiles to
+        # nothing off macOS. Assert its shape, not just its existence: if the
+        # condition, the packages or the gate wiring drift, the coverage is
+        # silently gone while every other guard still passes.
+        job = ci_job_block('restricted-runtime-macos')
+        self.assertIn("name: Restricted runtime (macOS)", job)
+        self.assertIn(
+            "if: ${{ github.event_name == 'pull_request'"
+            " && needs.changes.outputs.restricted_runtime == 'true' }}",
+            job,
+        )
+        self.assertIn('runs-on: macos-26', job)
+        for command in (
+            'cargo test --locked -p coven-restricted-runtime-macos'
+            ' -p coven-restricted-runtime --no-fail-fast',
+            'cargo clippy --locked -p coven-restricted-runtime-macos'
+            ' -p coven-restricted-runtime --all-targets -- -D warnings',
+        ):
+            self.assertIn(command, job)
+        # A gate nothing depends on is advisory, not a gate.
+        self.assertIn('\n      - restricted-runtime-macos\n', ci_job_block('pr-gate'))
+        # The classifier must expose the category the condition reads.
+        self.assertIn(
+            'restricted_runtime: ${{ steps.classify.outputs.restricted_runtime }}',
+            ci_job_block('changes'),
+        )
+
+    def test_full_macos_workspace_suite_stays_push_only(self) -> None:
+        # macOS runners bill at ~10x Linux; the workspace suite is push-only by
+        # design and the PR-scoped job above exists so that split can hold.
+        job = ci_job_block('rust-test-macos')
+        self.assertIn(
+            "if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}",
+            job,
+        )
+        self.assertIn('cargo test --workspace --locked --no-fail-fast', job)
 
     def test_ci_uses_expected_timeouts_and_cache_policy(self) -> None:
         self.assertGreaterEqual(CI_TEXT.count('timeout-minutes: 20'), 10)
