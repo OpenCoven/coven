@@ -31,6 +31,13 @@ def ci_job_block(job: str) -> str:
     return remainder[: following_job.start()] if following_job else remainder
 
 
+THREADS_FEATURE_COMMAND = (
+    "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock "
+    "--test threads_identity_invariants --test threads_protected_intake "
+    "--test threads_terminal_recovery --no-fail-fast"
+)
+
+
 class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_routes_pull_requests_through_gate(self) -> None:
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", CI_TEXT)
@@ -210,23 +217,80 @@ class CheckCiWorkflowTests(unittest.TestCase):
         )
 
     def test_all_platforms_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
-        command = (
-            "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock "
-            "--test threads_identity_invariants --test threads_protected_intake "
-            "--test threads_terminal_recovery --no-fail-fast"
-        )
+        command = THREADS_FEATURE_COMMAND
         for job in ("rust-test-linux", "threads-test-windows", "rust-test-macos"):
             self.assertIn(command, ci_job_block(job))
         harness = CI_WORKFLOW.parents[2] / "crates/coven-cli/tests/threads_e2e.rs"
         self.assertNotIn("#![cfg(unix)]", harness.read_text(encoding="utf-8"))
 
     def test_windows_threads_journeys_retain_failure_evidence(self) -> None:
+        # Only the job that actually runs the Threads journeys carries the
+        # evidence steps. `rust-test-windows` used to as well, because
+        # `cargo test --workspace` ran `threads_e2e` a second time there; that
+        # duplicate run is what flaked under load (#1116) and is now gated off
+        # by the `threads-test-clock` required-feature.
         for job, artifact_name in [
-            ("rust-test-windows", "threads-daemon-windows"),
             ("threads-test-windows", "threads-daemon-windows-feature"),
         ]:
             with self.subTest(job=job):
                 self.assert_windows_evidence(ci_job_block(job), artifact_name)
+
+    def test_workspace_jobs_do_not_rerun_the_threads_daemon_suites(self) -> None:
+        """The real-daemon Threads suites must run once per platform, from the feature step only.
+
+        It is the heaviest real-daemon fixture in the suite. Running it a second
+        time inside `cargo test --workspace` put it in contention with the rest
+        of the workspace for the runner, and daemon startup then exceeded its
+        health budget (#1116). The `required-features` gate is what keeps
+        `--workspace` from picking it up, so assert the gate itself rather than
+        only its effect on the workflow.
+        """
+        manifest = (CI_WORKFLOW.parents[2] / "crates/coven-cli/Cargo.toml").read_text(
+            encoding="utf-8"
+        )
+        for target in (
+            "threads_e2e",
+            "threads_identity_invariants",
+            "threads_protected_intake",
+            "threads_terminal_recovery",
+        ):
+            with self.subTest(target=target):
+                gate = (
+                    f'[[test]]\nname = "{target}"\n'
+                    'required-features = ["threads-test-clock"]'
+                )
+                self.assertIn(gate, manifest)
+
+        # The evidence steps belong to the job that runs the suite; leaving them
+        # on a job that no longer produces evidence fails on
+        # `if-no-files-found: error`.
+        workspace_windows = ci_job_block("rust-test-windows")
+        self.assertNotIn("Upload Threads daemon evidence", workspace_windows)
+        self.assertNotIn("COVEN_THREADS_E2E_ARTIFACT_ROOT", workspace_windows)
+
+        # The gate only holds while no workspace command enables the feature.
+        # Checking one job would let a `--features threads-test-clock` added to
+        # any other `cargo test --workspace` line bring the duplicate back
+        # silently, so assert it across every workflow.
+        for workflow in sorted(CI_WORKFLOW.parent.glob("*.yml")):
+            for lineno, line in enumerate(
+                workflow.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if "cargo test --workspace" not in line:
+                    continue
+                with self.subTest(workflow=workflow.name, line=lineno):
+                    self.assertNotIn("threads-test-clock", line)
+
+    def test_release_gate_still_exercises_the_threads_daemon_suites(self) -> None:
+        """The tag release gate must keep running the suites `--workspace` drops.
+
+        `release-npm.yml` gates the published release on `cargo test --workspace`
+        alone. Once the Threads targets require `threads-test-clock` that command
+        no longer builds them, so without an explicit feature-enabled step the
+        release would stop exercising the real-daemon journeys entirely.
+        """
+        release = (CI_WORKFLOW.parent / "release-npm.yml").read_text(encoding="utf-8")
+        self.assertIn(THREADS_FEATURE_COMMAND, release)
 
     def assert_windows_evidence(self, windows: str, artifact_name: str) -> None:
         self.assertIn("name: Upload Threads daemon evidence", windows)
