@@ -95,6 +95,81 @@ npm test
 `-D warnings` has **no exceptions**. Fix lints; don't `#[allow(...)]` without a
 justifying comment.
 
+### The `Policy guard` job
+
+The five commands above are **not** the whole gate. `cargo test` does not run
+any of the repo's guard scripts, so a branch can be green locally and still fail
+the required `PR gate` on `Policy guard` — a ~24-step job whose failures show up
+only after you push. Two of its steps have bitten recent PRs: the documentation
+ownership guard (#1089) and the CI workflow guard (#1118).
+
+Reproduce the whole job before pushing. The subshell keeps a failing guard from
+closing your terminal, and still reports a non-zero status, so a printed
+`FAILED:` line cannot be lost in the scroll:
+
+```sh
+(
+  fail=0
+  for s in check-coven-privacy-test.py check-secrets-test.py \
+           check-api-contract-docs-test.py check-api-contract-docs.py \
+           check-docs-ownership-test.py check-security-policy-test.py \
+           check-security-policy.py check-theme-tokens-test.py \
+           check-theme-tokens.py check-secrets.py \
+           classify-ci-changes-test.py check-reliability-scorecard-test.py \
+           check-reliability-scorecard.py check-workflows-test.py \
+           check-ci-workflow-test.py install-native-link-dependencies-test.py; do
+    python3 "scripts/$s" || { echo "FAILED: $s"; fail=1; }
+  done
+
+  node --test scripts/package-github-release-test.mjs || fail=1
+  node --test scripts/package-automations-protocol.test.mjs scripts/script-entrypoint.test.mjs || fail=1
+  node --test scripts/package-automations-authority-profile.test.mjs || fail=1
+  node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs || fail=1
+  node --test scripts/release-stress-test.mjs || fail=1
+  node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs || fail=1
+  bash scripts/check-workflows.sh || fail=1
+
+  exit "$fail"
+)
+echo "Policy guard (local): $?"
+```
+
+A trailing `Policy guard (local): 0` is the pass signal. Do not read a clean
+tail of the output as success — several of these guards print nothing when they
+pass, and the earlier failure may be thousands of lines up.
+
+### Two guards that only inspect what your branch changed
+
+These take a revision range, and CI passes the PR's base...head. Run them the
+same way — `--staged` is not equivalent, because it misses anything you have
+already committed:
+
+```sh
+python3 scripts/check-docs-ownership.py --range "origin/main...HEAD"
+python3 scripts/check-coven-privacy.py  --range "origin/main...HEAD"
+```
+
+Because they are range-scoped, **a file that is already non-compliant on `main`
+fails only once your branch touches it.** A one-line edit to a long-untouched
+page can surface a problem you did not introduce. That is the guard working as
+designed: fix the file (for docs ownership, usually by adding a
+`source_adjacent_reason` to its frontmatter), rather than reverting your edit.
+
+### Changing `.github/workflows/` needs more than CI green
+
+Two things do not show up in a local `cargo test`:
+
+- **Other workflows run `cargo test --workspace` too.** `release-npm.yml` gates
+  the published release on it, and `release-stress.yml` compiles with it. A
+  change to which targets that command builds — adding `required-features` to a
+  `[[test]]`, say — silently changes the **release** gate as well as CI. Check
+  every hit of `grep -rn 'cargo test --workspace' .github/workflows/` before
+  assuming CI is the only consumer.
+- **Pushing a workflow file needs the `workflow` OAuth scope.** An otherwise
+  valid `git push` over HTTPS is rejected with *"refusing to allow an OAuth App
+  to create or update workflow"*. Either `gh auth refresh -h github.com -s
+  workflow`, or push that branch over SSH.
+
 ## Repo-specific invariants (don't break these)
 
 - **Keep the Rust authority boundary clean.** Business/authority logic lives in
