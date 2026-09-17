@@ -13,6 +13,7 @@ CATEGORY_NAMES = [
     'openclaw',
     'npm_packaging',
     'engine',
+    'restricted_runtime',
     'workflow',
     'cargo_metadata',
 ]
@@ -65,6 +66,11 @@ def classify(paths: list[str]) -> dict[str, bool]:
             'scripts/user-journey-e2e-test.mjs',
             'scripts/fixtures/fake-codex.mjs',
         } or is_help_surface
+        # The macOS-only backend compiles to nothing off macOS, so no Linux or
+        # Windows job can cover it; this category gates the macOS PR job.
+        is_restricted_runtime = is_cargo_metadata or path.startswith(
+            'crates/coven-restricted-runtime'
+        )
         is_engine = path in {
             'crates/coven-cli/src/engine.rs',
             'crates/coven-cli/src/engine_install.rs',
@@ -86,6 +92,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
         categories['openclaw'] |= is_openclaw
         categories['npm_packaging'] |= is_npm
         categories['engine'] |= is_engine
+        categories['restricted_runtime'] |= is_restricted_runtime
         categories['workflow'] |= is_workflow
         categories['cargo_metadata'] |= is_cargo_metadata
     categories['docs_only'] = docs_only

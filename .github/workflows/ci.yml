@@ -29,6 +29,7 @@ jobs:
       openclaw: ${{ steps.classify.outputs.openclaw }}
       npm_packaging: ${{ steps.classify.outputs.npm_packaging }}
       engine: ${{ steps.classify.outputs.engine }}
+      restricted_runtime: ${{ steps.classify.outputs.restricted_runtime }}
       workflow: ${{ steps.classify.outputs.workflow }}
       cargo_metadata: ${{ steps.classify.outputs.cargo_metadata }}
     steps:
@@ -393,6 +394,37 @@ jobs:
       - name: Exercise real-daemon Threads journeys
         run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock --test threads_identity_invariants --test threads_protected_intake --test threads_terminal_recovery --no-fail-fast
 
+  # `rust-test-macos` runs the whole workspace but only on `push`, because
+  # macOS runners bill at ~10x Linux. That split is right for the workspace and
+  # wrong for one crate: `coven-restricted-runtime-macos` holds the Seatbelt
+  # kernel-conformance evidence and compiles to nothing off macOS, so no Linux
+  # or Windows job can cover it, and a break in it was only ever caught after it
+  # landed. This job keeps the cost split intact and closes that gap -- two
+  # small crates whose suites run in seconds, gated on their own paths, so a
+  # Rust PR that does not touch them spends no macOS runner at all.
+  restricted-runtime-macos:
+    name: Restricted runtime (macOS)
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.restricted_runtime == 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-restricted-runtime-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-restricted-runtime-
+      - name: Seatbelt conformance and controller tests
+        run: cargo test --locked -p coven-restricted-runtime-macos -p coven-restricted-runtime --no-fail-fast
+      - name: Lint
+        run: cargo clippy --locked -p coven-restricted-runtime-macos -p coven-restricted-runtime --all-targets -- -D warnings
+
   afs-mount-linux:
     name: AFS mount backend (Linux)
     needs: changes
@@ -745,6 +777,7 @@ jobs:
       - rust-test-windows
       - threads-test-windows
       - rust-test-macos
+      - restricted-runtime-macos
       - afs-mount-linux
       - afs-mount-macos
       - performance-baseline
