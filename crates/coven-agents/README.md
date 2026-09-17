@@ -1,26 +1,54 @@
 # coven-agents
 
-`coven-agents` is an experimental, provider-neutral Rust run loop for
-OpenCoven. It supplies the orchestration primitives that model adapters,
-applications, and familiar runtimes can share:
+The Rust `coven/crates/coven-agents` crate is an experimental, provider-neutral,
+in-process behavior loop for OpenCoven. It is distinct from the
+[OpenCoven/coven-agents cloud product](https://github.com/OpenCoven/coven-agents).
+Model adapters, applications, and familiar runtimes can share its local
+primitives:
 
 - bounded model/tool loops
 - journaled goal loops with explicit exit criteria
-- agent handoffs
+- agent handoffs (control transfer within one run, not child delegation)
 - blocking input and output guardrails
 - pluggable session journals
 - persistent loop journals that can be rediscovered after process or machine restart
 - explicit offline reconciliation before ambiguous work resumes
 - metadata-only lifecycle observation
 
-Input guardrails apply to the starting agent, and output guardrails apply to the
-agent that produces the final output. A `SessionStore` must serialize writers
-for each session id or implement optimistic concurrency control.
+## Policy and context boundaries
+
+Input guardrails apply to the starting agent and every handoff target before
+that agent's first model turn or tool execution. Each checks the same
+**original user input**, not session history or intermediate assistant/tool
+output. Output guardrails apply only to the agent that produces the final
+output; they do not screen intermediate contributions from other agents.
+
+A handoff preserves the accumulated model transcript, including loaded session
+history, and passes the same host-provided `&C` to models, tools, and guardrails.
+The target uses its own configured tools. The runner does not select a bounded
+child context, attenuate host authority, or establish cross-principal isolation.
+Use this compatibility behavior only within a host-established trust boundary;
+target ingress parity is not a complete delegation policy.
+
+Durable invocation ownership belongs to Psyche's orchestration contracts;
+process execution, transport, and remote placement belong to Coven's existing
+daemon/client/hub boundaries. The
+[invocation/delegation migration](https://github.com/OpenCoven/coven/issues/804)
+must preserve that split rather than turn this runner into a second distributed
+runtime.
+
+## Persistence and recovery boundaries
+
+A `SessionStore` must serialize writers for each session id or implement
+optimistic concurrency control.
 
 A failed run returns `RunFailure`, which carries the transcript produced before
 the failure alongside the error, so a failing tool never costs the caller the
 items the run already produced. The runner does not append a failed run's items
-to the session; persisting them is the caller's decision.
+to the session; persisting them is the caller's decision. A tool can succeed
+before a later model, guardrail, or session append fails. Neither a failed run
+nor missing session output proves that no side effect occurred; the transcript
+is not a per-effect ledger and does not authorize automatic retry.
 
 Tool call ids must be unique across a run, including call and result ids loaded
 from session history. Results correlate to calls by id, so the runner rejects a
@@ -63,3 +91,21 @@ running checkpoints retain that id and an attempt id so the live owner also
 cannot revoke its own claim under the guise of recovery. Blocked decisions are
 checkpointed with their reason and require an explicit journal transition
 before execution.
+
+`LoopRecoveryFence` is a trusted host assertion, not independently verified
+executor termination. The host/reconciler must establish that the previous
+executor cannot act before supplying it; a nonempty evidence string alone does
+not establish distributed fencing.
+
+## Behavioral evidence
+
+[`tests/runner.rs`](tests/runner.rs) covers direct/handoff ingress parity,
+multi-hop rejection before target execution, tool-call correlation, limits,
+session behavior, and terminal event pairing.
+[`tests/legacy_boundary.rs`](tests/legacy_boundary.rs) characterizes inherited
+history, root-input-only checks, final-only output policy, shared host context,
+and a successful tool effect followed by session-append failure.
+[`tests/loop_runner.rs`](tests/loop_runner.rs) covers local checkpoint and
+reconciliation behavior. These are in-process tests with scripted models and
+tools, not real-daemon, provider-containment, packaged-client, or external A2A
+conformance receipts.
