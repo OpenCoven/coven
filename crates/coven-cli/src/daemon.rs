@@ -13389,19 +13389,160 @@ mod tests {
         Ok(())
     }
 
+    fn serve_legacy_pipe_fixture_connection<R: Read, W: Write>(
+        read: R,
+        write: W,
+        home: &Path,
+        status: &DaemonStatus,
+        ordinal: usize,
+    ) -> Result<bool> {
+        let mut reader = BufReader::new(read);
+        if reader
+            .fill_buf()
+            .with_context(|| format!("inspect legacy fixture connection {ordinal}"))?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        handle_http_stream(
+            reader,
+            write,
+            home,
+            Some(status.clone()),
+            &LiveSessionRuntime::default(),
+            None,
+            HostGuard::Disabled,
+        )
+        .with_context(|| format!("legacy fixture health connection {ordinal}"))?;
+        Ok(true)
+    }
+
+    #[test]
+    fn legacy_pipe_fixture_serves_health_with_or_without_an_observed_empty_connection() -> Result<()>
+    {
+        let home = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_owned(),
+            socket: "coven-daemon-0123456789abcdef.sock".to_owned(),
+            process_creation_time: None,
+        };
+        let request = b"GET /health HTTP/1.1\r\nHost: coven\r\nContent-Length: 0\r\n\r\n";
+        for connections in [
+            vec![request.as_slice(), request.as_slice()],
+            vec![request.as_slice(), b"".as_slice(), request.as_slice()],
+        ] {
+            let mut served = 0;
+            for (index, request) in connections.into_iter().enumerate() {
+                let mut response = Vec::new();
+                let handled = serve_legacy_pipe_fixture_connection(
+                    request,
+                    &mut response,
+                    home.path(),
+                    &status,
+                    index + 1,
+                )?;
+                assert_eq!(handled, !request.is_empty(), "connection {}", index + 1);
+                if handled {
+                    served += 1;
+                    let response = String::from_utf8(response)?;
+                    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+                    let (_, body) = response.split_once("\r\n\r\n").context("health body")?;
+                    let health: serde_json::Value = serde_json::from_str(body)?;
+                    assert_eq!(health["apiVersion"], "coven.daemon.v1");
+                    assert_eq!(health["ok"], true);
+                    assert_eq!(health["daemon"]["socket"], status.socket);
+                } else {
+                    assert!(response.is_empty());
+                }
+            }
+            assert_eq!(served, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_pipe_fixture_does_not_treat_read_errors_or_malformed_requests_as_empty() -> Result<()>
+    {
+        struct FailedRead(std::io::ErrorKind);
+        impl Read for FailedRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0, "injected fixture read failure"))
+            }
+        }
+
+        let home = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_owned(),
+            socket: "coven-daemon-0123456789abcdef.sock".to_owned(),
+            process_creation_time: None,
+        };
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            let mut response = Vec::new();
+            let error = serve_legacy_pipe_fixture_connection(
+                FailedRead(kind),
+                &mut response,
+                home.path(),
+                &status,
+                2,
+            )
+            .expect_err("read errors are not empty connections");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(kind)
+            );
+            assert!(response.is_empty());
+        }
+        let mut response = Vec::new();
+        let error = serve_legacy_pipe_fixture_connection(
+            b"invalid\r\n\r\n".as_slice(),
+            &mut response,
+            home.path(),
+            &status,
+            2,
+        )
+        .expect_err("nonempty malformed requests must reach the HTTP parser");
+        assert!(format!("{error:#}").contains("missing HTTP path"));
+        assert!(response.is_empty());
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn discovers_same_profile_legacy_pipe_from_an_inherited_acl_status_file() -> Result<()> {
+        run_legacy_pipe_fixture(false)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_pipe_fixture_handles_an_observed_empty_connection_before_discovery() -> Result<()> {
+        run_legacy_pipe_fixture(true)
+    }
+
+    #[cfg(windows)]
+    fn run_legacy_pipe_fixture(observe_empty_connection: bool) -> Result<()> {
         use coven_client::{DaemonClient, DaemonEndpoint};
         use interprocess::{
-            local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
+            local_socket::{
+                prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
+            },
             os::windows::local_socket::ListenerOptionsExt,
         };
         use std::{
             hash::{DefaultHasher, Hash, Hasher},
+            os::windows::fs::OpenOptionsExt,
+            sync::mpsc,
             thread,
         };
 
+        // A harness hang guard, not a discovery/request deadline or timing assertion.
+        const FIXTURE_GUARD: Duration = Duration::from_secs(30);
         let temp_dir = tempfile::tempdir()?;
         let mut hasher = DefaultHasher::new();
         temp_dir.path().to_string_lossy().hash(&mut hasher);
@@ -13415,6 +13556,7 @@ mod tests {
             .security_descriptor(owner_only_pipe_security_descriptor()?)
             .create_sync()
             .expect("bind protected legacy pipe");
+        listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
@@ -13423,8 +13565,6 @@ mod tests {
         };
         write_inherited_windows_status(temp_dir.path(), serde_json::to_vec(&status)?)?;
 
-        let home = temp_dir.path().to_path_buf();
-        let server_status = status.clone();
         let started = std::time::Instant::now();
         let trace = move |phase: &str, connection: usize| {
             eprintln!(
@@ -13432,51 +13572,127 @@ mod tests {
                 started.elapsed().as_micros()
             );
         };
-        let server = thread::spawn(move || {
-            // This is the fixture's assumed sequence, not an observation of
-            // the accepted handles. Keep ordinals and client phases to
-            // distinguish discovery failure from caller-health failure.
-            for (index, serves_health) in [true, false, true].into_iter().enumerate() {
-                let ordinal = index + 1;
-                trace("accept-begin", ordinal);
-                let conn = listener.incoming().next().expect("accept").expect("stream");
-                trace("accept-ready", ordinal);
-                if serves_health {
-                    trace("health-handler-begin", ordinal);
-                    handle_http_stream(
-                        &conn,
-                        &conn,
-                        &home,
-                        Some(server_status.clone()),
-                        &LiveSessionRuntime::default(),
-                        None,
-                        HostGuard::Disabled,
-                    )
-                    .with_context(|| format!("legacy fixture health connection {ordinal}"))?;
-                    trace("health-handler-ready", ordinal);
-                } else {
-                    trace("drop-without-read", ordinal);
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (discovered_tx, discovered_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        thread::scope(|scope| -> Result<()> {
+            // Only the bounded client runs in a worker. Closing the listener and
+            // continuation channel below also unblocks it on server errors.
+            let home = temp_dir.path();
+            let client_status = &status;
+            let client = scope.spawn(move || -> Result<_> {
+                if observe_empty_connection {
+                    let metadata = std::fs::OpenOptions::new()
+                        .access_mode(windows_sys::Win32::Storage::FileSystem::READ_CONTROL)
+                        .open(format!(r"\\.\pipe\{}", client_status.socket))
+                        .context("open fixture metadata handle")?;
+                    accepted_rx
+                        .recv_timeout(FIXTURE_GUARD)
+                        .context("wait for fixture metadata acceptance")?;
+                    drop(metadata);
                 }
-                drop(conn);
-                trace("connection-dropped", ordinal);
-            }
-            Ok::<_, anyhow::Error>(())
-        });
 
-        trace("client-discovery-begin", 0);
-        let endpoint = DaemonEndpoint::discover(temp_dir.path())
-            .map_err(anyhow::Error::new)
-            .context("legacy fixture client discovery")?;
-        trace("client-discovery-ready", 0);
-        trace("client-health-begin", 0);
-        let health = DaemonClient::new(endpoint)
-            .health()
-            .map_err(anyhow::Error::new)
-            .context("legacy fixture caller health")?;
-        trace("client-health-ready", 0);
-        assert_eq!(health.api_version, "coven.daemon.v1");
-        server.join().expect("server thread")?;
-        Ok(())
+                trace("client-discovery-begin", 0);
+                let endpoint = DaemonEndpoint::discover(home)
+                    .map_err(anyhow::Error::new)
+                    .context("legacy fixture client discovery")?;
+                anyhow::ensure!(
+                    endpoint.is_owner_local(),
+                    "discovery must remain owner-local"
+                );
+                trace("client-discovery-ready", 0);
+                discovered_tx
+                    .send(())
+                    .context("signal completed discovery")?;
+                continue_rx
+                    .recv_timeout(FIXTURE_GUARD)
+                    .context("wait for fixture caller-health release")?;
+                trace("client-health-begin", 0);
+                let health = DaemonClient::new(endpoint)
+                    .health()
+                    .map_err(anyhow::Error::new)
+                    .context("legacy fixture caller health")?;
+                trace("client-health-ready", 0);
+                Ok(health)
+            });
+
+            let server_result = (|| -> Result<()> {
+                let mut served = 0;
+                let mut empty = 0;
+                let mut accepted = 0;
+                while served < 2 {
+                    trace("accept-begin", accepted + 1);
+                    let conn = loop {
+                        anyhow::ensure!(
+                            started.elapsed() < FIXTURE_GUARD,
+                            "legacy fixture accept hang guard expired after {:?}",
+                            started.elapsed()
+                        );
+                        match listener.accept() {
+                            Ok(conn) => break conn,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                anyhow::ensure!(
+                                    !client.is_finished(),
+                                    "legacy fixture client exited after {served} health requests"
+                                );
+                                thread::yield_now();
+                            }
+                            Err(error) => {
+                                return Err(error).context("accept legacy fixture connection")
+                            }
+                        }
+                    };
+                    accepted += 1;
+                    trace("accept-ready", accepted);
+                    accepted_tx.send(()).context("signal fixture acceptance")?;
+                    if serve_legacy_pipe_fixture_connection(
+                        &conn,
+                        &conn,
+                        temp_dir.path(),
+                        &status,
+                        accepted,
+                    )? {
+                        served += 1;
+                        trace("health-handler-ready", accepted);
+                        if served == 1 {
+                            // Hold the first health stream until real discovery
+                            // has closed its ACL-only handle, before accepting again.
+                            discovered_rx
+                                .recv_timeout(FIXTURE_GUARD)
+                                .context("wait for discovery before the next accept")?;
+                            trace("discovery-complete-before-next-accept", accepted);
+                            continue_tx.send(()).context("release caller health")?;
+                        }
+                    } else {
+                        empty += 1;
+                        trace("observed-empty-connection", accepted);
+                    }
+                    drop(conn);
+                    trace("connection-dropped", accepted);
+                }
+                assert_eq!(served, 2);
+                assert_eq!(empty, usize::from(observe_empty_connection));
+                assert_eq!(accepted, served + empty);
+                Ok(())
+            })();
+            drop(listener);
+            drop(continue_tx);
+            drop(accepted_tx);
+            let client_result = client
+                .join()
+                .map_err(|_| anyhow::anyhow!("legacy fixture client thread panicked"))
+                .and_then(std::convert::identity);
+            let health = match (server_result, client_result) {
+                (Ok(()), result) => result?,
+                (Err(server), Ok(_)) => return Err(server),
+                (Err(server), Err(client)) => {
+                    return Err(server)
+                        .context(format!("legacy fixture client also failed: {client:#}"));
+                }
+            };
+            assert_eq!(health.api_version, "coven.daemon.v1");
+            Ok(())
+        })
     }
 
     #[cfg(windows)]
