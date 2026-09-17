@@ -50,7 +50,7 @@ descriptors, a hash of the fixed profile, and fresh random attempt/worker IDs.
 | `install_restrictions` | Pins the single-line Seatbelt profile (below). The kernel install happens inside the forked worker **before its `execve`**, so no target code can run unrestricted; a profile that fails to compile aborts the exec. |
 | `retain_lifetime` | Spawns the **guardian** (`Role::Guardian`, own process group, empty environment, stderr discarded) with the owner PID and the executable path. The worker pipes travel as fds 3-5; every other inheritable descriptor is closed. The remaining lease is measured immediately before it is written as the first stdin line (`lease <ms>`), and the guardian starts its deadline on receipt, so handoff latency can only shorten the lease. Refuses if the lease already expired. |
 | `revalidate` | Same physical checks as `prepare`, plus the guardian must still be alive. |
-| `execute` | Re-checks the stop signal immediately before the irreversible `spawn` send and again after `spawned`; a cancel landing in between kills the fresh worker and returns `Rejected`. Tells the guardian to `spawn`; the guardian forks the worker in a **new process group**, closes inheritable descriptors, calls `sandbox_init`, then execs with an empty environment. `spawned <pid>` completes the handoff. |
+| `execute` | Re-checks the stop signal immediately before the irreversible `spawn` send and again after `spawned`; a cancel landing in between kills the fresh worker and returns `Rejected`. Tells the guardian to `spawn`; the guardian forks the worker in a **new process group**, closes inheritable descriptors, calls `sandbox_init`, then execs with an empty environment. `spawned <pid>` completes the handoff. The guardian re-reads the owner/lease boundary **after** the fork and may answer `terminated` instead: a worker that crossed the boundary mid-spawn is killed before it is ever reported as running, and that line is absorbed here so cleanup still sees a proven-empty group. |
 | `request_cleanup` | Sends `kill`; the guardian `SIGKILL`s the whole group until `killpg(pgid, 0)` reports no member and the leader is reaped (2 s budget). `Released` only when that completes; otherwise `Pending`, in which case the guardian stays alive and keeps killing until it can report `terminated`. With no guardian, nothing was launched and cleanup is `Released`. |
 | `observe_termination` | `Confirmed` only after the guardian reported `terminated` (leader reaped **and** group empty). A guardian that exited without that report is `Unavailable`, which fences and remains retryable as an observation. |
 
@@ -83,6 +83,19 @@ drop, a blocked caller, and owner death. It fences autonomously on:
   arrives);
 - **owner death** (`kill(owner, 0)` → `ESRCH`, or EOF on its command pipe);
 - explicit `kill`.
+
+The guardian is single-threaded, so it cannot process a fence while it is
+inside `fork`/`sandbox_init`/`exec`. `boundary_open` is therefore read twice
+around `Worker::spawn`: once to authorise the fork, once after it. A worker
+whose owner exited or whose lease expired during the spawn is killed before
+`spawned` is ever said, and the guardian answers `terminated` instead. It
+answers through `finish`, not `spawn-failed`, because only `terminated`
+proves the process group is empty — exiting with `spawn-failed` after a real
+fork would strand the controller on `Pending`/`Unavailable` for a group the
+guardian had already cleared. This narrows what is reported, not what is
+enforced: the profile is installed in the child before its `execve`, so
+anything running in that window is already sealed, and the loop tail fences
+immediately after spawn either way.
 
 Every fence is a `SIGKILL` of the whole process group until empty. The
 guardian exits after reporting `terminated`, or on `release`. If the first
