@@ -45,9 +45,12 @@ origin, so the controller lease and the guardian deadline live in one domain.
 descriptors, fresh random attempt/worker IDs, and for `runtime_closure` a
 SHA-256 **content manifest** of everything under `closure/` folded with the
 closure inode and the fixed profile. The manifest walks the tree in sorted
-relative-path order, opening every entry `openat` + `O_NOFOLLOW` from the
-held parent descriptor and typing it on the descriptor, and covers each
-entry's kind, mode bits, length and bytes. Symlinks, special files, another
+relative-path order, listing each directory through its held descriptor
+(`openat(fd, ".")`, never the pathname), opening every entry `openat` +
+`O_NOFOLLOW` + `O_NONBLOCK` from that descriptor and typing it on the result,
+and covers each entry's kind, mode bits, length and bytes. `O_NONBLOCK` keeps
+a FIFO from parking the open until a writer appears; it is then refused by
+type. Symlinks, special files, another
 filesystem, more than 32 levels, 65,536 entries or 256 MiB are refused at
 seal (`SealError::Closure`): a manifest cannot pin what a link points at, and
 a truncated manifest would pin only part of what the worker can read.

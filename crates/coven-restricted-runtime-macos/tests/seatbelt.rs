@@ -414,6 +414,24 @@ mod suite {
         ));
         fs::remove_file(ws.root.join("closure").join("hosts")).unwrap();
 
+        // A FIFO under `closure/` must be refused, not waited on: a plain
+        // O_RDONLY open would park until a writer appeared.
+        let fifo =
+            std::ffi::CString::new(ws.root.join("closure").join("fifo").to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo with a NUL-terminated path inside the test workspace.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (worker, _ends) = WorkerStdio::pipes().unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            SeatbeltDriver::seal(ws.config(), worker).map(|_| ()),
+            Err(SealError::Closure)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "seal blocked on the FIFO"
+        );
+        fs::remove_file(ws.root.join("closure").join("fifo")).unwrap();
+
         let guardian = ws.root.join("bin").join(GUARDIAN_NAME);
         fs::set_permissions(&guardian, fs::Permissions::from_mode(0o722)).unwrap();
         let (worker, _ends) = WorkerStdio::pipes().unwrap();

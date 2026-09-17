@@ -255,14 +255,65 @@ impl Held {
     }
 }
 
+/// Lists a directory through its **held descriptor**, never its pathname, so
+/// a same-UID process that swaps `closure/sub` after the descriptor was opened
+/// cannot change which names get hashed: the names come from the same inode
+/// the entries are then opened relative to.
+fn list_directory(dir: &File) -> Result<Vec<String>, SealError> {
+    // SAFETY: `openat(fd, ".")` yields a fresh open file description for the
+    // very inode `fd` holds (no pathname is consulted), with its own offset,
+    // so listing it cannot disturb the held descriptor and a second listing
+    // starts from the beginning. fdopendir takes ownership of that descriptor
+    // and closedir closes it; readdir results are copied out before closedir;
+    // nothing else touches the DIR.
+    unsafe {
+        let fresh = libc::openat(
+            dir.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if fresh < 0 {
+            return Err(SealError::Closure);
+        }
+        let stream = libc::fdopendir(fresh);
+        if stream.is_null() {
+            libc::close(fresh);
+            return Err(SealError::Closure);
+        }
+        let mut names = Vec::new();
+        loop {
+            *libc::__error() = 0;
+            let entry = libc::readdir(stream);
+            if entry.is_null() {
+                let failed = *libc::__error() != 0;
+                libc::closedir(stream);
+                return if failed {
+                    Err(SealError::Closure)
+                } else {
+                    Ok(names)
+                };
+            }
+            let name = std::ffi::CStr::from_ptr((*entry).d_name.as_ptr());
+            match name.to_str() {
+                Ok(".") | Ok("..") => {}
+                Ok(name) => names.push(name.to_owned()),
+                Err(_) => {
+                    libc::closedir(stream);
+                    return Err(SealError::Closure);
+                }
+            }
+        }
+    }
+}
+
 /// Content manifest of the sealed closure: SHA-256 over every entry below
 /// `closure/`, in sorted relative-path order, with each entry's kind, mode
 /// bits, byte length and (for regular files) contents. Directories are listed
-/// by path but every entry is opened `openat` + `O_NOFOLLOW` relative to the
-/// **held** parent descriptor and its type checked on the descriptor, so a
-/// component swapped for a symlink after the listing cannot smuggle in outside
-/// content. Symlinks, devices and sockets are refused: a manifest cannot pin
-/// what they point at.
+/// through their held descriptor and every entry is opened `openat` +
+/// `O_NOFOLLOW` + `O_NONBLOCK` relative to that same descriptor with its type
+/// checked on the result, so neither a swapped component nor a FIFO can alter
+/// or stall what gets hashed. Symlinks, FIFOs, devices and sockets are
+/// refused: a manifest cannot pin what they point at or produce.
 struct ClosureManifest {
     hasher: Sha256,
     entries: usize,
@@ -287,16 +338,7 @@ impl ClosureManifest {
         if depth > CLOSURE_MAX_DEPTH {
             return Err(SealError::Closure);
         }
-        let mut names: Vec<String> = fs::read_dir(&dir.path)
-            .map_err(|_| SealError::Closure)?
-            .map(|entry| {
-                entry
-                    .map_err(|_| SealError::Closure)?
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| SealError::Closure)
-            })
-            .collect::<Result<_, _>>()?;
+        let mut names = list_directory(&dir.file)?;
         names.sort_unstable();
         for name in names {
             self.entries += 1;
@@ -304,9 +346,12 @@ impl ClosureManifest {
                 return Err(SealError::Closure);
             }
             let relative = format!("{prefix}{name}");
-            // O_SYMLINK-free: O_NOFOLLOW on a symlink fails with ELOOP, which
-            // is exactly the refusal wanted.
-            let held = Held::open_at(dir, &name, 0).map_err(|_| SealError::Closure)?;
+            // O_NOFOLLOW turns a symlink into ELOOP, which is exactly the
+            // refusal wanted. O_NONBLOCK keeps a FIFO from parking the open
+            // until a writer appears; it is then refused by type below, and it
+            // has no effect on regular files or directories.
+            let held =
+                Held::open_at(dir, &name, libc::O_NONBLOCK).map_err(|_| SealError::Closure)?;
             let meta = held.file.metadata().map_err(|_| SealError::Closure)?;
             if meta.dev() != dir.identity.dev {
                 return Err(SealError::Closure);
