@@ -301,12 +301,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - name: Configure Threads evidence directory
-        shell: pwsh
-        env:
-          COVEN_THREADS_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          "COVEN_THREADS_E2E_ARTIFACT_ROOT=$env:COVEN_THREADS_E2E_ARTIFACT_ROOT" >> $env:GITHUB_ENV
+      # `threads_e2e` is the only producer of Threads daemon evidence, and it no
+      # longer runs in this job: it now requires the `threads-test-clock`
+      # feature (see crates/coven-cli/Cargo.toml) so `cargo test --workspace`
+      # does not run it a second time (#1116). The evidence directory and its
+      # upload moved to `threads-test-windows`, which runs the feature build.
       # The manual Windows release-stress job owns cache writes. Post-job
       # packing must not consume this acceptance job's remaining test budget.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -319,14 +318,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
-      - name: Upload Threads daemon evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: threads-daemon-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 14
-          if-no-files-found: error
 
   threads-test-windows:
     name: Threads daemon tests (Windows)

@@ -44,6 +44,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
+      # The real-daemon Threads targets require `threads-test-clock` so they no
+      # longer run twice per platform in CI (#1116). `cargo test --workspace`
+      # therefore does not pick them up, and this release gate would silently
+      # stop exercising them without this step.
+      - name: Exercise real-daemon Threads journeys
+        run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock --test threads_identity_invariants --test threads_protected_intake --test threads_terminal_recovery --no-fail-fast
       - run: python3 scripts/check-secrets-test.py
       - run: python3 scripts/check-secrets.py
 
