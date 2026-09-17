@@ -956,9 +956,14 @@ mod tests {
             prefix: PathBuf::from("/fixture/.local"),
         };
         let lines = doctor_lines(&[shim], Some(0), Some(Path::new("/x")), None);
+        // Paths are rendered as joined, so the expectation joins the same way
+        // and the assertion holds on both separators.
         assert_eq!(
             lines,
-            vec!["Install: /fixture/.local/bin/coven (npm, prefix /fixture/.local)".to_string()]
+            vec![format!(
+                "Install: {} (npm, prefix /fixture/.local)",
+                at("/fixture/.local/bin", "coven").display()
+            )]
         );
     }
 
@@ -1012,11 +1017,17 @@ mod tests {
         assert_eq!(lines[0], "Installs:");
         assert_eq!(
             lines[1],
-            "  [OK] /fixture/.local/bin/coven (active, this process) — npm, prefix /fixture/.local"
+            format!(
+                "  [OK] {} (active, this process) — npm, prefix /fixture/.local",
+                at("/fixture/.local/bin", "coven").display()
+            )
         );
         assert_eq!(
             lines[2],
-            "  [!!] /fixture/.nvm/versions/node/v24/bin/coven (shadowed) — npm, prefix /fixture/.nvm/versions/node/v24"
+            format!(
+                "  [!!] {} (shadowed) — npm, prefix /fixture/.nvm/versions/node/v24",
+                at("/fixture/.nvm/versions/node/v24/bin", "coven").display()
+            )
         );
         assert_eq!(
             lines[3],
@@ -1024,7 +1035,10 @@ mod tests {
         );
         assert_eq!(
             lines[4],
-            "  [!!] /fixture/.cargo/bin/coven (shadowed) — cargo install"
+            format!(
+                "  [!!] {} (shadowed) — cargo install",
+                at("/fixture/.cargo/bin", "coven").display()
+            )
         );
         assert_eq!(lines[5], "       remove: cargo uninstall coven-cli");
         assert!(lines[6].starts_with("  The first entry wins."));
@@ -1075,7 +1089,10 @@ mod tests {
         let lines = doctor_lines(&found, Some(2), None, None);
         assert_eq!(
             lines[4],
-            "  [!!] /fixture/.cargo/bin/coven (shadowed, yet this process) — cargo install"
+            format!(
+                "  [!!] {} (shadowed, yet this process) — cargo install",
+                at("/fixture/.cargo/bin", "coven").display()
+            )
         );
         let lines = doctor_lines(&found, None, Some(Path::new("/x/target/debug/coven")), None);
         assert!(lines
