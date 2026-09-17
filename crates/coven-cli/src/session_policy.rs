@@ -371,6 +371,10 @@ mod tests {
         let mut parsed = std::collections::BTreeMap::new();
         for (name, bytes) in V2_FIXTURES {
             assert_eq!(bytes.last(), Some(&b'\n'), "{name} lacks its trailing LF");
+            assert!(
+                !bytes.ends_with(b"\n\n"),
+                "{name} has more than one trailing LF"
+            );
             assert!(bytes.len() <= 16_384, "{name} exceeds the response bound");
             assert_eq!(manifest[name]["bytes"], bytes.len(), "{name}");
             assert_eq!(
@@ -424,9 +428,10 @@ mod tests {
             ));
             assert_eq!(row["backend"], accepted["backend"]);
         }
-        // `enforced: true` in the fixture is only meaningful against an
-        // eligible row; the fixture row is not, so a consumer must not honour it.
-        assert_eq!(accepted["enforced"], true);
+        // No vendored vector claims enforcement: the only row is ineligible,
+        // so the acceptance shape is carried with `enforced: false`, which a
+        // consumer treats as no authority.
+        assert_eq!(accepted["enforced"], false);
 
         let events = parsed["receipts"]["events"].as_array().unwrap();
         let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();

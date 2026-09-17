@@ -14,8 +14,8 @@
   },
   "accepted": {
     "file": "accepted.json",
-    "bytes": 983,
-    "digest": "sha256:51c73a472dcdbc23030f83381cb89de959c6fd93b1d3cf89238e2369f86fef50",
+    "bytes": 984,
+    "digest": "sha256:a43031c9a12f2ebf76d5a5e6ad37370aece74f2b2e8a13911e6f1dd75f0efa1d",
     "status": 200
   },
   "refusal": {

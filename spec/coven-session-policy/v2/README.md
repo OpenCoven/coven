@@ -84,7 +84,11 @@ no NUL, opaque at admission). `leaseMs` is the finite worker lease, 1,000 to
 HTTP 200 with the closed object in [`fixtures/accepted.json`](fixtures/accepted.json).
 It is issued **only after** `seal` succeeded and the controller reached
 `Running` with `spawned <pid>` acknowledged; a server that cannot get there
-answers with the v2 refusal instead.
+answers with the v2 refusal instead. The fixture is a **shape vector, not an
+authoritative acceptance**: its `backend` is the one matrix row, which is
+ineligible, so it carries `enforced: false` — the value a real server would
+be allowed to send for that tuple, and one a consumer treats as no authority.
+No vendored vector claims enforcement.
 
 | Field | Meaning |
 | --- | --- |
