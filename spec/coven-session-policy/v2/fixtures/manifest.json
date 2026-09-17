@@ -1,0 +1,39 @@
+{
+  "contract": "coven.session-policy.v2",
+  "admissionTimeUnixMs": 1799999700000,
+  "encoding": "UTF-8",
+  "trailingNewline": "LF",
+  "seatbeltProfile": {
+    "text": "(version 1) (deny default) (import \"dyld-support.sb\") (allow process-exec (literal \"/example/sealed-workspace/bin/coven-worker-target\")) (allow file-read* (subpath \"/example/sealed-workspace\")) (allow file-read* (subpath \"/usr/lib\") (literal \"/dev/null\")) (allow sysctl-read)",
+    "digest": "sha256:dc8069fcbb91641788f595ee9bad73d00a9e8b60aac6e4e182357043dd34fd7d"
+  },
+  "request": {
+    "file": "request.json",
+    "bytes": 288,
+    "digest": "sha256:bed802052e0717763e35243bf80354efd1ea358b9374c64c2fe81d8da312a6b8"
+  },
+  "accepted": {
+    "file": "accepted.json",
+    "bytes": 983,
+    "digest": "sha256:51c73a472dcdbc23030f83381cb89de959c6fd93b1d3cf89238e2369f86fef50",
+    "status": 200
+  },
+  "refusal": {
+    "file": "refusal.json",
+    "bytes": 315,
+    "digest": "sha256:a32cfaa8b42ba9f13ef461ea24b45b5a5ee1c07e78172ec1fbbac238a541e3ba",
+    "status": 409
+  },
+  "discovery": {
+    "file": "discovery.json",
+    "bytes": 1038,
+    "digest": "sha256:37d3e1cbec31120a24fdd150a97cb67095d11ecb96e75aa607c0d68e196c6798",
+    "status": 200
+  },
+  "receipts": {
+    "file": "receipts.json",
+    "bytes": 838,
+    "digest": "sha256:e4cf0a12c0b7d9b0568182dcfa50d14e97cbdd1ecba55c9f4e198fa022d9f005",
+    "status": 200
+  }
+}
