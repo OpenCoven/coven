@@ -8,8 +8,9 @@
 //!   profile; later lines: `spawn`, `kill`, `release`. EOF is owner loss.
 //! * fds 3/4/5: the controller-owned worker stdin/stdout/stderr pipes.
 //! * stdout lines: `ready`, `spawned <pid>`, `spawn-failed`, `terminated`,
-//!   `pending`. After `pending` the guardian keeps killing the group and
-//!   only exits once it can say `terminated`. A `spawn` may answer
+//!   `pending`. After `pending` the guardian keeps killing the group (and
+//!   the leader by pid, so a `setsid` escape does not help) and only exits
+//!   once it can say `terminated`. A `spawn` may answer
 //!   `terminated` rather than `spawned <pid>`: the owner/lease boundary is
 //!   re-read after the fork and a worker that crossed it mid-spawn is killed
 //!   before it is ever reported as running.
@@ -190,14 +191,27 @@ impl Worker {
         self.reaped
     }
 
-    /// SIGKILLs the whole group until no member remains and the leader is
-    /// reaped, within a bounded budget. Returns true only on full termination.
+    /// SIGKILLs the whole group **and the leader by pid** until no member
+    /// remains and the leader is reaped, within a bounded budget. Returns true
+    /// only on full termination.
+    ///
+    /// The pid signal is what makes the fence hold against `setsid`/`setpgid`:
+    /// Seatbelt has no operation for those calls, so the worker can leave the
+    /// group the guardian created, and `killpg` alone would then report an
+    /// empty group while the worker lives on. `process-fork` is denied, so the
+    /// leader is the only process the worker can ever be; killing it by pid
+    /// closes the escape without needing kernel-tracked descendants.
     fn terminate(&mut self) -> bool {
         let start = Instant::now();
         loop {
-            // SAFETY: killpg on the group this guardian created.
+            // SAFETY: killpg on the group this guardian created, and kill on
+            // the leader pid this guardian forked and has not yet reaped (so
+            // the pid cannot have been reused).
             unsafe {
                 libc::killpg(self.pgid, libc::SIGKILL);
+                if !self.reaped {
+                    libc::kill(self.pgid, libc::SIGKILL);
+                }
             }
             if self.reap() && !group_alive(self.pgid) {
                 return true;

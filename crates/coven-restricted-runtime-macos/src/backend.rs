@@ -4,7 +4,7 @@ use std::collections::hash_map::RandomState;
 use std::ffi::{c_int, c_void, CString};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
@@ -17,10 +17,19 @@ use coven_restricted_runtime::{
     BackendError, Binding, CleanupOutcome, CleanupReport, Clock, ClockError, Driver, Operation,
     Reading, Receipt, Request, Termination, TerminationReport,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{GUARDIAN_NAME, TARGET_NAME};
 
 const IPC_BUDGET: Duration = Duration::from_secs(3);
+
+/// Bounds on the sealed closure manifest. A closure past any of them is
+/// refused at seal rather than partially hashed: an unbounded walk would let
+/// a hostile workspace stall sealing, and a truncated manifest would pin only
+/// part of what the worker can read.
+const CLOSURE_MAX_DEPTH: usize = 32;
+const CLOSURE_MAX_ENTRIES: usize = 65_536;
+const CLOSURE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 // `acl_get_fd_np`/`acl_free` live in libsystem_c, re-exported by libSystem.
 // `libc` carries no Darwin ACL bindings, so they are declared here the way
@@ -111,7 +120,8 @@ pub enum SealError {
     /// `bin/coven-worker-target` is missing, not a private executable file, on
     /// another filesystem, or widened by an extended ACL.
     Executable,
-    /// `closure/` is missing or not on the workspace filesystem.
+    /// `closure/` is missing, not on the workspace filesystem, contains a
+    /// symlink or special file, or exceeds the manifest bounds.
     Closure,
     /// Guardian binary is not an absolute, caller-owned, executable file, or
     /// an extended ACL widens it.
@@ -245,6 +255,103 @@ impl Held {
     }
 }
 
+/// Content manifest of the sealed closure: SHA-256 over every entry below
+/// `closure/`, in sorted relative-path order, with each entry's kind, mode
+/// bits, byte length and (for regular files) contents. Directories are listed
+/// by path but every entry is opened `openat` + `O_NOFOLLOW` relative to the
+/// **held** parent descriptor and its type checked on the descriptor, so a
+/// component swapped for a symlink after the listing cannot smuggle in outside
+/// content. Symlinks, devices and sockets are refused: a manifest cannot pin
+/// what they point at.
+struct ClosureManifest {
+    hasher: Sha256,
+    entries: usize,
+    bytes: u64,
+}
+
+impl ClosureManifest {
+    fn digest(closure: &Held) -> Result<[u8; 32], SealError> {
+        let mut manifest = Self {
+            hasher: Sha256::new(),
+            entries: 0,
+            bytes: 0,
+        };
+        manifest.walk(closure, "", 0)?;
+        manifest.hasher.update(b"end:");
+        manifest.hasher.update(manifest.entries.to_le_bytes());
+        manifest.hasher.update(manifest.bytes.to_le_bytes());
+        Ok(manifest.hasher.finalize().into())
+    }
+
+    fn walk(&mut self, dir: &Held, prefix: &str, depth: usize) -> Result<(), SealError> {
+        if depth > CLOSURE_MAX_DEPTH {
+            return Err(SealError::Closure);
+        }
+        let mut names: Vec<String> = fs::read_dir(&dir.path)
+            .map_err(|_| SealError::Closure)?
+            .map(|entry| {
+                entry
+                    .map_err(|_| SealError::Closure)?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| SealError::Closure)
+            })
+            .collect::<Result<_, _>>()?;
+        names.sort_unstable();
+        for name in names {
+            self.entries += 1;
+            if self.entries > CLOSURE_MAX_ENTRIES || name.contains('/') || name.contains('\0') {
+                return Err(SealError::Closure);
+            }
+            let relative = format!("{prefix}{name}");
+            // O_SYMLINK-free: O_NOFOLLOW on a symlink fails with ELOOP, which
+            // is exactly the refusal wanted.
+            let held = Held::open_at(dir, &name, 0).map_err(|_| SealError::Closure)?;
+            let meta = held.file.metadata().map_err(|_| SealError::Closure)?;
+            if meta.dev() != dir.identity.dev {
+                return Err(SealError::Closure);
+            }
+            self.hasher.update(b"entry:");
+            self.hasher.update(relative.len().to_le_bytes());
+            self.hasher.update(relative.as_bytes());
+            self.hasher.update((meta.mode() & 0o7777).to_le_bytes());
+            if meta.is_dir() {
+                self.hasher.update(b"dir");
+                self.walk(&held, &format!("{relative}/"), depth + 1)?;
+            } else if meta.is_file() {
+                self.hasher.update(b"file");
+                self.hasher.update(meta.len().to_le_bytes());
+                self.bytes = self
+                    .bytes
+                    .checked_add(meta.len())
+                    .filter(|total| *total <= CLOSURE_MAX_BYTES)
+                    .ok_or(SealError::Closure)?;
+                let mut file = &held.file;
+                let mut buffer = [0u8; 64 * 1024];
+                let mut read_total = 0u64;
+                loop {
+                    let n = file.read(&mut buffer).map_err(|_| SealError::Closure)?;
+                    if n == 0 {
+                        break;
+                    }
+                    read_total += n as u64;
+                    if read_total > meta.len() {
+                        // Grew while being hashed: not a stable closure.
+                        return Err(SealError::Closure);
+                    }
+                    self.hasher.update(&buffer[..n]);
+                }
+                if read_total != meta.len() {
+                    return Err(SealError::Closure);
+                }
+            } else {
+                return Err(SealError::Closure);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn fresh_id() -> u128 {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u64(u64::from(std::process::id()));
@@ -322,6 +429,7 @@ pub struct SeatbeltDriver {
     bin: Held,
     executable: Held,
     closure: Held,
+    closure_digest: [u8; 32],
     guardian_binary: Held,
     profile: String,
     stdio: Option<WorkerStdio>,
@@ -391,15 +499,25 @@ impl SeatbeltDriver {
             .metadata()
             .map_err(|_| SealError::Stdio)?;
 
-        let mut closure_hash = RandomState::new().build_hasher();
-        closure_hash.write(profile.as_bytes());
+        // The closure identity is its content manifest folded with the fixed
+        // profile, so `runtime_closure` changes when any file under `closure/`
+        // changes, not only when the directory inode does.
+        let closure_digest = ClosureManifest::digest(&closure)?;
+        let mut runtime_closure = Sha256::new();
+        runtime_closure.update(b"coven-restricted-runtime-macos/closure/v1");
+        runtime_closure.update(closure_digest);
+        runtime_closure.update(closure.identity.id().to_le_bytes());
+        runtime_closure.update(profile.as_bytes());
+        let runtime_closure: [u8; 32] = runtime_closure.finalize().into();
         let binding = Binding {
             attempt: fresh_id(),
             backend: fresh_id(),
             worker: fresh_id(),
             workspace: workspace.identity.id(),
             executable: executable.identity.id(),
-            runtime_closure: closure.identity.id() ^ (u128::from(closure_hash.finish()) << 64),
+            runtime_closure: u128::from_le_bytes(
+                runtime_closure[..16].try_into().expect("16 bytes"),
+            ),
             stdio_pipes: Identity::of(&stdin_meta).id(),
         };
         let origin = Instant::now();
@@ -410,6 +528,7 @@ impl SeatbeltDriver {
                 bin,
                 executable,
                 closure,
+                closure_digest,
                 guardian_binary,
                 profile,
                 stdio: Some(stdio),
@@ -437,10 +556,14 @@ impl SeatbeltDriver {
             &self.closure,
             &self.guardian_binary,
         ];
-        if held.iter().all(|h| h.unchanged()) {
-            Ok(())
-        } else {
-            Err(BackendError::Rejected)
+        if !held.iter().all(|h| h.unchanged()) {
+            return Err(BackendError::Rejected);
+        }
+        // Physical revalidation of the closure means re-reading it: the
+        // directory inode surviving says nothing about the files below it.
+        match ClosureManifest::digest(&self.closure) {
+            Ok(digest) if digest == self.closure_digest => Ok(()),
+            _ => Err(BackendError::Rejected),
         }
     }
 

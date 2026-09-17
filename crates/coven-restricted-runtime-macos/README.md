@@ -42,16 +42,24 @@ now proven owner-only.
 It returns the driver plus an `InstantClock` sharing the backend's monotonic
 origin, so the controller lease and the guardian deadline live in one domain.
 `Binding` identities are the physical `(dev, ino)` pairs of the held
-descriptors, a hash of the fixed profile, and fresh random attempt/worker IDs.
+descriptors, fresh random attempt/worker IDs, and for `runtime_closure` a
+SHA-256 **content manifest** of everything under `closure/` folded with the
+closure inode and the fixed profile. The manifest walks the tree in sorted
+relative-path order, opening every entry `openat` + `O_NOFOLLOW` from the
+held parent descriptor and typing it on the descriptor, and covers each
+entry's kind, mode bits, length and bytes. Symlinks, special files, another
+filesystem, more than 32 levels, 65,536 entries or 256 MiB are refused at
+seal (`SealError::Closure`): a manifest cannot pin what a link points at, and
+a truncated manifest would pin only part of what the worker can read.
 
 | Controller operation | Backend behavior |
 | --- | --- |
-| `prepare` | Re-`fstat`s every held descriptor and `lstat`s its path; both must still name the sealed inode. |
+| `prepare` | Re-`fstat`s every held descriptor and `lstat`s its path; both must still name the sealed inode. Re-reads `closure/` and requires the content manifest to equal the sealed one. |
 | `install_restrictions` | Pins the single-line Seatbelt profile (below). The kernel install happens inside the forked worker **before its `execve`**, so no target code can run unrestricted; a profile that fails to compile aborts the exec. |
 | `retain_lifetime` | Spawns the **guardian** (`Role::Guardian`, own process group, empty environment, stderr discarded) with the owner PID and the executable path. The worker pipes travel as fds 3-5; every other inheritable descriptor is closed. The remaining lease is measured immediately before it is written as the first stdin line (`lease <ms>`), and the guardian starts its deadline on receipt, so handoff latency can only shorten the lease. Refuses if the lease already expired. |
-| `revalidate` | Same physical checks as `prepare`, plus the guardian must still be alive. |
+| `revalidate` | Same physical checks as `prepare` (inodes and closure manifest), plus the guardian must still be alive. |
 | `execute` | Re-checks the stop signal immediately before the irreversible `spawn` send and again after `spawned`; a cancel landing in between kills the fresh worker and returns `Rejected`. Tells the guardian to `spawn`; the guardian forks the worker in a **new process group**, closes inheritable descriptors, calls `sandbox_init`, then execs with an empty environment. `spawned <pid>` completes the handoff. The guardian re-reads the owner/lease boundary **after** the fork and may answer `terminated` instead: a worker that crossed the boundary mid-spawn is killed before it is ever reported as running, and that line is absorbed here so cleanup still sees a proven-empty group. |
-| `request_cleanup` | Sends `kill`; the guardian `SIGKILL`s the whole group until `killpg(pgid, 0)` reports no member and the leader is reaped (2 s budget). `Released` only when that completes; otherwise `Pending`, in which case the guardian stays alive and keeps killing until it can report `terminated`. With no guardian, nothing was launched and cleanup is `Released`. |
+| `request_cleanup` | Sends `kill`; the guardian `SIGKILL`s the whole group **and the leader by pid** until `killpg(pgid, 0)` reports no member and the leader is reaped (2 s budget). `Released` only when that completes; otherwise `Pending`, in which case the guardian stays alive and keeps killing until it can report `terminated`. With no guardian, nothing was launched and cleanup is `Released`. |
 | `observe_termination` | `Confirmed` only after the guardian reported `terminated` (leader reaped **and** group empty). A guardian that exited without that report is `Unavailable`, which fences and remains retryable as an observation. |
 
 ### Seatbelt profile
@@ -97,8 +105,14 @@ enforced: the profile is installed in the child before its `execve`, so
 anything running in that window is already sealed, and the loop tail fences
 immediately after spawn either way.
 
-Every fence is a `SIGKILL` of the whole process group until empty. The
-guardian exits after reporting `terminated`, or on `release`. If the first
+Every fence is a `SIGKILL` of the whole process group **and of the leader by
+pid** until the group is empty and the leader is reaped. The pid signal is
+what holds against `setsid`/`setpgid`: Seatbelt has no operation for those
+calls, and a worker that moved into another group of the session (its
+parent's, say) would otherwise leave `killpg` reporting an empty group while
+it lived on. `process-fork` is denied, so the leader is the only process the
+worker can ever be, and a pid the guardian forked and has not reaped cannot be
+reused. The guardian exits after reporting `terminated`, or on `release`. If the first
 bounded attempt (2 s) fails it reports `pending` once, then stays alive and
 keeps killing until the group is gone rather than orphaning a live worker. It
 is single-threaded (nonblocking stdin) so the fork/`sandbox_init` path stays
@@ -131,6 +145,8 @@ The test asserts, through the real controller:
 | `seal_refuses_unsafe_workspaces` | `0755` workspace, group/world-writable target, missing closure, group/world-writable or missing staged guardian, symlinked `bin/` → typed `SealError`s. |
 | `seal_refuses_an_extended_acl` | An `everyone allow write` ACL on the workspace, then on the target, with mode bits asserted still `0700`: `SealError::Workspace` / `SealError::Executable`. Removing the ACL — the only change — seals again. |
 | `substituted_executable_is_refused_before_execution` | Swapping the inode at the pinned path fails `Revalidate`; state `Refused`, execution `NotStarted`. |
+| `worker_that_leaves_its_process_group_is_still_fenced` | A worker reports `escape:allowed` after `setpgid` into the guardian's group (`setsid` is `EPERM` for a group leader); it still dies at a 600 ms lease and on explicit cancel, with `Released` cleanup and its pid gone. |
+| `modified_closure_is_refused_before_execution` | Editing `note.txt` in place, adding a file, or changing a file's mode after seal fails `Revalidate`; state `Refused`, execution `NotStarted`. Two seals of an untouched closure share `runtime_closure`; a changed closure does not. `seal_refuses_unsafe_workspaces` also covers a symlink under `closure/` → `SealError::Closure`. |
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_NET_OFFLINE=true cargo test -p coven-restricted-runtime-macos --locked
@@ -154,12 +170,17 @@ produce this evidence — it must be run on macOS.
   the parent, so it knows the pid at fork. A guardian crash in that
   microsecond window would orphan a restricted worker until lease expiry has
   nobody to enforce it.
-- **Descendant tracking is process-group based.** `process-fork` is denied so
-  no descendants can exist, but the worker itself could `setsid`/`setpgid` out
-  of its group and escape `killpg`; Seatbelt does not deny those calls here.
-- **Sealed closure is read-only, not a verified manifest.** The backend pins
-  identities of the workspace, executable and closure directory, not a hash of
-  every file inside `closure/`.
+- **Descendant tracking is process-group based, with a pid backstop.**
+  `process-fork` is denied so no descendants can exist, and the guardian now
+  kills the leader by pid as well as by group, so a `setpgid` escape no
+  longer survives a fence. Seatbelt still does not deny `setsid`/`setpgid`
+  themselves; if fork were ever allowed, group tracking alone would again be
+  insufficient.
+- **Closure is pinned by a content manifest, not a signed one.** Seal hashes
+  every entry under `closure/` and revalidation re-reads it, so an edited or
+  added file is refused before execution. The manifest is computed from the
+  workspace the caller supplied; it proves the closure did not change after
+  seal, not that its contents were reviewed.
 - **Only the direct owner PID is watched.** Owner loss is detected per process;
   there is no session/login boundary.
 - **No integration into `SessionRuntime`, discovery, or the wire contract.** A

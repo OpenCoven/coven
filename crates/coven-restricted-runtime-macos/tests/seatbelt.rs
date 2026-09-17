@@ -66,6 +66,22 @@ mod target {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "pid:{}", std::process::id());
         let _ = writeln!(out, "env:{}", std::env::vars_os().count());
+        // `closure/escape` asks the worker to leave the process group the
+        // guardian created. `setsid` is refused by the kernel for a group
+        // leader (EPERM), but `setpgid` into another group of the same session
+        // — the guardian's own, whose id is `getppid()` — is not, and Seatbelt
+        // has no operation for either call. The fence must hold regardless.
+        if workspace.join("closure").join("escape").exists() {
+            // SAFETY: setsid/setpgid/getppid/getpgrp/getpid only change or
+            // read this process's own session and group membership.
+            let escaped = unsafe {
+                if libc::setsid() < 0 {
+                    libc::setpgid(0, libc::getppid());
+                }
+                libc::getpgrp() != libc::getpid()
+            };
+            report(&mut out, "escape", escaped);
+        }
 
         let mut inside = String::new();
         let inside_ok = File::open(workspace.join("closure").join("note.txt"))
@@ -126,6 +142,10 @@ mod suite {
 
     impl Workspace {
         fn create(label: &str, linger: bool) -> Self {
+            Self::create_with(label, linger, false)
+        }
+
+        fn create_with(label: &str, linger: bool, escape: bool) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "coven-seatbelt-{label}-{}-{}",
                 std::process::id(),
@@ -143,6 +163,9 @@ mod suite {
             fs::write(root.join("closure").join("note.txt"), "sealed\n").unwrap();
             if linger {
                 fs::write(root.join("closure").join("linger"), "").unwrap();
+            }
+            if escape {
+                fs::write(root.join("closure").join("escape"), "").unwrap();
             }
             Self { root }
         }
@@ -382,6 +405,15 @@ mod suite {
         ));
         fs::create_dir_all(ws.root.join("closure")).unwrap();
 
+        // A symlink anywhere under `closure/` cannot be pinned by content.
+        std::os::unix::fs::symlink("/etc/hosts", ws.root.join("closure").join("hosts")).unwrap();
+        let (worker, _ends) = WorkerStdio::pipes().unwrap();
+        assert!(matches!(
+            SeatbeltDriver::seal(ws.config(), worker).map(|_| ()),
+            Err(SealError::Closure)
+        ));
+        fs::remove_file(ws.root.join("closure").join("hosts")).unwrap();
+
         let guardian = ws.root.join("bin").join(GUARDIAN_NAME);
         fs::set_permissions(&guardian, fs::Permissions::from_mode(0o722)).unwrap();
         let (worker, _ends) = WorkerStdio::pipes().unwrap();
@@ -481,12 +513,128 @@ mod suite {
         assert_eq!(ctl.observe_termination(), Err(Error::InvalidState));
     }
 
+    /// A worker that leaves its process group must still die at lease expiry
+    /// and on cancel: the guardian fences by pid as well as pgid.
+    fn worker_that_leaves_its_process_group_is_still_fenced() {
+        // Lease expiry.
+        let ws = Workspace::create_with("escape-lease", true, true);
+        let started = Instant::now();
+        let (mut ctl, mut stdio) = launch(&ws, 600);
+        let report = read_report(&mut stdio.stdout);
+        assert_line(&report, "escape:allowed");
+        let pid = worker_pid(&report);
+        let status = await_termination(&mut ctl);
+        let elapsed = started.elapsed();
+        assert_eq!(status.reason, Some(Error::Expired), "{status:?}");
+        assert!(
+            elapsed >= Duration::from_millis(600) && elapsed < Duration::from_secs(10),
+            "terminated after {elapsed:?}"
+        );
+        assert!(
+            !process_alive(pid),
+            "escaped worker {pid} survived the lease"
+        );
+        assert_eq!(
+            ctl.request_cleanup().unwrap().cleanup,
+            CleanupState::Released
+        );
+
+        // Explicit cancel.
+        let ws = Workspace::create_with("escape-cancel", true, true);
+        let (mut ctl, mut stdio) = launch(&ws, 30_000);
+        let report = read_report(&mut stdio.stdout);
+        assert_line(&report, "escape:allowed");
+        let pid = worker_pid(&report);
+        ctl.stop_signal().cancel().unwrap();
+        assert_eq!(ctl.poll(), Err(Error::Cancelled));
+        let _ = ctl.request_cleanup().unwrap();
+        let status = await_termination(&mut ctl);
+        assert_eq!(status.cleanup, CleanupState::Released, "{status:?}");
+        assert!(!process_alive(pid), "escaped worker {pid} survived cancel");
+    }
+
+    /// The closure is pinned by content, not by its directory inode: editing
+    /// a file in place or adding one after seal fails revalidation before the
+    /// worker is ever executed.
+    fn modified_closure_is_refused_before_execution() {
+        for (label, tamper) in [
+            (
+                "closure-edit",
+                (|root: &Path| {
+                    fs::write(
+                        root.join("closure").join("note.txt"),
+                        "tampered
+",
+                    )
+                    .unwrap();
+                }) as fn(&Path),
+            ),
+            ("closure-add", |root: &Path| {
+                fs::write(root.join("closure").join("extra"), "").unwrap();
+            }),
+            ("closure-mode", |root: &Path| {
+                fs::set_permissions(
+                    root.join("closure").join("note.txt"),
+                    fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }),
+        ] {
+            let ws = Workspace::create(label, false);
+            let (worker, _ends) = WorkerStdio::pipes().unwrap();
+            let (driver, clock) = SeatbeltDriver::seal(ws.config(), worker).expect("seal");
+            let binding = coven_restricted_runtime::Driver::binding(&driver);
+            let mut ctl = Controller::new(driver, clock, binding);
+            ctl.start(10_000).unwrap();
+            ctl.advance().unwrap();
+            ctl.advance().unwrap();
+            ctl.advance().unwrap();
+            tamper(&ws.root);
+            let result = ctl.advance();
+            assert_eq!(
+                result,
+                Err(Error::Backend(
+                    coven_restricted_runtime::Operation::Revalidate,
+                    coven_restricted_runtime::BackendError::Rejected
+                )),
+                "{label}"
+            );
+            let status = ctl.status();
+            assert_eq!(status.state, State::Refused, "{label}");
+            assert_eq!(status.execution, Execution::NotStarted, "{label}");
+            assert_eq!(
+                ctl.request_cleanup().unwrap().cleanup,
+                CleanupState::Released
+            );
+        }
+
+        // Two seals of the same untouched closure agree on its identity; a
+        // different closure has a different identity.
+        let ws = Workspace::create("closure-identity", false);
+        let (worker, _ends) = WorkerStdio::pipes().unwrap();
+        let (a, _) = SeatbeltDriver::seal(ws.config(), worker).expect("seal");
+        let (worker, _ends) = WorkerStdio::pipes().unwrap();
+        let (b, _) = SeatbeltDriver::seal(ws.config(), worker).expect("seal");
+        let (ba, bb) = (
+            coven_restricted_runtime::Driver::binding(&a),
+            coven_restricted_runtime::Driver::binding(&b),
+        );
+        assert_eq!(ba.runtime_closure, bb.runtime_closure);
+        fs::write(ws.root.join("closure").join("note.txt"), "other\n").unwrap();
+        let (worker, _ends) = WorkerStdio::pipes().unwrap();
+        let (c, _) = SeatbeltDriver::seal(ws.config(), worker).expect("seal");
+        assert_ne!(
+            ba.runtime_closure,
+            coven_restricted_runtime::Driver::binding(&c).runtime_closure
+        );
+    }
+
     pub fn run() {
         let mut args = std::env::args_os().skip(1);
         if args.next().is_some_and(|a| a == "--owner-probe") {
             owner_probe(PathBuf::from(args.next().expect("workspace path")));
         }
-        let cases: [(&str, fn()); 7] = [
+        let cases: [(&str, fn()); 9] = [
             (
                 "kernel_denies_everything_outside_the_sealed_closure",
                 kernel_denies_everything_outside_the_sealed_closure,
@@ -511,6 +659,14 @@ mod suite {
             (
                 "substituted_executable_is_refused_before_execution",
                 substituted_executable_is_refused_before_execution,
+            ),
+            (
+                "worker_that_leaves_its_process_group_is_still_fenced",
+                worker_that_leaves_its_process_group_is_still_fenced,
+            ),
+            (
+                "modified_closure_is_refused_before_execution",
+                modified_closure_is_refused_before_execution,
             ),
         ];
         let mut failed = 0;
