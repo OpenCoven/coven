@@ -18,7 +18,25 @@ class ClassifyTest(unittest.TestCase):
         return MOD.classify(list(paths))
 
     def test_docs_only(self):
-        self.assertEqual(self.classify('docs/a.md'), {'docs_only': True, 'rust': False, 'afs': False, 'channels': False, 'openclaw': False, 'npm_packaging': False, 'engine': False, 'workflow': False, 'cargo_metadata': False})
+        self.assertEqual(self.classify('docs/a.md'), {'docs_only': True, 'rust': False, 'afs': False, 'channels': False, 'openclaw': False, 'npm_packaging': False, 'engine': False, 'restricted_runtime': False, 'workflow': False, 'cargo_metadata': False})
+
+    def test_restricted_runtime_crates(self):
+        for path in (
+            'crates/coven-restricted-runtime-macos/src/backend.rs',
+            'crates/coven-restricted-runtime-macos/tests/seatbelt.rs',
+            'crates/coven-restricted-runtime/src/lib.rs',
+        ):
+            self.assertTrue(self.classify(path)['restricted_runtime'], path)
+
+    def test_other_rust_does_not_trigger_restricted_runtime(self):
+        # The macOS PR job is gated on this category; an unrelated Rust change
+        # must not spend a macOS runner.
+        result = self.classify('crates/coven-cli/src/main.rs')
+        self.assertTrue(result['rust'])
+        self.assertFalse(result['restricted_runtime'])
+
+    def test_cargo_metadata_triggers_restricted_runtime(self):
+        self.assertTrue(self.classify('Cargo.lock')['restricted_runtime'])
 
     def test_cargo_lock(self):
         self.assertEqual(self.classify('Cargo.lock')['rust'], True)
