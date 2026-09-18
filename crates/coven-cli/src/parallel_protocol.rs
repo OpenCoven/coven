@@ -1192,18 +1192,6 @@ if [ -f "$canary" ] && [ -n "$branch" ]; then
   fi
 fi
 
-privacy_guard="$repo_root/scripts/check-coven-privacy.py"
-if [ -f "$privacy_guard" ]; then
-  if command -v python3 >/dev/null 2>&1; then
-    python3 "$privacy_guard" --staged
-  elif command -v python >/dev/null 2>&1 \
-    && python -c 'import sys; sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then
-    python "$privacy_guard" --staged
-  else
-    echo "Coven privacy guard skipped: Python 3 not found (CI enforces it)." >&2
-  fi
-fi
-
 if [ -x "$common_dir/hooks/pre-commit.local" ]; then
   "$common_dir/hooks/pre-commit.local" "$@"
 fi
@@ -1276,16 +1264,9 @@ mod tests {
     const NEW_YEAR_2026_EPOCH: u64 = 1_767_225_600;
 
     #[test]
-    fn managed_pre_commit_hook_runs_coven_privacy_guard_when_present() {
-        assert!(PRE_COMMIT_HOOK.contains("scripts/check-coven-privacy.py"));
-        assert!(PRE_COMMIT_HOOK.contains("\"$privacy_guard\" --staged"));
-        // Hook must not hard-require python3 (absent in some Windows sh
-        // environments); CI remains the authoritative enforcement layer.
-        assert!(PRE_COMMIT_HOOK.contains("command -v python3"));
-        assert!(
-            PRE_COMMIT_HOOK.contains("python -c 'import sys; sys.exit(sys.version_info[0] != 3)'")
-        );
-        assert!(PRE_COMMIT_HOOK.contains("Coven privacy guard skipped"));
+    fn managed_pre_commit_hook_does_not_execute_worktree_scripts() {
+        assert!(!PRE_COMMIT_HOOK.contains("scripts/check-coven-privacy.py"));
+        assert!(PRE_COMMIT_HOOK.contains("$common_dir/hooks/pre-commit.local"));
     }
 
     fn sample_claim() -> Claim {
