@@ -114,21 +114,6 @@ impl Quest {
             None
         }
     }
-
-    /// Convenience accessor for the current phase. Exercised by the
-    /// in-module tests; the shell loop currently indexes `quest.phases`
-    /// directly so it can borrow mutably elsewhere.
-    #[allow(dead_code)]
-    pub(crate) fn current(&self) -> Option<&QuestPhase> {
-        self.current_index().map(|idx| &self.phases[idx])
-    }
-
-    /// Convenience predicate used by the in-module test suite to assert
-    /// quest exhaustion; the shell loop reads `current_index` directly.
-    #[allow(dead_code)]
-    pub(crate) fn is_complete(&self) -> bool {
-        self.cursor >= self.phases.len()
-    }
 }
 
 const DESIGN_PHASE_TEMPLATE: &str =
@@ -512,7 +497,7 @@ mod tests {
             vec!["design", "implement", "verify"]
         );
         assert_eq!(q.cursor, 0);
-        assert!(!q.is_complete());
+        assert!(q.current_index().is_some());
     }
 
     #[test]
@@ -681,9 +666,9 @@ mod tests {
         // Implement completes; verify is already Skipped, so advance walks
         // the cursor straight past it — the quest is exhausted, not
         // stranded on a Skipped row.
-        assert!(q.is_complete());
+        assert!(q.current_index().is_none());
         assert_eq!(q.cursor, q.phases.len());
-        assert!(q.current().is_none());
+        assert!(q.current_index().is_none());
         assert!(matches!(
             q.phases[2].status,
             QuestPhaseStatus::Skipped { .. }
@@ -746,8 +731,8 @@ mod tests {
         let r3 = advance(&mut q, QuestPhaseSummary::default());
         let r4 = advance(&mut q, QuestPhaseSummary::default());
         assert_eq!((r1, r2, r3, r4), (Some(1), Some(2), None, None));
-        assert!(q.is_complete());
-        assert!(q.current().is_none());
+        assert!(q.current_index().is_none());
+        assert!(q.current_index().is_none());
     }
 
     #[test]

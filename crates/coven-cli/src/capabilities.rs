@@ -236,15 +236,6 @@ fn get_one_for_home(
         .find(|manifest| manifest.harness_id == harness_id)
 }
 
-/// Invalidate the cache (e.g. on SIGHUP).
-#[allow(dead_code)]
-pub fn invalidate() {
-    cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
-}
-
 // ── Scanners ──────────────────────────────────────────────────────────────────
 
 fn dirs_home() -> PathBuf {

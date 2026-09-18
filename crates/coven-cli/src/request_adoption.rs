@@ -87,10 +87,6 @@ impl RequestAdoption {
         }
         Ok(())
     }
-
-    pub fn deterministic_json(&self) -> String {
-        serde_json::to_string(self).expect("validated request adoption serializes")
-    }
 }
 
 fn valid_key(value: &str) -> bool {
@@ -302,14 +298,17 @@ mod tests {
         value["key"] = json!(key);
         let parsed = parse(&value).expect("mixed-case key should parse");
         assert_eq!(parsed.key, key);
-        assert_eq!(parsed.deterministic_json(), value.to_string());
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("validated request adoption serializes"),
+            value.to_string()
+        );
     }
 
     #[test]
     fn deterministic_serialization_is_byte_exact() {
         let adoption = parse(&valid_value()).expect("valid adoption");
         assert_eq!(
-            adoption.deterministic_json(),
+            serde_json::to_string(&adoption).expect("validated request adoption serializes"),
             format!(
                 "{{\"contract\":\"{contract}\",\"key\":\"psyche:graph/node_attempt-1\",\"requestDigest\":\"{digest}\"}}",
                 contract = CONTRACT,

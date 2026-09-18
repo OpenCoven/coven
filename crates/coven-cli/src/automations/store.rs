@@ -46,9 +46,10 @@ pub const AUTOMATION_TIMEZONE_MIGRATIONS_SCHEMA_SQL: &str = "
     );
 ";
 
-#[allow(dead_code)]
 pub struct RoutineRecord {
     pub id: String,
+    // Projected with the row; only the adoption tests read it today.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub name: String,
     pub status: String,
     pub definition_json: String,
@@ -56,8 +57,6 @@ pub struct RoutineRecord {
     pub definition_digest: Option<String>,
     pub lifecycle_state: String,
     pub tombstoned_at: Option<String>,
-    pub authority_version: u8,
-    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -156,12 +155,12 @@ pub fn list_definitions_with_tombstones(
 ) -> Result<Vec<RoutineRecord>> {
     let query = if include_tombstoned {
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
-                tombstoned_at, authority_version, created_at, updated_at
+                tombstoned_at, updated_at
          FROM automation_definitions
          ORDER BY name ASC, id ASC"
     } else {
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
-                tombstoned_at, authority_version, created_at, updated_at
+                tombstoned_at, updated_at
          FROM automation_definitions
          WHERE tombstoned_at IS NULL
          ORDER BY name ASC, id ASC"
@@ -191,12 +190,12 @@ pub fn get_definition_with_tombstone(
 ) -> Result<Option<RoutineRecord>> {
     let query = if include_tombstoned {
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
-                tombstoned_at, authority_version, created_at, updated_at
+                tombstoned_at, updated_at
          FROM automation_definitions
          WHERE id = ?1"
     } else {
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
-                tombstoned_at, authority_version, created_at, updated_at
+                tombstoned_at, updated_at
          FROM automation_definitions
          WHERE id = ?1 AND tombstoned_at IS NULL"
     };
@@ -223,9 +222,7 @@ fn routine_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineR
         definition_digest: row.get(5)?,
         lifecycle_state: row.get(6)?,
         tombstoned_at: row.get(7)?,
-        authority_version: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -268,8 +265,6 @@ pub fn insert_definition(
         definition_digest: Some(definition_digest),
         lifecycle_state: lifecycle_state.to_string(),
         tombstoned_at: None,
-        authority_version: 0,
-        created_at: now.clone(),
         updated_at: now,
     })
 }

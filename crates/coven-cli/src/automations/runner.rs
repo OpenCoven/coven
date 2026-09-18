@@ -226,7 +226,9 @@ pub(crate) struct AutomationAuthorityRequest {
     pub runtime_id: String,
 }
 
-// Production construction remains blocked until the trusted-state adapter lands.
+// The dispatch path constructs this request, but every
+// `AutomationDispatchAuthority` that reads its fields is still a test double:
+// the trusted-state adapter that consumes them in production has not landed.
 #[allow(dead_code)]
 pub(crate) struct AutomationTerminalAuthorityRequest<'a> {
     pub execution_binding: &'a AutomationExecutionBinding,

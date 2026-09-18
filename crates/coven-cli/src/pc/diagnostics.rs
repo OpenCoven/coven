@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
+use sysinfo::{Disks, System};
 
 #[derive(Debug)]
 pub struct SystemSnapshot {
@@ -102,14 +102,4 @@ pub fn snapshot(verbose: bool) -> Result<SystemSnapshot> {
         processes,
         disks,
     })
-}
-
-/// Look up a process name for pre-signal identity verification.
-#[allow(dead_code)]
-pub fn process_name_for_pid(pid: u32) -> Option<String> {
-    let mut sys = System::new();
-    let pid_key = Pid::from_u32(pid);
-    sys.refresh_processes(ProcessesToUpdate::Some(&[pid_key]), true);
-    sys.process(pid_key)
-        .map(|p| p.name().to_string_lossy().into_owned())
 }

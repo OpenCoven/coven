@@ -934,6 +934,7 @@ impl Outcome {
     }
 
     /// The blocked decisions, if any.
+    #[cfg(test)]
     pub fn blocked(&self) -> impl Iterator<Item = &Decision> {
         self.decisions.iter().filter(|d| d.verdict.is_blocked())
     }
@@ -1146,6 +1147,7 @@ pub(crate) fn approved_apply_failure(error: &anyhow::Error) -> Option<&ApprovedA
 /// its changes were rolled back. `Some(true)` means recovery state must remain
 /// durable because a write may have committed. `None` is an unclassified error
 /// and callers must conservatively preserve recovery state.
+#[cfg(test)]
 pub(crate) fn approved_apply_error_may_have_committed_write(error: &anyhow::Error) -> Option<bool> {
     approved_apply_failure(error).map(|failure| {
         matches!(
@@ -1420,6 +1422,7 @@ impl ApplyReport {
     }
 
     /// Whether every edit in the proposal was written.
+    #[cfg(test)]
     pub fn is_applied(&self) -> bool {
         !self.changes.is_empty()
             && self
@@ -1779,6 +1782,11 @@ impl Ward {
     /// any byte is written. Count and proposed-content budgets run before
     /// target cloning or Gate 2; budget and I/O failures return `Err`, while a
     /// refusal or hold is a normal [`ApplyReport`].
+    ///
+    /// Production callers go through [`Ward::apply_admitted`], which carries
+    /// the daemon's admission decision; this un-admitted form is the test
+    /// harness's entry point.
+    #[cfg(test)]
     pub fn apply(&self, edits: &[FileEdit], authorization: &Authorization) -> Result<ApplyReport> {
         self.apply_inner(edits, authorization, None, None)
     }
@@ -1890,6 +1898,10 @@ impl Ward {
     /// Apply edits after an explicit principal proposal approval has cleared the
     /// daemon-side threads replay. Gate 1 and Gate 2 still run here; Gate 3's
     /// "held for review" state is the decision this endpoint represents.
+    ///
+    /// Production goes through the `_with_commit_check` form below; this
+    /// no-check wrapper exists for the test suite.
+    #[cfg(test)]
     pub(crate) fn apply_after_threads_approval(
         &self,
         edits: &[FileEdit],
@@ -1980,12 +1992,17 @@ impl Ward {
 
     /// Apply edits after an explicit principal coherence decision.
     ///
-    /// This is deliberately narrower than [`Ward::apply_after_threads_approval`]:
+    /// This is deliberately narrower than
+    /// [`Ward::apply_after_threads_approval_with_commit_check`]:
     /// it clears only [`Verdict::RequiresCoherenceReview`]. A protected target
     /// remains refused even when it carries valid Gate-1 authorization, and
     /// Gate-2 or authorization failures remain refused. `expected_before`
     /// binds the apply to the surface snapshot reviewed by the principal;
     /// `None` represents a reviewed target that did not exist at staging time.
+    ///
+    /// Production goes through the `_with_commit_check` form below; this
+    /// no-check wrapper exists for the test suite.
+    #[cfg(test)]
     pub(crate) fn apply_after_coherence_approval(
         &self,
         edits: &[FileEdit],
@@ -2069,24 +2086,6 @@ impl Ward {
     /// target reviewed, logged, or free surfaces, but they must still fail
     /// closed on protected or blocked targets and remain bound to the staged
     /// before-images.
-    pub(crate) fn apply_after_scheduled_approval(
-        &self,
-        edits: &[FileEdit],
-        authorization: &Authorization,
-        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
-        expected_resolved: &BTreeMap<String, String>,
-        mode: ApprovedApplyMode,
-    ) -> Result<ApplyReport> {
-        self.apply_after_scheduled_approval_with_commit_check(
-            edits,
-            authorization,
-            expected_before,
-            expected_resolved,
-            mode,
-            None,
-        )
-    }
-
     pub(crate) fn apply_after_scheduled_approval_with_commit_check(
         &self,
         edits: &[FileEdit],

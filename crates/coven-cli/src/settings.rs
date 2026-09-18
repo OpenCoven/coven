@@ -54,43 +54,6 @@ pub fn user_settings_path() -> Option<PathBuf> {
     Some(base.join("coven").join(SETTINGS_FILE_NAME))
 }
 
-/// Returns the set of dotted-path keys that appear in both inputs.
-///
-/// Both inputs are expected to be **dotted JSONC paths** (e.g. `"repos.alpha"`,
-/// `"defaultRepo"`, `"privacy.logRetentionDays"`), not raw TOML field names or
-/// bare repo names. Callers building these lists from a TOML loader must prefix
-/// nested fields with their parent (e.g. `"repos.{name}"` for entries inside the
-/// `[repos.*]` table).
-#[allow(dead_code)] // Wired into run_doctor in a follow-up; see plan
-                    // docs/superpowers/plans/2026-05-26-coven-cli-p0-coven-code-parity.md
-                    // Task 1.5 (deferred wire-up after PrivacySettings lands).
-pub fn shadowed_keys(toml_keys: &[String], jsonc_keys: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = toml_keys
-        .iter()
-        .filter(|k| jsonc_keys.iter().any(|j| j == *k))
-        .cloned()
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
-#[allow(dead_code)] // See shadowed_keys above.
-pub fn warn_if_shadowed(shadowed: &[String], toml_path: &Path, jsonc_path: &Path) {
-    if shadowed.is_empty() {
-        return;
-    }
-    eprintln!(
-        "coven: {} keys in {} are shadowed by {}. Consider removing them from the TOML file.",
-        shadowed.len(),
-        toml_path.display(),
-        jsonc_path.display()
-    );
-    for key in shadowed {
-        eprintln!("  - {key}");
-    }
-}
-
 static CACHED: OnceLock<Option<Settings>> = OnceLock::new();
 
 /// Initialize the process-wide cached Settings. Call exactly once at startup.
@@ -158,14 +121,6 @@ mod tests {
         let path = temp.path().join("settings.json");
         std::fs::write(&path, "{}").unwrap();
         assert_eq!(load_from(&path).unwrap().unwrap(), Settings::default());
-    }
-
-    #[test]
-    fn detect_shadowed_keys_lists_overrides() {
-        let toml_keys = ["repos.alpha".to_string(), "defaultRepo".to_string()];
-        let jsonc_keys = ["repos.alpha".to_string()];
-        let shadowed = shadowed_keys(&toml_keys, &jsonc_keys);
-        assert_eq!(shadowed, vec!["repos.alpha".to_string()]);
     }
 
     #[test]

@@ -2492,7 +2492,7 @@ where
 
     paths.into_iter().any(|path| {
         executable_candidates(&path, executable)
-            .any(|candidate| candidate_is_executable(&candidate))
+            .any(|candidate| crate::install_conflict::is_runnable(&candidate))
     })
 }
 
@@ -2533,20 +2533,6 @@ where
             .map(|path| path.join(format!("{executable}{normalized}")))
             .find(|candidate| candidate.is_file())
     })
-}
-
-#[cfg(unix)]
-fn candidate_is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    path.metadata()
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn candidate_is_executable(path: &Path) -> bool {
-    path.is_file()
 }
 
 #[cfg(windows)]

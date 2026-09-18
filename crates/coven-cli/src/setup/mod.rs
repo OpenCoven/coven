@@ -695,6 +695,9 @@ fn executable_names(executable: &str, pathext: Option<&OsStr>) -> Vec<OsString> 
     }
 }
 
+// Same predicate as `crate::install_conflict::is_runnable`, kept local because
+// tests/setup_cli.rs compiles this module standalone via `#[path]`, where the
+// rest of the crate is not available.
 #[cfg(unix)]
 fn executable_is_runnable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;

@@ -564,21 +564,6 @@ fn upgrade_hint(active_upgrade: Option<&str>) -> String {
     }
 }
 
-/// Human-readable summary for `coven doctor`. `None` when there is nothing to
-/// report -- zero or one install is the healthy case.
-#[allow(dead_code)] // prose is built inline in main.rs; kept for the conflict contract tests
-pub fn conflict_report(installations: &[Installation]) -> Option<String> {
-    if installations.len() < 2 {
-        return None;
-    }
-    let mut lines = Vec::new();
-    for (index, installation) in installations.iter().enumerate() {
-        let marker = if index == 0 { "active" } else { "shadowed" };
-        lines.push(format!("{} ({marker})", installation.path.display()));
-    }
-    Some(lines.join("; "))
-}
-
 /// Resolve against the real environment and filesystem.
 pub fn current_installations(name: &str) -> Vec<Installation> {
     let path_var = std::env::var("PATH").ok();
@@ -613,8 +598,14 @@ pub fn canonical(path: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
+/// Whether `path` is a regular file the current process could execute.
+///
+/// Unix: at least one executable bit must be set. Elsewhere the executable
+/// bit has no meaning and existence as a file is the whole test. Shared by
+/// every PATH-style probe in the crate (engine, harness, setup, memory
+/// dashboard) so they agree on what "runnable" means.
 #[cfg(unix)]
-fn is_runnable(path: &Path) -> bool {
+pub(crate) fn is_runnable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     path.metadata()
@@ -622,8 +613,9 @@ fn is_runnable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// See the Unix variant.
 #[cfg(not(unix))]
-fn is_runnable(path: &Path) -> bool {
+pub(crate) fn is_runnable(path: &Path) -> bool {
     path.is_file()
 }
 
@@ -1150,7 +1142,6 @@ mod tests {
             &probe(vec![at("/usr/local/bin", "coven")]),
         );
         assert_eq!(found.len(), 1);
-        assert_eq!(conflict_report(&found), None);
     }
 
     #[test]
@@ -1163,7 +1154,6 @@ mod tests {
             &probe(Vec::new()),
         );
         assert!(found.is_empty());
-        assert_eq!(conflict_report(&found), None);
     }
 
     #[test]
@@ -1185,9 +1175,6 @@ mod tests {
             vec![local.clone(), nvm, cargo.clone()],
             "installs must be reported in PATH order so the first is the one that runs"
         );
-        let report = conflict_report(&found).expect("three installs is a conflict");
-        assert!(report.contains(&format!("{} (active)", local.display())));
-        assert!(report.contains(&format!("{} (shadowed)", cargo.display())));
     }
 
     #[test]
@@ -1200,7 +1187,6 @@ mod tests {
             &probe(vec![at("/usr/local/bin", "coven")]),
         );
         assert_eq!(found.len(), 1, "a duplicated PATH entry is not a conflict");
-        assert_eq!(conflict_report(&found), None);
     }
 
     #[test]
@@ -1235,7 +1221,6 @@ mod tests {
             1,
             "same directory in two spellings is one install"
         );
-        assert_eq!(conflict_report(&found), None);
     }
 
     #[test]
@@ -1252,7 +1237,6 @@ mod tests {
             &probe(vec![upper.clone(), lower.clone()]),
         );
         assert_eq!(rendered(&found), vec![upper, lower]);
-        assert!(conflict_report(&found).is_some());
     }
 
     #[test]
@@ -1267,7 +1251,6 @@ mod tests {
             &windows_probe(vec![tools.clone(), npm.clone()]),
         );
         assert_eq!(rendered(&found), vec![tools, npm]);
-        assert!(conflict_report(&found).is_some());
     }
 
     #[test]
@@ -1283,10 +1266,7 @@ mod tests {
             Platform::Windows,
             &windows_probe(vec![cmd.clone(), exe.clone()]),
         );
-        assert_eq!(rendered(&found), vec![exe.clone(), cmd.clone()]);
-        let report = conflict_report(&found).expect("two spellings is a conflict");
-        assert!(report.contains(&format!("{} (active)", exe.display())));
-        assert!(report.contains(&format!("{} (shadowed)", cmd.display())));
+        assert_eq!(rendered(&found), vec![exe, cmd]);
     }
 
     #[test]

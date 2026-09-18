@@ -350,12 +350,6 @@ impl RoutineDefinition {
         self.timezone = self.timezone.resolve_for_persistence()?;
         Ok(self)
     }
-
-    /// Normalized wire form (camelCase, schema stamped) used by list/get.
-    #[allow(dead_code)]
-    pub fn to_json(&self) -> Value {
-        serde_json::to_value(self).unwrap_or(Value::Null)
-    }
 }
 
 #[cfg(test)]

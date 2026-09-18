@@ -36,9 +36,7 @@ mod event_writer;
 mod execution_binding;
 mod install_conflict;
 #[rustfmt::skip]
-#[allow(dead_code)]
 mod request_adoption;
-#[allow(dead_code)]
 mod adoption_gate;
 mod automations;
 mod executor_node;
@@ -87,7 +85,6 @@ mod ward_probes;
 // Wired into the daemon router via `POST /familiars/{id}/edits` (api.rs);
 // Gate 3 staging, deterministic probes, read surfaces, and explicit
 // coherence approval all compose through the Ward primitives in ward.rs.
-#[allow(dead_code)]
 mod ward;
 mod ward_decision;
 mod ward_migrate;
