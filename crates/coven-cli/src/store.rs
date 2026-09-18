@@ -492,29 +492,38 @@ fn harden_store_directory(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn ensure_private_store_file(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => harden_existing_store_file(path, metadata),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-            {
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("failed to create Coven store at {}", path.display()));
-                }
-            }
-            harden_existing_store_file(
-                path,
-                std::fs::symlink_metadata(path).with_context(|| {
-                    format!("failed to inspect Coven store at {}", path.display())
-                })?,
-            )
+    if existing_store_file_present(path)? {
+        return Ok(());
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to create Coven store at {}", path.display()));
         }
+    }
+    harden_existing_store_file(
+        path,
+        std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect Coven store at {}", path.display()))?,
+    )
+}
+
+/// Validates an existing store file without creating it. Returns `Ok(false)`
+/// when nothing exists at `path`, so existing-store openers keep their
+/// missing-store behavior. Anything that does exist goes through the same
+/// no-follow checks as a fresh open: symlinks and non-regular files are
+/// refused, and on Unix a group/other-readable file is restricted to `0600`.
+pub(crate) fn existing_store_file_present(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => harden_existing_store_file(path, metadata).map(|()| true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => {
             Err(err).with_context(|| format!("failed to inspect Coven store at {}", path.display()))
         }
@@ -546,15 +555,25 @@ fn harden_existing_store_file(path: &Path, metadata: std::fs::Metadata) -> Resul
 }
 
 #[cfg(not(unix))]
-fn ensure_private_store_file(path: &Path) -> Result<()> {
-    if path.exists() {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("failed to inspect Coven store at {}", path.display()))?;
-        if !metadata.is_file() {
-            bail!("Coven store path {} is not a regular file", path.display());
-        }
+fn harden_existing_store_file(path: &Path, metadata: std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to use symlinked Coven store file {}",
+            path.display()
+        );
+    }
+    if !metadata.is_file() {
+        bail!("Coven store path {} is not a regular file", path.display());
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_store_file(path: &Path) -> Result<()> {
+    // `Connection::open` creates a missing file; an existing one is validated
+    // without following symlinks. Directory security on Windows is applied by
+    // the owner-only DACL on the Coven home, not per file.
+    existing_store_file_present(path).map(drop)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1175,7 +1194,7 @@ impl Drop for WardAuditReservation<'_> {
 }
 
 pub fn open_existing_store_read_only(path: &Path) -> Result<Option<Connection>> {
-    if !path.exists() {
+    if !existing_store_file_present(path)? {
         return Ok(None);
     }
 
@@ -1186,7 +1205,7 @@ pub fn open_existing_store_read_only(path: &Path) -> Result<Option<Connection>> 
 }
 
 fn open_existing_store_writable(path: &Path) -> Result<Option<Connection>> {
-    if !path.exists() {
+    if !existing_store_file_present(path)? {
         return Ok(None);
     }
 
@@ -6014,6 +6033,76 @@ END;
             error
                 .to_string()
                 .contains("symlinked Coven store directory"),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_store_openers_refuse_symlinked_database() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir()?;
+        let target = temp_dir.path().join("target.db");
+        let link = temp_dir.path().join("coven.db");
+        drop(open_store(&target)?);
+        symlink(&target, &link)?;
+
+        let read_only = open_existing_store_read_only(&link).unwrap_err();
+        assert!(
+            read_only.to_string().contains("symlinked Coven store file"),
+            "unexpected read-only error: {read_only:?}"
+        );
+
+        let writable = open_existing_store_writable(&link).unwrap_err();
+        assert!(
+            writable.to_string().contains("symlinked Coven store file"),
+            "unexpected writable error: {writable:?}"
+        );
+
+        // The refusal is a no-follow check on the link itself: a dangling link
+        // is refused rather than reported as a missing store.
+        std::fs::remove_file(&target)?;
+        let dangling = open_existing_store_read_only(&link).unwrap_err();
+        assert!(
+            dangling.to_string().contains("symlinked Coven store file"),
+            "unexpected dangling-link error: {dangling:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_store_openers_restrict_permissive_database() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        drop(open_store(&path)?);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        drop(open_existing_store_read_only(&path)?.expect("store exists"));
+        let file_mode = std::fs::symlink_metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))?;
+        drop(open_existing_store_writable(&path)?.expect("store exists"));
+        let file_mode = std::fs::symlink_metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_store_openers_refuse_non_regular_database() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        std::fs::create_dir(&path)?;
+
+        let error = open_existing_store_read_only(&path).unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not a regular file"),
             "unexpected error: {error:?}"
         );
         Ok(())
