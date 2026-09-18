@@ -51,8 +51,22 @@ git show-ref --verify --quiet "$BASE_REF" || {
 
 # ── Step 1 — collect PR data ──────────────────────────────────────────────────
 log "Loading open and merged PR data from GitHub…"
+# Owner of this repository, lower-cased for comparison against the
+# `headRepositoryOwner.login` GitHub reports on every PR.
+REPO_OWNER=$(git config --get remote.origin.url |
+  sed -E 's#(git@github.com:|https://github.com/)##; s#/.*##; s#\.git$##' |
+  tr '[:upper:]' '[:lower:]')
+
 OPEN_PR_JSON=$(gh pr list --state open  --json number,title,headRefName,headRepositoryOwner,headRefOid --limit 200)
-MRGD_PR_JSON=$(gh pr list --state merged --json headRefName            --limit 500)
+# The merged list decides which branches are deleted as MERGED, so it only
+# keeps PRs whose head lived in this repository. A merged fork PR whose
+# `headRefName` collides with a live origin branch must not get that branch
+# classified MERGED and deleted; with no same-owner PR the branch falls through
+# to the unique-commit check like any other. Narrowing this list can only
+# reduce deletions, so it does not reopen the fail-open concern below.
+MRGD_PR_JSON=$(gh pr list --state merged --json headRefName,headRepositoryOwner --limit 500 |
+  jq --arg owner "$REPO_OWNER" \
+    '[ .[] | select((.headRepositoryOwner.login // "" | ascii_downcase) == $owner) ]')
 
 open_branches()  { echo "$OPEN_PR_JSON" | jq -r '.[].headRefName'; }
 merged_branches(){ echo "$MRGD_PR_JSON" | jq -r '.[].headRefName'; }
@@ -61,15 +75,13 @@ merged_branches(){ echo "$MRGD_PR_JSON" | jq -r '.[].headRefName'; }
 # this repository's remote-tracking ref at exactly the commit we fetched. Branch
 # names alone are not a trust boundary: fork PRs can reuse names from origin.
 trusted_open_pr_filter() {
-  local branch="$1" head_oid owner repo_owner
+  local branch="$1" head_oid
   head_oid=$(git rev-parse "origin/$branch" 2>/dev/null || true)
-  owner=$(git config --get remote.origin.url | sed -E 's#(git@github.com:|https://github.com/)##; s#/.*##; s#\.git$##')
-  repo_owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
 
   echo "$OPEN_PR_JSON" | jq -r \
     --arg b "$branch" \
     --arg oid "$head_oid" \
-    --arg owner "$repo_owner" \
+    --arg owner "$REPO_OWNER" \
     '.[]
      | select(.headRefName == $b)
      | select(.headRefOid == $oid)
@@ -279,6 +291,11 @@ if [[ ${#OPEN_LIST[@]} -gt 0 ]]; then
       continue
     fi
 
+    # The trust check just proved `origin/<branch>` is the commit GitHub reports
+    # as the PR head. Record it so the merge below is bound to that exact
+    # commit rather than to whatever the head has become by then.
+    gated_oid=$(git rev-parse "origin/$branch")
+
     # Gate first: never touch a PR we would not be allowed to merge. Rebasing and
     # force-pushing a blocked PR is itself destructive, so this runs before any
     # write to the branch.
@@ -291,16 +308,20 @@ if [[ ${#OPEN_LIST[@]} -gt 0 ]]; then
     fi
 
     if [[ "$DRY" == "true" ]]; then
-      log "  [dry-run] would merge #$pr ($STRATEGY)"
+      log "  [dry-run] would merge #$pr ($STRATEGY) at $gated_oid"
       continue
     fi
 
     merge_flag="--$STRATEGY"
-    if gh pr merge "$pr" "$merge_flag" --delete-branch 2>&1; then
+    # `--match-head-commit` (gh >= 2.20; ubuntu-latest ships far newer) makes
+    # the merge API refuse when the PR head is no longer $gated_oid, so a push
+    # landing between the gate and the merge cannot ride the earlier green
+    # result onto $BASE.
+    if gh pr merge "$pr" "$merge_flag" --match-head-commit "$gated_oid" --delete-branch 2>&1; then
       log "  $(green '✓') merged #$pr"
       (( merged_count++ )) || true
     else
-      warn "  merge failed for #$pr — check CI or conflicts"
+      warn "  merge failed for #$pr — check CI, conflicts, or a head that moved past $gated_oid"
       SKIPPED_LIST+=("#$pr ($branch) — merge API call failed")
     fi
   done

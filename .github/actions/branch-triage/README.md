@@ -11,11 +11,14 @@ branches and need periodic cleanup.
    | Category | Definition | Action |
    |---|---|---|
    | OPEN | Has an open PR | Merge if it passes the gate below |
-   | MERGED | Has a merged PR | Delete local + remote |
+   | MERGED | Has a merged PR whose head lived in this repository | Delete local + remote |
    | SUPERSEDED | No PR, 0 unique commits vs base | Delete |
    | REVIEW | No PR, >0 unique commits | Skip — report only |
 
-2. **Deletes** MERGED and SUPERSEDED branches (remote + local).
+2. **Deletes** MERGED and SUPERSEDED branches (remote + local). Only a merged
+   PR from this repository marks a branch MERGED; a merged fork PR that reused
+   the branch name does not, so the branch falls through to the unique-commit
+   check instead of being deleted on a name match.
 3. **Merges** each OPEN-PR branch that clears the merge gate.
 4. **Skips** REVIEW branches — reports them in the job summary so a human can decide.
 5. **Writes** a Markdown summary to the GitHub job summary.
@@ -52,8 +55,8 @@ on:
         default: "false"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: write       # delete merged/superseded branches
+  pull-requests: write  # merge gated PRs
 
 jobs:
   triage:
@@ -84,12 +87,23 @@ below holds, and is otherwise reported in the job summary and left alone.
 | No in-flight checks | any check is `QUEUED`, `IN_PROGRESS`, `WAITING`, or `PENDING` |
 | CI actually ran | the check rollup is empty — no CI ran at all |
 | Merge state is clean | `mergeStateStatus` is anything other than `CLEAN` |
+| Head is this repository's branch | the PR comes from a fork, or its head commit differs from `origin/<branch>` as fetched at the start of the run |
 
 Mergeability that GitHub has not finished computing counts as a skip, not a
 pass — a PR held for that reason merges on the next run.
 
 The gate is evaluated **before** the action writes anything to the branch, so a
-blocked PR is never rebased or force-pushed.
+blocked PR is never rebased or force-pushed. The merge call passes that fetched
+head commit to `gh pr merge --match-head-commit`, so GitHub refuses the merge
+if the PR head moved after the gate was evaluated instead of merging a commit
+nothing checked.
+
+Branch names are not a trust boundary — a fork PR can reuse the name of a live
+origin branch — so the head check above is what keeps a fork PR from being
+merged by name. Deletion deliberately stays name-based: an open PR of any origin
+protects its branch from being classified SUPERSEDED, because a push landing
+between the run's fetch and its PR listing would otherwise look untrusted and
+get a live branch deleted.
 
 ## Why there is no rebase step
 

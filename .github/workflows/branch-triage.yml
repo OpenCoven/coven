@@ -25,8 +25,8 @@ on:
         default: "30"
 
 permissions:
-  contents: write       # push rebased branches
-  pull-requests: write  # merge PRs
+  contents: write       # delete merged/superseded branches
+  pull-requests: write  # merge gated PRs
 
 jobs:
   triage:
