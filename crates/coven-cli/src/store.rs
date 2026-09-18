@@ -833,9 +833,13 @@ impl<'a> WardAuditReservation<'a> {
                 ))
             })
         };
-        trace(Phase::ReservationPassiveBegin);
-        let _ = checkpoint("PASSIVE");
-        trace(Phase::ReservationPassiveReady);
+        // Reclaim WAL space only when this admission would otherwise fail the
+        // WAL budget. An unconditional checkpoint here (and another on release)
+        // added two fsync-heavy passes to every request on top of its commits,
+        // which is what pushed Windows requests past the client's response
+        // budget (#1051). `wal_autocheckpoint` and the maintenance pass bound
+        // the WAL in the common case; the admission check below still reclaims
+        // on demand, and a pinned WAL still fails closed.
         let configured_wal_limit: Option<i64> = conn
             .query_row(
                 "SELECT wal_limit_bytes
@@ -1129,16 +1133,6 @@ impl<'a> WardAuditReservation<'a> {
         self.clear_active()?;
         checkpoint(Phase::ReservationReleaseActiveReady);
         self.finished = true;
-        let _ = self
-            .conn
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            });
-        checkpoint(Phase::ReservationReleasePassiveReady);
         Ok(())
     }
 
@@ -1285,17 +1279,27 @@ pub fn get_or_insert_store_meta(
     key: &str,
     default_value: &str,
 ) -> Result<String> {
+    let read = || {
+        conn.query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to read store_meta key {key}"))
+    };
+    // Read first: this runs on every request to bind the store identity, and
+    // an unconditional INSERT OR IGNORE takes the write lock each time even
+    // when the key already exists.
+    if let Some(value) = read()? {
+        return Ok(value);
+    }
     conn.execute(
         "INSERT OR IGNORE INTO store_meta(key, value) VALUES(?1, ?2)",
         params![key, default_value],
     )
     .with_context(|| format!("failed to initialize store_meta key {key}"))?;
-    conn.query_row(
-        "SELECT value FROM store_meta WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )
-    .with_context(|| format!("failed to read store_meta key {key}"))
+    read()?.with_context(|| format!("store_meta key {key} vanished after initialization"))
 }
 
 pub fn insert_travel_profile(conn: &Connection, record: &TravelProfileRecord) -> Result<()> {
@@ -6544,7 +6548,16 @@ END;
                 1
             );
         }
-        assert!(conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))? >= 2);
+        // WAL + NORMAL: durable across a daemon crash, no fsync per commit.
+        assert_eq!(
+            conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
+            1
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "temp_store", |row| row.get::<_, i64>(0))?,
+            2,
+            "temp objects must stay in memory"
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_temp_master WHERE type = 'trigger' AND name = ?1",

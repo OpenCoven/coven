@@ -579,16 +579,32 @@ pub(super) fn configure_initializing_connection(conn: &Connection) -> Result<()>
     // raw REPLACE that targets an existing hidden rowid with otherwise fresh
     // logical identities can bypass the `request_adoptions_no_replace`
     // logical-conflict guard entirely.
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;
-         PRAGMA recursive_triggers = ON;",
-    )
-    .context("failed to configure writable Coven store connection")?;
+    conn.execute_batch(WRITABLE_CONNECTION_PRAGMAS)
+        .context("failed to configure writable Coven store connection")?;
     enable_wal_with_retry(conn)?;
     configure_ward_audit_wal(conn)?;
     Ok(())
 }
+
+/// Per-connection settings for every writable store connection.
+///
+/// `synchronous = NORMAL` is the documented pairing for WAL mode: a commit
+/// appends to the WAL without an fsync, and the WAL is synced before each
+/// checkpoint, so the store survives a daemon crash intact and can lose only
+/// the final commits on an OS crash or power loss. The default `FULL` fsyncs
+/// on every commit, which on a loaded Windows runner cost several hundred
+/// milliseconds per write transaction and pushed ordinary requests past the
+/// client's response budget (#1051).
+///
+/// `temp_store = MEMORY` keeps the per-connection TEMP trigger and table that
+/// `install_ward_audit_capacity_trigger` rebuilds on every open out of a
+/// temp file; the default writes them under the OS temp directory on first
+/// use, which is another disk round trip per request on Windows.
+const WRITABLE_CONNECTION_PRAGMAS: &str = "PRAGMA busy_timeout = 5000;
+     PRAGMA foreign_keys = ON;
+     PRAGMA recursive_triggers = ON;
+     PRAGMA synchronous = NORMAL;
+     PRAGMA temp_store = MEMORY;";
 
 fn enable_wal_with_retry(conn: &Connection) -> Result<()> {
     const ATTEMPTS: usize = 50;
@@ -619,12 +635,8 @@ pub(super) fn configure_runtime_writable_connection(conn: &Connection) -> Result
     // See `configure_initializing_connection` for why recursive_triggers must
     // be ON: it closes the hidden-rowid REPLACE bypass around the
     // `request_adoptions_no_delete` / `request_adoptions_no_replace` guards.
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;
-         PRAGMA recursive_triggers = ON;",
-    )
-    .context("failed to configure writable Coven store connection")?;
+    conn.execute_batch(WRITABLE_CONNECTION_PRAGMAS)
+        .context("failed to configure writable Coven store connection")?;
     configure_ward_audit_wal(conn)?;
     let ward_audit_exists = sqlite_object_exists(conn, "table", "ward_audit")?;
     let capacity_exists = sqlite_object_exists(conn, "table", "coven_ward_audit_capacity")?;
