@@ -1,6 +1,6 @@
 //! TurboVec IdMapIndex wrapper — persistent 4-bit compressed ANN index with stable ids
 
-use crate::embed::DIM;
+use crate::{embed::DIM, fs_security};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use turbovec::IdMapIndex;
@@ -15,12 +15,15 @@ pub struct VecIndex {
 impl VecIndex {
     /// Load from disk if it exists, otherwise create a fresh index
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        fs_security::ensure_private_parent(path)?;
+        fs_security::validate_existing_private_file(path)?;
         let inner = if path.exists() {
-            IdMapIndex::load(path)
-                .with_context(|| format!("loading index from {}", path.display()))?
+            let inner = IdMapIndex::load(path)
+                .with_context(|| format!("loading index from {}", path.display()))?;
+            // Tighten an index written before hardening existed; `save` is not
+            // reached by read-only commands such as search and status.
+            fs_security::set_private_file(path)?;
+            inner
         } else {
             IdMapIndex::new(DIM, BIT_WIDTH)
                 .map_err(|e| anyhow::anyhow!("creating index: {:?}", e))?
@@ -67,6 +70,7 @@ impl VecIndex {
         self.inner
             .write(&self.path)
             .with_context(|| format!("saving index to {}", self.path.display()))?;
+        fs_security::set_private_file(&self.path)?;
         Ok(())
     }
 
@@ -76,5 +80,29 @@ impl VecIndex {
 
     pub fn is_empty(&self) -> bool {
         self.inner.len() == 0
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn opening_an_existing_permissive_index_tightens_it() {
+        let root = std::env::temp_dir().join(format!(
+            "coven-memory-index-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join(".coven/memory/index.tvim");
+        VecIndex::open(&path).unwrap().save().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        VecIndex::open(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

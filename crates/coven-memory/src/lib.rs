@@ -7,6 +7,7 @@
 
 pub mod db;
 pub mod embed;
+mod fs_security;
 pub mod index;
 pub mod ingest;
 pub mod promotion;

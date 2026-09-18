@@ -12,6 +12,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs-next = "2"
 fastembed = { version = "6", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,6 +1,6 @@
 //! SQLite metadata store — document records, id allocation, staleness tracking
 
-use crate::MemoryDoc;
+use crate::{fs_security, MemoryDoc};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -11,11 +11,11 @@ pub struct MetaDb {
 
 impl MetaDb {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        fs_security::ensure_private_parent(path)?;
+        fs_security::validate_existing_private_file(path)?;
         let conn =
             Connection::open(path).with_context(|| format!("opening db at {}", path.display()))?;
+        fs_security::set_private_file(path)?;
         let db = Self { conn };
         db.init()?;
         Ok(db)
@@ -164,5 +164,50 @@ impl MetaDb {
             .conn
             .query_row("SELECT COUNT(*) FROM docs", [], |row| row.get(0))?;
         Ok(n as u64)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    #[test]
+    fn open_and_insert_harden_database_and_sidecars() {
+        let root = std::env::temp_dir().join(format!(
+            "coven-memory-db-security-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db_path = root.join(".coven/memory/archival.sqlite3");
+        let db = MetaDb::open(&db_path).unwrap();
+        db.insert(&MemoryDoc {
+            id: 0,
+            path: "/private/note.txt".to_string(),
+            familiar: "coven".to_string(),
+            chunk: "secret chunk".to_string(),
+            chunk_offset: 0,
+            content_hash: "hash".to_string(),
+            ingested_at: 0,
+        })
+        .unwrap();
+
+        assert_eq!(mode(&root.join(".coven")), 0o700);
+        assert_eq!(mode(&root.join(".coven/memory")), 0o700);
+        assert_eq!(mode(&db_path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600);
+            }
+        }
+
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 }
