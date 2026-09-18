@@ -5796,17 +5796,22 @@ fn origin_in_allowlist(origin: &str, allowed: &[String]) -> bool {
     })
 }
 
+/// An `--allow-host` entry is a bare authority (`host` or `host:port`). Any
+/// slash means a scheme or a path was supplied, and the entry never matches:
+/// stripping a trailing slash first would let `example.com/` or `https:///`
+/// collapse into an authority the documented contract says is rejected.
 fn normalize_allowed_origin(allowed_host: &str) -> Option<String> {
-    let authority = allowed_host.trim().trim_end_matches('/');
-    if authority.is_empty() || authority.contains("://") || authority.contains('/') {
+    let authority = allowed_host.trim();
+    if authority.is_empty() || authority.contains('/') {
         return None;
     }
     Some(format!("https://{authority}"))
 }
 
+/// A serialized `Origin` header is `scheme://authority` with no trailing slash
+/// and no path, so anything else is rejected rather than repaired.
 fn normalize_https_origin(origin: &str) -> Option<String> {
-    let origin = origin.trim().trim_end_matches('/');
-    let (scheme, authority) = origin.split_once("://")?;
+    let (scheme, authority) = origin.trim().split_once("://")?;
     if !scheme.eq_ignore_ascii_case("https") || authority.is_empty() || authority.contains('/') {
         return None;
     }
@@ -10032,6 +10037,42 @@ mod tests {
             &allowed
         ));
         assert!(!origin_in_allowlist("https://evil.example", &allowed));
+    }
+
+    #[test]
+    fn allowed_origin_entries_with_a_scheme_or_path_never_match() {
+        // Each entry would collapse into a bare authority if a trailing slash
+        // were stripped before validation; the contract says they never match.
+        for entry in [
+            "example.com/",
+            "https:///",
+            "https://example.com/",
+            "https://example.com/path",
+            "https://example.com",
+            "/",
+            "",
+        ] {
+            assert_eq!(
+                normalize_allowed_origin(entry),
+                None,
+                "{entry:?} must not normalize to an allowed origin"
+            );
+            assert!(
+                !origin_in_allowlist("https://example.com", &[entry.to_string()]),
+                "{entry:?} must not match https://example.com"
+            );
+        }
+        assert_eq!(
+            normalize_allowed_origin(" example.com:8443 ").as_deref(),
+            Some("https://example.com:8443")
+        );
+        // The Origin side is just as strict: a serialized origin has no path.
+        assert_eq!(normalize_https_origin("https://example.com/"), None);
+        assert_eq!(normalize_https_origin("https:///"), None);
+        assert_eq!(
+            normalize_https_origin("https://example.com").as_deref(),
+            Some("https://example.com")
+        );
     }
 
     #[cfg(unix)]
