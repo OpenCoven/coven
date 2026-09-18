@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 const ENTRY_ENV: &str = "COVEN_MEMORY_DASHBOARD_ENTRY";
@@ -13,23 +13,6 @@ struct LaunchCommand {
     args: Vec<OsString>,
 }
 
-fn executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 fn resolve_from(
     node: Option<&OsStr>,
     entry: Option<&OsStr>,
@@ -39,7 +22,7 @@ fn resolve_from(
     if let (Some(node), Some(entry)) = (node, entry) {
         let node = PathBuf::from(node);
         let entry = PathBuf::from(entry);
-        if executable(&node) && entry.is_file() {
+        if crate::install_conflict::is_runnable(&node) && entry.is_file() {
             return Some(LaunchCommand {
                 program: node,
                 args: vec![entry.into_os_string()],
@@ -49,7 +32,7 @@ fn resolve_from(
 
     if let Some(override_bin) = override_bin {
         let path = PathBuf::from(override_bin);
-        if executable(&path) {
+        if crate::install_conflict::is_runnable(&path) {
             return Some(LaunchCommand {
                 program: path,
                 args: Vec::new(),
@@ -70,7 +53,7 @@ fn resolve_from(
 
         for name in names {
             let candidate = directory.join(name);
-            if executable(&candidate) {
+            if crate::install_conflict::is_runnable(&candidate) {
                 return Some(LaunchCommand {
                     program: candidate,
                     args: Vec::new(),

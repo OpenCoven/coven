@@ -599,8 +599,14 @@ pub fn canonical(path: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
+/// Whether `path` is a regular file the current process could execute.
+///
+/// Unix: at least one executable bit must be set. Elsewhere the executable
+/// bit has no meaning and existence as a file is the whole test. Shared by
+/// every PATH-style probe in the crate (engine, harness, setup, memory
+/// dashboard) so they agree on what "runnable" means.
 #[cfg(unix)]
-fn is_runnable(path: &Path) -> bool {
+pub(crate) fn is_runnable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     path.metadata()
@@ -608,8 +614,9 @@ fn is_runnable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// See the Unix variant.
 #[cfg(not(unix))]
-fn is_runnable(path: &Path) -> bool {
+pub(crate) fn is_runnable(path: &Path) -> bool {
     path.is_file()
 }
 

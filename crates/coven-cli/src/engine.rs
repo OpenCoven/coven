@@ -86,7 +86,7 @@ pub fn resolve_from(
     // 1. COVEN_ENGINE_BIN explicit override
     if let Some(override_path) = env_override {
         let p = PathBuf::from(override_path);
-        if is_executable(&p) {
+        if crate::install_conflict::is_runnable(&p) {
             return Some(ResolvedEngine {
                 path: p,
                 source: EngineSource::EnvOverride,
@@ -103,7 +103,7 @@ pub fn resolve_from(
             let version = version.trim();
             if !version.is_empty() {
                 let candidate = engine_root.join(version).join(ENGINE_BIN_NAME);
-                if is_executable(&candidate) {
+                if crate::install_conflict::is_runnable(&candidate) {
                     return Some(ResolvedEngine {
                         path: candidate,
                         source: EngineSource::Managed,
@@ -121,7 +121,7 @@ pub fn resolve_from(
             }
             for name in engine_bin_names() {
                 let candidate = dir.join(name);
-                if is_executable(&candidate) {
+                if crate::install_conflict::is_runnable(&candidate) {
                     return Some(ResolvedEngine {
                         path: candidate,
                         source: EngineSource::PathLookup,
@@ -136,7 +136,7 @@ pub fn resolve_from(
         let bin_dir = home.join(".coven-code").join("bin");
         for name in engine_bin_names() {
             let candidate = bin_dir.join(name);
-            if is_executable(&candidate) {
+            if crate::install_conflict::is_runnable(&candidate) {
                 return Some(ResolvedEngine {
                     path: candidate,
                     source: EngineSource::LegacyHome,
@@ -225,7 +225,6 @@ fn engine_bin_names() -> &'static [&'static str] {
     }
 }
 
-/// Check whether a path is an executable file.
 /// Only absolute PATH entries take part in engine lookup. Empty, `.`, and other
 /// relative entries resolve against the current working directory, so a
 /// `coven-code` planted in any project checkout would otherwise win. On Windows
@@ -233,25 +232,6 @@ fn engine_bin_names() -> &'static [&'static str] {
 /// entries, which `Path::is_absolute` rejects there.
 fn path_entry_is_trusted(dir: &Path) -> bool {
     dir.is_absolute()
-}
-
-/// Unix: file must exist and have at least one executable bit set.
-/// Non-Unix: file must exist (is_file()).
-fn is_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 #[cfg(test)]
@@ -408,7 +388,7 @@ mod tests {
         }
         assert!(rel.is_relative());
         assert!(
-            is_executable(&rel.join(ENGINE_BIN_NAME)),
+            crate::install_conflict::is_runnable(&rel.join(ENGINE_BIN_NAME)),
             "precondition: {} must reach the planted engine via cwd",
             rel.display()
         );
