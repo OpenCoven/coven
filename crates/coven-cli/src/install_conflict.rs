@@ -395,8 +395,14 @@ pub fn origin_label(origin: &InstallOrigin) -> String {
     }
 }
 
-/// The exact command that removes this copy and nothing else.
-pub fn removal_command(installation: &Installation) -> String {
+/// The exact command that removes this copy and nothing else. Every arm is
+/// pasteable in the platform's shell; the trailing parenthetical is context,
+/// not part of the command.
+pub fn removal_command(installation: &Installation, platform: Platform) -> String {
+    let delete = match platform {
+        Platform::Windows => "del",
+        Platform::Unix => "rm",
+    };
     match &installation.origin {
         InstallOrigin::Npm { prefix } => {
             format!(
@@ -406,12 +412,12 @@ pub fn removal_command(installation: &Installation) -> String {
         }
         InstallOrigin::Cargo => "cargo uninstall coven-cli".to_string(),
         InstallOrigin::SourceBuild => format!(
-            "delete {} (a build from a source checkout; rebuilding recreates it)",
-            installation.path.display()
+            "{delete} {} (a build from a source checkout; rebuilding recreates it)",
+            shell_arg(&installation.path)
         ),
         InstallOrigin::EngineInstaller => format!(
-            "delete {} (left by an older coven-code installer)",
-            installation.path.display()
+            "{delete} {} (left by an older coven-code installer)",
+            shell_arg(&installation.path)
         ),
         InstallOrigin::Unknown => format!(
             "find out how {} was installed, then remove it with that same tool",
@@ -462,6 +468,7 @@ pub fn doctor_lines(
     running: Option<usize>,
     current_exe: Option<&Path>,
     npm_writes_to: Option<(&Path, Option<usize>)>,
+    platform: Platform,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let exe = |lines: &mut Vec<String>, note: &str| {
@@ -508,7 +515,10 @@ pub fn doctor_lines(
                     origin_label(&installation.origin)
                 ));
                 if index > 0 {
-                    lines.push(format!("       remove: {}", removal_command(installation)));
+                    lines.push(format!(
+                        "       remove: {}",
+                        removal_command(installation, platform)
+                    ));
                 }
             }
             lines.push(
@@ -916,7 +926,7 @@ mod tests {
             prefix: PathBuf::from("/fixture/.nvm/versions/node/v24"),
         };
         assert_eq!(
-            removal_command(&shim),
+            removal_command(&shim, Platform::Unix),
             "npm uninstall -g --prefix /fixture/.nvm/versions/node/v24 @opencoven/cli"
         );
         assert_eq!(
@@ -926,15 +936,33 @@ mod tests {
 
         let mut cargo = install("/fixture/.cargo/bin", "coven");
         cargo.origin = InstallOrigin::Cargo;
-        assert_eq!(removal_command(&cargo), "cargo uninstall coven-cli");
+        assert_eq!(
+            removal_command(&cargo, Platform::Unix),
+            "cargo uninstall coven-cli"
+        );
         assert!(upgrade_command(&cargo.origin)
             .unwrap()
             .starts_with("cargo install --path crates/coven-cli --force"));
 
         let mut stray = install("/usr/local/bin", "coven");
         stray.origin = InstallOrigin::Unknown;
-        assert!(removal_command(&stray).contains("/usr/local/bin"));
+        assert!(removal_command(&stray, Platform::Unix).contains("/usr/local/bin"));
         assert_eq!(upgrade_command(&stray.origin), None);
+    }
+
+    #[test]
+    fn file_removals_use_the_platform_delete_command() {
+        let mut build = install("/fixture/bin", "coven");
+        build.origin = InstallOrigin::SourceBuild;
+        assert!(removal_command(&build, Platform::Unix).starts_with("rm "));
+        let mut legacy = install("C:/fixture/.coven-code/bin", "coven.exe");
+        legacy.origin = InstallOrigin::EngineInstaller;
+        assert!(removal_command(&legacy, Platform::Windows).starts_with("del "));
+        let mut spaced = install("C:/fixture/My Tools", "coven.exe");
+        spaced.origin = InstallOrigin::SourceBuild;
+        assert!(
+            removal_command(&spaced, Platform::Windows).starts_with("del \"C:/fixture/My Tools")
+        );
     }
 
     #[test]
@@ -944,7 +972,7 @@ mod tests {
             prefix: PathBuf::from("C:/fixture/First Last/AppData/Roaming/npm"),
         };
         assert_eq!(
-            removal_command(&shim),
+            removal_command(&shim, Platform::Unix),
             "npm uninstall -g --prefix \"C:/fixture/First Last/AppData/Roaming/npm\" @opencoven/cli"
         );
     }
@@ -955,7 +983,13 @@ mod tests {
         shim.origin = InstallOrigin::Npm {
             prefix: PathBuf::from("/fixture/.local"),
         };
-        let lines = doctor_lines(&[shim], Some(0), Some(Path::new("/x")), None);
+        let lines = doctor_lines(
+            &[shim],
+            Some(0),
+            Some(Path::new("/x")),
+            None,
+            Platform::Unix,
+        );
         // Paths are rendered as joined, so the expectation joins the same way
         // and the assertion holds on both separators.
         assert_eq!(
@@ -974,7 +1008,7 @@ mod tests {
             prefix: PathBuf::from("/fixture/.local"),
         };
         let exe = Path::new("/fixture/src/coven/target/debug/coven");
-        let lines = doctor_lines(&[shim], None, Some(exe), None);
+        let lines = doctor_lines(&[shim], None, Some(exe), None, Platform::Unix);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].starts_with("  [--] this process is not that install"));
         assert!(lines[1].ends_with("/fixture/src/coven/target/debug/coven"));
@@ -982,7 +1016,7 @@ mod tests {
 
     #[test]
     fn no_install_on_path_names_the_process() {
-        let lines = doctor_lines(&[], None, Some(Path::new("/x/coven")), None);
+        let lines = doctor_lines(&[], None, Some(Path::new("/x/coven")), None, Platform::Unix);
         assert_eq!(
             lines,
             vec![
@@ -991,7 +1025,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            doctor_lines(&[], None, None, None),
+            doctor_lines(&[], None, None, None, Platform::Unix),
             vec!["Install: none on PATH".to_string()]
         );
     }
@@ -1013,7 +1047,7 @@ mod tests {
     #[test]
     fn a_conflict_lists_each_copy_with_its_removal_command() {
         let found = the_maintainer_machine();
-        let lines = doctor_lines(&found, Some(0), Some(Path::new("/x")), None);
+        let lines = doctor_lines(&found, Some(0), Some(Path::new("/x")), None, Platform::Unix);
         assert_eq!(lines[0], "Installs:");
         assert_eq!(
             lines[1],
@@ -1049,7 +1083,7 @@ mod tests {
     fn a_shadowed_npm_prefix_is_called_out_with_the_prefix_explicit_upgrade() {
         let found = the_maintainer_machine();
         let npm = Path::new("/fixture/.nvm/versions/node/v24");
-        let lines = doctor_lines(&found, Some(0), None, Some((npm, Some(1))));
+        let lines = doctor_lines(&found, Some(0), None, Some((npm, Some(1))), Platform::Unix);
         let last = lines.last().unwrap();
         assert!(last.starts_with(
             "  [!!] `npm install -g` writes to /fixture/.nvm/versions/node/v24, a shadowed copy"
@@ -1063,7 +1097,7 @@ mod tests {
     fn an_npm_prefix_that_is_the_active_copy_is_reassuring() {
         let found = the_maintainer_machine();
         let npm = Path::new("/fixture/.local");
-        let lines = doctor_lines(&found, Some(0), None, Some((npm, Some(0))));
+        let lines = doctor_lines(&found, Some(0), None, Some((npm, Some(0))), Platform::Unix);
         assert_eq!(
             lines.last().unwrap(),
             "  `npm install -g` writes to /fixture/.local, the active copy."
@@ -1075,7 +1109,7 @@ mod tests {
         let mut found = the_maintainer_machine();
         found.rotate_right(1); // cargo first
         let npm = Path::new("/opt/homebrew");
-        let lines = doctor_lines(&found, Some(0), None, Some((npm, None)));
+        let lines = doctor_lines(&found, Some(0), None, Some((npm, None)), Platform::Unix);
         let last = lines.last().unwrap();
         assert!(last.starts_with(
             "  [!!] `npm install -g` writes to /opt/homebrew, which holds no install on PATH"
@@ -1086,7 +1120,7 @@ mod tests {
     #[test]
     fn a_process_that_is_a_shadowed_copy_or_no_copy_is_named() {
         let found = the_maintainer_machine();
-        let lines = doctor_lines(&found, Some(2), None, None);
+        let lines = doctor_lines(&found, Some(2), None, None, Platform::Unix);
         assert_eq!(
             lines[4],
             format!(
@@ -1094,7 +1128,13 @@ mod tests {
                 at("/fixture/.cargo/bin", "coven").display()
             )
         );
-        let lines = doctor_lines(&found, None, Some(Path::new("/x/target/debug/coven")), None);
+        let lines = doctor_lines(
+            &found,
+            None,
+            Some(Path::new("/x/target/debug/coven")),
+            None,
+            Platform::Unix,
+        );
         assert!(lines
             .iter()
             .any(|line| line == "  This process is none of the entries above; it was launched by explicit path: /x/target/debug/coven"));

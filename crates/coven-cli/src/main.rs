@@ -2675,6 +2675,7 @@ fn print_doctor_prose(report: &DoctorReport) {
         running,
         current_exe.as_deref(),
         npm_writes_to,
+        install_conflict::Platform::current(),
     ) {
         print_doctor_line(line);
     }
@@ -3976,11 +3977,10 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
 }
 
 /// The first `coven-code` on PATH when it is not the engine `coven` resolved.
-/// Only meaningful when resolution did not itself go through PATH.
+/// Compared by path even when resolution itself went through PATH: the
+/// resolver tries a fixed `.exe`/`.cmd`/`.bat` order while the shell honours
+/// PATHEXT, so the two can pick different shims from the same directory.
 fn engine_other_on_path(resolved: &engine::ResolvedEngine) -> Option<PathBuf> {
-    if matches!(resolved.source, engine::EngineSource::PathLookup) {
-        return None;
-    }
     let first = install_conflict::current_installations("coven-code")
         .into_iter()
         .next()?;
