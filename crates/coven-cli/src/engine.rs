@@ -120,8 +120,7 @@ pub fn resolve_from(
     // 3. PATH lookup (honor Windows multi-name)
     if let Some(path_var) = path_var {
         for dir in std::env::split_paths(path_var) {
-            // Empty/relative entries resolve against the cwd, so a planted coven-code would win.
-            if !dir.is_absolute() {
+            if !path_entry_is_trusted(&dir) {
                 continue;
             }
             for name in engine_bin_names() {
@@ -231,6 +230,15 @@ fn engine_bin_names() -> &'static [&'static str] {
 }
 
 /// Check whether a path is an executable file.
+/// Only absolute PATH entries take part in engine lookup. Empty, `.`, and other
+/// relative entries resolve against the current working directory, so a
+/// `coven-code` planted in any project checkout would otherwise win. On Windows
+/// this also drops drive-relative (`C:bin`) and rooted-but-driveless (`\bin`)
+/// entries, which `Path::is_absolute` rejects there.
+fn path_entry_is_trusted(dir: &Path) -> bool {
+    dir.is_absolute()
+}
+
 /// Unix: file must exist and have at least one executable bit set.
 /// Non-Unix: file must exist (is_file()).
 fn is_executable(path: &Path) -> bool {
@@ -328,6 +336,49 @@ mod tests {
         touch_exec(&legacy);
         let r = resolve_from(Some(not_exec.as_os_str()), None, Some(home.path())).unwrap();
         assert!(matches!(r.source, EngineSource::LegacyHome));
+    }
+
+    #[test]
+    fn only_absolute_path_entries_are_trusted() {
+        assert!(!path_entry_is_trusted(Path::new("")));
+        assert!(!path_entry_is_trusted(Path::new(".")));
+        assert!(!path_entry_is_trusted(Path::new("relative/bin")));
+        assert!(!path_entry_is_trusted(Path::new("../bin")));
+        if cfg!(windows) {
+            assert!(path_entry_is_trusted(Path::new("C:\\tools")));
+            assert!(path_entry_is_trusted(Path::new("\\\\server\\share\\bin")));
+            assert!(
+                !path_entry_is_trusted(Path::new("C:tools")),
+                "drive-relative"
+            );
+            assert!(
+                !path_entry_is_trusted(Path::new("\\tools")),
+                "rooted without a drive"
+            );
+        } else {
+            assert!(path_entry_is_trusted(Path::new("/usr/local/bin")));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_lookup_skips_relative_and_drive_relative_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let trusted = sandbox.path().join("trusted");
+        let trusted_bin = trusted.join(ENGINE_BIN_NAME);
+        touch_exec(&trusted_bin);
+        let path = std::env::join_paths([
+            PathBuf::from(""),
+            PathBuf::from("."),
+            PathBuf::from("relative\\bin"),
+            PathBuf::from("C:relative\\bin"),
+            trusted.clone(),
+        ])
+        .unwrap();
+        let r = resolve_from(None, Some(&path), Some(home.path())).unwrap();
+        assert!(matches!(r.source, EngineSource::PathLookup));
+        assert_eq!(r.path, trusted_bin);
     }
 
     #[cfg(unix)]
