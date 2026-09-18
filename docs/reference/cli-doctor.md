@@ -3,6 +3,7 @@ summary: "Environment readiness check."
 read_when:
   - Looking up doctor
 title: "coven doctor"
+source_adjacent_reason: "Documents the doctor checks, install-origin classification, and JSON envelope implemented in this repository's coven-cli crate."
 description: "Reference for coven doctor: the first command to run after install. It checks COVEN_HOME, the socket, harness PATH, and the SQLite store."
 ---
 
@@ -34,6 +35,7 @@ found):
   "store": "<coven-home>",
   "project": "<project>",
   "checks": [
+    { "id": "install:conflicts", "status": "pass", "message": "one coven on PATH" },
     { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket <daemon-socket>)" },
     { "id": "harness:codex", "status": "pass", "message": "`codex` executable is available (built-in)" },
     { "id": "harnesses", "status": "pass", "message": "2 of 4 configured harness executables available" },
@@ -69,15 +71,73 @@ availability, where any missing adapter is a `fail`.
 
 | Section | Meaning |
 | --- | --- |
+| `Install` / `Installs` | Every `coven` executable on this shell's `PATH`, in resolution order, with how each one was installed. See [Installs](#installs). |
 | `Store` | The active Coven state directory. Defaults to `<home>/.coven` unless `COVEN_HOME` is set. |
 | `Project` | The current git/project root when the command runs inside a project. |
 | `Daemon` | Whether the background daemon is stopped, running, or stale. |
 | `Repos` | Configured repositories from Coven repo settings, if present. |
 | `Harnesses` | Supported harness executables that are visible on this shell's `PATH`. |
-| `Engine` | Whether the Coven engine is installed and meets the minimum supported version. |
+| `Engine` | Whether the Coven engine is installed and meets the minimum supported version. An advisory `[--]` line (JSON check `engine:path`) names a `coven-code` that is first on `PATH` but is not the engine `coven` runs. |
 | `Familiars` | Configured familiar identities from `familiars.toml`, if present. |
 | `Credentials` | Advisory local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor calls only the engine's contractually offline `auth status --json`; it launches no provider CLI process, performs no provider network request, does not inspect provider tokens or credential stores, and does not verify authentication. |
 | `Next steps` | The safest next command based on the detected state. |
+
+## Installs
+
+More than one `coven` on `PATH` is the most expensive install failure: the
+first entry answers every command, so an upgrade applied to any other copy
+appears to do nothing. Doctor prints this block first, before `Store`, because
+every later line describes whichever binary won.
+
+With one install the block is a single line naming its origin:
+
+```text
+Install: ~/.local/bin/coven (npm, prefix ~/.local)
+```
+
+With several, each copy is listed in `PATH` order with its origin and the
+command that removes exactly that copy:
+
+```text
+Installs:
+  [OK] ~/.local/bin/coven (active, this process) — npm, prefix ~/.local
+  [!!] ~/.nvm/versions/node/v24.18.1/bin/coven (shadowed) — npm, prefix ~/.nvm/versions/node/v24.18.1
+       remove: npm uninstall -g --prefix ~/.nvm/versions/node/v24.18.1 @opencoven/cli
+  [!!] ~/.cargo/bin/coven (shadowed) — cargo install
+       remove: cargo uninstall coven-cli
+  The first entry wins. Keep one install per machine: remove the shadowed copies with the commands above, then re-check with `coven --version`.
+  [!!] `npm install -g` writes to ~/.nvm/versions/node/v24.18.1, a shadowed copy, so upgrades never reach the active install. Upgrade the active copy with: npm install -g --prefix ~/.local @opencoven/cli@latest
+```
+
+Origins Doctor recognizes:
+
+| Origin | How it is detected | Removal command |
+| --- | --- | --- |
+| `npm, prefix <dir>` | The executable is npm's shim: a symlink into `<prefix>/lib/node_modules/@opencoven/cli` (Unix) or a `coven.cmd` beside `<prefix>\node_modules\@opencoven\cli` (Windows). | `npm uninstall -g --prefix <dir> @opencoven/cli` |
+| `cargo install` | It lives in `$CARGO_HOME/bin` (default `~/.cargo/bin`). | `cargo uninstall coven-cli` |
+| `source build` | It resolves into a `target/debug` or `target/release` directory. | Delete the link or file; rebuilding recreates it. |
+| `legacy coven-code installer` | It lives in `~/.coven-code/bin`, where older standalone engine installers wrote a `coven` alias. | Delete the file. |
+| `unknown origin` | None of the above. | Find how it was installed and remove it with that tool. |
+
+`this process` marks the entry that is actually running Doctor. When none
+matches — for example `cargo run -p coven-cli -- doctor` from a checkout —
+Doctor says so and prints the executable path instead.
+
+The npm prefix matters because a bare `npm install -g` writes to whichever
+prefix is active in the current shell (`npm prefix -g`), and Node version
+managers such as nvm, fnm, and volta give every Node version its own prefix.
+When installs conflict and at least one is an npm install, Doctor asks npm for
+that prefix and says outright whether the copy it would overwrite is the active
+one. The prefix-explicit `npm install -g --prefix <dir>` form always targets
+the copy you name.
+
+Removing a shadowed npm copy that sits in the active Node's prefix is fine:
+the active copy keeps working, and the next `npm install -g` recreates a copy
+in that prefix only if you run it without `--prefix`.
+
+The JSON report keeps this check path-free (`install:conflicts` reports counts
+and origin kinds only), so bug reports and CI logs do not carry account or
+project directory names. Run the prose form for the paths and commands.
 
 ## Expected first-run loop
 

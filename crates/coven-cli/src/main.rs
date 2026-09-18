@@ -2491,6 +2491,11 @@ struct DoctorEngineReport {
     path: PathBuf,
     source_label: String,
     version: Option<(u64, u64, u64)>,
+    /// A `coven-code` that PATH resolves first but that is not the engine
+    /// `coven` runs (the managed install wins the resolution order). Left as
+    /// is, `coven-code --version` in a shell describes a different binary than
+    /// `coven --version` reports, which reads as a broken upgrade.
+    other_on_path: Option<PathBuf>,
 }
 
 impl DoctorReport {
@@ -2559,6 +2564,7 @@ fn gather_doctor_report() -> Result<DoctorReport> {
                 Some(DoctorEngineReport {
                     source_label: engine_source_label(&resolved.source).to_string(),
                     version: engine::engine_version(&resolved.path).ok(),
+                    other_on_path: engine_other_on_path(&resolved),
                     path: resolved.path,
                 }),
                 Some(auth),
@@ -2630,19 +2636,48 @@ fn print_doctor_prose(report: &DoctorReport) {
     // are running. Prose keeps the concrete paths -- the operator needs to know
     // which file to remove -- unlike the JSON report, which redacts them.
     let installations = install_conflict::current_installations("coven");
+    let current_exe = std::env::current_exe().ok();
+    let running = install_conflict::running_index(
+        &installations,
+        current_exe.as_deref(),
+        &install_conflict::canonical,
+    );
+    // Asking npm costs a process spawn, so only do it when there is a conflict
+    // to explain: the question "which copy will `npm install -g` overwrite?"
+    // is what turns a list of paths into a diagnosis.
+    let npm_prefix = if installations.len() > 1
+        && installations.iter().any(|installation| {
+            matches!(
+                installation.origin,
+                install_conflict::InstallOrigin::Npm { .. }
+            )
+        }) {
+        npm_global_prefix()
+    } else {
+        None
+    };
+    let npm_writes_to = npm_prefix.as_deref().map(|prefix| {
+        (
+            prefix,
+            install_conflict::index_for_npm_prefix(
+                &installations,
+                prefix,
+                install_conflict::Platform::current(),
+                &install_conflict::canonical,
+            ),
+        )
+    });
     if installations.len() > 1 {
-        println!("\nInstalls:");
-        for (index, installation) in installations.iter().enumerate() {
-            let marker = if index == 0 { "OK" } else { "!!" };
-            let role = if index == 0 { "active" } else { "shadowed" };
-            print_doctor_line(format!(
-                "  [{marker}] {} ({role})",
-                installation.path.display()
-            ));
-        }
-        print_doctor_line(
-            "  The first entry wins. Remove the others or reorder PATH, then re-check with `coven --version`.",
-        );
+        println!();
+    }
+    for line in install_conflict::doctor_lines(
+        &installations,
+        running,
+        current_exe.as_deref(),
+        npm_writes_to,
+        install_conflict::Platform::current(),
+    ) {
+        print_doctor_line(line);
     }
     print_doctor_line(format!("Store: {}", report.home.display()));
     match &report.project_root {
@@ -2717,6 +2752,12 @@ fn print_doctor_prose(report: &DoctorReport) {
                 engine.path.display(),
                 engine.source_label
             ));
+            if let Some(shadow) = &engine.other_on_path {
+                print_doctor_line(format!(
+                    "  [--] a different coven-code is first on PATH: {} — `coven-code` in this shell is not the engine `coven` runs; keep the managed engine current with: coven engine install",
+                    shadow.display()
+                ));
+            }
             match engine.version {
                 Some(version) => {
                     let (a, b, c) = version;
@@ -2925,12 +2966,23 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         // Deliberately path-free. Doctor JSON is routinely attached to bug
         // reports and CI logs, and DoctorJsonPathRedactor exists to keep user
         // and project directory names out of it. The concrete paths an operator
-        // needs are printed by the prose report instead.
+        // needs -- and the removal command for each copy -- are printed by the
+        // prose report instead. Origin kinds carry no paths and say at a glance
+        // whether this is the npm-prefix trap or a stray cargo build.
+        let shadowed = installations[1..]
+            .iter()
+            .map(|installation| install_conflict::origin_kind(&installation.origin))
+            .collect::<Vec<_>>()
+            .join(", ");
         checks.push(DoctorCheck::warn(
             "install:conflicts",
-            format!("{} coven executables on PATH", installations.len()),
+            format!(
+                "{} coven executables on PATH (active: {}; shadowed: {shadowed})",
+                installations.len(),
+                install_conflict::origin_kind(&installations[0].origin)
+            ),
             Some(
-                "run `coven doctor` for the paths; the first entry wins, so remove the others or reorder PATH"
+                "run `coven doctor` for the paths and the removal command for each copy; the first entry wins, so keep one install per machine"
                     .to_string(),
             ),
         ));
@@ -3067,6 +3119,20 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             }
         }
     });
+    if report
+        .engine
+        .as_ref()
+        .is_some_and(|engine| engine.other_on_path.is_some())
+    {
+        checks.push(DoctorCheck::warn(
+            "engine:path",
+            "a different coven-code is first on PATH; `coven-code` in this shell is not the engine coven runs",
+            Some(
+                "keep the managed engine current with: coven engine install; remove the PATH copy if it is stale"
+                    .to_string(),
+            ),
+        ));
+    }
 
     checks.push(match &report.familiars {
         Err(error) => DoctorCheck::warn(
@@ -3908,6 +3974,96 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
             }
         },
     }
+}
+
+/// The first `coven-code` on PATH when it is not the engine `coven` resolved.
+/// Compared by path even when resolution itself went through PATH: the
+/// resolver tries a fixed `.exe`/`.cmd`/`.bat` order while the shell honours
+/// PATHEXT, so the two can pick different shims from the same directory.
+fn engine_other_on_path(resolved: &engine::ResolvedEngine) -> Option<PathBuf> {
+    let first = install_conflict::current_installations("coven-code")
+        .into_iter()
+        .next()?;
+    let same = match (
+        install_conflict::canonical(&first.path),
+        install_conflict::canonical(&resolved.path),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => first.path == resolved.path,
+    };
+    (!same).then_some(first.path)
+}
+
+/// `npm prefix -g`, bounded to a few seconds so a wedged npm never hangs
+/// `coven doctor`. `None` when npm is absent, fails, or times out; doctor then
+/// simply omits the line that names where `npm install -g` writes.
+fn npm_global_prefix() -> Option<PathBuf> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const OUTPUT_LIMIT: usize = 64 * 1024;
+    let deadline = Instant::now() + TIMEOUT;
+
+    // Windows ships npm as a batch script; std spawns `.cmd` through cmd.exe
+    // with its arguments escaped, and these arguments are constants anyway.
+    let program = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let mut command = Command::new(program);
+    command
+        .args(["prefix", "-g"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let (mut child, mut process_tree) =
+        pty_runner::spawn_strict_child_process_tree(&mut command).ok()?;
+    let stdout = child.stdout.take()?;
+    let (sender, receiver) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((OUTPUT_LIMIT + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+
+    let mut output = None;
+    let mut exited_ok = None;
+    loop {
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(bytes)) if bytes.len() <= OUTPUT_LIMIT => output = Some(bytes),
+                Ok(_) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if exited_ok.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited_ok = Some(status.success()),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        if output.is_some() && exited_ok.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if exited_ok.is_none() {
+        process_tree.terminate(&mut child);
+        let _ = child.try_wait();
+    }
+    if exited_ok != Some(true) {
+        return None;
+    }
+    let text = String::from_utf8(output?).ok()?;
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    Some(PathBuf::from(line))
 }
 
 fn engine_source_label(source: &engine::EngineSource) -> &'static str {
@@ -8818,6 +8974,7 @@ mod tests {
                 path: PathBuf::from("/usr/local/bin/coven-code"),
                 source_label: "managed install".to_string(),
                 version: Some(engine::MIN_ENGINE_VERSION),
+                other_on_path: None,
             }),
             engine_auth: Some(Some(true)),
             familiars_manifest: PathBuf::from("/tmp/coven-home/familiars.toml"),
