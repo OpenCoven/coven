@@ -54,9 +54,18 @@ pub fn validate_existing_private_file(_path: &Path) -> Result<()> {
 pub fn set_private_file(path: &Path) -> Result<()> {
     set_file_mode(path, 0o600)?;
     for sidecar in sqlite_sidecar_paths(path) {
-        if sidecar.exists() {
-            validate_existing_private_file(&sidecar)?;
-            set_file_mode(&sidecar, 0o600)?;
+        // `Path::exists` follows links and reports a dangling symlink as absent,
+        // which would let a planted `-wal`/`-shm` link skip validation. Ask for
+        // the link itself and fail closed on anything but "not there".
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                validate_existing_private_file(&sidecar)?;
+                set_file_mode(&sidecar, 0o600)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", sidecar.display()))
+            }
         }
     }
     Ok(())
@@ -189,12 +198,17 @@ fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("setting private permissions on {}", path.display()))
 }
 
+/// SQLite names its sidecars by appending to the exact database path bytes;
+/// going through `display()` would be lossy for non-UTF-8 paths and name
+/// files that never get hardened.
 #[cfg(unix)]
 fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
-    [
-        PathBuf::from(format!("{}-wal", path.display())),
-        PathBuf::from(format!("{}-shm", path.display())),
-    ]
+    let sidecar = |suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    [sidecar("-wal"), sidecar("-shm")]
 }
 
 #[cfg(all(test, unix))]
@@ -227,6 +241,44 @@ mod tests {
         assert_eq!(memory_mode, 0o700);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_dangling_sidecar_symlink() {
+        let root = std::env::temp_dir().join(format!(
+            "coven-memory-sidecar-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("archival.sqlite3");
+        std::fs::write(&db, b"").unwrap();
+        let wal = root.join("archival.sqlite3-wal");
+        std::os::unix::fs::symlink(root.join("missing"), &wal).unwrap();
+        assert!(!wal.exists(), "precondition: the link must dangle");
+
+        let error = set_private_file(&db).unwrap_err().to_string();
+        assert!(error.contains("path is a symlink"), "{error}");
+
+        std::fs::remove_file(&wal).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sidecar_names_keep_the_exact_database_path_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let db = Path::new(OsStr::from_bytes(b"/fixture/mem/arch\xffival.sqlite3"));
+        let [wal, shm] = sqlite_sidecar_paths(db);
+        assert_eq!(
+            wal.as_os_str().as_bytes(),
+            b"/fixture/mem/arch\xffival.sqlite3-wal"
+        );
+        assert_eq!(
+            shm.as_os_str().as_bytes(),
+            b"/fixture/mem/arch\xffival.sqlite3-shm"
+        );
     }
 
     #[test]
