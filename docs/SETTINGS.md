@@ -21,9 +21,7 @@ For privacy retention calculations, environment variables
 `covenCli.privacy.*`.
 
 When a key is set in both the JSONC file and a legacy TOML file, the JSONC
-value wins and `coven` can print a one-time stderr warning naming the
-shadowed keys (via `settings::warn_if_shadowed`; the doctor and shell entry
-points will start emitting this warning in a follow-up commit).
+value wins. `coven` does not currently warn about shadowed TOML keys.
 
 ## Schema
 

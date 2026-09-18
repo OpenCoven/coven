@@ -200,7 +200,6 @@ pub(super) enum InputMode {
 pub(super) enum SlashCommandResult {
     Handled,
     Quit,
-    #[allow(dead_code)]
     Unknown(String),
 }
 

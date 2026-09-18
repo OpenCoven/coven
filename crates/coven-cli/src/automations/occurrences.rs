@@ -126,7 +126,6 @@ pub fn ensure_occurrence_kind(conn: &Connection) -> Result<()> {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // planning-only report; the production tick reports the superset TickReport
 pub struct PlanTickReport {
     pub planned: Vec<String>,
     pub already_fenced: usize,
@@ -235,7 +234,6 @@ const OCCURRENCE_TERMINAL_STATES: [&str; 3] = ["succeeded", "failed", "cancelled
 ///
 /// The runner (coven#816 part 4) is the production caller; until then tests
 /// and the daemon tick exercise the path directly.
-#[allow(dead_code)]
 pub fn claim_due_occurrence(
     conn: &Connection,
     automation_id: &str,
@@ -645,7 +643,6 @@ pub(crate) fn recover_expired_leases_with_scheduler_fence(
 
 /// Finalizes an occurrence into a terminal state. Releasing a PLANNED
 /// occurrence is refused — only claimed work can settle.
-#[allow(dead_code)]
 pub fn settle_occurrence(
     conn: &Connection,
     occurrence_id: &str,
@@ -1609,7 +1606,6 @@ fn plan_latest_due_occurrence_in_transaction(
 /// occurrence fence. Production ticks go through `tick`, which adds lease
 /// recovery and claiming; this stays public for planning-only callers and
 /// tests.
-#[allow(dead_code)]
 pub fn tick_planning(conn: &Connection, now: DateTime<Utc>) -> Result<PlanTickReport> {
     let mut report = plan_bounded_definition_page(conn, now, None)?.report;
 

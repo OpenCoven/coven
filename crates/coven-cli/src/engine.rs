@@ -12,7 +12,9 @@ use std::process::Command;
 #[derive(Debug, serde::Deserialize)]
 struct EngineLock {
     version: String,
-    #[allow(dead_code)] // read in tests via pinned_contract()
+    // Present so a lock file missing its contract key fails to parse; only
+    // the lock-validation test reads the value today.
+    #[allow(dead_code)]
     contract: u32,
     sha256: std::collections::HashMap<String, String>,
 }
@@ -29,12 +31,6 @@ fn engine_lock() -> &'static EngineLock {
 /// The exact engine version this coven build pins.
 pub fn pinned_version() -> &'static str {
     &engine_lock().version
-}
-
-/// The contract version the pinned engine satisfies.
-#[allow(dead_code)] // used in tests; reserved for future contract gating
-pub fn pinned_contract() -> u32 {
-    engine_lock().contract
 }
 
 /// The pinned SHA-256 for a release artifact (archive) filename, if present.
@@ -456,7 +452,7 @@ mod tests {
             parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
             "non-numeric component in {v:?}"
         );
-        assert_eq!(pinned_contract(), 1);
+        assert_eq!(engine_lock().contract, 1);
     }
 
     #[test]

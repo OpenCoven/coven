@@ -36,10 +36,9 @@ pub(crate) fn cast_salute() -> &'static str {
 
 /// A short Cast frame for non-interactive mode: who Cast is, what spells look
 /// like, and where work goes when it lands. Designed for piped stdout, CI
-/// snapshots, and `coven` from a non-tty wrapper. Today only consumed by
-/// tests; future phases (announcement banners, plain `coven` snapshots) will
-/// wire it into more callsites.
-#[allow(dead_code)]
+/// snapshots, and `coven` from a non-tty wrapper. Only the test suite
+/// reaches it today; interactive callers use `render_cast_frame_for_terminal`.
+#[cfg(test)]
 pub(crate) fn render_cast_frame_plain(
     project_root: Option<&Path>,
     default_harness: Option<&str>,
@@ -229,7 +228,6 @@ fn render_outcome_with_mode(outcome: &CastOutcome, mode: TerminalMode) -> String
 /// next phase's sub-prompt will be before approving the handoff. The card
 /// is a *visible delegation announcement* — it never executes anything; it
 /// just makes Cast's deterministic composer inspectable.
-#[allow(dead_code)]
 pub(crate) fn render_quest_handoff(quest: &Quest, next_index: usize) -> String {
     render_quest_handoff_with_mode(quest, next_index, theme::mode())
 }
@@ -897,7 +895,7 @@ mod tests {
         advance(&mut quest, QuestPhaseSummary::default());
         advance(&mut quest, QuestPhaseSummary::default());
         advance(&mut quest, QuestPhaseSummary::default());
-        assert!(quest.is_complete());
+        assert!(quest.current_index().is_none());
 
         // Asking for the handoff at the past-the-end cursor must not panic.
         let frame = render_quest_handoff_plain(&quest, quest.phases.len());

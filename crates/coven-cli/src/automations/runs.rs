@@ -132,10 +132,8 @@ pub const AUTOMATION_ATTEMPTS_SCHEMA_SQL: &str = "
     );
 ";
 
-#[allow(dead_code)]
 const LOG_ENTRY_MAX_CHARS: usize = 64 * 1024;
 
-#[allow(dead_code)]
 fn iso(instant: DateTime<Utc>) -> String {
     instant.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -181,7 +179,6 @@ pub struct AttemptRecord {
     pub settled_at: Option<String>,
 }
 
-#[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
 pub struct RunStart<'a> {
     pub automation_id: &'a str,
     pub occurrence_id: Option<&'a str>,
@@ -301,7 +298,6 @@ fn definition_pin(
     }
 }
 
-#[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
 pub struct RunFinish {
     pub status: &'static str,
     pub exit_code: Option<i64>,
@@ -310,7 +306,6 @@ pub struct RunFinish {
     pub output_commit: Option<String>,
 }
 
-#[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
 pub fn record_run_finish(
     conn: &Connection,
     run_id: &str,

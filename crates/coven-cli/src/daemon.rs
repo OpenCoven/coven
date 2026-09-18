@@ -1540,9 +1540,11 @@ pub fn daemon_socket_path(coven_home: &Path) -> PathBuf {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum DaemonIpcPlatform {
     Unix,
+    // Constructed only under cfg(windows) and in tests; the enum keeps the
+    // pipe-vs-socket rule exercised on every platform.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Windows,
 }
 

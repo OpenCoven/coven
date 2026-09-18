@@ -4072,11 +4072,6 @@ fn stream_harness_with_claude_args_and_permission_bypass<W: Write>(
     stream_harness_with_program(program, cwd, args, forward_stdin, "claude", session_id, out)
 }
 
-#[allow(dead_code)]
-pub fn spawn_detached(command: &HarnessCommand) -> Result<DetachedPtySession> {
-    spawn_detached_with_observer(command, None)
-}
-
 /// Handle returned by `spawn_piped_with_observer`. The child handle itself is
 /// owned by the internal wait thread (so `wait()` can block without blocking
 /// cancellation); the caller gets writable stdin plus the strict process-tree
@@ -7164,7 +7159,7 @@ mod tests {
             env_overrides: Vec::new(),
         };
 
-        let mut session = spawn_detached(&command)?;
+        let mut session = spawn_detached_with_observer(&command, None)?;
         session.input.write_all(b"hello detached pty\n")?;
         session.input.flush()?;
         session.killer.kill()?;
