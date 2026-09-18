@@ -133,7 +133,6 @@ fn output_auto_submission_records_bounded_request_phases() -> Result<()> {
                 "reservation-size-begin", "reservation-size-ready",
                 "reservation-identity-begin", "reservation-identity-ready",
                 "reservation-active-check-ready",
-                "reservation-passive-begin", "reservation-passive-ready",
                 "reservation-wal-check-ready",
                 "reservation-lock-wait", "reservation-lock-acquired",
                 "reservation-ledger-ready",
@@ -145,7 +144,7 @@ fn output_auto_submission_records_bounded_request_phases() -> Result<()> {
                 "finalize-begin",
                 "reservation-release-lock-wait", "reservation-release-lock-acquired",
                 "reservation-release-delete-ready", "reservation-release-commit-ready",
-                "reservation-release-active-ready", "reservation-release-passive-ready",
+                "reservation-release-active-ready",
                 "finalize-ready", "handler-returned", "response-begin",
             ] {
                 anyhow::ensure!(phases.first() == Some(&phase), "missing/out-of-order {phase}: {phases:?}");
