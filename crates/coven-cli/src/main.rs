@@ -5585,14 +5585,25 @@ fn first_chars(value: &str, limit: usize) -> String {
 
 fn coven_store_path() -> Result<PathBuf> {
     let home = coven_home_dir()?;
-    std::fs::create_dir_all(&home)
-        .with_context(|| format!("failed to create Coven home directory {}", home.display()))?;
+    daemon::ensure_private_coven_home(&home)?;
     Ok(home.join(STORE_FILE_NAME))
 }
 
+/// Locates an existing store without creating the Coven home. An existing
+/// home gets the same no-symlink, owner-only guard the daemon applies to it,
+/// and the store file itself is validated without following symlinks.
 fn coven_store_path_if_exists() -> Result<Option<PathBuf>> {
-    let store_path = coven_home_dir()?.join(STORE_FILE_NAME);
-    Ok(store_path.exists().then_some(store_path))
+    let home = coven_home_dir()?;
+    match std::fs::symlink_metadata(&home) {
+        Ok(_) => daemon::ensure_private_coven_home(&home)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to inspect Coven home {}", home.display()))
+        }
+    }
+    let store_path = home.join(STORE_FILE_NAME);
+    Ok(store::existing_store_file_present(&store_path)?.then_some(store_path))
 }
 
 #[cfg(test)]
