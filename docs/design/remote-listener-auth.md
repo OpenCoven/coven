@@ -50,7 +50,9 @@ What already exists — the remote listener composes with all of it:
 - **Loopback-only TCP transport** (`daemon.rs`): `bind_tcp_listener` resolves
   the bind address and `ensure_loopback_addrs` refuses any non-loopback
   socket address outright. `--allow-host` widens only the *Host/Origin*
-  guard (`HostGuard::Loopback`), never the bind.
+  guard (`HostGuard::Loopback`), never the bind. An allowed origin must be
+  the exact `https://<host[:port]>` origin; plain-HTTP or different-port
+  origins are rejected.
 - **Browser-attack defenses on TCP**: exact-match Host allowlist plus Origin
   check defend against CSRF and DNS rebinding; `TCP_IO_TIMEOUT` (30 s
   read/write) and `MAX_TCP_BODY_BYTES` (1 MiB) cap slowloris and allocation

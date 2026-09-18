@@ -4,6 +4,7 @@ read_when:
   - Exposing Coven to another machine you own
 title: "Remote access"
 description: "Guidance for exposing the Coven daemon socket beyond same-user local trust, and why remote access requires explicit transport instead of OAuth or tokens."
+source_adjacent_reason: "Tracks the daemon's loopback Host/Origin guard and --allow-host behavior implemented in this repository."
 ---
 
 The daemon exposes no OAuth, tokens, or cookies — its only auth check is local
@@ -31,8 +32,10 @@ Two patterns, both keeping the API on loopback:
   [Cloud host runbook](/daemon/cloud-host-runbook). One extra step versus the SSH
   tunnel: `tailscale serve` forwards the Tailnet FQDN as the `Host` header, which
   the loopback guard rejects, so start the daemon with `--allow-host
-  <host>.<your-tailnet>.ts.net` to trust that one proxied hostname. The bind
-  stays on loopback; Tailscale remains the boundary.
+  <host>.<your-tailnet>.ts.net` to trust that one proxied hostname. A browser
+  `Origin` must then be the exact `https://<host[:port]>` origin; plain-HTTP
+  or different-port origins are rejected. The bind stays on loopback;
+  Tailscale remains the boundary.
 
 Never bind `--tcp` to a non-loopback or public address to achieve remote access
 — the API is unauthenticated. Let SSH or Tailscale be the boundary. A
