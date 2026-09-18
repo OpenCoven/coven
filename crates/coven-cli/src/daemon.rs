@@ -5779,17 +5779,43 @@ fn host_in_allowlist(host: Option<&str>, allowed: &[String]) -> bool {
     }
 }
 
-/// Same allowlist check applied to a request `Origin` (`scheme://host[:port]`).
+/// Exact origin check applied to a request `Origin` (`scheme://host[:port]`).
+///
+/// Browser origins include the scheme and port, so do not reuse the Host guard's
+/// port-insensitive hostname comparison here. `--allow-host example.com` trusts
+/// only the HTTPS origin for that exact authority (`https://example.com`), while
+/// `--allow-host example.com:8443` trusts `https://example.com:8443`.
 fn origin_in_allowlist(origin: &str, allowed: &[String]) -> bool {
-    match origin.trim().split_once("://") {
-        Some((_scheme, rest)) => {
-            let h = strip_port(rest);
-            allowed
-                .iter()
-                .any(|a| strip_port(a.trim()).eq_ignore_ascii_case(h))
-        }
-        None => false,
+    let Some(normalized_origin) = normalize_https_origin(origin) else {
+        return false;
+    };
+    allowed.iter().any(|allowed_host| {
+        normalize_allowed_origin(allowed_host)
+            .as_deref()
+            .is_some_and(|allowed_origin| allowed_origin.eq_ignore_ascii_case(&normalized_origin))
+    })
+}
+
+/// An `--allow-host` entry is a bare authority (`host` or `host:port`). Any
+/// slash means a scheme or a path was supplied, and the entry never matches:
+/// stripping a trailing slash first would let `example.com/` or `https:///`
+/// collapse into an authority the documented contract says is rejected.
+fn normalize_allowed_origin(allowed_host: &str) -> Option<String> {
+    let authority = allowed_host.trim();
+    if authority.is_empty() || authority.contains('/') {
+        return None;
     }
+    Some(format!("https://{authority}"))
+}
+
+/// A serialized `Origin` header is `scheme://authority` with no trailing slash
+/// and no path, so anything else is rejected rather than repaired.
+fn normalize_https_origin(origin: &str) -> Option<String> {
+    let (scheme, authority) = origin.trim().split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") || authority.is_empty() || authority.contains('/') {
+        return None;
+    }
+    Some(format!("https://{authority}"))
 }
 
 fn strip_port(authority: &str) -> &str {
@@ -9909,6 +9935,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn handle_http_stream_allow_host_blocks_different_origin_port() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        let request = b"GET /api/v1/health HTTP/1.1\r\nHost: coven-host.taile46e90.ts.net\r\nOrigin: https://coven-host.taile46e90.ts.net:4444\r\n\r\n";
+        let mut stream = Cursor::new(Vec::from(&request[..]));
+        let mut output: Vec<u8> = Vec::new();
+        let allowed = vec!["coven-host.taile46e90.ts.net".to_string()];
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &NoopSessionRuntime,
+            Some(MAX_TCP_BODY_BYTES),
+            HostGuard::Loopback {
+                allowed_hosts: &allowed,
+            },
+        )
+        .expect("handle ok");
+        let response = String::from_utf8(output).expect("utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "got: {response}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn handle_http_stream_allow_host_still_blocks_unlisted_host() {
         use crate::api::NoopSessionRuntime;
         use std::io::Cursor;
@@ -9940,7 +9996,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn host_and_origin_allowlist_match_is_case_and_port_insensitive() {
+    fn host_allowlist_match_is_case_and_port_insensitive() {
         let allowed = vec!["Coven-Host.Taile46E90.TS.net".to_string()];
         // Host: case-insensitive, and a forwarded port must not defeat the match.
         assert!(host_in_allowlist(
@@ -9951,11 +10007,6 @@ mod tests {
             Some("COVEN-HOST.TAILE46E90.TS.NET"),
             &allowed
         ));
-        // Origin: scheme is stripped, host compared the same way.
-        assert!(origin_in_allowlist(
-            "https://coven-host.taile46e90.ts.net",
-            &allowed
-        ));
         // Non-members and an empty allowlist never match.
         assert!(!host_in_allowlist(Some("evil.example"), &allowed));
         assert!(!host_in_allowlist(
@@ -9963,7 +10014,79 @@ mod tests {
             &[]
         ));
         assert!(!host_in_allowlist(None, &allowed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn origin_allowlist_requires_exact_https_origin() {
+        let allowed = vec!["Coven-Host.Taile46E90.TS.net".to_string()];
+        assert!(origin_in_allowlist(
+            "https://coven-host.taile46e90.ts.net",
+            &allowed
+        ));
+        assert!(origin_in_allowlist(
+            "HTTPS://COVEN-HOST.TAILE46E90.TS.NET",
+            &allowed
+        ));
+        assert!(!origin_in_allowlist(
+            "http://coven-host.taile46e90.ts.net",
+            &allowed
+        ));
+        assert!(!origin_in_allowlist(
+            "https://coven-host.taile46e90.ts.net:4444",
+            &allowed
+        ));
         assert!(!origin_in_allowlist("https://evil.example", &allowed));
+    }
+
+    #[test]
+    fn allowed_origin_entries_with_a_scheme_or_path_never_match() {
+        // Each entry would collapse into a bare authority if a trailing slash
+        // were stripped before validation; the contract says they never match.
+        for entry in [
+            "example.com/",
+            "https:///",
+            "https://example.com/",
+            "https://example.com/path",
+            "https://example.com",
+            "/",
+            "",
+        ] {
+            assert_eq!(
+                normalize_allowed_origin(entry),
+                None,
+                "{entry:?} must not normalize to an allowed origin"
+            );
+            assert!(
+                !origin_in_allowlist("https://example.com", &[entry.to_string()]),
+                "{entry:?} must not match https://example.com"
+            );
+        }
+        assert_eq!(
+            normalize_allowed_origin(" example.com:8443 ").as_deref(),
+            Some("https://example.com:8443")
+        );
+        // The Origin side is just as strict: a serialized origin has no path.
+        assert_eq!(normalize_https_origin("https://example.com/"), None);
+        assert_eq!(normalize_https_origin("https:///"), None);
+        assert_eq!(
+            normalize_https_origin("https://example.com").as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn origin_allowlist_preserves_allowed_port() {
+        let allowed = vec!["coven-host.taile46e90.ts.net:8443".to_string()];
+        assert!(origin_in_allowlist(
+            "https://coven-host.taile46e90.ts.net:8443",
+            &allowed
+        ));
+        assert!(!origin_in_allowlist(
+            "https://coven-host.taile46e90.ts.net",
+            &allowed
+        ));
     }
 
     #[cfg(unix)]

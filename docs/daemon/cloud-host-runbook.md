@@ -5,6 +5,7 @@ read_when:
   - Standing up an always-on daemon on a server
 title: "Cloud host runbook"
 description: "Minimal-lift runbook for hosting the Coven daemon on a cloud VM: a single systemd-supervised `coven daemon serve` bound to loopback, fronted by Tailscale so the unauthenticated API is never exposed to the public internet."
+source_adjacent_reason: "Tracks the daemon serve flags, systemd unit, and --allow-host guard behavior implemented in this repository."
 ---
 
 Host one familiar as an always-on daemon on a cheap VM and reach it from
@@ -101,8 +102,9 @@ sudo systemctl restart coven-daemon
 ```
 
 The bind stays on `127.0.0.1` and the API stays unauthenticated — `--allow-host`
-only tells the guard to trust that one proxied hostname; Tailscale is still the
-boundary. Now expose the loopback API **into the Tailnet only** — the daemon
+only tells the guard to trust that one proxied hostname, and a browser `Origin`
+must be the exact `https://<host[:port]>` origin (plain-HTTP or different-port
+origins are rejected); Tailscale is still the boundary. Now expose the loopback API **into the Tailnet only** — the daemon
 stays bound to `127.0.0.1`; `tailscale serve` proxies to it:
 
 ```sh
