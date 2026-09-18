@@ -120,6 +120,9 @@ pub fn resolve_from(
     // 3. PATH lookup (honor Windows multi-name)
     if let Some(path_var) = path_var {
         for dir in std::env::split_paths(path_var) {
+            if !path_entry_is_trusted(&dir) {
+                continue;
+            }
             for name in engine_bin_names() {
                 let candidate = dir.join(name);
                 if is_executable(&candidate) {
@@ -227,6 +230,15 @@ fn engine_bin_names() -> &'static [&'static str] {
 }
 
 /// Check whether a path is an executable file.
+/// Only absolute PATH entries take part in engine lookup. Empty, `.`, and other
+/// relative entries resolve against the current working directory, so a
+/// `coven-code` planted in any project checkout would otherwise win. On Windows
+/// this also drops drive-relative (`C:bin`) and rooted-but-driveless (`\bin`)
+/// entries, which `Path::is_absolute` rejects there.
+fn path_entry_is_trusted(dir: &Path) -> bool {
+    dir.is_absolute()
+}
+
 /// Unix: file must exist and have at least one executable bit set.
 /// Non-Unix: file must exist (is_file()).
 fn is_executable(path: &Path) -> bool {
@@ -324,6 +336,103 @@ mod tests {
         touch_exec(&legacy);
         let r = resolve_from(Some(not_exec.as_os_str()), None, Some(home.path())).unwrap();
         assert!(matches!(r.source, EngineSource::LegacyHome));
+    }
+
+    #[test]
+    fn only_absolute_path_entries_are_trusted() {
+        assert!(!path_entry_is_trusted(Path::new("")));
+        assert!(!path_entry_is_trusted(Path::new(".")));
+        assert!(!path_entry_is_trusted(Path::new("relative/bin")));
+        assert!(!path_entry_is_trusted(Path::new("../bin")));
+        if cfg!(windows) {
+            assert!(path_entry_is_trusted(Path::new("C:\\tools")));
+            assert!(path_entry_is_trusted(Path::new("\\\\server\\share\\bin")));
+            assert!(
+                !path_entry_is_trusted(Path::new("C:tools")),
+                "drive-relative"
+            );
+            assert!(
+                !path_entry_is_trusted(Path::new("\\tools")),
+                "rooted without a drive"
+            );
+        } else {
+            assert!(path_entry_is_trusted(Path::new("/usr/local/bin")));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_lookup_skips_relative_and_drive_relative_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let trusted = sandbox.path().join("trusted");
+        let trusted_bin = trusted.join(ENGINE_BIN_NAME);
+        touch_exec(&trusted_bin);
+        let path = std::env::join_paths([
+            PathBuf::from(""),
+            PathBuf::from("."),
+            PathBuf::from("relative\\bin"),
+            PathBuf::from("C:relative\\bin"),
+            trusted.clone(),
+        ])
+        .unwrap();
+        let r = resolve_from(None, Some(&path), Some(home.path())).unwrap();
+        assert!(matches!(r.source, EngineSource::PathLookup));
+        assert_eq!(r.path, trusted_bin);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_lookup_skips_empty_and_relative_entries() {
+        use std::path::Component;
+        let home = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = sandbox.path().canonicalize().unwrap();
+        // Executables a cwd-relative PATH entry would find, plus one legitimate absolute dir.
+        touch_exec(&sandbox.join("relative/bin").join(ENGINE_BIN_NAME));
+        touch_exec(&sandbox.join(ENGINE_BIN_NAME));
+        let trusted = sandbox.join("trusted");
+        let trusted_bin = trusted.join(ENGINE_BIN_NAME);
+        touch_exec(&trusted_bin);
+
+        // Build a *relative* entry that reaches `sandbox/relative/bin` from the test cwd
+        // (`..` up to the root, then back down), so it resolves only if cwd is consulted.
+        // This avoids mutating the process-global cwd, which parallel tests share.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let mut rel = PathBuf::new();
+        for c in cwd.components() {
+            if matches!(c, Component::Normal(_)) {
+                rel.push("..");
+            }
+        }
+        for c in sandbox.join("relative/bin").components() {
+            if let Component::Normal(n) = c {
+                rel.push(n);
+            }
+        }
+        assert!(rel.is_relative());
+        assert!(
+            is_executable(&rel.join(ENGINE_BIN_NAME)),
+            "precondition: {} must reach the planted engine via cwd",
+            rel.display()
+        );
+
+        let path = std::env::join_paths([
+            PathBuf::from(""),
+            PathBuf::from("."),
+            rel.clone(),
+            trusted.clone(),
+        ])
+        .unwrap();
+        let r = resolve_from(None, Some(&path), Some(home.path())).unwrap();
+        assert!(matches!(r.source, EngineSource::PathLookup));
+        assert_eq!(r.path, trusted_bin);
+
+        let path = std::env::join_paths([PathBuf::from(""), PathBuf::from("."), rel]).unwrap();
+        assert!(
+            resolve_from(None, Some(&path), Some(home.path())).is_none(),
+            "relative-only PATH must not resolve an engine"
+        );
     }
 
     #[test]
