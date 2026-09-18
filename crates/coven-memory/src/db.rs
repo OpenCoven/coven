@@ -3,11 +3,10 @@
 use crate::{fs_security, MemoryDoc};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct MetaDb {
     conn: Connection,
-    path: PathBuf,
 }
 
 impl MetaDb {
@@ -17,12 +16,8 @@ impl MetaDb {
         let conn =
             Connection::open(path).with_context(|| format!("opening db at {}", path.display()))?;
         fs_security::set_private_file(path)?;
-        let db = Self {
-            conn,
-            path: path.to_owned(),
-        };
+        let db = Self { conn };
         db.init()?;
-        fs_security::set_private_file(path)?;
         Ok(db)
     }
 
@@ -70,7 +65,6 @@ impl MetaDb {
                 now
             ],
         )?;
-        fs_security::set_private_file(&self.path)?;
         Ok(self.conn.last_insert_rowid() as u64)
     }
 
@@ -139,7 +133,6 @@ impl MetaDb {
     pub fn delete(&self, id: u64) -> Result<()> {
         self.conn
             .execute("DELETE FROM docs WHERE id = ?1", params![id as i64])?;
-        fs_security::set_private_file(&self.path)?;
         Ok(())
     }
 
@@ -178,6 +171,7 @@ impl MetaDb {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     #[test]
     fn open_and_insert_harden_database_and_sidecars() {
