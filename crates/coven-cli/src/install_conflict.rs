@@ -564,7 +564,6 @@ fn upgrade_hint(active_upgrade: Option<&str>) -> String {
     }
 }
 
-
 /// Resolve against the real environment and filesystem.
 pub fn current_installations(name: &str) -> Vec<Installation> {
     let path_var = std::env::var("PATH").ok();
