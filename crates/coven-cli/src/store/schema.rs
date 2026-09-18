@@ -3,7 +3,10 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
-use super::{sqlite_object_exists, StoreInitializationPhase, WARD_AUDIT_CAPACITY_SQLITE_MESSAGE};
+use super::{
+    ensure_private_store_directory, ensure_private_store_file, sqlite_object_exists,
+    StoreInitializationPhase, WARD_AUDIT_CAPACITY_SQLITE_MESSAGE,
+};
 
 pub const DEFAULT_WARD_AUDIT_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
 pub const WARD_AUDIT_WAL_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
@@ -90,12 +93,13 @@ pub(super) fn initialize_store_connection(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create store directory {}", parent.display()))?;
+        ensure_private_store_directory(parent)?;
     }
+    ensure_private_store_file(path)?;
 
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
+    ensure_private_store_file(path)?;
     observe(StoreInitializationPhase::ConnectionOpened);
     configure_initializing_connection(&conn)?;
     observe(StoreInitializationPhase::ConnectionConfigured);
@@ -128,8 +132,16 @@ pub(super) fn initialize_store_connection(
 }
 
 pub(super) fn open_initialized_store(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_private_store_directory(parent)?;
+    }
+    ensure_private_store_file(path)?;
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
+    ensure_private_store_file(path)?;
     configure_runtime_writable_connection(&conn)?;
     Ok(conn)
 }
