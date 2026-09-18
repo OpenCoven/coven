@@ -38,7 +38,9 @@ latest release to pick up security fixes.
   [session artifacts spec](specs/coven-session-artifacts/TECH.md) and the
   [trust layer contract](specs/coven-trust-layer/PRODUCT.md).
 - Repository content guards: the secret scan and the Coven privacy guard run in
-  CI (`Policy guard`) and in managed local hooks.
+  CI (`Policy guard`), which is the enforcement layer; contributors run them
+  locally before committing (see `AGENTS.md`), and managed local hooks
+  deliberately execute no repository-tracked scripts.
 
 **Experimental or disabled surfaces — not security-supported.**
 
