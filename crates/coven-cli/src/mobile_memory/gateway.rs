@@ -856,12 +856,31 @@ fn active_gateway() -> Result<Arc<MobileGatewayState>> {
         .context("mobile gateway is not running")
 }
 
+const LOCAL_CONTROL_ROOT: &str = "/api/v1/internal/mobile/pairings";
+
+/// Whether [`handle_local_control`] owns this path.
+///
+/// The daemon needs this answer *before* calling it, to decide whether a
+/// request bypasses the API handler and therefore needs the chat-context gate
+/// applied earlier. Keeping the predicate here, and having
+/// `handle_local_control` refuse anything it rejects, stops the two from
+/// drifting apart.
+pub(crate) fn claims_local_control(path: &str) -> bool {
+    path == LOCAL_CONTROL_ROOT
+        || path
+            .strip_prefix(LOCAL_CONTROL_ROOT)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub(crate) fn handle_local_control(
     method: &str,
     path: &str,
     body: Option<&str>,
 ) -> Option<Result<crate::api::ApiResponse>> {
-    const ROOT: &str = "/api/v1/internal/mobile/pairings";
+    const ROOT: &str = LOCAL_CONTROL_ROOT;
+    if !claims_local_control(path) {
+        return None;
+    }
     if path == ROOT {
         if method != "POST" {
             return Some(crate::api::api_error(
