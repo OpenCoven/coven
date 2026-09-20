@@ -30,6 +30,13 @@ or kill, is rejected. It does not extend those contracts. Mixing it with
 `executionBinding` or `requestAdoption` is rejected without interpreting either
 as chat authority.
 
+Routes under `/api/v1/internal/` that the daemon dispatches *before* the API
+handler -- lifecycle shutdown, and mobile local control, which ignores the
+request body entirely -- are gated at that earlier dispatch point. Without that
+gate an internal mutation would take effect while carrying an intent, returning
+its own success instead of a refusal, so "any other mutation" would hold only
+for the routes the API handler happens to observe.
+
 For direct CLI launch, `--context-admission FILE` reads a bounded JSON intent.
 The gate also applies with `--continue`, `--detach`, and streaming flags.
 A rejected intent does not initialize the CLI store, acquire a session writer,
