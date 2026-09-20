@@ -193,6 +193,11 @@ pub struct DeviceStatusRecord {
     pub display_name: String,
     pub paired_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Mirrors `DeviceRecord::suspended_at`. Consumers of this projection
+    /// classify a device by these two fields, so omitting it here would report
+    /// a suspended device as active on the legacy surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<DateTime<Utc>>,
     pub scopes: Vec<DeviceScope>,
     pub grant_id: Uuid,
     pub minimum_assurance: AssuranceLevel,
@@ -1036,6 +1041,7 @@ impl DeviceRegistry {
         Ok(self
             .authorization_record(device_id)?
             .filter(|record| record.device.revoked_at.is_none())
+            .filter(|record| record.device.suspended_at.is_none())
             .filter(|record| {
                 record
                     .grant
@@ -1079,6 +1085,7 @@ impl DeviceRegistry {
                 display_name: record.device.display_name.clone(),
                 paired_at: record.device.paired_at,
                 revoked_at: record.device.revoked_at,
+                suspended_at: record.device.suspended_at,
                 scopes: record.grant.scopes.clone(),
                 grant_id: record.grant.id,
                 minimum_assurance: record.grant.minimum_assurance,
@@ -1432,6 +1439,43 @@ mod tests {
         let revoked = first.authorization_record(record.id).unwrap().unwrap();
         assert!(revoked.device.revoked_at.is_some());
         assert_eq!(revoked.grant.revocation_epoch, original_epoch + 1);
+    }
+
+    #[test]
+    fn suspension_reaches_the_status_projection_and_the_active_predicate() {
+        // `DeviceStatusRecord` is a separate projection feeding the legacy
+        // `coven memory mobile status`/`devices` surfaces, which classify a
+        // device from `revoked_at` alone. Adding the state to `DeviceRecord`
+        // without threading it here would report a suspended device as active.
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        let record = device(Uuid::new_v4(), "Synthetic phone");
+        registry.register(record.clone()).unwrap();
+
+        assert!(registry.active_device(record.id).unwrap().is_some());
+        let before = registry.list_status().unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].suspended_at.is_none());
+
+        registry.suspend(record.id, Utc::now()).unwrap();
+
+        let during = registry.list_status().unwrap();
+        assert!(
+            during[0].suspended_at.is_some(),
+            "status projection must carry the suspension"
+        );
+        assert!(
+            during[0].revoked_at.is_none(),
+            "suspension is not revocation"
+        );
+        assert!(
+            registry.active_device(record.id).unwrap().is_none(),
+            "a predicate named `active` must not return a suspended device"
+        );
+
+        registry.resume(record.id).unwrap();
+        assert!(registry.list_status().unwrap()[0].suspended_at.is_none());
+        assert!(registry.active_device(record.id).unwrap().is_some());
     }
 
     #[test]
