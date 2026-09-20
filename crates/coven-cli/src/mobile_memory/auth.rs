@@ -28,6 +28,7 @@ pub enum MobileAuthError {
     InvalidEncoding,
     DeviceUnknown,
     DeviceRevoked,
+    DeviceSuspended,
     RequestExpired,
     RequestReplayed,
     SignatureInvalid,
@@ -374,6 +375,13 @@ impl MobileAuthenticator {
             Some(record) if record.device.revoked_at.is_some() => {
                 Err(MobileAuthError::DeviceRevoked)
             }
+            // Checked here rather than at each call site because this is the
+            // one lookup both `verify*` and `ensure_still_active_at` go
+            // through. A suspension therefore takes effect on the mid-request
+            // re-check too, not only at the start of the next request.
+            Some(record) if record.device.suspended_at.is_some() => {
+                Err(MobileAuthError::DeviceSuspended)
+            }
             Some(record) => Ok(record),
         }
     }
@@ -467,6 +475,7 @@ mod tests {
             public_key_x963: vector["publicKeyX963"].as_str().unwrap().to_owned(),
             paired_at: Utc::now(),
             revoked_at: None,
+            suspended_at: None,
             scopes: vec![DeviceScope::MemoryRead],
         };
         let canonical = canonical_request(
@@ -574,6 +583,176 @@ mod tests {
             authenticator.ensure_still_active(&verified),
             Err(MobileAuthError::DeviceRevoked)
         );
+    }
+
+    #[test]
+    fn suspended_device_loses_a_race_before_response() {
+        // Suspension has to behave like revocation for an in-flight request:
+        // the re-check before the response must catch it, not just the next
+        // request. Both go through `lookup_device`, which is what makes this
+        // hold for the initial verify and the re-check with one check.
+        let (_temp, authenticator) = authenticator();
+        let device_id = Uuid::from_u128(101);
+        authenticator
+            .registry
+            .register(test_device(device_id))
+            .unwrap();
+        let authorization = authenticator
+            .registry
+            .authorization_record(device_id)
+            .unwrap()
+            .unwrap();
+        let verified = VerifiedMobileDevice {
+            device_id,
+            grant_id: authorization.grant.id,
+            revocation_epoch: authorization.grant.revocation_epoch,
+            required_scope: Some(DeviceScope::MemoryRead),
+            effective_assurance: AssuranceLevel::Possession,
+            assurance_attempt: AssuranceAttempt::Absent,
+            verified_assurance: None,
+            assurance_challenge_request: false,
+        };
+        assert_eq!(authenticator.ensure_still_active(&verified), Ok(()));
+        authenticator
+            .registry
+            .suspend(device_id, Utc::now() + Duration::seconds(1))
+            .unwrap();
+        assert_eq!(
+            authenticator.ensure_still_active(&verified),
+            Err(MobileAuthError::DeviceSuspended)
+        );
+    }
+
+    #[test]
+    fn resuming_restores_the_same_grant_without_re_pairing() {
+        // The whole point of suspension over revocation: the grant survives.
+        // If suspending bumped `revocation_epoch` or revoked the authorization
+        // key, resuming would leave the device unable to authenticate against
+        // the credential it still holds, and this would silently be a slower
+        // `revoke`.
+        let (_temp, authenticator) = authenticator();
+        let device_id = Uuid::from_u128(102);
+        authenticator
+            .registry
+            .register(test_device(device_id))
+            .unwrap();
+        let before = authenticator
+            .registry
+            .authorization_record(device_id)
+            .unwrap()
+            .unwrap();
+
+        authenticator
+            .registry
+            .suspend(device_id, Utc::now())
+            .unwrap();
+        let during = authenticator
+            .registry
+            .authorization_record(device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(during.grant.id, before.grant.id);
+        assert_eq!(
+            during.grant.revocation_epoch, before.grant.revocation_epoch,
+            "suspension must not burn the grant"
+        );
+        assert!(during.device.revoked_at.is_none());
+
+        authenticator.registry.resume(device_id).unwrap();
+        let after = authenticator
+            .registry
+            .authorization_record(device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.grant.id, before.grant.id);
+        assert_eq!(after.grant.revocation_epoch, before.grant.revocation_epoch);
+        assert!(after.device.suspended_at.is_none());
+
+        let verified = VerifiedMobileDevice {
+            device_id,
+            grant_id: before.grant.id,
+            revocation_epoch: before.grant.revocation_epoch,
+            required_scope: Some(DeviceScope::MemoryRead),
+            effective_assurance: AssuranceLevel::Possession,
+            assurance_attempt: AssuranceAttempt::Absent,
+            verified_assurance: None,
+            assurance_challenge_request: false,
+        };
+        assert_eq!(authenticator.ensure_still_active(&verified), Ok(()));
+    }
+
+    #[test]
+    fn resuming_does_not_revive_a_grant_that_expired_while_suspended() {
+        // Resume restores the grant the device had; it does not refresh it.
+        // A grant that lapsed during the suspension must stay unusable.
+        let (_temp, authenticator) = authenticator();
+        let device_id = Uuid::from_u128(103);
+        let record = test_device(device_id);
+        // The default fixture grant never expires, so give this one a real
+        // window -- otherwise the assertion below passes for the wrong reason.
+        let issued_at = Utc::now();
+        let mut grant = super::super::grant::DeviceGrant::for_device(
+            record.id,
+            &record.public_key_x963,
+            record.scopes.clone(),
+            issued_at,
+        )
+        .unwrap();
+        grant.expires_at = Some(issued_at + Duration::days(30));
+        authenticator
+            .registry
+            .register_with_grant(record, grant)
+            .unwrap();
+        let authorization = authenticator
+            .registry
+            .authorization_record(device_id)
+            .unwrap()
+            .unwrap();
+        // Valid before the suspension, so the failure below is the expiry.
+        assert!(authorization.grant.expires_at.is_some());
+        let verified = VerifiedMobileDevice {
+            device_id,
+            grant_id: authorization.grant.id,
+            revocation_epoch: authorization.grant.revocation_epoch,
+            required_scope: Some(DeviceScope::MemoryRead),
+            effective_assurance: AssuranceLevel::Possession,
+            assurance_attempt: AssuranceAttempt::Absent,
+            verified_assurance: None,
+            assurance_challenge_request: false,
+        };
+        let now = Utc::now();
+        assert_eq!(authenticator.ensure_still_active_at(&verified, now), Ok(()));
+        authenticator.registry.suspend(device_id, now).unwrap();
+        authenticator.registry.resume(device_id).unwrap();
+        // Past the grant's own expiry, which resuming must not move.
+        let long_after = now + Duration::days(31);
+        assert!(
+            authenticator
+                .ensure_still_active_at(&verified, long_after)
+                .is_err(),
+            "resume must not extend the grant's own time window"
+        );
+    }
+
+    #[test]
+    fn a_revoked_device_cannot_be_suspended_or_resumed() {
+        // Revocation is terminal. Allowing either transition would suggest a
+        // revoked device can be brought back without pairing, which it cannot.
+        let (_temp, authenticator) = authenticator();
+        let device_id = Uuid::from_u128(104);
+        authenticator
+            .registry
+            .register(test_device(device_id))
+            .unwrap();
+        authenticator
+            .registry
+            .revoke(device_id, Utc::now())
+            .unwrap();
+        assert!(authenticator
+            .registry
+            .suspend(device_id, Utc::now())
+            .is_err());
+        assert!(authenticator.registry.resume(device_id).is_err());
     }
 
     #[test]
@@ -870,6 +1049,7 @@ mod tests {
                 .encode(signing_key.public_key().to_encoded_point(false).as_bytes()),
             paired_at: Utc::now(),
             revoked_at: None,
+            suspended_at: None,
             scopes: vec![DeviceScope::MemoryRead],
         }
     }
@@ -915,6 +1095,7 @@ mod tests {
                 public_key_x963: public_key_x963.clone(),
                 paired_at: now,
                 revoked_at: None,
+                suspended_at: None,
                 scopes: vec![DeviceScope::MemoryRead],
             };
             let grant =

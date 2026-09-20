@@ -67,6 +67,8 @@ pub enum DeviceRevocationReason {
 #[serde(rename_all = "snake_case")]
 pub enum DeviceLifecycleStatus {
     Active,
+    /// Temporarily disabled by the owner; reversible with `device resume`.
+    Suspended,
     Revoked,
 }
 
@@ -107,6 +109,8 @@ pub struct DeviceView {
     pub grant_status: DeviceGrantStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<DateTime<Utc>>,
     pub grant_id: Uuid,
     pub scopes: Vec<DeviceScope>,
     pub transport: GrantTransportConstraint,
@@ -182,6 +186,40 @@ impl DeviceAuthority {
             &self.coven_home,
             now,
             reason.audit_event(),
+            Some(record.device.id),
+        )?;
+        self.inspect(&record.device.id.to_string(), now)
+    }
+
+    /// Temporarily disables a device, leaving its grant intact.
+    ///
+    /// `revoke` is the wrong tool for a phone that is merely away: it burns the
+    /// grant, revokes the authorization key, and sends the owner back through
+    /// pairing. Suspension is the reversible form, and `resume` restores the
+    /// grant the device already held -- never more than that, because the grant
+    /// is still evaluated per request against its own scopes, assurance floor
+    /// and time window.
+    pub fn suspend(&self, selector: &str, now: DateTime<Utc>) -> Result<DeviceView> {
+        let record = self.resolve(selector)?;
+        self.registry.suspend(record.device.id, now)?;
+        append_event(
+            &self.coven_home,
+            now,
+            MobileAuditEvent::DeviceSuspended,
+            Some(record.device.id),
+        )?;
+        self.inspect(&record.device.id.to_string(), now)
+    }
+
+    /// Lifts a suspension. Does not extend, refresh or re-authorize the grant.
+    pub fn resume(&self, selector: &str) -> Result<DeviceView> {
+        let now = Utc::now();
+        let record = self.resolve(selector)?;
+        self.registry.resume(record.device.id)?;
+        append_event(
+            &self.coven_home,
+            now,
+            MobileAuditEvent::DeviceResumed,
             Some(record.device.id),
         )?;
         self.inspect(&record.device.id.to_string(), now)
@@ -334,9 +372,14 @@ impl DeviceAuthority {
         };
         let status = if record.device.revoked_at.is_some() {
             DeviceLifecycleStatus::Revoked
+        } else if record.device.suspended_at.is_some() {
+            DeviceLifecycleStatus::Suspended
         } else {
             DeviceLifecycleStatus::Active
         };
+        // Grant status deliberately still reports the underlying grant while
+        // suspended -- an operator needs to see that a grant expired during a
+        // suspension, which resuming will not undo.
         let grant_status = if status == DeviceLifecycleStatus::Revoked {
             DeviceGrantStatus::Revoked
         } else if now < record.grant.not_before {
@@ -357,6 +400,7 @@ impl DeviceAuthority {
             status,
             grant_status,
             revoked_at: record.device.revoked_at,
+            suspended_at: record.device.suspended_at,
             grant_id: record.grant.id,
             scopes: record.grant.scopes,
             transport: record.grant.restrictions.transport,
@@ -423,6 +467,23 @@ pub fn run_revoke(selector: &str, reason: DeviceRevocationReason) -> Result<()> 
     let authority = DeviceAuthority::load(&crate::coven_home_dir()?)?;
     let device = authority.revoke(selector, reason, Utc::now())?;
     println!("Revoked device {}.", device.id);
+    Ok(())
+}
+
+pub fn run_suspend(selector: &str) -> Result<()> {
+    let authority = DeviceAuthority::load(&crate::coven_home_dir()?)?;
+    let device = authority.suspend(selector, Utc::now())?;
+    println!(
+        "Suspended device {}. Its grant is unchanged; resume restores it without re-pairing.",
+        device.id
+    );
+    Ok(())
+}
+
+pub fn run_resume(selector: &str) -> Result<()> {
+    let authority = DeviceAuthority::load(&crate::coven_home_dir()?)?;
+    let device = authority.resume(selector)?;
+    println!("Resumed device {}.", device.id);
     Ok(())
 }
 
@@ -544,6 +605,7 @@ mod tests {
             public_key_x963: public_key(key_seed),
             paired_at: now,
             revoked_at: None,
+            suspended_at: None,
             scopes: vec![DeviceScope::MemoryRead],
         }
     }

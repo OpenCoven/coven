@@ -59,6 +59,7 @@ pub enum MobileErrorCode {
     PairingPhraseMismatch,
     DeviceUnknown,
     DeviceRevoked,
+    DeviceSuspended,
     SignatureInvalid,
     RequestExpired,
     RequestReplayed,

@@ -911,6 +911,25 @@ enum DeviceCommand {
         #[arg(value_name = "NAME", value_parser = parse_nonempty_arg)]
         name: String,
     },
+    #[command(
+        about = "Temporarily disable a device without ending its enrolment",
+        long_about = "Temporarily disable a device without ending its enrolment.\n\n\
+                      Unlike `revoke`, this is reversible: the device's grant and \
+                      authorization key are left intact, so `device resume` restores \
+                      access without pairing again. Resuming grants nothing new -- the \
+                      grant is still checked against its own scopes, assurance floor and \
+                      expiry on every request, so a grant that expired or was tightened \
+                      during the suspension stays unusable."
+    )]
+    Suspend {
+        #[arg(value_name = "DEVICE", value_parser = parse_nonempty_arg)]
+        device: String,
+    },
+    #[command(about = "Lift a suspension and restore the device's existing grant")]
+    Resume {
+        #[arg(value_name = "DEVICE", value_parser = parse_nonempty_arg)]
+        device: String,
+    },
     #[command(about = "Revoke an enrolled device")]
     Revoke {
         #[arg(value_name = "DEVICE", value_parser = parse_nonempty_arg)]
@@ -1644,6 +1663,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             DeviceCommand::Rename { device, name } => {
                 mobile_memory::device::run_rename(&device, &name)
             }
+            DeviceCommand::Suspend { device } => mobile_memory::device::run_suspend(&device),
+            DeviceCommand::Resume { device } => mobile_memory::device::run_resume(&device),
             DeviceCommand::Revoke { device, reason } => {
                 mobile_memory::device::run_revoke(&device, reason.into())
             }

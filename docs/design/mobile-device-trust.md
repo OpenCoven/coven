@@ -204,6 +204,8 @@ into clap handlers:
 coven device list [--json]
 coven device inspect <device> [--json]
 coven device rename <device> <name>
+coven device suspend <device>
+coven device resume <device>
 coven device revoke <device> [--reason ordinary|lost|suspected-compromise|retired]
 coven device grant reissue <device> \
   --scope <scope>[,<scope>...] \
@@ -213,6 +215,21 @@ coven device grant reissue <device> \
   [--direct-only]
 coven device rotate <old-device> <replacement-device>
 ```
+
+Suspension is the reversible half of revocation. `revoke` is one-way: it burns
+the grant, advances the revocation epoch, revokes the authorization key, and
+sends the owner back through pairing -- correct for a lost or compromised
+device, and far too blunt for one that is simply away for a week. `suspend`
+leaves the grant and authorization key untouched, so `resume` restores exactly
+the authority the device already held.
+
+Resuming grants nothing new. The grant is still evaluated per request against
+its own scopes, assurance floor and time window, so one that expired or was
+tightened during the suspension stays unusable afterwards. A suspended device
+is refused at the same lookup that refuses a revoked one, which is what makes a
+suspension take effect on an in-flight request rather than only on the next
+one. Revocation is terminal: a revoked device can be neither suspended nor
+resumed.
 
 `<device>` is an exact UUID or exact display name; ambiguous names fail closed.
 CLI scope input is sorted before submission, duplicates are rejected, and the
