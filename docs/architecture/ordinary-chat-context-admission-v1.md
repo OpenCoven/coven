@@ -224,5 +224,46 @@ additional source work, not something a publication or environment toggle
 completes. Until then, do not interpret a self-consistent digest, known roster
 slot, healthy daemon, or successful parser test as accepted familiar continuity.
 
+### What a verifier's output must look like
+
+The freshness and revocation observations above are already modelled, for a
+different consumer, by `AutomationAuthorityExtension`'s familiar binding in
+`crates/coven-cli/src/automations/contract/authority.rs`. It names the same
+four identity fields this intent's `identity` names -- `familiarRootId`,
+`identityRevisionId`, `bindingId` as `embodimentBindingId`, and `bindingDigest`
+as `embodimentDigest` -- adds `declarationDigest`, and then carries the seven
+dimensions this intent has no slot for: `statusAtDecision` (`Active`,
+`Revoked`, `Retired`, `Stale`), `verifiedAt`, `freshnessPolicyVersion`,
+`freshnessBoundSeconds`, `validTime`, `revocation` with its own `checkedAt`,
+and `retirement`.
+
+Treat that struct as the worked example of what a chat verifier must *produce*,
+rather than re-deriving the list. It is not a shape this intent should grow.
+`identity` here is a caller-supplied claim; that binding is an
+authority-produced decision record, and a caller cannot meaningfully assert
+`verifiedAt` or `revocation.checkedAt`. Letting it try is how self-consistent
+client data starts to look like authority. The asymmetry is deliberate.
+
+The automation boundary reached the same two-phase structure independently,
+for its `RuntimeAuthorityV1` consumers: `validate_authority_profile_structure`
+checks shape and integrity without consulting live state, and
+`validate_authority_profile` then requires a verifier, failing with
+`AUTHORITY_ADAPTER_MISSING` when none is configured -- the same refusal this
+boundary spells `chat_context_admission_unavailable`.
+
+That qualification is load-bearing. A `GenericBaseV1` consumer returns
+`PreservedOpaque` from the structure check before any profile, capability or
+verifier requirement is reached, so the adapter refusal never arises for it at
+all. The parallel holds only for the consumer class that actually claims
+runtime authority -- which is the class a chat verifier would correspond to.
+
+One question is deliberately left open. That contract binds context as
+authority-resolved projection identities (`projectId`, `workspaceId`,
+`contextProjectionIds`, `memoryProjectionIds`), where this intent binds
+caller-described `projectRoot`, `resourceRefs`, `selections` and `sources` with
+content digests. Which model admitted chat context should use cannot be settled
+before a verifier exists to produce projection identities, and is the first
+question to settle when enabling work begins.
+
 No retained-side lifecycle, import/writeback, memory ingestion, accepted
 receipt store, or native isolation acceptance is implemented here.
