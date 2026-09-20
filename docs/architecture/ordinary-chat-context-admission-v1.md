@@ -244,11 +244,18 @@ authority-produced decision record, and a caller cannot meaningfully assert
 `verifiedAt` or `revocation.checkedAt`. Letting it try is how self-consistent
 client data starts to look like authority. The asymmetry is deliberate.
 
-The automation boundary reached the same two-phase structure independently:
-`validate_authority_profile_structure` checks shape and integrity without
-consulting live state, and `validate_authority_profile` then requires a
-verifier, failing with `AUTHORITY_ADAPTER_MISSING` when none is configured --
-the same refusal this boundary spells `chat_context_admission_unavailable`.
+The automation boundary reached the same two-phase structure independently,
+for its `RuntimeAuthorityV1` consumers: `validate_authority_profile_structure`
+checks shape and integrity without consulting live state, and
+`validate_authority_profile` then requires a verifier, failing with
+`AUTHORITY_ADAPTER_MISSING` when none is configured -- the same refusal this
+boundary spells `chat_context_admission_unavailable`.
+
+That qualification is load-bearing. A `GenericBaseV1` consumer returns
+`PreservedOpaque` from the structure check before any profile, capability or
+verifier requirement is reached, so the adapter refusal never arises for it at
+all. The parallel holds only for the consumer class that actually claims
+runtime authority -- which is the class a chat verifier would correspond to.
 
 One question is deliberately left open. That contract binds context as
 authority-resolved projection identities (`projectId`, `workspaceId`,
