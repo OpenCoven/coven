@@ -201,6 +201,13 @@ identity bundle was supplied for this admission boundary.
 
 ### Conditions for enabling acceptance
 
+**These conditions are tracked as
+[OpenCoven/coven#1137](https://github.com/OpenCoven/coven/issues/1137).** They
+are unbuilt work with real dependencies, not a checklist this document owns;
+the issue carries the ordered slices, and the two open questions that have to
+be settled before the second slice can start. What follows is the design
+reasoning behind them, kept here because it explains *why* each is required.
+
 This implementation completes the unavailable capability and rejection
 boundary. It contains no hidden success path, test-verifier switch, or accepted
 receipt placeholder. To enable acceptance in a later change, the owning
@@ -263,7 +270,8 @@ authority-resolved projection identities (`projectId`, `workspaceId`,
 caller-described `projectRoot`, `resourceRefs`, `selections` and `sources` with
 content digests. Which model admitted chat context should use cannot be settled
 before a verifier exists to produce projection identities, and is the first
-question to settle when enabling work begins.
+question to settle when enabling work begins. It is tracked with the rest of
+that work in [#1137](https://github.com/OpenCoven/coven/issues/1137).
 
 No retained-side lifecycle, import/writeback, memory ingestion, accepted
 receipt store, or native isolation acceptance is implemented here.
