@@ -30,12 +30,27 @@ or kill, is rejected. It does not extend those contracts. Mixing it with
 `executionBinding` or `requestAdoption` is rejected without interpreting either
 as chat authority.
 
-Routes under `/api/v1/internal/` that the daemon dispatches *before* the API
-handler -- lifecycle shutdown, and mobile local control, which ignores the
-request body entirely -- are gated at that earlier dispatch point. Without that
-gate an internal mutation would take effect while carrying an intent, returning
-its own success instead of a refusal, so "any other mutation" would hold only
-for the routes the API handler happens to observe.
+The daemon dispatches some routes *before* the API handler: lifecycle
+shutdown, and mobile local control, which ignores the request body entirely.
+Without a gate above those, an internal mutation would take effect while
+carrying an intent, returning its own success instead of a refusal, so "any
+other mutation" would hold only for the routes the API handler happens to
+observe.
+
+The gate therefore runs once in the daemon, immediately after the request body
+is read, at the point every remaining dispatch path passes through. It
+classifies the path with the same `normalize_api_route` the API handler uses,
+so `/sessions` and `/sessions/:id/input` keep their admission semantics rather
+than being refused as some other route, and an unsupported or malformed version
+prefix is left for the handler's 404. Scoping the gate by path prefix instead
+would hold only while every early-dispatched route keeps that prefix.
+
+One route is resolved even earlier, above the body read, and reaches neither
+gate: `POST /sessions/restricted`, which `session_policy` answers itself. It
+stays safe for a different reason -- `RestrictedRequest` is a closed schema, so
+an unknown `contextAdmission` member is refused at deserialization. That is a
+property of the schema, not of this boundary; opening it would require giving
+that route its own gate.
 
 For direct CLI launch, `--context-admission FILE` reads a bounded JSON intent.
 The gate also applies with `--continue`, `--detach`, and streaming flags.

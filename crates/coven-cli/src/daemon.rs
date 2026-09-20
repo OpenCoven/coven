@@ -5573,15 +5573,29 @@ where
     };
     // Lifecycle shutdown and mobile local control are dispatched below without
     // reaching `api::handle_request_with_runtime_and_authority`, so the chat
-    // context intent gate inside it never observes them. Reject the intent here
-    // so an internal mutation cannot take effect while carrying one, and so the
+    // context intent gate inside it never observes them. Run the gate here, at
+    // the one point every remaining dispatch path passes through, so the
     // documented "only /sessions and /sessions/:id/input" boundary holds for
     // every route rather than only the ones the API handler sees.
-    let internal_intent_rejection = if path.starts_with("/api/v1/internal/") {
-        crate::chat_context_admission::reject_api_intent(method, path, body.as_deref(), authority)?
-    } else {
-        None
-    };
+    //
+    // Classify the path exactly as that handler does, so `/sessions` and
+    // `/sessions/:id/input` keep their admission semantics instead of being
+    // refused here as some other route. An unsupported or malformed version
+    // prefix is left alone: it cannot reach an early dispatch, and the handler
+    // owns its 404.
+    let internal_intent_rejection =
+        match crate::api_routes::normalize_api_route(crate::api_routes::split_path_query(path).0) {
+            crate::api_routes::ApiRoute::Route(route) => {
+                crate::chat_context_admission::reject_api_intent(
+                    method,
+                    route.as_ref(),
+                    body.as_deref(),
+                    authority,
+                )?
+            }
+            crate::api_routes::ApiRoute::Unsupported(_)
+            | crate::api_routes::ApiRoute::Malformed => None,
+        };
     let lifecycle_response = if internal_intent_rejection.is_none()
         && lifecycle == LifecycleControl::OwnerLocal
         && method == "POST"
@@ -9831,6 +9845,205 @@ mod tests {
             response.contains(r#""code":"internal_error""#),
             "got: {response}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_context_admission_surface_survives_the_daemon_level_gate() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        // The daemon-level gate classifies the path exactly as the API handler
+        // does, so the real admission surface must still be treated as an
+        // admission request -- refused for want of trusted authority, not
+        // refused as the wrong route. Both the versioned and unversioned
+        // spellings normalize to the same route.
+        for route in ["/api/v1/sessions", "/sessions"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            ensure_private_coven_home(temp.path()).expect("ensure home");
+            let runtime = NoopSessionRuntime;
+            let intent = crate::chat_context_admission::test_intent(
+                temp.path(),
+                "hello",
+                serde_json::Value::Null,
+            );
+            let body = serde_json::json!({
+                "projectRoot": temp.path(),
+                "harness": "codex",
+                "familiarId": "fixture",
+                "prompt": "hello",
+                "contextAdmission": intent,
+            })
+            .to_string();
+            let request = format!(
+                "POST {route} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut stream = Cursor::new(request.into_bytes());
+            let mut output: Vec<u8> = Vec::new();
+            handle_http_stream(
+                &mut stream,
+                &mut output,
+                temp.path(),
+                None,
+                &runtime,
+                None,
+                HostGuard::Disabled,
+            )
+            .expect("handle ok");
+            let response = String::from_utf8(output).expect("utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "{route} got: {response}"
+            );
+            assert!(
+                response.contains(r#""code":"chat_context_admission_unavailable""#),
+                "{route} got: {response}"
+            );
+            assert!(
+                !response.contains("chat_context_wrong_route"),
+                "{route} was refused as the wrong route: {response}"
+            );
+            assert!(
+                response.contains(r#""receiptIssued":false"#),
+                "{route} got: {response}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_context_admission_other_mutations_reject_at_daemon_dispatch() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        // `api::tests::chat_context_admission_cannot_be_dropped_by_other_mutations`
+        // asserts this through the API handler. Assert it again through the
+        // daemon, which is the layer an actual client reaches, so a future
+        // early dispatch added for one of these routes cannot quietly skip the
+        // gate the way lifecycle and local control did.
+        for (method, route) in [
+            ("POST", "/api/v1/cast"),
+            ("POST", "/api/v1/actions"),
+            ("POST", "/api/v1/afs/sessions"),
+            ("POST", "/api/v1/hub/jobs"),
+            ("PUT", "/api/v1/familiars/fixture/icon"),
+            ("PATCH", "/api/v1/sessions/session-1"),
+            ("DELETE", "/api/v1/afs/sessions/session-1"),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            ensure_private_coven_home(temp.path()).expect("ensure home");
+            let runtime = NoopSessionRuntime;
+            let intent = crate::chat_context_admission::test_intent(
+                temp.path(),
+                "hello",
+                serde_json::Value::Null,
+            );
+            let body = serde_json::json!({
+                "projectRoot": temp.path(),
+                "harness": "codex",
+                "familiarId": "fixture",
+                "prompt": "hello",
+                "contextAdmission": intent,
+            })
+            .to_string();
+            let request = format!(
+                "{method} {route} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut stream = Cursor::new(request.into_bytes());
+            let mut output: Vec<u8> = Vec::new();
+            handle_http_stream(
+                &mut stream,
+                &mut output,
+                temp.path(),
+                None,
+                &runtime,
+                None,
+                HostGuard::Disabled,
+            )
+            .expect("handle ok");
+            let response = String::from_utf8(output).expect("utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{method} {route} got: {response}"
+            );
+            assert!(
+                response.contains(r#""code":"chat_context_wrong_route""#),
+                "{method} {route} got: {response}"
+            );
+            assert!(
+                !crate::api::store_path(temp.path()).exists(),
+                "{method} {route} created a store"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_context_admission_cannot_ride_the_restricted_session_route() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        // `POST /sessions/restricted` is resolved by `session_policy` before the
+        // body-read gate below it, so it never reaches either the daemon-level
+        // gate or the API handler. It stays safe because `RestrictedRequest` is
+        // a closed schema: an unknown `contextAdmission` member is refused at
+        // deserialization. This pins that reasoning -- if the schema is ever
+        // opened, this route needs its own gate.
+        for route in ["/api/v1/sessions/restricted", "/sessions/restricted"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            ensure_private_coven_home(temp.path()).expect("ensure home");
+            let runtime = NoopSessionRuntime;
+            let body = serde_json::json!({
+                "contract": "coven.session-policy.v1",
+                "requestId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "invocationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "profile": "workspace-readonly-no-network.v1",
+                "expiresAtUnixMs": 1_800_000_000_000i64,
+                "launch": {
+                    "projectRoot": "/example/project",
+                    "cwd": "/example/project",
+                    "harness": "codex",
+                    "familiarId": "sage",
+                    "launchMode": "nonInteractive",
+                    "prompt": "Review the supplied material.",
+                    "title": "Wand review"
+                },
+                "contextAdmission": serde_json::Value::Null,
+            })
+            .to_string();
+            let request = format!(
+                "POST {route} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut stream = Cursor::new(request.into_bytes());
+            let mut output: Vec<u8> = Vec::new();
+            handle_http_stream(
+                &mut stream,
+                &mut output,
+                temp.path(),
+                None,
+                &runtime,
+                None,
+                HostGuard::Disabled,
+            )
+            .expect("handle ok");
+            let response = String::from_utf8(output).expect("utf8");
+            // Refused, and never admitted: no decision, no session, no store.
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{route} got: {response}"
+            );
+            assert!(
+                !response.contains(r#""decision""#),
+                "{route} produced a session-policy decision: {response}"
+            );
+            assert!(
+                !crate::api::store_path(temp.path()).exists(),
+                "{route} created a store"
+            );
+        }
     }
 
     #[cfg(unix)]
