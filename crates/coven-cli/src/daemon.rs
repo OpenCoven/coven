@@ -5434,6 +5434,14 @@ enum LifecycleControl {
     OwnerLocal,
 }
 
+/// A dispatch that answers before `crate::api` does, and therefore does not
+/// inherit the chat-context gate inside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlyDispatch {
+    LifecycleShutdown,
+    LocalControl,
+}
+
 #[derive(Clone, Copy)]
 struct HttpStreamPolicy<'a> {
     host_guard: HostGuard<'a>,
@@ -5571,20 +5579,35 @@ where
         HostGuard::Disabled => crate::api::RequestAuthority::OwnerLocalIpc,
         HostGuard::Loopback { .. } => crate::api::RequestAuthority::Tcp,
     };
-    // Lifecycle shutdown and mobile local control are dispatched below without
-    // reaching `api::handle_request_with_runtime_and_authority`, so the chat
-    // context intent gate inside it never observes them. Run the gate here, at
-    // the one point every remaining dispatch path passes through, so the
-    // documented "only /sessions and /sessions/:id/input" boundary holds for
-    // every route rather than only the ones the API handler sees.
+    // Which pre-API dispatch, if any, owns this request.
     //
-    // Classify the path exactly as that handler does, so `/sessions` and
-    // `/sessions/:id/input` keep their admission semantics instead of being
-    // refused here as some other route. An unsupported or malformed version
-    // prefix is left alone: it cannot reach an early dispatch, and the handler
+    // Deciding this once is what keeps the chat-context gate honest. The gate
+    // runs exactly when a request would answer without reaching
+    // `api::handle_request_with_runtime_and_authority` -- which applies the
+    // same gate itself -- and every bypassing request is dispatched from this
+    // same decision, so the two cannot drift apart the way a path-prefix test
+    // would. Requests that do reach the handler are gated there, and are not
+    // re-parsed here.
+    let early_dispatch = if lifecycle == LifecycleControl::OwnerLocal
+        && method == "POST"
+        && path == "/api/v1/internal/lifecycle/shutdown"
+    {
+        Some(EarlyDispatch::LifecycleShutdown)
+    } else if matches!(guard, HostGuard::Disabled)
+        && crate::mobile_memory::gateway::claims_local_control(path)
+    {
+        Some(EarlyDispatch::LocalControl)
+    } else {
+        None
+    };
+    // Classify the path exactly as the API handler does, so a route it would
+    // have admitted is not refused here as some other route. An unsupported or
+    // malformed version prefix cannot reach an early dispatch, and the handler
     // owns its 404.
-    let internal_intent_rejection =
-        match crate::api_routes::normalize_api_route(crate::api_routes::split_path_query(path).0) {
+    let intent_rejection = match early_dispatch {
+        Some(_) => match crate::api_routes::normalize_api_route(
+            crate::api_routes::split_path_query(path).0,
+        ) {
             crate::api_routes::ApiRoute::Route(route) => {
                 crate::chat_context_admission::reject_api_intent(
                     method,
@@ -5595,30 +5618,20 @@ where
             }
             crate::api_routes::ApiRoute::Unsupported(_)
             | crate::api_routes::ApiRoute::Malformed => None,
-        };
-    let lifecycle_response = if internal_intent_rejection.is_none()
-        && lifecycle == LifecycleControl::OwnerLocal
-        && method == "POST"
-        && path == "/api/v1/internal/lifecycle/shutdown"
-    {
-        Some(lifecycle_shutdown_response(
-            status.as_ref(),
-            body.as_deref(),
-        )?)
-    } else {
-        None
+        },
+        None => None,
     };
-    let local_control =
-        if internal_intent_rejection.is_none() && matches!(guard, HostGuard::Disabled) {
-            crate::mobile_memory::gateway::handle_local_control(method, path, body.as_deref())
-        } else {
-            None
-        };
-    let (response, hold_for_shutdown) = if let Some(rejection) = internal_intent_rejection {
+    let (response, hold_for_shutdown) = if let Some(rejection) = intent_rejection {
         (rejection, false)
-    } else if let Some(response) = lifecycle_response {
-        response
+    } else if matches!(early_dispatch, Some(EarlyDispatch::LifecycleShutdown)) {
+        lifecycle_shutdown_response(status.as_ref(), body.as_deref())?
     } else {
+        let local_control = match early_dispatch {
+            Some(EarlyDispatch::LocalControl) => {
+                crate::mobile_memory::gateway::handle_local_control(method, path, body.as_deref())
+            }
+            _ => None,
+        };
         let response = match local_control.unwrap_or_else(|| {
             crate::api::handle_request_with_runtime_and_authority(
                 method,

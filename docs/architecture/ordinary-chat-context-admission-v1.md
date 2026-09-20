@@ -37,13 +37,20 @@ carrying an intent, returning its own success instead of a refusal, so "any
 other mutation" would hold only for the routes the API handler happens to
 observe.
 
-The gate therefore runs once in the daemon, immediately after the request body
-is read, at the point every remaining dispatch path passes through. It
-classifies the path with the same `normalize_api_route` the API handler uses,
-so `/sessions` and `/sessions/:id/input` keep their admission semantics rather
-than being refused as some other route, and an unsupported or malformed version
-prefix is left for the handler's 404. Scoping the gate by path prefix instead
-would hold only while every early-dispatched route keeps that prefix.
+The daemon therefore decides **once**, before dispatching, whether a request
+is answered by one of those pre-API paths, and applies the gate exactly when it
+is. The same decision then performs the dispatch, so the set of requests that
+bypass the API handler and the set the daemon gates cannot drift apart. A
+request that does reach the handler is gated there, and its body is not parsed
+a second time on the way.
+
+Where the daemon does gate, it classifies the path with the same
+`normalize_api_route` the handler uses, so a route the handler would have
+admitted is not refused earlier as some other route; an unsupported or
+malformed version prefix cannot reach a pre-API dispatch and is left for the
+handler's 404. Scoping by path prefix instead would hold only while every
+pre-API route keeps that prefix, which is the assumption that produced the
+original gap.
 
 One route is resolved even earlier, above the body read, and reaches neither
 gate: `POST /sessions/restricted`, which `session_policy` answers itself. It
