@@ -15,6 +15,198 @@ use anyhow::Context;
 use serde_json::{json, Value};
 
 #[test]
+fn chat_context_admission_cli_never_downgrades_to_an_ordinary_run() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let coven_home = temp.path().join("coven-home");
+    let manifest_path = temp.path().join("context.json");
+    fs::write(&manifest_path, "null")?;
+    let output = run_coven_in(
+        &coven_bin(),
+        &coven_home,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        temp.path(),
+        &[],
+        &[
+            "run",
+            "codex",
+            "hello",
+            "--context-admission",
+            manifest_path.to_str().unwrap(),
+        ],
+    )?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("chat_context_invalid"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!coven_home.join("coven.sqlite3").exists());
+    Ok(())
+}
+
+#[test]
+fn chat_context_admission_cli_fences_refs_detach_stream_and_resume() -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let hash = |bytes: &[u8]| {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let coven_home = root.join("coven-home");
+    let fake_bin = root.join("bin");
+    fs::create_dir(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    let launched = root.join("harness-launched");
+    let executable = fake_bin.join("codex");
+    fs::write(
+        &executable,
+        "#!/bin/sh\n: > \"$COVEN_CONTEXT_LAUNCH_MARKER\"\nexit 91\n",
+    )?;
+    let path = std::env::join_paths(std::iter::once(fake_bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))?;
+    let initialized = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&root)
+        .output()?;
+    assert_success("initialize isolated context fixture", &initialized);
+    // If reference expansion runs, reading this directory as text fails.
+    fs::create_dir(root.join("unselected.md"))?;
+    let intent_path = root.join("context.json");
+    for (prompt, flags, receipt_session, expected) in [
+        ("hello", vec![], None, "chat_context_admission_unavailable"),
+        (
+            "@unselected.md",
+            vec![],
+            None,
+            "chat_context_implicit_refs_unsupported",
+        ),
+        (
+            "@T-parent",
+            vec![],
+            None,
+            "chat_context_implicit_refs_unsupported",
+        ),
+        (
+            "@@parent",
+            vec![],
+            None,
+            "chat_context_implicit_refs_unsupported",
+        ),
+        (
+            "hello",
+            vec!["--detach"],
+            None,
+            "chat_context_admission_unavailable",
+        ),
+        (
+            "hello",
+            vec!["--stream-json", "--stream-json-input"],
+            None,
+            "chat_context_admission_unavailable",
+        ),
+        (
+            "hello",
+            vec!["--continue", "missing-session"],
+            None,
+            "chat_context_mismatch",
+        ),
+        (
+            "hello",
+            vec!["--continue", "other-session"],
+            Some("session-1"),
+            "chat_context_mismatch",
+        ),
+        (
+            "hello",
+            vec!["--continue", "session-1"],
+            Some("session-1"),
+            "chat_context_receipt_unavailable",
+        ),
+        (
+            "hello",
+            vec!["--continue"],
+            Some("session-1"),
+            "chat_context_mismatch",
+        ),
+    ] {
+        let manifest = json!({
+            "identity": {
+                "profile": "familiar.embodiment_binding.v1",
+                "bindingId": "binding:unverified", "bindingDigest": "a".repeat(64),
+                "familiarRootId": "familiar:fixture-root", "identityRevisionId": "revision:fixture"
+            },
+            "familiarId": "fixture", "harness": "codex", "model": null,
+            "adapterProfile": "codex:unqualified-context-v1", "mode": "continuity",
+            "projectRoot": root, "resourceRefs": ["resource:fixture"],
+            "selections": ["identity", "policy"],
+            "sources": (["identity", "policy"].map(|category| json!({
+                "sourceRef": format!("source:{category}"), "sourceRevision": "revision:fixture",
+                "contentDigest": "b".repeat(64), "resourceRef": "resource:fixture",
+                "category": category, "truncation": {"originalBytes": 10, "includedBytes": 10}
+            }))),
+            "promptDigest": hash(prompt.as_bytes()),
+            "launchPolicyDigest": hash(&serde_jcs::to_vec(&json!({
+                "permission": null, "addDirs": [], "think": false, "speed": null
+            }))?),
+            "retention": "retained", "optionalMemoryPolicy": "disabled"
+        });
+        let mut intent = json!({
+            "profile": "coven.chat_context_admission.v1",
+            "manifestDigest": hash(&serde_jcs::to_vec(&manifest)?),
+            "manifest": manifest, "expectedReceipt": null
+        });
+        if let Some(session_id) = receipt_session {
+            intent["expectedReceipt"] = json!({
+                "receiptId": "receipt:never-issued",
+                "sessionId": session_id,
+                "manifestDigest": intent["manifestDigest"],
+                "bindingDigest": intent["manifest"]["identity"]["bindingDigest"]
+            });
+        }
+        fs::write(&intent_path, intent.to_string())?;
+        let mut args = vec![
+            "run",
+            "codex",
+            prompt,
+            "--familiar",
+            "fixture",
+            "--context-admission",
+            intent_path.to_str().unwrap(),
+        ];
+        args.extend(flags);
+        let output = run_coven_in(
+            &coven_bin(),
+            &coven_home,
+            &path,
+            &root,
+            &[("COVEN_CONTEXT_LAUNCH_MARKER", launched.to_str().unwrap())],
+            &args,
+        )?;
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !launched.exists(),
+            "rejected request invoked the harness: {args:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fake codex"));
+        let database = coven_home.join("coven.sqlite3");
+        assert!(
+            !database.exists(),
+            "rejected request initialized the store: {args:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn daemon_status_clears_stale_metadata_when_daemon_is_gone() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");

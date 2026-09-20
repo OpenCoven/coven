@@ -11,6 +11,10 @@ pub(crate) enum RequestAuthority {
 }
 
 impl RequestAuthority {
+    pub(crate) fn allows_chat_context_admission(self) -> bool {
+        matches!(self, Self::OwnerLocalIpc)
+    }
+
     pub(crate) fn allows_session_launch_policy(self) -> bool {
         matches!(self, Self::OwnerLocalIpc)
     }
@@ -32,9 +36,11 @@ mod tests {
     fn sensitive_capabilities_require_owner_local_ipc() {
         assert!(RequestAuthority::OwnerLocalIpc.allows_session_launch_policy());
         assert!(RequestAuthority::OwnerLocalIpc.allows_ward_proposal_access());
+        assert!(RequestAuthority::OwnerLocalIpc.allows_chat_context_admission());
         assert!(!RequestAuthority::Tcp.allows_session_launch_policy());
         assert!(!RequestAuthority::Tcp.allows_ward_proposal_access());
         assert!(RequestAuthority::OwnerLocalIpc.allows_automation_receipt_access());
+        assert!(!RequestAuthority::Tcp.allows_chat_context_admission());
         assert!(!RequestAuthority::Tcp.allows_automation_receipt_access());
     }
 }

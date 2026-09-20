@@ -854,6 +854,11 @@ fn handle_request_with_runtime_authority_and_automation_time(
             return api_error(404, "not_found", "Route not found.", None);
         }
     };
+    if let Some(rejection) =
+        crate::chat_context_admission::reject_api_intent(method, route.as_ref(), body, authority)?
+    {
+        return Ok(rejection);
+    }
     match (method, route.as_ref()) {
         ("GET", "/api-version") => json_response(
             200,
@@ -23490,6 +23495,333 @@ pub(crate) mod tests {
             assert_eq!(launches[0].launch_mode, HarnessLaunchMode::Interactive);
             assert!(launches[0].launch_policy.is_none());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn chat_context_admission_is_not_silently_dropped_at_launch() -> anyhow::Result<()> {
+        for intent in [Value::Null, json!({}), json!({"profile": "unknown"})] {
+            let temp = tempfile::tempdir()?;
+            let project_root = temp.path().join("repo");
+            std::fs::create_dir(&project_root)?;
+            let runtime = RecordingRuntime::default();
+            let body = json!({
+                "projectRoot": project_root,
+                "harness": "codex",
+                "prompt": "hello",
+                "contextAdmission": intent
+            });
+            let response = handle_request_with_runtime(
+                "POST",
+                "/sessions",
+                temp.path(),
+                None,
+                Some(&body.to_string()),
+                &runtime,
+            )?;
+            assert_eq!(response.status, 400, "{}", response.body);
+            assert!(response.body.contains("chat_context_invalid"));
+            assert!(runtime.launches.borrow().is_empty());
+            assert!(!store_path(temp.path()).exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chat_context_admission_is_not_silently_dropped_at_input() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        insert_test_session(temp.path(), "session-1")?;
+        let runtime = RecordingRuntime::default();
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp.path(),
+            None,
+            Some(r#"{"data":"hello","contextAdmission":null}"#),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert!(response.body.contains("chat_context_invalid"));
+        assert!(runtime.inputs.borrow().is_empty());
+        let events = handle_request("GET", "/events?sessionId=session-1", temp.path(), None)?;
+        assert!(!events.body.contains(r#""kind":"input""#));
+        Ok(())
+    }
+
+    #[test]
+    fn chat_context_admission_unverified_profiles_never_reach_runtime_or_store(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+        for route in ["/sessions", "/api/v1/sessions"] {
+            for (harness, mode, retention, revision) in [
+                ("codex", "continuity", "retained", "revision:current"),
+                ("claude", "fresh", "retained", "revision:current"),
+                ("copilot", "fresh", "temporary", "revision:current"),
+                ("codex", "continuity", "retained", "revision:stale"),
+                ("codex", "continuity", "retained", "revision:revoked"),
+            ] {
+                let mut intent =
+                    crate::chat_context_admission::test_intent(temp.path(), "hello", Value::Null);
+                intent["manifest"]["harness"] = json!(harness);
+                intent["manifest"]["adapterProfile"] = json!(format!("{harness}:not-qualified"));
+                intent["manifest"]["mode"] = json!(mode);
+                intent["manifest"]["retention"] = json!(retention);
+                intent["manifest"]["identity"]["identityRevisionId"] = json!(revision);
+                intent["manifestDigest"] = json!(crate::automations::contract::sha256_digest(
+                    &intent["manifest"]
+                )?);
+                let body = json!({
+                    "projectRoot": temp.path(), "harness": harness, "familiarId": "fixture",
+                    "prompt": "hello", "contextAdmission": intent
+                })
+                .to_string();
+                for _ in 0..2 {
+                    let response = handle_request_with_runtime(
+                        "POST",
+                        route,
+                        temp.path(),
+                        None,
+                        Some(&body),
+                        &runtime,
+                    )?;
+                    assert_eq!(response.status, 503, "{}", response.body);
+                    assert!(response.body.contains("chat_context_admission_unavailable"));
+                    assert!(response.body.contains(r#""receiptIssued":false"#));
+                    assert!(!response.body.contains(revision));
+                }
+            }
+        }
+        assert!(runtime.launches.borrow().is_empty());
+        assert!(!store_path(temp.path()).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn chat_context_admission_receipt_retry_cannot_create_an_input_receipt() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        insert_test_session(temp.path(), "session-1")?;
+        let before = std::fs::read(store_path(temp.path()))?;
+        let runtime = RecordingRuntime::default();
+        let mut intent =
+            crate::chat_context_admission::test_intent(temp.path(), "hello", Value::Null);
+        intent["expectedReceipt"] = json!({
+            "receiptId": "receipt:never-issued",
+            "sessionId": "session-1",
+            "manifestDigest": intent["manifestDigest"],
+            "bindingDigest": intent["manifest"]["identity"]["bindingDigest"]
+        });
+        let body = json!({"data": "hello", "contextAdmission": intent}).to_string();
+        for _ in 0..2 {
+            let response = handle_request_with_runtime(
+                "POST",
+                "/api/v1/sessions/session-1/input",
+                temp.path(),
+                None,
+                Some(&body),
+                &runtime,
+            )?;
+            assert_eq!(response.status, 503, "{}", response.body);
+            assert!(response.body.contains("chat_context_receipt_unavailable"));
+            assert!(!response.body.contains(r#""accepted":true"#));
+        }
+        let altered = body.replace("\"data\":\"hello\"", "\"data\":\"changed\"");
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp.path(),
+            None,
+            Some(&altered),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert!(response.body.contains("manifest.promptDigest"));
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/other/input",
+            temp.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert!(response.body.contains("expectedReceipt.sessionId"));
+        assert!(runtime.inputs.borrow().is_empty());
+        assert_eq!(std::fs::read(store_path(temp.path()))?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn chat_context_admission_transport_and_alternate_routes_fail_closed() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+        let intent = crate::chat_context_admission::test_intent(temp.path(), "hello", Value::Null);
+        let body = json!({
+            "projectRoot": temp.path(), "harness": "codex", "familiarId": "fixture",
+            "prompt": "hello", "contextAdmission": intent
+        })
+        .to_string();
+        let response = handle_request_with_runtime_and_authority(
+            "POST",
+            "/sessions",
+            temp.path(),
+            None,
+            Some(&body),
+            &runtime,
+            RequestAuthority::Tcp,
+        )?;
+        assert_eq!(response.status, 403);
+        assert!(response.body.contains("chat_context_forbidden"));
+        for route in [
+            "/adopted-sessions",
+            "/sessions/external",
+            "/sessions/s/adopted-input",
+            "/sessions/s/kill",
+            "/sessions/s/handoffs",
+            "/sessions/s/complete",
+        ] {
+            let response = handle_request_with_runtime(
+                "POST",
+                route,
+                temp.path(),
+                None,
+                Some(&body),
+                &runtime,
+            )?;
+            assert_eq!(response.status, 400, "{route}: {}", response.body);
+            assert!(response.body.contains("chat_context_wrong_route"));
+        }
+        for field in ["executionBinding", "requestAdoption"] {
+            let mut mixed: Value = serde_json::from_str(&body)?;
+            mixed[field] = Value::Null;
+            let response = handle_request_with_runtime(
+                "POST",
+                "/sessions",
+                temp.path(),
+                None,
+                Some(&mixed.to_string()),
+                &runtime,
+            )?;
+            assert!(response.body.contains("chat_context_wrong_route"));
+        }
+        assert!(runtime.launches.borrow().is_empty());
+        assert!(runtime.inputs.borrow().is_empty());
+        assert!(!store_path(temp.path()).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn chat_context_admission_cannot_be_dropped_by_other_mutations() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+        let intent = crate::chat_context_admission::test_intent(temp.path(), "hello", Value::Null);
+        let body = json!({
+            "projectRoot": temp.path(), "harness": "codex", "familiarId": "fixture",
+            "prompt": "hello", "contextAdmission": intent
+        })
+        .to_string();
+        for (method, route) in [
+            ("POST", "/api/v1/cast"),
+            ("POST", "/api/v1/actions"),
+            ("POST", "/api/v1/afs/sessions"),
+            ("POST", "/api/v1/hub/jobs"),
+            ("PUT", "/api/v1/familiars/fixture/icon"),
+            ("PATCH", "/api/v1/sessions/session-1"),
+            ("DELETE", "/api/v1/afs/sessions/session-1"),
+        ] {
+            let response = handle_request_with_runtime(
+                method,
+                route,
+                temp.path(),
+                None,
+                Some(&body),
+                &runtime,
+            )?;
+            assert_eq!(response.status, 400, "{method} {route}: {}", response.body);
+            assert!(
+                response.body.contains("chat_context_wrong_route"),
+                "{method} {route}: {}",
+                response.body
+            );
+            assert!(!store_path(temp.path()).exists());
+        }
+        assert!(runtime.launches.borrow().is_empty());
+        assert!(runtime.inputs.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn chat_context_admission_fresh_input_cannot_reuse_a_session() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+        let mut intent =
+            crate::chat_context_admission::test_intent(temp.path(), "hello", Value::Null);
+        intent["manifest"]["mode"] = json!("fresh");
+        intent["manifestDigest"] = json!(crate::automations::contract::sha256_digest(
+            &intent["manifest"]
+        )?);
+        intent["expectedReceipt"] = json!({
+            "receiptId": "receipt:unverified",
+            "sessionId": "session-1",
+            "manifestDigest": intent["manifestDigest"],
+            "bindingDigest": intent["manifest"]["identity"]["bindingDigest"]
+        });
+        let body = json!({"data": "hello", "contextAdmission": intent}).to_string();
+        let response = handle_request_with_runtime(
+            "POST",
+            "/api/v1/sessions/session-1/input",
+            temp.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert!(response.body.contains("manifest.mode"));
+        assert!(runtime.inputs.borrow().is_empty());
+        assert!(!store_path(temp.path()).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn chat_context_admission_duplicate_keys_cannot_hide_an_intent() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+        let intent = crate::chat_context_admission::test_intent(temp.path(), "hello", Value::Null);
+        let body = json!({
+            "projectRoot": temp.path(), "harness": "codex", "familiarId": "fixture",
+            "prompt": "hello", "contextAdmission": intent
+        })
+        .to_string();
+        for altered in [
+            body.replacen(
+                "\"contextAdmission\":",
+                "\"contextAdmission\":null,\"contextAdmission\":",
+                1,
+            ),
+            body.replacen(
+                "\"contextAdmission\":",
+                "\"prompt\":\"hidden\",\"contextAdmission\":",
+                1,
+            ),
+            body.replacen(
+                "\"contextAdmission\":",
+                "\"\\u0063ontextAdmission\":null,\"contextAdmission\":",
+                1,
+            ),
+        ] {
+            let response = handle_request_with_runtime(
+                "POST",
+                "/sessions",
+                temp.path(),
+                None,
+                Some(&altered),
+                &runtime,
+            )?;
+            assert_eq!(response.status, 400, "{}", response.body);
+            assert!(response.body.contains("chat_context_invalid"));
+        }
+        assert!(runtime.launches.borrow().is_empty());
+        assert!(!store_path(temp.path()).exists());
         Ok(())
     }
 

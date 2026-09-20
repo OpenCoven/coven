@@ -5567,7 +5567,23 @@ where
     let _request_trace = request_diagnostics::begin(coven_home, method, path);
     let body = read_http_body(&mut reader, headers.content_length)?;
     request_diagnostics::checkpoint(Phase::BodyRead);
-    let lifecycle_response = if lifecycle == LifecycleControl::OwnerLocal
+    let authority = match guard {
+        HostGuard::Disabled => crate::api::RequestAuthority::OwnerLocalIpc,
+        HostGuard::Loopback { .. } => crate::api::RequestAuthority::Tcp,
+    };
+    // Lifecycle shutdown and mobile local control are dispatched below without
+    // reaching `api::handle_request_with_runtime_and_authority`, so the chat
+    // context intent gate inside it never observes them. Reject the intent here
+    // so an internal mutation cannot take effect while carrying one, and so the
+    // documented "only /sessions and /sessions/:id/input" boundary holds for
+    // every route rather than only the ones the API handler sees.
+    let internal_intent_rejection = if path.starts_with("/api/v1/internal/") {
+        crate::chat_context_admission::reject_api_intent(method, path, body.as_deref(), authority)?
+    } else {
+        None
+    };
+    let lifecycle_response = if internal_intent_rejection.is_none()
+        && lifecycle == LifecycleControl::OwnerLocal
         && method == "POST"
         && path == "/api/v1/internal/lifecycle/shutdown"
     {
@@ -5578,19 +5594,18 @@ where
     } else {
         None
     };
-    let local_control = if matches!(guard, HostGuard::Disabled) {
-        crate::mobile_memory::gateway::handle_local_control(method, path, body.as_deref())
-    } else {
-        None
-    };
-    let (response, hold_for_shutdown) = if let Some(response) = lifecycle_response {
+    let local_control =
+        if internal_intent_rejection.is_none() && matches!(guard, HostGuard::Disabled) {
+            crate::mobile_memory::gateway::handle_local_control(method, path, body.as_deref())
+        } else {
+            None
+        };
+    let (response, hold_for_shutdown) = if let Some(rejection) = internal_intent_rejection {
+        (rejection, false)
+    } else if let Some(response) = lifecycle_response {
         response
     } else {
         let response = match local_control.unwrap_or_else(|| {
-            let authority = match guard {
-                HostGuard::Disabled => crate::api::RequestAuthority::OwnerLocalIpc,
-                HostGuard::Loopback { .. } => crate::api::RequestAuthority::Tcp,
-            };
             crate::api::handle_request_with_runtime_and_authority(
                 method,
                 path,
@@ -9816,6 +9831,72 @@ mod tests {
             response.contains(r#""code":"internal_error""#),
             "got: {response}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_context_admission_cannot_ride_an_early_internal_dispatch() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        // Mobile local control and lifecycle shutdown are dispatched before the
+        // API handler runs, so they must refuse a chat-context intent rather
+        // than take effect while carrying one. A malformed intent is refused at
+        // parse; a well-formed one is refused for the route it arrived on.
+        let well_formed = crate::chat_context_admission::test_intent(
+            Path::new("/example/project"),
+            "hello",
+            serde_json::Value::Null,
+        );
+        for (label, admission, expected_code) in [
+            ("null", serde_json::Value::Null, "chat_context_invalid"),
+            ("well-formed", well_formed, "chat_context_wrong_route"),
+        ] {
+            for path in [
+                "/api/v1/internal/mobile/pairings",
+                "/api/v1/internal/lifecycle/shutdown",
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                ensure_private_coven_home(temp.path()).expect("ensure home");
+                let runtime = NoopSessionRuntime;
+                let body = serde_json::json!({ "contextAdmission": admission.clone() }).to_string();
+                let request = format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let mut stream = Cursor::new(request.into_bytes());
+                let mut output: Vec<u8> = Vec::new();
+                let outcome = handle_http_stream_with_lifecycle(
+                    &mut stream,
+                    &mut output,
+                    temp.path(),
+                    None,
+                    &runtime,
+                    None,
+                    HttpStreamPolicy {
+                        host_guard: HostGuard::Disabled,
+                        lifecycle: LifecycleControl::OwnerLocal,
+                    },
+                )
+                .expect("handle ok");
+                let response = String::from_utf8(output).expect("utf8");
+                assert!(
+                    response.starts_with("HTTP/1.1 400 Bad Request"),
+                    "{label} {path} got: {response}"
+                );
+                assert!(
+                    response.contains(&format!(r#""code":"{expected_code}""#)),
+                    "{label} {path} got: {response}"
+                );
+                // The daemon must not be held open for a shutdown it refused.
+                assert_eq!(outcome, HttpStreamOutcome::Complete, "{label} {path}");
+                // A pairing invitation would carry this field.
+                assert!(
+                    !response.contains("terminal_output"),
+                    "{label} {path} created a pairing: {response}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

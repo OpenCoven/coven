@@ -590,6 +590,24 @@ this forbidden legacy location returns `request_adoption_invalid` at
 [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1)
 and [Psyche request-adoption contract (`v1`)](#psyche-request-adoption-contract-v1).
 
+### Ordinary-chat context intent (not enabled)
+
+An explicit `contextAdmission` member must not silently become an ordinary
+launch or input. The source-level
+[`coven.chat_context_admission.v1` intent boundary](architecture/ordinary-chat-context-admission-v1.md)
+validates a closed manifest and refuses execution while trusted Familiar
+embodiment verification and native context-profile qualification are absent.
+It issues no accepted receipt and advertises no new capability.
+
+This is separate from `executionBinding` and `requestAdoption`. A caller must
+not remove a rejected `contextAdmission` member and retry as a legacy launch.
+Requests without the member retain their existing behavior.
+Only owner-local `POST /sessions` and `POST /sessions/:id/input` interpret the
+intent. Other mutations, including `/cast` and `/actions`, reject its presence
+rather than dispatching an unbound session. No successful admission profile
+is enabled; valid unverified requests receive `503` with `accepted: false` and
+`receiptIssued: false`.
+
 ## Session-policy admission (`coven.session-policy.v1`)
 
 The canonical cross-client contract and deterministic JSON fixtures live at

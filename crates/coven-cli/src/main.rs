@@ -23,6 +23,7 @@ mod api_health;
 mod api_response;
 mod api_routes;
 mod capabilities;
+mod chat_context_admission;
 mod cockpit_sources;
 mod config_paths;
 mod control_plane;
@@ -460,6 +461,12 @@ enum Command {
             help = "Familiar id to inject as identity context (e.g. charm). The identity preamble is injected via each harness's preferred mechanism (--system-prompt flag or prompt prefix)."
         )]
         familiar: Option<String>,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Explicit ordinary-chat context intent JSON (fails closed until trusted authority and adapter qualification are available)"
+        )]
+        context_admission: Option<PathBuf>,
         #[arg(
             long,
             value_name = "ID",
@@ -1571,6 +1578,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             visibility,
             archive,
             familiar,
+            context_admission,
             model,
             think,
             speed,
@@ -1596,6 +1604,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             add_dir,
             stream_json,
             stream_json_input,
+            context_admission.as_deref(),
         ),
         Some(Command::Sessions {
             command,
@@ -4667,7 +4676,11 @@ fn run_session(
     add_dirs: Vec<String>,
     stream_json: bool,
     stream_json_input: bool,
+    context_admission: Option<&Path>,
 ) -> Result<()> {
+    let context_admission = context_admission
+        .map(chat_context_admission::Request::read)
+        .transpose()?;
     // `stream_json_input` is consumed by the claude pass-through in 4.4; for
     // non-stream harnesses it has no effect on this path.
     let prompt = if prompt_args.is_empty() {
@@ -4694,6 +4707,25 @@ fn run_session(
             )),
             session_launch::LaunchPathError::Cwd(error) => error.context("failed to resolve cwd"),
         })?;
+    if let Some(admission) = &context_admission {
+        admission.check_launch(
+            harness_id,
+            model,
+            familiar_id,
+            &project_root,
+            continue_session.is_some(),
+        )?;
+        admission.check_policy(&serde_json::json!({
+            "permission": permission, "addDirs": add_dirs,
+            "think": think, "speed": speed,
+        }))?;
+        if let Some(session_id) = continue_session {
+            admission.check_session_target(session_id)?;
+        }
+        // Reference-free expansion is the original prompt. Reject before
+        // opening the store or reading prompt references or familiar identity.
+        match admission.reject_cli_dispatch(&prompt, || Ok(prompt.clone()))? {}
+    }
     let maintenance_writer = acquire_session_writer(&project_root, "session")?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_store_path()?;
