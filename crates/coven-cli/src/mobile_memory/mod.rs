@@ -103,7 +103,7 @@ pub fn run_status(json: bool) -> Result<()> {
         .unwrap_or_default();
     let active_device_count = devices
         .iter()
-        .filter(|device| device.revoked_at.is_none())
+        .filter(|device| device.revoked_at.is_none() && device.suspended_at.is_none())
         .count();
     let status = MobileGatewayStatus {
         configured: config.is_some(),
@@ -152,6 +152,8 @@ pub fn run_devices(json: bool) -> Result<()> {
         for device in devices {
             let state = if device.revoked_at.is_some() {
                 "revoked"
+            } else if device.suspended_at.is_some() {
+                "suspended"
             } else {
                 "active"
             };

@@ -1132,6 +1132,12 @@ fn auth_error_response(error: MobileAuthError) -> MobileHttpResponse {
     let (status, code) = match error {
         MobileAuthError::DeviceUnknown => (401, MobileErrorCode::DeviceUnknown),
         MobileAuthError::DeviceRevoked => (403, MobileErrorCode::DeviceRevoked),
+        // Distinct from `DeviceRevoked` so a client can say "temporarily
+        // disabled" rather than sending the owner back through pairing. This
+        // reveals no more than the existing codes do: `lookup_device` runs
+        // before signature verification, so unknown/revoked are already
+        // distinguishable to anyone holding a device id, and that id is a UUID.
+        MobileAuthError::DeviceSuspended => (403, MobileErrorCode::DeviceSuspended),
         MobileAuthError::RequestExpired => (401, MobileErrorCode::RequestExpired),
         MobileAuthError::RequestReplayed => (409, MobileErrorCode::RequestReplayed),
         MobileAuthError::RateLimited => (429, MobileErrorCode::RateLimited),
@@ -1316,6 +1322,7 @@ mod tests {
             public_key_x963: public_key_x963.clone(),
             paired_at: now,
             revoked_at: None,
+            suspended_at: None,
             scopes: vec![super::super::grant::DeviceScope::MemoryRead],
         };
         let mut grant = super::super::grant::DeviceGrant::for_device(

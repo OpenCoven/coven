@@ -73,6 +73,16 @@ pub struct DeviceRecord {
     pub public_key_x963: String,
     pub paired_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Set while the owner has temporarily disabled this device.
+    ///
+    /// Unlike `revoked_at`, this is reversible and deliberately does **not**
+    /// touch the grant's `revocation_epoch` or the authorization key: resuming
+    /// restores the existing grant rather than forcing the device back through
+    /// pairing. `default` plus `skip_serializing_if` keeps the stored shape
+    /// byte-identical for devices that were never suspended, so this needs no
+    /// registry version bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<DateTime<Utc>>,
     pub scopes: Vec<DeviceScope>,
 }
 
@@ -183,6 +193,11 @@ pub struct DeviceStatusRecord {
     pub display_name: String,
     pub paired_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Mirrors `DeviceRecord::suspended_at`. Consumers of this projection
+    /// classify a device by these two fields, so omitting it here would report
+    /// a suspended device as active on the legacy surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<DateTime<Utc>>,
     pub scopes: Vec<DeviceScope>,
     pub grant_id: Uuid,
     pub minimum_assurance: AssuranceLevel,
@@ -691,6 +706,80 @@ impl DeviceRegistry {
         Ok(())
     }
 
+    /// Temporarily disables a device without ending its enrolment.
+    ///
+    /// Deliberately does not bump `revocation_epoch` or touch the
+    /// authorization key. Revocation is one-way -- it burns the grant and the
+    /// device has to pair again -- which makes it the wrong tool for "my phone
+    /// is in a drawer for a week". Suspension leaves the grant intact so
+    /// `resume` restores exactly the authority the device already had, and no
+    /// more: the grant is re-evaluated against its own scopes, assurance and
+    /// time window on the next request either way.
+    ///
+    /// Suspending an already-suspended device keeps the original timestamp, so
+    /// repeating the command cannot quietly extend or reset anything.
+    pub fn suspend(&self, device_id: Uuid, suspended_at: DateTime<Utc>) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        let mut devices = self
+            .devices
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
+        let mut updated = loaded.devices;
+        let record = updated
+            .iter_mut()
+            .find(|record| record.device.id == device_id)
+            .context("mobile device is not registered")?;
+        if record.device.revoked_at.is_some() {
+            bail!("mobile device is revoked and cannot be suspended");
+        }
+        if record.device.suspended_at.is_none() {
+            record.device.suspended_at = Some(suspended_at);
+        }
+        validate_devices(&updated)?;
+        write_registry(
+            &self.path,
+            &updated,
+            &loaded.rotation_transitions,
+            &loaded.grant_reissue_transitions,
+        )?;
+        *devices = updated;
+        Ok(())
+    }
+
+    /// Lifts a suspension, restoring the grant the device already held.
+    ///
+    /// Resuming does not re-authorize anything on its own: the grant's scopes,
+    /// assurance floor and time window are still evaluated per request, so a
+    /// grant that expired or was tightened while the device was suspended stays
+    /// unusable afterwards.
+    pub fn resume(&self, device_id: Uuid) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        let mut devices = self
+            .devices
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
+        let mut updated = loaded.devices;
+        let record = updated
+            .iter_mut()
+            .find(|record| record.device.id == device_id)
+            .context("mobile device is not registered")?;
+        if record.device.revoked_at.is_some() {
+            bail!("mobile device is revoked and cannot be resumed");
+        }
+        record.device.suspended_at = None;
+        validate_devices(&updated)?;
+        write_registry(
+            &self.path,
+            &updated,
+            &loaded.rotation_transitions,
+            &loaded.grant_reissue_transitions,
+        )?;
+        *devices = updated;
+        Ok(())
+    }
+
     pub fn revoke(&self, device_id: Uuid, revoked_at: DateTime<Utc>) -> Result<()> {
         let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
         let loaded = read_registry(&self.path)?;
@@ -952,6 +1041,7 @@ impl DeviceRegistry {
         Ok(self
             .authorization_record(device_id)?
             .filter(|record| record.device.revoked_at.is_none())
+            .filter(|record| record.device.suspended_at.is_none())
             .filter(|record| {
                 record
                     .grant
@@ -995,6 +1085,7 @@ impl DeviceRegistry {
                 display_name: record.device.display_name.clone(),
                 paired_at: record.device.paired_at,
                 revoked_at: record.device.revoked_at,
+                suspended_at: record.device.suspended_at,
                 scopes: record.grant.scopes.clone(),
                 grant_id: record.grant.id,
                 minimum_assurance: record.grant.minimum_assurance,
@@ -1079,6 +1170,7 @@ fn migrate_legacy_device(record: LegacyDeviceRecord) -> Result<GrantedDeviceReco
         public_key_x963: record.public_key_x963,
         paired_at: record.paired_at,
         revoked_at: record.revoked_at,
+        suspended_at: None,
         scopes: vec![DeviceScope::MemoryRead],
     };
     let mut grant = DeviceGrant::for_device(
@@ -1288,6 +1380,7 @@ mod tests {
                 .encode(signing_key.public_key().to_encoded_point(false).as_bytes()),
             paired_at: Utc::now(),
             revoked_at: None,
+            suspended_at: None,
             scopes: vec![DeviceScope::MemoryRead],
         }
     }
@@ -1346,6 +1439,97 @@ mod tests {
         let revoked = first.authorization_record(record.id).unwrap().unwrap();
         assert!(revoked.device.revoked_at.is_some());
         assert_eq!(revoked.grant.revocation_epoch, original_epoch + 1);
+    }
+
+    #[test]
+    fn suspension_reaches_the_status_projection_and_the_active_predicate() {
+        // `DeviceStatusRecord` is a separate projection feeding the legacy
+        // `coven memory mobile status`/`devices` surfaces, which classify a
+        // device from `revoked_at` alone. Adding the state to `DeviceRecord`
+        // without threading it here would report a suspended device as active.
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        let record = device(Uuid::new_v4(), "Synthetic phone");
+        registry.register(record.clone()).unwrap();
+
+        assert!(registry.active_device(record.id).unwrap().is_some());
+        let before = registry.list_status().unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].suspended_at.is_none());
+
+        registry.suspend(record.id, Utc::now()).unwrap();
+
+        let during = registry.list_status().unwrap();
+        assert!(
+            during[0].suspended_at.is_some(),
+            "status projection must carry the suspension"
+        );
+        assert!(
+            during[0].revoked_at.is_none(),
+            "suspension is not revocation"
+        );
+        assert!(
+            registry.active_device(record.id).unwrap().is_none(),
+            "a predicate named `active` must not return a suspended device"
+        );
+
+        registry.resume(record.id).unwrap();
+        assert!(registry.list_status().unwrap()[0].suspended_at.is_none());
+        assert!(registry.active_device(record.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn suspension_round_trips_without_changing_the_stored_shape_of_other_devices() {
+        // The field is additive within registry version 2. A device that was
+        // never suspended must serialize exactly as before, so a registry
+        // written by this build stays readable by one without the field --
+        // `DeviceRecord` is `deny_unknown_fields`, so an always-present field
+        // would be a one-way upgrade.
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        let untouched = device(Uuid::new_v4(), "Untouched phone");
+        let suspended = device(Uuid::new_v4(), "Suspended phone");
+        registry.register(untouched.clone()).unwrap();
+        registry.register(suspended.clone()).unwrap();
+
+        let path = temp.path().join("mobile").join("devices.json");
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !before.contains("suspendedAt"),
+            "no device is suspended yet: {before}"
+        );
+
+        registry.suspend(suspended.id, Utc::now()).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after.matches("suspendedAt").count(),
+            1,
+            "only the suspended device gains the field: {after}"
+        );
+
+        // Reload from disk rather than trusting the in-memory copy.
+        let reloaded = DeviceRegistry::load(temp.path()).unwrap();
+        assert!(reloaded
+            .authorization_record(suspended.id)
+            .unwrap()
+            .unwrap()
+            .device
+            .suspended_at
+            .is_some());
+        assert!(reloaded
+            .authorization_record(untouched.id)
+            .unwrap()
+            .unwrap()
+            .device
+            .suspended_at
+            .is_none());
+
+        reloaded.resume(suspended.id).unwrap();
+        let resumed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !resumed.contains("suspendedAt"),
+            "resuming must remove the field again: {resumed}"
+        );
     }
 
     #[test]

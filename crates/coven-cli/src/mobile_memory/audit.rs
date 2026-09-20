@@ -54,6 +54,8 @@ pub enum MobileAuditEvent {
     PairingCompleted,
     PairingRejected,
     DeviceRenamed,
+    DeviceSuspended,
+    DeviceResumed,
     DeviceGrantReissued,
     DeviceAuthorizationReenrolled,
     DeviceLostRevoked,

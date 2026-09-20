@@ -490,6 +490,7 @@ impl PairingManager {
             public_key_x963: device.public_key_x963,
             paired_at: now,
             revoked_at: None,
+            suspended_at: None,
             scopes: device.scopes,
         };
         let grant = super::grant::DeviceGrant::for_device(
