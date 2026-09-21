@@ -819,7 +819,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "coven-afs",
- "coven-client",
  "coven-runtime-spec",
  "coven-threads-core",
  "crossterm",
@@ -832,6 +831,7 @@ dependencies = [
  "json5",
  "jsonschema",
  "libc",
+ "opencoven-coven-client",
  "p256",
  "portable-pty",
  "qrcode",
@@ -863,20 +863,6 @@ dependencies = [
  "widestring",
  "windows-sys 0.61.2",
  "zeroize",
-]
-
-[[package]]
-name = "coven-client"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "siphasher",
- "socket2",
- "thiserror 2.0.20",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3395,6 +3381,20 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "opencoven-coven-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "siphasher",
+ "socket2",
+ "thiserror 2.0.20",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "openssl"

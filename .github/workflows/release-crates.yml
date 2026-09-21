@@ -1,0 +1,239 @@
+name: Release crates
+
+# Signed-tag release pipeline for the owner-adjacent `opencoven-coven-client`
+# crate. Separate from `release-npm.yml`, which stays responsible only for
+# `@opencoven/cli` and its platform binaries.
+#
+# Trigger: a `coven-client-v<version>` tag push. The tag must be an annotated,
+# GitHub-verified, signer-authorized tag on the default branch whose version
+# equals crates/coven-client/Cargo.toml. A `workflow_dispatch` on an existing
+# tag rehearses everything except publication.
+#
+# Publication happens only in the `publish` job, only through the
+# `crates-io-release` environment's CARGO_REGISTRY_TOKEN, and fails closed when
+# that secret is absent. A dry run is not a release.
+
+on:
+  push:
+    tags:
+      - 'coven-client-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing signed coven-client-v<version> tag to rehearse (never publishes)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-crates-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATE_NAME: opencoven-coven-client
+  CRATE_MANIFEST: crates/coven-client/Cargo.toml
+
+jobs:
+  verify-tag:
+    name: Verify signed crate tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.context.outputs.tag }}
+      version: ${{ steps.context.outputs.version }}
+      commit: ${{ steps.context.outputs.commit }}
+      publish: ${{ steps.context.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Resolve the release tag
+        id: context
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          if ! printf '%s' "$tag" | grep -Eq '^coven-client-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::Tag '$tag' is not a coven-client-v<major>.<minor>.<patch> tag."
+            exit 1
+          fi
+          version="${tag#coven-client-v}"
+          if [ "${version%%.*}" != "0" ]; then
+            echo "::error::Refusing to release $tag: the crate is owner-adjacent and pre-1.0; a 1.x release needs its own design."
+            exit 1
+          fi
+          git fetch --quiet origin "refs/tags/$tag:refs/tags/$tag" || true
+          if ! git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag does not exist on origin."
+            exit 1
+          fi
+          commit=$(git rev-parse "$tag^{commit}")
+          publish=false
+          if [ "$EVENT_NAME" = "push" ]; then
+            publish=true
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "commit=$commit"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+      - name: Confirm tag is annotated, GitHub-verified, and signer-authorized
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.context.outputs.tag }}
+          NPM_RELEASE_ALLOWED_SIGNERS: ${{ vars.NPM_RELEASE_ALLOWED_SIGNERS }}
+        run: |
+          set -euo pipefail
+          tag_object_sha=$(git rev-parse "$TAG_NAME")
+          if [ "$(git cat-file -t "$tag_object_sha")" != "tag" ]; then
+            echo "::error::Refusing to release: $TAG_NAME is a lightweight tag, not an annotated signed tag. Re-tag with \`git tag -s $TAG_NAME -m ...\`."
+            exit 1
+          fi
+          ref_payload=$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME")
+          api_tag_object_sha=$(jq -r '.object.sha // ""' <<<"$ref_payload")
+          if [ "$(jq -r '.object.type // ""' <<<"$ref_payload")" != "tag" ] || [ "$api_tag_object_sha" != "$tag_object_sha" ]; then
+            echo "::error::Refusing to release: GitHub's ref for $TAG_NAME does not resolve to the local annotated tag object $tag_object_sha."
+            exit 1
+          fi
+          payload=$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$api_tag_object_sha")
+          verified=$(jq -r '.verification.verified' <<<"$payload")
+          reason=$(jq -r '.verification.reason' <<<"$payload")
+          if [ "$verified" != "true" ]; then
+            echo "::error::Tag $TAG_NAME does not have a GitHub-verified signature (reason=$reason)."
+            exit 1
+          fi
+          tagged_commit=$(jq -r '.object.sha // ""' <<<"$payload")
+          if [ "$(jq -r '.object.type // ""' <<<"$payload")" != "commit" ] || [ "$tagged_commit" != "$(git rev-parse "$TAG_NAME^{commit}")" ]; then
+            echo "::error::Refusing to release: $TAG_NAME does not target the GitHub-verified commit."
+            exit 1
+          fi
+          allowed_signers_raw="${NPM_RELEASE_ALLOWED_SIGNERS:-}"
+          if [ -z "${allowed_signers_raw//[[:space:]]/}" ]; then
+            echo "::error::Repository variable NPM_RELEASE_ALLOWED_SIGNERS must contain the allowed release signers."
+            exit 1
+          fi
+          allowed_signers_file="$RUNNER_TEMP/coven-crate-allowed-signers"
+          printf '%s\n' "$allowed_signers_raw" > "$allowed_signers_file"
+          git config gpg.ssh.allowedSignersFile "$allowed_signers_file"
+          if ! git verify-tag "$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::Local verification of $TAG_NAME failed against the allowed release signers."
+            exit 1
+          fi
+          default_branch=$(gh api "/repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          git fetch --quiet origin "$default_branch"
+          if ! git merge-base --is-ancestor "$tagged_commit" "origin/$default_branch"; then
+            echo "::error::Refusing to release: $TAG_NAME points at $tagged_commit, which is not on $default_branch."
+            exit 1
+          fi
+          echo "tag=$TAG_NAME verified=$verified reason=$reason commit=$tagged_commit"
+      - name: Confirm the tag version matches the crate manifest
+        env:
+          TAG_NAME: ${{ steps.context.outputs.tag }}
+          EXPECTED_VERSION: ${{ steps.context.outputs.version }}
+        run: |
+          set -euo pipefail
+          git checkout --quiet "$TAG_NAME"
+          manifest_version=$(grep -m1 '^version = ' "$CRATE_MANIFEST" | sed -E 's/^version = "([^"]+)"$/\1/')
+          if [ "$manifest_version" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Tag $TAG_NAME names $EXPECTED_VERSION but $CRATE_MANIFEST declares $manifest_version."
+            exit 1
+          fi
+          manifest_name=$(grep -m1 '^name = ' "$CRATE_MANIFEST" | sed -E 's/^name = "([^"]+)"$/\1/')
+          if [ "$manifest_name" != "$CRATE_NAME" ]; then
+            echo "::error::$CRATE_MANIFEST declares package $manifest_name, expected $CRATE_NAME."
+            exit 1
+          fi
+
+  gates:
+    name: Workspace gates
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.verify-tag.outputs.commit }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: python3 scripts/check-secrets.py
+
+  package:
+    name: Package and dry-run publish
+    needs: [verify-tag, gates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.verify-tag.outputs.commit }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
+      - run: cargo test -p "$CRATE_NAME" --test package_contract --locked
+      - run: node scripts/verify-coven-client-package.mjs
+      - run: cargo package -p "$CRATE_NAME" --locked
+      - run: cargo publish -p "$CRATE_NAME" --locked --dry-run
+      - name: Record the packaged crate identity
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          crate_file="target/package/${CRATE_NAME}-${VERSION}.crate"
+          test -f "$crate_file"
+          sha256sum "$crate_file" | tee "target/package/${CRATE_NAME}-${VERSION}.crate.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: ${{ env.CRATE_NAME }}-${{ needs.verify-tag.outputs.version }}
+          path: |
+            target/package/${{ env.CRATE_NAME }}-${{ needs.verify-tag.outputs.version }}.crate
+            target/package/${{ env.CRATE_NAME }}-${{ needs.verify-tag.outputs.version }}.crate.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish to crates.io
+    needs: [verify-tag, gates, package]
+    if: ${{ needs.verify-tag.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: crates-io-release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.verify-tag.outputs.commit }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require crates.io authority
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured in the crates-io-release environment. The crate was verified but not published; a dry run is not a release."
+            exit 1
+          fi
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p "$CRATE_NAME" --locked

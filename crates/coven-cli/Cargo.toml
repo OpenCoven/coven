@@ -53,7 +53,7 @@ required-features = ["threads-test-clock"]
 
 [dependencies]
 coven-afs = { path = "../coven-afs", version = "0.1.0" }
-coven-client = { path = "../coven-client", version = "0.1.0" }
+coven-client = { package = "opencoven-coven-client", path = "../coven-client", version = "0.1.0" }
 anyhow = "1"
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }

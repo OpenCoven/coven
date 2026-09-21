@@ -1,10 +1,27 @@
 [package]
-name = "coven-client"
+name = "opencoven-coven-client"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+description = "Owner-adjacent Rust client for the OpenCoven Coven daemon: coven.daemon.v1 discovery, same-user local IPC transport, health probes, and typed errors."
+readme = "README.md"
+documentation = "https://docs.rs/opencoven-coven-client"
+homepage = "https://github.com/OpenCoven/coven/tree/main/crates/coven-client"
+keywords = ["opencoven", "coven", "daemon", "client", "ipc"]
+categories = ["api-bindings", "development-tools"]
+# The published tarball is exactly the source, its fixtures, its tests, and
+# this README. Fixtures are part of the contract: the package-contract test
+# reads them, so a tarball without them cannot pass its own tests.
+include = ["Cargo.toml", "README.md", "src/**/*.rs", "tests/**/*.rs", "fixtures/**"]
+
+# The package is published as `opencoven-coven-client`; the library keeps its
+# original `coven_client` name so `coven-cli`, this crate's integration tests,
+# and downstream code compose over it without a rename.
+[lib]
+name = "coven_client"
+path = "src/lib.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
