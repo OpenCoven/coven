@@ -74,8 +74,16 @@ fn publication_metadata_is_complete() {
 
 #[test]
 fn library_keeps_the_coven_client_crate_name() {
-    assert!(
-        MANIFEST.contains("[lib]\nname = \"coven_client\""),
+    // Compare parsed lines rather than a literal "\n" so a CRLF checkout on
+    // Windows reads the same manifest as a LF checkout does.
+    let lines: Vec<&str> = MANIFEST.lines().map(str::trim).collect();
+    let lib_table = lines
+        .iter()
+        .position(|line| *line == "[lib]")
+        .expect("manifest declares a [lib] table");
+    assert_eq!(
+        lines.get(lib_table + 1).copied(),
+        Some("name = \"coven_client\""),
         "downstream code imports `coven_client::…`; renaming the library is a breaking change"
     );
 }
