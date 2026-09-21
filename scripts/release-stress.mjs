@@ -58,7 +58,7 @@ const UNIX_COMMANDS = [
   },
   {
     label: 'short socket homes',
-    args: ['test', '-p', 'coven-client', '--test', 'health', '--locked']
+    args: ['test', '-p', 'opencoven-coven-client', '--test', 'health', '--locked']
   }
 ];
 

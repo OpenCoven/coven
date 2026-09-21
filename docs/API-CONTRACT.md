@@ -41,7 +41,7 @@ proof of `coven.daemon.v1` support.
 
 ### Reusable Rust client
 
-Rust integrations should use `coven-client` rather than compose HTTP over the
+Rust integrations should use `opencoven-coven-client` (library `coven_client`) rather than compose HTTP over the
 daemon transport themselves. Construct a `DaemonEndpoint` only through
 `DaemonEndpoint::discover(coven_home)`, then pass it to `DaemonClient::new`.
 The public client accepts no URLs or arbitrary socket/pipe paths, exposes only

@@ -24,7 +24,8 @@ Recommended handshake:
 3. Call `GET /api/v1/capabilities` if using control-plane actions.
 4. Use versioned `/api/v1/...` routes only.
 
-Rust integrations should use the owner-adjacent `coven-client` crate for this
+Rust integrations should use the owner-adjacent `opencoven-coven-client` crate
+(library name `coven_client`, in `crates/coven-client`) for this
 handshake and daemon framing. Discover `DaemonEndpoint` from the chosen Coven
 home, pass it to `DaemonClient::new`, and use its typed `/api/v1` operations.
 It does not accept URLs or arbitrary socket paths:

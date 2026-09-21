@@ -59,7 +59,7 @@ test('unix stress plan covers every release reliability surface ten times', () =
         '--',
         '--exact'
       ],
-      ['test', '-p', 'coven-client', '--test', 'health', '--locked']
+      ['test', '-p', 'opencoven-coven-client', '--test', 'health', '--locked']
     ]
   );
 });

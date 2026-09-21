@@ -1,3 +1,20 @@
+//! Owner-adjacent Rust client for the OpenCoven Coven daemon.
+//!
+//! `opencoven-coven-client` speaks the named `coven.daemon.v1` contract
+//! ([`PROTOCOL_VERSION`]) over same-user local IPC: a Unix domain socket under
+//! the daemon home on Unix-like systems and an owner-only named pipe on
+//! Windows. It discovers the running daemon ([`DaemonEndpoint`]), issues
+//! bounded HTTP requests over that transport ([`DaemonClient`]), decodes the
+//! health envelope ([`Health`]), and reports failures as typed errors
+//! ([`ClientError`], [`DaemonError`]).
+//!
+//! The crate is pre-1.0 and owner-adjacent: it lives in the `OpenCoven/coven`
+//! repository next to the daemon it talks to, `coven-cli` composes over it, and
+//! it carries no CLI, TUI, or agent-runtime dependency. Items marked
+//! `#[doc(hidden)]` are lifecycle hooks the daemon's own CLI uses; they are not
+//! part of the supported public surface and may change in any release.
+//!
+//! See the crate README for the compatibility policy and a usage example.
 mod discovery;
 mod error;
 mod http;
