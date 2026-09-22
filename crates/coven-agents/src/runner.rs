@@ -125,6 +125,17 @@ where
                     });
                 }
             }
+
+            let mut review_names = BTreeSet::new();
+            for review in &agent.proposal_reviews {
+                let name = review.name().to_owned();
+                if !review_names.insert(name.clone()) {
+                    return Err(ConfigError::DuplicateProposalReview {
+                        agent: agent.id.clone(),
+                        name,
+                    });
+                }
+            }
         }
 
         Ok(Self {

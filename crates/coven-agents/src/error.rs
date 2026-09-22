@@ -35,6 +35,8 @@ pub enum ConfigError {
     DuplicateTool { agent: AgentId, tool: String },
     #[error("agent `{agent}` registers handoff `{handoff}` more than once")]
     DuplicateHandoff { agent: AgentId, handoff: String },
+    #[error("agent `{agent}` registers proposal review `{name}` more than once")]
+    DuplicateProposalReview { agent: AgentId, name: String },
     #[error("agent `{agent}` handoff `{handoff}` targets unknown agent `{target}`")]
     UnknownHandoffTarget {
         agent: AgentId,
