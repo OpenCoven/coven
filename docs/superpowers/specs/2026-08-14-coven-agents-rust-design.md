@@ -76,6 +76,8 @@ implied by an implementation detail.
 - `Tool<C>`: JSON-schema description plus asynchronous local execution.
 - `InputGuardrail<C>` and `OutputGuardrail<C>`: blocking checks returning allow
   or a reasoned rejection.
+- `ProposalReview<C>`: fail-closed pre-dispatch review of a resolved tool call
+  (added 2026-09-22; see the amendment below).
 - `SessionStore`: load and append conversation items.
 - `RunObserver`: non-failing metadata event sink.
 
@@ -153,3 +155,36 @@ approval, and durable run-state adapters exercise it. Keep the crate
 experimental and workspace-local until at least two real consumers share it.
 The next coherent slice is a typed OpenAI/Anthropic-neutral test adapter or a
 Coven event-ledger adapter, not broad feature parity.
+
+## 2026-09-22 amendment: `ProposalReview<C>`
+
+OpenCoven/coven#1151 adds a fourth extension trait beside the guardrails.
+`ProposalReview<C>` sees a resolved tool call (`ToolProposal`: call id, tool
+name, arguments) after the runner has matched it to a registered tool and
+before anything is dispatched, and returns `ReviewVerdict::{Permit,
+ProposalOnly, Reject, Unavailable}`. Reviewers are registered per agent with
+`Agent::with_proposal_review`, run in registration order, and the first
+non-permit verdict wins; `Runner::new` rejects duplicate reviewer names on one
+agent.
+
+The seam fails closed. A reviewer error is treated as `Unavailable`; only an
+explicit `Permit` reaches the tool. A non-permit verdict does not fail the run:
+the runner still records `RunItem::ToolCall`, skips execution and the
+`ToolStarted`/`ToolCompleted` events, and appends a `RunItem::ToolResult` of
+`{"executed": false, "review": {"reviewer", "verdict", "reason"}}`. No new
+`RunItem` variant exists, so transcripts and sessions are wire-compatible.
+Observers receive `RunEvent::ProposalReviewed` per reviewer consulted with a
+payload-free `ReviewOutcome`, keeping to the metadata-only observer policy
+above. `InvocationEventKind` and `InvocationFailureKind` are unchanged; no
+`RunFailureKind` is added because neither a verdict nor a reviewer error is a
+run failure. Handoff targets are reviewed by their own reviewers, mirroring
+input-guardrail ingress parity.
+
+Verdicts are evidence, not authorization. A permit records that a named
+reviewer raised no objection to the proposal it was shown; it grants no
+capability and does not stand in for operator approval.
+
+The non-goals above still hold. This crate ships the seam and deterministic
+fake reviewers only. There is no HTTP client, no Jev/TypeSafe transport, no
+approval interrupt/resume, and no daemon, CLI, or Cave integration; a live
+reviewer is an adapter that implements the trait outside this crate.
