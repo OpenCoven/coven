@@ -10,10 +10,11 @@ use std::{
 use async_trait::async_trait;
 use coven_agents::{
     Agent, BoxError, ConfigError, GuardrailStage, GuardrailVerdict, Handoff, HandoffCall,
-    InMemorySession, InputGuardrail, InvocationContext, InvocationId, Model, ModelAction,
-    ModelRequest, ModelResponse, OutputGuardrail, ProposalReview, ReviewOutcome, ReviewVerdict,
-    RunError, RunEvent, RunFailureKind, RunItem, RunObserver, RunOptions, RunResult, Runner,
-    SessionStore, Tool, ToolCall, ToolDefinition, ToolProposal,
+    InMemorySession, InputGuardrail, InvocationContext, InvocationEvent, InvocationEventKind,
+    InvocationFailureKind, InvocationId, InvocationObserver, Model, ModelAction, ModelRequest,
+    ModelResponse, OutputGuardrail, ProposalReview, ReviewOutcome, ReviewVerdict, RunError,
+    RunEvent, RunFailureKind, RunItem, RunObserver, RunOptions, RunResult, Runner, SessionStore,
+    Tool, ToolCall, ToolDefinition, ToolProposal,
 };
 use serde_json::{json, Value};
 
@@ -211,6 +212,41 @@ impl RecordingObserver {
 impl RunObserver for RecordingObserver {
     fn on_event(&self, event: &RunEvent) {
         self.events.lock().unwrap().push(event.clone());
+    }
+}
+
+#[derive(Clone)]
+enum ObservedEvent {
+    Run(RunEvent),
+    Invocation(InvocationEvent),
+}
+
+#[derive(Default)]
+struct RecordingCombinedObserver {
+    events: Mutex<Vec<ObservedEvent>>,
+}
+
+impl RecordingCombinedObserver {
+    fn events(&self) -> Vec<ObservedEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl RunObserver for RecordingCombinedObserver {
+    fn on_event(&self, event: &RunEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ObservedEvent::Run(event.clone()));
+    }
+}
+
+impl InvocationObserver for RecordingCombinedObserver {
+    fn on_event(&self, event: &InvocationEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ObservedEvent::Invocation(event.clone()));
     }
 }
 
@@ -1808,10 +1844,11 @@ async fn reviewer_error_fails_the_run_with_proposal_review_kind() {
             calls: calls.clone(),
         }))
         .with_proposal_review(Arc::new(FailingReview));
-    let observer = Arc::new(RecordingObserver::default());
+    let observer = Arc::new(RecordingCombinedObserver::default());
     let runner = Runner::new([agent])
         .unwrap()
-        .with_observer(observer.clone());
+        .with_observer(observer.clone())
+        .with_invocation_observer(observer.clone());
 
     let failure = runner
         .run("worker", "Add 2 and 3.", &(), RunOptions::default())
@@ -1827,13 +1864,62 @@ async fn reviewer_error_fails_the_run_with_proposal_review_kind() {
         } if reviewer == "failing-review" && source.to_string() == "reviewer exploded"
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(observer.events().iter().any(|event| matches!(
+    let events = observer.events();
+    assert!(events.iter().any(|event| matches!(
         event,
-        RunEvent::RunFailed {
+        ObservedEvent::Run(RunEvent::RunFailed {
             kind: RunFailureKind::ProposalReview,
             ..
-        }
+        })
     )));
+    let reviewed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                ObservedEvent::Run(RunEvent::ProposalReviewed {
+                    reviewer,
+                    verdict: ReviewOutcome::Unavailable,
+                    ..
+                }) if reviewer == "failing-review"
+            )
+        })
+        .expect("reviewer error still emits a review event");
+    let failed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                ObservedEvent::Run(RunEvent::RunFailed {
+                    kind: RunFailureKind::ProposalReview,
+                    ..
+                })
+            )
+        })
+        .expect("reviewer error emits run failure");
+    assert!(
+        reviewed < failed,
+        "proposal review event must be observed before run failure"
+    );
+    let invocation_failed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                ObservedEvent::Invocation(InvocationEvent {
+                    event: InvocationEventKind::Failed {
+                        kind: InvocationFailureKind::ProposalReview,
+                        ..
+                    },
+                    ..
+                })
+            )
+        })
+        .expect("invocation observer records proposal-review failure kind");
+    assert!(
+        reviewed < invocation_failed,
+        "proposal review event must be observed before invocation failure"
+    );
 }
 
 #[tokio::test]

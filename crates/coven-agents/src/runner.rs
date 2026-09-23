@@ -7,8 +7,8 @@ use crate::{
     Agent, AgentId, AgentRef, ConfigError, GuardrailStage, GuardrailVerdict, HandoffDefinition,
     InvocationContext, InvocationEvent, InvocationEventKind, InvocationFailureKind, InvocationId,
     InvocationObserver, InvocationRequest, InvocationSource, ModelAction, ModelRequest,
-    NoopInvocationObserver, NoopObserver, ReviewVerdict, RunError, RunEvent, RunFailure,
-    RunFailureKind, RunItem, RunObserver, SessionStore, ToolCall, ToolProposal,
+    NoopInvocationObserver, NoopObserver, ReviewOutcome, ReviewVerdict, RunError, RunEvent,
+    RunFailure, RunFailureKind, RunItem, RunObserver, SessionStore, ToolCall, ToolProposal,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,7 +247,8 @@ where
     ///
     /// One `ProposalReviewed` event is emitted per reviewer consulted;
     /// reviewers after the deciding one are not called. A reviewer
-    /// implementation error fails the run.
+    /// implementation error records an `Unavailable` review outcome, then
+    /// fails the run.
     async fn review_tool_proposal(
         &self,
         request: &InvocationRequest,
@@ -261,18 +262,29 @@ where
             arguments: &call.arguments,
         };
         for review in &agent.proposal_reviews {
-            let verdict = review.review(&proposal, context).await.map_err(|source| {
-                self.fail(
-                    request,
-                    &agent.id,
-                    RunFailureKind::ProposalReview,
-                    RunError::ProposalReviewFailed {
+            let verdict = match review.review(&proposal, context).await {
+                Ok(verdict) => verdict,
+                Err(source) => {
+                    self.observer.on_event(&RunEvent::ProposalReviewed {
+                        invocation: request.invocation.clone(),
                         agent: agent.id.clone(),
                         reviewer: review.name().to_owned(),
-                        source,
-                    },
-                )
-            })?;
+                        tool: call.name.clone(),
+                        call_id: call.id.clone(),
+                        verdict: ReviewOutcome::Unavailable,
+                    });
+                    return Err(self.fail(
+                        request,
+                        &agent.id,
+                        RunFailureKind::ProposalReview,
+                        RunError::ProposalReviewFailed {
+                            agent: agent.id.clone(),
+                            reviewer: review.name().to_owned(),
+                            source,
+                        },
+                    ));
+                }
+            };
             self.observer.on_event(&RunEvent::ProposalReviewed {
                 invocation: request.invocation.clone(),
                 agent: agent.id.clone(),
