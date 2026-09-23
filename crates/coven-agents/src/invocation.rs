@@ -176,6 +176,7 @@ pub enum InvocationEventKind {
 pub enum InvocationFailureKind {
     Configuration,
     Session,
+    ProposalReview,
     InputGuardrail,
     OutputGuardrail,
     Model,
