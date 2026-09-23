@@ -53,6 +53,7 @@ const fn invocation_failure_kind(kind: RunFailureKind) -> InvocationFailureKind 
     match kind {
         RunFailureKind::Configuration => InvocationFailureKind::Configuration,
         RunFailureKind::Session => InvocationFailureKind::Session,
+        RunFailureKind::ProposalReview => InvocationFailureKind::ProposalReview,
         RunFailureKind::InputGuardrail => InvocationFailureKind::InputGuardrail,
         RunFailureKind::OutputGuardrail => InvocationFailureKind::OutputGuardrail,
         RunFailureKind::Model => InvocationFailureKind::Model,
@@ -244,28 +245,34 @@ where
     /// first non-permit verdict with the reviewer that produced it. `None`
     /// means every reviewer permitted the call, or none is registered.
     ///
-    /// A reviewer error is not a permit: it becomes `Unavailable` and the
-    /// call is not executed. One `ProposalReviewed` event is emitted per
-    /// reviewer consulted; reviewers after the deciding one are not called.
+    /// One `ProposalReviewed` event is emitted per reviewer consulted;
+    /// reviewers after the deciding one are not called. A reviewer
+    /// implementation error fails the run.
     async fn review_tool_proposal(
         &self,
         request: &InvocationRequest,
         agent: &Agent<C>,
         call: &ToolCall,
         context: &C,
-    ) -> Option<(String, ReviewVerdict)> {
+    ) -> Result<Option<(String, ReviewVerdict)>, RunError> {
         let proposal = ToolProposal {
             call_id: &call.id,
             tool: &call.name,
             arguments: &call.arguments,
         };
         for review in &agent.proposal_reviews {
-            let verdict = review
-                .review(&proposal, context)
-                .await
-                .unwrap_or_else(|source| ReviewVerdict::Unavailable {
-                    reason: source.to_string(),
-                });
+            let verdict = review.review(&proposal, context).await.map_err(|source| {
+                self.fail(
+                    request,
+                    &agent.id,
+                    RunFailureKind::ProposalReview,
+                    RunError::ProposalReviewFailed {
+                        agent: agent.id.clone(),
+                        reviewer: review.name().to_owned(),
+                        source,
+                    },
+                )
+            })?;
             self.observer.on_event(&RunEvent::ProposalReviewed {
                 invocation: request.invocation.clone(),
                 agent: agent.id.clone(),
@@ -275,10 +282,10 @@ where
                 verdict: verdict.outcome(),
             });
             if verdict != ReviewVerdict::Permit {
-                return Some((review.name().to_owned(), verdict));
+                return Ok(Some((review.name().to_owned(), verdict)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Checks an agent's input guardrails against the run's original user
@@ -860,7 +867,7 @@ where
                 // reaches the tool.
                 let review = self
                     .review_tool_proposal(request, &current, &call, context)
-                    .await;
+                    .await?;
                 let call_item = RunItem::ToolCall {
                     agent: current.id.clone(),
                     call: call.clone(),

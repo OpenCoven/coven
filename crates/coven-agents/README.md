@@ -25,7 +25,7 @@ per agent with `Agent::with_proposal_review` and see each resolved tool call
 (name and arguments) before it runs, returning `Permit`, `ProposalOnly`,
 `Reject`, or `Unavailable`. Reviewers run in registration order and the first
 non-permit verdict wins. The seam fails closed: a reviewer that returns an error
-is treated as `Unavailable` and the tool is not executed; there is no default
+fails the run with `RunFailureKind::ProposalReview`; there is no default
 permit. A non-permitted call does not fail the run. The runner records the
 `RunItem::ToolCall`, skips execution, and appends a `RunItem::ToolResult` of
 `{"executed": false, "review": {"reviewer", "verdict", "reason"}}` so the model

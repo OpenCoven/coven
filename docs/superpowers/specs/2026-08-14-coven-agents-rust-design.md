@@ -167,17 +167,16 @@ ProposalOnly, Reject, Unavailable}`. Reviewers are registered per agent with
 non-permit verdict wins; `Runner::new` rejects duplicate reviewer names on one
 agent.
 
-The seam fails closed. A reviewer error is treated as `Unavailable`; only an
-explicit `Permit` reaches the tool. A non-permit verdict does not fail the run:
+The seam fails closed. A reviewer error fails the run as
+`RunFailureKind::ProposalReview` (`InvocationFailureKind::ProposalReview`);
+only an explicit `Permit` reaches the tool. A non-permit verdict does not fail the run:
 the runner still records `RunItem::ToolCall`, skips execution and the
 `ToolStarted`/`ToolCompleted` events, and appends a `RunItem::ToolResult` of
 `{"executed": false, "review": {"reviewer", "verdict", "reason"}}`. No new
 `RunItem` variant exists, so transcripts and sessions are wire-compatible.
 Observers receive `RunEvent::ProposalReviewed` per reviewer consulted with a
 payload-free `ReviewOutcome`, keeping to the metadata-only observer policy
-above. `InvocationEventKind` and `InvocationFailureKind` are unchanged; no
-`RunFailureKind` is added because neither a verdict nor a reviewer error is a
-run failure. Handoff targets are reviewed by their own reviewers, mirroring
+above. Handoff targets are reviewed by their own reviewers, mirroring
 input-guardrail ingress parity.
 
 Verdicts are evidence, not authorization. A permit records that a named

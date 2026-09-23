@@ -1793,14 +1793,47 @@ async fn unavailable_verdict_records_the_call_without_executing_it() {
 }
 
 #[tokio::test]
-async fn reviewer_error_fails_closed_as_unavailable() {
-    let run = run_reviewed(vec![Arc::new(FailingReview)]).await;
+async fn reviewer_error_fails_the_run_with_proposal_review_kind() {
+    let model = Arc::new(QueueModel::new([
+        ModelResponse::actions(vec![ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({ "left": 2, "right": 3 }),
+        ))]),
+        ModelResponse::final_output("Done."),
+    ]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new("worker", "Worker", "Use tools.", model)
+        .with_tool(Arc::new(CountingCallTool {
+            calls: calls.clone(),
+        }))
+        .with_proposal_review(Arc::new(FailingReview));
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([agent])
+        .unwrap()
+        .with_observer(observer.clone());
 
-    assert_not_executed(&run, "failing-review", "unavailable", "reviewer exploded");
-    assert_eq!(
-        reviewed_outcomes(&run.events),
-        [("failing-review".to_owned(), ReviewOutcome::Unavailable)]
-    );
+    let failure = runner
+        .run("worker", "Add 2 and 3.", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::ProposalReviewFailed {
+            ref reviewer,
+            ref source,
+            ..
+        } if reviewer == "failing-review" && source.to_string() == "reviewer exploded"
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(observer.events().iter().any(|event| matches!(
+        event,
+        RunEvent::RunFailed {
+            kind: RunFailureKind::ProposalReview,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

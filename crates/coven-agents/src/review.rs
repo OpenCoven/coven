@@ -23,9 +23,6 @@ pub enum ReviewVerdict {
     /// The call is refused and is not executed.
     Reject { reason: String },
     /// The reviewer could not reach a decision; the call is not executed.
-    ///
-    /// The runner also produces this verdict itself when a reviewer returns an
-    /// error, so a broken or unreachable reviewer fails closed.
     Unavailable { reason: String },
 }
 
@@ -118,10 +115,8 @@ pub struct ToolProposal<'a> {
 /// tool calls after control transfers to it. The first non-`Permit` verdict
 /// wins and later reviewers are not consulted.
 ///
-/// The seam fails closed: a reviewer that returns `Err` is treated as
-/// [`ReviewVerdict::Unavailable`] and the tool does not run. The run itself
-/// continues; the model sees a tool result stating that the call was not
-/// executed and why.
+/// The seam fails closed: a reviewer that returns `Err` fails the run as a
+/// proposal-review error before dispatch.
 ///
 /// This crate ships the seam only. It carries no HTTP client or hosted review
 /// transport; a live reviewer is an adapter that implements this trait.

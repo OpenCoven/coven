@@ -4,6 +4,7 @@ use crate::{AgentId, GuardrailStage, InvocationContext, InvocationEvent, ReviewO
 pub enum RunFailureKind {
     Configuration,
     Session,
+    ProposalReview,
     InputGuardrail,
     OutputGuardrail,
     Model,

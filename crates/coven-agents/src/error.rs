@@ -72,6 +72,13 @@ pub enum RunError {
         #[source]
         source: BoxError,
     },
+    #[error("proposal review `{reviewer}` for agent `{agent}` failed")]
+    ProposalReviewFailed {
+        agent: AgentId,
+        reviewer: String,
+        #[source]
+        source: BoxError,
+    },
     #[error("model call for agent `{agent}` failed")]
     ModelFailed {
         agent: AgentId,
