@@ -5704,8 +5704,10 @@ fn write_api_response_conditional<W: Write>(
         return write_api_response(write, response);
     }
     let etag = json_body_etag(&response.body);
+    // No Content-Length on a 304: there it would describe the selected
+    // representation (RFC 9110 §8.6), and the connection closes anyway.
     let http = if if_none_match.is_some_and(|header| if_none_match_names(header, &etag)) {
-        format!("HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        format!("HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nConnection: close\r\n\r\n")
     } else {
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nETag: {etag}\r\nConnection: close\r\n\r\n{}",
@@ -6071,7 +6073,11 @@ fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
             } else if name.eq_ignore_ascii_case("origin") {
                 headers.origin = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("if-none-match") {
-                headers.if_none_match = Some(value.to_string());
+                // Repeated field lines form one comma-separated list (RFC 9110 §5.3).
+                headers.if_none_match = Some(match headers.if_none_match.take() {
+                    Some(previous) => format!("{previous}, {value}"),
+                    None => value.to_string(),
+                });
             }
         }
     }
@@ -9955,6 +9961,20 @@ mod tests {
         assert!(
             unchanged.ends_with("\r\n\r\n"),
             "a 304 carries no body: {unchanged}"
+        );
+        assert!(
+            !unchanged.contains("Content-Length"),
+            "a 304 advertises no length: {unchanged}"
+        );
+
+        // Repeated If-None-Match lines are one list: the current tag in an
+        // earlier line still matches.
+        let repeated = send(format!(
+            "GET /api/v1/sessions HTTP/1.1\r\nHost: x\r\nIf-None-Match: {etag}\r\nIf-None-Match: \"stale\"\r\nContent-Length: 0\r\n\r\n"
+        ));
+        assert!(
+            repeated.starts_with("HTTP/1.1 304 Not Modified"),
+            "got: {repeated}"
         );
 
         let stale = send(
