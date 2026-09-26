@@ -5657,13 +5657,69 @@ where
     };
     request_diagnostics::checkpoint(Phase::HandlerReturned);
     request_diagnostics::checkpoint(Phase::ResponseBegin);
-    write_api_response(&mut write, &response)?;
+    write_api_response_conditional(
+        &mut write,
+        &response,
+        method,
+        headers.if_none_match.as_deref(),
+    )?;
     request_diagnostics::checkpoint(Phase::ResponseReady);
     if hold_for_shutdown {
         Ok(HttpStreamOutcome::HoldForShutdown)
     } else {
         Ok(HttpStreamOutcome::Complete)
     }
+}
+
+/// Strong content tag for a JSON body: a truncated BLAKE3 hash, quoted.
+fn json_body_etag(body: &str) -> String {
+    let hash = blake3::hash(body.as_bytes()).to_hex();
+    format!("\"{}\"", &hash.as_str()[..32])
+}
+
+/// Whether an `If-None-Match` header names `etag` (a list, a weak prefix, or `*`).
+fn if_none_match_names(header: &str, etag: &str) -> bool {
+    let bare = etag.trim_start_matches("W/");
+    header
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == bare)
+}
+
+/// Conditional GET (#1153). A successful JSON `GET` carries a content `ETag`,
+/// and a request whose `If-None-Match` already names it gets a bodiless `304`.
+/// Pollers such as Coven Cave's chat list then skip re-downloading and
+/// re-parsing an unchanged payload (the session list is ~1.4 MB on a real
+/// profile). Every other response is written exactly as before.
+fn write_api_response_conditional<W: Write>(
+    write: &mut W,
+    response: &crate::api::ApiResponse,
+    method: &str,
+    if_none_match: Option<&str>,
+) -> Result<()> {
+    if method != "GET"
+        || response.status != 200
+        || !response.content_type.starts_with("application/json")
+    {
+        return write_api_response(write, response);
+    }
+    let etag = json_body_etag(&response.body);
+    // No Content-Length on a 304: there it would describe the selected
+    // representation (RFC 9110 §8.6), and the connection closes anyway.
+    let http = if if_none_match.is_some_and(|header| if_none_match_names(header, &etag)) {
+        format!("HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nConnection: close\r\n\r\n")
+    } else {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nETag: {etag}\r\nConnection: close\r\n\r\n{}",
+            response.content_type,
+            response.body.len(),
+            response.body
+        )
+    };
+    write
+        .write_all(http.as_bytes())
+        .context("failed to write API response")?;
+    Ok(())
 }
 
 fn write_api_response<W: Write>(write: &mut W, response: &crate::api::ApiResponse) -> Result<()> {
@@ -5988,6 +6044,7 @@ struct ParsedHeaders {
     content_length: usize,
     host: Option<String>,
     origin: Option<String>,
+    if_none_match: Option<String>,
 }
 
 fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
@@ -5995,6 +6052,7 @@ fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
         content_length: 0,
         host: None,
         origin: None,
+        if_none_match: None,
     };
     let mut header = String::new();
     loop {
@@ -6014,6 +6072,12 @@ fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
                 headers.host = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("origin") {
                 headers.origin = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("if-none-match") {
+                // Repeated field lines form one comma-separated list (RFC 9110 §5.3).
+                headers.if_none_match = Some(match headers.if_none_match.take() {
+                    Some(previous) => format!("{previous}, {value}"),
+                    None => value.to_string(),
+                });
             }
         }
     }
@@ -9821,6 +9885,106 @@ mod tests {
         assert!(
             response.contains(r#""sessionLaunchPolicy":true"#),
             "got: {response}"
+        );
+    }
+
+    #[test]
+    fn if_none_match_names_handles_lists_weak_tags_and_wildcards() {
+        let etag = json_body_etag("[]");
+        assert!(if_none_match_names(&etag, &etag));
+        assert!(if_none_match_names(&format!("W/{etag}"), &etag));
+        assert!(if_none_match_names(&format!("\"other\", {etag}"), &etag));
+        assert!(if_none_match_names("*", &etag));
+        assert!(!if_none_match_names("\"stale\"", &etag));
+        assert_ne!(json_body_etag("[]"), json_body_etag("[1]"));
+    }
+
+    #[test]
+    fn conditional_writer_leaves_non_get_and_non_ok_responses_untagged() {
+        let ok = crate::api::ApiResponse::json_body(200, "[]".to_string());
+        let mut post = Vec::new();
+        write_api_response_conditional(&mut post, &ok, "POST", None).expect("write");
+        assert!(!String::from_utf8(post).expect("utf8").contains("ETag:"));
+        let missing = crate::api::ApiResponse::json_body(404, "{}".to_string());
+        let mut get = Vec::new();
+        write_api_response_conditional(&mut get, &missing, "GET", Some("*")).expect("write");
+        let get = String::from_utf8(get).expect("utf8");
+        assert!(get.starts_with("HTTP/1.1 404 Not Found"), "got: {get}");
+        assert!(!get.contains("ETag:"), "got: {get}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sessions_get_carries_an_etag_and_answers_a_matching_tag_with_304() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        let runtime = NoopSessionRuntime;
+        let send = |request: String| {
+            let mut stream = Cursor::new(request.into_bytes());
+            let mut output: Vec<u8> = Vec::new();
+            handle_http_stream(
+                &mut stream,
+                &mut output,
+                temp.path(),
+                None,
+                &runtime,
+                None,
+                HostGuard::Disabled,
+            )
+            .expect("handle ok");
+            String::from_utf8(output).expect("utf8")
+        };
+
+        let first = send(
+            "GET /api/v1/sessions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n".to_string(),
+        );
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "got: {first}");
+        let etag = first
+            .lines()
+            .find_map(|line| line.strip_prefix("ETag: "))
+            .expect("a successful JSON GET carries an ETag")
+            .to_string();
+
+        let unchanged = send(format!(
+            "GET /api/v1/sessions HTTP/1.1\r\nHost: x\r\nIf-None-Match: {etag}\r\nContent-Length: 0\r\n\r\n"
+        ));
+        assert!(
+            unchanged.starts_with("HTTP/1.1 304 Not Modified"),
+            "got: {unchanged}"
+        );
+        assert!(
+            unchanged.contains(&format!("ETag: {etag}")),
+            "got: {unchanged}"
+        );
+        assert!(
+            unchanged.ends_with("\r\n\r\n"),
+            "a 304 carries no body: {unchanged}"
+        );
+        assert!(
+            !unchanged.contains("Content-Length"),
+            "a 304 advertises no length: {unchanged}"
+        );
+
+        // Repeated If-None-Match lines are one list: the current tag in an
+        // earlier line still matches.
+        let repeated = send(format!(
+            "GET /api/v1/sessions HTTP/1.1\r\nHost: x\r\nIf-None-Match: {etag}\r\nIf-None-Match: \"stale\"\r\nContent-Length: 0\r\n\r\n"
+        ));
+        assert!(
+            repeated.starts_with("HTTP/1.1 304 Not Modified"),
+            "got: {repeated}"
+        );
+
+        let stale = send(
+            "GET /api/v1/sessions HTTP/1.1\r\nHost: x\r\nIf-None-Match: \"stale\"\r\nContent-Length: 0\r\n\r\n".to_string(),
+        );
+        assert!(stale.starts_with("HTTP/1.1 200 OK"), "got: {stale}");
+        assert!(stale.contains(&format!("ETag: {etag}")), "got: {stale}");
+        assert!(
+            stale.ends_with("[]"),
+            "a stale tag gets the full body: {stale}"
         );
     }
 
