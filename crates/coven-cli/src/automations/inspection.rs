@@ -134,6 +134,79 @@ pub fn list_occurrences(
     Ok(records)
 }
 
+/// A keyset position in one automation's occurrence history: the
+/// `(scheduled_for, id)` of the last row a previous page returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceHistoryPosition {
+    pub scheduled_for: String,
+    pub id: String,
+}
+
+pub struct OccurrenceHistoryPage {
+    pub occurrences: Vec<OccurrenceRecord>,
+    /// The position after the last returned row, when more rows exist.
+    pub next: Option<OccurrenceHistoryPosition>,
+}
+
+/// One automation's occurrences in every state, newest first, from one
+/// snapshot. The page starts strictly after `after`, so rows inserted above
+/// the cursor while a caller pages never shift a later page. Diagnostic only.
+pub fn occurrence_history(
+    conn: &Connection,
+    automation_id: &str,
+    limit: usize,
+    after: Option<&OccurrenceHistoryPosition>,
+) -> Result<OccurrenceHistoryPage> {
+    let transaction = conn
+        .unchecked_transaction()
+        .context("failed to begin automation occurrence history snapshot")?;
+    let bounded = limit.clamp(1, 100);
+    // The planning fence UNIQUE(automation_id, scheduled_for) means one
+    // automation never has two rows at one time; `id` only keeps the order
+    // total if that fence is ever relaxed.
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
+                    kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                    failure_reason, created_at, updated_at
+             FROM automation_occurrences
+             WHERE automation_id = ?1
+               AND (?2 IS NULL OR scheduled_for < ?2 OR (scheduled_for = ?2 AND id < ?3))
+             ORDER BY scheduled_for DESC, id DESC
+             LIMIT ?4",
+        )
+        .context("failed to prepare automation occurrence history query")?;
+    let rows = statement
+        .query_map(
+            params![
+                automation_id,
+                after.map(|position| position.scheduled_for.as_str()),
+                after.map(|position| position.id.as_str()),
+                i64::try_from(bounded + 1)
+                    .context("occurrence history limit exceeds SQLite range")?
+            ],
+            occurrence_record_from_row,
+        )
+        .context("failed to read automation occurrence history")?;
+    let mut occurrences = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read automation occurrence history")?;
+    drop(statement);
+    transaction
+        .commit()
+        .context("failed to commit automation occurrence history snapshot")?;
+    let next = if occurrences.len() > bounded {
+        occurrences.truncate(bounded);
+        occurrences.last().map(|last| OccurrenceHistoryPosition {
+            scheduled_for: last.scheduled_for.clone(),
+            id: last.id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(OccurrenceHistoryPage { occurrences, next })
+}
+
 pub fn inspect_occurrence(conn: &Connection, id: &str) -> Result<Option<OccurrenceInspection>> {
     let transaction = conn
         .unchecked_transaction()

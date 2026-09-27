@@ -141,6 +141,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.occurrence.list.v1",
                     "coven.automations.occurrence.get.v1",
                     "coven.automations.run.get.v1",
+                    "coven.automations.occurrence.history.v1",
                     "coven.automations.unquarantine",
                 ],
                 variant_negotiation: Some(
@@ -666,6 +667,27 @@ pub(crate) fn route_action_at(
                     origin,
                     intent_id,
                     automation_occurrence_list_payload(conn, view, limit, automation_id.as_deref()),
+                ),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    (400, rejected_action(action, error))
+                }
+            }
+        }
+        "coven.automations.occurrence.history.v1" => {
+            let automation_id = required_history_automation_id(&payload, action);
+            let limit = optional_inspection_limit(&payload, action);
+            let cursor = optional_history_cursor(&payload, action);
+            match (automation_id, limit, cursor) {
+                (Ok(automation_id), Ok(limit), Ok(cursor)) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_occurrence_history_payload(
+                        conn,
+                        &automation_id,
+                        limit,
+                        cursor.as_ref(),
+                    ),
                 ),
                 (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                     (400, rejected_action(action, error))
@@ -1207,6 +1229,58 @@ fn required_occurrence_view(
     }
 }
 
+fn required_history_automation_id(payload: &Value, action: &str) -> Result<String, String> {
+    payload
+        .get("automationId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("{action} requires non-empty string field `automationId`"))
+}
+
+const OCCURRENCE_HISTORY_CURSOR_MAX_CHARS: usize = 512;
+
+/// Occurrence history cursors are opaque to clients: unpadded base64url of
+/// a JSON `[scheduledFor, id]` keyset position. Only a cursor this producer
+/// could have issued is accepted, so any other spelling is refused.
+fn encode_history_cursor(
+    position: &crate::automations::inspection::OccurrenceHistoryPosition,
+) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(json!([position.scheduled_for, position.id]).to_string())
+}
+
+fn optional_history_cursor(
+    payload: &Value,
+    action: &str,
+) -> Result<Option<crate::automations::inspection::OccurrenceHistoryPosition>, String> {
+    use base64::Engine as _;
+    let Some(value) = payload.get("cursor") else {
+        return Ok(None);
+    };
+    let invalid = || format!("{action} field `cursor` is not a cursor this producer issued");
+    let cursor = value.as_str().ok_or_else(invalid)?;
+    if cursor.is_empty() || cursor.len() > OCCURRENCE_HISTORY_CURSOR_MAX_CHARS {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| invalid())?;
+    let position: Vec<String> = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let [scheduled_for, id] = <[String; 2]>::try_from(position).map_err(|_| invalid())?;
+    if scheduled_for.is_empty() || id.is_empty() {
+        return Err(invalid());
+    }
+    let position = crate::automations::inspection::OccurrenceHistoryPosition { scheduled_for, id };
+    // Canonical spelling only: re-encoding must reproduce the exact input.
+    if encode_history_cursor(&position) != cursor {
+        return Err(invalid());
+    }
+    Ok(Some(position))
+}
+
 /// An absent `automationId` keeps the global view; a present one must be a
 /// non-empty string, so a malformed filter is refused rather than ignored.
 fn optional_automation_filter(payload: &Value, action: &str) -> Result<Option<String>, String> {
@@ -1394,6 +1468,36 @@ fn automation_occurrence_get_payload(
                     .collect(),
             );
             json!({ "occurrence": occurrence })
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_occurrence_history_payload(
+    conn: &rusqlite::Connection,
+    automation_id: &str,
+    limit: usize,
+    after: Option<&crate::automations::inspection::OccurrenceHistoryPosition>,
+) -> Result<Value, String> {
+    crate::automations::inspection::occurrence_history(conn, automation_id, limit, after)
+        .map(|page| {
+            let has_more = page.next.is_some();
+            let mut cursor = json!({ "hasMore": has_more });
+            // Echo the requested position so a pager can confirm which page it read.
+            if let Some(after) = after {
+                cursor["current"] = json!(encode_history_cursor(after));
+            }
+            if let Some(next) = &page.next {
+                cursor["next"] = json!(encode_history_cursor(next));
+            }
+            json!({
+                "automationId": automation_id,
+                "occurrences": page
+                    .occurrences
+                    .into_iter()
+                    .map(automation_occurrence_value)
+                    .collect::<Vec<_>>(),
+                "cursor": cursor,
+            })
         })
         .map_err(|error| format!("{error:#}"))
 }
@@ -2577,6 +2681,153 @@ mod tests {
                 &crate::api::NoopSessionRuntime,
             );
             assert_eq!(status, 400, "automationId {automation_id}");
+        }
+    }
+
+    fn history_page(
+        conn: &rusqlite::Connection,
+        automation_id: &str,
+        limit: u64,
+        cursor: Option<&str>,
+    ) -> (Vec<String>, Value) {
+        let mut request = json!({
+            "action": "coven.automations.occurrence.history.v1",
+            "automationId": automation_id,
+            "limit": limit
+        });
+        if let Some(cursor) = cursor {
+            request["cursor"] = json!(cursor);
+        }
+        let (status, response) = route_action(request, conn, &crate::api::NoopSessionRuntime);
+        assert_eq!(status, 200);
+        let payload = response.event.as_ref().unwrap().payload.clone();
+        assert_eq!(payload["automationId"], automation_id);
+        let ids = payload["occurrences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|occurrence| occurrence["id"].as_str().unwrap().to_owned())
+            .collect();
+        (ids, payload["cursor"].clone())
+    }
+
+    #[test]
+    fn occurrence_history_pages_every_state_newest_first_by_keyset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "alpha");
+        filter_fixture_definition(&conn, "beta");
+        for (id, day, state) in [
+            ("alpha-1", "01", "failed"),
+            ("alpha-2", "02", "succeeded"),
+            ("alpha-3", "03", "running"),
+            ("alpha-4", "04", "claimed"),
+            ("alpha-5", "05", "planned"),
+        ] {
+            filter_fixture_occurrence(
+                &conn,
+                id,
+                "alpha",
+                &format!("2026-09-{day}T09:00:00.000Z"),
+                state,
+            );
+        }
+        filter_fixture_occurrence(
+            &conn,
+            "beta-1",
+            "beta",
+            "2026-09-06T09:00:00.000Z",
+            "planned",
+        );
+
+        let (first, cursor) = history_page(&conn, "alpha", 2, None);
+        assert_eq!(first, vec!["alpha-5", "alpha-4"]);
+        assert_eq!(cursor["hasMore"], true);
+        let next = cursor["next"].as_str().unwrap().to_owned();
+
+        // A row inserted above the cursor must not shift the next page.
+        filter_fixture_occurrence(
+            &conn,
+            "alpha-6",
+            "alpha",
+            "2026-09-07T09:00:00.000Z",
+            "planned",
+        );
+        let (second, cursor) = history_page(&conn, "alpha", 2, Some(&next));
+        assert_eq!(second, vec!["alpha-3", "alpha-2"]);
+        assert_eq!(cursor["current"], next.as_str());
+        let next = cursor["next"].as_str().unwrap().to_owned();
+
+        let (third, cursor) = history_page(&conn, "alpha", 2, Some(&next));
+        assert_eq!(third, vec!["alpha-1"]);
+        assert_eq!(cursor, json!({ "hasMore": false, "current": next }));
+
+        let (whole, cursor) = history_page(&conn, "alpha", 100, None);
+        assert_eq!(
+            whole,
+            vec!["alpha-6", "alpha-5", "alpha-4", "alpha-3", "alpha-2", "alpha-1"]
+        );
+        assert_eq!(cursor, json!({ "hasMore": false }));
+        let (none, cursor) = history_page(&conn, "missing", 20, None);
+        assert!(none.is_empty());
+        assert_eq!(cursor, json!({ "hasMore": false }));
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.occurrence.history.v1"));
+    }
+
+    #[test]
+    fn occurrence_history_refuses_malformed_requests() {
+        use base64::Engine as _;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let encode = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        let padded =
+            base64::engine::general_purpose::URL_SAFE.encode(r#"["2026-09-01T09:00:00.000Z","x"]"#);
+        let spaced = encode(r#"[ "2026-09-01T09:00:00.000Z", "x" ]"#);
+        let bad_cursors = vec![
+            json!(""),
+            json!(7),
+            json!("not base64!"),
+            json!(padded),
+            json!(spaced),
+            json!(encode(r#"{"s":"2026","i":"x"}"#)),
+            json!(encode(r#"["2026-09-01T09:00:00.000Z"]"#)),
+            json!(encode(r#"["2026","x","y"]"#)),
+            json!(encode(r#"["","x"]"#)),
+            json!(encode(r#"["2026",""]"#)),
+            json!(encode(r#"["2026",5]"#)),
+            json!("A".repeat(OCCURRENCE_HISTORY_CURSOR_MAX_CHARS + 1)),
+        ];
+        for cursor in bad_cursors {
+            let (status, _) = route_action(
+                json!({
+                    "action": "coven.automations.occurrence.history.v1",
+                    "automationId": "alpha",
+                    "cursor": cursor
+                }),
+                &conn,
+                &crate::api::NoopSessionRuntime,
+            );
+            assert_eq!(status, 400, "cursor {cursor}");
+        }
+        for request in [
+            json!({ "action": "coven.automations.occurrence.history.v1" }),
+            json!({ "action": "coven.automations.occurrence.history.v1", "automationId": " " }),
+            json!({ "action": "coven.automations.occurrence.history.v1", "automationId": 3 }),
+            json!({ "action": "coven.automations.occurrence.history.v1", "automationId": "a", "limit": 0 }),
+            json!({ "action": "coven.automations.occurrence.history.v1", "automationId": "a", "limit": 101 }),
+        ] {
+            let (status, _) = route_action(request.clone(), &conn, &crate::api::NoopSessionRuntime);
+            assert_eq!(status, 400, "request {request}");
         }
     }
 
