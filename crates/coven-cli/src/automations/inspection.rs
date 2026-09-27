@@ -134,6 +134,92 @@ pub fn list_occurrences(
     Ok(records)
 }
 
+/// A keyset position in one automation's occurrence history: the
+/// `(scheduled_for, id)` of the last row a previous page returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceHistoryPosition {
+    pub scheduled_for: String,
+    pub id: String,
+}
+
+pub struct OccurrenceHistoryPage {
+    pub occurrences: Vec<OccurrenceRecord>,
+    /// The position after the last returned row, when more rows exist.
+    pub next: Option<OccurrenceHistoryPosition>,
+}
+
+/// One automation's occurrences in every state, newest first, from one
+/// snapshot. The page starts strictly after `after`, so rows inserted above
+/// the cursor while a caller pages never shift a later page. Diagnostic only.
+/// SQL for `YYYY-MM-DDTHH:MM:SS.fffffffffZ` from a UTC RFC 3339 `Z` timestamp
+/// with a zero- to nine-digit fraction, so TEXT order is instant order.
+fn history_sort_key(column: &str) -> String {
+    format!(
+        "(substr({column}, 1, 19) || '.' || \
+         substr(rtrim(substr({column}, 21), 'Z') || '000000000', 1, 9) || 'Z')"
+    )
+}
+
+pub fn occurrence_history(
+    conn: &Connection,
+    automation_id: &str,
+    limit: usize,
+    after: Option<&OccurrenceHistoryPosition>,
+) -> Result<OccurrenceHistoryPage> {
+    let transaction = conn
+        .unchecked_transaction()
+        .context("failed to begin automation occurrence history snapshot")?;
+    let bounded = limit.clamp(1, 100);
+    // Scheduled rows store millisecond RFC 3339 and manual rows nanosecond,
+    // so raw TEXT order is wrong within one millisecond (`.123Z` sorts after
+    // `.123100000Z`). Order and page by the instant with its fraction padded
+    // to nine digits instead. `.123Z` and `.123000000Z` then share a key,
+    // which `id` breaks.
+    let mut statement = transaction
+        .prepare(&format!(
+            "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
+                    kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                    failure_reason, created_at, updated_at
+             FROM automation_occurrences
+             WHERE automation_id = ?1
+               AND (?2 IS NULL OR {key} < {after} OR ({key} = {after} AND id < ?3))
+             ORDER BY {key} DESC, id DESC
+             LIMIT ?4",
+            key = history_sort_key("scheduled_for"),
+            after = history_sort_key("?2"),
+        ))
+        .context("failed to prepare automation occurrence history query")?;
+    let rows = statement
+        .query_map(
+            params![
+                automation_id,
+                after.map(|position| position.scheduled_for.as_str()),
+                after.map(|position| position.id.as_str()),
+                i64::try_from(bounded + 1)
+                    .context("occurrence history limit exceeds SQLite range")?
+            ],
+            occurrence_record_from_row,
+        )
+        .context("failed to read automation occurrence history")?;
+    let mut occurrences = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read automation occurrence history")?;
+    drop(statement);
+    transaction
+        .commit()
+        .context("failed to commit automation occurrence history snapshot")?;
+    let next = if occurrences.len() > bounded {
+        occurrences.truncate(bounded);
+        occurrences.last().map(|last| OccurrenceHistoryPosition {
+            scheduled_for: last.scheduled_for.clone(),
+            id: last.id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(OccurrenceHistoryPage { occurrences, next })
+}
+
 pub fn inspect_occurrence(conn: &Connection, id: &str) -> Result<Option<OccurrenceInspection>> {
     let transaction = conn
         .unchecked_transaction()
