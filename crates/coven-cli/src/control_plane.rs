@@ -2783,6 +2783,49 @@ mod tests {
     }
 
     #[test]
+    fn occurrence_history_orders_mixed_precision_by_instant() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "alpha");
+        // Manual rows store nanoseconds, scheduled rows milliseconds; raw TEXT
+        // order would put `.123Z` above `.123100000Z`.
+        for (id, scheduled_for) in [
+            ("scheduled-ms", "2026-09-10T09:00:00.123Z"),
+            ("manual-ns", "2026-09-10T09:00:00.123100000Z"),
+            ("tie-a", "2026-09-09T09:00:00.500Z"),
+            ("tie-b", "2026-09-09T09:00:00.500000000Z"),
+            ("whole-second", "2026-09-08T09:00:00Z"),
+        ] {
+            filter_fixture_occurrence(&conn, id, "alpha", scheduled_for, "succeeded");
+        }
+        let expected = vec![
+            "manual-ns",
+            "scheduled-ms",
+            "tie-b",
+            "tie-a",
+            "whole-second",
+        ];
+        let (whole, _) = history_page(&conn, "alpha", 100, None);
+        assert_eq!(whole, expected);
+
+        // One row per page walks across the equal-instant pair without a gap
+        // or a repeat.
+        let mut walked = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let (page, position) = history_page(&conn, "alpha", 1, cursor.as_deref());
+            walked.extend(page);
+            match position["next"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        assert_eq!(walked, expected);
+    }
+
+    #[test]
     fn occurrence_history_refuses_malformed_requests() {
         use base64::Engine as _;
         let temp = tempfile::tempdir().unwrap();

@@ -151,6 +151,15 @@ pub struct OccurrenceHistoryPage {
 /// One automation's occurrences in every state, newest first, from one
 /// snapshot. The page starts strictly after `after`, so rows inserted above
 /// the cursor while a caller pages never shift a later page. Diagnostic only.
+/// SQL for `YYYY-MM-DDTHH:MM:SS.fffffffffZ` from a UTC RFC 3339 `Z` timestamp
+/// with a zero- to nine-digit fraction, so TEXT order is instant order.
+fn history_sort_key(column: &str) -> String {
+    format!(
+        "(substr({column}, 1, 19) || '.' || \
+         substr(rtrim(substr({column}, 21), 'Z') || '000000000', 1, 9) || 'Z')"
+    )
+}
+
 pub fn occurrence_history(
     conn: &Connection,
     automation_id: &str,
@@ -161,20 +170,24 @@ pub fn occurrence_history(
         .unchecked_transaction()
         .context("failed to begin automation occurrence history snapshot")?;
     let bounded = limit.clamp(1, 100);
-    // The planning fence UNIQUE(automation_id, scheduled_for) means one
-    // automation never has two rows at one time; `id` only keeps the order
-    // total if that fence is ever relaxed.
+    // Scheduled rows store millisecond RFC 3339 and manual rows nanosecond,
+    // so raw TEXT order is wrong within one millisecond (`.123Z` sorts after
+    // `.123100000Z`). Order and page by the instant with its fraction padded
+    // to nine digits instead. `.123Z` and `.123000000Z` then share a key,
+    // which `id` breaks.
     let mut statement = transaction
-        .prepare(
+        .prepare(&format!(
             "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
                     kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
                     failure_reason, created_at, updated_at
              FROM automation_occurrences
              WHERE automation_id = ?1
-               AND (?2 IS NULL OR scheduled_for < ?2 OR (scheduled_for = ?2 AND id < ?3))
-             ORDER BY scheduled_for DESC, id DESC
+               AND (?2 IS NULL OR {key} < {after} OR ({key} = {after} AND id < ?3))
+             ORDER BY {key} DESC, id DESC
              LIMIT ?4",
-        )
+            key = history_sort_key("scheduled_for"),
+            after = history_sort_key("?2"),
+        ))
         .context("failed to prepare automation occurrence history query")?;
     let rows = statement
         .query_map(
