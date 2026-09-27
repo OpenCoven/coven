@@ -770,6 +770,7 @@ fn tick_inner(
         now,
         SCHEDULER_PASS_BATCH_LIMIT,
         &planning.claimable_definition_ids,
+        None,
     )? {
         let claimed = match scheduler_fence {
             Some(fence) => claim_due_occurrence_with_scheduler_fence(
@@ -1204,7 +1205,26 @@ pub(crate) fn eligible_occurrences(
     limit: usize,
 ) -> Result<Vec<EligibleOccurrence>> {
     let active_definition_ids = active_definition_ids(conn)?;
-    eligible_occurrences_for_active_definition_ids(conn, now, limit, &active_definition_ids)
+    eligible_occurrences_for_active_definition_ids(conn, now, limit, &active_definition_ids, None)
+}
+
+/// The eligible queue restricted to one automation. Eligibility is decided
+/// by the same query the scheduler claims from; the restriction is applied
+/// inside it, so the limit bounds the automation's rows, not a global page.
+pub(crate) fn eligible_occurrences_for_automation(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    limit: usize,
+    automation_id: &str,
+) -> Result<Vec<EligibleOccurrence>> {
+    let active_definition_ids = active_definition_ids(conn)?;
+    eligible_occurrences_for_active_definition_ids(
+        conn,
+        now,
+        limit,
+        &active_definition_ids,
+        Some(automation_id),
+    )
 }
 
 fn eligible_occurrences_for_active_definition_ids(
@@ -1212,6 +1232,7 @@ fn eligible_occurrences_for_active_definition_ids(
     now: DateTime<Utc>,
     limit: usize,
     active_definition_ids: &BTreeSet<String>,
+    automation_id: Option<&str>,
 ) -> Result<Vec<EligibleOccurrence>> {
     anyhow::ensure!(
         (1..=100).contains(&limit),
@@ -1311,13 +1332,14 @@ fn eligible_occurrences_for_active_definition_ids(
                              OR retry_run.timeout_at <= ?1
                          )
                    )
+                   AND (?4 IS NULL OR occurrence.automation_id = ?4)
                  ORDER BY occurrence.scheduled_for ASC, occurrence.id ASC
                  LIMIT ?3",
             )
             .context("failed to prepare automations eligible queue query")?;
         let rows = statement
             .query_map(
-                params![now_iso, active_definition_ids_json, bounded],
+                params![now_iso, active_definition_ids_json, bounded, automation_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .context("failed to query automations eligible queue")?;

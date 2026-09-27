@@ -81,11 +81,15 @@ pub struct OccurrenceInspection {
 
 const OCCURRENCE_RUN_INSPECTION_LIMIT: usize = 20;
 
+/// One bounded operator view, optionally restricted to one automation. The
+/// restriction is part of each view's query, so `limit` bounds that
+/// automation's rows rather than a global page filtered afterwards.
 pub fn list_occurrences(
     conn: &Connection,
     view: OccurrenceView,
     now: DateTime<Utc>,
     limit: usize,
+    automation_id: Option<&str>,
 ) -> Result<Vec<OccurrenceRecord>> {
     let transaction = conn
         .unchecked_transaction()
@@ -97,9 +101,18 @@ pub fn list_occurrences(
             "state = 'planned' AND scheduled_for <= ?1",
             &now.to_rfc3339_opts(SecondsFormat::Millis, true),
             bounded,
+            automation_id,
         )?,
         OccurrenceView::Eligible => {
-            let eligible = super::occurrences::eligible_occurrences(&transaction, now, bounded)?;
+            let eligible = match automation_id {
+                Some(automation_id) => super::occurrences::eligible_occurrences_for_automation(
+                    &transaction,
+                    now,
+                    bounded,
+                    automation_id,
+                )?,
+                None => super::occurrences::eligible_occurrences(&transaction, now, bounded)?,
+            };
             let mut records = Vec::with_capacity(eligible.len().min(bounded));
             for eligible in eligible {
                 let record = occurrence_by_id(&transaction, &eligible.id)?.with_context(|| {
@@ -109,10 +122,10 @@ pub fn list_occurrences(
             }
             records
         }
-        OccurrenceView::Claimed => list_by_state(&transaction, "claimed", bounded)?,
-        OccurrenceView::Running => list_by_state(&transaction, "running", bounded)?,
+        OccurrenceView::Claimed => list_by_state(&transaction, "claimed", bounded, automation_id)?,
+        OccurrenceView::Running => list_by_state(&transaction, "running", bounded, automation_id)?,
         OccurrenceView::RecoveryRequired => {
-            list_by_state(&transaction, "recovery_required", bounded)?
+            list_by_state(&transaction, "recovery_required", bounded, automation_id)?
         }
     };
     transaction
@@ -147,8 +160,13 @@ pub fn inspect_occurrence(conn: &Connection, id: &str) -> Result<Option<Occurren
     }))
 }
 
-fn list_by_state(conn: &Connection, state: &str, limit: usize) -> Result<Vec<OccurrenceRecord>> {
-    list_by_query(conn, "state = ?1", state, limit)
+fn list_by_state(
+    conn: &Connection,
+    state: &str,
+    limit: usize,
+    automation_id: Option<&str>,
+) -> Result<Vec<OccurrenceRecord>> {
+    list_by_query(conn, "state = ?1", state, limit, automation_id)
 }
 
 fn list_by_query(
@@ -156,13 +174,15 @@ fn list_by_query(
     predicate: &str,
     parameter: &str,
     limit: usize,
+    automation_id: Option<&str>,
 ) -> Result<Vec<OccurrenceRecord>> {
     let query = format!(
         "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
                 failure_reason, created_at, updated_at
          FROM automation_occurrences
-         WHERE {predicate}
+         WHERE ({predicate})
+           AND (?3 IS NULL OR automation_id = ?3)
          ORDER BY scheduled_for ASC, id ASC
          LIMIT ?2"
     );
@@ -173,7 +193,8 @@ fn list_by_query(
         .query_map(
             params![
                 parameter,
-                i64::try_from(limit).context("occurrence inspection limit exceeds SQLite range")?
+                i64::try_from(limit).context("occurrence inspection limit exceeds SQLite range")?,
+                automation_id
             ],
             occurrence_record_from_row,
         )
@@ -234,32 +255,66 @@ fn list_runs_for_occurrence(conn: &Connection, occurrence_id: &str) -> Result<Ve
                 i64::try_from(OCCURRENCE_RUN_INSPECTION_LIMIT + 1)
                     .context("occurrence run inspection limit exceeds SQLite range")?
             ],
-            |row| {
-                Ok(RunInspection {
-                    id: row.get(0)?,
-                    automation_id: row.get(1)?,
-                    automation_revision: sqlite_u64(row, 2)?,
-                    definition_digest: row.get(3)?,
-                    occurrence_id: row.get(4)?,
-                    authority_profile: row.get(5)?,
-                    receipt_id: row.get(6)?,
-                    session_id: row.get(7)?,
-                    familiar_id: row.get(8)?,
-                    runtime: row.get(9)?,
-                    status: row.get(10)?,
-                    exit_code: row.get(11)?,
-                    log_json: row.get(12)?,
-                    output_commit: row.get(13)?,
-                    started_at: row.get(14)?,
-                    timeout_at: row.get(15)?,
-                    finished_at: row.get(16)?,
-                    attempts: Vec::new(),
-                })
-            },
+            run_record_from_row,
         )
         .context("failed to inspect automation occurrence runs")?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to read automation occurrence run inspection")
+}
+
+const RUN_COLUMNS: &str =
+    "id, automation_id, automation_revision, definition_digest, occurrence_id,
+     authority_profile, receipt_id, session_id, familiar_id, runtime, status,
+     exit_code, log_json, output_commit, started_at, timeout_at, finished_at";
+
+/// One run and its attempts, read from a single snapshot. Diagnostic only:
+/// it neither renews leases nor mutates lifecycle rows.
+pub fn inspect_run(conn: &Connection, id: &str) -> Result<Option<RunInspection>> {
+    let transaction = conn
+        .unchecked_transaction()
+        .context("failed to begin automation run detail snapshot")?;
+    let run = transaction
+        .query_row(
+            &format!("SELECT {RUN_COLUMNS} FROM automation_runs WHERE id = ?1"),
+            [id],
+            run_record_from_row,
+        )
+        .optional()
+        .context("failed to inspect automation run")?;
+    let run = match run {
+        Some(mut run) => {
+            run.attempts = list_attempts_for_run(&transaction, &run.id)?;
+            Some(run)
+        }
+        None => None,
+    };
+    transaction
+        .commit()
+        .context("failed to commit automation run detail snapshot")?;
+    Ok(run)
+}
+
+fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunInspection> {
+    Ok(RunInspection {
+        id: row.get(0)?,
+        automation_id: row.get(1)?,
+        automation_revision: sqlite_u64(row, 2)?,
+        definition_digest: row.get(3)?,
+        occurrence_id: row.get(4)?,
+        authority_profile: row.get(5)?,
+        receipt_id: row.get(6)?,
+        session_id: row.get(7)?,
+        familiar_id: row.get(8)?,
+        runtime: row.get(9)?,
+        status: row.get(10)?,
+        exit_code: row.get(11)?,
+        log_json: row.get(12)?,
+        output_commit: row.get(13)?,
+        started_at: row.get(14)?,
+        timeout_at: row.get(15)?,
+        finished_at: row.get(16)?,
+        attempts: Vec::new(),
+    })
 }
 
 fn list_attempts_for_run(conn: &Connection, run_id: &str) -> Result<Vec<AttemptInspection>> {
