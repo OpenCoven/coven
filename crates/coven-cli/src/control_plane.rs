@@ -140,6 +140,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.scheduler.status.v1",
                     "coven.automations.occurrence.list.v1",
                     "coven.automations.occurrence.get.v1",
+                    "coven.automations.run.get.v1",
                     "coven.automations.unquarantine",
                 ],
                 variant_negotiation: Some(
@@ -658,14 +659,29 @@ pub(crate) fn route_action_at(
         "coven.automations.occurrence.list.v1" => {
             let view = required_occurrence_view(&payload, action);
             let limit = optional_inspection_limit(&payload, action);
-            match (view, limit) {
-                (Ok(view), Ok(limit)) => automation_result(
+            let automation_id = optional_automation_filter(&payload, action);
+            match (view, limit, automation_id) {
+                (Ok(view), Ok(limit), Ok(automation_id)) => automation_result(
                     action,
                     origin,
                     intent_id,
-                    automation_occurrence_list_payload(conn, view, limit),
+                    automation_occurrence_list_payload(conn, view, limit, automation_id.as_deref()),
                 ),
-                (Err(error), _) | (_, Err(error)) => (400, rejected_action(action, error)),
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    (400, rejected_action(action, error))
+                }
+            }
+        }
+        "coven.automations.run.get.v1" => {
+            let id = required_id_field(&payload, action);
+            match id {
+                Ok(id) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_run_get_payload(conn, &id),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
             }
         }
         "coven.automations.occurrence.get.v1" => {
@@ -1191,6 +1207,20 @@ fn required_occurrence_view(
     }
 }
 
+/// An absent `automationId` keeps the global view; a present one must be a
+/// non-empty string, so a malformed filter is refused rather than ignored.
+fn optional_automation_filter(payload: &Value, action: &str) -> Result<Option<String>, String> {
+    match payload.get("automationId") {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| Some(id.to_owned()))
+            .ok_or_else(|| format!("{action} field `automationId` must be a non-empty string")),
+    }
+}
+
 fn optional_inspection_limit(payload: &Value, action: &str) -> Result<usize, String> {
     match payload.get("limit") {
         None => Ok(20),
@@ -1326,16 +1356,23 @@ fn automation_occurrence_list_payload(
     conn: &rusqlite::Connection,
     view: crate::automations::inspection::OccurrenceView,
     limit: usize,
+    automation_id: Option<&str>,
 ) -> Result<Value, String> {
-    crate::automations::inspection::list_occurrences(conn, view, chrono::Utc::now(), limit)
-        .map(|records| {
-            let occurrences = records
-                .into_iter()
-                .map(automation_occurrence_value)
-                .collect::<Vec<_>>();
-            json!({ "occurrences": occurrences })
-        })
-        .map_err(|error| format!("{error:#}"))
+    crate::automations::inspection::list_occurrences(
+        conn,
+        view,
+        chrono::Utc::now(),
+        limit,
+        automation_id,
+    )
+    .map(|records| {
+        let occurrences = records
+            .into_iter()
+            .map(automation_occurrence_value)
+            .collect::<Vec<_>>();
+        json!({ "occurrences": occurrences })
+    })
+    .map_err(|error| format!("{error:#}"))
 }
 
 fn automation_occurrence_get_payload(
@@ -1353,58 +1390,66 @@ fn automation_occurrence_get_payload(
                 inspection
                     .runs
                     .into_iter()
-                    .map(|run| {
-                        let attempts = run
-                            .attempts
-                            .into_iter()
-                            .map(|attempt| {
-                                json!({
-                                    "id": attempt.id,
-                                    "runId": attempt.run_id,
-                                    "occurrenceId": attempt.occurrence_id,
-                                    "attemptNumber": attempt.attempt_number,
-                                    "adoptionKey": attempt.adoption_key,
-                                    "occurrenceFenceGeneration": attempt.occurrence_fence_generation,
-                                    "dispatchGeneration": attempt.dispatch_generation,
-                                    "state": attempt.state,
-                                    "failureClass": attempt.failure_class,
-                                    "priorAttemptNumber": attempt.prior_attempt_number,
-                                    "priorDisposition": attempt.prior_disposition,
-                                    "retryClassification": attempt.retry_classification,
-                                    "notBefore": attempt.not_before,
-                                    "sessionId": attempt.session_id,
-                                    "stateReason": attempt.state_reason,
-                                    "openedAt": attempt.opened_at,
-                                    "settledAt": attempt.settled_at,
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        json!({
-                            "id": run.id,
-                            "automationId": run.automation_id,
-                            "automationRevision": run.automation_revision,
-                            "definitionDigest": run.definition_digest,
-                            "occurrenceId": run.occurrence_id,
-                            "authorityProfile": run.authority_profile,
-                            "receiptId": run.receipt_id,
-                            "sessionId": run.session_id,
-                            "familiarId": run.familiar_id,
-                            "runtime": run.runtime,
-                            "status": run.status,
-                            "exitCode": run.exit_code,
-                            "logJson": run.log_json,
-                            "outputCommit": run.output_commit,
-                            "startedAt": run.started_at,
-                            "timeoutAt": run.timeout_at,
-                            "finishedAt": run.finished_at,
-                            "attempts": attempts,
-                        })
-                    })
+                    .map(automation_run_value)
                     .collect(),
             );
             json!({ "occurrence": occurrence })
         })
         .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_run_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
+    crate::automations::inspection::inspect_run(conn, id)
+        .map(|run| json!({ "run": run.map(automation_run_value) }))
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_run_value(run: crate::automations::inspection::RunInspection) -> Value {
+    let attempts = run
+        .attempts
+        .into_iter()
+        .map(|attempt| {
+            json!({
+                "id": attempt.id,
+                "runId": attempt.run_id,
+                "occurrenceId": attempt.occurrence_id,
+                "attemptNumber": attempt.attempt_number,
+                "adoptionKey": attempt.adoption_key,
+                "occurrenceFenceGeneration": attempt.occurrence_fence_generation,
+                "dispatchGeneration": attempt.dispatch_generation,
+                "state": attempt.state,
+                "failureClass": attempt.failure_class,
+                "priorAttemptNumber": attempt.prior_attempt_number,
+                "priorDisposition": attempt.prior_disposition,
+                "retryClassification": attempt.retry_classification,
+                "notBefore": attempt.not_before,
+                "sessionId": attempt.session_id,
+                "stateReason": attempt.state_reason,
+                "openedAt": attempt.opened_at,
+                "settledAt": attempt.settled_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": run.id,
+        "automationId": run.automation_id,
+        "automationRevision": run.automation_revision,
+        "definitionDigest": run.definition_digest,
+        "occurrenceId": run.occurrence_id,
+        "authorityProfile": run.authority_profile,
+        "receiptId": run.receipt_id,
+        "sessionId": run.session_id,
+        "familiarId": run.familiar_id,
+        "runtime": run.runtime,
+        "status": run.status,
+        "exitCode": run.exit_code,
+        "logJson": run.log_json,
+        "outputCommit": run.output_commit,
+        "startedAt": run.started_at,
+        "timeoutAt": run.timeout_at,
+        "finishedAt": run.finished_at,
+        "attempts": attempts,
+    })
 }
 
 fn automation_occurrence_value(record: crate::automations::inspection::OccurrenceRecord) -> Value {
@@ -2338,6 +2383,300 @@ mod tests {
         let occurrence = &response.event.as_ref().unwrap().payload["occurrence"];
         assert_eq!(occurrence["runs"].as_array().unwrap().len(), 20);
         assert_eq!(occurrence["runsTruncated"], true);
+    }
+
+    fn filter_fixture_definition(conn: &rusqlite::Connection, id: &str) {
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": id,
+            "name": id,
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(conn, &definition).unwrap();
+    }
+
+    fn filter_fixture_occurrence(
+        conn: &rusqlite::Connection,
+        id: &str,
+        automation_id: &str,
+        scheduled_for: &str,
+        state: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT ?1, id, revision, definition_digest, ?3, 'scheduled', ?4, 0, ?3, ?3
+             FROM automation_definitions WHERE id = ?2",
+            rusqlite::params![id, automation_id, scheduled_for, state],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn occurrence_list_filters_every_view_by_automation_before_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "alpha");
+        filter_fixture_definition(&conn, "beta");
+        // Three alpha rows sort before beta's, so a global page of one would
+        // never contain beta: the filter must apply before the limit.
+        for (index, hour) in ["06", "07", "08"].iter().enumerate() {
+            filter_fixture_occurrence(
+                &conn,
+                &format!("alpha-due-{index}"),
+                "alpha",
+                &format!("2026-09-01T{hour}:00:00.000Z"),
+                "planned",
+            );
+        }
+        filter_fixture_occurrence(
+            &conn,
+            "beta-due",
+            "beta",
+            "2026-09-01T09:00:00.000Z",
+            "planned",
+        );
+        filter_fixture_occurrence(
+            &conn,
+            "alpha-claimed",
+            "alpha",
+            "2026-09-02T09:00:00.000Z",
+            "claimed",
+        );
+        filter_fixture_occurrence(
+            &conn,
+            "beta-claimed",
+            "beta",
+            "2026-09-03T09:00:00.000Z",
+            "claimed",
+        );
+
+        let list = |view: &str, automation_id: Option<&str>, limit: u64| {
+            let mut request = json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": view,
+                "limit": limit
+            });
+            if let Some(automation_id) = automation_id {
+                request["automationId"] = json!(automation_id);
+            }
+            let (status, response) = route_action(request, &conn, &crate::api::NoopSessionRuntime);
+            assert_eq!(status, 200, "{view} {automation_id:?}");
+            response.event.as_ref().unwrap().payload["occurrences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|occurrence| occurrence["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(list("due", None, 1), vec!["alpha-due-0"]);
+        assert_eq!(list("due", Some("beta"), 1), vec!["beta-due"]);
+        assert_eq!(
+            list("due", Some("alpha"), 100),
+            vec!["alpha-due-0", "alpha-due-1", "alpha-due-2"]
+        );
+        // Eligibility is latest-only per automation, and stays scoped to it.
+        assert_eq!(list("eligible", Some("beta"), 1), Vec::<String>::new());
+        assert_eq!(list("claimed", Some("beta"), 100), vec!["beta-claimed"]);
+        assert_eq!(
+            list("claimed", None, 100),
+            vec!["alpha-claimed", "beta-claimed"]
+        );
+        assert_eq!(list("running", Some("alpha"), 100), Vec::<String>::new());
+        assert_eq!(list("due", Some("missing"), 100), Vec::<String>::new());
+    }
+
+    #[test]
+    fn occurrence_list_scopes_the_eligible_queue_to_one_automation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "alpha");
+        filter_fixture_definition(&conn, "beta");
+        filter_fixture_occurrence(
+            &conn,
+            "alpha-old",
+            "alpha",
+            "2026-09-01T07:00:00.000Z",
+            "planned",
+        );
+        filter_fixture_occurrence(
+            &conn,
+            "alpha-latest",
+            "alpha",
+            "2026-09-01T08:00:00.000Z",
+            "planned",
+        );
+        filter_fixture_occurrence(
+            &conn,
+            "beta-latest",
+            "beta",
+            "2026-09-01T09:00:00.000Z",
+            "planned",
+        );
+
+        let eligible = |automation_id: Option<&str>, limit: u64| {
+            let mut request = json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible",
+                "limit": limit
+            });
+            if let Some(automation_id) = automation_id {
+                request["automationId"] = json!(automation_id);
+            }
+            let (status, response) = route_action(request, &conn, &crate::api::NoopSessionRuntime);
+            assert_eq!(status, 200);
+            response.event.as_ref().unwrap().payload["occurrences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|occurrence| occurrence["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(eligible(None, 100), vec!["alpha-latest", "beta-latest"]);
+        assert_eq!(eligible(None, 1), vec!["alpha-latest"]);
+        assert_eq!(eligible(Some("beta"), 1), vec!["beta-latest"]);
+        assert_eq!(eligible(Some("alpha"), 100), vec!["alpha-latest"]);
+    }
+
+    #[test]
+    fn occurrence_list_refuses_a_malformed_automation_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for automation_id in [
+            json!(""),
+            json!("   "),
+            json!(7),
+            json!(null),
+            json!(["alpha"]),
+        ] {
+            let (status, _) = route_action(
+                json!({
+                    "action": "coven.automations.occurrence.list.v1",
+                    "view": "due",
+                    "automationId": automation_id
+                }),
+                &conn,
+                &crate::api::NoopSessionRuntime,
+            );
+            assert_eq!(status, 400, "automationId {automation_id}");
+        }
+    }
+
+    #[test]
+    fn run_get_action_reads_one_run_with_its_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "run-read");
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'run-read-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'running', 4,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:01:00.000Z'
+             FROM automation_definitions WHERE id = 'run-read';
+             INSERT INTO automation_runs
+                (id, automation_id, automation_revision, definition_digest, occurrence_id,
+                 authority_profile, receipt_id, runtime, status, started_at, timeout_at)
+             SELECT 'run-read-run', automation_id, automation_revision, definition_digest, id,
+                    'coven.automations.authority.v1', 'receipt-7', 'coven-code', 'running',
+                    '2026-09-01T09:01:00.000Z', '2026-09-01T09:31:00.000Z'
+             FROM automation_occurrences WHERE id = 'run-read-occurrence';
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, dispatch_generation, state, failure_class,
+                 prior_attempt_number, prior_disposition, retry_classification, not_before,
+                 opened_at, settled_at)
+             VALUES
+                ('run-read-attempt-2', 'run-read-run', 'run-read-occurrence', 2, 'adopt-2',
+                 4, 9, 'observing', NULL, 1, 'failed', 'automatic_retry',
+                 '2026-09-01T09:01:30.000Z', '2026-09-01T09:02:00.000Z', NULL),
+                ('run-read-attempt-1', 'run-read-run', 'run-read-occurrence', 1, 'adopt-1',
+                 3, 8, 'failed', 'runtime_error', NULL, NULL, 'initial',
+                 '2026-09-01T09:01:00.000Z', '2026-09-01T09:01:00.000Z',
+                 '2026-09-01T09:01:20.000Z');",
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({ "action": "coven.automations.run.get.v1", "id": "run-read-run" }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(status, 200);
+        let run = response.event.as_ref().unwrap().payload["run"].clone();
+        assert_eq!(run["id"], "run-read-run");
+        assert_eq!(run["automationId"], "run-read");
+        assert_eq!(run["occurrenceId"], "run-read-occurrence");
+        assert_eq!(run["authorityProfile"], "coven.automations.authority.v1");
+        assert_eq!(run["receiptId"], "receipt-7");
+        assert_eq!(run["status"], "running");
+        let attempts = run["attempts"].as_array().unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt["attemptNumber"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(1), json!(2)]
+        );
+
+        // The detail read and the occurrence detail project a run identically.
+        let (_, occurrence) = route_action(
+            json!({ "action": "coven.automations.occurrence.get.v1", "id": "run-read-occurrence" }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(
+            occurrence.event.as_ref().unwrap().payload["occurrence"]["runs"][0],
+            run
+        );
+
+        let (absent_status, absent) = route_action(
+            json!({ "action": "coven.automations.run.get.v1", "id": "no-such-run" }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(absent_status, 200);
+        assert_eq!(
+            absent.event.as_ref().unwrap().payload,
+            json!({ "run": null })
+        );
+
+        for request in [
+            json!({ "action": "coven.automations.run.get.v1" }),
+            json!({ "action": "coven.automations.run.get.v1", "id": "  " }),
+            json!({ "action": "coven.automations.run.get.v1", "id": 7 }),
+        ] {
+            let (status, _) = route_action(request, &conn, &crate::api::NoopSessionRuntime);
+            assert_eq!(status, 400);
+        }
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.run.get.v1"));
     }
 
     #[test]
