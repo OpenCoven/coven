@@ -152,12 +152,25 @@ pub(crate) fn route(
     )
 }
 
-/// A rejected spec response around the typed error the adapter produced.
+/// A rejected spec response around the adapter's error. The spec requires a
+/// typed error on every rejection, so an untyped inner failure (a legacy-style
+/// read reporting only a reason) becomes `INTERNAL`.
 fn rejected_response(
     command: &str,
     adoption_key: &Value,
     (status, inner): (u16, ControlActionResponse),
 ) -> (u16, ControlActionResponse) {
+    if inner.error.is_none() {
+        let reason = inner
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("{command} failed without a typed error"));
+        return rejected_response(
+            command,
+            adoption_key,
+            typed_rejection(ACTION, automation_error(ErrorCode::Internal, reason)),
+        );
+    }
     let error = inner.error.clone();
     (
         status,
@@ -172,7 +185,7 @@ fn rejected_response(
                 "command": command,
                 "adoptionKey": adoption_key,
                 "outcome": "rejected",
-                "error": error.clone().unwrap_or(Value::Null),
+                "error": error.clone(),
             })),
             error,
             event: None,
@@ -583,6 +596,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(adoptions, 0);
+    }
+
+    #[test]
+    fn event_subscriptions_answer_pages_and_typed_cursor_rejections() {
+        let validator = response_validator();
+        let (_temp, conn) = store();
+        let stream = json!({ "kind": "automation", "id": "envelope-wire" });
+        let (status, response) = send(
+            &conn,
+            envelope(
+                "events.subscribe.v1",
+                "adopt:envelope:subscribe",
+                None,
+                json!({ "stream": stream }),
+            ),
+        );
+        assert_eq!(status, 200, "{response:?}");
+        let page = response.result.unwrap();
+        assert!(validator.is_valid(&page), "{page}");
+        assert_eq!(page["outcome"], "committed");
+        let checkpoint = page["result"]["checkpoint"].as_str().unwrap().to_owned();
+
+        let (status, resumed) = send(
+            &conn,
+            envelope(
+                "events.subscribe.v1",
+                "adopt:envelope:subscribe-resume",
+                None,
+                json!({ "stream": stream, "checkpoint": checkpoint }),
+            ),
+        );
+        assert_eq!(status, 200, "{resumed:?}");
+        assert!(validator.is_valid(resumed.result.as_ref().unwrap()));
+
+        let (status, unknown) = send(
+            &conn,
+            envelope(
+                "events.subscribe.v1",
+                "adopt:envelope:subscribe-unknown",
+                None,
+                json!({ "stream": stream, "checkpoint": format!("ecp{}", "0".repeat(32)) }),
+            ),
+        );
+        let unknown = unknown.result.unwrap();
+        assert!(validator.is_valid(&unknown), "{unknown}");
+        assert_eq!(unknown["outcome"], "rejected");
+        assert_ne!(status, 200);
+        assert!(unknown["error"]["code"].is_string(), "{unknown}");
+    }
+
+    #[test]
+    fn untyped_adapter_failures_become_typed_internal_rejections() {
+        let validator = response_validator();
+        let (_temp, conn) = store();
+        conn.execute(
+            "UPDATE automation_definitions SET definition_json = '{' WHERE id = 'envelope-wire'",
+            [],
+        )
+        .unwrap();
+        for (command, payload) in [
+            (
+                "definition.get.v1",
+                json!({ "automationId": "envelope-wire" }),
+            ),
+            ("definition.list.v1", json!({})),
+        ] {
+            let (status, response) = send(
+                &conn,
+                envelope(command, "adopt:envelope:corrupt", None, payload),
+            );
+            let body = response.result.unwrap();
+            assert!(validator.is_valid(&body), "{command}: {body}");
+            assert_eq!(body["outcome"], "rejected", "{command}");
+            assert_eq!(body["error"]["code"], "INTERNAL", "{command}: {body}");
+            assert_eq!(status, 500, "{command}");
+        }
     }
 
     #[test]
