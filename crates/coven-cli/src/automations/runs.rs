@@ -360,46 +360,51 @@ pub fn record_run_finish(
     Ok(changed > 0)
 }
 
+const RUN_COLUMNS: &str =
+    "id, automation_id, automation_revision, definition_digest, occurrence_id,
+     receipt_id, session_id, familiar_id, runtime, status, exit_code, log_json,
+     output_commit, started_at, timeout_at, finished_at";
+
+fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: row.get(0)?,
+        automation_id: row.get(1)?,
+        automation_revision: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        definition_digest: row.get(3)?,
+        occurrence_id: row.get(4)?,
+        receipt_id: row.get(5)?,
+        session_id: row.get(6)?,
+        familiar_id: row.get(7)?,
+        runtime: row.get(8)?,
+        status: row.get(9)?,
+        exit_code: row.get(10)?,
+        log_json: row.get(11)?,
+        output_commit: row.get(12)?,
+        started_at: row.get(13)?,
+        timeout_at: row.get(14)?,
+        finished_at: row.get(15)?,
+    })
+}
+
 pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<Vec<RunRecord>> {
     let bounded = limit.clamp(1, 100);
     let mut statement = conn
-        .prepare(
-            "SELECT id, automation_id, automation_revision, definition_digest, occurrence_id,
-                    receipt_id, session_id, familiar_id, runtime, status, exit_code, log_json,
-                    output_commit, started_at, timeout_at, finished_at
+        .prepare(&format!(
+            "SELECT {RUN_COLUMNS}
              FROM automation_runs
              WHERE automation_id = ?1
              ORDER BY started_at DESC
-             LIMIT ?2",
-        )
+             LIMIT ?2"
+        ))
         .context("failed to prepare run list query")?;
     let rows = statement
-        .query_map(params![automation_id, bounded], |row| {
-            Ok(RunRecord {
-                id: row.get(0)?,
-                automation_id: row.get(1)?,
-                automation_revision: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Integer,
-                        Box::new(error),
-                    )
-                })?,
-                definition_digest: row.get(3)?,
-                occurrence_id: row.get(4)?,
-                receipt_id: row.get(5)?,
-                session_id: row.get(6)?,
-                familiar_id: row.get(7)?,
-                runtime: row.get(8)?,
-                status: row.get(9)?,
-                exit_code: row.get(10)?,
-                log_json: row.get(11)?,
-                output_commit: row.get(12)?,
-                started_at: row.get(13)?,
-                timeout_at: row.get(14)?,
-                finished_at: row.get(15)?,
-            })
-        })
+        .query_map(params![automation_id, bounded], run_record_from_row)
         .context("failed to list runs")?;
 
     let mut records = Vec::new();
@@ -407,6 +412,71 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
         records.push(row.context("failed to read run row")?);
     }
     Ok(records)
+}
+
+/// Where the next run-history page starts: strictly after this run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHistoryPosition {
+    pub started_at: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunHistoryPage {
+    pub runs: Vec<RunRecord>,
+    pub next: Option<RunHistoryPosition>,
+}
+
+/// One automation's runs, optionally for one occurrence, newest first by
+/// start instant then `id`, starting strictly after `after`. `started_at` is
+/// written at more than one precision, so rows are ordered by the instant
+/// rather than the text, as occurrence history is.
+pub fn run_history(
+    conn: &Connection,
+    automation_id: &str,
+    occurrence_id: Option<&str>,
+    limit: usize,
+    after: Option<&RunHistoryPosition>,
+) -> Result<RunHistoryPage> {
+    let bounded = limit.clamp(1, 100);
+    let key = super::inspection::history_sort_key("started_at");
+    let after_key = super::inspection::history_sort_key("?3");
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {RUN_COLUMNS}
+             FROM automation_runs
+             WHERE automation_id = ?1
+               AND (?2 IS NULL OR occurrence_id = ?2)
+               AND (?3 IS NULL OR {key} < {after_key} OR ({key} = {after_key} AND id < ?4))
+             ORDER BY {key} DESC, id DESC
+             LIMIT ?5"
+        ))
+        .context("failed to prepare run history query")?;
+    let rows = statement
+        .query_map(
+            params![
+                automation_id,
+                occurrence_id,
+                after.map(|position| position.started_at.as_str()),
+                after.map(|position| position.id.as_str()),
+                i64::try_from(bounded + 1).context("run history limit exceeds SQLite range")?
+            ],
+            run_record_from_row,
+        )
+        .context("failed to read run history")?;
+    let mut runs = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read run history")?;
+    let next = if runs.len() > bounded {
+        runs.truncate(bounded);
+        runs.last().map(|last| RunHistoryPosition {
+            started_at: last.started_at.clone(),
+            id: last.id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(RunHistoryPage { runs, next })
 }
 
 pub fn is_retry_quarantined(conn: &Connection, automation_id: &str) -> Result<bool> {
@@ -421,7 +491,6 @@ pub fn is_retry_quarantined(conn: &Connection, automation_id: &str) -> Result<bo
     .context("failed to inspect automation retry quarantine")
 }
 
-#[cfg(test)]
 pub fn list_attempts(conn: &Connection, run_id: &str) -> Result<Vec<AttemptRecord>> {
     let mut statement = conn
         .prepare(

@@ -153,7 +153,7 @@ pub struct OccurrenceHistoryPage {
 /// the cursor while a caller pages never shift a later page. Diagnostic only.
 /// SQL for `YYYY-MM-DDTHH:MM:SS.fffffffffZ` from a UTC RFC 3339 `Z` timestamp
 /// with a zero- to nine-digit fraction, so TEXT order is instant order.
-fn history_sort_key(column: &str) -> String {
+pub(crate) fn history_sort_key(column: &str) -> String {
     format!(
         "(substr({column}, 1, 19) || '.' || \
          substr(rtrim(substr({column}, 21), 'Z') || '000000000', 1, 9) || 'Z')"

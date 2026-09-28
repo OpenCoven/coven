@@ -49,12 +49,7 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
     entry("occurrence.recover.v1", Unsupported),
     entry("definition.list.v1", Implemented),
     entry("definition.get.v1", Implemented),
-    entry(
-        "run.history.v1",
-        CompatibilityOnly {
-            legacy_action: "coven.automations.runs",
-        },
-    ),
+    entry("run.history.v1", Implemented),
     entry("definition.health.v1", Implemented),
     entry("events.read.v1", Implemented),
     entry("events.subscribe.v1", Implemented),
