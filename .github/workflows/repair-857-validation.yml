@@ -1,0 +1,35 @@
+name: Temporary authority boundary regression
+
+on:
+  push:
+    branches: [fix/857-automation-transport-authority]
+    paths: [.github/workflows/repair-857-validation.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    if: github.repository == 'OpenCoven/coven' && github.ref == 'refs/heads/fix/857-automation-transport-authority'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/coven-target
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/coven-target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - name: Install native link dependencies
+        run: bash scripts/install-native-link-dependencies.sh
+      - name: Prove request-boundary regression against unpatched source
+        run: cargo test --locked -p coven-cli --bin coven transport_authority_tests -- --nocapture

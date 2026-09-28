@@ -32,6 +32,8 @@ pub mod runs;
 pub mod runtime_terminal_evidence;
 pub mod schedule;
 pub mod store;
+#[cfg(test)]
+mod transport_authority_tests;
 
 #[allow(unused_imports)]
 pub use definition::RoutineDefinition;
