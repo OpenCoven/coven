@@ -1,4 +1,4 @@
-name: Temporary authority boundary regression
+name: Temporary authority boundary validation
 
 on:
   push:
@@ -12,7 +12,9 @@ jobs:
   regression:
     if: github.repository == 'OpenCoven/coven' && github.ref == 'refs/heads/fix/857-automation-transport-authority'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -20,6 +22,39 @@ jobs:
       - name: Keep build output outside source
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/coven-target" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply exact reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object crates/coven-cli/src/api.rs)" = ca5f3d6b5d1bfe970baefdfafe4277f437c2bcb9
+          test "$(git hash-object crates/coven-cli/src/request_authority.rs)" = 1571c9209e848b8ec5991624fd9a4fb104b0b3dc
+          git apply --check .github/repair-857.patch
+          git apply .github/repair-857.patch
+          cargo fmt --all
+          git diff --check
+          python3 - <<'PY'
+          import subprocess
+          allowed = {'crates/coven-cli/src/api.rs', 'crates/coven-cli/src/control_plane.rs', 'crates/coven-cli/src/request_authority.rs', 'crates/coven-cli/src/automations/transport_authority_tests.rs', 'docs/API-CONTRACT.md'}
+          actual = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert actual <= allowed, actual - allowed
+          PY
+          git config user.name 'Valentina Alexander'
+          git config user.email '68980965+BunsDev@users.noreply.github.com'
+          git add crates/coven-cli/src/api.rs crates/coven-cli/src/control_plane.rs crates/coven-cli/src/request_authority.rs crates/coven-cli/src/automations/transport_authority_tests.rs docs/API-CONTRACT.md
+          git commit -s -m 'fix: require owner transport before automation adoption and dispatch'
+      - name: Publish only to isolated repair branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_head=$(git ls-remote origin refs/heads/fix/857-automation-transport-authority | cut -f1)
+          test "$remote_head" = "$GITHUB_SHA"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/fix/857-automation-transport-authority
+          git rev-parse HEAD
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -31,5 +66,21 @@ jobs:
             ${{ runner.os }}-rust-test-
       - name: Install native link dependencies
         run: bash scripts/install-native-link-dependencies.sh
-      - name: Prove request-boundary regression against unpatched source
+      - name: Authority request regression
         run: cargo test --locked -p coven-cli --bin coven transport_authority_tests -- --nocapture
+      - name: Existing control action regressions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p coven-cli --bin coven control_actions -- --nocapture
+      - name: Formatting and contract guards
+        if: ${{ !cancelled() }}
+        run: |
+          cargo fmt --check
+          python3 scripts/check-api-contract-docs.py
+          python3 scripts/check-secrets.py
+          python3 scripts/check-security-policy.py
+      - name: Full workspace tests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --locked
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
