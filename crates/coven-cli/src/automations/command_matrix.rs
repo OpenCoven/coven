@@ -198,8 +198,10 @@ mod tests {
 
     #[test]
     fn architecture_doc_publishes_the_current_matrix() {
+        // Windows checkouts may convert the doc to CRLF.
+        let doc = ARCHITECTURE_DOC.replace("\r\n", "\n");
         assert!(
-            ARCHITECTURE_DOC.contains(&markdown_table()),
+            doc.contains(&markdown_table()),
             "docs/architecture/coven-automations-v1.md must contain:\n{}",
             markdown_table()
         );
