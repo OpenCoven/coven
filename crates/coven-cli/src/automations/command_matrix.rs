@@ -55,12 +55,7 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
             legacy_action: "coven.automations.runs",
         },
     ),
-    entry(
-        "definition.health.v1",
-        CompatibilityOnly {
-            legacy_action: "coven.automations.health",
-        },
-    ),
+    entry("definition.health.v1", Implemented),
     entry("events.read.v1", Implemented),
     entry("events.subscribe.v1", Implemented),
     entry(

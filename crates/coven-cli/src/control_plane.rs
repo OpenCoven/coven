@@ -139,6 +139,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.run",
                     "coven.automations.import",
                     "coven.automations.health",
+                    "coven.automations.definition.health.v1",
                     "coven.automations.scheduler.status.v1",
                     "coven.automations.occurrence.list.v1",
                     "coven.automations.occurrence.get.v1",
@@ -657,6 +658,10 @@ pub(crate) fn route_action_at(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
+        "coven.automations.definition.health.v1" => match required_id_field(&payload, action) {
+            Ok(id) => automation_definition_health_result(conn, action, origin, intent_id, &id),
+            Err(error) => validation_rejection(action, error),
+        },
         "coven.automations.scheduler.status.v1" => automation_result(
             action,
             origin,
@@ -1438,6 +1443,39 @@ fn automation_health_payload(
             }
         })),
         Err(error) => Err(format!("{error:#}")),
+    }
+}
+
+/// `definition.health.v1`: the legacy health projection behind typed
+/// absence, tombstone and internal errors.
+fn automation_definition_health_result(
+    conn: &rusqlite::Connection,
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    id: &str,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    match crate::automations::store::get_definition_with_tombstone(conn, id, true) {
+        Ok(None) => typed_rejection(
+            action,
+            automation_error(ErrorCode::NotFound, format!("no routine with id `{id}`")),
+        ),
+        Ok(Some(record)) if record.tombstoned_at.is_some() => typed_rejection(
+            action,
+            automation_error(
+                ErrorCode::GoneTombstoned,
+                format!("routine `{id}` is tombstoned"),
+            ),
+        ),
+        Ok(Some(_)) => match automation_health_payload(conn, id, chrono::Utc::now()) {
+            Ok(payload) => (200, automation_event(action, origin, intent_id, payload)),
+            Err(error) => typed_rejection(action, automation_error(ErrorCode::Internal, error)),
+        },
+        Err(error) => typed_rejection(
+            action,
+            automation_error(ErrorCode::Internal, format!("{error:#}")),
+        ),
     }
 }
 
@@ -3890,6 +3928,59 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn definition_health_v1_types_absence_and_tombstones() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "healthy");
+        let route = |request: Value| route_action(request, &conn, &crate::api::NoopSessionRuntime);
+        let code = |response: &ControlActionResponse| {
+            response.error.as_ref().unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.health.v1",
+            "id": "healthy",
+        }));
+        assert_eq!(status, 200, "{response:?}");
+        let legacy = route(json!({ "action": "coven.automations.health", "id": "healthy" })).1;
+        let health = response.event.unwrap().payload;
+        assert_eq!(health["health"]["automationId"], "healthy");
+        assert_eq!(health, legacy.event.unwrap().payload);
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.health.v1",
+            "id": "absent",
+        }));
+        assert_eq!((status, code(&response).as_str()), (404, "NOT_FOUND"));
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.health.v1",
+        }));
+        assert_eq!(
+            (status, code(&response).as_str()),
+            (400, "VALIDATION_FAILED")
+        );
+
+        let (status, _) = route(json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:healthy",
+            "id": "healthy",
+            "expectedRevision": 1,
+        }));
+        assert_eq!(status, 200);
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.health.v1",
+            "id": "healthy",
+        }));
+        assert_eq!((status, code(&response).as_str()), (410, "GONE_TOMBSTONED"));
     }
 
     #[test]
