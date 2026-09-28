@@ -124,6 +124,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.delete",
                     "coven.automations.definition.list.v1",
                     "coven.automations.definition.get.v1",
+                    "coven.automations.command.v1",
                     "coven.automations.definition.create.v1",
                     "coven.automations.definition.revise.v1",
                     "coven.automations.definition.disable.v1",
@@ -596,6 +597,9 @@ pub(crate) fn route_action_at(
                     recorded_at,
                 ),
             )
+        }
+        crate::automations::command_envelope::ACTION => {
+            crate::automations::command_envelope::route(&payload, conn, runtime, recorded_at)
         }
         "coven.automations.run.cancel.v1" => {
             match crate::automations::cancellation::execute_run_cancellation(
@@ -1189,7 +1193,7 @@ fn automation_event_store_result(
     }
 }
 
-fn validation_rejection(action: &str, reason: String) -> (u16, ControlActionResponse) {
+pub(crate) fn validation_rejection(action: &str, reason: String) -> (u16, ControlActionResponse) {
     let error = automation_error(
         crate::automations::contract::error::ErrorCode::ValidationFailed,
         reason,
@@ -1197,7 +1201,7 @@ fn validation_rejection(action: &str, reason: String) -> (u16, ControlActionResp
     typed_rejection(action, error)
 }
 
-fn automation_error(
+pub(crate) fn automation_error(
     code: crate::automations::contract::error::ErrorCode,
     message: impl Into<String>,
 ) -> crate::automations::contract::error::ErrorEnvelope {
@@ -1211,7 +1215,7 @@ fn automation_error(
         .expect("bounded non-empty automation error message is valid")
 }
 
-fn typed_rejection(
+pub(crate) fn typed_rejection(
     action: &str,
     error: crate::automations::contract::error::ErrorEnvelope,
 ) -> (u16, ControlActionResponse) {
@@ -2893,7 +2897,8 @@ mod tests {
             assert!(
                 COMMAND_MATRIX.iter().any(|entry| entry.command == command
                     && entry.support == CommandSupport::Implemented)
-                    || PRODUCER_READ_EXTENSIONS.contains(action),
+                    || PRODUCER_READ_EXTENSIONS.contains(action)
+                    || *action == crate::automations::command_envelope::ACTION,
                 "{action} is advertised but absent from the command matrix"
             );
         }
