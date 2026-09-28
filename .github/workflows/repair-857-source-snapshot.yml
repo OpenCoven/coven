@@ -14,22 +14,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - name: Archive tracked source only
+      - name: Archive public tracked repair inputs
         shell: bash
         run: |
           set -euo pipefail
-          git archive --format=tar --output="$RUNNER_TEMP/coven-source.tar" "$GITHUB_SHA"
-          git rev-parse HEAD > "$RUNNER_TEMP/coven-source-commit.txt"
-          sha256sum "$RUNNER_TEMP/coven-source.tar" > "$RUNNER_TEMP/coven-source-sha256.txt"
+          mkdir -p "$RUNNER_TEMP/repair-inputs"
+          for repo in coven-cave coven-docs; do
+            source="$RUNNER_TEMP/source-$repo"
+            git init "$source"
+            git -C "$source" remote add origin "https://github.com/OpenCoven/$repo.git"
+            git -C "$source" fetch --depth=1 origin main
+            git -C "$source" archive --format=tar --output="$RUNNER_TEMP/repair-inputs/$repo.tar" FETCH_HEAD
+            git -C "$source" rev-parse FETCH_HEAD > "$RUNNER_TEMP/repair-inputs/$repo-commit.txt"
+            sha256sum "$RUNNER_TEMP/repair-inputs/$repo.tar" > "$RUNNER_TEMP/repair-inputs/$repo-sha256.txt"
+          done
       - uses: actions/upload-artifact@v7
         with:
-          name: authority-repair-source-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/coven-source.tar
-            ${{ runner.temp }}/coven-source-commit.txt
-            ${{ runner.temp }}/coven-source-sha256.txt
+          name: cave-docs-repair-inputs-${{ github.sha }}
+          path: ${{ runner.temp }}/repair-inputs
           retention-days: 1
           if-no-files-found: error
