@@ -367,6 +367,8 @@ pub fn append_definition_event(
         "legacy.definition.create.v1" | "definition.create.v1" => "definition.created",
         "legacy.definition.revise.v1" | "definition.revise.v1" => "definition.revised",
         "definition.disable.v1" => "definition.disabled",
+        "definition.activate.v1" => "definition.activated",
+        "definition.pause.v1" => "definition.paused",
         "legacy.definition.delete.v1" | "definition.tombstone.v1" => "definition.tombstoned",
         _ => anyhow::bail!("unsupported definition event command `{}`", input.command),
     };

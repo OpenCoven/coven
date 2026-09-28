@@ -32,18 +32,8 @@ use CommandSupport::{CompatibilityOnly, Implemented, Unsupported};
 pub const COMMAND_MATRIX: &[CommandEntry] = &[
     entry("definition.create.v1", Implemented),
     entry("definition.revise.v1", Implemented),
-    entry(
-        "definition.activate.v1",
-        CompatibilityOnly {
-            legacy_action: "coven.automations.update",
-        },
-    ),
-    entry(
-        "definition.pause.v1",
-        CompatibilityOnly {
-            legacy_action: "coven.automations.update",
-        },
-    ),
+    entry("definition.activate.v1", Implemented),
+    entry("definition.pause.v1", Implemented),
     entry("definition.disable.v1", Implemented),
     entry("definition.tombstone.v1", Implemented),
     entry(

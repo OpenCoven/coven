@@ -127,6 +127,8 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.create.v1",
                     "coven.automations.definition.revise.v1",
                     "coven.automations.definition.disable.v1",
+                    "coven.automations.definition.activate.v1",
+                    "coven.automations.definition.pause.v1",
                     "coven.automations.definition.tombstone.v1",
                     "coven.automations.run.cancel.v1",
                     "coven.automations.events.read.v1",
@@ -462,47 +464,51 @@ pub(crate) fn route_action_at(
                 Err(error) => validation_rejection(action, error),
             }
         }
-        "coven.automations.definition.disable.v1" => {
-            let id = required_id_field(&payload, action);
-            let adoption_key = required_adoption_key(&payload, action);
-            let expected_revision = required_expected_revision(&payload, action);
-            let reason = optional_reason(&payload, action);
-            match adoption_key {
-                Ok(adoption_key) => {
-                    let command = match (id, expected_revision, reason) {
-                        (Ok(id), Ok(expected_revision), Ok(reason)) => {
-                            crate::automations::command_adoption::DefinitionCommand::Disable {
-                                automation_id: id,
-                                expected_revision: Some(expected_revision),
-                                reason,
-                            }
-                        }
-                        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                            crate::automations::command_adoption::DefinitionCommand::Invalid {
-                                command: "definition.disable.v1".to_owned(),
-                                request: command_request_fields(
-                                    &payload,
-                                    &["id", "expectedRevision", "reason"],
-                                ),
-                                message: error,
-                            }
-                        }
-                    };
-                    automation_command_result(
-                        action,
-                        origin,
-                        intent_id,
-                        crate::automations::command_adoption::execute_definition_command(
-                            conn,
-                            &adoption_key,
-                            command,
-                            recorded_at,
-                        ),
-                    )
+        "coven.automations.definition.disable.v1" => definition_status_command(
+            conn,
+            &payload,
+            action,
+            (origin, intent_id),
+            recorded_at,
+            "definition.disable.v1",
+            |automation_id, expected_revision, reason| {
+                crate::automations::command_adoption::DefinitionCommand::Disable {
+                    automation_id,
+                    expected_revision,
+                    reason,
                 }
-                Err(error) => validation_rejection(action, error),
-            }
-        }
+            },
+        ),
+        "coven.automations.definition.activate.v1" => definition_status_command(
+            conn,
+            &payload,
+            action,
+            (origin, intent_id),
+            recorded_at,
+            "definition.activate.v1",
+            |automation_id, expected_revision, reason| {
+                crate::automations::command_adoption::DefinitionCommand::Activate {
+                    automation_id,
+                    expected_revision,
+                    reason,
+                }
+            },
+        ),
+        "coven.automations.definition.pause.v1" => definition_status_command(
+            conn,
+            &payload,
+            action,
+            (origin, intent_id),
+            recorded_at,
+            "definition.pause.v1",
+            |automation_id, expected_revision, reason| {
+                crate::automations::command_adoption::DefinitionCommand::Pause {
+                    automation_id,
+                    expected_revision,
+                    reason,
+                }
+            },
+        ),
         "coven.automations.run.cancel.v1" => {
             match crate::automations::cancellation::execute_run_cancellation(
                 conn,
@@ -763,6 +769,52 @@ pub(crate) fn route_action_at(
             ),
         },
     }
+}
+
+/// Disable, activate and pause share one request shape: `id`, `adoptionKey`,
+/// `expectedRevision` and an optional `reason`.
+fn definition_status_command(
+    conn: &rusqlite::Connection,
+    payload: &Value,
+    action: &str,
+    (origin, intent_id): (Option<String>, Option<String>),
+    recorded_at: &str,
+    command: &str,
+    build: impl FnOnce(
+        String,
+        Option<u64>,
+        Option<String>,
+    ) -> crate::automations::command_adoption::DefinitionCommand,
+) -> (u16, ControlActionResponse) {
+    let id = required_id_field(payload, action);
+    let adoption_key = required_adoption_key(payload, action);
+    let expected_revision = required_expected_revision(payload, action);
+    let reason = optional_reason(payload, action);
+    let adoption_key = match adoption_key {
+        Ok(adoption_key) => adoption_key,
+        Err(error) => return validation_rejection(action, error),
+    };
+    let command = match (id, expected_revision, reason) {
+        (Ok(id), Ok(expected_revision), Ok(reason)) => build(id, Some(expected_revision), reason),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                command: command.to_owned(),
+                request: command_request_fields(payload, &["id", "expectedRevision", "reason"]),
+                message: error,
+            }
+        }
+    };
+    automation_command_result(
+        action,
+        origin,
+        intent_id,
+        crate::automations::command_adoption::execute_definition_command(
+            conn,
+            &adoption_key,
+            command,
+            recorded_at,
+        ),
+    )
 }
 
 fn automation_event(
@@ -3838,6 +3890,67 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn definition_activate_and_pause_route_over_the_flat_wire() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let route = |request: Value| route_action(request, &conn, &crate::api::NoopSessionRuntime);
+        let (status, _) = route(json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:wire-switch",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "wire-switch",
+                "name": "wire-switch",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Do the thing."
+            },
+        }));
+        assert_eq!(status, 200);
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.activate.v1",
+            "adoptionKey": "adopt:activate:wire-switch",
+            "id": "wire-switch",
+            "expectedRevision": 1,
+        }));
+        assert_eq!(status, 200, "{response:?}");
+        let event = response.event.unwrap();
+        assert_eq!(event.payload["outcome"], "committed");
+        assert_eq!(event.payload["revision"], 2);
+        assert_eq!(event.payload["result"]["status"], "ACTIVE");
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.pause.v1",
+            "adoptionKey": "adopt:pause:wire-switch",
+            "id": "wire-switch",
+            "expectedRevision": 2,
+            "reason": "Holiday freeze.",
+        }));
+        assert_eq!(status, 200, "{response:?}");
+        assert_eq!(
+            response.event.unwrap().payload["result"]["status"],
+            "PAUSED"
+        );
+
+        // Missing expectedRevision is a durable typed validation rejection.
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.activate.v1",
+            "adoptionKey": "adopt:activate:wire-switch:no-revision",
+            "id": "wire-switch",
+        }));
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
     }
 
     #[test]

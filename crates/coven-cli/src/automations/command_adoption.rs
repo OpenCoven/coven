@@ -227,6 +227,16 @@ pub enum DefinitionCommand {
         expected_revision: Option<u64>,
         reason: Option<String>,
     },
+    Activate {
+        automation_id: String,
+        expected_revision: Option<u64>,
+        reason: Option<String>,
+    },
+    Pause {
+        automation_id: String,
+        expected_revision: Option<u64>,
+        reason: Option<String>,
+    },
     Delete {
         automation_id: String,
         expected_revision: Option<u64>,
@@ -501,6 +511,26 @@ fn canonical_command(command: &DefinitionCommand) -> Result<Value> {
             "expectedRevision": expected_revision,
             "reason": reason,
         }),
+        DefinitionCommand::Activate {
+            automation_id,
+            expected_revision,
+            reason,
+        } => json!({
+            "command": "definition.activate.v1",
+            "automationId": automation_id,
+            "expectedRevision": expected_revision,
+            "reason": reason,
+        }),
+        DefinitionCommand::Pause {
+            automation_id,
+            expected_revision,
+            reason,
+        } => json!({
+            "command": "definition.pause.v1",
+            "automationId": automation_id,
+            "expectedRevision": expected_revision,
+            "reason": reason,
+        }),
         DefinitionCommand::Delete {
             automation_id,
             expected_revision,
@@ -654,6 +684,8 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
                 "definition.create.v1" => "definition.create.v1",
                 "definition.revise.v1" => "definition.revise.v1",
                 "definition.disable.v1" => "definition.disable.v1",
+                "definition.activate.v1" => "definition.activate.v1",
+                "definition.pause.v1" => "definition.pause.v1",
                 "definition.tombstone.v1" => "definition.tombstone.v1",
                 _ => "definition.invalid.v1",
             },
@@ -696,6 +728,12 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
         ),
         DefinitionCommand::Disable { automation_id, .. } => {
             ("definition.disable.v1", Some(automation_id.clone()))
+        }
+        DefinitionCommand::Activate { automation_id, .. } => {
+            ("definition.activate.v1", Some(automation_id.clone()))
+        }
+        DefinitionCommand::Pause { automation_id, .. } => {
+            ("definition.pause.v1", Some(automation_id.clone()))
         }
         DefinitionCommand::Delete { automation_id, .. } => {
             ("definition.tombstone.v1", Some(automation_id.clone()))
@@ -852,6 +890,30 @@ fn apply_command(
             &automation_id,
             expected_revision,
             reason.as_deref(),
+            adopted_at,
+        ),
+        DefinitionCommand::Activate {
+            automation_id,
+            expected_revision,
+            reason,
+        } => apply_status_transition(
+            conn,
+            &automation_id,
+            expected_revision,
+            reason.as_deref(),
+            StatusTransition::Activate,
+            adopted_at,
+        ),
+        DefinitionCommand::Pause {
+            automation_id,
+            expected_revision,
+            reason,
+        } => apply_status_transition(
+            conn,
+            &automation_id,
+            expected_revision,
+            reason.as_deref(),
+            StatusTransition::Pause,
             adopted_at,
         ),
         DefinitionCommand::Delete {
@@ -1362,6 +1424,139 @@ fn apply_disable(
         json!({
             "disabled": true,
             "id": automation_id,
+            "revision": next_revision,
+            "reason": reason,
+        }),
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StatusTransition {
+    Activate,
+    Pause,
+}
+
+impl StatusTransition {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Activate => "definition.activate.v1",
+            Self::Pause => "definition.pause.v1",
+        }
+    }
+
+    /// The only lifecycle state each transition leaves, per `definition.v1`.
+    fn required_state(self) -> &'static str {
+        match self {
+            Self::Activate => "paused",
+            Self::Pause => "active",
+        }
+    }
+
+    fn target(self) -> super::definition::RoutineStatus {
+        match self {
+            Self::Activate => super::definition::RoutineStatus::Active,
+            Self::Pause => super::definition::RoutineStatus::Paused,
+        }
+    }
+}
+
+/// `paused -> active` or `active -> paused`, as a new revision of the stored
+/// body with only its status changed. Disabled, draft and invalid
+/// definitions are refused: re-enabling and repair are separate transitions.
+fn apply_status_transition(
+    conn: &Connection,
+    automation_id: &str,
+    expected_revision: Option<u64>,
+    reason: Option<&str>,
+    transition: StatusTransition,
+    adopted_at: &str,
+) -> Result<DefinitionCommandResponse> {
+    let Some(current) = current_definition_state(conn, automation_id)? else {
+        return Ok(rejected(
+            ErrorCode::NotFound,
+            format!("no routine with id `{automation_id}`"),
+            None,
+        ));
+    };
+    if current.tombstoned {
+        return Ok(rejected(
+            ErrorCode::GoneTombstoned,
+            format!("routine `{automation_id}` is tombstoned"),
+            Some(current.revision),
+        ));
+    }
+    if expected_revision.is_some_and(|expected| current.revision != expected) {
+        return Ok(revision_conflict(current.revision));
+    }
+    if current.lifecycle_state != transition.required_state() {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            format!(
+                "{} requires a {} definition; this one is {}",
+                transition.command(),
+                transition.required_state(),
+                current.lifecycle_state
+            ),
+            Some(current.revision),
+        ));
+    }
+    let record = super::store::get_definition(conn, automation_id)?
+        .with_context(|| format!("automation definition `{automation_id}` disappeared"))?;
+    let mut body: Value = serde_json::from_str(&record.definition_json)
+        .context("failed to parse automation definition for a status transition")?;
+    body["status"] = json!(status_text(transition.target()));
+    // Activation re-validates the stored body exactly as a revise to ACTIVE
+    // would, so a body that became unsupported cannot be switched on.
+    let definition = match negotiate_definition(&body) {
+        Ok(DefinitionNegotiation::Supported(definition)) => *definition,
+        Ok(DefinitionNegotiation::Unsupported(unsupported)) => {
+            return Ok(capability_unsupported(unsupported));
+        }
+        Err(_) => {
+            return Ok(rejected(
+                ErrorCode::ValidationFailed,
+                DEFINITION_VALIDATION_FAILED_MESSAGE,
+                Some(current.revision),
+            ));
+        }
+    };
+    let status = status_text(definition.status);
+    let definition_json = serde_json::to_string(&definition)
+        .context("failed to serialize automation definition for a status transition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let next_revision = next_revision(current.revision)?;
+    let changed = conn
+        .execute(
+            "UPDATE automation_definitions
+             SET status = ?3,
+                 definition_json = ?4,
+                 definition_digest = ?5,
+                 lifecycle_state = ?6,
+                 revision = ?7,
+                 authority_version = 1,
+                 updated_at = ?8
+             WHERE id = ?1 AND revision = ?2 AND tombstoned_at IS NULL",
+            params![
+                automation_id,
+                sqlite_revision(current.revision)?,
+                status,
+                definition_json,
+                definition_digest,
+                super::contract::migration::lifecycle_state(status),
+                sqlite_revision(next_revision)?,
+                adopted_at,
+            ],
+        )
+        .context("failed to apply automation definition status transition")?;
+    anyhow::ensure!(
+        changed == 1,
+        "automation definition revision changed inside status transition"
+    );
+    Ok(committed(
+        next_revision,
+        json!({
+            "id": automation_id,
+            "status": status,
             "revision": next_revision,
             "reason": reason,
         }),
@@ -3707,5 +3902,227 @@ mod tests {
             .unwrap();
         assert_eq!(retained, (2, "2026-09-03T09:01:00.000Z".to_owned()));
         assert_eq!(adoption_count(&conn), 2);
+    }
+
+    fn last_definition_event(conn: &Connection, automation_id: &str) -> Value {
+        let json: String = conn
+            .query_row(
+                "SELECT event_json FROM automation_events
+                 WHERE stream_kind = 'automation' AND stream_id = ?1
+                 ORDER BY sequence DESC LIMIT 1",
+                [automation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    fn stored_status(conn: &Connection, automation_id: &str) -> (String, String, u64, String) {
+        let record = get_definition(conn, automation_id).unwrap().unwrap();
+        let body: Value = serde_json::from_str(&record.definition_json).unwrap();
+        (
+            record.status,
+            record.lifecycle_state,
+            record.revision,
+            body["status"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    fn activate(automation_id: &str, expected_revision: u64) -> DefinitionCommand {
+        DefinitionCommand::Activate {
+            automation_id: automation_id.to_owned(),
+            expected_revision: Some(expected_revision),
+            reason: None,
+        }
+    }
+
+    fn pause(automation_id: &str, expected_revision: u64) -> DefinitionCommand {
+        DefinitionCommand::Pause {
+            automation_id: automation_id.to_owned(),
+            expected_revision: Some(expected_revision),
+            reason: Some("Holiday freeze.".to_owned()),
+        }
+    }
+
+    fn create_paused(conn: &Connection, automation_id: &str) {
+        let created = execute_definition_command(
+            conn,
+            &format!("adopt:create-{automation_id}"),
+            DefinitionCommand::Create {
+                definition: definition(automation_id, automation_id),
+            },
+            "2026-09-27T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(created.outcome, DefinitionCommandOutcome::Committed);
+    }
+
+    #[test]
+    fn activate_and_pause_commit_a_status_revision_with_one_lifecycle_event() {
+        let (_temp, conn) = temp_store();
+        create_paused(&conn, "switch");
+
+        let activated = execute_definition_command(
+            &conn,
+            "adopt:activate-switch",
+            activate("switch", 1),
+            "2026-09-27T09:01:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(activated.outcome, DefinitionCommandOutcome::Committed);
+        assert_eq!(activated.revision, Some(2));
+        assert_eq!(
+            stored_status(&conn, "switch"),
+            (
+                "ACTIVE".to_owned(),
+                "active".to_owned(),
+                2,
+                "ACTIVE".to_owned()
+            )
+        );
+        let event = last_definition_event(&conn, "switch");
+        assert_eq!(event["kind"], "definition.activated");
+        assert_eq!(event["payload"]["lifecycleState"], "active");
+        assert_eq!(definition_event_count(&conn, "switch"), 2);
+
+        let replay = execute_definition_command(
+            &conn,
+            "adopt:activate-switch",
+            activate("switch", 1),
+            "2026-09-27T09:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(replay.outcome, DefinitionCommandOutcome::Replayed);
+        assert_eq!(replay.event_ref, activated.event_ref);
+        assert_eq!(definition_event_count(&conn, "switch"), 2);
+
+        let paused = execute_definition_command(
+            &conn,
+            "adopt:pause-switch",
+            pause("switch", 2),
+            "2026-09-27T09:03:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(paused.outcome, DefinitionCommandOutcome::Committed);
+        assert_eq!(paused.result.unwrap()["reason"], "Holiday freeze.");
+        assert_eq!(
+            stored_status(&conn, "switch"),
+            (
+                "PAUSED".to_owned(),
+                "paused".to_owned(),
+                3,
+                "PAUSED".to_owned()
+            )
+        );
+        assert_eq!(
+            last_definition_event(&conn, "switch")["kind"],
+            "definition.paused"
+        );
+        assert_eq!(definition_event_count(&conn, "switch"), 3);
+    }
+
+    #[test]
+    fn status_transitions_refuse_without_writing_state_or_events() {
+        let (_temp, conn) = temp_store();
+        create_paused(&conn, "held");
+        let refuse = |key: &str, command: DefinitionCommand, code: ErrorCode| {
+            let before = (
+                stored_status(&conn, "held"),
+                definition_event_count(&conn, "held"),
+            );
+            let response =
+                execute_definition_command(&conn, key, command, "2026-09-27T10:00:00.000Z")
+                    .unwrap();
+            assert_eq!(
+                response.outcome,
+                DefinitionCommandOutcome::Rejected,
+                "{key}"
+            );
+            assert_eq!(response.error.unwrap().code(), code, "{key}");
+            assert_eq!(
+                (
+                    stored_status(&conn, "held"),
+                    definition_event_count(&conn, "held")
+                ),
+                before,
+                "{key}"
+            );
+        };
+
+        refuse(
+            "adopt:stale",
+            activate("held", 7),
+            ErrorCode::RevisionConflict,
+        );
+        refuse(
+            "adopt:pause-paused",
+            pause("held", 1),
+            ErrorCode::IllegalTransition,
+        );
+        refuse("adopt:missing", activate("absent", 1), ErrorCode::NotFound);
+
+        let active = execute_definition_command(
+            &conn,
+            "adopt:activate-held",
+            activate("held", 1),
+            "2026-09-27T10:01:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(active.outcome, DefinitionCommandOutcome::Committed);
+        refuse(
+            "adopt:activate-active",
+            activate("held", 2),
+            ErrorCode::IllegalTransition,
+        );
+        // A retained key cannot be reused for the opposite transition.
+        refuse(
+            "adopt:activate-held",
+            pause("held", 2),
+            ErrorCode::AdoptionReplayMismatch,
+        );
+
+        let disabled = execute_definition_command(
+            &conn,
+            "adopt:disable-held",
+            DefinitionCommand::Disable {
+                automation_id: "held".to_owned(),
+                expected_revision: Some(2),
+                reason: None,
+            },
+            "2026-09-27T10:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(disabled.outcome, DefinitionCommandOutcome::Committed);
+        // Disabled never reactivates directly; re-enable is a separate transition.
+        refuse(
+            "adopt:activate-disabled",
+            activate("held", 3),
+            ErrorCode::IllegalTransition,
+        );
+        refuse(
+            "adopt:pause-disabled",
+            pause("held", 3),
+            ErrorCode::IllegalTransition,
+        );
+
+        let tombstoned = execute_definition_command(
+            &conn,
+            "adopt:tombstone-held",
+            DefinitionCommand::Delete {
+                automation_id: "held".to_owned(),
+                expected_revision: Some(3),
+            },
+            "2026-09-27T10:03:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(tombstoned.outcome, DefinitionCommandOutcome::Committed);
+        let response = execute_definition_command(
+            &conn,
+            "adopt:activate-tombstoned",
+            activate("held", 4),
+            "2026-09-27T10:04:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(response.error.unwrap().code(), ErrorCode::GoneTombstoned);
     }
 }
