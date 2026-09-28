@@ -21,8 +21,8 @@ use super::command_matrix::{refusal_message, refused_command};
 use super::contract::error::ErrorCode;
 use super::contract::types::{CommandName, CommandRequest};
 use crate::control_plane::{
-    automation_error, route_action_at, typed_rejection, validation_rejection, ActionStatus,
-    ControlActionResponse,
+    automation_command_result, automation_error, route_action_at, typed_rejection,
+    validation_rejection, ActionStatus, ControlActionResponse,
 };
 
 pub const ACTION: &str = "coven.automations.command.v1";
@@ -34,7 +34,9 @@ const SCHEMA_VERSION: &str = "coven.automations.v1";
 fn adopted(command: CommandName) -> bool {
     matches!(
         command,
-        CommandName::DefinitionActivate
+        CommandName::DefinitionCreate
+            | CommandName::DefinitionRevise
+            | CommandName::DefinitionActivate
             | CommandName::DefinitionPause
             | CommandName::DefinitionDisable
             | CommandName::DefinitionTombstone
@@ -87,11 +89,40 @@ pub(crate) fn route(
         )
     };
 
-    let flat = match flat_request(&command_name, envelope, &request) {
-        Ok(flat) => flat,
-        Err(message) => return refuse(ErrorCode::CapabilityUnsupported, message),
+    let (status, inner) = match command {
+        // Rich definition bodies have no flat action: they go straight to
+        // command adoption, which projects them onto the executable routine.
+        CommandName::DefinitionCreate | CommandName::DefinitionRevise => {
+            let definition = envelope["payload"]["definition"].clone();
+            let rich = if command == CommandName::DefinitionCreate {
+                super::command_adoption::DefinitionCommand::RichCreate { definition }
+            } else {
+                super::command_adoption::DefinitionCommand::RichRevise {
+                    definition,
+                    expected_revision: envelope["expectedRevision"].as_u64(),
+                }
+            };
+            automation_command_result(
+                &format!("coven.automations.{command_name}"),
+                envelope["origin"]["channel"]
+                    .as_str()
+                    .map(ToOwned::to_owned),
+                envelope["origin"]["correlationId"]
+                    .as_str()
+                    .map(ToOwned::to_owned),
+                super::command_adoption::execute_definition_command(
+                    conn,
+                    adoption_key.as_str().unwrap_or_default(),
+                    rich,
+                    recorded_at,
+                ),
+            )
+        }
+        _ => match flat_request(&command_name, envelope, &request) {
+            Ok(flat) => route_action_at(flat, conn, runtime, recorded_at),
+            Err(message) => return refuse(ErrorCode::CapabilityUnsupported, message),
+        },
     };
-    let (status, inner) = route_action_at(flat, conn, runtime, recorded_at);
     if !inner.ok || inner.error.is_some() {
         return rejected_response(&command_name, &adoption_key, (status, inner));
     }
@@ -270,11 +301,7 @@ fn flat_request(
             flat.extend(payload);
         }
         CommandName::DefinitionCreate | CommandName::DefinitionRevise => {
-            return Err(format!(
-                "`{command}` carries a rich definition body, which this producer cannot yet \
-                 execute (coven#1054). Use `coven.automations.{command}` with a routine \
-                 definition."
-            ));
+            return Err(format!("`{command}` has no flat translation."));
         }
         CommandName::RunCancel => {
             return Err(format!(
@@ -672,6 +699,275 @@ mod tests {
             assert_eq!(body["error"]["code"], "INTERNAL", "{command}: {body}");
             assert_eq!(status, 500, "{command}");
         }
+    }
+
+    /// The spec's golden definition reduced to the executable subset, at the
+    /// given revision and lifecycle state, with its integrity recomputed.
+    fn rich(revision: u64, lifecycle_state: &str, change: impl FnOnce(&mut Value)) -> Value {
+        use crate::automations::contract::canonical_json::{
+            canonicalize_without_integrity, sha256_hex,
+        };
+        let vectors: Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{SPEC_DIR}/test-vectors.json")).unwrap(),
+        )
+        .unwrap();
+        let mut definition = vectors["fixtures"]["definition.golden"].clone();
+        let object = definition.as_object_mut().unwrap();
+        object["policies"]
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery");
+        object.remove("activation");
+        definition["automationId"] = json!("rich-notes");
+        definition["revision"] = json!(revision);
+        definition["lifecycleState"] = json!(lifecycle_state);
+        change(&mut definition);
+        let digest = sha256_hex(&canonicalize_without_integrity(&definition).unwrap());
+        definition["integrity"]["value"] = json!(digest);
+        definition
+    }
+
+    fn rich_command(command: &str, key: &str, expected: Option<u64>, definition: Value) -> Value {
+        envelope(command, key, expected, json!({ "definition": definition }))
+    }
+
+    fn assert_verifies(definition: &Value) {
+        let typed: crate::automations::contract::types::AutomationDefinition =
+            serde_json::from_value(definition.clone()).unwrap();
+        typed.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn rich_definitions_create_revise_and_regenerate_through_the_lifecycle() {
+        let validator = response_validator();
+        let (_temp, conn) = store();
+        let create = rich_command(
+            "definition.create.v1",
+            "adopt:rich:create",
+            None,
+            rich(1, "draft", |_| {}),
+        );
+
+        let (status, response) = send(&conn, create.clone());
+        assert_eq!(status, 200, "{response:?}");
+        let body = response.result.unwrap();
+        assert!(validator.is_valid(&body), "{body}");
+        assert_eq!(
+            (body["outcome"].clone(), body["revision"].clone()),
+            (json!("committed"), json!(1))
+        );
+        assert_eq!(body["result"]["definition"]["lifecycleState"], "draft");
+        assert_verifies(&body["result"]["definition"]);
+
+        // The executor runs the projected routine, paused as a draft.
+        let record = crate::automations::store::get_definition(&conn, "rich-notes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (record.status.as_str(), record.lifecycle_state.as_str()),
+            ("PAUSED", "draft")
+        );
+        let routine: Value = serde_json::from_str(&record.definition_json).unwrap();
+        for (key, expected) in [
+            ("prompt", json!("Write the daily reflection.")),
+            ("cwd", json!("~/projects/notes")),
+            ("familiarId", json!("charm")),
+            ("rrule", json!("FREQ=DAILY;BYHOUR=9")),
+            ("timezone", json!("utc")),
+            ("timeoutMinutes", json!(30)),
+            ("runtime", json!("coven-code")),
+            ("tags", json!(["notes", "daily"])),
+        ] {
+            assert_eq!(routine[key], expected, "{key}");
+        }
+        assert_eq!(routine["retry"]["maxAttempts"], 3);
+
+        let (_, replay) = send(&conn, create);
+        assert_eq!(replay.result.unwrap()["outcome"], "replayed");
+        // The same key cannot also name a routine-bodied create.
+        let (_, flat) = crate::control_plane::route_action(
+            json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": "adopt:rich:create",
+                "definition": routine,
+            }),
+            &conn,
+            &NoopSessionRuntime,
+        );
+        assert_eq!(flat.error.unwrap()["code"], "ADOPTION_REPLAY_MISMATCH");
+
+        // A draft revises only to paused, at exactly the next revision.
+        let (_, to_active) = send(
+            &conn,
+            rich_command(
+                "definition.revise.v1",
+                "adopt:rich:revise-active",
+                Some(1),
+                rich(2, "active", |_| {}),
+            ),
+        );
+        assert_eq!(
+            to_active.result.unwrap()["error"]["code"],
+            "ILLEGAL_TRANSITION"
+        );
+        let (_, skipped) = send(
+            &conn,
+            rich_command(
+                "definition.revise.v1",
+                "adopt:rich:revise-skip",
+                Some(1),
+                rich(3, "paused", |_| {}),
+            ),
+        );
+        assert_eq!(
+            skipped.result.unwrap()["error"]["code"],
+            "VALIDATION_FAILED"
+        );
+        let (status, revised) = send(
+            &conn,
+            rich_command(
+                "definition.revise.v1",
+                "adopt:rich:revise",
+                Some(1),
+                rich(2, "paused", |definition| {
+                    definition["action"]["prompt"] = json!("Reflect briefly.")
+                }),
+            ),
+        );
+        assert_eq!(status, 200, "{revised:?}");
+        let revised = revised.result.unwrap();
+        assert!(validator.is_valid(&revised), "{revised}");
+        assert_eq!(revised["revision"], 2);
+
+        // Activation is its own command; the rich view follows it.
+        let (_, activated) = send(
+            &conn,
+            envelope(
+                "definition.activate.v1",
+                "adopt:rich:activate",
+                Some(2),
+                json!({ "automationId": "rich-notes" }),
+            ),
+        );
+        assert_eq!(activated.result.unwrap()["revision"], 3);
+        let (_, read) = send(
+            &conn,
+            envelope(
+                "definition.get.v1",
+                "adopt:rich:get",
+                None,
+                json!({ "automationId": "rich-notes" }),
+            ),
+        );
+        let view = read.result.unwrap()["result"]["definition"].clone();
+        assert_eq!(
+            (view["revision"].clone(), view["lifecycleState"].clone()),
+            (json!(3), json!("active"))
+        );
+        assert_eq!(view["action"]["prompt"], "Reflect briefly.");
+        assert_verifies(&view);
+
+        // A routine-bodied revise replaces the rich body.
+        let mut routine: Value = serde_json::from_str(
+            &crate::automations::store::get_definition(&conn, "rich-notes")
+                .unwrap()
+                .unwrap()
+                .definition_json,
+        )
+        .unwrap();
+        routine["prompt"] = json!("Plain routine now.");
+        let (status, flat) = crate::control_plane::route_action(
+            json!({
+                "action": "coven.automations.definition.revise.v1",
+                "adoptionKey": "adopt:rich:flat-revise",
+                "expectedRevision": 3,
+                "definition": routine,
+            }),
+            &conn,
+            &NoopSessionRuntime,
+        );
+        assert_eq!(status, 200, "{flat:?}");
+        let (_, read) = send(
+            &conn,
+            envelope(
+                "definition.get.v1",
+                "adopt:rich:get-flat",
+                None,
+                json!({ "automationId": "rich-notes" }),
+            ),
+        );
+        assert!(read.result.unwrap()["result"].get("definition").is_none());
+    }
+
+    #[test]
+    fn rich_creates_refuse_invalid_unsupported_and_unlawful_bodies_without_writes() {
+        let validator = response_validator();
+        let (_temp, conn) = store();
+        let mut tampered = rich(1, "draft", |_| {});
+        tampered["action"]["prompt"] = json!("Changed after signing.");
+        // The typed envelope already verifies integrity, so a tampered body
+        // never reaches adoption: a plain validation refusal, nothing stored.
+        let (status, response) = send(
+            &conn,
+            rich_command(
+                "definition.create.v1",
+                "adopt:rich:tampered",
+                None,
+                tampered,
+            ),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
+        let cases = [
+            (
+                "a revision other than 1",
+                rich(2, "draft", |_| {}),
+                "VALIDATION_FAILED",
+            ),
+            (
+                "a non-draft state",
+                rich(1, "paused", |_| {}),
+                "ILLEGAL_TRANSITION",
+            ),
+            (
+                "an activation window",
+                rich(1, "draft", |definition| {
+                    definition["activation"] =
+                        json!({ "effectiveFrom": "2026-08-30T09:00:00.000Z" });
+                }),
+                "CAPABILITY_UNSUPPORTED",
+            ),
+            (
+                "a delivery policy",
+                rich(1, "draft", |definition| {
+                    definition["policies"]["delivery"] =
+                        json!({ "outputTarget": "~/notes/today.md", "mode": "atomic" });
+                }),
+                "CAPABILITY_UNSUPPORTED",
+            ),
+        ];
+        for (index, (label, definition, code)) in cases.into_iter().enumerate() {
+            let (_, response) = send(
+                &conn,
+                rich_command(
+                    "definition.create.v1",
+                    &format!("adopt:rich:refuse:{index}"),
+                    None,
+                    definition,
+                ),
+            );
+            let body = response
+                .result
+                .clone()
+                .unwrap_or_else(|| panic!("{label}: {:?}", response.reason));
+            assert!(validator.is_valid(&body), "{label}: {body}");
+            assert_eq!(body["error"]["code"], code, "{label}: {body}");
+        }
+        assert!(
+            crate::automations::store::get_definition(&conn, "rich-notes")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

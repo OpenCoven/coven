@@ -241,6 +241,15 @@ pub enum DefinitionCommand {
         automation_id: String,
         expected_revision: Option<u64>,
     },
+    /// `definition.create.v1` with a rich `AutomationDefinition` body.
+    RichCreate {
+        definition: Value,
+    },
+    /// `definition.revise.v1` with a rich `AutomationDefinition` body.
+    RichRevise {
+        definition: Value,
+        expected_revision: Option<u64>,
+    },
     /// `legacy.import.v1` from `codex-automation-toml`, the only v1 source.
     LegacyImport {
         dry_run: bool,
@@ -543,6 +552,20 @@ fn canonical_command(command: &DefinitionCommand) -> Result<Value> {
             "automationId": automation_id,
             "expectedRevision": expected_revision,
         }),
+        // Keyed apart from the routine-bodied forms, so one adoption key cannot
+        // stand for both a routine and a rich request.
+        DefinitionCommand::RichCreate { definition } => json!({
+            "command": "definition.create.v1",
+            "richDefinition": lossless_json_fingerprint(definition),
+        }),
+        DefinitionCommand::RichRevise {
+            definition,
+            expected_revision,
+        } => json!({
+            "command": "definition.revise.v1",
+            "expectedRevision": expected_revision,
+            "richDefinition": lossless_json_fingerprint(definition),
+        }),
         DefinitionCommand::LegacyImport { dry_run } => json!({
             "command": "legacy.import.v1",
             "source": "codex-automation-toml",
@@ -748,6 +771,20 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
         DefinitionCommand::Delete { automation_id, .. } => {
             ("definition.tombstone.v1", Some(automation_id.clone()))
         }
+        DefinitionCommand::RichCreate { definition } => (
+            "definition.create.v1",
+            definition
+                .get("automationId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        ),
+        DefinitionCommand::RichRevise { definition, .. } => (
+            "definition.revise.v1",
+            definition
+                .get("automationId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        ),
         // An import touches many definitions and appends its own events.
         DefinitionCommand::LegacyImport { .. } => ("legacy.import.v1", None),
     }
@@ -932,6 +969,13 @@ fn apply_command(
             automation_id,
             expected_revision,
         } => apply_delete(conn, &automation_id, expected_revision, adopted_at),
+        DefinitionCommand::RichCreate { definition } => {
+            apply_rich_create(conn, &definition, adopted_at)
+        }
+        DefinitionCommand::RichRevise {
+            definition,
+            expected_revision,
+        } => apply_rich_revise(conn, &definition, expected_revision, adopted_at),
         DefinitionCommand::LegacyImport { dry_run } => {
             let report = super::import_legacy::import_codex_as_draft(conn, dry_run)?;
             Ok(DefinitionCommandResponse {
@@ -1277,6 +1321,132 @@ fn apply_create(
     ))
 }
 
+fn rich_refusal(refusal: super::rich_definition::Refusal) -> DefinitionCommandResponse {
+    use super::rich_definition::Refusal;
+    match refusal {
+        Refusal::Invalid(message) => rejected(ErrorCode::ValidationFailed, message, None),
+        Refusal::Unsupported { variant, reason } => {
+            capability_unsupported(UnsupportedVariant { variant, reason })
+        }
+        Refusal::Transition(message) => rejected(ErrorCode::IllegalTransition, message, None),
+    }
+}
+
+/// Stores the rich body beside a committed routine write and adds the
+/// regenerated rich definition to the committed result.
+fn attach_rich_body(
+    conn: &Connection,
+    mut response: DefinitionCommandResponse,
+    automation_id: &str,
+    canonical: &str,
+    lifecycle_state: &str,
+) -> Result<DefinitionCommandResponse> {
+    if response.outcome != DefinitionCommandOutcome::Committed {
+        return Ok(response);
+    }
+    let changed = conn
+        .execute(
+            "UPDATE automation_definitions
+             SET rich_definition_json = ?2, lifecycle_state = ?3
+             WHERE id = ?1 AND tombstoned_at IS NULL",
+            params![automation_id, canonical, lifecycle_state],
+        )
+        .context("failed to store rich automation definition")?;
+    anyhow::ensure!(changed == 1, "rich automation definition row disappeared");
+    if let (Some(result), Some(view)) = (
+        response.result.as_mut(),
+        super::rich_definition::current_view(conn, automation_id)?,
+    ) {
+        result["definition"] = view;
+    }
+    Ok(response)
+}
+
+/// `definition.create.v1` with a rich body: new definitions start in
+/// `draft` at revision 1 and run nothing until activated.
+fn apply_rich_create(
+    conn: &Connection,
+    definition: &Value,
+    adopted_at: &str,
+) -> Result<DefinitionCommandResponse> {
+    let projection = match super::rich_definition::project(definition) {
+        Ok(projection) => projection,
+        Err(refusal) => return Ok(rich_refusal(refusal)),
+    };
+    if projection.revision != 1 {
+        return Ok(rejected(
+            ErrorCode::ValidationFailed,
+            "a created definition must be revision 1",
+            None,
+        ));
+    }
+    if projection.lifecycle_state != "draft" {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "new definitions start in draft; activate is a separate command",
+            None,
+        ));
+    }
+    let response = apply_create(conn, &projection.routine, adopted_at)?;
+    attach_rich_body(
+        conn,
+        response,
+        &projection.automation_id,
+        &projection.canonical,
+        "draft",
+    )
+}
+
+/// `definition.revise.v1` with a rich body: the full next revision, whose
+/// lifecycle state must be the one a revise can lawfully leave.
+fn apply_rich_revise(
+    conn: &Connection,
+    definition: &Value,
+    expected_revision: Option<u64>,
+    adopted_at: &str,
+) -> Result<DefinitionCommandResponse> {
+    let projection = match super::rich_definition::project(definition) {
+        Ok(projection) => projection,
+        Err(refusal) => return Ok(rich_refusal(refusal)),
+    };
+    if expected_revision.and_then(|expected| expected.checked_add(1)) != Some(projection.revision) {
+        return Ok(rejected(
+            ErrorCode::ValidationFailed,
+            "a revised definition's revision must be expectedRevision + 1",
+            None,
+        ));
+    }
+    if let Some(current) = current_definition_state(conn, &projection.automation_id)? {
+        // `state-machines.json`: draft and invalid revise only to paused;
+        // otherwise a revise keeps the state, since activation and pausing are
+        // their own commands.
+        let lawful = match current.lifecycle_state.as_str() {
+            "draft" | "invalid" | "paused" => "paused",
+            "active" => "active",
+            _ => projection.lifecycle_state.as_str(),
+        };
+        if !current.tombstoned && projection.lifecycle_state != lawful {
+            return Ok(rejected(
+                ErrorCode::IllegalTransition,
+                format!(
+                    "revising a {} definition must write lifecycleState `{lawful}`",
+                    current.lifecycle_state
+                ),
+                Some(current.revision),
+            ));
+        }
+    }
+    let lifecycle_state = projection.lifecycle_state.clone();
+    let response = apply_revise(conn, &projection.routine, expected_revision, adopted_at)?;
+    attach_rich_body(
+        conn,
+        response,
+        &projection.automation_id,
+        &projection.canonical,
+        &lifecycle_state,
+    )
+}
+
 fn apply_revise(
     conn: &Connection,
     definition_value: &Value,
@@ -1370,7 +1540,8 @@ fn apply_revise(
                  lifecycle_state = ?6,
                  revision = ?7,
                  authority_version = 1,
-                 updated_at = ?8
+                 updated_at = ?8,
+                 rich_definition_json = NULL
              WHERE id = ?1 AND revision = ?9",
             params![
                 definition.id,

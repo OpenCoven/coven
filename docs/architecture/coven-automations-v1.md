@@ -357,17 +357,38 @@ This producer does not implement the whole catalog. `automations/command_matrix.
 
 The envelope translates:
 
-- the adopted mutations `definition.activate.v1`, `.pause.v1`, `.disable.v1`, `.tombstone.v1` and `legacy.import.v1`;
+- the adopted mutations `definition.create.v1` and `.revise.v1` with rich bodies (below), `definition.activate.v1`, `.pause.v1`, `.disable.v1`, `.tombstone.v1` and `legacy.import.v1`;
 - the queries `definition.list.v1`, `definition.get.v1`, `definition.health.v1`, `run.history.v1`, `events.read.v1` and `events.subscribe.v1`. Queries answer `outcome: "committed"` on every request; their adoption key is echoed but not stored.
 
 The envelope refuses with `CAPABILITY_UNSUPPORTED`, before any write:
 
-- `definition.create.v1` and `.revise.v1`, whose rich definition bodies the executor cannot run yet;
 - `run.cancel.v1`, whose payload lacks the attempt and runtime correlation the producer's cancellation requires;
 - the matrix's unimplemented commands;
 - any payload field the adapter does not implement: list `limit`, `cursor` or a `lifecycleState` other than `all`; get `revision`; tombstone `reason`.
 
 A malformed envelope is `VALIDATION_FAILED` and is not adopted. `origin.channel` and `origin.correlationId` are recorded on the committed event; like every caller-supplied identity field they grant nothing. The action is owner-local IPC only, as the transport gate denies every automation action not on its TCP read list.
+
+#### Rich definitions
+
+An envelope `definition.create.v1` or `.revise.v1` carries a rich `AutomationDefinition`. The typed envelope validates it, including its JCS `integrity` digest, and a mismatched digest is a non-adopted `VALIDATION_FAILED`. It is then projected onto the executable `RoutineDefinition` that the scheduler and runner still run:
+
+- `display.name` and `tags` map to name and tags;
+- the schedule's `rrule` and `timezone` map across;
+- `action.prompt` and `cwd` map across;
+- `binding.familiarId` maps across;
+- `runtimeRequirements.runtimeId` and `model` map across, with `coven-code` as the default runtime;
+- `policies.timeout.perRunMinutes` and `policies.retry` map across;
+- misfire is `latest` and overlap is `forbid`.
+
+The projection runs through the same create and revise transactions, validation, capability negotiation, adoption and events as a routine body. The rich body is stored verbatim (canonical JCS) beside the routine. `definition.get.v1` returns it as `definition`, regenerated for the row's current `revision` and `lifecycleState` with its integrity recomputed, so it stays accurate after activate, pause or disable.
+
+The rules:
+
+- **Create** must be `revision: 1` in `lifecycleState: "draft"`: new definitions start in draft and run nothing until activated.
+- **Revise** must be `revision: expectedRevision + 1`, and write `paused` for a draft, invalid or paused definition and `active` for an active one, because activation and pausing are their own commands. Anything else is `ILLEGAL_TRANSITION`.
+- **Refused as `CAPABILITY_UNSUPPORTED`, rather than dropped:** `policies.delivery` (atomic output targets are refused by the capability profile) and `activation` windows.
+- **`binding.authority`** is required by the schema. It is stored as a reference and not enforced until trusted Runtime Authority exists (#857).
+- **Replacement.** A routine-bodied revise replaces the rich body, and a rich request and a routine request can never share an adoption key.
 
 **Idempotency storage note for implementers:** the adoption key must be persisted in the same transaction as the state change it drives (a `command_adoption` table keyed by adoption key storing the first terminal outcome, including durable domain rejections), so replays and changed-request conflicts are answerable without recomputation. A rejected key is retained: the exact rejected request returns the stored rejection, while a corrected or otherwise changed request must use a new key or receive `ADOPTION_REPLAY_MISMATCH`.
 

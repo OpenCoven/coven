@@ -23,6 +23,7 @@ pub const AUTOMATION_DEFINITIONS_SCHEMA_SQL: &str = "
             CHECK (lifecycle_state IN ('draft', 'paused', 'active', 'disabled', 'invalid')),
         tombstoned_at TEXT,
         authority_version INTEGER NOT NULL DEFAULT 0 CHECK (authority_version IN (0, 1)),
+        rich_definition_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
@@ -102,6 +103,16 @@ pub(crate) fn ensure_definition_command_columns(conn: &Connection) -> Result<()>
             [],
         )
         .context("failed to add automation definition authority version column")?;
+    }
+    if !columns
+        .iter()
+        .any(|column| column == "rich_definition_json")
+    {
+        conn.execute(
+            "ALTER TABLE automation_definitions ADD COLUMN rich_definition_json TEXT",
+            [],
+        )
+        .context("failed to add automation definition rich body column")?;
     }
     Ok(())
 }

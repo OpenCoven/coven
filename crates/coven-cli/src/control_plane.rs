@@ -1065,7 +1065,7 @@ fn automation_legacy_command_result(
     }
 }
 
-fn automation_command_result(
+pub(crate) fn automation_command_result(
     action: &str,
     origin: Option<String>,
     intent_id: Option<String>,
@@ -2085,11 +2085,23 @@ fn automation_list_payload(
 fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
     match crate::automations::store::get_definition_with_tombstone(conn, id, true) {
         Ok(Some(record)) => match serde_json::from_str::<Value>(&record.definition_json) {
-            Ok(routine) => Ok(json!({
-                "routine": routine,
-                "revision": record.revision,
-                "tombstonedAt": record.tombstoned_at,
-            })),
+            Ok(routine) => {
+                let mut payload = json!({
+                    "routine": routine,
+                    "revision": record.revision,
+                    "tombstonedAt": record.tombstoned_at,
+                });
+                // Richly authored definitions also return their rich form,
+                // regenerated for the current revision and lifecycle state.
+                match crate::automations::rich_definition::current_view(conn, id) {
+                    Ok(Some(definition)) => payload["definition"] = definition,
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(format!("stored rich definition is unreadable: {error:#}"))
+                    }
+                }
+                Ok(payload)
+            }
             Err(error) => Err(format!("stored routine is unreadable: {error}")),
         },
         Ok(None) => Ok(json!({ "routine": Value::Null })),
