@@ -13,12 +13,12 @@ jobs:
     if: github.repository == 'OpenCoven/coven' && github.ref == 'refs/heads/fix/857-automation-transport-authority'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/coven-target
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      - name: Keep build output outside source
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/coven-target" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
