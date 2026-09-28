@@ -1,0 +1,35 @@
+name: Temporary authority repair source snapshot
+
+on:
+  push:
+    branches: [fix/857-automation-transport-authority]
+    paths: [.github/workflows/repair-857-source-snapshot.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.repository == 'OpenCoven/coven' && github.ref == 'refs/heads/fix/857-automation-transport-authority'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Archive tracked source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar --output="$RUNNER_TEMP/coven-source.tar" "$GITHUB_SHA"
+          git rev-parse HEAD > "$RUNNER_TEMP/coven-source-commit.txt"
+          sha256sum "$RUNNER_TEMP/coven-source.tar" > "$RUNNER_TEMP/coven-source-sha256.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: authority-repair-source-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/coven-source.tar
+            ${{ runner.temp }}/coven-source-commit.txt
+            ${{ runner.temp }}/coven-source-sha256.txt
+          retention-days: 1
+          if-no-files-found: error
