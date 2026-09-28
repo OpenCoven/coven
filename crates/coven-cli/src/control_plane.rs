@@ -747,10 +747,21 @@ pub(crate) fn route_action_at(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
-        _ => (
-            400,
-            rejected_action(action, format!("unknown action `{action}`")),
-        ),
+        _ => match crate::automations::command_matrix::refused_command(action) {
+            // A spec command without a versioned adapter is refused before
+            // any adoption, definition, event or execution write.
+            Some(entry) => typed_rejection(
+                action,
+                automation_error(
+                    crate::automations::contract::error::ErrorCode::CapabilityUnsupported,
+                    crate::automations::command_matrix::refusal_message(entry),
+                ),
+            ),
+            None => (
+                400,
+                rejected_action(action, format!("unknown action `{action}`")),
+            ),
+        },
     }
 }
 
@@ -2487,6 +2498,163 @@ mod tests {
         let occurrence = &response.event.as_ref().unwrap().payload["occurrence"];
         assert_eq!(occurrence["runs"].as_array().unwrap().len(), 20);
         assert_eq!(occurrence["runsTruncated"], true);
+    }
+
+    /// Every row of every table, as sorted text, so a test can prove a request
+    /// wrote nothing anywhere in the store.
+    fn store_snapshot(conn: &rusqlite::Connection) -> Vec<String> {
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut snapshot = Vec::new();
+        for table in tables {
+            let mut statement = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| {
+                            row.get::<_, rusqlite::types::Value>(index)
+                                .map(|value| format!("{value:?}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .map(|row| format!("{table}: {}", row.unwrap().join(" | ")))
+                .collect::<Vec<_>>();
+            rows.sort();
+            snapshot.push(format!("{table}: {} rows", rows.len()));
+            snapshot.extend(rows);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn command_matrix_matches_advertisement_and_dispatch() {
+        use crate::automations::command_matrix::{
+            action_name, CommandSupport, COMMAND_MATRIX, PRODUCER_READ_EXTENSIONS,
+        };
+        let advertised = capabilities()
+            .capabilities
+            .into_iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+
+        for entry in COMMAND_MATRIX {
+            let action = action_name(entry.command);
+            let implemented = entry.support == CommandSupport::Implemented;
+            assert_eq!(
+                advertised.contains(&action.as_str()),
+                implemented,
+                "{action} must be advertised exactly when implemented"
+            );
+            if let CommandSupport::CompatibilityOnly { legacy_action } = entry.support {
+                assert!(advertised.contains(&legacy_action), "{legacy_action}");
+            }
+            let (_, response) = route_action(
+                json!({ "action": action }),
+                &conn,
+                &crate::api::NoopSessionRuntime,
+            );
+            let code = response
+                .error
+                .as_ref()
+                .and_then(|error| error["code"].as_str());
+            if implemented {
+                assert_ne!(code, Some("CAPABILITY_UNSUPPORTED"), "{action}");
+                assert!(
+                    !response
+                        .reason
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with("unknown action"),
+                    "{action} must be dispatched"
+                );
+            } else {
+                assert_eq!(code, Some("CAPABILITY_UNSUPPORTED"), "{action}");
+            }
+        }
+
+        // A versioned action is advertised only as an implemented command or
+        // a named read extension; nothing slips in outside the matrix.
+        for action in advertised.iter().filter(|action| action.ends_with(".v1")) {
+            let command = action.strip_prefix("coven.automations.").unwrap();
+            assert!(
+                COMMAND_MATRIX.iter().any(|entry| entry.command == command
+                    && entry.support == CommandSupport::Implemented)
+                    || PRODUCER_READ_EXTENSIONS.contains(action),
+                "{action} is advertised but absent from the command matrix"
+            );
+        }
+        for extension in PRODUCER_READ_EXTENSIONS {
+            assert!(advertised.contains(extension), "{extension}");
+        }
+    }
+
+    #[test]
+    fn refused_commands_write_nothing() {
+        use crate::automations::command_matrix::{action_name, CommandSupport, COMMAND_MATRIX};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "alpha");
+        filter_fixture_occurrence(
+            &conn,
+            "alpha-1",
+            "alpha",
+            "2026-09-01T09:00:00.000Z",
+            "failed",
+        );
+        let before = store_snapshot(&conn);
+
+        let refused = COMMAND_MATRIX
+            .iter()
+            .filter(|entry| entry.support != CommandSupport::Implemented)
+            .collect::<Vec<_>>();
+        assert!(!refused.is_empty());
+        for entry in refused {
+            // Every field any of these commands could plausibly act on, so a
+            // partial adapter would have something to write.
+            let request = json!({
+                "action": action_name(entry.command),
+                "schemaVersion": "coven.automations.v1",
+                "command": entry.command,
+                "adoptionKey": format!("adopt:{}", entry.command),
+                "expectedRevision": 1,
+                "id": "alpha",
+                "automationId": "alpha",
+                "occurrenceId": "alpha-1",
+                "runId": "run-1",
+                "attemptId": "attempt-1",
+                "priorDisposition": "failed",
+                "origin": "cli",
+                "intentId": "intent-1",
+                "intent": { "statement": "Exercise a refused command." },
+                "payload": { "automationId": "alpha", "occurrenceId": "alpha-1" }
+            });
+            let (status, response) = route_action(request, &conn, &crate::api::NoopSessionRuntime);
+            let error = response.error.as_ref().expect("typed error");
+            assert_eq!(error["code"], "CAPABILITY_UNSUPPORTED", "{}", entry.command);
+            assert_eq!(status, error["httpStatus"].as_u64().unwrap() as u16);
+            assert!(!response.ok && !response.accepted);
+            assert!(response.event.is_none() && response.result.is_none());
+            let reason = response.reason.as_deref().unwrap();
+            assert!(reason.contains(entry.command), "{reason}");
+            if let CommandSupport::CompatibilityOnly { legacy_action } = entry.support {
+                assert!(reason.contains(legacy_action), "{reason}");
+            }
+        }
+        assert_eq!(store_snapshot(&conn), before);
     }
 
     fn filter_fixture_definition(conn: &rusqlite::Connection, id: &str) {

@@ -10,6 +10,7 @@ pub mod authority_projection;
 pub mod cancellation;
 pub mod capability_negotiation;
 pub mod command_adoption;
+pub mod command_matrix;
 pub mod conformance_target;
 #[cfg(test)]
 mod conformance_target_tests;
