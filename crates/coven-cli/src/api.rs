@@ -895,7 +895,7 @@ fn handle_request_with_runtime_authority_and_automation_time(
                 }
             };
             if let Some(rejection) =
-                control_plane::automation_receipt_transport_rejection(&payload, authority)
+                control_plane::automation_transport_rejection(&payload, authority)
             {
                 return json_response(rejection.0, &rejection.1);
             }

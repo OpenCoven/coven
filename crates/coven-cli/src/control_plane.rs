@@ -166,20 +166,50 @@ pub fn capabilities() -> CapabilityCatalog {
     }
 }
 
-pub(crate) fn automation_receipt_transport_rejection(
+/// Check transport authority before opening the store, adoption lookup, or dispatch.
+/// Keep a read-only allowlist: adding an automation command must not silently
+/// expose a new mutation over unauthenticated loopback TCP. Event reads are
+/// excluded because each page issues a stored checkpoint.
+pub(crate) fn automation_transport_rejection(
     payload: &Value,
     authority: crate::request_authority::RequestAuthority,
 ) -> Option<(u16, ControlActionResponse)> {
     let action = payload.get("action")?.as_str()?.trim();
-    if action != "coven.automations.receipt.get.v1" || authority.allows_automation_receipt_access()
-    {
+    if !action.starts_with("coven.automations.") {
         return None;
     }
+    let reason = if action == "coven.automations.receipt.get.v1" {
+        if authority.allows_automation_receipt_access() {
+            return None;
+        }
+        "Automation receipt reads require owner-local IPC."
+    } else {
+        if matches!(
+            action,
+            "coven.automations.list"
+                | "coven.automations.get"
+                | "coven.automations.definition.list.v1"
+                | "coven.automations.definition.get.v1"
+                | "coven.automations.runs"
+                | "coven.automations.run.history.v1"
+                | "coven.automations.health"
+                | "coven.automations.definition.health.v1"
+                | "coven.automations.scheduler.status.v1"
+                | "coven.automations.occurrence.list.v1"
+                | "coven.automations.occurrence.get.v1"
+                | "coven.automations.run.get.v1"
+                | "coven.automations.occurrence.history.v1"
+        ) || authority.allows_automation_mutation()
+        {
+            return None;
+        }
+        "Automation mutations require owner-local IPC."
+    };
     Some(typed_rejection(
         action,
         automation_error(
             crate::automations::contract::error::ErrorCode::AuthorityRequired,
-            "Automation receipt reads require owner-local IPC.",
+            reason,
         ),
     ))
 }
