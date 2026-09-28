@@ -19,15 +19,30 @@ impl Drop for Daemon {
     }
 }
 
-fn exchange(mut stream: impl Read + Write, method: &str, route: &str, body: &Value) -> Result<(u16, Value)> {
-    let body = if method == "GET" { String::new() } else { body.to_string() };
+fn exchange(
+    mut stream: impl Read + Write,
+    method: &str,
+    route: &str,
+    body: &Value,
+) -> Result<(u16, Value)> {
+    let body = if method == "GET" {
+        String::new()
+    } else {
+        body.to_string()
+    };
     write!(stream, "{method} {route} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())?;
     stream.flush()?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    let (headers, body) = response.split_once("\r\n\r\n").context("HTTP response has no body separator")?;
-    let status = headers.lines().next().and_then(|line| line.split_whitespace().nth(1))
-        .context("HTTP response has no status")?.parse()?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("HTTP response has no body separator")?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("HTTP response has no status")?
+        .parse()?;
     Ok((status, serde_json::from_str(body)?))
 }
 
@@ -39,15 +54,18 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
     let address = reservation.local_addr()?;
     drop(reservation);
     let log_path = temp.path().join("daemon.log");
-    let mut daemon = Daemon(Command::new(env!("CARGO_BIN_EXE_coven"))
-        .args(["daemon", "serve", "--tcp", &address.to_string()])
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", temp.path())
-        .env("COVEN_HOME", &home)
-        .stdin(Stdio::null()).stdout(Stdio::null())
-        .stderr(std::fs::File::create(&log_path)?)
-        .spawn()?);
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_coven"))
+            .args(["daemon", "serve", "--tcp", &address.to_string()])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", temp.path())
+            .env("COVEN_HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log_path)?)
+            .spawn()?,
+    );
     let tcp = |method: &str, route: &str, body: &Value| -> Result<(u16, Value)> {
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -63,9 +81,15 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if matches!(ipc("GET", "/health", &Value::Null), Ok((200, _)))
-            && matches!(tcp("GET", "/health", &Value::Null), Ok((200, _))) { break; }
+            && matches!(tcp("GET", "/health", &Value::Null), Ok((200, _)))
+        {
+            break;
+        }
         if daemon.0.try_wait()?.is_some() || Instant::now() >= deadline {
-            bail!("isolated daemon did not become ready: {}", std::fs::read_to_string(&log_path)?);
+            bail!(
+                "isolated daemon did not become ready: {}",
+                std::fs::read_to_string(&log_path)?
+            );
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -81,10 +105,21 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
         }
     });
     for action in [
-        "definition.create.v1", "definition.revise.v1", "definition.disable.v1",
-        "definition.tombstone.v1", "definition.activate.v1", "definition.pause.v1",
-        "create", "update", "delete", "tick", "run", "import", "run.cancel.v1",
-        "receipt.get.v1", "futureMutation.v2",
+        "definition.create.v1",
+        "definition.revise.v1",
+        "definition.disable.v1",
+        "definition.tombstone.v1",
+        "definition.activate.v1",
+        "definition.pause.v1",
+        "create",
+        "update",
+        "delete",
+        "tick",
+        "run",
+        "import",
+        "run.cancel.v1",
+        "receipt.get.v1",
+        "futureMutation.v2",
     ] {
         for route in ["/actions", "/api/v1/actions"] {
             let mut body = create.clone();
@@ -95,9 +130,18 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
             assert_eq!(response["accepted"], false);
         }
     }
-    let conn = rusqlite::Connection::open_with_flags(home.join("coven.sqlite3"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    for table in ["automation_definitions", "automation_command_adoptions", "automation_command_reservations"] {
-        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+    let conn = rusqlite::Connection::open_with_flags(
+        home.join("coven.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    for table in [
+        "automation_definitions",
+        "automation_command_adoptions",
+        "automation_command_reservations",
+    ] {
+        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
         assert_eq!(count, 0, "TCP refusal wrote {table}");
     }
     let (status, owner) = ipc("POST", "/api/v1/actions", &create)?;
@@ -108,7 +152,11 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
     let (status, owner_replay) = ipc("POST", "/api/v1/actions", &create)?;
     assert_eq!(status, 200, "{owner_replay}");
     assert_eq!(owner_replay["result"]["outcome"], "replayed");
-    let (status, read) = tcp("POST", "/api/v1/actions", &json!({"action": "coven.automations.definition.list.v1"}))?;
+    let (status, read) = tcp(
+        "POST",
+        "/api/v1/actions",
+        &json!({"action": "coven.automations.definition.list.v1"}),
+    )?;
     assert_eq!(status, 200, "read-only compatibility: {read}");
     Ok(())
 }

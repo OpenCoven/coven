@@ -129,7 +129,7 @@ fn database_snapshot(conn: &Connection) -> Result<Vec<(String, Vec<String>)>> {
 }
 
 #[test]
-fn tcp_mutations_are_refused_before_store_open_or_runtime_effects() -> Result<()> {
+fn mutations_are_refused_before_store_open_or_runtime_effects() -> Result<()> {
     let catalog = crate::control_plane::capabilities();
     let mut actions = catalog
         .capabilities
@@ -166,7 +166,7 @@ fn tcp_mutations_are_refused_before_store_open_or_runtime_effects() -> Result<()
 }
 
 #[test]
-fn tcp_refusal_cannot_reserve_an_owners_adoption_key() -> Result<()> {
+fn refusal_cannot_reserve_an_owners_adoption_key() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let body = create_payload("transport-retry-after-refusal");
     for _ in 0..2 {
@@ -186,7 +186,7 @@ fn tcp_refusal_cannot_reserve_an_owners_adoption_key() -> Result<()> {
 }
 
 #[test]
-fn tcp_cannot_replay_or_mutate_an_owners_committed_definition() -> Result<()> {
+fn untrusted_transport_cannot_replay_or_mutate_an_owners_committed_definition() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let body = create_payload("transport-owner-committed-adoption");
     let owner = request(
