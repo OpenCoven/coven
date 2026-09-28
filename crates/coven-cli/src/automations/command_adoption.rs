@@ -4169,4 +4169,60 @@ mod tests {
         .unwrap();
         assert_eq!(response.error.unwrap().code(), ErrorCode::GoneTombstoned);
     }
+
+    #[test]
+    fn revise_takes_an_invalid_definition_only_to_paused() {
+        let (_temp, conn) = temp_store();
+        create_paused(&conn, "broken");
+        conn.execute(
+            "UPDATE automation_definitions SET lifecycle_state = 'invalid' WHERE id = 'broken'",
+            [],
+        )
+        .unwrap();
+        let revise = |key: &str, status: &str| {
+            let mut body = definition("broken", "broken");
+            body["status"] = json!(status);
+            execute_definition_command(
+                &conn,
+                key,
+                DefinitionCommand::Revise {
+                    definition: body,
+                    expected_revision: Some(1),
+                },
+                "2026-09-28T11:00:00.000Z",
+            )
+            .unwrap()
+        };
+        let before = (
+            stored_status(&conn, "broken"),
+            definition_event_count(&conn, "broken"),
+        );
+        assert_eq!(before.0 .1, "invalid");
+
+        let to_active = revise("adopt:revise:broken:active", "ACTIVE");
+        assert_eq!(
+            to_active.error.unwrap().code(),
+            ErrorCode::IllegalTransition
+        );
+        assert_eq!(
+            (
+                stored_status(&conn, "broken"),
+                definition_event_count(&conn, "broken")
+            ),
+            before
+        );
+
+        let to_paused = revise("adopt:revise:broken:paused", "PAUSED");
+        assert_eq!(to_paused.outcome, DefinitionCommandOutcome::Committed);
+        assert_eq!(
+            stored_status(&conn, "broken"),
+            (
+                "PAUSED".to_owned(),
+                "paused".to_owned(),
+                2,
+                "PAUSED".to_owned()
+            )
+        );
+        assert_eq!(definition_event_count(&conn, "broken"), before.1 + 1);
+    }
 }
