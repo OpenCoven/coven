@@ -95,10 +95,15 @@ fn owner_ipc(home: &Path) -> Result<interprocess::local_socket::Stream> {
     let pipe = status["socket"]
         .as_str()
         .context("daemon status omitted its pipe name")?;
-    Ok(ConnectOptions::new()
+    let stream = ConnectOptions::new()
         .name(pipe.to_ns_name::<GenericNamespaced>()?)
         .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(2)))
-        .connect_sync()?)
+        .connect_sync()?;
+    // Bound every exchange, as the daemon bounds its side, so a stalled pipe
+    // fails the test instead of wedging the job.
+    stream.set_recv_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_send_timeout(Some(Duration::from_secs(5)))?;
+    Ok(stream)
 }
 
 fn spawn_daemon(temp: &Path, home: &Path, address: SocketAddr, log: &Path) -> Result<Daemon> {
@@ -152,11 +157,11 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    // Unix serves `--tcp`; the Windows daemon does not bind TCP at all, so its
-    // owner-only pipe is the whole surface. Should Windows gain a TCP listener,
-    // every TCP refusal below applies to it unchanged.
-    let tcp_served =
-        cfg!(unix) || TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok();
+    // Unix serves `--tcp`. The Windows daemon ignores it and binds no TCP
+    // listener, so its owner-only pipe is the whole surface, and anything on the
+    // released port there belongs to another process. Enable this for Windows
+    // when its daemon starts serving TCP.
+    let tcp_served = cfg!(unix);
     let create = json!({
         "action": "coven.automations.definition.create.v1",
         "adoptionKey": "wire-owner-adoption",
