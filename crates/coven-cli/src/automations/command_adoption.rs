@@ -1338,6 +1338,20 @@ fn apply_revise(
             Some(current.revision),
         ));
     }
+    // `state-machines.json`: a revise takes draft and invalid definitions only
+    // to `paused`; activation is a separate transition.
+    if matches!(current.lifecycle_state.as_str(), "draft" | "invalid")
+        && definition.status != super::definition::RoutineStatus::Paused
+    {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            format!(
+                "a {} definition can only be revised to PAUSED",
+                current.lifecycle_state
+            ),
+            Some(current.revision),
+        ));
+    }
     let next_revision = next_revision(current.revision)?;
     let next_revision_sql = sqlite_revision(next_revision)?;
     let current_revision_sql = sqlite_revision(current.revision)?;

@@ -523,6 +523,47 @@ prompt = "Do the legacy thing."
             super::super::contract::error::ErrorCode::IllegalTransition
         );
 
+        // Nor can a revise skip `paused`: the only revise exit from draft is
+        // `draft -> paused`.
+        let stored: serde_json::Value = serde_json::from_str(
+            &super::super::store::get_definition(&conn, "nightly")
+                .unwrap()
+                .unwrap()
+                .definition_json,
+        )
+        .unwrap();
+        let revise = |key: &str, status: &str| {
+            let mut definition = stored.clone();
+            definition["status"] = serde_json::json!(status);
+            super::super::command_adoption::execute_definition_command(
+                &conn,
+                key,
+                super::super::command_adoption::DefinitionCommand::Revise {
+                    definition,
+                    expected_revision: Some(1),
+                },
+                "2026-09-28T09:02:00.000Z",
+            )
+            .unwrap()
+        };
+        let to_active = revise("adopt:revise:nightly:active", "ACTIVE");
+        assert_eq!(
+            to_active.error.unwrap().code(),
+            super::super::contract::error::ErrorCode::IllegalTransition
+        );
+        assert_eq!(definition_rows(&conn)[0].2, "draft");
+        let to_paused = revise("adopt:revise:nightly:paused", "PAUSED");
+        assert_eq!(to_paused.outcome, DefinitionCommandOutcome::Committed);
+        assert_eq!(
+            definition_rows(&conn),
+            vec![(
+                "nightly".to_owned(),
+                "PAUSED".to_owned(),
+                "paused".to_owned(),
+                1
+            )]
+        );
+
         // A second import skips what is already present.
         let again = draft_import(&conn, &root, "adopt:import:again", false);
         let again = again.result.unwrap();
@@ -532,7 +573,8 @@ prompt = "Do the legacy thing."
             .unwrap()
             .iter()
             .any(|skip| skip == "nightly: already exists"));
-        assert_eq!(event_count(&conn), 1);
+        // The import and the paused revise; the refused revise and the re-import append nothing.
+        assert_eq!(event_count(&conn), 2);
     }
 
     #[test]
