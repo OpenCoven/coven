@@ -250,9 +250,14 @@ pub fn import_codex_as_draft(conn: &Connection, dry_run: bool) -> Result<ImportR
         candidates,
         mut report,
     } = plan_codex_import(&codex_automations_dir())?;
+    // Ids this run has already imported (or, dry, would have): a second
+    // source file with the same id is skipped either way.
+    let mut claimed = std::collections::HashSet::new();
     for definition in candidates {
         let id = definition.id.clone();
-        if super::store::get_definition_with_tombstone(conn, &id, true)?.is_some() {
+        if !claimed.insert(id.clone())
+            || super::store::get_definition_with_tombstone(conn, &id, true)?.is_some()
+        {
             report.skipped.push(format!("{id}: already exists"));
             continue;
         }
@@ -449,22 +454,37 @@ prompt = "Do the legacy thing."
         let root = temp.path().join("automations");
         write_codex_automation(&root, "nightly", "RRULE:FREQ=DAILY;BYHOUR=2;BYMINUTE=0");
         write_codex_automation(&root, "minutely", "RRULE:FREQ=MINUTELY");
+        // A second source directory declaring the same id.
+        let twin = root.join("nightly-copy");
+        std::fs::create_dir_all(&twin).unwrap();
+        std::fs::copy(
+            root.join("nightly/automation.toml"),
+            twin.join("automation.toml"),
+        )
+        .unwrap();
 
         let dry = draft_import(&conn, &root, "adopt:import:dry", true);
         assert_eq!(dry.outcome, DefinitionCommandOutcome::Committed);
         let result = dry.result.unwrap();
         assert_eq!(result["dryRun"], true);
         assert_eq!(result["imported"], serde_json::json!(["nightly"]));
-        assert_eq!(result["skipped"].as_array().unwrap().len(), 1);
+        let mut predicted = result["skipped"].as_array().unwrap().clone();
+        assert_eq!(predicted.len(), 2);
+        assert!(predicted
+            .iter()
+            .any(|skip| skip == "nightly: already exists"));
         assert!(definition_rows(&conn).is_empty());
         assert_eq!(event_count(&conn), 0);
 
         let imported = draft_import(&conn, &root, "adopt:import:real", false);
         assert_eq!(imported.outcome, DefinitionCommandOutcome::Committed);
-        assert_eq!(
-            imported.result.unwrap()["imported"],
-            serde_json::json!(["nightly"])
-        );
+        let real = imported.result.unwrap();
+        // The dry run predicted exactly this outcome.
+        assert_eq!(real["imported"], serde_json::json!(["nightly"]));
+        let mut skipped = real["skipped"].as_array().unwrap().clone();
+        skipped.sort_by_key(ToString::to_string);
+        predicted.sort_by_key(ToString::to_string);
+        assert_eq!(skipped, predicted);
         // Draft, v1-managed, and still PAUSED to the scheduler.
         assert_eq!(
             definition_rows(&conn),
