@@ -139,6 +139,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.receipt.get.v1",
                     "coven.automations.run",
                     "coven.automations.import",
+                    "coven.automations.legacy.import.v1",
                     "coven.automations.health",
                     "coven.automations.definition.health.v1",
                     "coven.automations.scheduler.status.v1",
@@ -511,6 +512,48 @@ pub(crate) fn route_action_at(
                 }
             },
         ),
+        "coven.automations.legacy.import.v1" => {
+            let adoption_key = match required_adoption_key(&payload, action) {
+                Ok(adoption_key) => adoption_key,
+                Err(error) => return validation_rejection(action, error),
+            };
+            let source = match payload.get("source").and_then(Value::as_str) {
+                Some("codex-automation-toml") => Ok(()),
+                _ => Err(format!(
+                    "{action} field `source` must be `codex-automation-toml`"
+                )),
+            };
+            let dry_run = match payload.get("dryRun") {
+                None => Ok(false),
+                Some(Value::Bool(dry_run)) => Ok(*dry_run),
+                Some(_) => Err(format!("{action} field `dryRun` must be a boolean")),
+            };
+            let command = match (source, dry_run) {
+                (Ok(()), Ok(dry_run)) => {
+                    crate::automations::command_adoption::DefinitionCommand::LegacyImport {
+                        dry_run,
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    crate::automations::command_adoption::DefinitionCommand::Invalid {
+                        command: "legacy.import.v1".to_owned(),
+                        request: command_request_fields(&payload, &["source", "dryRun"]),
+                        message: error,
+                    }
+                }
+            };
+            automation_command_result(
+                action,
+                origin,
+                intent_id,
+                crate::automations::command_adoption::execute_definition_command(
+                    conn,
+                    &adoption_key,
+                    command,
+                    recorded_at,
+                ),
+            )
+        }
         "coven.automations.run.cancel.v1" => {
             match crate::automations::cancellation::execute_run_cancellation(
                 conn,
@@ -4211,6 +4254,50 @@ mod tests {
         assert_eq!(status, 200);
         assert!(runs.is_empty());
         assert_eq!(payload["cursor"], json!({ "hasMore": false }));
+    }
+
+    #[test]
+    fn legacy_import_v1_rejects_unknown_sources_and_malformed_flags_durably() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for (key, request) in [
+            ("adopt:import:no-source", json!({})),
+            ("adopt:import:other-source", json!({ "source": "cron" })),
+            (
+                "adopt:import:bad-dry-run",
+                json!({ "source": "codex-automation-toml", "dryRun": "yes" }),
+            ),
+        ] {
+            let mut request = request;
+            request["action"] = json!("coven.automations.legacy.import.v1");
+            request["adoptionKey"] = json!(key);
+            let (status, response) =
+                route_action(request.clone(), &conn, &crate::api::NoopSessionRuntime);
+            assert_eq!(status, 400, "{request}");
+            assert_eq!(
+                response.error.unwrap()["code"],
+                "VALIDATION_FAILED",
+                "{request}"
+            );
+            // The rejection is adopted: the exact request replays it.
+            let (_, replay) = route_action(request, &conn, &crate::api::NoopSessionRuntime);
+            assert_eq!(replay.error.unwrap()["code"], "VALIDATION_FAILED");
+        }
+        let (status, response) = route_action(
+            json!({ "action": "coven.automations.legacy.import.v1", "source": "codex-automation-toml" }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
+        let definitions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(definitions, 0);
     }
 
     #[test]
