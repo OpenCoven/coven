@@ -95,15 +95,36 @@ fn owner_ipc(home: &Path) -> Result<interprocess::local_socket::Stream> {
     let pipe = status["socket"]
         .as_str()
         .context("daemon status omitted its pipe name")?;
-    let stream = ConnectOptions::new()
+    Ok(ConnectOptions::new()
         .name(pipe.to_ns_name::<GenericNamespaced>()?)
         .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(2)))
-        .connect_sync()?;
-    // Bound every exchange, as the daemon bounds its side, so a stalled pipe
-    // fails the test instead of wedging the job.
-    stream.set_recv_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_send_timeout(Some(Duration::from_secs(5)))?;
-    Ok(stream)
+        .connect_sync()?)
+}
+
+#[cfg(unix)]
+fn owner_exchange(home: &Path, method: &str, route: &str, body: &Value) -> Result<(u16, Value)> {
+    exchange(owner_ipc(home)?, method, route, body)
+}
+
+/// A client pipe cannot take I/O timeouts (the daemon's `set_recv_timeout`
+/// applies to its accepted end only), so bound the whole exchange from outside:
+/// a stalled pipe fails the test instead of wedging the job.
+#[cfg(windows)]
+fn owner_exchange(home: &Path, method: &str, route: &str, body: &Value) -> Result<(u16, Value)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (home, method, route, body) = (
+        home.to_path_buf(),
+        method.to_owned(),
+        route.to_owned(),
+        body.clone(),
+    );
+    std::thread::spawn(move || {
+        let _ = sender
+            .send(owner_ipc(&home).and_then(|stream| exchange(stream, &method, &route, &body)));
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| anyhow::anyhow!("owner pipe exchange did not finish within 10 seconds"))?
 }
 
 fn spawn_daemon(temp: &Path, home: &Path, address: SocketAddr, log: &Path) -> Result<Daemon> {
@@ -140,7 +161,7 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
         exchange(stream, method, route, body)
     };
     let ipc = |method: &str, route: &str, body: &Value| -> Result<(u16, Value)> {
-        exchange(owner_ipc(&home)?, method, route, body)
+        owner_exchange(&home, method, route, body)
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
