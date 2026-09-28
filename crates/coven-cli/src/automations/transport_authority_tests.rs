@@ -47,7 +47,12 @@ impl SessionRuntime for NoEffectsRuntime {
     }
 }
 
-fn request(home: &Path, route: &str, body: &Value, authority: RequestAuthority) -> Result<ApiResponse> {
+fn request(
+    home: &Path,
+    route: &str,
+    body: &Value,
+    authority: RequestAuthority,
+) -> Result<ApiResponse> {
     handle_request_with_runtime_and_authority(
         "POST",
         route,
@@ -169,7 +174,12 @@ fn tcp_refusal_cannot_reserve_an_owners_adoption_key() -> Result<()> {
         assert_authority_refusal(&response, body["action"].as_str().unwrap())?;
     }
     assert!(!temp.path().join("coven.sqlite3").exists());
-    let owner = request(temp.path(), "/actions", &body, RequestAuthority::OwnerLocalIpc)?;
+    let owner = request(
+        temp.path(),
+        "/actions",
+        &body,
+        RequestAuthority::OwnerLocalIpc,
+    )?;
     assert_eq!(owner.status, 200, "{}", owner.body);
     assert!(owner.body.contains(r#""outcome":"committed""#));
     Ok(())
@@ -179,7 +189,12 @@ fn tcp_refusal_cannot_reserve_an_owners_adoption_key() -> Result<()> {
 fn tcp_cannot_replay_or_mutate_an_owners_committed_definition() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let body = create_payload("transport-owner-committed-adoption");
-    let owner = request(temp.path(), "/actions", &body, RequestAuthority::OwnerLocalIpc)?;
+    let owner = request(
+        temp.path(),
+        "/actions",
+        &body,
+        RequestAuthority::OwnerLocalIpc,
+    )?;
     assert_eq!(owner.status, 200, "{}", owner.body);
     let conn = crate::store::open_store(&temp.path().join("coven.sqlite3"))?;
     let before = database_snapshot(&conn)?;
@@ -207,7 +222,12 @@ fn tcp_cannot_replay_or_mutate_an_owners_committed_definition() -> Result<()> {
         assert_authority_refusal(&response, action)?;
         assert_eq!(database_snapshot(&conn)?, before, "{action}");
     }
-    let replay = request(temp.path(), "/actions", &body, RequestAuthority::OwnerLocalIpc)?;
+    let replay = request(
+        temp.path(),
+        "/actions",
+        &body,
+        RequestAuthority::OwnerLocalIpc,
+    )?;
     assert_eq!(replay.status, 200, "{}", replay.body);
     assert!(replay.body.contains(r#""outcome":"replayed""#));
     assert_eq!(database_snapshot(&conn)?, before);
@@ -216,15 +236,29 @@ fn tcp_cannot_replay_or_mutate_an_owners_committed_definition() -> Result<()> {
 
 #[test]
 fn transport_gate_preserves_read_and_non_automation_validation() -> Result<()> {
-    for action in PUBLIC_READ_ACTIONS.iter().copied().chain(["coven.capabilities.refresh"]) {
+    for action in PUBLIC_READ_ACTIONS
+        .iter()
+        .copied()
+        .chain(["coven.capabilities.refresh"])
+    {
         let temp = tempfile::tempdir()?;
         let body = json!({"action": action});
-        let owner = request(temp.path(), "/actions", &body, RequestAuthority::OwnerLocalIpc)?;
+        let owner = request(
+            temp.path(),
+            "/actions",
+            &body,
+            RequestAuthority::OwnerLocalIpc,
+        )?;
         let tcp = request(temp.path(), "/actions", &body, RequestAuthority::Tcp)?;
         assert_ne!(tcp.status, 403, "{action}: {}", tcp.body);
         assert_eq!(tcp.status, owner.status, "{action}");
     }
-    for body in [json!({}), json!({"action": 7}), json!({"action": " "}), json!([])] {
+    for body in [
+        json!({}),
+        json!({"action": 7}),
+        json!({"action": " "}),
+        json!([]),
+    ] {
         let temp = tempfile::tempdir()?;
         let response = request(temp.path(), "/actions", &body, RequestAuthority::Tcp)?;
         assert_eq!(response.status, 400, "{}", response.body);
