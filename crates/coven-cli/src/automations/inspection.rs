@@ -153,10 +153,27 @@ pub struct OccurrenceHistoryPage {
 /// the cursor while a caller pages never shift a later page. Diagnostic only.
 /// SQL for `YYYY-MM-DDTHH:MM:SS.fffffffffZ` from a UTC RFC 3339 `Z` timestamp
 /// with a zero- to nine-digit fraction, so TEXT order is instant order.
-fn history_sort_key(column: &str) -> String {
+pub(crate) fn history_sort_key(column: &str) -> String {
     format!(
         "(substr({column}, 1, 19) || '.' || \
          substr(rtrim(substr({column}, 21), 'Z') || '000000000', 1, 9) || 'Z')"
+    )
+}
+
+/// Uses `idx_automation_occurrences_history`, whose expression must stay
+/// identical to `history_sort_key("scheduled_for")`.
+pub(crate) fn occurrence_history_sql() -> String {
+    format!(
+        "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
+                kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                failure_reason, created_at, updated_at
+         FROM automation_occurrences
+         WHERE automation_id = ?1
+           AND (?2 IS NULL OR {key} < {after} OR ({key} = {after} AND id < ?3))
+         ORDER BY {key} DESC, id DESC
+         LIMIT ?4",
+        key = history_sort_key("scheduled_for"),
+        after = history_sort_key("?2"),
     )
 }
 
@@ -176,18 +193,7 @@ pub fn occurrence_history(
     // to nine digits instead. `.123Z` and `.123000000Z` then share a key,
     // which `id` breaks.
     let mut statement = transaction
-        .prepare(&format!(
-            "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
-                    kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
-                    failure_reason, created_at, updated_at
-             FROM automation_occurrences
-             WHERE automation_id = ?1
-               AND (?2 IS NULL OR {key} < {after} OR ({key} = {after} AND id < ?3))
-             ORDER BY {key} DESC, id DESC
-             LIMIT ?4",
-            key = history_sort_key("scheduled_for"),
-            after = history_sort_key("?2"),
-        ))
+        .prepare(&occurrence_history_sql())
         .context("failed to prepare automation occurrence history query")?;
     let rows = statement
         .query_map(

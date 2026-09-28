@@ -926,6 +926,8 @@ fn handle_request_with_runtime_authority_and_automation_time(
                         | "coven.automations.delete"
                         | "coven.automations.definition.create.v1"
                         | "coven.automations.definition.revise.v1"
+                        | "coven.automations.definition.activate.v1"
+                        | "coven.automations.definition.pause.v1"
                         | "coven.automations.definition.tombstone.v1"
                         | "coven.automations.run.cancel.v1"
                         | "coven.automations.run"

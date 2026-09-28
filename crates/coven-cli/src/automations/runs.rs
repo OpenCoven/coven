@@ -37,6 +37,10 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
 
     CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_started
         ON automation_runs(automation_id, started_at DESC);
+
+    -- run.history.v1 orders by this instant key (inspection::history_sort_key).
+    CREATE INDEX IF NOT EXISTS idx_automation_runs_history
+        ON automation_runs(automation_id, (substr(started_at, 1, 19) || '.' || substr(rtrim(substr(started_at, 21), 'Z') || '000000000', 1, 9) || 'Z') DESC, id DESC);
 ";
 
 pub const AUTOMATION_ATTEMPTS_SCHEMA_SQL: &str = "
@@ -360,46 +364,51 @@ pub fn record_run_finish(
     Ok(changed > 0)
 }
 
+const RUN_COLUMNS: &str =
+    "id, automation_id, automation_revision, definition_digest, occurrence_id,
+     receipt_id, session_id, familiar_id, runtime, status, exit_code, log_json,
+     output_commit, started_at, timeout_at, finished_at";
+
+fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: row.get(0)?,
+        automation_id: row.get(1)?,
+        automation_revision: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        definition_digest: row.get(3)?,
+        occurrence_id: row.get(4)?,
+        receipt_id: row.get(5)?,
+        session_id: row.get(6)?,
+        familiar_id: row.get(7)?,
+        runtime: row.get(8)?,
+        status: row.get(9)?,
+        exit_code: row.get(10)?,
+        log_json: row.get(11)?,
+        output_commit: row.get(12)?,
+        started_at: row.get(13)?,
+        timeout_at: row.get(14)?,
+        finished_at: row.get(15)?,
+    })
+}
+
 pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<Vec<RunRecord>> {
     let bounded = limit.clamp(1, 100);
     let mut statement = conn
-        .prepare(
-            "SELECT id, automation_id, automation_revision, definition_digest, occurrence_id,
-                    receipt_id, session_id, familiar_id, runtime, status, exit_code, log_json,
-                    output_commit, started_at, timeout_at, finished_at
+        .prepare(&format!(
+            "SELECT {RUN_COLUMNS}
              FROM automation_runs
              WHERE automation_id = ?1
              ORDER BY started_at DESC
-             LIMIT ?2",
-        )
+             LIMIT ?2"
+        ))
         .context("failed to prepare run list query")?;
     let rows = statement
-        .query_map(params![automation_id, bounded], |row| {
-            Ok(RunRecord {
-                id: row.get(0)?,
-                automation_id: row.get(1)?,
-                automation_revision: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Integer,
-                        Box::new(error),
-                    )
-                })?,
-                definition_digest: row.get(3)?,
-                occurrence_id: row.get(4)?,
-                receipt_id: row.get(5)?,
-                session_id: row.get(6)?,
-                familiar_id: row.get(7)?,
-                runtime: row.get(8)?,
-                status: row.get(9)?,
-                exit_code: row.get(10)?,
-                log_json: row.get(11)?,
-                output_commit: row.get(12)?,
-                started_at: row.get(13)?,
-                timeout_at: row.get(14)?,
-                finished_at: row.get(15)?,
-            })
-        })
+        .query_map(params![automation_id, bounded], run_record_from_row)
         .context("failed to list runs")?;
 
     let mut records = Vec::new();
@@ -407,6 +416,77 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
         records.push(row.context("failed to read run row")?);
     }
     Ok(records)
+}
+
+/// Where the next run-history page starts: strictly after this run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHistoryPosition {
+    pub started_at: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunHistoryPage {
+    pub runs: Vec<RunRecord>,
+    pub next: Option<RunHistoryPosition>,
+}
+
+/// One automation's runs, optionally for one occurrence, newest first by
+/// start instant then `id`, starting strictly after `after`. `started_at` is
+/// written at more than one precision, so rows are ordered by the instant
+/// rather than the text, as occurrence history is.
+/// Uses `idx_automation_runs_history`, whose expression must stay identical to
+/// `history_sort_key("started_at")`.
+fn run_history_sql() -> String {
+    let key = super::inspection::history_sort_key("started_at");
+    let after_key = super::inspection::history_sort_key("?3");
+    format!(
+        "SELECT {RUN_COLUMNS}
+         FROM automation_runs
+         WHERE automation_id = ?1
+           AND (?2 IS NULL OR occurrence_id = ?2)
+           AND (?3 IS NULL OR {key} < {after_key} OR ({key} = {after_key} AND id < ?4))
+         ORDER BY {key} DESC, id DESC
+         LIMIT ?5"
+    )
+}
+
+pub fn run_history(
+    conn: &Connection,
+    automation_id: &str,
+    occurrence_id: Option<&str>,
+    limit: usize,
+    after: Option<&RunHistoryPosition>,
+) -> Result<RunHistoryPage> {
+    let bounded = limit.clamp(1, 100);
+    let mut statement = conn
+        .prepare(&run_history_sql())
+        .context("failed to prepare run history query")?;
+    let rows = statement
+        .query_map(
+            params![
+                automation_id,
+                occurrence_id,
+                after.map(|position| position.started_at.as_str()),
+                after.map(|position| position.id.as_str()),
+                i64::try_from(bounded + 1).context("run history limit exceeds SQLite range")?
+            ],
+            run_record_from_row,
+        )
+        .context("failed to read run history")?;
+    let mut runs = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read run history")?;
+    let next = if runs.len() > bounded {
+        runs.truncate(bounded);
+        runs.last().map(|last| RunHistoryPosition {
+            started_at: last.started_at.clone(),
+            id: last.id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(RunHistoryPage { runs, next })
 }
 
 pub fn is_retry_quarantined(conn: &Connection, automation_id: &str) -> Result<bool> {
@@ -421,7 +501,6 @@ pub fn is_retry_quarantined(conn: &Connection, automation_id: &str) -> Result<bo
     .context("failed to inspect automation retry quarantine")
 }
 
-#[cfg(test)]
 pub fn list_attempts(conn: &Connection, run_id: &str) -> Result<Vec<AttemptRecord>> {
     let mut statement = conn
         .prepare(
@@ -817,6 +896,57 @@ mod tests {
     use super::*;
     use crate::store::initialize_store;
     use chrono::TimeZone;
+
+    /// The detail lines of `EXPLAIN QUERY PLAN` for `sql`, binding NULL to
+    /// each of its `parameters` placeholders.
+    fn query_plan(conn: &Connection, sql: &str, parameters: usize) -> Vec<String> {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let nulls = vec![rusqlite::types::Null; parameters];
+        statement
+            .query_map(rusqlite::params_from_iter(nulls), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn history_reads_order_by_their_expression_index_without_a_sort() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for (schema, column, sql, parameters, index) in [
+            (
+                AUTOMATION_RUNS_SCHEMA_SQL,
+                "started_at",
+                run_history_sql(),
+                5,
+                "idx_automation_runs_history",
+            ),
+            (
+                super::super::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL,
+                "scheduled_for",
+                super::super::inspection::occurrence_history_sql(),
+                4,
+                "idx_automation_occurrences_history",
+            ),
+        ] {
+            // The index expression must be the query's key, byte for byte, or
+            // SQLite silently falls back to sorting every matching row.
+            assert!(
+                schema.contains(&super::super::inspection::history_sort_key(column)),
+                "{index} must index history_sort_key(\"{column}\")"
+            );
+            let plan = query_plan(&conn, &sql, parameters);
+            assert!(plan.iter().any(|line| line.contains(index)), "{plan:?}");
+            assert!(
+                !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
+    }
 
     fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()

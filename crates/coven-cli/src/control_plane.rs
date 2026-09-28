@@ -127,16 +127,20 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.create.v1",
                     "coven.automations.definition.revise.v1",
                     "coven.automations.definition.disable.v1",
+                    "coven.automations.definition.activate.v1",
+                    "coven.automations.definition.pause.v1",
                     "coven.automations.definition.tombstone.v1",
                     "coven.automations.run.cancel.v1",
                     "coven.automations.events.read.v1",
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
                     "coven.automations.runs",
+                    "coven.automations.run.history.v1",
                     "coven.automations.receipt.get.v1",
                     "coven.automations.run",
                     "coven.automations.import",
                     "coven.automations.health",
+                    "coven.automations.definition.health.v1",
                     "coven.automations.scheduler.status.v1",
                     "coven.automations.occurrence.list.v1",
                     "coven.automations.occurrence.get.v1",
@@ -462,47 +466,51 @@ pub(crate) fn route_action_at(
                 Err(error) => validation_rejection(action, error),
             }
         }
-        "coven.automations.definition.disable.v1" => {
-            let id = required_id_field(&payload, action);
-            let adoption_key = required_adoption_key(&payload, action);
-            let expected_revision = required_expected_revision(&payload, action);
-            let reason = optional_reason(&payload, action);
-            match adoption_key {
-                Ok(adoption_key) => {
-                    let command = match (id, expected_revision, reason) {
-                        (Ok(id), Ok(expected_revision), Ok(reason)) => {
-                            crate::automations::command_adoption::DefinitionCommand::Disable {
-                                automation_id: id,
-                                expected_revision: Some(expected_revision),
-                                reason,
-                            }
-                        }
-                        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                            crate::automations::command_adoption::DefinitionCommand::Invalid {
-                                command: "definition.disable.v1".to_owned(),
-                                request: command_request_fields(
-                                    &payload,
-                                    &["id", "expectedRevision", "reason"],
-                                ),
-                                message: error,
-                            }
-                        }
-                    };
-                    automation_command_result(
-                        action,
-                        origin,
-                        intent_id,
-                        crate::automations::command_adoption::execute_definition_command(
-                            conn,
-                            &adoption_key,
-                            command,
-                            recorded_at,
-                        ),
-                    )
+        "coven.automations.definition.disable.v1" => definition_status_command(
+            conn,
+            &payload,
+            action,
+            (origin, intent_id),
+            recorded_at,
+            "definition.disable.v1",
+            |automation_id, expected_revision, reason| {
+                crate::automations::command_adoption::DefinitionCommand::Disable {
+                    automation_id,
+                    expected_revision,
+                    reason,
                 }
-                Err(error) => validation_rejection(action, error),
-            }
-        }
+            },
+        ),
+        "coven.automations.definition.activate.v1" => definition_status_command(
+            conn,
+            &payload,
+            action,
+            (origin, intent_id),
+            recorded_at,
+            "definition.activate.v1",
+            |automation_id, expected_revision, reason| {
+                crate::automations::command_adoption::DefinitionCommand::Activate {
+                    automation_id,
+                    expected_revision,
+                    reason,
+                }
+            },
+        ),
+        "coven.automations.definition.pause.v1" => definition_status_command(
+            conn,
+            &payload,
+            action,
+            (origin, intent_id),
+            recorded_at,
+            "definition.pause.v1",
+            |automation_id, expected_revision, reason| {
+                crate::automations::command_adoption::DefinitionCommand::Pause {
+                    automation_id,
+                    expected_revision,
+                    reason,
+                }
+            },
+        ),
         "coven.automations.run.cancel.v1" => {
             match crate::automations::cancellation::execute_run_cancellation(
                 conn,
@@ -637,6 +645,9 @@ pub(crate) fn route_action_at(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
+        "coven.automations.run.history.v1" => {
+            automation_run_history_result(conn, action, origin, intent_id, &payload)
+        }
         "coven.automations.receipt.get.v1" => automation_receipt_result(conn, action, &payload),
         "coven.automations.health" => {
             let id = required_id_field(&payload, action);
@@ -651,6 +662,10 @@ pub(crate) fn route_action_at(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
+        "coven.automations.definition.health.v1" => match required_id_field(&payload, action) {
+            Ok(id) => automation_definition_health_result(conn, action, origin, intent_id, &id),
+            Err(error) => validation_rejection(action, error),
+        },
         "coven.automations.scheduler.status.v1" => automation_result(
             action,
             origin,
@@ -763,6 +778,52 @@ pub(crate) fn route_action_at(
             ),
         },
     }
+}
+
+/// Disable, activate and pause share one request shape: `id`, `adoptionKey`,
+/// `expectedRevision` and an optional `reason`.
+fn definition_status_command(
+    conn: &rusqlite::Connection,
+    payload: &Value,
+    action: &str,
+    (origin, intent_id): (Option<String>, Option<String>),
+    recorded_at: &str,
+    command: &str,
+    build: impl FnOnce(
+        String,
+        Option<u64>,
+        Option<String>,
+    ) -> crate::automations::command_adoption::DefinitionCommand,
+) -> (u16, ControlActionResponse) {
+    let id = required_id_field(payload, action);
+    let adoption_key = required_adoption_key(payload, action);
+    let expected_revision = required_expected_revision(payload, action);
+    let reason = optional_reason(payload, action);
+    let adoption_key = match adoption_key {
+        Ok(adoption_key) => adoption_key,
+        Err(error) => return validation_rejection(action, error),
+    };
+    let command = match (id, expected_revision, reason) {
+        (Ok(id), Ok(expected_revision), Ok(reason)) => build(id, Some(expected_revision), reason),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                command: command.to_owned(),
+                request: command_request_fields(payload, &["id", "expectedRevision", "reason"]),
+                message: error,
+            }
+        }
+    };
+    automation_command_result(
+        action,
+        origin,
+        intent_id,
+        crate::automations::command_adoption::execute_definition_command(
+            conn,
+            &adoption_key,
+            command,
+            recorded_at,
+        ),
+    )
 }
 
 fn automation_event(
@@ -1255,41 +1316,62 @@ const OCCURRENCE_HISTORY_CURSOR_MAX_CHARS: usize = 512;
 /// Occurrence history cursors are opaque to clients: unpadded base64url of
 /// a JSON `[scheduledFor, id]` keyset position. Only a cursor this producer
 /// could have issued is accepted, so any other spelling is refused.
-fn encode_history_cursor(
-    position: &crate::automations::inspection::OccurrenceHistoryPosition,
-) -> String {
+/// Unpadded base64url of the JSON pair `[first, second]`: an opaque keyset
+/// position for a newest-first history read.
+fn encode_keyset_cursor(first: &str, second: &str) -> String {
     use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(json!([position.scheduled_for, position.id]).to_string())
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!([first, second]).to_string())
 }
 
-fn optional_history_cursor(
+/// Decode an optional `cursor` field. Only the canonical spelling of a pair
+/// this producer could have issued, within `max_chars`, is accepted.
+fn optional_keyset_cursor(
     payload: &Value,
     action: &str,
-) -> Result<Option<crate::automations::inspection::OccurrenceHistoryPosition>, String> {
+    max_chars: usize,
+) -> Result<Option<(String, String)>, String> {
     use base64::Engine as _;
     let Some(value) = payload.get("cursor") else {
         return Ok(None);
     };
     let invalid = || format!("{action} field `cursor` is not a cursor this producer issued");
     let cursor = value.as_str().ok_or_else(invalid)?;
-    if cursor.is_empty() || cursor.len() > OCCURRENCE_HISTORY_CURSOR_MAX_CHARS {
+    if cursor.is_empty() || cursor.len() > max_chars {
         return Err(invalid());
     }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|_| invalid())?;
     let position: Vec<String> = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    let [scheduled_for, id] = <[String; 2]>::try_from(position).map_err(|_| invalid())?;
-    if scheduled_for.is_empty() || id.is_empty() {
+    let [first, second] = <[String; 2]>::try_from(position).map_err(|_| invalid())?;
+    if first.is_empty() || second.is_empty() {
         return Err(invalid());
     }
-    let position = crate::automations::inspection::OccurrenceHistoryPosition { scheduled_for, id };
     // Canonical spelling only: re-encoding must reproduce the exact input.
-    if encode_history_cursor(&position) != cursor {
+    if encode_keyset_cursor(&first, &second) != cursor {
         return Err(invalid());
     }
-    Ok(Some(position))
+    Ok(Some((first, second)))
+}
+
+fn encode_history_cursor(
+    position: &crate::automations::inspection::OccurrenceHistoryPosition,
+) -> String {
+    encode_keyset_cursor(&position.scheduled_for, &position.id)
+}
+
+fn optional_history_cursor(
+    payload: &Value,
+    action: &str,
+) -> Result<Option<crate::automations::inspection::OccurrenceHistoryPosition>, String> {
+    Ok(
+        optional_keyset_cursor(payload, action, OCCURRENCE_HISTORY_CURSOR_MAX_CHARS)?.map(
+            |(scheduled_for, id)| crate::automations::inspection::OccurrenceHistoryPosition {
+                scheduled_for,
+                id,
+            },
+        ),
+    )
 }
 
 /// An absent `automationId` keeps the global view; a present one must be a
@@ -1386,6 +1468,39 @@ fn automation_health_payload(
             }
         })),
         Err(error) => Err(format!("{error:#}")),
+    }
+}
+
+/// `definition.health.v1`: the legacy health projection behind typed
+/// absence, tombstone and internal errors.
+fn automation_definition_health_result(
+    conn: &rusqlite::Connection,
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    id: &str,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    match crate::automations::store::get_definition_with_tombstone(conn, id, true) {
+        Ok(None) => typed_rejection(
+            action,
+            automation_error(ErrorCode::NotFound, format!("no routine with id `{id}`")),
+        ),
+        Ok(Some(record)) if record.tombstoned_at.is_some() => typed_rejection(
+            action,
+            automation_error(
+                ErrorCode::GoneTombstoned,
+                format!("routine `{id}` is tombstoned"),
+            ),
+        ),
+        Ok(Some(_)) => match automation_health_payload(conn, id, chrono::Utc::now()) {
+            Ok(payload) => (200, automation_event(action, origin, intent_id, payload)),
+            Err(error) => typed_rejection(action, automation_error(ErrorCode::Internal, error)),
+        },
+        Err(error) => typed_rejection(
+            action,
+            automation_error(ErrorCode::Internal, format!("{error:#}")),
+        ),
     }
 }
 
@@ -1641,6 +1756,145 @@ fn automation_run_payload(
     }
 }
 
+fn attempt_value(attempt: &crate::automations::runs::AttemptRecord) -> Value {
+    json!({
+        "id": attempt.id,
+        "runId": attempt.run_id,
+        "occurrenceId": attempt.occurrence_id,
+        "attemptNumber": attempt.attempt_number,
+        "adoptionKey": attempt.adoption_key,
+        "occurrenceFenceGeneration": attempt.occurrence_fence_generation,
+        "dispatchGeneration": attempt.dispatch_generation,
+        "state": attempt.state,
+        "failureClass": attempt.failure_class,
+        "priorAttemptNumber": attempt.prior_attempt_number,
+        "priorDisposition": attempt.prior_disposition,
+        "retryClassification": attempt.retry_classification,
+        "notBefore": attempt.not_before,
+        "sessionId": attempt.session_id,
+        "stateReason": attempt.state_reason,
+        "openedAt": attempt.opened_at,
+        "settledAt": attempt.settled_at,
+    })
+}
+
+/// The compatibility run projection shared by `runs` and `run.history.v1`.
+fn run_value(
+    record: &crate::automations::runs::RunRecord,
+    attempts: Vec<Value>,
+    cancellation: Option<Value>,
+) -> Value {
+    let mut run = json!({
+        "id": record.id,
+        "automationId": record.automation_id,
+        "occurrenceId": record.occurrence_id,
+        "sessionId": record.session_id,
+        "familiarId": record.familiar_id,
+        "runtime": record.runtime,
+        "status": record.status,
+        "exitCode": record.exit_code,
+        "logJson": record.log_json,
+        "outputCommit": record.output_commit,
+        "startedAt": record.started_at,
+        "finishedAt": record.finished_at,
+        "receiptId": record.receipt_id,
+        "attempts": attempts,
+    });
+    if let Some(cancellation) = cancellation {
+        run["cancellation"] = cancellation;
+    }
+    run
+}
+
+/// Spec bound for `run.history.v1` cursors (`command-envelope.schema.json`).
+const RUN_HISTORY_CURSOR_MAX_CHARS: usize = 256;
+
+fn automation_run_history_result(
+    conn: &rusqlite::Connection,
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    payload: &Value,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    let automation_id = match required_history_automation_id(payload, action) {
+        Ok(automation_id) => automation_id,
+        Err(error) => return validation_rejection(action, error),
+    };
+    let occurrence_id = match payload.get("occurrenceId") {
+        None => None,
+        Some(value) => match value.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => Some(id.to_owned()),
+            None => {
+                return validation_rejection(
+                    action,
+                    format!("{action} field `occurrenceId` must be a non-empty string"),
+                )
+            }
+        },
+    };
+    let limit = match optional_inspection_limit(payload, action) {
+        Ok(limit) => limit,
+        Err(error) => return validation_rejection(action, error),
+    };
+    let after = match optional_keyset_cursor(payload, action, RUN_HISTORY_CURSOR_MAX_CHARS) {
+        Ok(after) => after.map(
+            |(started_at, id)| crate::automations::runs::RunHistoryPosition { started_at, id },
+        ),
+        Err(error) => return validation_rejection(action, error),
+    };
+    let internal =
+        |error: String| typed_rejection(action, automation_error(ErrorCode::Internal, error));
+    // One snapshot for the page, its attempts and its cancellations.
+    let page = (|| -> anyhow::Result<Value> {
+        let transaction = conn.unchecked_transaction()?;
+        let page = crate::automations::runs::run_history(
+            &transaction,
+            &automation_id,
+            occurrence_id.as_deref(),
+            limit,
+            after.as_ref(),
+        )?;
+        let mut runs = Vec::with_capacity(page.runs.len());
+        for record in &page.runs {
+            let attempts = crate::automations::runs::list_attempts(&transaction, &record.id)?
+                .iter()
+                .map(attempt_value)
+                .collect();
+            let cancellation =
+                crate::automations::cancellation::cancellation_for_run(&transaction, &record.id)
+                    .map_err(anyhow::Error::msg)?;
+            runs.push(run_value(record, attempts, cancellation));
+        }
+        transaction.commit()?;
+        let mut cursor = json!({ "hasMore": page.next.is_some() });
+        if let Some(after) = &after {
+            cursor["current"] = json!(encode_keyset_cursor(&after.started_at, &after.id));
+        }
+        if let Some(next) = &page.next {
+            let next = encode_keyset_cursor(&next.started_at, &next.id);
+            anyhow::ensure!(
+                next.len() <= RUN_HISTORY_CURSOR_MAX_CHARS,
+                "run history position does not fit the cursor bound"
+            );
+            cursor["next"] = json!(next);
+        }
+        let mut result = json!({
+            "automationId": automation_id,
+            "runs": runs,
+            "cursor": cursor,
+        });
+        if let Some(occurrence_id) = &occurrence_id {
+            result["occurrenceId"] = json!(occurrence_id);
+        }
+        Ok(result)
+    })();
+    match page {
+        Ok(payload) => (200, automation_event(action, origin, intent_id, payload)),
+        Err(error) => internal(format!("{error:#}")),
+    }
+}
+
 fn automation_runs_payload(
     conn: &rusqlite::Connection,
     id: &str,
@@ -1665,47 +1919,9 @@ fn automation_runs_payload(
                     .remove(&record.id)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|attempt| {
-                        json!({
-                            "id": attempt.id,
-                            "runId": attempt.run_id,
-                            "occurrenceId": attempt.occurrence_id,
-                            "attemptNumber": attempt.attempt_number,
-                            "adoptionKey": attempt.adoption_key,
-                            "occurrenceFenceGeneration": attempt.occurrence_fence_generation,
-                            "dispatchGeneration": attempt.dispatch_generation,
-                            "state": attempt.state,
-                            "failureClass": attempt.failure_class,
-                            "priorAttemptNumber": attempt.prior_attempt_number,
-                            "priorDisposition": attempt.prior_disposition,
-                            "retryClassification": attempt.retry_classification,
-                            "notBefore": attempt.not_before,
-                            "sessionId": attempt.session_id,
-                            "stateReason": attempt.state_reason,
-                            "openedAt": attempt.opened_at,
-                            "settledAt": attempt.settled_at,
-                        })
-                    })
+                    .map(|attempt| attempt_value(&attempt))
                     .collect::<Vec<_>>();
-                let mut run = json!({
-                    "id": record.id,
-                    "automationId": record.automation_id,
-                    "occurrenceId": record.occurrence_id,
-                    "sessionId": record.session_id,
-                    "familiarId": record.familiar_id,
-                    "runtime": record.runtime,
-                    "status": record.status,
-                    "exitCode": record.exit_code,
-                    "logJson": record.log_json,
-                    "outputCommit": record.output_commit,
-                    "startedAt": record.started_at,
-                    "finishedAt": record.finished_at,
-                    "receiptId": record.receipt_id,
-                    "attempts": attempts,
-                });
-                if let Some(cancellation) = cancellation {
-                    run["cancellation"] = cancellation;
-                }
+                let run = run_value(record, attempts, cancellation);
                 runs.push(run);
             }
             Ok(json!({ "runs": runs }))
@@ -3838,6 +4054,277 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    fn run_history_fixture_run(
+        conn: &rusqlite::Connection,
+        id: &str,
+        automation_id: &str,
+        occurrence_id: Option<&str>,
+        started_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at)
+             VALUES (?1, ?2, ?3, 'coven-code', 'succeeded', ?4)",
+            rusqlite::params![id, automation_id, occurrence_id, started_at],
+        )
+        .unwrap();
+    }
+
+    fn run_history_page(conn: &rusqlite::Connection, request: Value) -> (u16, Vec<String>, Value) {
+        let mut request = request;
+        request["action"] = json!("coven.automations.run.history.v1");
+        let (status, response) = route_action(request, conn, &crate::api::NoopSessionRuntime);
+        let Some(event) = response.event else {
+            return (status, Vec::new(), response.error.unwrap_or_default());
+        };
+        let ids = event.payload["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| run["id"].as_str().unwrap().to_owned())
+            .collect();
+        (status, ids, event.payload)
+    }
+
+    #[test]
+    fn run_history_pages_newest_first_by_instant_with_an_occurrence_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "alpha");
+        filter_fixture_definition(&conn, "beta");
+        filter_fixture_occurrence(
+            &conn,
+            "occ-1",
+            "alpha",
+            "2026-09-01T09:00:00.000Z",
+            "succeeded",
+        );
+        filter_fixture_occurrence(
+            &conn,
+            "occ-2",
+            "alpha",
+            "2026-09-02T09:00:00.000Z",
+            "succeeded",
+        );
+        // Millisecond and nanosecond start times, an equal-instant pair broken
+        // by id, a whole-second value, a run without an occurrence, and a run
+        // of another automation.
+        for (id, automation_id, occurrence_id, started_at) in [
+            ("run-a", "alpha", Some("occ-1"), "2026-09-01T09:00:00.100Z"),
+            (
+                "run-b",
+                "alpha",
+                Some("occ-1"),
+                "2026-09-01T09:00:00.100500000Z",
+            ),
+            ("run-c", "alpha", Some("occ-2"), "2026-09-02T09:00:00.000Z"),
+            (
+                "run-d",
+                "alpha",
+                Some("occ-2"),
+                "2026-09-02T09:00:00.000000000Z",
+            ),
+            ("run-e", "alpha", None, "2026-09-03T09:00:00Z"),
+            ("run-x", "beta", None, "2026-09-04T09:00:00.000Z"),
+        ] {
+            run_history_fixture_run(&conn, id, automation_id, occurrence_id, started_at);
+        }
+        conn.execute(
+            "INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, dispatch_generation, state,
+                 retry_classification, not_before, opened_at)
+             VALUES ('attempt-c', 'run-c', 'occ-2', 1, 'adopt:attempt-c', 1, 0,
+                     'succeeded', 'initial', '2026-09-02T09:00:00.000Z',
+                     '2026-09-02T09:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        let (status, whole, payload) = run_history_page(&conn, json!({ "automationId": "alpha" }));
+        assert_eq!(status, 200, "{payload}");
+        assert_eq!(whole, vec!["run-e", "run-d", "run-c", "run-b", "run-a"]);
+        assert_eq!(payload["cursor"], json!({ "hasMore": false }));
+        assert_eq!(payload["runs"][2]["attempts"][0]["id"], "attempt-c");
+
+        // One run per page, with a newer run added mid-walk: every page echoes
+        // its cursor, and the walk neither skips nor repeats.
+        let mut walked = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut request = json!({ "automationId": "alpha", "limit": 1 });
+            if let Some(cursor) = &cursor {
+                request["cursor"] = json!(cursor);
+            }
+            let (status, page, payload) = run_history_page(&conn, request);
+            assert_eq!(status, 200, "{payload}");
+            assert_eq!(payload["cursor"]["current"].as_str(), cursor.as_deref());
+            walked.extend(page);
+            if walked.len() == 2 {
+                run_history_fixture_run(&conn, "run-z", "alpha", None, "2026-09-05T09:00:00.000Z");
+            }
+            match payload["cursor"]["next"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        assert_eq!(walked, vec!["run-e", "run-d", "run-c", "run-b", "run-a"]);
+
+        let (_, filtered, payload) = run_history_page(
+            &conn,
+            json!({ "automationId": "alpha", "occurrenceId": "occ-1" }),
+        );
+        assert_eq!(filtered, vec!["run-b", "run-a"]);
+        assert_eq!(payload["occurrenceId"], "occ-1");
+    }
+
+    #[test]
+    fn run_history_refuses_malformed_requests_with_typed_errors() {
+        use base64::Engine as _;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let long_position = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!(["2026", "x".repeat(200)]).to_string());
+        assert!(long_position.len() > RUN_HISTORY_CURSOR_MAX_CHARS);
+        for request in [
+            json!({}),
+            json!({ "automationId": "" }),
+            json!({ "automationId": "alpha", "occurrenceId": "" }),
+            json!({ "automationId": "alpha", "occurrenceId": 7 }),
+            json!({ "automationId": "alpha", "limit": 0 }),
+            json!({ "automationId": "alpha", "limit": 101 }),
+            json!({ "automationId": "alpha", "cursor": "not base64!" }),
+            json!({ "automationId": "alpha", "cursor": long_position }),
+        ] {
+            let (status, runs, error) = run_history_page(&conn, request.clone());
+            assert_eq!(status, 400, "{request}");
+            assert!(runs.is_empty());
+            assert_eq!(error["code"], "VALIDATION_FAILED", "{request}");
+        }
+        let (status, runs, payload) = run_history_page(&conn, json!({ "automationId": "absent" }));
+        assert_eq!(status, 200);
+        assert!(runs.is_empty());
+        assert_eq!(payload["cursor"], json!({ "hasMore": false }));
+    }
+
+    #[test]
+    fn definition_health_v1_types_absence_and_tombstones() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        filter_fixture_definition(&conn, "healthy");
+        let route = |request: Value| route_action(request, &conn, &crate::api::NoopSessionRuntime);
+        let code = |response: &ControlActionResponse| {
+            response.error.as_ref().unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.health.v1",
+            "id": "healthy",
+        }));
+        assert_eq!(status, 200, "{response:?}");
+        let legacy = route(json!({ "action": "coven.automations.health", "id": "healthy" })).1;
+        let health = response.event.unwrap().payload;
+        assert_eq!(health["health"]["automationId"], "healthy");
+        assert_eq!(health, legacy.event.unwrap().payload);
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.health.v1",
+            "id": "absent",
+        }));
+        assert_eq!((status, code(&response).as_str()), (404, "NOT_FOUND"));
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.health.v1",
+        }));
+        assert_eq!(
+            (status, code(&response).as_str()),
+            (400, "VALIDATION_FAILED")
+        );
+
+        let (status, _) = route(json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:healthy",
+            "id": "healthy",
+            "expectedRevision": 1,
+        }));
+        assert_eq!(status, 200);
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.health.v1",
+            "id": "healthy",
+        }));
+        assert_eq!((status, code(&response).as_str()), (410, "GONE_TOMBSTONED"));
+    }
+
+    #[test]
+    fn definition_activate_and_pause_route_over_the_flat_wire() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let route = |request: Value| route_action(request, &conn, &crate::api::NoopSessionRuntime);
+        let (status, _) = route(json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:wire-switch",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "wire-switch",
+                "name": "wire-switch",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Do the thing."
+            },
+        }));
+        assert_eq!(status, 200);
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.activate.v1",
+            "adoptionKey": "adopt:activate:wire-switch",
+            "id": "wire-switch",
+            "expectedRevision": 1,
+        }));
+        assert_eq!(status, 200, "{response:?}");
+        let event = response.event.unwrap();
+        assert_eq!(event.payload["outcome"], "committed");
+        assert_eq!(event.payload["revision"], 2);
+        assert_eq!(event.payload["result"]["status"], "ACTIVE");
+
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.pause.v1",
+            "adoptionKey": "adopt:pause:wire-switch",
+            "id": "wire-switch",
+            "expectedRevision": 2,
+            "reason": "Holiday freeze.",
+        }));
+        assert_eq!(status, 200, "{response:?}");
+        assert_eq!(
+            response.event.unwrap().payload["result"]["status"],
+            "PAUSED"
+        );
+
+        // Missing expectedRevision is a durable typed validation rejection.
+        let (status, response) = route(json!({
+            "action": "coven.automations.definition.activate.v1",
+            "adoptionKey": "adopt:activate:wire-switch:no-revision",
+            "id": "wire-switch",
+        }));
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
     }
 
     #[test]

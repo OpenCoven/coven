@@ -38,6 +38,10 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_automation_occurrences_scheduled
         ON automation_occurrences(automation_id, scheduled_for);
 
+    -- occurrence.history.v1 orders by this instant key (inspection::history_sort_key).
+    CREATE INDEX IF NOT EXISTS idx_automation_occurrences_history
+        ON automation_occurrences(automation_id, (substr(scheduled_for, 1, 19) || '.' || substr(rtrim(substr(scheduled_for, 21), 'Z') || '000000000', 1, 9) || 'Z') DESC, id DESC);
+
     CREATE INDEX IF NOT EXISTS idx_automation_occurrences_state
         ON automation_occurrences(state, lease_expires_at);
 
