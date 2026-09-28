@@ -37,6 +37,10 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
 
     CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_started
         ON automation_runs(automation_id, started_at DESC);
+
+    -- run.history.v1 orders by this instant key (inspection::history_sort_key).
+    CREATE INDEX IF NOT EXISTS idx_automation_runs_history
+        ON automation_runs(automation_id, (substr(started_at, 1, 19) || '.' || substr(rtrim(substr(started_at, 21), 'Z') || '000000000', 1, 9) || 'Z') DESC, id DESC);
 ";
 
 pub const AUTOMATION_ATTEMPTS_SCHEMA_SQL: &str = "
@@ -431,6 +435,22 @@ pub struct RunHistoryPage {
 /// start instant then `id`, starting strictly after `after`. `started_at` is
 /// written at more than one precision, so rows are ordered by the instant
 /// rather than the text, as occurrence history is.
+/// Uses `idx_automation_runs_history`, whose expression must stay identical to
+/// `history_sort_key("started_at")`.
+fn run_history_sql() -> String {
+    let key = super::inspection::history_sort_key("started_at");
+    let after_key = super::inspection::history_sort_key("?3");
+    format!(
+        "SELECT {RUN_COLUMNS}
+         FROM automation_runs
+         WHERE automation_id = ?1
+           AND (?2 IS NULL OR occurrence_id = ?2)
+           AND (?3 IS NULL OR {key} < {after_key} OR ({key} = {after_key} AND id < ?4))
+         ORDER BY {key} DESC, id DESC
+         LIMIT ?5"
+    )
+}
+
 pub fn run_history(
     conn: &Connection,
     automation_id: &str,
@@ -439,18 +459,8 @@ pub fn run_history(
     after: Option<&RunHistoryPosition>,
 ) -> Result<RunHistoryPage> {
     let bounded = limit.clamp(1, 100);
-    let key = super::inspection::history_sort_key("started_at");
-    let after_key = super::inspection::history_sort_key("?3");
     let mut statement = conn
-        .prepare(&format!(
-            "SELECT {RUN_COLUMNS}
-             FROM automation_runs
-             WHERE automation_id = ?1
-               AND (?2 IS NULL OR occurrence_id = ?2)
-               AND (?3 IS NULL OR {key} < {after_key} OR ({key} = {after_key} AND id < ?4))
-             ORDER BY {key} DESC, id DESC
-             LIMIT ?5"
-        ))
+        .prepare(&run_history_sql())
         .context("failed to prepare run history query")?;
     let rows = statement
         .query_map(
@@ -886,6 +896,57 @@ mod tests {
     use super::*;
     use crate::store::initialize_store;
     use chrono::TimeZone;
+
+    /// The detail lines of `EXPLAIN QUERY PLAN` for `sql`, binding NULL to
+    /// each of its `parameters` placeholders.
+    fn query_plan(conn: &Connection, sql: &str, parameters: usize) -> Vec<String> {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let nulls = vec![rusqlite::types::Null; parameters];
+        statement
+            .query_map(rusqlite::params_from_iter(nulls), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn history_reads_order_by_their_expression_index_without_a_sort() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for (schema, column, sql, parameters, index) in [
+            (
+                AUTOMATION_RUNS_SCHEMA_SQL,
+                "started_at",
+                run_history_sql(),
+                5,
+                "idx_automation_runs_history",
+            ),
+            (
+                super::super::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL,
+                "scheduled_for",
+                super::super::inspection::occurrence_history_sql(),
+                4,
+                "idx_automation_occurrences_history",
+            ),
+        ] {
+            // The index expression must be the query's key, byte for byte, or
+            // SQLite silently falls back to sorting every matching row.
+            assert!(
+                schema.contains(&super::super::inspection::history_sort_key(column)),
+                "{index} must index history_sort_key(\"{column}\")"
+            );
+            let plan = query_plan(&conn, &sql, parameters);
+            assert!(plan.iter().any(|line| line.contains(index)), "{plan:?}");
+            assert!(
+                !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
+    }
 
     fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
