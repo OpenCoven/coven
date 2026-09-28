@@ -11,22 +11,26 @@ use crate::api::{
 };
 use crate::request_authority::RequestAuthority;
 
-// Keep this list independent of the production gate. New advertised actions
+// Keep these lists independent of the production gate. New advertised actions
 // are denied unless their read-only behavior has been deliberately reviewed.
 const PUBLIC_READ_ACTIONS: &[&str] = &[
+    "coven.automations.health",
+    "coven.automations.definition.health.v1",
+    "coven.automations.scheduler.status.v1",
+    "coven.automations.occurrence.list.v1",
+    "coven.automations.occurrence.history.v1",
+];
+
+/// Reads that return definition prompts or run `logJson`.
+const PROMPT_OR_LOG_READ_ACTIONS: &[&str] = &[
     "coven.automations.list",
     "coven.automations.get",
     "coven.automations.definition.list.v1",
     "coven.automations.definition.get.v1",
     "coven.automations.runs",
     "coven.automations.run.history.v1",
-    "coven.automations.health",
-    "coven.automations.definition.health.v1",
-    "coven.automations.scheduler.status.v1",
-    "coven.automations.occurrence.list.v1",
-    "coven.automations.occurrence.get.v1",
     "coven.automations.run.get.v1",
-    "coven.automations.occurrence.history.v1",
+    "coven.automations.occurrence.get.v1",
 ];
 
 struct NoEffectsRuntime;
@@ -305,5 +309,51 @@ fn event_reads_require_owner_ipc_because_they_issue_checkpoints() -> Result<()> 
         assert_eq!(local.status, 200, "{action}: {}", local.body);
         assert_eq!(checkpoints(&conn)?, before + 1, "{action} over owner IPC");
     }
+    Ok(())
+}
+
+#[test]
+fn prompt_and_log_reads_require_owner_ipc() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let owner = request(
+        temp.path(),
+        "/actions",
+        &create_payload("transport-sensitive-read-fixture"),
+        RequestAuthority::OwnerLocalIpc,
+    )?;
+    assert_eq!(owner.status, 200, "{}", owner.body);
+    for action in PROMPT_OR_LOG_READ_ACTIONS {
+        let body = json!({
+            "action": action,
+            "id": "authority-boundary-fixture",
+            "automationId": "authority-boundary-fixture",
+        });
+        for route in ["/actions", "/api/v1/actions"] {
+            let tcp = request(temp.path(), route, &body, RequestAuthority::Tcp)?;
+            assert_authority_refusal(&tcp, action)?;
+            assert!(
+                !tcp.body.contains("A paused test definition"),
+                "{action} leaked the prompt over TCP"
+            );
+        }
+        let local = request(
+            temp.path(),
+            "/actions",
+            &body,
+            RequestAuthority::OwnerLocalIpc,
+        )?;
+        assert_ne!(local.status, 403, "{action}: {}", local.body);
+    }
+    let local = request(
+        temp.path(),
+        "/actions",
+        &json!({"action": "coven.automations.definition.get.v1", "id": "authority-boundary-fixture"}),
+        RequestAuthority::OwnerLocalIpc,
+    )?;
+    assert!(
+        local.body.contains("A paused test definition"),
+        "{}",
+        local.body
+    );
     Ok(())
 }

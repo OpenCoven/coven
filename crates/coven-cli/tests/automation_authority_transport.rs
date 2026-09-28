@@ -152,10 +152,27 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
     let (status, owner_replay) = ipc("POST", "/api/v1/actions", &create)?;
     assert_eq!(status, 200, "{owner_replay}");
     assert_eq!(owner_replay["result"]["outcome"], "replayed");
-    let (status, read) = tcp(
+    // Prompt- and log-bearing reads are owner-only; scheduling diagnostics
+    // remain readable over TCP.
+    let (status, refused_read) = tcp(
         "POST",
         "/api/v1/actions",
         &json!({"action": "coven.automations.definition.list.v1"}),
+    )?;
+    assert_eq!(status, 403, "{refused_read}");
+    assert!(!refused_read
+        .to_string()
+        .contains("Never execute this paused fixture"));
+    let (status, owner_read) = ipc(
+        "POST",
+        "/api/v1/actions",
+        &json!({"action": "coven.automations.definition.list.v1"}),
+    )?;
+    assert_eq!(status, 200, "{owner_read}");
+    let (status, read) = tcp(
+        "POST",
+        "/api/v1/actions",
+        &json!({"action": "coven.automations.scheduler.status.v1"}),
     )?;
     assert_eq!(status, 200, "read-only compatibility: {read}");
     Ok(())

@@ -166,44 +166,57 @@ pub fn capabilities() -> CapabilityCatalog {
     }
 }
 
+/// Automation reads loopback TCP may serve: scheduling and health diagnostics
+/// that carry neither prompts nor run logs and write nothing.
+const TCP_AUTOMATION_READS: &[&str] = &[
+    "coven.automations.health",
+    "coven.automations.definition.health.v1",
+    "coven.automations.scheduler.status.v1",
+    "coven.automations.occurrence.list.v1",
+    "coven.automations.occurrence.history.v1",
+];
+
+/// Automation reads restricted to owner-local IPC: definitions carry prompts,
+/// runs carry `logJson`, receipts carry authority evidence, and event pages
+/// issue a stored checkpoint.
+const OWNER_AUTOMATION_READS: &[&str] = &[
+    "coven.automations.list",
+    "coven.automations.get",
+    "coven.automations.definition.list.v1",
+    "coven.automations.definition.get.v1",
+    "coven.automations.runs",
+    "coven.automations.run.history.v1",
+    "coven.automations.run.get.v1",
+    "coven.automations.occurrence.get.v1",
+    "coven.automations.receipt.get.v1",
+    "coven.automations.events.read.v1",
+    "coven.automations.events.subscribe.v1",
+];
+
 /// Check transport authority before opening the store, adoption lookup, or dispatch.
-/// Keep a read-only allowlist: adding an automation command must not silently
-/// expose a new mutation over unauthenticated loopback TCP. Event reads are
-/// excluded because each page issues a stored checkpoint.
+/// Deny by default: an automation action not listed as a TCP read requires
+/// owner-local IPC, so a new command cannot silently become reachable over
+/// unauthenticated loopback TCP.
 pub(crate) fn automation_transport_rejection(
     payload: &Value,
     authority: crate::request_authority::RequestAuthority,
 ) -> Option<(u16, ControlActionResponse)> {
     let action = payload.get("action")?.as_str()?.trim();
-    if !action.starts_with("coven.automations.") {
+    if !action.starts_with("coven.automations.")
+        || TCP_AUTOMATION_READS.contains(&action)
+        || authority.allows_owner_automation_access()
+    {
         return None;
     }
-    let reason = if action == "coven.automations.receipt.get.v1" {
-        if authority.allows_automation_receipt_access() {
-            return None;
+    let reason = match action {
+        "coven.automations.receipt.get.v1" => "Automation receipt reads require owner-local IPC.",
+        "coven.automations.events.read.v1" | "coven.automations.events.subscribe.v1" => {
+            "Automation event reads require owner-local IPC."
         }
-        "Automation receipt reads require owner-local IPC."
-    } else {
-        if matches!(
-            action,
-            "coven.automations.list"
-                | "coven.automations.get"
-                | "coven.automations.definition.list.v1"
-                | "coven.automations.definition.get.v1"
-                | "coven.automations.runs"
-                | "coven.automations.run.history.v1"
-                | "coven.automations.health"
-                | "coven.automations.definition.health.v1"
-                | "coven.automations.scheduler.status.v1"
-                | "coven.automations.occurrence.list.v1"
-                | "coven.automations.occurrence.get.v1"
-                | "coven.automations.run.get.v1"
-                | "coven.automations.occurrence.history.v1"
-        ) || authority.allows_automation_mutation()
-        {
-            return None;
+        _ if OWNER_AUTOMATION_READS.contains(&action) => {
+            "Automation reads that return prompts or run logs require owner-local IPC."
         }
-        "Automation mutations require owner-local IPC."
+        _ => "Automation mutations require owner-local IPC.",
     };
     Some(typed_rejection(
         action,
