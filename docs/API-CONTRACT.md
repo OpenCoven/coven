@@ -527,11 +527,23 @@ both `/actions` and `/api/v1/actions`. Loopback TCP does not establish daemon
 ownership. Refusal is `403` with the typed `AUTHORITY_REQUIRED` error, before
 opening the store, reserving an adoption key, replaying a stored result, emitting
 an event, or dispatching runtime work. Caller-supplied `origin`, `intentId`, or
-identity fields do not grant authority. Receipt reads keep the same owner-local
-restriction, as do `coven.automations.events.read.v1` and `.subscribe.v1`, because
-each event page issues a stored resume checkpoint. Reviewed read-only automation
-actions remain available over TCP;
-unknown automation actions also require owner-local IPC before action validation.
+identity fields do not grant authority.
+
+Automation reads that expose sensitive content are owner-local too:
+
+- definition reads, which return prompts: `coven.automations.list`, `.get`,
+  `.definition.list.v1` and `.definition.get.v1`;
+- run reads, which return `logJson`: `.runs`, `.run.history.v1`, `.run.get.v1` and
+  `.occurrence.get.v1`;
+- receipt reads;
+- `.events.read.v1` and `.events.subscribe.v1`, because each event page issues a
+  stored resume checkpoint.
+
+Over TCP these return the same `403 AUTHORITY_REQUIRED` without reading the store.
+Only scheduling and health diagnostics remain readable over loopback TCP:
+`.health`, `.definition.health.v1`, `.scheduler.status.v1`, `.occurrence.list.v1`
+and `.occurrence.history.v1`. Any other automation action, including an unknown
+one, requires owner-local IPC before action validation.
 This transport gate does not supply a trusted Runtime Authority adapter or enable
 any currently refused execution command or SDK mutation phase.
 

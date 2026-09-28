@@ -23,11 +23,9 @@ impl RequestAuthority {
         matches!(self, Self::OwnerLocalIpc)
     }
 
-    pub(crate) fn allows_automation_mutation(self) -> bool {
-        matches!(self, Self::OwnerLocalIpc)
-    }
-
-    pub(crate) fn allows_automation_receipt_access(self) -> bool {
+    /// Automation mutations and the reads that expose prompts, run logs,
+    /// receipts, or stored event checkpoints.
+    pub(crate) fn allows_owner_automation_access(self) -> bool {
         matches!(self, Self::OwnerLocalIpc)
     }
 }
@@ -43,10 +41,8 @@ mod tests {
         assert!(RequestAuthority::OwnerLocalIpc.allows_chat_context_admission());
         assert!(!RequestAuthority::Tcp.allows_session_launch_policy());
         assert!(!RequestAuthority::Tcp.allows_ward_proposal_access());
-        assert!(RequestAuthority::OwnerLocalIpc.allows_automation_receipt_access());
         assert!(!RequestAuthority::Tcp.allows_chat_context_admission());
-        assert!(!RequestAuthority::Tcp.allows_automation_receipt_access());
-        assert!(RequestAuthority::OwnerLocalIpc.allows_automation_mutation());
-        assert!(!RequestAuthority::Tcp.allows_automation_mutation());
+        assert!(RequestAuthority::OwnerLocalIpc.allows_owner_automation_access());
+        assert!(!RequestAuthority::Tcp.allows_owner_automation_access());
     }
 }
