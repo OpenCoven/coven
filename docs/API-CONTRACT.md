@@ -528,7 +528,9 @@ ownership. Refusal is `403` with the typed `AUTHORITY_REQUIRED` error, before
 opening the store, reserving an adoption key, replaying a stored result, emitting
 an event, or dispatching runtime work. Caller-supplied `origin`, `intentId`, or
 identity fields do not grant authority. Receipt reads keep the same owner-local
-restriction. Reviewed read-only automation actions remain available over TCP;
+restriction, as do `coven.automations.events.read.v1` and `.subscribe.v1`, because
+each event page issues a stored resume checkpoint. Reviewed read-only automation
+actions remain available over TCP;
 unknown automation actions also require owner-local IPC before action validation.
 This transport gate does not supply a trusted Runtime Authority adapter or enable
 any currently refused execution command or SDK mutation phase.

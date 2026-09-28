@@ -18,8 +18,6 @@ const PUBLIC_READ_ACTIONS: &[&str] = &[
     "coven.automations.get",
     "coven.automations.definition.list.v1",
     "coven.automations.definition.get.v1",
-    "coven.automations.events.read.v1",
-    "coven.automations.events.subscribe.v1",
     "coven.automations.runs",
     "coven.automations.run.history.v1",
     "coven.automations.health",
@@ -262,6 +260,50 @@ fn transport_gate_preserves_read_and_non_automation_validation() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let response = request(temp.path(), "/actions", &body, RequestAuthority::Tcp)?;
         assert_eq!(response.status, 400, "{}", response.body);
+    }
+    Ok(())
+}
+
+#[test]
+fn event_reads_require_owner_ipc_because_they_issue_checkpoints() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let owner = request(
+        temp.path(),
+        "/actions",
+        &create_payload("transport-events-fixture"),
+        RequestAuthority::OwnerLocalIpc,
+    )?;
+    assert_eq!(owner.status, 200, "{}", owner.body);
+    let conn = crate::store::open_store(&temp.path().join("coven.sqlite3"))?;
+    let checkpoints = |conn: &Connection| -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM automation_event_checkpoints",
+            [],
+            |row| row.get(0),
+        )?)
+    };
+    let stream = json!({"kind": "automation", "id": "authority-boundary-fixture"});
+    for action in [
+        "coven.automations.events.read.v1",
+        "coven.automations.events.subscribe.v1",
+    ] {
+        let body = json!({"action": action, "stream": stream});
+        let before = checkpoints(&conn)?;
+        let tcp = request(temp.path(), "/actions", &body, RequestAuthority::Tcp)?;
+        assert_authority_refusal(&tcp, action)?;
+        assert_eq!(
+            checkpoints(&conn)?,
+            before,
+            "{action} over TCP issued a checkpoint"
+        );
+        let local = request(
+            temp.path(),
+            "/actions",
+            &body,
+            RequestAuthority::OwnerLocalIpc,
+        )?;
+        assert_eq!(local.status, 200, "{action}: {}", local.body);
+        assert_eq!(checkpoints(&conn)?, before + 1, "{action} over owner IPC");
     }
     Ok(())
 }

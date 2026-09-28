@@ -168,7 +168,8 @@ pub fn capabilities() -> CapabilityCatalog {
 
 /// Check transport authority before opening the store, adoption lookup, or dispatch.
 /// Keep a read-only allowlist: adding an automation command must not silently
-/// expose a new mutation over unauthenticated loopback TCP.
+/// expose a new mutation over unauthenticated loopback TCP. Event reads are
+/// excluded because each page issues a stored checkpoint.
 pub(crate) fn automation_transport_rejection(
     payload: &Value,
     authority: crate::request_authority::RequestAuthority,
@@ -189,8 +190,6 @@ pub(crate) fn automation_transport_rejection(
                 | "coven.automations.get"
                 | "coven.automations.definition.list.v1"
                 | "coven.automations.definition.get.v1"
-                | "coven.automations.events.read.v1"
-                | "coven.automations.events.subscribe.v1"
                 | "coven.automations.runs"
                 | "coven.automations.run.history.v1"
                 | "coven.automations.health"
