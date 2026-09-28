@@ -23,6 +23,10 @@ impl RequestAuthority {
         matches!(self, Self::OwnerLocalIpc)
     }
 
+    pub(crate) fn allows_automation_mutation(self) -> bool {
+        matches!(self, Self::OwnerLocalIpc)
+    }
+
     pub(crate) fn allows_automation_receipt_access(self) -> bool {
         matches!(self, Self::OwnerLocalIpc)
     }
@@ -42,5 +46,7 @@ mod tests {
         assert!(RequestAuthority::OwnerLocalIpc.allows_automation_receipt_access());
         assert!(!RequestAuthority::Tcp.allows_chat_context_admission());
         assert!(!RequestAuthority::Tcp.allows_automation_receipt_access());
+        assert!(RequestAuthority::OwnerLocalIpc.allows_automation_mutation());
+        assert!(!RequestAuthority::Tcp.allows_automation_mutation());
     }
 }
