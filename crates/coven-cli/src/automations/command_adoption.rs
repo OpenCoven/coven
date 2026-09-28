@@ -241,6 +241,10 @@ pub enum DefinitionCommand {
         automation_id: String,
         expected_revision: Option<u64>,
     },
+    /// `legacy.import.v1` from `codex-automation-toml`, the only v1 source.
+    LegacyImport {
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,6 +543,11 @@ fn canonical_command(command: &DefinitionCommand) -> Result<Value> {
             "automationId": automation_id,
             "expectedRevision": expected_revision,
         }),
+        DefinitionCommand::LegacyImport { dry_run } => json!({
+            "command": "legacy.import.v1",
+            "source": "codex-automation-toml",
+            "dryRun": dry_run,
+        }),
     })
 }
 
@@ -687,6 +696,7 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
                 "definition.activate.v1" => "definition.activate.v1",
                 "definition.pause.v1" => "definition.pause.v1",
                 "definition.tombstone.v1" => "definition.tombstone.v1",
+                "legacy.import.v1" => "legacy.import.v1",
                 _ => "definition.invalid.v1",
             },
             request
@@ -738,6 +748,8 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
         DefinitionCommand::Delete { automation_id, .. } => {
             ("definition.tombstone.v1", Some(automation_id.clone()))
         }
+        // An import touches many definitions and appends its own events.
+        DefinitionCommand::LegacyImport { .. } => ("legacy.import.v1", None),
     }
 }
 
@@ -920,6 +932,24 @@ fn apply_command(
             automation_id,
             expected_revision,
         } => apply_delete(conn, &automation_id, expected_revision, adopted_at),
+        DefinitionCommand::LegacyImport { dry_run } => {
+            let report = super::import_legacy::import_codex_as_draft(conn, dry_run)?;
+            Ok(DefinitionCommandResponse {
+                outcome: DefinitionCommandOutcome::Committed,
+                revision: None,
+                mutation_committed: !dry_run && !report.imported.is_empty(),
+                result: Some(json!({
+                    "source": "codex-automation-toml",
+                    "dryRun": dry_run,
+                    "imported": report.imported,
+                    "skipped": report.skipped,
+                    "failures": report.failures,
+                })),
+                error: None,
+                replay_first_committed_at: None,
+                event_ref: None,
+            })
+        }
     }
 }
 

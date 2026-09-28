@@ -53,12 +53,7 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
     entry("definition.health.v1", Implemented),
     entry("events.read.v1", Implemented),
     entry("events.subscribe.v1", Implemented),
-    entry(
-        "legacy.import.v1",
-        CompatibilityOnly {
-            legacy_action: "coven.automations.import",
-        },
-    ),
+    entry("legacy.import.v1", Implemented),
 ];
 
 /// Versioned read actions this producer adds outside the command enum. They
