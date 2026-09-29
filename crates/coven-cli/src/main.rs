@@ -50,6 +50,7 @@ pub mod harness_contract;
 mod help;
 mod hub;
 mod main_session;
+mod main_session_routes;
 mod maintenance_gate;
 mod memory_dashboard;
 mod memory_import;

@@ -1306,6 +1306,16 @@ fn handle_request_with_runtime_authority_and_automation_time(
         }
         ("GET", "/sessions") => list_sessions_response(coven_home, query),
         ("POST", "/sessions") => launch_session(coven_home, body, runtime, authority),
+        ("GET", "/main-session") => crate::main_session_routes::get_main_session(coven_home, query),
+        ("POST", "/main-session/turn") => {
+            crate::main_session_routes::turn(coven_home, body, runtime, authority)
+        }
+        ("POST", "/main-session/reset") => {
+            crate::main_session_routes::reset(coven_home, body, runtime)
+        }
+        ("POST", "/main-session/rollover") => {
+            crate::main_session_routes::rollover(coven_home, body)
+        }
         ("POST", "/adopted-sessions") => {
             launch_adopted_session(coven_home, body, runtime, authority)
         }
@@ -2352,7 +2362,7 @@ fn queue_pressure_label(queue_pressure: i64) -> &'static str {
     }
 }
 
-fn launch_session(
+pub(crate) fn launch_session(
     coven_home: &Path,
     body: Option<&str>,
     runtime: &dyn SessionRuntime,
@@ -4406,7 +4416,7 @@ fn record_adopted_input(
     }
 }
 
-fn record_input(
+pub(crate) fn record_input(
     coven_home: &Path,
     session_id: &str,
     body: Option<&str>,
@@ -23681,6 +23691,9 @@ pub(crate) mod tests {
             "/sessions/s/kill",
             "/sessions/s/handoffs",
             "/sessions/s/complete",
+            "/main-session/turn",
+            "/main-session/reset",
+            "/main-session/rollover",
         ] {
             let response = handle_request_with_runtime(
                 "POST",
