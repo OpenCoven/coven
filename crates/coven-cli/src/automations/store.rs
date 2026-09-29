@@ -30,6 +30,17 @@ pub const AUTOMATION_DEFINITIONS_SCHEMA_SQL: &str = "
 
     CREATE INDEX IF NOT EXISTS idx_automation_definitions_updated_at
         ON automation_definitions(updated_at DESC);
+
+    -- What each revision of a richly authored definition meant, retained
+    -- after later revisions replace the current rich body.
+    CREATE TABLE IF NOT EXISTS automation_rich_definition_revisions (
+        automation_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        rich_definition_json TEXT NOT NULL,
+        integrity TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (automation_id, revision)
+    );
 ";
 
 pub const AUTOMATION_TIMEZONE_MIGRATIONS_SCHEMA_SQL: &str = "

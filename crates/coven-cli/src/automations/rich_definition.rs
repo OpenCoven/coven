@@ -16,6 +16,7 @@
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 
+use super::capability_negotiation::preflight_definition;
 use super::contract::canonical_json::{canonicalize, canonicalize_without_integrity, sha256_hex};
 use super::contract::types::AutomationDefinition;
 
@@ -58,6 +59,14 @@ pub(crate) fn project(definition: &Value) -> Result<Projection, Refusal> {
             .cloned()
             .unwrap_or(Value::Null)
     };
+    // The shared capability preflight refuses every variant the profile does
+    // not advertise, such as non-standard retention classes.
+    if let Some(unsupported) = preflight_definition(definition) {
+        return Err(Refusal::Unsupported {
+            variant: unsupported.variant,
+            reason: unsupported.reason,
+        });
+    }
     if !field(&["policies", "delivery"]).is_null() {
         return Err(Refusal::Unsupported {
             variant: "outputTarget.atomic".to_owned(),
@@ -172,4 +181,30 @@ pub(crate) fn current_view(
         "value": digest,
     });
     Ok(Some(definition))
+}
+
+/// Records what the definition's current revision means in rich terms, when
+/// it was authored richly. Called once per committed revision, inside its
+/// transaction, so every revision's rich body stays recoverable.
+pub(crate) fn record_revision(
+    conn: &Connection,
+    automation_id: &str,
+    recorded_at: &str,
+) -> anyhow::Result<()> {
+    let Some(view) = current_view(conn, automation_id)? else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO automation_rich_definition_revisions
+            (automation_id, revision, rich_definition_json, integrity, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            automation_id,
+            view["revision"].as_i64(),
+            String::from_utf8(canonicalize(&view)?)?,
+            view["integrity"]["value"].as_str(),
+            recorded_at,
+        ],
+    )?;
+    Ok(())
 }

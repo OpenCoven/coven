@@ -2083,6 +2083,11 @@ fn automation_list_payload(
 }
 
 fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
+    // One snapshot, so the routine and its rich form come from one revision.
+    let snapshot = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin definition read: {error}"))?;
+    let conn: &rusqlite::Connection = &snapshot;
     match crate::automations::store::get_definition_with_tombstone(conn, id, true) {
         Ok(Some(record)) => match serde_json::from_str::<Value>(&record.definition_json) {
             Ok(routine) => {

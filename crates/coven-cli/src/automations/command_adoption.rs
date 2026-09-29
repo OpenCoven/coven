@@ -437,6 +437,11 @@ pub fn execute_definition_command(
                     observed_at: &effective_adopted_at,
                 },
             )?);
+            super::rich_definition::record_revision(
+                &transaction,
+                automation_id,
+                &effective_adopted_at,
+            )?;
         }
     }
     let stored = match (&response.result, &response.error) {

@@ -718,6 +718,8 @@ mod tests {
             .unwrap()
             .remove("delivery");
         object.remove("activation");
+        // The capability profile advertises only standard retention.
+        definition["policies"]["retention"]["receipts"] = json!({ "classification": "standard" });
         definition["automationId"] = json!("rich-notes");
         definition["revision"] = json!(revision);
         definition["lifecycleState"] = json!(lifecycle_state);
@@ -897,6 +899,44 @@ mod tests {
             ),
         );
         assert!(read.result.unwrap()["result"].get("definition").is_none());
+
+        // Every rich revision stays recoverable after later ones replace it.
+        let history: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT revision, rich_definition_json FROM automation_rich_definition_revisions
+                 WHERE automation_id = 'rich-notes' ORDER BY revision",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|(revision, _)| *revision)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let prompts = history
+            .iter()
+            .map(|(_, json)| {
+                let snapshot: Value = serde_json::from_str(json).unwrap();
+                assert_verifies(&snapshot);
+                (
+                    snapshot["lifecycleState"].clone(),
+                    snapshot["action"]["prompt"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prompts,
+            vec![
+                (json!("draft"), json!("Write the daily reflection.")),
+                (json!("paused"), json!("Reflect briefly.")),
+                (json!("active"), json!("Reflect briefly.")),
+            ]
+        );
     }
 
     #[test]
@@ -942,6 +982,14 @@ mod tests {
                 rich(1, "draft", |definition| {
                     definition["policies"]["delivery"] =
                         json!({ "outputTarget": "~/notes/today.md", "mode": "atomic" });
+                }),
+                "CAPABILITY_UNSUPPORTED",
+            ),
+            (
+                "an extended retention class",
+                rich(1, "draft", |definition| {
+                    definition["policies"]["retention"]["receipts"] =
+                        json!({ "classification": "extended" });
                 }),
                 "CAPABILITY_UNSUPPORTED",
             ),
