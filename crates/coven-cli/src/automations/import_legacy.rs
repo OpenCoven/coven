@@ -244,8 +244,14 @@ pub fn import_legacy_codex_automations(conn: &Connection) -> Result<ImportReport
 /// `legacy.import.v1`: imports into the `draft` lifecycle state as v1-managed
 /// rows, inside the caller's transaction with one savepoint per definition.
 /// An id already in the store, tombstoned or not, is skipped. With
-/// `dry_run`, reports the same outcome without writing anything.
-pub fn import_codex_as_draft(conn: &Connection, dry_run: bool) -> Result<ImportReport> {
+/// `dry_run`, reports the same outcome without writing anything. Each row
+/// and its `definition.imported` event carry the adoption's `adopted_at`,
+/// kept monotonic against any earlier event on that id, not the wall clock.
+pub fn import_codex_as_draft(
+    conn: &Connection,
+    dry_run: bool,
+    adopted_at: &str,
+) -> Result<ImportReport> {
     let ImportPlan {
         candidates,
         mut report,
@@ -268,7 +274,8 @@ pub fn import_codex_as_draft(conn: &Connection, dry_run: bool) -> Result<ImportR
         conn.execute_batch("SAVEPOINT legacy_import_definition")
             .context("failed to open legacy import savepoint")?;
         let imported = (|| {
-            insert_definition(conn, &definition)?;
+            let imported_at = super::store::monotonic_definition_timestamp(conn, &id, adopted_at)?;
+            super::store::insert_definition_at(conn, &definition, &imported_at)?;
             conn.execute(
                 "UPDATE automation_definitions
                  SET lifecycle_state = 'draft', authority_version = 1
@@ -406,6 +413,8 @@ prompt = "Do the legacy thing."
         .unwrap();
     }
 
+    const IMPORT_ADOPTED_AT: &str = "2026-09-28T09:00:00.000Z";
+
     fn draft_import(
         conn: &Connection,
         root: &Path,
@@ -417,7 +426,7 @@ prompt = "Do the legacy thing."
                 conn,
                 key,
                 super::super::command_adoption::DefinitionCommand::LegacyImport { dry_run },
-                "2026-09-28T09:00:00.000Z",
+                IMPORT_ADOPTED_AT,
             )
             .unwrap()
         })
@@ -495,16 +504,32 @@ prompt = "Do the legacy thing."
                 1
             )]
         );
-        let event: String = conn
+        // The row is stamped with the adoption's `adoptedAt`, not the wall clock.
+        let (created_at, updated_at): (String, String) = conn
             .query_row(
-                "SELECT event_json FROM automation_events WHERE stream_id = 'nightly'",
+                "SELECT created_at, updated_at FROM automation_definitions WHERE id = 'nightly'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(created_at, IMPORT_ADOPTED_AT);
+        assert_eq!(updated_at, IMPORT_ADOPTED_AT);
+        let (recorded_at, observed_at, event): (String, String, String) = conn
+            .query_row(
+                "SELECT recorded_at, observed_at, event_json
+                 FROM automation_events WHERE stream_id = 'nightly'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         let event: serde_json::Value = serde_json::from_str(&event).unwrap();
         assert_eq!(event["kind"], "definition.imported");
         assert_eq!(event["payload"]["lifecycleState"], "draft");
+        // So is the imported event, in both columns and in its body.
+        assert_eq!(recorded_at, IMPORT_ADOPTED_AT);
+        assert_eq!(observed_at, IMPORT_ADOPTED_AT);
+        assert_eq!(event["recordedAt"], IMPORT_ADOPTED_AT);
+        assert_eq!(event["observedAt"], IMPORT_ADOPTED_AT);
 
         // A draft cannot be activated; a revise must validate it first.
         let activate = super::super::command_adoption::execute_definition_command(

@@ -230,11 +230,22 @@ pub fn insert_definition(
     conn: &Connection,
     definition: &RoutineDefinition,
 ) -> Result<RoutineRecord> {
+    insert_definition_at(conn, definition, &now_iso())
+}
+
+/// Inserts `definition` as revision 1 with `created_at` and `updated_at` both
+/// set to `at`, so an adopted command can stamp the row with its own
+/// `adopted_at` instead of the wall clock.
+pub fn insert_definition_at(
+    conn: &Connection,
+    definition: &RoutineDefinition,
+    at: &str,
+) -> Result<RoutineRecord> {
     let definition = definition
         .clone()
         .resolve_timezone_for_persistence()
         .map_err(anyhow::Error::msg)?;
-    let now = now_iso();
+    let now = at.to_owned();
     let definition_json =
         serde_json::to_string(&definition).context("failed to serialize routine definition")?;
     let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
