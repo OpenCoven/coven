@@ -7,8 +7,8 @@ use crate::{
     Agent, AgentId, AgentRef, ConfigError, GuardrailStage, GuardrailVerdict, HandoffDefinition,
     InvocationContext, InvocationEvent, InvocationEventKind, InvocationFailureKind, InvocationId,
     InvocationObserver, InvocationRequest, InvocationSource, ModelAction, ModelRequest,
-    NoopInvocationObserver, NoopObserver, RunError, RunEvent, RunFailure, RunFailureKind, RunItem,
-    RunObserver, SessionStore,
+    NoopInvocationObserver, NoopObserver, ReviewOutcome, ReviewVerdict, RunError, RunEvent,
+    RunFailure, RunFailureKind, RunItem, RunObserver, SessionStore, ToolCall, ToolProposal,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +53,7 @@ const fn invocation_failure_kind(kind: RunFailureKind) -> InvocationFailureKind 
     match kind {
         RunFailureKind::Configuration => InvocationFailureKind::Configuration,
         RunFailureKind::Session => InvocationFailureKind::Session,
+        RunFailureKind::ProposalReview => InvocationFailureKind::ProposalReview,
         RunFailureKind::InputGuardrail => InvocationFailureKind::InputGuardrail,
         RunFailureKind::OutputGuardrail => InvocationFailureKind::OutputGuardrail,
         RunFailureKind::Model => InvocationFailureKind::Model,
@@ -122,6 +123,17 @@ where
                         agent: agent.id.clone(),
                         handoff: handoff.name.clone(),
                         target: handoff.target.clone(),
+                    });
+                }
+            }
+
+            let mut review_names = BTreeSet::new();
+            for review in &agent.proposal_reviews {
+                let name = review.name().to_owned();
+                if !review_names.insert(name.clone()) {
+                    return Err(ConfigError::DuplicateProposalReview {
+                        agent: agent.id.clone(),
+                        name,
                     });
                 }
             }
@@ -227,6 +239,65 @@ where
             kind,
         });
         error
+    }
+
+    /// Consults the agent's reviewers in registration order and returns the
+    /// first non-permit verdict with the reviewer that produced it. `None`
+    /// means every reviewer permitted the call, or none is registered.
+    ///
+    /// One `ProposalReviewed` event is emitted per reviewer consulted;
+    /// reviewers after the deciding one are not called. A reviewer
+    /// implementation error records an `Unavailable` review outcome, then
+    /// fails the run.
+    async fn review_tool_proposal(
+        &self,
+        request: &InvocationRequest,
+        agent: &Agent<C>,
+        call: &ToolCall,
+        context: &C,
+    ) -> Result<Option<(String, ReviewVerdict)>, RunError> {
+        let proposal = ToolProposal {
+            call_id: &call.id,
+            tool: &call.name,
+            arguments: &call.arguments,
+        };
+        for review in &agent.proposal_reviews {
+            let verdict = match review.review(&proposal, context).await {
+                Ok(verdict) => verdict,
+                Err(source) => {
+                    self.observer.on_event(&RunEvent::ProposalReviewed {
+                        invocation: request.invocation.clone(),
+                        agent: agent.id.clone(),
+                        reviewer: review.name().to_owned(),
+                        tool: call.name.clone(),
+                        call_id: call.id.clone(),
+                        verdict: ReviewOutcome::Unavailable,
+                    });
+                    return Err(self.fail(
+                        request,
+                        &agent.id,
+                        RunFailureKind::ProposalReview,
+                        RunError::ProposalReviewFailed {
+                            agent: agent.id.clone(),
+                            reviewer: review.name().to_owned(),
+                            source,
+                        },
+                    ));
+                }
+            };
+            self.observer.on_event(&RunEvent::ProposalReviewed {
+                invocation: request.invocation.clone(),
+                agent: agent.id.clone(),
+                reviewer: review.name().to_owned(),
+                tool: call.name.clone(),
+                call_id: call.id.clone(),
+                verdict: verdict.outcome(),
+            });
+            if verdict != ReviewVerdict::Permit {
+                return Ok(Some((review.name().to_owned(), verdict)));
+            }
+        }
+        Ok(None)
     }
 
     /// Checks an agent's input guardrails against the run's original user
@@ -803,12 +874,36 @@ where
                             },
                         )
                     })?;
+                // Review the resolved call before anything is dispatched. The
+                // proposal stays in the transcript either way; only a permit
+                // reaches the tool.
+                let review = self
+                    .review_tool_proposal(request, &current, &call, context)
+                    .await?;
                 let call_item = RunItem::ToolCall {
                     agent: current.id.clone(),
                     call: call.clone(),
                 };
                 progress.items.push(call_item.clone());
                 model_items.push(call_item);
+                if let Some((reviewer, verdict)) = review {
+                    let result_item = RunItem::ToolResult {
+                        agent: current.id.clone(),
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        output: serde_json::json!({
+                            "executed": false,
+                            "review": {
+                                "reviewer": reviewer,
+                                "verdict": verdict.outcome().as_str(),
+                                "reason": verdict.reason(),
+                            },
+                        }),
+                    };
+                    progress.items.push(result_item.clone());
+                    model_items.push(result_item);
+                    continue;
+                }
                 self.observer.on_event(&RunEvent::ToolStarted {
                     invocation: request.invocation.clone(),
                     agent: current.id.clone(),

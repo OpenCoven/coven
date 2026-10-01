@@ -11,6 +11,7 @@ mod loop_journal;
 mod loop_runner;
 mod model;
 mod observer;
+mod review;
 mod runner;
 mod session;
 mod tool;
@@ -36,6 +37,7 @@ pub use model::{
 pub use observer::{
     InvocationObserver, NoopInvocationObserver, NoopObserver, RunEvent, RunFailureKind, RunObserver,
 };
+pub use review::{ProposalReview, ReviewOutcome, ReviewVerdict, ToolProposal};
 pub use runner::{RunOptions, RunResult, Runner};
 pub use session::{InMemorySession, SessionStore};
 pub use tool::{Tool, ToolDefinition};
