@@ -108,9 +108,10 @@ suite does not certify a signed principal-authorization profile, changed runtime
 bindings, every commit/recovery interleaving, or Cave acceptance. It is bounded
 process-boundary evidence, not complete closure of every assertion in
 [OpenCoven/coven#884](https://github.com/OpenCoven/coven/issues/884).
-Passing scheduled-intake journeys does not close the separately coordinated
-production scheduled-publication work in
-[OpenCoven/coven#888](https://github.com/OpenCoven/coven/issues/888).
+Passing scheduled-intake journeys did not by themselves close the production
+scheduled-publication work in
+[OpenCoven/coven#888](https://github.com/OpenCoven/coven/issues/888). That
+issue closed on 2026-09-13 on its own retired-corpus dossier at `226bfcc8`.
 
 The clock feature is disabled in production builds. It uses a capability-gated
 fixture in each disposable home and explicit real-scheduler ticks, not sleeps

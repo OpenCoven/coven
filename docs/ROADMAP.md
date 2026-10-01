@@ -15,6 +15,16 @@ Native Automations readiness was reviewed separately on 2026-09-14. Its
 [source readiness map](roadmaps/coven-automations-readiness.md) supersedes this
 older product snapshot for automation status and release gates.
 
+Protected-authority validation is tracked in
+[OpenCoven/coven-threads](https://github.com/OpenCoven/coven-threads), which
+the daemon imports as `coven-threads-core`. As of 2026-10-01, Threads phases
+0–4 are frozen and Phase 5 (approval semantics) is active. Every engineering
+blocker is closed, and the latest published release, `v0.4.4`, carries the
+integration. The human coherence acceptance and the scoped freeze remain
+outstanding. The coven-threads
+[delivery ledger](https://github.com/OpenCoven/coven-threads/blob/main/docs/phases.md)
+is authoritative for that status; this snapshot does not restate it.
+
 This roadmap is the public progress ledger for **OpenCoven**, **CastCodes**, and **Coven**.
 
 It is intentionally written as a community-facing map, not an internal promise sheet. Items move when they are designed, implemented, tested, released, or deliberately cut. Dates are avoided unless a release is already scheduled.
