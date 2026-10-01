@@ -23,12 +23,24 @@ pub const AUTOMATION_DEFINITIONS_SCHEMA_SQL: &str = "
             CHECK (lifecycle_state IN ('draft', 'paused', 'active', 'disabled', 'invalid')),
         tombstoned_at TEXT,
         authority_version INTEGER NOT NULL DEFAULT 0 CHECK (authority_version IN (0, 1)),
+        rich_definition_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_automation_definitions_updated_at
         ON automation_definitions(updated_at DESC);
+
+    -- What each revision of a richly authored definition meant, retained
+    -- after later revisions replace the current rich body.
+    CREATE TABLE IF NOT EXISTS automation_rich_definition_revisions (
+        automation_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        rich_definition_json TEXT NOT NULL,
+        integrity TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (automation_id, revision)
+    );
 ";
 
 pub const AUTOMATION_TIMEZONE_MIGRATIONS_SCHEMA_SQL: &str = "
@@ -102,6 +114,16 @@ pub(crate) fn ensure_definition_command_columns(conn: &Connection) -> Result<()>
             [],
         )
         .context("failed to add automation definition authority version column")?;
+    }
+    if !columns
+        .iter()
+        .any(|column| column == "rich_definition_json")
+    {
+        conn.execute(
+            "ALTER TABLE automation_definitions ADD COLUMN rich_definition_json TEXT",
+            [],
+        )
+        .context("failed to add automation definition rich body column")?;
     }
     Ok(())
 }
