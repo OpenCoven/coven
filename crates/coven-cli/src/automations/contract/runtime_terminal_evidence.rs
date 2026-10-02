@@ -554,14 +554,14 @@ const fn authority_side_effect_rank(class: AuthoritySideEffectClass) -> u8 {
     }
 }
 
+/// Terminal evidence for the published authority binding, sealed with its
+/// integrity and signed digest. `seal` signs with a placeholder; callers that
+/// verify signatures replace `authentication.signature`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use serde_json::{json, Value};
 
     use super::{
-        verify_runtime_terminal_evidence, RuntimeTerminalEvidence,
-        RuntimeTerminalEvidenceClassification, RuntimeTerminalEvidenceError,
-        RuntimeTerminalEvidenceErrorCode, RuntimeTerminalEvidenceVerifier,
         RUNTIME_TERMINAL_EVIDENCE_AUTHENTICATION_DOMAIN, RUNTIME_TERMINAL_EVIDENCE_PROFILE,
     };
     use crate::automations::contract::authority::AutomationExecutionBinding;
@@ -570,43 +570,12 @@ mod tests {
     const AUTHORITY_VECTORS: &str =
         include_str!("../../../../../spec/coven-automations/authority/v1/test-vectors.json");
 
-    struct FixtureVerifier {
-        key_id: &'static str,
-        stale: bool,
-    }
-
-    impl RuntimeTerminalEvidenceVerifier for FixtureVerifier {
-        fn verify(
-            &self,
-            evidence: &RuntimeTerminalEvidence,
-        ) -> Result<(), RuntimeTerminalEvidenceError> {
-            if self.stale {
-                return Err(RuntimeTerminalEvidenceError::new(
-                    RuntimeTerminalEvidenceErrorCode::AuthenticationStale,
-                ));
-            }
-            if evidence.authentication.key_id.as_str() != self.key_id
-                || evidence.authentication.signature.as_str()
-                    != format!(
-                        "{}{}",
-                        evidence.authentication.signed_digest.value.as_str(),
-                        evidence.authentication.signed_digest.value.as_str()
-                    )
-            {
-                return Err(RuntimeTerminalEvidenceError::new(
-                    RuntimeTerminalEvidenceErrorCode::AuthenticationInvalid,
-                ));
-            }
-            Ok(())
-        }
-    }
-
-    fn binding() -> AutomationExecutionBinding {
+    pub(crate) fn binding() -> AutomationExecutionBinding {
         let vectors: Value = serde_json::from_str(AUTHORITY_VECTORS).unwrap();
         serde_json::from_value(vectors["fixtures"]["binding"].clone()).unwrap()
     }
 
-    fn digest(value: &str) -> Value {
+    pub(crate) fn digest(value: &str) -> Value {
         json!({
             "algorithm": "sha256",
             "canonicalization": "jcs-rfc8785",
@@ -614,7 +583,7 @@ mod tests {
         })
     }
 
-    fn evidence_value() -> Value {
+    pub(crate) fn evidence_value() -> Value {
         json!({
             "profile": RUNTIME_TERMINAL_EVIDENCE_PROFILE,
             "evidenceId": "evidence:daily-notes-1",
@@ -680,7 +649,7 @@ mod tests {
         })
     }
 
-    fn seal(mut value: Value) -> Value {
+    pub(crate) fn seal(mut value: Value) -> Value {
         let object = value.as_object_mut().unwrap();
         object.remove("integrity");
         object.remove("authentication");
@@ -700,6 +669,49 @@ mod tests {
             "signature": format!("{signed_digest}{signed_digest}")
         });
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::test_support::{binding, evidence_value, seal};
+    use super::{
+        verify_runtime_terminal_evidence, RuntimeTerminalEvidence,
+        RuntimeTerminalEvidenceClassification, RuntimeTerminalEvidenceError,
+        RuntimeTerminalEvidenceErrorCode, RuntimeTerminalEvidenceVerifier,
+    };
+
+    struct FixtureVerifier {
+        key_id: &'static str,
+        stale: bool,
+    }
+
+    impl RuntimeTerminalEvidenceVerifier for FixtureVerifier {
+        fn verify(
+            &self,
+            evidence: &RuntimeTerminalEvidence,
+        ) -> Result<(), RuntimeTerminalEvidenceError> {
+            if self.stale {
+                return Err(RuntimeTerminalEvidenceError::new(
+                    RuntimeTerminalEvidenceErrorCode::AuthenticationStale,
+                ));
+            }
+            if evidence.authentication.key_id.as_str() != self.key_id
+                || evidence.authentication.signature.as_str()
+                    != format!(
+                        "{}{}",
+                        evidence.authentication.signed_digest.value.as_str(),
+                        evidence.authentication.signed_digest.value.as_str()
+                    )
+            {
+                return Err(RuntimeTerminalEvidenceError::new(
+                    RuntimeTerminalEvidenceErrorCode::AuthenticationInvalid,
+                ));
+            }
+            Ok(())
+        }
     }
 
     fn verified(value: Value) -> super::VerifiedRuntimeTerminalEvidence {
