@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildStressPlan,
+  buildWarmPlan,
   runStressPlan,
   sanitizeOutput
 } from './release-stress.mjs';
@@ -80,6 +81,61 @@ test('windows stress plan repeats descendant-killing PTY timeout ten times', () 
     '--',
     '--exact'
   ]);
+});
+
+test('warm plan compiles each distinct selection once without running it', () => {
+  const windows = buildWarmPlan(buildStressPlan({ suite: 'windows', iterations: 10 }));
+  assert.deepEqual(windows, [
+    {
+      label: 'Windows PTY timeout and process cleanup',
+      args: [
+        'test',
+        '-p',
+        'coven-cli',
+        '--bin',
+        'coven',
+        'pty_runner::tests::windows_detached_pty_timeout_fails_and_kills_descendant',
+        '--locked',
+        '--no-run'
+      ],
+      iteration: 0,
+      timeoutMs: 1_800_000
+    }
+  ]);
+
+  const unixPlan = buildStressPlan({ suite: 'unix', iterations: 10 });
+  const unix = buildWarmPlan(unixPlan, { buildTimeoutMs: 600_000 });
+  assert.deepEqual(
+    unix.map((entry) => entry.label),
+    [...new Set(unixPlan.map((entry) => entry.label))]
+  );
+  for (const entry of unix) {
+    assert.equal(entry.args.at(-1), '--no-run');
+    assert.ok(!entry.args.includes('--') && !entry.args.includes('--exact'));
+    assert.equal(entry.iteration, 0);
+    assert.equal(entry.timeoutMs, 600_000);
+  }
+});
+
+test('a warm-up that times out is reported as a build, not an iteration', () => {
+  const writes = [];
+  const plan = buildWarmPlan(buildStressPlan({ suite: 'windows', iterations: 1 }));
+
+  assert.throws(
+    () =>
+      runStressPlan({
+        plan,
+        repoRoot: '/private/work/coven',
+        runCommand() {
+          return { error: { code: 'ETIMEDOUT' }, stdout: '', stderr: '' };
+        },
+        writeLog(text) {
+          writes.push(text);
+        }
+      }),
+    /Windows PTY timeout and process cleanup warm-up timed out after 1800000ms/
+  );
+  assert.match(writes.join(''), /^warm surface=Windows PTY timeout and process cleanup\n/);
 });
 
 test('stress runner stops at the first failed command and records its iteration', () => {

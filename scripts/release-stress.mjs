@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_ITERATIONS = 10;
 const DEFAULT_COMMAND_TIMEOUT_MS = 180_000;
+const DEFAULT_BUILD_TIMEOUT_MS = 1_800_000;
 
 const UNIX_COMMANDS = [
   {
@@ -109,6 +110,27 @@ export function buildStressPlan({
   ).flat();
 }
 
+// Each distinct selection in the plan, compiled once without running. A
+// package-scoped `cargo test -p ...` resolves its own feature set, so the
+// workflow's workspace-wide `--no-run` warm-up does not build it, and the
+// first timed iteration would otherwise spend its bound compiling.
+export function buildWarmPlan(plan, { buildTimeoutMs = DEFAULT_BUILD_TIMEOUT_MS } = {}) {
+  const seen = new Set();
+  const warm = [];
+  for (const entry of plan) {
+    const separator = entry.args.indexOf('--');
+    const cargoArgs = separator < 0 ? entry.args : entry.args.slice(0, separator);
+    const args = [...cargoArgs, '--no-run'];
+    const key = args.join('\u0000');
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    warm.push({ label: entry.label, args, iteration: 0, timeoutMs: buildTimeoutMs });
+  }
+  return warm;
+}
+
 export function sanitizeOutput(text, privatePaths) {
   let sanitized = String(text ?? '');
   for (const privatePath of privatePaths) {
@@ -127,7 +149,11 @@ export function runStressPlan({
   writeLog
 }) {
   for (const entry of plan) {
-    const header = `iteration=${entry.iteration} surface=${entry.label}\n`;
+    const warmUp = entry.iteration === 0;
+    const step = warmUp ? 'warm-up' : `iteration ${entry.iteration}`;
+    const header = warmUp
+      ? `warm surface=${entry.label}\n`
+      : `iteration=${entry.iteration} surface=${entry.label}\n`;
     writeLog(header);
     const result = runCommand(entry, workingDirectory);
     const output = sanitizeOutput(
@@ -140,19 +166,13 @@ export function runStressPlan({
     }
 
     if (result.error?.code === 'ETIMEDOUT') {
-      throw new Error(
-        `${entry.label} iteration ${entry.iteration} timed out after ${entry.timeoutMs}ms`
-      );
+      throw new Error(`${entry.label} ${step} timed out after ${entry.timeoutMs}ms`);
     }
     if (result.error) {
-      throw new Error(
-        `${entry.label} iteration ${entry.iteration} failed to launch: ${result.error.message}`
-      );
+      throw new Error(`${entry.label} ${step} failed to launch: ${result.error.message}`);
     }
     if (result.status !== 0) {
-      throw new Error(
-        `${entry.label} iteration ${entry.iteration} failed with exit ${result.status}`
-      );
+      throw new Error(`${entry.label} ${step} failed with exit ${result.status}`);
     }
   }
 }
@@ -184,7 +204,7 @@ function main() {
   writeFileSync(logPath, `suite=${suite} iterations=${iterations}\n`);
 
   runStressPlan({
-    plan,
+    plan: [...buildWarmPlan(plan), ...plan],
     repoRoot,
     writeLog(text) {
       appendFileSync(logPath, text);
