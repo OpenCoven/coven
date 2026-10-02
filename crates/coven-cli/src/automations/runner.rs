@@ -3694,6 +3694,7 @@ pub(crate) fn settle_finished_runs_with(
                         }
                         continue;
                     }
+                    EvidenceConsumption::SettledElsewhere => continue,
                     EvidenceConsumption::Held(reason) => reason,
                 },
                 None => RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON,
@@ -3875,6 +3876,8 @@ pub(crate) fn settle_finished_runs_with(
 
 enum EvidenceConsumption {
     Settled(TerminalOutcome),
+    /// A concurrent reconciliation pass settled it first.
+    SettledElsewhere,
     Held(&'static str),
 }
 
@@ -3945,7 +3948,7 @@ fn consume_runtime_terminal_evidence(
                     RUNTIME_TERMINAL_EVIDENCE_LATE_REASON,
                 ));
             }
-            settle_from_runtime_terminal_evidence(
+            let settled_here = settle_from_runtime_terminal_evidence(
                 conn,
                 TerminalEvidenceSettlement {
                     run_id,
@@ -3960,7 +3963,11 @@ fn consume_runtime_terminal_evidence(
                 settlement.authority,
                 now,
             )?;
-            return Ok(EvidenceConsumption::Settled(verified.evidence.disposition));
+            return Ok(if settled_here {
+                EvidenceConsumption::Settled(verified.evidence.disposition)
+            } else {
+                EvidenceConsumption::SettledElsewhere
+            });
         }
         RuntimeTerminalEvidenceClassification::AuthenticatedPartialOrAmbiguous => {
             RUNTIME_TERMINAL_EVIDENCE_PARTIAL_REASON
@@ -3999,12 +4006,15 @@ fn launched_receipt_id(binding: &AutomationExecutionBinding) -> String {
 
 /// Settles the attempt, occurrence and run to the evidence's disposition and
 /// commits the launched receipt with its authority evidence, atomically.
+/// Returns `false`, writing nothing, when a concurrent pass has already
+/// settled the run: settlement and receipt commit together, so there is never
+/// a partial settlement to replay.
 fn settle_from_runtime_terminal_evidence(
     conn: &Connection,
     settled: TerminalEvidenceSettlement<'_>,
     authority: &dyn AutomationDispatchAuthority,
     now: DateTime<Utc>,
-) -> Result<ReceiptCommitOutcome, String> {
+) -> Result<bool, String> {
     let TerminalEvidenceSettlement {
         run_id,
         occurrence_id,
@@ -4016,12 +4026,7 @@ fn settle_from_runtime_terminal_evidence(
         binding,
     } = settled;
     let receipt_id = launched_receipt_id(binding);
-    let receipt = read_receipt(conn, &receipt_id)
-        .map_err(|error| format!("failed to inspect launched receipt replay: {error:#}"))?
-        .map_or_else(
-            || build_launched_receipt(&receipt_id, binding, familiar_id, evidence, now),
-            Ok,
-        )
+    let receipt = build_launched_receipt(&receipt_id, binding, familiar_id, evidence, now)
         .map_err(|error| format!("failed to build launched receipt: {error:#}"))?;
     let terminal_extensions = authority
         .produce_terminal_evidence(&AutomationTerminalAuthorityRequest {
@@ -4037,16 +4042,21 @@ fn settle_from_runtime_terminal_evidence(
 
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin launched receipt settlement: {error}"))?;
-    let event_id = receipt_event_id(receipt.receipt_id.as_str());
-    let existing_sequence = transaction
+    // Checked under the write lock, so of two concurrent passes exactly one
+    // settles and the other writes nothing.
+    let run_running: bool = transaction
         .query_row(
-            "SELECT sequence FROM automation_events WHERE event_id = ?1",
-            [&event_id],
-            |row| row.get::<_, i64>(0),
+            "SELECT status = 'running' AND receipt_id IS NULL
+             FROM automation_runs
+             WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
         )
-        .optional()
-        .map_err(|error| format!("failed to inspect launched receipt event replay: {error}"))?;
-    if existing_sequence.is_none() {
+        .map_err(|error| format!("failed to read Runtime Authority run: {error}"))?;
+    if !run_running {
+        return Ok(false);
+    }
+    {
         let produced_at = receipt.produced_at.as_str();
         let (run_status, attempt_state) = terminal_states(evidence.disposition);
         let (failure_class, detail) = launched_terminal_detail(evidence.disposition);
@@ -4118,19 +4128,16 @@ fn settle_from_runtime_terminal_evidence(
 
     // The receipt event takes the run stream's head only after settlement:
     // the attempt and run transitions above append their own events to it.
-    let event_sequence = match existing_sequence {
-        Some(sequence) => u64::try_from(sequence)
-            .map_err(|_| "stored launched receipt event sequence is negative".to_string())?,
-        None => stream_head(&transaction, "run", run_id)
-            .map_err(|error| format!("failed to read launched receipt event sequence: {error}"))?
-            .map_or(Ok(0), |head| {
-                head.checked_add(1)
-                    .ok_or_else(|| "launched receipt event sequence overflowed".to_string())
-            })?,
-    };
+    let event_sequence = stream_head(&transaction, "run", run_id)
+        .map_err(|error| format!("failed to read launched receipt event sequence: {error}"))?
+        .map_or(Ok(0), |head| {
+            head.checked_add(1)
+                .ok_or_else(|| "launched receipt event sequence overflowed".to_string())
+        })?;
+    let event_id = receipt_event_id(receipt.receipt_id.as_str());
     let event = build_receipt_recorded_event(&event_id, &receipt, event_sequence)
         .map_err(|error| format!("failed to build launched receipt event: {error:#}"))?;
-    let outcome = commit_authorized_receipt(
+    commit_authorized_receipt(
         &transaction,
         &receipt,
         &event,
@@ -4141,7 +4148,7 @@ fn settle_from_runtime_terminal_evidence(
     transaction
         .commit()
         .map_err(|error| format!("failed to commit launched receipt settlement: {error}"))?;
-    Ok(outcome)
+    Ok(true)
 }
 
 fn hold_runtime_authority_terminal_settlement(
@@ -7834,6 +7841,15 @@ mod tests {
         .unwrap()
     }
 
+    fn verified_attempt_id(conn: &Connection, run_id: &str) -> String {
+        conn.query_row(
+            "SELECT id FROM automation_attempts WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     fn receipt_count(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM automation_receipts", [], |row| {
             row.get(0)
@@ -7937,6 +7953,46 @@ mod tests {
                 serde_json::to_value(receipt.side_effect_class).unwrap(),
                 json!("local_write")
             );
+            // The runtime that ran is the one the binding pinned.
+            let (verified, binding) = read_verified_runtime_terminal_evidence_with_binding(
+                &conn,
+                RuntimeTerminalEvidenceLookup::AttemptId(
+                    verified_attempt_id(&conn, &run.run_id).as_str(),
+                ),
+                &VectorAuthority,
+            )
+            .unwrap()
+            .unwrap();
+            let runtime = receipt
+                .runtime
+                .as_ref()
+                .expect("launched receipts name their runtime");
+            assert_eq!(runtime.runtime_id, binding.runtime.runtime_id);
+            assert_eq!(
+                serde_json::to_value(&runtime.capabilities).unwrap(),
+                serde_json::to_value(&binding.runtime.capabilities).unwrap()
+            );
+            assert!(runtime.model.is_none());
+
+            // A concurrent pass that read the same evidence before this one
+            // committed finds the run settled and writes nothing.
+            let loser = settle_from_runtime_terminal_evidence(
+                &conn,
+                TerminalEvidenceSettlement {
+                    run_id: &run.run_id,
+                    occurrence_id: binding.base.occurrence_id.as_str(),
+                    attempt_id: binding.base.attempt_id.as_str(),
+                    session_id: &run.session_id,
+                    familiar_id: "charm",
+                    exit_code: Some(0),
+                    evidence: &verified.evidence,
+                    binding: &binding,
+                },
+                &VectorAuthority,
+                terminal_at + chrono::Duration::seconds(1),
+            );
+            assert_eq!(loser, Ok(false), "{disposition}");
+            assert_eq!(read_receipt(&conn, &receipt_id).unwrap().unwrap(), receipt);
 
             // Only `succeeded` is reachable from `started`; the others pass
             // through `observing`, and every step is published.

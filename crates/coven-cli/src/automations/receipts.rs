@@ -32,8 +32,8 @@ use super::contract::types::{
     ImplementationVersion, InstanceId, PrivacyClassification, ProducerIdentity,
     ReceiptAuthentication, ReceiptAuthority, ReceiptId, ReceiptIntegrity, ReceiptOutcome,
     ReceiptPayload, ReceiptPrivacy, ReceiptRecoveryDisposition, RetentionClass,
-    RetentionClassification, SafeInteger, SchemaVersion, Sha256Digest, SideEffectClass, StreamKind,
-    StreamRef, TerminalOutcome, Timestamp,
+    RetentionClassification, RuntimeDescriptor, SafeInteger, SchemaVersion, Sha256Digest,
+    SideEffectClass, StreamKind, StreamRef, TerminalOutcome, Timestamp,
 };
 
 pub(crate) const NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL: &str =
@@ -51,6 +51,7 @@ fn receipt_producer() -> Result<ProducerIdentity> {
 
 /// What a receipt reports beyond the binding its attempt was dispatched under.
 struct ReceiptObservation {
+    runtime: Option<RuntimeDescriptor>,
     side_effect_class: SideEffectClass,
     exercised_capabilities: ExercisedCapabilities,
     result_digest: Option<DigestValue>,
@@ -91,7 +92,7 @@ fn build_authority_receipt(
             // so no approval reference can be copied losslessly.
             approval: None,
         }),
-        runtime: None,
+        runtime: observation.runtime,
         delivery_digest: observation.delivery_digest,
         result_digest: observation.result_digest,
         exercised_capabilities: Some(observation.exercised_capabilities),
@@ -126,6 +127,8 @@ pub(crate) fn build_no_launch_receipt(
         familiar_id,
         produced_at,
         ReceiptObservation {
+            // Nothing was launched, so no runtime ran.
+            runtime: None,
             side_effect_class: SideEffectClass::None,
             exercised_capabilities: ExercisedCapabilities::empty(),
             result_digest: None,
@@ -176,7 +179,8 @@ pub(crate) fn launched_terminal_detail(
 
 /// The receipt for a launched attempt, from complete, verified runtime
 /// terminal evidence: its disposition, observed side effects and exercised
-/// capabilities, result and delivery digests, and privacy.
+/// capabilities, result and delivery digests, and privacy. The runtime that
+/// ran is the one the binding pinned; it reported no model, so none is named.
 pub(crate) fn build_launched_receipt(
     receipt_id: &str,
     binding: &AutomationExecutionBinding,
@@ -214,6 +218,14 @@ pub(crate) fn build_launched_receipt(
         familiar_id,
         produced_at,
         ReceiptObservation {
+            runtime: Some(RuntimeDescriptor {
+                runtime_id: binding.runtime.runtime_id.clone(),
+                capabilities: serde_json::from_value(serde_json::to_value(
+                    &binding.runtime.capabilities,
+                )?)
+                .context("pinned runtime capabilities are not receipt capabilities")?,
+                model: None,
+            }),
             side_effect_class: maximum_class,
             exercised_capabilities: serde_json::from_value(serde_json::to_value(values)?)
                 .context("observed capabilities are not receipt capabilities")?,
