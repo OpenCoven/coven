@@ -846,19 +846,6 @@ fn settle_runtime_authority_unsupported(
         )
         .optional()
         .map_err(|error| format!("failed to inspect no-launch receipt event replay: {error}"))?;
-    let event_sequence = match existing_sequence {
-        Some(sequence) => u64::try_from(sequence)
-            .map_err(|_| "stored no-launch receipt event sequence is negative".to_string())?,
-        None => stream_head(&transaction, "run", run_id)
-            .map_err(|error| format!("failed to read no-launch receipt event sequence: {error}"))?
-            .map_or(Ok(0), |head| {
-                head.checked_add(1)
-                    .ok_or_else(|| "no-launch receipt event sequence overflowed".to_string())
-            })?,
-    };
-    let event = build_receipt_recorded_event(&event_id, &receipt, event_sequence)
-        .map_err(|error| format!("failed to build no-launch receipt event: {error:#}"))?;
-
     if existing_sequence.is_none() {
         let now_iso = receipt.produced_at.as_str();
         let settled_session = crate::store::update_session_terminal_if_active(
@@ -922,6 +909,20 @@ fn settle_runtime_authority_unsupported(
         }
     }
 
+    // The receipt event takes the run stream's head only after settlement:
+    // the attempt and run transitions above append their own events to it.
+    let event_sequence = match existing_sequence {
+        Some(sequence) => u64::try_from(sequence)
+            .map_err(|_| "stored no-launch receipt event sequence is negative".to_string())?,
+        None => stream_head(&transaction, "run", run_id)
+            .map_err(|error| format!("failed to read no-launch receipt event sequence: {error}"))?
+            .map_or(Ok(0), |head| {
+                head.checked_add(1)
+                    .ok_or_else(|| "no-launch receipt event sequence overflowed".to_string())
+            })?,
+    };
+    let event = build_receipt_recorded_event(&event_id, &receipt, event_sequence)
+        .map_err(|error| format!("failed to build no-launch receipt event: {error:#}"))?;
     let outcome = commit_authorized_receipt(
         &transaction,
         &receipt,
@@ -5328,6 +5329,18 @@ mod tests {
         (launch, attempt)
     }
 
+    fn receipt_event_sequence(conn: &Connection, run_id: &str) -> u64 {
+        conn.query_row(
+            "SELECT sequence FROM automation_events
+             WHERE stream_kind = 'run' AND stream_id = ?1
+               AND json_extract(event_json, '$.kind') = 'receipt.recorded'",
+            [run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|sequence| u64::try_from(sequence).unwrap())
+        .unwrap()
+    }
+
     fn assert_dispatching_without_receipt(
         conn: &Connection,
         run_id: &str,
@@ -5381,10 +5394,20 @@ mod tests {
             .unwrap();
         assert_eq!(session_status, "created");
         assert_eq!(receipt_artifact_counts(conn, run_id), (0, 0, 0));
-        assert_eq!(
-            super::super::contract::events::stream_head(conn, "run", run_id).unwrap(),
-            None
-        );
+        // Dispatch published its own transitions; settlement must add neither a
+        // receipt nor a terminal transition.
+        let settled_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_events
+                 WHERE stream_kind = 'run' AND stream_id = ?1
+                   AND (json_extract(event_json, '$.kind') = 'receipt.recorded'
+                        OR json_extract(event_json, '$.payload.to')
+                           IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous'))",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled_events, 0);
     }
 
     #[test]
@@ -5864,7 +5887,7 @@ mod tests {
         assert_eq!(counts, (1, 1, 1));
         assert_eq!(
             super::super::contract::events::stream_head(&conn, "run", &outcome.run_id).unwrap(),
-            Some(0)
+            Some(receipt_event_sequence(&conn, &outcome.run_id))
         );
         assert_eq!(
             settle_finished_runs(&conn, now + chrono::Duration::seconds(1)).unwrap(),
@@ -6204,12 +6227,15 @@ mod tests {
             &VectorAuthority,
             None,
         );
+        let next = super::super::contract::events::stream_head(&conn, "run", &attempt.run_id)
+            .unwrap()
+            .map_or(0, |head| head + 1);
         let existing: crate::automations::contract::types::EventEnvelope =
             serde_json::from_value(json!({
                 "schemaVersion": "coven.automations.v1",
                 "eventId": "evtruntransition00000001",
                 "stream": {"kind": "run", "id": attempt.run_id},
-                "sequence": 0,
+                "sequence": next,
                 "recordedAt": "2026-09-03T12:00:00.000Z",
                 "observedAt": "2026-09-03T12:00:00.000Z",
                 "producer": {"component": "coven-daemon", "instanceId": "daemon@test"},
@@ -6230,7 +6256,7 @@ mod tests {
                 }
             }))
             .unwrap();
-        super::super::contract::events::append_event(&conn, &existing, 0).unwrap();
+        super::super::contract::events::append_event(&conn, &existing, next).unwrap();
         let resolved = attempt.authority.as_deref().unwrap();
 
         assert_eq!(
@@ -6260,11 +6286,22 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(receipt_sequence, 1);
+        // Settlement's attempt and run transitions follow the existing event,
+        // and the receipt takes the next sequence after them.
+        assert!(receipt_sequence > i64::try_from(next).unwrap() + 2);
         assert_eq!(
             super::super::contract::events::stream_head(&conn, "run", &attempt.run_id).unwrap(),
-            Some(1)
+            Some(u64::try_from(receipt_sequence).unwrap())
         );
+        let previous: String = conn
+            .query_row(
+                "SELECT json_extract(event_json, '$.kind') FROM automation_events
+                 WHERE stream_kind = 'run' AND stream_id = ?1 AND sequence = ?2",
+                rusqlite::params![&attempt.run_id, receipt_sequence - 1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(previous, "run.transitioned");
     }
 
     #[test]
@@ -6313,9 +6350,10 @@ mod tests {
             ReceiptCommitOutcome::Replayed
         );
         assert_eq!(receipt_artifact_counts(&conn, &attempt.run_id), (1, 1, 1));
+        // The replay appended nothing: the receipt is still the last event.
         assert_eq!(
             super::super::contract::events::stream_head(&conn, "run", &attempt.run_id).unwrap(),
-            Some(0)
+            Some(receipt_event_sequence(&conn, &attempt.run_id))
         );
     }
 

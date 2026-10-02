@@ -34,6 +34,7 @@ pub mod runs;
 pub mod runtime_terminal_evidence;
 pub mod schedule;
 pub mod store;
+pub mod transition_events;
 #[cfg(test)]
 mod transport_authority_tests;
 
