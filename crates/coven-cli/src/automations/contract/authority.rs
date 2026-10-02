@@ -1192,7 +1192,7 @@ pub struct AuthorityReceiptRuntime {
 }
 
 impl AutomationAuthorityExtension {
-    fn validate_structure(
+    pub(crate) fn validate_structure(
         &self,
         phase: AuthorityValidationPhase,
     ) -> Result<(), AuthorityProfileError> {

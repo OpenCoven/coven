@@ -25,8 +25,8 @@ use super::contract::authority::{
     AuthorityTimestamp, AuthorityValidationPhase, AutomationAuthorityExtension,
 };
 use super::contract::runtime_terminal_evidence::{
-    RuntimeTerminalEvidence, RuntimeTerminalEvidenceError, RuntimeTerminalEvidenceErrorCode,
-    RuntimeTerminalEvidenceVerifier,
+    validate_integrity, RuntimeTerminalEvidence, RuntimeTerminalEvidenceError,
+    RuntimeTerminalEvidenceErrorCode, RuntimeTerminalEvidenceVerifier,
 };
 
 /// The fixed SubjectPublicKeyInfo prefix of an Ed25519 public key (RFC 8410).
@@ -178,13 +178,16 @@ impl TrustedKeys {
 
 /// Authenticates the execution binding, and at the terminal boundary the
 /// receipt authority evidence too, each by its own producer and decision time.
-/// A Runtime Authority adapter composes this with its trusted-state checks; on
-/// its own it proves who signed, not that the binding may run.
+/// The extension's structure for `phase` is validated first, including each
+/// object's integrity, so a signature only ever vouches for the body it is
+/// about. A Runtime Authority adapter composes this with its trusted-state
+/// checks; on its own it proves who signed, not that the binding may run.
 pub(crate) fn authenticate_authority_extension(
     keys: &TrustedKeys,
     extension: &AutomationAuthorityExtension,
     phase: AuthorityValidationPhase,
 ) -> Result<(), AuthorityProfileError> {
+    extension.validate_structure(phase)?;
     let binding = &extension.execution_binding;
     authenticate_authority_object(
         keys,
@@ -192,18 +195,14 @@ pub(crate) fn authenticate_authority_extension(
         &binding.producer,
         &binding.decision_timestamp,
     )?;
-    match (phase, extension.receipt_evidence.0.as_deref()) {
-        (_, Some(evidence)) => authenticate_authority_object(
+    match extension.receipt_evidence.0.as_deref() {
+        Some(evidence) => authenticate_authority_object(
             keys,
             &evidence.authentication,
             &evidence.producer,
             &evidence.decision_timestamp,
         ),
-        (AuthorityValidationPhase::Terminal, None) => Err(AuthorityProfileError::new(
-            AuthorityProfileErrorCode::ReceiptEvidenceRequired,
-            "terminal authority evidence is missing",
-        )),
-        (AuthorityValidationPhase::PreDispatch, None) => Ok(()),
+        None => Ok(()),
     }
 }
 
@@ -246,6 +245,9 @@ fn authenticate_authority_object(
 }
 
 /// Authenticates runtime terminal evidence by its producer and `producedAt`.
+/// It rechecks the evidence's integrity itself, so it vouches only for the
+/// body the signature is about even when called outside
+/// `verify_runtime_terminal_evidence`.
 pub(crate) struct Ed25519TerminalEvidenceVerifier<'a>(pub(crate) &'a TrustedKeys);
 
 impl RuntimeTerminalEvidenceVerifier for Ed25519TerminalEvidenceVerifier<'_> {
@@ -253,6 +255,7 @@ impl RuntimeTerminalEvidenceVerifier for Ed25519TerminalEvidenceVerifier<'_> {
         &self,
         evidence: &RuntimeTerminalEvidence,
     ) -> Result<(), RuntimeTerminalEvidenceError> {
+        validate_integrity(evidence)?;
         let refuse = RuntimeTerminalEvidenceError::new;
         let signed_at = DateTime::parse_from_rfc3339(evidence.produced_at.as_str())
             .map_err(|_| refuse(RuntimeTerminalEvidenceErrorCode::SchemaInvalid))?
@@ -321,6 +324,7 @@ mod tests {
     use crate::automations::contract::runtime_terminal_evidence::{
         verify_runtime_terminal_evidence, RuntimeTerminalEvidence,
         RuntimeTerminalEvidenceClassification, RuntimeTerminalEvidenceErrorCode,
+        RuntimeTerminalEvidenceVerifier,
     };
 
     const VECTORS: &str =
@@ -385,12 +389,16 @@ mod tests {
     #[test]
     fn published_authority_vectors_authenticate_with_their_trusted_keys() {
         let keys = published_keys(|key| key);
-        for phase in [
-            AuthorityValidationPhase::PreDispatch,
+        // Receipt evidence exists only at the terminal boundary.
+        let dispatched = extension(|extension| extension["receiptEvidence"] = Value::Null);
+        authenticate_authority_extension(&keys, &dispatched, AuthorityValidationPhase::PreDispatch)
+            .unwrap();
+        authenticate_authority_extension(
+            &keys,
+            &extension(|_| {}),
             AuthorityValidationPhase::Terminal,
-        ] {
-            authenticate_authority_extension(&keys, &extension(|_| {}), phase).unwrap();
-        }
+        )
+        .unwrap();
         let scoped = published_keys(|key| key.for_producer("coven-daemon", "daemon:host-a"));
         authenticate_authority_extension(
             &scoped,
@@ -453,6 +461,35 @@ mod tests {
     }
 
     #[test]
+    fn a_signature_never_vouches_for_an_edited_body() {
+        let keys = published_keys(|key| key);
+        // A signed field changes while integrity, signedDigest and signature
+        // stay as published.
+        for object in ["executionBinding", "receiptEvidence"] {
+            let edited = extension(|extension| {
+                extension[object]["privacy"]["retention"] = json!("authority_evidence_1y");
+            });
+            assert_eq!(
+                refusal(&keys, &edited),
+                AuthorityProfileErrorCode::IntegrityInvalid,
+                "{object}"
+            );
+        }
+
+        let mut value = serde_json::to_value(signed_evidence(|_| {})).unwrap();
+        value["sessionId"] = json!("session-attacker");
+        let edited: RuntimeTerminalEvidence = serde_json::from_value(value).unwrap();
+        let verifier_keys = runtime_keys(|key| key);
+        assert_eq!(
+            Ed25519TerminalEvidenceVerifier(&verifier_keys)
+                .verify(&edited)
+                .unwrap_err()
+                .code(),
+            RuntimeTerminalEvidenceErrorCode::IntegrityInvalid
+        );
+    }
+
+    #[test]
     fn authority_signatures_cover_exactly_the_signed_digest() {
         let keys = published_keys(|key| key);
         // A flipped signature byte.
@@ -471,8 +508,10 @@ mod tests {
         );
         // A changed body whose digests are recomputed keeps the old signatures.
         let mut value = authority_extensions_value();
-        value[AUTHORITY_EXTENSION_KEY]["executionBinding"]["decisionTimestamp"] =
-            json!("2026-09-03T11:59:58.000Z");
+        for object in ["executionBinding", "receiptEvidence"] {
+            value[AUTHORITY_EXTENSION_KEY][object]["privacy"]["retention"] =
+                json!("authority_evidence_1y");
+        }
         resign_authority_extensions(&mut value);
         let resealed: AutomationAuthorityExtension =
             serde_json::from_value(value[AUTHORITY_EXTENSION_KEY].clone()).unwrap();

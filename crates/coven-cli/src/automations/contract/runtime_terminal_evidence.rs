@@ -407,7 +407,7 @@ pub fn verify_runtime_terminal_evidence(
     })
 }
 
-fn validate_integrity(
+pub(crate) fn validate_integrity(
     evidence: &RuntimeTerminalEvidence,
 ) -> Result<(), RuntimeTerminalEvidenceError> {
     let mut body = serde_json::to_value(evidence).map_err(|_| {
