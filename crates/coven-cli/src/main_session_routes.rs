@@ -153,8 +153,11 @@ pub(crate) fn turn(
 
     let mut conn = store::open_store(&store_path(coven_home))?;
     let existing = main_session::get_main_session(&conn, &scope)?;
-    let created = existing.is_none();
-    let record = match existing {
+    // `created` is the store's verdict from the IMMEDIATE transaction inside
+    // `resolve_main_session`, not `existing.is_none()`: two first turns can
+    // both read `None`, but only one of them creates the pointer, and only
+    // that one may unwind it if its launch is refused.
+    let (record, created) = match existing {
         Some(record) => {
             // An existing pointer is authoritative. A request that names a
             // different harness, familiar, or root is asking for a different
@@ -182,7 +185,7 @@ pub(crate) fn turn(
                     })),
                 );
             }
-            record
+            (record, false)
         }
         None => {
             let Some(project_root) = requested_root else {
@@ -193,15 +196,15 @@ pub(crate) fn turn(
                     Some(json!({ "scopeKey": scope })),
                 );
             };
-            main_session::resolve_main_session(
+            let resolved = main_session::resolve_main_session(
                 &mut conn,
                 &scope,
                 Some(requested_familiar.unwrap_or(DEFAULT_MAIN_SESSION_FAMILIAR_ID)),
                 requested_harness.unwrap_or(DEFAULT_MAIN_SESSION_HARNESS),
                 project_root,
                 &current_timestamp(),
-            )?
-            .record
+            )?;
+            (resolved.record, resolved.created)
         }
     };
 
