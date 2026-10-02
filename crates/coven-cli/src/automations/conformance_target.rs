@@ -28,6 +28,7 @@ use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
 };
 
+mod command_envelope_outcomes;
 mod runtime_authority_terminal_recovery;
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -90,6 +91,7 @@ pub const CALENDAR_SCHEDULE_RESOLUTION_SUITE: &str = "calendar-schedule-resoluti
 pub const CANCELLATION_TIMEOUT_ARBITRATION_SUITE: &str = "cancellation-timeout-arbitration";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
+pub const COMMAND_ENVELOPE_OUTCOMES_SUITE: &str = "command-envelope-outcomes";
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
@@ -1536,6 +1538,7 @@ pub fn capability() -> TargetCapability {
                     ATTEMPT_TERMINAL_IMMUTABILITY_SUITE,
                     CAPABILITY_NEGOTIATION_SUITE,
                     COMMAND_ADOPTION_IDEMPOTENCY_SUITE,
+                    COMMAND_ENVELOPE_OUTCOMES_SUITE,
                     DEFINITION_LIFECYCLE_TRANSITIONS_SUITE,
                     DEFINITION_VALIDATION_SUITE,
                     EVENT_REDUCER_DETERMINISM_SUITE,
@@ -1586,6 +1589,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (STRUCTURAL_PROFILE, COMMAND_ADOPTION_IDEMPOTENCY_SUITE) => {
             evaluate_command_adoption_idempotency(&request.vector)?
+        }
+        (STRUCTURAL_PROFILE, COMMAND_ENVELOPE_OUTCOMES_SUITE) => {
+            command_envelope_outcomes::evaluate(&request.vector)?
         }
         (STRUCTURAL_PROFILE, DEFINITION_LIFECYCLE_TRANSITIONS_SUITE) => {
             evaluate_definition_lifecycle_transitions(&request.vector)?

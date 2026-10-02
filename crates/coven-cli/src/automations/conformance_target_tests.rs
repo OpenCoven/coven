@@ -13,6 +13,9 @@ const ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS: &str = include_str!(
 const COMMAND_ADOPTION_IDEMPOTENCY_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/command-adoption-idempotency.vectors.json"
 );
+const COMMAND_ENVELOPE_OUTCOMES_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/command-envelope-outcomes.vectors.json"
+);
 const CALENDAR_SCHEDULE_RESOLUTION_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/calendar-schedule-resolution.vectors.json"
 );
@@ -103,6 +106,7 @@ fn capability_advertises_the_native_structural_suites() {
                         "attempt-terminal-immutability",
                         CAPABILITY_NEGOTIATION_SUITE,
                         "command-adoption-idempotency",
+                        "command-envelope-outcomes",
                         "definition-lifecycle-transitions",
                         "definition-validation",
                         "event-reducer-determinism",
@@ -1197,6 +1201,85 @@ fn command_adoption_idempotency_suite_rejects_invalid_vector_shapes() {
         mutate(&mut vectors);
         assert_eq!(
             evaluate(&request_for("command-adoption-idempotency", vectors)).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn command_envelope_outcomes_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(COMMAND_ENVELOPE_OUTCOMES_VECTORS).unwrap();
+    let response = evaluate(&request_for("command-envelope-outcomes", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 5);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 5);
+}
+
+#[test]
+fn command_envelope_outcomes_suite_fails_when_the_router_disagrees() {
+    let wrong_expectations: [fn(&mut Value); 5] = [
+        // The refused retry would have to commit.
+        |vectors| {
+            vectors["cases"][1]["steps"][0]["expect"] = json!({ "outcome": "committed" });
+        },
+        // The stale revise would have to be refused for a different reason.
+        |vectors| {
+            vectors["cases"][2]["steps"][2]["expect"]["errorCode"] = json!("NOT_FOUND");
+        },
+        // The duplicate create would have to add a revision.
+        |vectors| vectors["cases"][3]["steps"][1]["expect"]["revision"] = json!(2),
+        // The replayed revise would have to return the create's result.
+        |vectors| {
+            vectors["cases"][3]["steps"][3]["envelope"] =
+                vectors["cases"][3]["steps"][0]["envelope"].clone();
+            vectors["cases"][3]["steps"][3]["expect"] =
+                json!({ "outcome": "replayed", "revision": 2, "replays": 0 });
+        },
+        // Adoption would have to be forgotten across the restart.
+        |vectors| {
+            vectors["cases"][4]["steps"][2]["expect"] =
+                json!({ "outcome": "committed", "revision": 1 });
+        },
+    ];
+
+    for mutate in wrong_expectations {
+        let mut vectors: Value = serde_json::from_str(COMMAND_ENVELOPE_OUTCOMES_VECTORS).unwrap();
+        mutate(&mut vectors);
+        let response = evaluate(&request_for("command-envelope-outcomes", vectors)).unwrap();
+        assert_eq!(response.status, TargetSuiteStatus::Failed);
+    }
+}
+
+#[test]
+fn command_envelope_outcomes_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 9] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| {
+            let duplicate = vectors["cases"][0].clone();
+            vectors["cases"].as_array_mut().unwrap().push(duplicate);
+        },
+        |vectors| vectors["cases"][0]["steps"] = json!([]),
+        |vectors| vectors["cases"][4]["steps"][1] = json!({ "kind": "reboot" }),
+        |vectors| vectors["cases"][0]["steps"][0]["envelope"]["command"] = json!("made.up.v1"),
+        |vectors| vectors["cases"][0]["steps"][0]["envelope"]["adoptionKey"] = json!("bad key"),
+        // A rejection must name its code, and a replay an earlier committed
+        // send of the same envelope.
+        |vectors| {
+            vectors["cases"][1]["steps"][0]["expect"]
+                .as_object_mut()
+                .unwrap()
+                .remove("errorCode");
+        },
+        |vectors| vectors["cases"][3]["steps"][1]["expect"]["replays"] = json!(2),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(COMMAND_ENVELOPE_OUTCOMES_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for("command-envelope-outcomes", vectors)).unwrap_err(),
             "conformance vector is invalid"
         );
     }

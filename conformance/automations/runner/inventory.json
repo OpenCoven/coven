@@ -5,6 +5,7 @@
     { "profile": "structural", "suiteId": "attempt-terminal-immutability", "vectorFile": "attempt-terminal-immutability.vectors.json" },
     { "profile": "structural", "suiteId": "capability-negotiation", "vectorFile": "capability-negotiation.vectors.json" },
     { "profile": "structural", "suiteId": "command-adoption-idempotency", "vectorFile": "command-adoption-idempotency.vectors.json" },
+    { "profile": "structural", "suiteId": "command-envelope-outcomes", "vectorFile": "command-envelope-outcomes.vectors.json" },
     { "profile": "structural", "suiteId": "definition-lifecycle-transitions", "vectorFile": "definition-lifecycle-transitions.vectors.json" },
     { "profile": "structural", "suiteId": "definition-validation", "vectorFile": "definition-validation.vectors.json" },
     { "profile": "structural", "suiteId": "event-reducer-determinism", "vectorFile": "event-reducer-determinism.vectors.json" },
