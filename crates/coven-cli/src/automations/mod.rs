@@ -25,6 +25,8 @@ pub mod inspection;
 pub mod leadership;
 pub mod occurrences;
 pub mod receipts;
+#[cfg(test)]
+mod release_upgrade_tests;
 pub mod rich_definition;
 pub mod rrule;
 // The inbox is intentionally internal until a trusted runtime adapter exists.

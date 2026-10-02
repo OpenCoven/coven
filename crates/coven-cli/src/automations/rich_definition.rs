@@ -183,6 +183,27 @@ pub(crate) fn current_view(
     Ok(Some(definition))
 }
 
+/// Drops rich bodies that no longer describe their definition's current
+/// revision. Every revision this producer commits for a richly authored
+/// definition is recorded below, so a current revision without a record was
+/// committed by a binary that predates rich bodies (a rollback). That binary
+/// kept the old body, which would otherwise be served and re-recorded as the
+/// new revision. Recorded revisions stay, so nothing authored is lost.
+pub(crate) fn clear_stale_rich_bodies(conn: &Connection) -> anyhow::Result<usize> {
+    Ok(conn.execute(
+        "UPDATE automation_definitions
+         SET rich_definition_json = NULL
+         WHERE rich_definition_json IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1
+               FROM automation_rich_definition_revisions AS recorded
+               WHERE recorded.automation_id = automation_definitions.id
+                 AND recorded.revision = automation_definitions.revision
+           )",
+        [],
+    )?)
+}
+
 /// Records what the definition's current revision means in rich terms, when
 /// it was authored richly. Called once per committed revision, inside its
 /// transaction, so every revision's rich body stays recoverable.
