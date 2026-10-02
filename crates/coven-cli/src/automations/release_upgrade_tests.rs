@@ -20,10 +20,16 @@ const V0_4_6_ROLLBACK: &str =
 fn restore(dump: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("coven.sqlite3");
-    Connection::open(&path)
-        .unwrap()
-        .execute_batch(dump)
-        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(dump).unwrap();
+    // As in the store the release wrote: one AUTOINCREMENT counter per table.
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT name FROM sqlite_sequence GROUP BY name HAVING COUNT(*) > 1"
+        ),
+        Vec::<String>::new()
+    );
     (dir, path)
 }
 
@@ -149,12 +155,20 @@ fn events(conn: &Connection) -> Vec<Event> {
     .unwrap()
 }
 
-/// The feed is dense, every stream counts up from zero to its head, and
-/// every event decodes as a v1 envelope.
+/// The feed is dense with its AUTOINCREMENT counter at the last position,
+/// every stream counts up from zero to its head, and every event decodes as
+/// a v1 envelope.
 fn assert_feed_is_whole(conn: &Connection) {
     let events = events(conn);
     let positions: Vec<i64> = events.iter().map(|event| event.feed_position).collect();
     assert_eq!(positions, (1..=events.len() as i64).collect::<Vec<_>>());
+    assert_eq!(
+        rows(
+            conn,
+            "SELECT seq FROM sqlite_sequence WHERE name = 'automation_events'"
+        ),
+        [format!("{:?}", [SqlValue::Integer(events.len() as i64)])]
+    );
     let mut streams: BTreeMap<(String, String), Vec<i64>> = BTreeMap::new();
     for event in &events {
         serde_json::from_value::<EventEnvelope>(event.body.clone()).unwrap_or_else(|error| {

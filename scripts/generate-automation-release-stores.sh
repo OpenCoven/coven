@@ -51,7 +51,12 @@ act() {
 }
 
 dump() { # <store directory> <fixture>
-  sqlite3 "$1/c/coven.sqlite3" .dump | sed "s#$1/c/#/coven-home/#g" >"$out/$2"
+  # Replaying the AUTOINCREMENT tables' rows already creates their
+  # sqlite_sequence entries, and not every sqlite3 build clears them before
+  # the dumped ones, so a restore would hold two rows per table.
+  sqlite3 "$1/c/coven.sqlite3" .dump |
+    awk '/^INSERT INTO sqlite_sequence / && !cleared { print "DELETE FROM sqlite_sequence;"; cleared = 1 } { print }' |
+    sed "s#$1/c/#/coven-home/#g" >"$out/$2"
   if grep -q "$work" "$out/$2"; then
     echo "a local path leaked into $2" >&2
     exit 1

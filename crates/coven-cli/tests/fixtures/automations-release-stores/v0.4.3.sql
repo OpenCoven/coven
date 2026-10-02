@@ -71,8 +71,8 @@ CREATE TABLE sessions (
             external INTEGER NOT NULL DEFAULT 0,
             transcript_path TEXT
         , transcript_indexed_at TEXT);
-INSERT INTO sessions VALUES('session-3bec78bf81fa4606ba82fe9f7a78ced2','/work/project','codex','Nightly review','failed',NULL,NULL,'2026-10-02T01:51:22.601Z','2026-10-02T01:51:22.601Z',NULL,NULL,'private',NULL,NULL,0,NULL,NULL);
-INSERT INTO sessions VALUES('session-179a7eeb4ef746dc9eae908eb3da3b25','/work/project','claude','Weekly digest','failed',NULL,NULL,'2026-10-02T01:51:22.834Z','2026-10-02T01:51:22.834Z',NULL,NULL,'private','charm',NULL,0,NULL,NULL);
+INSERT INTO sessions VALUES('session-7d32c8d0a3c844e198a165ea2b4d0098','/work/project','codex','Nightly review','failed',NULL,NULL,'2026-10-02T02:04:27.749Z','2026-10-02T02:04:27.749Z',NULL,NULL,'private',NULL,NULL,0,NULL,NULL);
+INSERT INTO sessions VALUES('session-e62a894f21214b9c8bfcf90411c84a5a','/work/project','claude','Weekly digest','failed',NULL,NULL,'2026-10-02T02:04:28.003Z','2026-10-02T02:04:28.003Z',NULL,NULL,'private','charm',NULL,0,NULL,NULL);
 CREATE TABLE request_adoptions (
             id TEXT PRIMARY KEY NOT NULL,
             adoption_key TEXT,
@@ -176,7 +176,7 @@ CREATE TABLE store_meta (
             value TEXT NOT NULL
         );
 INSERT INTO store_meta VALUES('events_fts_backfill_complete','1');
-INSERT INTO store_meta VALUES('travel_source_hub_id','hub_40914d51-27eb-478d-862d-db2254d1a6c0');
+INSERT INTO store_meta VALUES('travel_source_hub_id','hub_4bc21a68-46ac-4170-8343-3ebced9114ec');
 CREATE TABLE travel_profiles (
             id TEXT PRIMARY KEY NOT NULL,
             familiar_id TEXT NOT NULL,
@@ -315,9 +315,9 @@ CREATE TABLE automation_definitions (
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
-INSERT INTO automation_definitions VALUES('nightly-review','Nightly review','ACTIVE','{"schemaVersion":1,"id":"nightly-review","name":"Nightly review","status":"ACTIVE","rrule":"FREQ=DAILY;BYHOUR=3","timezone":"utc","misfire":"latest","overlap":"forbid","timeoutMinutes":30,"runtime":"codex","cwd":"/work/project","prompt":"Summarize the changes merged yesterday and list follow-ups."}','2026-10-02T01:51:22.487Z','2026-10-02T01:51:22.802Z');
-INSERT INTO automation_definitions VALUES('weekly-digest','Weekly digest','PAUSED','{"schemaVersion":1,"id":"weekly-digest","name":"Weekly digest","status":"PAUSED","rrule":"FREQ=WEEKLY;BYDAY=MO,TH;BYHOUR=9","timezone":"utc","misfire":"latest","overlap":"forbid","timeoutMinutes":30,"runtime":"claude","familiarId":"charm","cwd":"/work/project","prompt":"Write the weekly digest and flag open risks."}','2026-10-02T01:51:22.514Z','2026-10-02T01:51:22.774Z');
-INSERT INTO automation_definitions VALUES('legacy-standup','Legacy standup','PAUSED','{"schemaVersion":1,"id":"legacy-standup","name":"Legacy standup","status":"PAUSED","rrule":"FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8","timezone":"local","misfire":"latest","overlap":"forbid","timeoutMinutes":60,"runtime":"coven-code","prompt":"Draft the standup notes."}','2026-10-02T01:51:22.544Z','2026-10-02T01:51:22.544Z');
+INSERT INTO automation_definitions VALUES('nightly-review','Nightly review','ACTIVE','{"schemaVersion":1,"id":"nightly-review","name":"Nightly review","status":"ACTIVE","rrule":"FREQ=DAILY;BYHOUR=3","timezone":"utc","misfire":"latest","overlap":"forbid","timeoutMinutes":30,"runtime":"codex","cwd":"/work/project","prompt":"Summarize the changes merged yesterday and list follow-ups."}','2026-10-02T02:04:27.533Z','2026-10-02T02:04:27.973Z');
+INSERT INTO automation_definitions VALUES('weekly-digest','Weekly digest','PAUSED','{"schemaVersion":1,"id":"weekly-digest","name":"Weekly digest","status":"PAUSED","rrule":"FREQ=WEEKLY;BYDAY=MO,TH;BYHOUR=9","timezone":"utc","misfire":"latest","overlap":"forbid","timeoutMinutes":30,"runtime":"claude","familiarId":"charm","cwd":"/work/project","prompt":"Write the weekly digest and flag open risks."}','2026-10-02T02:04:27.586Z','2026-10-02T02:04:27.919Z');
+INSERT INTO automation_definitions VALUES('legacy-standup','Legacy standup','PAUSED','{"schemaVersion":1,"id":"legacy-standup","name":"Legacy standup","status":"PAUSED","rrule":"FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8","timezone":"local","misfire":"latest","overlap":"forbid","timeoutMinutes":60,"runtime":"coven-code","prompt":"Draft the standup notes."}','2026-10-02T02:04:27.628Z','2026-10-02T02:04:27.628Z');
 CREATE TABLE automation_occurrences (
         id TEXT PRIMARY KEY NOT NULL,
         automation_id TEXT NOT NULL,
@@ -332,8 +332,8 @@ CREATE TABLE automation_occurrences (
         updated_at TEXT NOT NULL,
         UNIQUE(automation_id, scheduled_for)
     );
-INSERT INTO automation_occurrences VALUES('occ-d1bb940e722b46ed85df40e0a4c635df','nightly-review','2026-10-02T01:51:22.599144000Z','manual','failed',NULL,NULL,1,'failed to spawn harness `codex` in piped mode: No such file or directory (os error 2)','2026-10-02T01:51:22.599Z','2026-10-02T01:51:22.601Z');
-INSERT INTO automation_occurrences VALUES('occ-c87fcc5616734d1f8033ebc6655e7a96','weekly-digest','2026-10-02T01:51:22.832672000Z','manual','failed',NULL,NULL,1,'unknown familiar `charm`; no familiars are configured in /coven-home/familiars.toml','2026-10-02T01:51:22.832Z','2026-10-02T01:51:22.834Z');
+INSERT INTO automation_occurrences VALUES('occ-a5468367d1c84e7bb22582337f6fd808','nightly-review','2026-10-02T02:04:27.746806000Z','manual','failed',NULL,NULL,1,'failed to spawn harness `codex` in piped mode: No such file or directory (os error 2)','2026-10-02T02:04:27.746Z','2026-10-02T02:04:27.749Z');
+INSERT INTO automation_occurrences VALUES('occ-d772d89d88164e9691b4aa5919488d9a','weekly-digest','2026-10-02T02:04:28.000725000Z','manual','failed',NULL,NULL,1,'unknown familiar `charm`; no familiars are configured in /coven-home/familiars.toml','2026-10-02T02:04:28.000Z','2026-10-02T02:04:28.003Z');
 CREATE TABLE automation_runs (
         id TEXT PRIMARY KEY NOT NULL,
         automation_id TEXT NOT NULL,
@@ -350,8 +350,9 @@ CREATE TABLE automation_runs (
         finished_at TEXT,
         FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE SET NULL
     );
-INSERT INTO automation_runs VALUES('run-e9999d226f7c489d86937bc456c12176','nightly-review','occ-d1bb940e722b46ed85df40e0a4c635df','session-3bec78bf81fa4606ba82fe9f7a78ced2',NULL,'codex','failed',NULL,NULL,NULL,'2026-10-02T01:51:22.601Z','2026-10-02T02:21:22.601Z','2026-10-02T01:51:22.601Z');
-INSERT INTO automation_runs VALUES('run-d118d9690d1549bdb86e61acb31898c4','weekly-digest','occ-c87fcc5616734d1f8033ebc6655e7a96','session-179a7eeb4ef746dc9eae908eb3da3b25','charm','claude','failed',NULL,NULL,NULL,'2026-10-02T01:51:22.834Z','2026-10-02T02:21:22.834Z','2026-10-02T01:51:22.834Z');
+INSERT INTO automation_runs VALUES('run-97037add4df743c180876b5edd416067','nightly-review','occ-a5468367d1c84e7bb22582337f6fd808','session-7d32c8d0a3c844e198a165ea2b4d0098',NULL,'codex','failed',NULL,NULL,NULL,'2026-10-02T02:04:27.749Z','2026-10-02T02:34:27.749Z','2026-10-02T02:04:27.749Z');
+INSERT INTO automation_runs VALUES('run-11da6625adfd4a6db25841ceaad3901e','weekly-digest','occ-d772d89d88164e9691b4aa5919488d9a','session-e62a894f21214b9c8bfcf90411c84a5a','charm','claude','failed',NULL,NULL,NULL,'2026-10-02T02:04:28.003Z','2026-10-02T02:34:28.003Z','2026-10-02T02:04:28.003Z');
+DELETE FROM sqlite_sequence;
 INSERT INTO sqlite_sequence VALUES('executor_result_envelopes',0);
 CREATE TRIGGER ward_audit_append_only_update
 BEFORE UPDATE ON ward_audit
