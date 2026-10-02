@@ -1770,7 +1770,14 @@ mod tests {
         }
     }
 
-    fn receipt_event(receipt: &AutomationReceipt, sequence: u64) -> EventEnvelope {
+    /// The receipt event at `offset` past the run stream's next sequence: the
+    /// fixture's run and attempt rows have already published transitions.
+    fn receipt_event(conn: &Connection, receipt: &AutomationReceipt, offset: u64) -> EventEnvelope {
+        let sequence =
+            crate::automations::contract::events::stream_head(conn, "run", receipt.run_id.as_str())
+                .unwrap()
+                .map_or(0, |head| head + 1)
+                + offset;
         let mut value = json!({
             "schemaVersion": "coven.automations.v1",
             "eventId": "evt00000000000000000000000000001",
@@ -2048,7 +2055,7 @@ mod tests {
     fn receipt_commit_is_atomic_immutable_and_replay_safe() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
 
         assert_eq!(
             commit_receipt(&fixture.conn, &receipt, &event).unwrap(),
@@ -2079,7 +2086,8 @@ mod tests {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM automation_events
-                 WHERE stream_kind = 'run' AND stream_id = 'run-daily-1'",
+                 WHERE stream_kind = 'run' AND stream_id = 'run-daily-1'
+                   AND json_extract(event_json, '$.kind') = 'receipt.recorded'",
                 [],
                 |row| row.get(0),
             )
@@ -2112,7 +2120,7 @@ mod tests {
     fn authorized_receipt_commit_reopens_with_validated_terminal_sidecar() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = terminal_authority(&fixture, &receipt);
         let pinned_before: String = fixture
             .conn
@@ -2167,7 +2175,7 @@ mod tests {
     fn authorized_commit_and_read_only_apply_live_terminal_verification() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = terminal_authority(&fixture, &receipt);
         let commit_verifier = TerminalOnlyVerifier::default();
         commit_authorized_receipt(&fixture.conn, &receipt, &event, &terminal, &commit_verifier)
@@ -2190,7 +2198,7 @@ mod tests {
     fn authority_sidecar_is_immutable_and_unique_per_receipt_run_and_attempt() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = terminal_authority(&fixture, &receipt);
         commit_authorized_receipt(
             &fixture.conn,
@@ -2268,7 +2276,7 @@ mod tests {
     fn authorized_receipt_requires_exact_base_digest_correlation() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = mutate_authority(terminal_authority(&fixture, &receipt), |value| {
             value[AUTHORITY_EXTENSION_KEY]["receiptEvidence"]["baseReceiptDigest"]["value"] =
                 json!("0".repeat(64));
@@ -2291,7 +2299,7 @@ mod tests {
                 make_authorized_receipt(&fixture, "receipt-daily-1"),
                 |value| value["sideEffectClass"] = json!(actual),
             );
-            let event = receipt_event(&receipt, 0);
+            let event = receipt_event(&fixture.conn, &receipt, 0);
             let terminal = terminal_authority(&fixture, &receipt);
 
             assert_eq!(
@@ -2316,7 +2324,7 @@ mod tests {
             make_authorized_receipt(&fixture, "receipt-daily-1"),
             |value| value["sideEffectClass"] = json!("irreversible_external_mutation"),
         );
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = terminal_authority(&fixture, &receipt);
 
         assert_authorized_failure_is_atomic(
@@ -2332,7 +2340,7 @@ mod tests {
     fn authorized_receipt_rejects_a_spliced_execution_binding() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = mutate_authority(terminal_authority(&fixture, &receipt), |value| {
             value[AUTHORITY_EXTENSION_KEY]["executionBinding"]["bindingId"] =
                 json!("binding:spliced");
@@ -2358,7 +2366,7 @@ mod tests {
         ] {
             let fixture = authorized_fixture();
             let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-            let event = receipt_event(&receipt, 0);
+            let event = receipt_event(&fixture.conn, &receipt, 0);
             let mut value = serde_json::to_value(terminal_authority(&fixture, &receipt)).unwrap();
             value[AUTHORITY_EXTENSION_KEY]["receiptEvidence"] = malformed;
             let terminal = extension_bag(value);
@@ -2381,7 +2389,7 @@ mod tests {
     fn authorized_receipt_requires_verifier_acceptance() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = terminal_authority(&fixture, &receipt);
 
         let error = assert_authorized_failure_is_atomic(
@@ -2398,7 +2406,7 @@ mod tests {
     fn authorized_receipt_replay_is_exact_and_conflicts_fail_closed() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = terminal_authority(&fixture, &receipt);
 
         assert_eq!(
@@ -2447,7 +2455,7 @@ mod tests {
     fn base_only_commit_rejects_authority_pinned_runs_before_fresh_or_replay_acceptance() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let before = receipt_commit_state(&fixture, &receipt, &event);
         assert!(commit_receipt(&fixture.conn, &receipt, &event).is_err());
         assert_eq!(receipt_commit_state(&fixture, &receipt, &event), before);
@@ -2472,7 +2480,7 @@ mod tests {
     fn structural_v1_base_receipt_commit_remains_available() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
 
         assert_eq!(
             commit_receipt(&fixture.conn, &receipt, &event).unwrap(),
@@ -2488,7 +2496,7 @@ mod tests {
     fn authorized_receipt_rolls_back_base_event_head_and_sidecar_when_sidecar_insert_fails() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = terminal_authority(&fixture, &receipt);
         fixture
             .conn
@@ -2515,7 +2523,11 @@ mod tests {
         for failure in ["missing-integrity", "out-of-order"] {
             let fixture = authorized_fixture();
             let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-            let mut event = receipt_event(&receipt, u64::from(failure == "out-of-order"));
+            let mut event = receipt_event(
+                &fixture.conn,
+                &receipt,
+                u64::from(failure == "out-of-order"),
+            );
             if failure == "missing-integrity" {
                 event.integrity = None;
             }
@@ -2571,7 +2583,7 @@ mod tests {
                     _ => unreachable!(),
                 },
             );
-            let event = receipt_event(&receipt, 0);
+            let event = receipt_event(&fixture.conn, &receipt, 0);
             let terminal = terminal_authority(&fixture, &receipt);
 
             assert_authorized_failure_is_atomic(
@@ -2603,7 +2615,7 @@ mod tests {
             } else {
                 make_authorized_receipt(&fixture, "receipt-daily-1")
             };
-            let event = receipt_event(&receipt, 0);
+            let event = receipt_event(&fixture.conn, &receipt, 0);
             let terminal = terminal_authority(&fixture, &receipt);
             commit_authorized_receipt(
                 &fixture.conn,
@@ -2688,7 +2700,7 @@ mod tests {
         ] {
             let fixture = authorized_fixture();
             let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-            let event = receipt_event(&receipt, 0);
+            let event = receipt_event(&fixture.conn, &receipt, 0);
             let terminal = terminal_authority(&fixture, &receipt);
             commit_authorized_receipt(
                 &fixture.conn,
@@ -2727,7 +2739,7 @@ mod tests {
     fn authorized_receipt_read_rejects_malformed_sidecar_without_disclosure() {
         let fixture = authorized_fixture();
         let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let terminal = terminal_authority(&fixture, &receipt);
         commit_authorized_receipt(
             &fixture.conn,
@@ -2765,7 +2777,7 @@ mod tests {
         for corruption in ["profile", "enum", "malformed"] {
             let fixture = authorized_fixture();
             let receipt = make_authorized_receipt(&fixture, "receipt-daily-1");
-            let event = receipt_event(&receipt, 0);
+            let event = receipt_event(&fixture.conn, &receipt, 0);
             let terminal = terminal_authority(&fixture, &receipt);
             let sentinel = format!("private-{corruption}-sentinel");
             if corruption == "malformed" {
@@ -2826,7 +2838,7 @@ mod tests {
     fn automation_receipt_read_survives_reopen_without_claiming_authentication() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         commit_receipt(&fixture.conn, &receipt, &event).unwrap();
 
         let reopened = crate::store::open_store(&fixture.store_path).unwrap();
@@ -2920,7 +2932,12 @@ mod tests {
                 serde_json::to_value(make_receipt(&fixture, "receipt-daily-1")).unwrap();
             value["integrity"]["authentication"] = json!(authentication);
             let receipt: AutomationReceipt = serde_json::from_value(value).unwrap();
-            commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+            commit_receipt(
+                &fixture.conn,
+                &receipt,
+                &receipt_event(&fixture.conn, &receipt, 0),
+            )
+            .unwrap();
             let response = read_response(&fixture, RequestAuthority::OwnerLocalIpc);
             assert_eq!(response.status, 200);
             let body: Value = serde_json::from_str(&response.body).unwrap();
@@ -2968,7 +2985,12 @@ mod tests {
             value["integrity"]["value"] =
                 json!(sha256_hex(&canonicalize_without_integrity(&value).unwrap()));
             let receipt: AutomationReceipt = serde_json::from_value(value).unwrap();
-            commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+            commit_receipt(
+                &fixture.conn,
+                &receipt,
+                &receipt_event(&fixture.conn, &receipt, 0),
+            )
+            .unwrap();
             let response = read_response(&fixture, RequestAuthority::OwnerLocalIpc);
             assert_eq!(response.status, 403);
             assert!(!response.body.contains("private receipt content"));
@@ -2998,7 +3020,12 @@ mod tests {
     fn automation_receipt_read_requires_integrity_for_non_correlation_event_fields() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+        commit_receipt(
+            &fixture.conn,
+            &receipt,
+            &receipt_event(&fixture.conn, &receipt, 0),
+        )
+        .unwrap();
         fixture
             .conn
             .execute_batch(
@@ -3018,7 +3045,12 @@ mod tests {
     fn automation_receipt_read_rejects_malformed_receipt_json_without_disclosure() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+        commit_receipt(
+            &fixture.conn,
+            &receipt,
+            &receipt_event(&fixture.conn, &receipt, 0),
+        )
+        .unwrap();
         fixture
             .conn
             .execute_batch(
@@ -3037,7 +3069,12 @@ mod tests {
     fn automation_receipt_read_rejects_malformed_event_json_without_disclosure() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+        commit_receipt(
+            &fixture.conn,
+            &receipt,
+            &receipt_event(&fixture.conn, &receipt, 0),
+        )
+        .unwrap();
         fixture
             .conn
             .execute_batch(
@@ -3076,7 +3113,12 @@ mod tests {
         ] {
             let fixture = fixture();
             let receipt = make_receipt(&fixture, "receipt-daily-1");
-            commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+            commit_receipt(
+                &fixture.conn,
+                &receipt,
+                &receipt_event(&fixture.conn, &receipt, 0),
+            )
+            .unwrap();
             fixture.conn.execute_batch(corrupt_sql).unwrap();
             assert!(
                 read_receipt(&fixture.conn, "receipt-daily-1").is_err(),
@@ -3093,14 +3135,14 @@ mod tests {
     fn receipt_commit_refuses_conflict_or_correlation_mismatch() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         assert_eq!(
             commit_receipt(&fixture.conn, &receipt, &event).unwrap(),
             ReceiptCommitOutcome::Committed
         );
 
         let conflicting = make_receipt(&fixture, "receipt-daily-2");
-        let conflicting_event = receipt_event(&conflicting, 1);
+        let conflicting_event = receipt_event(&fixture.conn, &conflicting, 1);
         assert!(commit_receipt(&fixture.conn, &conflicting, &conflicting_event).is_err());
 
         let stored: String = fixture
@@ -3118,7 +3160,7 @@ mod tests {
     fn receipt_commit_rolls_back_when_event_append_fails() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        let out_of_order_event = receipt_event(&receipt, 1);
+        let out_of_order_event = receipt_event(&fixture.conn, &receipt, 1);
 
         assert!(commit_receipt(&fixture.conn, &receipt, &out_of_order_event).is_err());
         let receipt_count: i64 = fixture
@@ -3143,7 +3185,7 @@ mod tests {
     fn receipt_commit_refuses_missing_event_integrity_without_writes() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        let mut event = receipt_event(&receipt, 0);
+        let mut event = receipt_event(&fixture.conn, &receipt, 0);
         event.integrity = None;
 
         let before = receipt_commit_state(&fixture, &receipt, &event);
@@ -3169,7 +3211,7 @@ mod tests {
         let digest = sha256_hex(&canonicalize_without_integrity(&value).unwrap());
         value["integrity"]["value"] = Value::String(digest);
         let mismatched: AutomationReceipt = serde_json::from_value(value).unwrap();
-        let event = receipt_event(&mismatched, 0);
+        let event = receipt_event(&fixture.conn, &mismatched, 0);
 
         assert!(commit_receipt(&fixture.conn, &mismatched, &event).is_err());
         let receipt_count: i64 = fixture
@@ -3185,7 +3227,7 @@ mod tests {
     fn receipt_commit_requires_attempt_and_run_to_share_the_occurrence() {
         let fixture = fixture_with_attempt_occurrence("occurrence-daily-2");
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
 
         assert!(commit_receipt(&fixture.conn, &receipt, &event).is_err());
         let receipt_count: i64 = fixture
@@ -3201,7 +3243,7 @@ mod tests {
     fn concurrent_identical_receipt_commits_converge_to_replay() {
         let fixture = fixture();
         let receipt = make_receipt(&fixture, "receipt-daily-1");
-        let event = receipt_event(&receipt, 0);
+        let event = receipt_event(&fixture.conn, &receipt, 0);
         let barrier = Arc::new(Barrier::new(2));
         let mut workers = Vec::new();
         for _ in 0..2 {

@@ -553,6 +553,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     crate::automations::contract::migration::migrate_legacy_contract_metadata(conn)?;
     conn.execute_batch(crate::automations::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
         .context("failed to initialize automation events schema")?;
+    crate::automations::transition_events::ensure_transition_triggers(conn)?;
     conn.execute_batch(crate::automations::receipts::AUTOMATION_RECEIPTS_SCHEMA_SQL)
         .context("failed to initialize automation receipts schema")?;
     conn.execute_batch(
