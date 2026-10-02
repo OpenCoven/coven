@@ -418,6 +418,22 @@ pub fn read_verified_runtime_terminal_evidence(
     lookup: RuntimeTerminalEvidenceLookup<'_>,
     verifier: &dyn RuntimeTerminalEvidenceVerifier,
 ) -> Result<Option<VerifiedRuntimeTerminalEvidence>, RuntimeTerminalEvidenceError> {
+    Ok(
+        read_verified_runtime_terminal_evidence_with_binding(conn, lookup, verifier)?
+            .map(|(evidence, _)| evidence),
+    )
+}
+
+/// Verified evidence together with the pinned binding it was verified
+/// against, for a consumer that settles the attempt the binding names.
+pub(crate) fn read_verified_runtime_terminal_evidence_with_binding(
+    conn: &Connection,
+    lookup: RuntimeTerminalEvidenceLookup<'_>,
+    verifier: &dyn RuntimeTerminalEvidenceVerifier,
+) -> Result<
+    Option<(VerifiedRuntimeTerminalEvidence, AutomationExecutionBinding)>,
+    RuntimeTerminalEvidenceError,
+> {
     if conn.is_autocommit() {
         let transaction = conn
             .unchecked_transaction()
@@ -435,7 +451,10 @@ fn read_verified_runtime_terminal_evidence_in(
     conn: &Connection,
     lookup: RuntimeTerminalEvidenceLookup<'_>,
     verifier: &dyn RuntimeTerminalEvidenceVerifier,
-) -> Result<Option<VerifiedRuntimeTerminalEvidence>, RuntimeTerminalEvidenceError> {
+) -> Result<
+    Option<(VerifiedRuntimeTerminalEvidence, AutomationExecutionBinding)>,
+    RuntimeTerminalEvidenceError,
+> {
     let stored = match lookup {
         RuntimeTerminalEvidenceLookup::EvidenceId(evidence_id) => {
             read_stored(conn, "evidence_id", evidence_id)?
@@ -468,7 +487,7 @@ fn read_verified_runtime_terminal_evidence_in(
             RuntimeTerminalEvidenceErrorCode::StoredEvidenceInvalid,
         ));
     }
-    Ok(Some(verified))
+    Ok(Some((verified, binding)))
 }
 
 fn read_stored(

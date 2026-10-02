@@ -49,11 +49,29 @@ idempotent replay into a snapshot race.
 This slice intentionally adds no daemon action or other public submission
 endpoint, advertises no runtime capability, and constructs no launched-session
 receipt. The Ed25519 verifier in `automations/ed25519_trust.rs` has no production
-caller and no configured keys, so nothing is accepted. Until a production runtime adapter can
-submit and consume trustworthy evidence, reconciliation places terminal
-Runtime Authority sessions on the existing recovery-required surface and
-leaves their run and attempt unresolved. Output text, exit status, granted
-capabilities, and merely stored but unconsumed inbox rows cannot settle them.
+caller and no configured keys, so nothing is accepted. Production
+reconciliation has no Runtime Authority adapter, so it places terminal Runtime
+Authority sessions on the existing recovery-required surface and leaves their
+run and attempt unresolved. Output text, exit status and granted capabilities
+cannot settle them.
+
+With an adapter and an evidence verifier, the same reconciliation pass consumes
+the attempt's verified evidence when the session ends
+(`settle_finished_runs_with`):
+
+- **Complete evidence, occurrence still running.** The attempt settles to the
+  evidence's disposition, through `observing` where the published attempt
+  machine requires it. The occurrence and run settle to the same outcome, and
+  the launched receipt and its authority sidecar commit in the same
+  transaction.
+- **Partial, ambiguous, unknown or policy-violating evidence.** No receipt
+  commits. The occurrence stays `recovery_required`, with a reason naming the
+  classification.
+- **Unverifiable evidence, or none.** The same hold, with its own reason.
+- **Evidence arriving after the hold.** The published occurrence machine leaves
+  `recovery_required` only for `failed` or a new dispatch, so this goes to
+  operator recovery rather than settling.
+
 The already-terminal dispatcher-controlled no-launch refusal remains separate,
 and base-v1 reconciliation is unchanged.
 
@@ -98,7 +116,7 @@ runtime terminal observation
   -> [missing producer]
   -> Ed25519 verification against out-of-band trusted keys [no keys configured]
   -> immutable verified inbox
-  -> [missing evidence consumer]
+  -> evidence consumer at session end [no production adapter]
   -> immutable base receipt + authority sidecar correlation
   -> immutable receipt commitment + run reference + receipt event
   -> owner-local base read (principal-aware sensitive reads still missing)
@@ -118,9 +136,9 @@ The first path is useful operational history. It is not an
 | Retry and timeout settlement | Existing, partial v1 projection | Rejected pre-ownership launches persist failed attempts and either schedule a new adopted attempt or finish the run (`crates/coven-cli/src/automations/runner.rs:505-662`). A waiting retry that exceeds the run deadline records an attempt as `timed_out` but finishes the run as `failed` (`runner.rs:1793-1868`). |
 | Occurrence distinctions | Existing, narrower than the v1 schema | Production occurrence rows use `planned`, `claimed`, `running`, `succeeded`, `failed`, and `skipped`; stale planned slots become `skipped` during claim (`crates/coven-cli/src/automations/occurrences.rs:127-179`), while settlement accepts only `succeeded` or `failed` (`occurrences.rs:371-413`). `skipped` is occurrence evidence, not a receipt outcome. |
 | Receipt construction | No-launch case implemented; launched-session producer missing | `build_no_launch_receipt` and `settle_runtime_authority_unsupported` construct and commit a receipt only when the dispatcher itself proves no runtime invocation. Production Runtime Authority construction is still blocked on its trusted adapter. Launched sessions lack authenticated observations of effects, exercised capabilities, and result/delivery evidence, so the legacy run projection must not fabricate their receipts. |
-| Runtime terminal evidence contract and inbox | Proposed internal seam; production adapters missing | `coven.automations.runtime-terminal-evidence.v1` defines closed typed observations, JCS integrity, domain-separated authentication, privacy/retention, exact binding/runtime correlation, and receipt-eligibility classification. `automation_runtime_terminal_evidence` stores verified canonical evidence immutably and preserves authenticated policy violations. `automations/ed25519_trust.rs` verifies its Ed25519 signature over the raw signed digest against out-of-band trusted keys, by exact key and proof, producer, validity window and revocation; it has no production caller or configured keys. There is no public submission action, no runtime capability advertisement, and reconciliation does not consume these rows yet. |
+| Runtime terminal evidence contract and inbox | Proposed internal seam; production adapters missing | `coven.automations.runtime-terminal-evidence.v1` defines closed typed observations, JCS integrity, domain-separated authentication, privacy/retention, exact binding/runtime correlation, and receipt-eligibility classification. `automation_runtime_terminal_evidence` stores verified canonical evidence immutably and preserves authenticated policy violations. `automations/ed25519_trust.rs` verifies its Ed25519 signature over the raw signed digest against out-of-band trusted keys, by exact key and proof, producer, validity window and revocation; it has no production caller or configured keys. There is no public submission action and no runtime capability advertisement. Reconciliation consumes these rows only when given an adapter and a verifier, which production does not have. |
 | Durable receipt persistence | Base and authority-sidecar commitment implemented | `automation_receipts` stores one validated receipt per run and terminal attempt. `commit_authorized_receipt` commits the base receipt, immutable correlated sidecar, run reference, and `receipt.recorded` event together (`crates/coven-cli/src/automations/receipts.rs`). Database triggers refuse mutation/deletion and receipt-reference reassignment. The dispatcher-controlled no-launch path uses this seam; normal launched-session settlement does not. |
-| Receipt idempotency and restart recovery | Commitment and no-launch replay are safe; launched-session settlement remains missing | Replaying identical receipt/event/sidecar evidence returns the committed result without a second row or event. A changed body, identifier, correlation, event, or authority sidecar fails closed, and a write failure rolls back the atomic commitment. Launched-session restart settlement still needs authenticated terminal evidence production and consumption. |
+| Receipt idempotency and restart recovery | Commitment and no-launch replay are safe; launched-session settlement implemented behind the missing adapter | Replaying identical receipt/event/sidecar evidence returns the committed result without a second row or event. A changed body, identifier, correlation, event, or authority sidecar fails closed, and a write failure rolls back the atomic commitment. Launched-session settlement consumes complete verified evidence when the session ends and commits the receipt atomically; it still needs a production evidence producer and adapter. |
 | Run/attempt correlation inputs | Existing, with immutable authority slots | Runs pin definition revision/digest, occurrence, and nullable authority profile; attempts pin run, occurrence, attempt number, adoption key, occurrence fence, dispatch generation, session, and nullable authority-extension JSON (`crates/coven-cli/src/automations/runs.rs`). Database triggers prevent a pinned run profile or attempt extension from being rewritten and prevent deletion of an authority-bound attempt. |
 | Runtime authority companion contract | Dispatch pin seam exists; production adapter missing | The profile defines the execution binding and receipt-correlated sidecar and requires terminal evidence to match the base receipt (`spec/coven-automations/authority/v1/README.md:1-41`). The runner's explicit Runtime Authority mode now resolves, validates, exactly correlates, and stores one pre-dispatch extension in the same immediate transaction that moves the attempt to `dispatching`, before runtime launch (`crates/coven-cli/src/automations/runner.rs`). Existing scheduler and manual-run entry points remain base-v1 because no trusted Familiar/Threads/approval/runtime adapter is wired and the capability is not advertised. |
 | Authority and approval outcome distinction | Contract and dispatch pin seam exist; live policy adapter is missing | The companion admits only `permit` and satisfied `requires_approval` bindings and makes `degrade_to_proposal` or `reject` non-dispatch outcomes (`spec/coven-automations/authority/v1/README.md:39-64`). Runtime Authority validation failures roll back the launch transaction and expose only stable refusal codes, but current production Automations actions still have no approval request/decision or effective-authority read action (`crates/coven-cli/src/control_plane.rs:108-131`). |

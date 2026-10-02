@@ -21,6 +21,10 @@ use super::contract::authority::{
 };
 use super::contract::canonical_json::{canonicalize_without_integrity, sha256_hex};
 use super::contract::events::append_event;
+use super::contract::runtime_terminal_evidence::{
+    RuntimeDeliveryEvidence, RuntimeExercisedCapabilities, RuntimeResultEvidence,
+    RuntimeSideEffects, RuntimeTerminalEvidence,
+};
 use super::contract::types::{
     AutomationReceipt, Canonicalization, ComponentName, Detail, DigestAlgorithm, DigestValue,
     EventEnvelope, EventId, EventKind, EventPayload, EventPrivacy, EventStreamId, EventSummary,
@@ -45,11 +49,22 @@ fn receipt_producer() -> Result<ProducerIdentity> {
     })
 }
 
-pub(crate) fn build_no_launch_receipt(
+/// What a receipt reports beyond the binding its attempt was dispatched under.
+struct ReceiptObservation {
+    side_effect_class: SideEffectClass,
+    exercised_capabilities: ExercisedCapabilities,
+    result_digest: Option<DigestValue>,
+    delivery_digest: Option<DigestValue>,
+    outcome: ReceiptOutcome,
+    privacy: ReceiptPrivacy,
+}
+
+fn build_authority_receipt(
     receipt_id: &str,
     binding: &AutomationExecutionBinding,
     familiar_id: &str,
     produced_at: DateTime<Utc>,
+    observation: ReceiptObservation,
 ) -> Result<AutomationReceipt> {
     let produced_at =
         Timestamp::new(produced_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))?;
@@ -77,21 +92,11 @@ pub(crate) fn build_no_launch_receipt(
             approval: None,
         }),
         runtime: None,
-        delivery_digest: None,
-        result_digest: None,
-        exercised_capabilities: Some(ExercisedCapabilities::empty()),
-        side_effect_class: SideEffectClass::None,
-        outcome: ReceiptOutcome {
-            disposition: TerminalOutcome::Failed,
-            failure_class: Some(FailureClass::new(
-                "runtime_authority_unsupported".to_string(),
-            )?),
-            detail: Some(Detail::new(
-                NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL.to_string(),
-            )?),
-            partial_failures: None,
-            recovery_disposition: Some(ReceiptRecoveryDisposition::NotRequired),
-        },
+        delivery_digest: observation.delivery_digest,
+        result_digest: observation.result_digest,
+        exercised_capabilities: Some(observation.exercised_capabilities),
+        side_effect_class: observation.side_effect_class,
+        outcome: observation.outcome,
         produced_at,
         producer: receipt_producer()?,
         integrity: ReceiptIntegrity {
@@ -100,20 +105,134 @@ pub(crate) fn build_no_launch_receipt(
             value: Sha256Digest::new("0".repeat(64))?,
             authentication: Some(ReceiptAuthentication::None),
         },
-        privacy: ReceiptPrivacy {
-            classification: PrivacyClassification::Operational,
-            retention: RetentionClass {
-                classification: RetentionClassification::Standard,
-                delete_after: None,
-            },
-            notes: None,
-        },
+        privacy: observation.privacy,
     };
     let value = serde_json::to_value(&receipt)?;
     receipt.integrity.value =
         Sha256Digest::new(sha256_hex(&canonicalize_without_integrity(&value)?))?;
     receipt.verify_integrity()?;
     Ok(receipt)
+}
+
+pub(crate) fn build_no_launch_receipt(
+    receipt_id: &str,
+    binding: &AutomationExecutionBinding,
+    familiar_id: &str,
+    produced_at: DateTime<Utc>,
+) -> Result<AutomationReceipt> {
+    build_authority_receipt(
+        receipt_id,
+        binding,
+        familiar_id,
+        produced_at,
+        ReceiptObservation {
+            side_effect_class: SideEffectClass::None,
+            exercised_capabilities: ExercisedCapabilities::empty(),
+            result_digest: None,
+            delivery_digest: None,
+            outcome: ReceiptOutcome {
+                disposition: TerminalOutcome::Failed,
+                failure_class: Some(FailureClass::new(
+                    "runtime_authority_unsupported".to_string(),
+                )?),
+                detail: Some(Detail::new(
+                    NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL.to_string(),
+                )?),
+                partial_failures: None,
+                recovery_disposition: Some(ReceiptRecoveryDisposition::NotRequired),
+            },
+            privacy: ReceiptPrivacy {
+                classification: PrivacyClassification::Operational,
+                retention: RetentionClass {
+                    classification: RetentionClassification::Standard,
+                    delete_after: None,
+                },
+                notes: None,
+            },
+        },
+    )
+}
+
+/// The attempt failure class and reason a launched receipt reports for a
+/// terminal disposition. Settlement writes the same values onto the attempt,
+/// which the receipt commitment checks.
+pub(crate) fn launched_terminal_detail(
+    disposition: TerminalOutcome,
+) -> (Option<&'static str>, Option<&'static str>) {
+    match disposition {
+        TerminalOutcome::Succeeded => (None, None),
+        TerminalOutcome::Failed => (None, Some("authenticated runtime evidence reports failure")),
+        TerminalOutcome::Cancelled => (
+            Some("cancelled"),
+            Some("authenticated runtime evidence reports cancellation"),
+        ),
+        TerminalOutcome::TimedOut => (
+            Some("timeout"),
+            Some("authenticated runtime evidence reports a timeout"),
+        ),
+        TerminalOutcome::Ambiguous => (None, Some("authenticated runtime evidence is ambiguous")),
+    }
+}
+
+/// The receipt for a launched attempt, from complete, verified runtime
+/// terminal evidence: its disposition, observed side effects and exercised
+/// capabilities, result and delivery digests, and privacy.
+pub(crate) fn build_launched_receipt(
+    receipt_id: &str,
+    binding: &AutomationExecutionBinding,
+    familiar_id: &str,
+    evidence: &RuntimeTerminalEvidence,
+    produced_at: DateTime<Utc>,
+) -> Result<AutomationReceipt> {
+    let RuntimeSideEffects::Observed { maximum_class, .. } = evidence.side_effects else {
+        anyhow::bail!("a launched receipt requires observed side effects");
+    };
+    let RuntimeExercisedCapabilities::Observed { values, .. } = &evidence.exercised_capabilities
+    else {
+        anyhow::bail!("a launched receipt requires observed capabilities");
+    };
+    let result_digest = match &evidence.result {
+        RuntimeResultEvidence::Produced { digest } => digest.clone(),
+        RuntimeResultEvidence::NotProduced => None,
+        RuntimeResultEvidence::Unknown { .. } => {
+            anyhow::bail!("a launched receipt requires a known result")
+        }
+    };
+    let delivery_digest = match &evidence.delivery {
+        RuntimeDeliveryEvidence::NotAttempted => None,
+        RuntimeDeliveryEvidence::Committed { digest }
+        | RuntimeDeliveryEvidence::Failed { digest }
+        | RuntimeDeliveryEvidence::Partial { digest } => digest.clone(),
+        RuntimeDeliveryEvidence::Unknown { .. } => {
+            anyhow::bail!("a launched receipt requires a known delivery")
+        }
+    };
+    let (failure_class, detail) = launched_terminal_detail(evidence.disposition);
+    build_authority_receipt(
+        receipt_id,
+        binding,
+        familiar_id,
+        produced_at,
+        ReceiptObservation {
+            side_effect_class: maximum_class,
+            exercised_capabilities: serde_json::from_value(serde_json::to_value(values)?)
+                .context("observed capabilities are not receipt capabilities")?,
+            result_digest,
+            delivery_digest,
+            outcome: ReceiptOutcome {
+                disposition: evidence.disposition,
+                failure_class: failure_class
+                    .map(|class| FailureClass::new(class.to_string()))
+                    .transpose()?,
+                detail: detail
+                    .map(|detail| Detail::new(detail.to_string()))
+                    .transpose()?,
+                partial_failures: None,
+                recovery_disposition: Some(ReceiptRecoveryDisposition::NotRequired),
+            },
+            privacy: evidence.privacy.clone(),
+        },
+    )
 }
 
 pub(crate) fn build_receipt_recorded_event(
@@ -1304,7 +1423,7 @@ const fn terminal_outcome_name(outcome: TerminalOutcome) -> &'static str {
     }
 }
 
-const fn terminal_states(outcome: TerminalOutcome) -> (&'static str, &'static str) {
+pub(crate) const fn terminal_states(outcome: TerminalOutcome) -> (&'static str, &'static str) {
     match outcome {
         TerminalOutcome::Succeeded => ("succeeded", "succeeded"),
         TerminalOutcome::Failed => ("failed", "failed"),

@@ -22,6 +22,11 @@ use super::contract::authority::{
     AUTHORITY_PROFILE, RUNTIME_AUTHORITY_CAPABILITY,
 };
 use super::contract::events::stream_head;
+use super::contract::runtime_terminal_evidence::{
+    RuntimeTerminalEvidence, RuntimeTerminalEvidenceClassification,
+    RuntimeTerminalEvidenceErrorCode, RuntimeTerminalEvidenceVerifier,
+};
+use super::contract::types::TerminalOutcome;
 use super::contract::types::{AutomationReceipt, BackoffPolicy, ExtensionBag, RetryableClass};
 use super::definition::{RoutineDefinition, RoutineRetryPolicy};
 use super::occurrences::{
@@ -29,18 +34,32 @@ use super::occurrences::{
     recover_expired_leases_with_scheduler_fence, settle_occurrence,
 };
 use super::receipts::{
-    build_no_launch_receipt, build_receipt_recorded_event, commit_authorized_receipt, read_receipt,
+    build_launched_receipt, build_no_launch_receipt, build_receipt_recorded_event,
+    commit_authorized_receipt, launched_terminal_detail, read_receipt, terminal_states,
     ReceiptCommitOutcome, NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL,
 };
 use super::runs::{
     is_retry_quarantined, record_retry_exhaustion, record_run_finish, record_run_start, RunFinish,
     RunStart,
 };
+use super::runtime_terminal_evidence::{
+    read_verified_runtime_terminal_evidence_with_binding, RuntimeTerminalEvidenceLookup,
+};
 use crate::api::{SessionLaunch, SessionRuntime};
 use crate::harness::HarnessLaunchMode;
 
 const RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON: &str =
     "trusted runtime terminal evidence is required before Runtime Authority settlement";
+const RUNTIME_TERMINAL_EVIDENCE_UNVERIFIABLE_REASON: &str =
+    "stored runtime terminal evidence could not be verified; recovery required";
+const RUNTIME_TERMINAL_EVIDENCE_PARTIAL_REASON: &str =
+    "authenticated runtime terminal evidence is partial or ambiguous; recovery required";
+const RUNTIME_TERMINAL_EVIDENCE_UNKNOWN_REASON: &str =
+    "authenticated runtime terminal evidence reports unknown observations; recovery required";
+const RUNTIME_TERMINAL_EVIDENCE_POLICY_REASON: &str =
+    "authenticated runtime terminal evidence exceeds the authorized binding; recovery required";
+const RUNTIME_TERMINAL_EVIDENCE_LATE_REASON: &str =
+    "verified runtime terminal evidence arrived after the recovery hold; operator recovery required";
 
 pub(crate) fn containment_receipt_path(coven_home: &Path, session_id: &str) -> PathBuf {
     coven_home
@@ -792,7 +811,7 @@ fn no_launch_receipt_id(binding: &AutomationExecutionBinding) -> String {
     format!("receipt-{}", digest.to_hex())
 }
 
-fn no_launch_receipt_event_id(receipt_id: &str) -> String {
+fn receipt_event_id(receipt_id: &str) -> String {
     let digest = blake3::hash(receipt_id.as_bytes()).to_hex().to_string();
     format!("evt{}", &digest[..32])
 }
@@ -837,7 +856,7 @@ fn settle_runtime_authority_unsupported(
     if let Some(fence) = scheduler_fence {
         require_current_scheduler_fence(&transaction, occurrence_id, fence)?;
     }
-    let event_id = no_launch_receipt_event_id(receipt.receipt_id.as_str());
+    let event_id = receipt_event_id(receipt.receipt_id.as_str());
     let existing_sequence = transaction
         .query_row(
             "SELECT sequence FROM automation_events WHERE event_id = ?1",
@@ -3190,6 +3209,7 @@ pub(crate) fn settle_confirmed_stop(
                     &transaction,
                     run_id,
                     &occurrence_id,
+                    RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON,
                     now,
                 )?;
                 transaction
@@ -3235,7 +3255,13 @@ pub(crate) fn settle_confirmed_stop(
             format!("automation run `{run_id}` changed before stop settlement completed")
         })?;
     if authority_profile.as_deref() == Some(AUTHORITY_PROFILE) {
-        hold_runtime_authority_terminal_settlement_in(&transaction, run_id, &occurrence_id, now)?;
+        hold_runtime_authority_terminal_settlement_in(
+            &transaction,
+            run_id,
+            &occurrence_id,
+            RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON,
+            now,
+        )?;
         transaction
             .execute(
                 "DELETE FROM automation_stop_fences
@@ -3531,6 +3557,23 @@ pub fn settle_finished_runs(
     conn: &Connection,
     now: DateTime<Utc>,
 ) -> Result<SettlementReport, String> {
+    settle_finished_runs_with(conn, now, None)
+}
+
+/// What terminal settlement needs to consume Runtime Authority evidence.
+/// Production supplies none, so every terminal Runtime Authority session is
+/// held for recovery until a trusted adapter exists (coven#857).
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeAuthoritySettlement<'a> {
+    pub authority: &'a dyn AutomationDispatchAuthority,
+    pub evidence: &'a dyn RuntimeTerminalEvidenceVerifier,
+}
+
+pub(crate) fn settle_finished_runs_with(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    runtime_authority: Option<RuntimeAuthoritySettlement<'_>>,
+) -> Result<SettlementReport, String> {
     type RunningRow = (
         String,
         Option<String>,
@@ -3633,10 +3676,33 @@ pub fn settle_finished_runs(
             continue;
         }
         if authority_profile.as_deref() == Some(AUTHORITY_PROFILE) {
+            let reason = match runtime_authority {
+                Some(settlement) => match consume_runtime_terminal_evidence(
+                    conn,
+                    &run_id,
+                    occurrence_id.as_deref(),
+                    occurrence_state.as_deref(),
+                    exit_code,
+                    settlement,
+                    now,
+                )? {
+                    EvidenceConsumption::Settled(disposition) => {
+                        match disposition {
+                            TerminalOutcome::Succeeded => report.succeeded += 1,
+                            TerminalOutcome::Cancelled => report.cancelled += 1,
+                            _ => report.failed += 1,
+                        }
+                        continue;
+                    }
+                    EvidenceConsumption::Held(reason) => reason,
+                },
+                None => RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON,
+            };
             hold_runtime_authority_terminal_settlement(
                 conn,
                 &run_id,
                 occurrence_id.as_deref(),
+                reason,
                 now,
             )?;
             continue;
@@ -3807,10 +3873,282 @@ pub fn settle_finished_runs(
     Ok(report)
 }
 
+enum EvidenceConsumption {
+    Settled(TerminalOutcome),
+    Held(&'static str),
+}
+
+/// Settles a terminal Runtime Authority session from its verified runtime
+/// terminal evidence, or says why it stays held. Only complete evidence
+/// settles, and only while the occurrence is still running: the published
+/// occurrence machine leaves `recovery_required` only for `failed` or a new
+/// dispatch, so evidence that arrives after the hold goes to operator
+/// recovery. Partial, unknown and policy-violating evidence commits no receipt.
+fn consume_runtime_terminal_evidence(
+    conn: &Connection,
+    run_id: &str,
+    occurrence_id: Option<&str>,
+    occurrence_state: Option<&str>,
+    exit_code: Option<i64>,
+    settlement: RuntimeAuthoritySettlement<'_>,
+    now: DateTime<Utc>,
+) -> Result<EvidenceConsumption, String> {
+    let occurrence_id = occurrence_id
+        .ok_or_else(|| format!("running automation run `{run_id}` has no occurrence"))?;
+    let attempt: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT attempt.id, attempt.session_id, run.familiar_id
+             FROM automation_attempts AS attempt
+             JOIN automation_runs AS run ON run.id = attempt.run_id
+             WHERE attempt.run_id = ?1
+               AND attempt.state IN ('started', 'observing')
+             ORDER BY attempt.attempt_number DESC
+             LIMIT 1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read Runtime Authority attempt: {error}"))?;
+    let Some((attempt_id, Some(session_id), Some(familiar_id))) = attempt else {
+        return Ok(EvidenceConsumption::Held(
+            RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON,
+        ));
+    };
+    let verified = match read_verified_runtime_terminal_evidence_with_binding(
+        conn,
+        RuntimeTerminalEvidenceLookup::AttemptId(&attempt_id),
+        settlement.evidence,
+    ) {
+        Ok(Some(verified)) => verified,
+        Ok(None) => {
+            return Ok(EvidenceConsumption::Held(
+                RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON,
+            ))
+        }
+        Err(error) if error.code() == RuntimeTerminalEvidenceErrorCode::StoreUnavailable => {
+            return Err(format!(
+                "failed to read Runtime Authority terminal evidence: {}",
+                error.code().as_str()
+            ))
+        }
+        Err(_) => {
+            return Ok(EvidenceConsumption::Held(
+                RUNTIME_TERMINAL_EVIDENCE_UNVERIFIABLE_REASON,
+            ))
+        }
+    };
+    let (verified, binding) = verified;
+    let reason = match verified.classification {
+        RuntimeTerminalEvidenceClassification::ReceiptEligibleComplete => {
+            if !matches!(occurrence_state, Some("claimed" | "running")) {
+                return Ok(EvidenceConsumption::Held(
+                    RUNTIME_TERMINAL_EVIDENCE_LATE_REASON,
+                ));
+            }
+            settle_from_runtime_terminal_evidence(
+                conn,
+                TerminalEvidenceSettlement {
+                    run_id,
+                    occurrence_id,
+                    attempt_id: &attempt_id,
+                    session_id: &session_id,
+                    familiar_id: &familiar_id,
+                    exit_code,
+                    evidence: &verified.evidence,
+                    binding: &binding,
+                },
+                settlement.authority,
+                now,
+            )?;
+            return Ok(EvidenceConsumption::Settled(verified.evidence.disposition));
+        }
+        RuntimeTerminalEvidenceClassification::AuthenticatedPartialOrAmbiguous => {
+            RUNTIME_TERMINAL_EVIDENCE_PARTIAL_REASON
+        }
+        RuntimeTerminalEvidenceClassification::AuthenticatedUnknown => {
+            RUNTIME_TERMINAL_EVIDENCE_UNKNOWN_REASON
+        }
+        RuntimeTerminalEvidenceClassification::PolicyViolating => {
+            RUNTIME_TERMINAL_EVIDENCE_POLICY_REASON
+        }
+    };
+    Ok(EvidenceConsumption::Held(reason))
+}
+
+struct TerminalEvidenceSettlement<'a> {
+    run_id: &'a str,
+    occurrence_id: &'a str,
+    attempt_id: &'a str,
+    session_id: &'a str,
+    familiar_id: &'a str,
+    exit_code: Option<i64>,
+    evidence: &'a RuntimeTerminalEvidence,
+    binding: &'a AutomationExecutionBinding,
+}
+
+fn launched_receipt_id(binding: &AutomationExecutionBinding) -> String {
+    let digest = blake3::hash(
+        format!(
+            "runtime-authority-terminal:{}",
+            binding.base.attempt_id.as_str()
+        )
+        .as_bytes(),
+    );
+    format!("receipt-{}", digest.to_hex())
+}
+
+/// Settles the attempt, occurrence and run to the evidence's disposition and
+/// commits the launched receipt with its authority evidence, atomically.
+fn settle_from_runtime_terminal_evidence(
+    conn: &Connection,
+    settled: TerminalEvidenceSettlement<'_>,
+    authority: &dyn AutomationDispatchAuthority,
+    now: DateTime<Utc>,
+) -> Result<ReceiptCommitOutcome, String> {
+    let TerminalEvidenceSettlement {
+        run_id,
+        occurrence_id,
+        attempt_id,
+        session_id,
+        familiar_id,
+        exit_code,
+        evidence,
+        binding,
+    } = settled;
+    let receipt_id = launched_receipt_id(binding);
+    let receipt = read_receipt(conn, &receipt_id)
+        .map_err(|error| format!("failed to inspect launched receipt replay: {error:#}"))?
+        .map_or_else(
+            || build_launched_receipt(&receipt_id, binding, familiar_id, evidence, now),
+            Ok,
+        )
+        .map_err(|error| format!("failed to build launched receipt: {error:#}"))?;
+    let terminal_extensions = authority
+        .produce_terminal_evidence(&AutomationTerminalAuthorityRequest {
+            execution_binding: binding,
+            receipt: &receipt,
+        })
+        .map_err(|error| {
+            format!(
+                "automation authority refused terminal evidence: {}",
+                error.code().as_str()
+            )
+        })?;
+
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to begin launched receipt settlement: {error}"))?;
+    let event_id = receipt_event_id(receipt.receipt_id.as_str());
+    let existing_sequence = transaction
+        .query_row(
+            "SELECT sequence FROM automation_events WHERE event_id = ?1",
+            [&event_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect launched receipt event replay: {error}"))?;
+    if existing_sequence.is_none() {
+        let produced_at = receipt.produced_at.as_str();
+        let (run_status, attempt_state) = terminal_states(evidence.disposition);
+        let (failure_class, detail) = launched_terminal_detail(evidence.disposition);
+        let occurrence_running: bool = transaction
+            .query_row(
+                "SELECT state IN ('claimed', 'running')
+                 FROM automation_occurrences
+                 WHERE id = ?1",
+                [occurrence_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to read Runtime Authority occurrence: {error}"))?;
+        if !occurrence_running {
+            return Err("Runtime Authority occurrence changed before settlement".to_string());
+        }
+        // The published attempt machine reaches every terminal state but
+        // `succeeded` from a started attempt only through `observing`.
+        if attempt_state != "succeeded" {
+            transaction
+                .execute(
+                    "UPDATE automation_attempts
+                     SET state = 'observing'
+                     WHERE id = ?1 AND state = 'started'",
+                    [attempt_id],
+                )
+                .map_err(|error| format!("failed to observe Runtime Authority attempt: {error}"))?;
+        }
+        let settled_attempt = transaction
+            .execute(
+                "UPDATE automation_attempts
+                 SET state = ?2,
+                     failure_class = ?3,
+                     state_reason = ?4,
+                     settled_at = ?5
+                 WHERE id = ?1
+                   AND state IN ('started', 'observing')",
+                rusqlite::params![
+                    attempt_id,
+                    attempt_state,
+                    failure_class,
+                    detail,
+                    produced_at
+                ],
+            )
+            .map_err(|error| format!("failed to settle Runtime Authority attempt: {error}"))?;
+        if settled_attempt != 1 {
+            return Err("Runtime Authority attempt changed before settlement".to_string());
+        }
+        if !settle_occurrence(&transaction, occurrence_id, run_status, detail, now)? {
+            return Err("Runtime Authority occurrence changed before settlement".to_string());
+        }
+        if !record_run_finish(
+            &transaction,
+            run_id,
+            RunFinish {
+                status: run_status,
+                exit_code,
+                session_id: Some(session_id.to_string()),
+                log_json: None,
+                output_commit: None,
+            },
+            now,
+        )
+        .map_err(|error| format!("failed to settle Runtime Authority run: {error:#}"))?
+        {
+            return Err("Runtime Authority run changed before settlement".to_string());
+        }
+    }
+
+    // The receipt event takes the run stream's head only after settlement:
+    // the attempt and run transitions above append their own events to it.
+    let event_sequence = match existing_sequence {
+        Some(sequence) => u64::try_from(sequence)
+            .map_err(|_| "stored launched receipt event sequence is negative".to_string())?,
+        None => stream_head(&transaction, "run", run_id)
+            .map_err(|error| format!("failed to read launched receipt event sequence: {error}"))?
+            .map_or(Ok(0), |head| {
+                head.checked_add(1)
+                    .ok_or_else(|| "launched receipt event sequence overflowed".to_string())
+            })?,
+    };
+    let event = build_receipt_recorded_event(&event_id, &receipt, event_sequence)
+        .map_err(|error| format!("failed to build launched receipt event: {error:#}"))?;
+    let outcome = commit_authorized_receipt(
+        &transaction,
+        &receipt,
+        &event,
+        &terminal_extensions,
+        authority,
+    )
+    .map_err(|error| format!("failed to commit launched authority receipt: {error:#}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit launched receipt settlement: {error}"))?;
+    Ok(outcome)
+}
+
 fn hold_runtime_authority_terminal_settlement(
     conn: &Connection,
     run_id: &str,
     occurrence_id: Option<&str>,
+    reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
     let occurrence_id = occurrence_id
@@ -3818,7 +4156,13 @@ fn hold_runtime_authority_terminal_settlement(
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| format!("failed to begin Runtime Authority recovery hold: {error}"))?;
-    hold_runtime_authority_terminal_settlement_in(&transaction, run_id, occurrence_id, now)?;
+    hold_runtime_authority_terminal_settlement_in(
+        &transaction,
+        run_id,
+        occurrence_id,
+        reason,
+        now,
+    )?;
     transaction
         .commit()
         .map_err(|error| format!("failed to commit Runtime Authority recovery hold: {error}"))
@@ -3828,6 +4172,7 @@ fn hold_runtime_authority_terminal_settlement_in(
     conn: &Connection,
     run_id: &str,
     occurrence_id: &str,
+    reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -3837,7 +4182,7 @@ fn hold_runtime_authority_terminal_settlement_in(
              WHERE run_id = ?1
                AND state IN ('dispatching', 'started', 'observing')
                AND state_reason IS NOT ?2",
-        rusqlite::params![run_id, RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON],
+        rusqlite::params![run_id, reason],
     )
     .map_err(|error| {
         format!("failed to record Runtime Authority terminal evidence hold: {error}")
@@ -3874,11 +4219,7 @@ fn hold_runtime_authority_terminal_settlement_in(
                        AND failure_reason IS NOT ?2
                    )
                )",
-        rusqlite::params![
-            occurrence_id,
-            RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON,
-            now_iso,
-        ],
+        rusqlite::params![occurrence_id, reason, now_iso],
     )
     .map_err(|error| {
         format!("failed to mark Runtime Authority occurrence for recovery: {error}")
@@ -4676,12 +5017,17 @@ mod tests {
                     binding["authorization"]["consumptionSnapshotDigest"],
                 "outcome": binding["authorization"]["outcome"]
             });
+            // Like a real adapter, the sidecar reports what the base receipt
+            // says was exercised.
             evidence["capabilities"] = json!({
                 "requested": binding["capabilities"]["requested"],
                 "granted": binding["capabilities"]["granted"],
                 "denied": binding["capabilities"]["denied"],
                 "degraded": binding["capabilities"]["degraded"],
-                "exercised": []
+                "exercised": receipt
+                    .exercised_capabilities
+                    .as_ref()
+                    .map_or_else(|| json!([]), |exercised| serde_json::to_value(exercised).unwrap())
             });
             evidence["approval"] = binding["approval"].clone();
             evidence["risk"] = binding["risk"].clone();
@@ -4740,6 +5086,17 @@ mod tests {
         conn: &Connection,
         run_id: &str,
         session_id: &str,
+    ) -> RuntimeTerminalEvidence {
+        runtime_terminal_evidence_with(conn, run_id, session_id, |_| {})
+    }
+
+    /// Complete `succeeded` evidence for the run's pinned binding, edited
+    /// before it is sealed.
+    fn runtime_terminal_evidence_with(
+        conn: &Connection,
+        run_id: &str,
+        session_id: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
     ) -> RuntimeTerminalEvidence {
         let extension_json: String = conn
             .query_row(
@@ -4806,6 +5163,7 @@ mod tests {
                 "signature": "0".repeat(128)
             }
         });
+        edit(&mut value);
         let mut body = value.clone();
         let object = body.as_object_mut().unwrap();
         object.remove("integrity");
@@ -7359,6 +7717,396 @@ mod tests {
                 "started".to_string(),
                 None,
                 None,
+            )
+        );
+    }
+
+    struct LaunchedAuthorityRun {
+        run_id: String,
+        session_id: String,
+        launched_at: DateTime<Utc>,
+    }
+
+    /// A Runtime Authority run launched through dispatch, still running.
+    fn launched_authority_run(conn: &Connection, name: &str) -> LaunchedAuthorityRun {
+        let routine = definition(name);
+        insert_definition(conn, &routine).unwrap();
+        let launched_at = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = format!("occurrence.{name}");
+        assert!(insert_claimed_occurrence(
+            conn,
+            &occurrence_id,
+            &routine.id,
+            "daemon",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let runtime = AuthorityObservingRuntime { conn };
+        let mut clock = || launched_at;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+        let DispatchAttempt::Completed(outcome) = dispatch_occurrence_with_clock(
+            conn,
+            &runtime,
+            &routine,
+            &occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            launched_at,
+            &mut control,
+        )
+        .unwrap() else {
+            panic!("Runtime Authority launch must complete");
+        };
+        LaunchedAuthorityRun {
+            run_id: outcome.run_id,
+            session_id: outcome.session_id.unwrap(),
+            launched_at,
+        }
+    }
+
+    /// Ends the run's session and returns when.
+    fn end_authority_session(conn: &Connection, run: &LaunchedAuthorityRun) -> DateTime<Utc> {
+        let terminal_at = run.launched_at + chrono::Duration::seconds(5);
+        crate::store::update_session_terminal_if_active(
+            conn,
+            &run.session_id,
+            "completed",
+            Some(0),
+            &terminal_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+        terminal_at
+    }
+
+    fn store_evidence(
+        conn: &Connection,
+        run: &LaunchedAuthorityRun,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let evidence = runtime_terminal_evidence_with(conn, &run.run_id, &run.session_id, edit);
+        store_runtime_terminal_evidence(conn, &evidence, &VectorAuthority).unwrap();
+    }
+
+    const VECTOR_SETTLEMENT: RuntimeAuthoritySettlement<'static> = RuntimeAuthoritySettlement {
+        authority: &VectorAuthority,
+        evidence: &VectorAuthority,
+    };
+
+    /// Occurrence state and reason, run status and receipt, attempt state,
+    /// failure class and reason.
+    type AuthorityLifecycle = (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    );
+
+    fn authority_lifecycle(conn: &Connection, run_id: &str) -> AuthorityLifecycle {
+        conn.query_row(
+            "SELECT o.state, o.failure_reason, r.status, r.receipt_id,
+                    a.state, a.failure_class, a.state_reason
+             FROM automation_runs AS r
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             WHERE r.id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    fn receipt_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM automation_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn complete_runtime_evidence_settles_a_launched_run_with_its_receipt() {
+        let some = |value: &str| Some(value.to_string());
+        for (disposition, run_status, attempt_state, failure_class, report) in [
+            (
+                "succeeded",
+                "succeeded",
+                "succeeded",
+                None,
+                SettlementReport {
+                    succeeded: 1,
+                    ..SettlementReport::default()
+                },
+            ),
+            (
+                "failed",
+                "failed",
+                "failed",
+                None,
+                SettlementReport {
+                    failed: 1,
+                    ..SettlementReport::default()
+                },
+            ),
+            (
+                "cancelled",
+                "cancelled",
+                "cancelled",
+                some("cancelled"),
+                SettlementReport {
+                    cancelled: 1,
+                    ..SettlementReport::default()
+                },
+            ),
+            (
+                "timed_out",
+                "failed",
+                "timed_out",
+                some("timeout"),
+                SettlementReport {
+                    failed: 1,
+                    ..SettlementReport::default()
+                },
+            ),
+        ] {
+            let (_temp, conn) = temp_store();
+            let run = launched_authority_run(&conn, &format!("authority-evidence-{disposition}"));
+            store_evidence(&conn, &run, |evidence| {
+                evidence["disposition"] = json!(disposition);
+            });
+            let terminal_at = end_authority_session(&conn, &run);
+
+            assert_eq!(
+                settle_finished_runs_with(&conn, terminal_at, Some(VECTOR_SETTLEMENT)).unwrap(),
+                report,
+                "{disposition}"
+            );
+            let (failure, detail) = crate::automations::receipts::launched_terminal_detail(
+                serde_json::from_value(json!(disposition)).unwrap(),
+            );
+            let lifecycle = authority_lifecycle(&conn, &run.run_id);
+            assert_eq!(
+                (
+                    lifecycle.0.as_str(),
+                    lifecycle.1.as_deref(),
+                    lifecycle.2.as_str(),
+                    lifecycle.4.as_str(),
+                    lifecycle.5.clone(),
+                    lifecycle.6.as_deref(),
+                ),
+                (
+                    run_status,
+                    detail,
+                    run_status,
+                    attempt_state,
+                    failure_class,
+                    detail,
+                ),
+                "{disposition}"
+            );
+            assert_eq!(failure, lifecycle.5.as_deref(), "{disposition}");
+
+            let receipt_id = lifecycle.3.expect("settled run references its receipt");
+            let receipt = read_receipt(&conn, &receipt_id).unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(receipt.outcome.disposition).unwrap(),
+                json!(disposition)
+            );
+            assert_eq!(
+                serde_json::to_value(&receipt.exercised_capabilities).unwrap(),
+                json!(["analysis.read", "artifact.write"])
+            );
+            assert_eq!(
+                serde_json::to_value(receipt.side_effect_class).unwrap(),
+                json!("local_write")
+            );
+
+            // Only `succeeded` is reachable from `started`; the others pass
+            // through `observing`, and every step is published.
+            let attempt_steps: Vec<String> = conn
+                .prepare(
+                    "SELECT json_extract(event_json, '$.payload.to')
+                     FROM automation_events
+                     WHERE stream_kind = 'run' AND stream_id = ?1
+                       AND json_extract(event_json, '$.kind') = 'attempt.transitioned'
+                     ORDER BY sequence",
+                )
+                .unwrap()
+                .query_map([&run.run_id], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let expected_tail: &[&str] = if attempt_state == "succeeded" {
+                &["succeeded"]
+            } else {
+                &["observing", attempt_state]
+            };
+            assert!(
+                attempt_steps.ends_with(
+                    &expected_tail
+                        .iter()
+                        .map(|step| (*step).to_string())
+                        .collect::<Vec<_>>()
+                ),
+                "{disposition}: {attempt_steps:?}"
+            );
+
+            // A second pass changes nothing.
+            assert_eq!(
+                settle_finished_runs_with(&conn, terminal_at, Some(VECTOR_SETTLEMENT)).unwrap(),
+                SettlementReport::default()
+            );
+            assert_eq!(receipt_count(&conn), 1);
+        }
+    }
+
+    type EvidenceEdit = fn(&mut serde_json::Value);
+
+    #[test]
+    fn incomplete_or_violating_runtime_evidence_keeps_the_run_held_without_a_receipt() {
+        let cases: [(&str, EvidenceEdit, &str); 4] = [
+            (
+                "partial",
+                |evidence| evidence["sideEffects"]["coverage"] = json!("partial"),
+                RUNTIME_TERMINAL_EVIDENCE_PARTIAL_REASON,
+            ),
+            (
+                "ambiguous",
+                |evidence| evidence["disposition"] = json!("ambiguous"),
+                RUNTIME_TERMINAL_EVIDENCE_PARTIAL_REASON,
+            ),
+            (
+                "unknown",
+                |evidence| {
+                    evidence["result"] =
+                        json!({ "state": "unknown", "reasonCode": "runtime_result_unavailable" });
+                },
+                RUNTIME_TERMINAL_EVIDENCE_UNKNOWN_REASON,
+            ),
+            (
+                "violating",
+                |evidence| {
+                    evidence["exercisedCapabilities"]["values"] =
+                        json!(["analysis.read", "artifact.write", "network.publish"]);
+                },
+                RUNTIME_TERMINAL_EVIDENCE_POLICY_REASON,
+            ),
+        ];
+        for (name, edit, reason) in cases {
+            let (_temp, conn) = temp_store();
+            let run = launched_authority_run(&conn, &format!("authority-evidence-{name}"));
+            store_evidence(&conn, &run, edit);
+            let terminal_at = end_authority_session(&conn, &run);
+
+            assert_eq!(
+                settle_finished_runs_with(&conn, terminal_at, Some(VECTOR_SETTLEMENT)).unwrap(),
+                SettlementReport::default(),
+                "{name}"
+            );
+            assert_eq!(
+                authority_lifecycle(&conn, &run.run_id),
+                (
+                    "recovery_required".to_string(),
+                    Some(reason.to_string()),
+                    "running".to_string(),
+                    None,
+                    "started".to_string(),
+                    None,
+                    Some(reason.to_string()),
+                ),
+                "{name}"
+            );
+            assert_eq!(receipt_count(&conn), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn runtime_evidence_after_the_recovery_hold_goes_to_operator_recovery() {
+        let (_temp, conn) = temp_store();
+        let run = launched_authority_run(&conn, "authority-evidence-late");
+        let terminal_at = end_authority_session(&conn, &run);
+        settle_finished_runs_with(&conn, terminal_at, Some(VECTOR_SETTLEMENT)).unwrap();
+        assert_eq!(
+            authority_lifecycle(&conn, &run.run_id).1.as_deref(),
+            Some(RUNTIME_TERMINAL_EVIDENCE_REQUIRED_REASON)
+        );
+
+        store_evidence(&conn, &run, |_| {});
+        let later = terminal_at + chrono::Duration::seconds(30);
+        assert_eq!(
+            settle_finished_runs_with(&conn, later, Some(VECTOR_SETTLEMENT)).unwrap(),
+            SettlementReport::default()
+        );
+        let lifecycle = authority_lifecycle(&conn, &run.run_id);
+        assert_eq!(
+            (
+                lifecycle.0.as_str(),
+                lifecycle.1.as_deref(),
+                lifecycle.2.as_str(),
+                lifecycle.3.as_deref(),
+            ),
+            (
+                "recovery_required",
+                Some(RUNTIME_TERMINAL_EVIDENCE_LATE_REASON),
+                "running",
+                None,
+            )
+        );
+        assert_eq!(receipt_count(&conn), 0);
+    }
+
+    struct RefusingEvidenceVerifier;
+
+    impl RuntimeTerminalEvidenceVerifier for RefusingEvidenceVerifier {
+        fn verify(
+            &self,
+            _evidence: &RuntimeTerminalEvidence,
+        ) -> Result<(), RuntimeTerminalEvidenceError> {
+            Err(RuntimeTerminalEvidenceError::new(
+                RuntimeTerminalEvidenceErrorCode::AuthenticationStale,
+            ))
+        }
+    }
+
+    #[test]
+    fn runtime_evidence_that_no_longer_verifies_keeps_the_run_held() {
+        let (_temp, conn) = temp_store();
+        let run = launched_authority_run(&conn, "authority-evidence-unverifiable");
+        store_evidence(&conn, &run, |_| {});
+        let terminal_at = end_authority_session(&conn, &run);
+        let refusing = RuntimeAuthoritySettlement {
+            authority: &VectorAuthority,
+            evidence: &RefusingEvidenceVerifier,
+        };
+
+        assert_eq!(
+            settle_finished_runs_with(&conn, terminal_at, Some(refusing)).unwrap(),
+            SettlementReport::default()
+        );
+        let lifecycle = authority_lifecycle(&conn, &run.run_id);
+        assert_eq!(
+            (lifecycle.0.as_str(), lifecycle.1.as_deref(), lifecycle.3),
+            (
+                "recovery_required",
+                Some(RUNTIME_TERMINAL_EVIDENCE_UNVERIFIABLE_REASON),
+                None
             )
         );
     }
