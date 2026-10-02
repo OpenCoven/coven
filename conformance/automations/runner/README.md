@@ -273,10 +273,14 @@ event while a changed request under the same adoption key is refused with
 `command-envelope-outcomes` sends portable `coven.automations.v1` command
 envelopes, in order, through the producer's `coven.automations.command.v1`
 router to one durable store per case, closing and reopening the store where a
-case restarts. Its five cases cover a committed create, revise and read; refused
-unsupported and illegal commands that write nothing; `REVISION_CONFLICT` and
-`ADOPTION_REPLAY_MISMATCH`; a duplicate delivery that replays the original
-result and event without a new revision; and adoption that survives a restart.
+case restarts. Its five cases cover a committed create, revise and read;
+refusals; `REVISION_CONFLICT` and `ADOPTION_REPLAY_MISMATCH`; a duplicate
+delivery that replays the original result and event without a new revision; and
+adoption that survives a restart. Around every rejection the target compares
+each automation table. A rejection never changes definitions, events or
+execution state. A command the producer does not implement is refused before
+adoption and writes nothing; one it implements retains its domain rejection
+under the adoption key, so the exact request replays it.
 `definition-lifecycle-transitions` executes the complete versioned definition
 lifecycle graph through the production command transaction: creation into
 paused or active, active/paused revision, disable, tombstone, and fail-closed

@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::Connection;
+use rusqlite::{types::Value as SqlValue, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -54,6 +54,20 @@ struct Expect {
     /// The earlier step whose `result` and `eventRef` this replay returns.
     #[serde(default)]
     replays: Option<usize>,
+    /// What a rejection may leave behind.
+    #[serde(default)]
+    writes: Option<Writes>,
+}
+
+/// A rejection never changes definitions, events or execution state. A
+/// command the producer implements retains its domain rejection under the
+/// adoption key, so the exact request replays it; one it does not implement
+/// is refused before adoption and writes nothing at all.
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Writes {
+    Nothing,
+    Adoption,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -98,8 +112,8 @@ pub(super) fn evaluate(vector: &Value) -> Result<bool, &'static str> {
 }
 
 /// Every envelope is a valid spec command, a case opens by sending one, a
-/// rejection names its code, and a replay names an earlier committed send of
-/// the same envelope.
+/// rejection names its code and what it writes, and a replay names an earlier
+/// committed send of the same envelope.
 fn valid_steps(case: &Case) -> bool {
     if case.steps.is_empty()
         || case.steps.len() > MAX_STEPS
@@ -130,6 +144,7 @@ fn valid_steps(case: &Case) -> bool {
         valid_envelope
             && replay_names_its_original
             && (expect.outcome == Outcome::Rejected) == expect.error_code.is_some()
+            && (expect.outcome == Outcome::Rejected) == expect.writes.is_some()
     })
 }
 
@@ -154,6 +169,7 @@ fn case_matches(case: &Case) -> Result<bool, &'static str> {
             responses.push(None);
             continue;
         };
+        let before = durable_state(&conn)?;
         let minutes = i64::try_from(index).map_err(|_| "conformance vector is invalid")?;
         let recorded_at = (first_recorded_at + Duration::minutes(minutes))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -164,6 +180,14 @@ fn case_matches(case: &Case) -> Result<bool, &'static str> {
             &recorded_at,
         );
         let body = response.result.unwrap_or(Value::Null);
+        let after = durable_state(&conn)?;
+        let writes_match = expect.writes.is_none_or(|writes| {
+            before.domain == after.domain
+                && match writes {
+                    Writes::Nothing => before.adoptions == after.adoptions,
+                    Writes::Adoption => before.adoptions != after.adoptions,
+                }
+        });
         let replay_matches = expect.replays.is_none_or(|earlier| {
             responses[earlier].as_ref().is_some_and(|original| {
                 original["result"] == body["result"] && original["eventRef"] == body["eventRef"]
@@ -175,8 +199,59 @@ fn case_matches(case: &Case) -> Result<bool, &'static str> {
             && expect
                 .revision
                 .is_none_or(|revision| body["revision"] == json!(revision))
-            && replay_matches;
+            && replay_matches
+            && writes_match;
         responses.push(Some(body));
     }
     Ok(passed)
+}
+
+/// Every automation row, split into the adoption ledger and everything else
+/// the router can write: definitions, rich revisions, events and execution
+/// state.
+struct DurableState {
+    adoptions: Vec<String>,
+    domain: Vec<String>,
+}
+
+fn durable_state(conn: &Connection) -> Result<DurableState, &'static str> {
+    let failed = |_| "conformance suite execution failed";
+    let tables: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name LIKE 'automation%'
+             ORDER BY name",
+        )
+        .map_err(failed)?
+        .query_map([], |row| row.get(0))
+        .map_err(failed)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(failed)?;
+    let mut state = DurableState {
+        adoptions: Vec::new(),
+        domain: Vec::new(),
+    };
+    for table in tables {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM \"{table}\""))
+            .map_err(failed)?;
+        let width = statement.column_count();
+        let mut rows: Vec<String> = statement
+            .query_map([], |row| {
+                (0..width)
+                    .map(|index| row.get::<_, SqlValue>(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map(|values| format!("{table} {values:?}"))
+            })
+            .map_err(failed)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(failed)?;
+        rows.sort();
+        if table.starts_with("automation_command_") {
+            state.adoptions.extend(rows);
+        } else {
+            state.domain.extend(rows);
+        }
+    }
+    Ok(state)
 }

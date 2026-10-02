@@ -1218,11 +1218,15 @@ fn command_envelope_outcomes_suite_executes_the_checked_in_vectors() {
 
 #[test]
 fn command_envelope_outcomes_suite_fails_when_the_router_disagrees() {
-    let wrong_expectations: [fn(&mut Value); 5] = [
+    let wrong_expectations: [fn(&mut Value); 7] = [
         // The refused retry would have to commit.
         |vectors| {
             vectors["cases"][1]["steps"][0]["expect"] = json!({ "outcome": "committed" });
         },
+        // The retry, which this producer does not implement, would have to be
+        // adopted; the refused delivery variant would have to leave no adoption.
+        |vectors| vectors["cases"][1]["steps"][0]["expect"]["writes"] = json!("adoption"),
+        |vectors| vectors["cases"][1]["steps"][2]["expect"]["writes"] = json!("nothing"),
         // The stale revise would have to be refused for a different reason.
         |vectors| {
             vectors["cases"][2]["steps"][2]["expect"]["errorCode"] = json!("NOT_FOUND");
@@ -1253,7 +1257,7 @@ fn command_envelope_outcomes_suite_fails_when_the_router_disagrees() {
 
 #[test]
 fn command_envelope_outcomes_suite_rejects_invalid_vector_shapes() {
-    let invalid_mutations: [fn(&mut Value); 9] = [
+    let invalid_mutations: [fn(&mut Value); 11] = [
         |vectors| vectors["schemaVersion"] = json!("unsupported"),
         |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
         |vectors| {
@@ -1264,14 +1268,22 @@ fn command_envelope_outcomes_suite_rejects_invalid_vector_shapes() {
         |vectors| vectors["cases"][4]["steps"][1] = json!({ "kind": "reboot" }),
         |vectors| vectors["cases"][0]["steps"][0]["envelope"]["command"] = json!("made.up.v1"),
         |vectors| vectors["cases"][0]["steps"][0]["envelope"]["adoptionKey"] = json!("bad key"),
-        // A rejection must name its code, and a replay an earlier committed
-        // send of the same envelope.
+        // A rejection must name its code and what it writes, only a
+        // rejection says what it writes, and a replay names an earlier
+        // committed send of the same envelope.
         |vectors| {
             vectors["cases"][1]["steps"][0]["expect"]
                 .as_object_mut()
                 .unwrap()
                 .remove("errorCode");
         },
+        |vectors| {
+            vectors["cases"][1]["steps"][2]["expect"]
+                .as_object_mut()
+                .unwrap()
+                .remove("writes");
+        },
+        |vectors| vectors["cases"][0]["steps"][0]["expect"]["writes"] = json!("nothing"),
         |vectors| vectors["cases"][3]["steps"][1]["expect"]["replays"] = json!(2),
     ];
 

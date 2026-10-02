@@ -246,7 +246,7 @@
       ]
     },
     {
-      "caseId": "unsupported-and-illegal-commands-write-nothing",
+      "caseId": "refusals-leave-definitions-events-and-execution-unchanged",
       "steps": [
         {
           "kind": "send",
@@ -272,7 +272,8 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "CAPABILITY_UNSUPPORTED"
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "nothing"
           }
         },
         {
@@ -297,7 +298,8 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "CAPABILITY_UNSUPPORTED"
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "nothing"
           }
         },
         {
@@ -408,7 +410,8 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "CAPABILITY_UNSUPPORTED"
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "adoption"
           }
         },
         {
@@ -515,7 +518,120 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "ILLEGAL_TRANSITION"
+            "errorCode": "ILLEGAL_TRANSITION",
+            "writes": "adoption"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:refusal:delivery",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-refusal",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "delivery": {
+                    "outputTarget": "~/projects/notes/today.md",
+                    "mode": "atomic"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "9438f9913b277226b8acef861acc21702206cd7c6c900b1591e6c968cbfd3cbe"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "nothing"
           }
         },
         {
@@ -950,7 +1066,8 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "REVISION_CONFLICT"
+            "errorCode": "REVISION_CONFLICT",
+            "writes": "adoption"
           }
         },
         {
@@ -1057,7 +1174,8 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "ADOPTION_REPLAY_MISMATCH"
+            "errorCode": "ADOPTION_REPLAY_MISMATCH",
+            "writes": "nothing"
           }
         }
       ]
@@ -2045,7 +2163,8 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "REVISION_CONFLICT"
+            "errorCode": "REVISION_CONFLICT",
+            "writes": "adoption"
           }
         }
       ]
