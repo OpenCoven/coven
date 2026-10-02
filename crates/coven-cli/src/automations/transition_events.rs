@@ -8,8 +8,10 @@
 //! always has its event.
 //!
 //! The triggers keep the bookkeeping `contract::events::append_event` keeps:
-//! the stream head supplies the gapless sequence, and the event id is derived
-//! from the row's feed position so the column and the JSON agree. Optional id
+//! the stream head supplies the gapless sequence. Each event id is one random
+//! 128-bit value, as Rust-built ids are, drawn into a single-row scratch table
+//! so the column and the JSON read the same value (triggers cannot use CTEs,
+//! and a repeated `randomblob()` may be evaluated twice). Optional id
 //! fields are omitted unless they match the contract's identifier shape, so a
 //! legacy row cannot make its stream unreadable.
 //!
@@ -133,7 +135,10 @@ fn body(entity: &Entity, from: &str) -> String {
         .map(|value| format!(", 'attemptNumber', {value}"))
         .unwrap_or_default();
     format!(
-        "INSERT INTO automation_event_stream_heads (
+        "DELETE FROM automation_event_id_scratch;
+         INSERT INTO automation_event_id_scratch (singleton, event_id)
+         VALUES (1, 'evt' || lower(hex(randomblob(16))));
+         INSERT INTO automation_event_stream_heads (
              stream_kind, stream_id, next_sequence, earliest_sequence, updated_at
          ) VALUES ({stream_kind}, {stream_id}, 0, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(stream_kind, stream_id) DO NOTHING;
@@ -141,13 +146,13 @@ fn body(entity: &Entity, from: &str) -> String {
              feed_position, event_id, stream_kind, stream_id, sequence, recorded_at,
              recorded_at_millis, observed_at, event_json
          )
-         SELECT p.position, 'evt' || printf('%032x', p.position), {stream_kind}, {stream_id},
+         SELECT p.position, s.event_id, {stream_kind}, {stream_id},
                 h.next_sequence, p.at,
                 CAST(strftime('%s', p.at) AS INTEGER) * 1000 + CAST(substr(p.at, 21, 3) AS INTEGER),
                 p.at,
                 json_remove(json_object(
                     'schemaVersion', 'coven.automations.v1',
-                    'eventId', 'evt' || printf('%032x', p.position),
+                    'eventId', s.event_id,
                     'stream', json_object('kind', {stream_kind}, 'id', {stream_id}),
                     'sequence', h.next_sequence,
                     'recordedAt', p.at,
@@ -173,8 +178,10 @@ fn body(entity: &Entity, from: &str) -> String {
              SELECT COALESCE((SELECT MAX(feed_position) FROM automation_events), 0) + 1 AS position,
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS at
          ) AS p
+         JOIN automation_event_id_scratch AS s ON s.singleton = 1
          JOIN automation_event_stream_heads AS h
            ON h.stream_kind = {stream_kind} AND h.stream_id = {stream_id};
+         DELETE FROM automation_event_id_scratch;
          UPDATE automation_event_stream_heads
             SET next_sequence = next_sequence + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -217,6 +224,13 @@ pub(crate) fn transition_trigger_sql() -> String {
 /// Installs the transition triggers. Requires the occurrence, run, attempt and
 /// event tables; idempotent.
 pub(crate) fn ensure_transition_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automation_event_id_scratch (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             event_id TEXT NOT NULL
+         );",
+    )
+    .context("failed to create the automation event id scratch table")?;
     conn.execute_batch(&transition_trigger_sql())
         .context("failed to install automation transition event triggers")
 }
@@ -525,6 +539,73 @@ mod tests {
             .unwrap();
         let distinct = positions.iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(distinct.len(), positions.len());
+    }
+
+    #[test]
+    fn event_ids_are_random_per_event_and_differ_across_stores() {
+        let (_one, first) = store();
+        let (_two, second) = store();
+        insert_occurrence(&first, "alpha-1");
+        insert_occurrence(&second, "alpha-1");
+        let id = |conn: &Connection| stream(conn, "occurrence", "alpha-1")[0]["eventId"].clone();
+        assert_ne!(id(&first), id(&second));
+        let stored: String = first
+            .query_row(
+                "SELECT event_id FROM automation_events WHERE stream_kind = 'occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(json!(stored), id(&first));
+        assert!(stored.starts_with("evt") && stored.len() == 35, "{stored}");
+        let scratch: i64 = first
+            .query_row(
+                "SELECT COUNT(*) FROM automation_event_id_scratch",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scratch, 0);
+    }
+
+    #[test]
+    fn an_event_write_failure_aborts_the_state_change() {
+        let (_temp, conn) = store();
+        insert_occurrence(&conn, "alpha-1");
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_event_writes BEFORE INSERT ON automation_events
+             BEGIN SELECT RAISE(ABORT, 'event store unavailable'); END;",
+        )
+        .unwrap();
+        let error = conn
+            .execute(
+                "UPDATE automation_occurrences SET state = 'claimed' WHERE id = 'alpha-1'",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("event store unavailable"),
+            "{error}"
+        );
+        conn.execute_batch("DROP TRIGGER refuse_event_writes")
+            .unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'alpha-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "planned");
+        assert_eq!(
+            transitions(&stream(&conn, "occurrence", "alpha-1")).len(),
+            1
+        );
+        assert_eq!(
+            crate::automations::contract::events::stream_head(&conn, "occurrence", "alpha-1")
+                .unwrap(),
+            Some(0)
+        );
     }
 
     #[test]

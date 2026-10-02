@@ -420,7 +420,7 @@ Occurrence, run and attempt transitions are published by SQLite triggers in `aut
 - **What is published.** Creating a row publishes `from: "none"`. Every change of an occurrence's `state`, a run's `status` or an attempt's `state` publishes `from`/`to`. A write that leaves the state unchanged publishes nothing.
 - **Streams.** Occurrence events go to `occurrence/{id}`. Run and attempt events go to `run/{id}`, the stream receipts already use.
 - **Bookkeeping.** The trigger keeps the same stream-head bookkeeping as `append_event`, so Rust appends on the same stream (receipt events) continue the gapless sequence; the no-launch receipt therefore takes its sequence after its settlement transitions.
-- **Event content.** The event id derives from the row's feed position, so it is unique and matches the stored column. The `reason` is the occurrence failure reason or the attempt state reason (or failure class) when present, otherwise a generic statement.
+- **Event content.** Each event id is one random 128-bit value, like Rust-built ids, so ids are unique across stores and match the stored column. The `reason` is the occurrence failure reason or the attempt state reason (or failure class) when present, otherwise a generic statement.
 - **Identifiers.** Optional id fields are included only when they match the contract identifier shape, so a legacy row cannot make its stream unreadable.
 - **No backfill.** History before the triggers existed is not backfilled, so a stream may begin mid-lifecycle, and consumers treat its first prior state as unknown.
 
