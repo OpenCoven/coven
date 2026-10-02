@@ -10,6 +10,8 @@ const ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS: &str = include_str!(
 const COMMAND_ADOPTION_IDEMPOTENCY_VECTORS: &str = include_str!(
     "../../../conformance/automations/runner/command-adoption-idempotency.vectors.json"
 );
+const COMMAND_ENVELOPE_OUTCOMES_VECTORS: &str =
+    include_str!("../../../conformance/automations/runner/command-envelope-outcomes.vectors.json");
 const CALENDAR_SCHEDULE_RESOLUTION_VECTORS: &str = include_str!(
     "../../../conformance/automations/runner/calendar-schedule-resolution.vectors.json"
 );
@@ -132,6 +134,7 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "attempt-terminal-immutability",
                         "capability-negotiation",
                         "command-adoption-idempotency",
+                        "command-envelope-outcomes",
                         "definition-lifecycle-transitions",
                         "definition-validation",
                         "event-reducer-determinism",
@@ -702,6 +705,47 @@ fn native_target_evaluates_checked_in_command_adoption_vectors() -> anyhow::Resu
     assert_eq!(response["status"], "passed");
     assert_eq!(response["evidence"]["executedCases"], 1);
     assert_eq!(response["evidence"]["passedCases"], 1);
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_command_envelope_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(COMMAND_ENVELOPE_OUTCOMES_VECTORS)?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "structural",
+        "suiteId": "command-envelope-outcomes",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "command-envelope-outcomes");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 5);
+    assert_eq!(response["evidence"]["passedCases"], 5);
     assert!(!coven_home.exists());
     Ok(())
 }

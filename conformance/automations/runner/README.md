@@ -187,6 +187,7 @@ The checked-in
 [`calendar-schedule-resolution.vectors.json`](calendar-schedule-resolution.vectors.json),
 [`cancellation-timeout-arbitration.vectors.json`](cancellation-timeout-arbitration.vectors.json),
 [`command-adoption-idempotency.vectors.json`](command-adoption-idempotency.vectors.json),
+[`command-envelope-outcomes.vectors.json`](command-envelope-outcomes.vectors.json),
 [`definition-lifecycle-transitions.vectors.json`](definition-lifecycle-transitions.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
@@ -220,6 +221,7 @@ The runner invokes the target directly without a shell.
         "attempt-terminal-immutability",
         "capability-negotiation",
         "command-adoption-idempotency",
+        "command-envelope-outcomes",
         "definition-lifecycle-transitions",
         "definition-validation",
         "event-reducer-determinism",
@@ -257,7 +259,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements ten structural suites, nine
+The native Coven target currently implements eleven structural suites, nine
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -268,6 +270,17 @@ production transactional adoption path, then proves that an exact replay
 returns the committed result without duplicating the definition, adoption, or
 event while a changed request under the same adoption key is refused with
 `ADOPTION_REPLAY_MISMATCH`.
+`command-envelope-outcomes` sends portable `coven.automations.v1` command
+envelopes, in order, through the producer's `coven.automations.command.v1`
+router to one durable store per case, closing and reopening the store where a
+case restarts. Its five cases cover a committed create, revise and read;
+refusals; `REVISION_CONFLICT` and `ADOPTION_REPLAY_MISMATCH`; a duplicate
+delivery that replays the original result and event without a new revision; and
+adoption that survives a restart. Around every rejection the target compares
+each automation table. A rejection never changes definitions, events or
+execution state. A command the producer does not implement is refused before
+adoption and writes nothing; one it implements retains its domain rejection
+under the adoption key, so the exact request replays it.
 `definition-lifecycle-transitions` executes the complete versioned definition
 lifecycle graph through the production command transaction: creation into
 paused or active, active/paused revision, disable, tombstone, and fail-closed

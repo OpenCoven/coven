@@ -1,0 +1,2173 @@
+{
+  "schemaVersion": "coven.automations.command-envelope-outcomes-vectors.v1",
+  "cases": [
+    {
+      "caseId": "create-revise-and-read",
+      "steps": [
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:positive:create",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-positive",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "2ef2279a566b7db95950504c99c1e00316e1ae2292276b0f9495585abcc39fc0"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 1
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.revise.v1",
+            "adoptionKey": "adopt:envelope-outcomes:positive:revise",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-positive",
+                "revision": 2,
+                "lifecycleState": "paused",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the reflection and open questions.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "33196ca282c30d662ea9512d6e4ef83dc7f46b03b72b20fa0beefc1f0911268b"
+                }
+              }
+            },
+            "expectedRevision": 1
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 2
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.get.v1",
+            "adoptionKey": "adopt:envelope-outcomes:positive:get",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "automationId": "envelope-positive"
+            }
+          },
+          "expect": {
+            "outcome": "committed"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "refusals-leave-definitions-events-and-execution-unchanged",
+      "steps": [
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "attempt.retry.v1",
+            "adoptionKey": "adopt:envelope-outcomes:refusal:retry",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "runId": "run-1",
+              "priorAttemptNumber": 1,
+              "priorDisposition": "failed"
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "nothing"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "run.cancel.v1",
+            "adoptionKey": "adopt:envelope-outcomes:refusal:cancel",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "runId": "run-1"
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "nothing"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:refusal:delivery",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-refusal",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "delivery": {
+                    "outputTarget": "~/projects/notes/today.md",
+                    "mode": "atomic"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "9438f9913b277226b8acef861acc21702206cd7c6c900b1591e6c968cbfd3cbe"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:refusal:active",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-refusal",
+                "revision": 1,
+                "lifecycleState": "active",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "f3bfb4e175c7e5bdd8eb7e3789028abc1271e43cb305175ba14a49bb8315065f"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "ILLEGAL_TRANSITION",
+            "writes": "adoption"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:refusal:delivery",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-refusal",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "delivery": {
+                    "outputTarget": "~/projects/notes/today.md",
+                    "mode": "atomic"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "9438f9913b277226b8acef861acc21702206cd7c6c900b1591e6c968cbfd3cbe"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "nothing"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:refusal:create",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-refusal",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "429bc9cd23e68e9c637e6a9c96298aa7733fc862ae83e1f4e85ecef8c08f5e65"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 1
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "stale-revision-and-changed-replay-conflict",
+      "steps": [
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:conflict:create",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-conflict",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "62054c912d367cb0c1f287db70b764fa41dd9f720eea339345c27dc54b878cdc"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 1
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.revise.v1",
+            "adoptionKey": "adopt:envelope-outcomes:conflict:revise",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-conflict",
+                "revision": 2,
+                "lifecycleState": "paused",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "The first revision wins.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "eacf40cb313641f1b9907b5430d11c4d446ec5eaaf8a54bfa98da6633ff86d1f"
+                }
+              }
+            },
+            "expectedRevision": 1
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 2
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.revise.v1",
+            "adoptionKey": "adopt:envelope-outcomes:conflict:stale",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-conflict",
+                "revision": 2,
+                "lifecycleState": "paused",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "A stale writer loses.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "307f24dc48232e13e0411d588e3544d127ff153f4fbabb3d7aca9a9debac939a"
+                }
+              }
+            },
+            "expectedRevision": 1
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "REVISION_CONFLICT",
+            "writes": "adoption"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:conflict:create",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-conflict",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "A different body under the same key.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "6fec5deaa5e6c985c23bfcc6ab865748fd637bb7b6c7246a8445b71097d69008"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "ADOPTION_REPLAY_MISMATCH",
+            "writes": "nothing"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "duplicate-delivery-replays-once",
+      "steps": [
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:duplicate:create",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-duplicate",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "110d390398e419d8c86f366c6908b7db0cb4c8e64fd61b6792ce029f47a69c91"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 1
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:duplicate:create",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-duplicate",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "110d390398e419d8c86f366c6908b7db0cb4c8e64fd61b6792ce029f47a69c91"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "replayed",
+            "revision": 1,
+            "replays": 0
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.revise.v1",
+            "adoptionKey": "adopt:envelope-outcomes:duplicate:revise",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-duplicate",
+                "revision": 2,
+                "lifecycleState": "paused",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Delivered twice, revised once.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "f005a2a56dcb59dc6d09b6fa9d3c4a39be8fa8e5bf0fbf34af42ec7a4ec7fabf"
+                }
+              }
+            },
+            "expectedRevision": 1
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 2
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.revise.v1",
+            "adoptionKey": "adopt:envelope-outcomes:duplicate:revise",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-duplicate",
+                "revision": 2,
+                "lifecycleState": "paused",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Delivered twice, revised once.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "f005a2a56dcb59dc6d09b6fa9d3c4a39be8fa8e5bf0fbf34af42ec7a4ec7fabf"
+                }
+              }
+            },
+            "expectedRevision": 1
+          },
+          "expect": {
+            "outcome": "replayed",
+            "revision": 2,
+            "replays": 2
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "adoption-survives-restart",
+      "steps": [
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:restart:create",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-restart",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "c1331f15e59cd715ae5c493a4503ca2cb6993ec4806b59320c5f824c2a828640"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 1
+          }
+        },
+        {
+          "kind": "restart"
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.create.v1",
+            "adoptionKey": "adopt:envelope-outcomes:restart:create",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-restart",
+                "revision": 1,
+                "lifecycleState": "draft",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Write the daily reflection.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "c1331f15e59cd715ae5c493a4503ca2cb6993ec4806b59320c5f824c2a828640"
+                }
+              }
+            }
+          },
+          "expect": {
+            "outcome": "replayed",
+            "revision": 1,
+            "replays": 0
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.revise.v1",
+            "adoptionKey": "adopt:envelope-outcomes:restart:revise",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-restart",
+                "revision": 2,
+                "lifecycleState": "paused",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Adopted before the restart.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "2f8a0724b4288e5a12729906661ff0a4db9de1aeddc3178e7b8cf89c747aa7bc"
+                }
+              }
+            },
+            "expectedRevision": 1
+          },
+          "expect": {
+            "outcome": "committed",
+            "revision": 2
+          }
+        },
+        {
+          "kind": "restart"
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.revise.v1",
+            "adoptionKey": "adopt:envelope-outcomes:restart:revise",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-restart",
+                "revision": 2,
+                "lifecycleState": "paused",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Adopted before the restart.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "2f8a0724b4288e5a12729906661ff0a4db9de1aeddc3178e7b8cf89c747aa7bc"
+                }
+              }
+            },
+            "expectedRevision": 1
+          },
+          "expect": {
+            "outcome": "replayed",
+            "revision": 2,
+            "replays": 3
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.revise.v1",
+            "adoptionKey": "adopt:envelope-outcomes:restart:stale",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise one command-envelope outcome."
+            },
+            "payload": {
+              "definition": {
+                "schemaVersion": "coven.automations.v1",
+                "automationId": "envelope-restart",
+                "revision": 2,
+                "lifecycleState": "paused",
+                "display": {
+                  "name": "Daily notes",
+                  "description": "Write the daily reflection into the notes target.",
+                  "tags": [
+                    "notes",
+                    "daily"
+                  ]
+                },
+                "trigger": {
+                  "variant": "schedule",
+                  "version": 1,
+                  "schedule": {
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "utc"
+                  }
+                },
+                "conditions": [],
+                "action": {
+                  "variant": "familiarInvocation",
+                  "version": 1,
+                  "prompt": "Stale after the restart.",
+                  "cwd": "~/projects/notes"
+                },
+                "binding": {
+                  "familiarBindingPolicy": "exact",
+                  "familiarId": "charm",
+                  "authority": {
+                    "approvalPolicyRef": "policy://authority/familiars/charm"
+                  }
+                },
+                "runtimeRequirements": {
+                  "runtimeId": "coven-code",
+                  "capabilities": [
+                    "sessions.launch"
+                  ]
+                },
+                "policies": {
+                  "timeout": {
+                    "perRunMinutes": 30
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "backoffPolicy": "exponential",
+                    "retryableClasses": [
+                      "transient_dispatch"
+                    ]
+                  },
+                  "concurrency": {
+                    "overlap": "forbid"
+                  },
+                  "misfire": {
+                    "disposition": "latest"
+                  },
+                  "retention": {
+                    "occurrenceHistory": {
+                      "classification": "standard"
+                    },
+                    "runLogs": {
+                      "classification": "standard"
+                    },
+                    "receipts": {
+                      "classification": "standard"
+                    }
+                  }
+                },
+                "provenance": {
+                  "createdBy": {
+                    "principalId": "principal:tim"
+                  },
+                  "createdAt": "2026-08-30T09:00:00.000Z"
+                },
+                "extensions": {},
+                "integrity": {
+                  "algorithm": "sha256",
+                  "canonicalization": "jcs-rfc8785",
+                  "value": "3f78ddeaafd93619ddc46b0288574bd6e9968f0119f33190fe10ed9e7fc340a0"
+                }
+              }
+            },
+            "expectedRevision": 1
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "REVISION_CONFLICT",
+            "writes": "adoption"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -27,10 +27,11 @@ const MARKER = "PRIVATE-AUDIT-TEST-MARKER";
 const REQUIRED = {
   structural: [
     "attempt-terminal-immutability", "capability-negotiation",
-    "command-adoption-idempotency", "definition-lifecycle-transitions",
-    "definition-validation", "event-reducer-determinism",
-    "occurrence-fence-uniqueness", "receipt-integrity-validation",
-    "rrule-vocabulary", "run-terminal-monotonicity",
+    "command-adoption-idempotency", "command-envelope-outcomes",
+    "definition-lifecycle-transitions", "definition-validation",
+    "event-reducer-determinism", "occurrence-fence-uniqueness",
+    "receipt-integrity-validation", "rrule-vocabulary",
+    "run-terminal-monotonicity",
   ],
   scheduler_reliability: [
     "calendar-schedule-resolution", "cancellation-timeout-arbitration",
@@ -337,9 +338,9 @@ function run(f, { name = "output", output, env = {}, args } = {}) {
   };
 }
 
-test("reviewed inventory covers every vector, all 20 suites, and exact metadata", () => {
+test("reviewed inventory covers every vector, all 21 suites, and exact metadata", () => {
   const suites = loadInventory();
-  assert.equal(suites.length, 20);
+  assert.equal(suites.length, 21);
   assert.deepEqual(
     Object.fromEntries(Object.keys(REQUIRED).map((profile) =>
       [profile, suites.filter((suite) => suite.profile === profile).map((suite) => suite.suiteId)])),
@@ -381,7 +382,7 @@ test("CLI packages, builds, binds and retains repeatable all-suite audit artifac
   assert.equal(report.statement.overallStatus, "passed");
   assert.deepEqual(report.statement.decisionScope, { kind: "audit_only" });
   assert.equal(report.statement.source.commit, f.head);
-  assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 20);
+  assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 21);
   assert.deepEqual(report, json(path.join(first.outputDir, "result.json")));
   assert.deepEqual(report.statementDigest, digestCanonical(report.statement));
   assert.doesNotMatch(first.stdout, /productionReady|release_eligibility|"full"|privateOutput|privatePath/);
@@ -719,10 +720,10 @@ test("an unadvertised required suite stays in the job and fails the whole audit"
   assert.equal(result.status, 1);
   const report = json(path.join(result.outputDir, "result.json"));
   assert.equal(report.statement.overallStatus, "incomplete", result.diagnostics);
-  assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 20);
+  assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 21);
   assert.deepEqual(report.statement.profileResults.at(-1).suiteResults,
     [{ suiteId: "runtime-authority-terminal-recovery", status: "not_applicable" }]);
-  assert.equal(json(path.join(result.outputDir, "job.json")).suites.length, 20);
+  assert.equal(json(path.join(result.outputDir, "job.json")).suites.length, 21);
 });
 
 test("fixture data cannot claim native execution without the explicit test transport", (t) => {
@@ -749,7 +750,7 @@ test("unavailable, failed, incomplete and malformed targets cannot pass or leak 
       assert.equal(result.status, 1, result.stderr);
       const report = json(path.join(result.outputDir, "result.json"));
       assert.notEqual(report.statement.overallStatus, "passed");
-      assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 20);
+      assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 21);
       assert.doesNotMatch(JSON.stringify(report), new RegExp(MARKER));
     });
   }

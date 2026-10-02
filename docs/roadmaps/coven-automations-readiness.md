@@ -39,7 +39,7 @@ and terminal-recovery conformance additions in this change:
 | --- | --- | --- |
 | Definitions and scheduling | Durable revisions, adopted requests, UTC/IANA schedules, DST, latest-only misfire, occurrence fences, overlap refusal | Executable rich-definition and versioned command parity, complete lifecycle publication (#1054) |
 | Scheduler recovery | Persisted retry/backoff, quarantine, stop-fence cancellation/timeout arbitration, leadership fencing, startup and definition-change wake | Complete crash-boundary matrix, storage fault injection, measured load/retention limits (#858) |
-| Portable audit | Ten structural and nine scheduler-reliability suites in the native target; versioned vectors and independent audit-result runner | Full authority, continuity, privacy, interoperability, and release-eligibility evidence (#858) |
+| Portable audit | Eleven structural and nine scheduler-reliability suites in the native target; versioned vectors and independent audit-result runner | Full authority, continuity, privacy, interoperability, and release-eligibility evidence (#858) |
 | Authority | Exact dispatch-binding validation/persistence seam and bounded runtime projection | Trusted production Familiar/Threads/principal/approval/runtime adapters (#857) |
 | Receipts | Immutable base receipt and authority sidecar commitment, atomic run link/event, verified reopen, owner-local base read | Launched-session authenticated observation producer, accepting verifier, evidence consumption and terminal receipt construction (#857) |
 | No-launch evidence | Dispatcher-controlled refusal of an authority-unaware runtime can commit a truthful no-launch receipt through the explicit authority seam | This is not proof of a launched runtime's effects, and the production authority adapter remains unavailable |
@@ -81,7 +81,7 @@ implemented. Unsupported is not passed.
 
 | Profile | Native portable coverage in this revision | Remaining acceptance examples |
 | --- | --- | --- |
-| Structural | Definition parsing/lifecycle, RRULE vocabulary, adoption replay/conflict, occurrence uniqueness, terminal immutability, event reduction, receipt integrity, capability negotiation | Full supported command matrix, randomized operation sequences, typed transport/domain parity, packed consumer compatibility |
+| Structural | Definition parsing/lifecycle, RRULE vocabulary, adoption replay/conflict, command-envelope outcomes across a restart, occurrence uniqueness, terminal immutability, event reduction, receipt integrity, capability negotiation | Full supported command matrix, randomized operation sequences, typed transport/domain parity, packed consumer compatibility |
 | Scheduler reliability | Calendar/DST, misfire, lease recovery, overlap, retry/backoff/quarantine, leadership fencing, startup/wake, cancellation/timeout arbitration | Process kill at every durable/external boundary, database busy/I/O/corruption, delivery failure, bounded load and retention |
 | Runtime Authority | Terminal-evidence recovery hold only | Authenticated production dispatch, revocation/approval races, runtime capability downgrade, signed terminal producer and trusted verification |
 | Continuity | No native portable profile advertised | Exact familiar root/revision, alias ambiguity, historical rehydration, and direct/Psyche correlation |
