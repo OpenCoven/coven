@@ -19,6 +19,9 @@ pub mod contract;
 pub mod daemon_tick;
 pub mod definition;
 pub mod diagnostics;
+// Accepting verifiers for evidence no production producer signs yet (coven#857).
+#[allow(dead_code)]
+pub mod ed25519_trust;
 pub mod health;
 pub mod import_legacy;
 pub mod inspection;

@@ -839,6 +839,7 @@ dependencies = [
  "ratatui",
  "rcgen",
  "regex",
+ "ring",
  "rusqlite",
  "rustix",
  "rustls",
