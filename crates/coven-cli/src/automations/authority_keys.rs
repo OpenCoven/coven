@@ -13,7 +13,8 @@
 //!
 //! Each key's public half, `keyId`, `proofRef`, producer and validity window
 //! are recorded in the store, and [`trusted_keys`] builds the #1192 verifiers'
-//! trust set from those records. The private half lives in an owner-only file
+//! trust set for one role from those records. Roles are enforced by that
+//! scoping, because every role shares the daemon's producer identity. The private half lives in an owner-only file
 //! under `COVEN_HOME/authority-keys`. On Unix it is created `0600` inside a
 //! `0700` directory. On Windows it inherits the owner-only DACL that the daemon
 //! places on `COVEN_HOME`.
@@ -167,6 +168,7 @@ pub(crate) fn current_signing_key(
     role: AuthorityKeyRole,
     now: DateTime<Utc>,
 ) -> Result<RoleSigningKey> {
+    let now = persisted(now)?;
     ensure_authority_keys_schema(conn)?;
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("failed to begin authority key transaction")?;
@@ -198,13 +200,16 @@ fn commit_or_discard(
     committed
 }
 
-/// Closes the role's current key at `now` and creates its successor.
+/// Closes the role's current key at `now` and creates its successor. Every
+/// retired or revoked private key of the role is then deleted, including any
+/// an earlier, interrupted rotation left behind.
 pub(crate) fn rotate_signing_key(
     conn: &Connection,
     coven_home: &Path,
     role: AuthorityKeyRole,
     now: DateTime<Utc>,
 ) -> Result<RoleSigningKey> {
+    let now = persisted(now)?;
     ensure_authority_keys_schema(conn)?;
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("failed to begin authority key rotation")?;
@@ -224,10 +229,27 @@ pub(crate) fn rotate_signing_key(
     }
     let key = create_signing_key(&transaction, coven_home, role, now)?;
     commit_or_discard(transaction, coven_home, &key, true)?;
-    if let Some(record) = retired {
-        remove_private_key(coven_home, &record.key_id)?;
-    }
+    remove_retired_private_keys(conn, coven_home, role)?;
     Ok(key)
+}
+
+/// Deletes the private file of every retired or revoked key of `role`. It is
+/// idempotent, so a cleanup that failed part-way finishes on the next call.
+fn remove_retired_private_keys(
+    conn: &Connection,
+    coven_home: &Path,
+    role: AuthorityKeyRole,
+) -> Result<()> {
+    let mut first_error = None;
+    for record in key_records(conn)? {
+        let retired = record.valid_until.is_some() || record.revoked_at.is_some();
+        if record.role == role && retired {
+            if let Err(error) = remove_private_key(coven_home, &record.key_id) {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Revokes one key so it authenticates nothing, whenever evidence claims it
@@ -243,6 +265,7 @@ pub(crate) fn revoke_key(
         !reason.trim().is_empty(),
         "an authority key revocation needs a reason"
     );
+    let now = persisted(now)?;
     ensure_authority_keys_schema(conn)?;
     let changed = conn
         .execute(
@@ -257,10 +280,10 @@ pub(crate) fn revoke_key(
             record_by_id(conn, key_id)?.is_some(),
             "authority key `{key_id}` does not exist"
         );
-        return Ok(false);
     }
+    // Also on a repeat, so a deletion that failed the first time is retried.
     remove_private_key(coven_home, key_id)?;
-    Ok(true)
+    Ok(changed > 0)
 }
 
 /// Every recorded key, oldest first.
@@ -282,11 +305,18 @@ pub(crate) fn key_records(conn: &Connection) -> Result<Vec<AuthorityKeyRecord>> 
     .collect()
 }
 
-/// The #1192 verifiers' trust set: every recorded key, scoped to its producer,
-/// inside its window, and revoked where recorded.
-pub(crate) fn trusted_keys(conn: &Connection) -> Result<TrustedKeys> {
+/// The trust set for evidence that `role` signs: that role's keys only,
+/// scoped to their producer, inside their windows, and revoked where recorded.
+/// Every role shares one producer identity, so a verifier must be given the
+/// set for the role that signs what it checks. Runtime terminal evidence is
+/// checked against `TerminalObserver`. Execution bindings and receipt
+/// authority evidence are checked against `DispatchAuthority`.
+pub(crate) fn trusted_keys(conn: &Connection, role: AuthorityKeyRole) -> Result<TrustedKeys> {
     let mut keys = TrustedKeys::default();
-    for record in key_records(conn)? {
+    for record in key_records(conn)?
+        .into_iter()
+        .filter(|record| record.role == role)
+    {
         let key = TrustedKey::from_spki_der_hex(
             &record.key_id,
             &record.proof_ref,
@@ -479,17 +509,22 @@ fn write_private_key(coven_home: &Path, key_id: &str, pkcs8: &[u8]) -> Result<Pa
     let mut file = options
         .open(&path)
         .with_context(|| format!("failed to create authority key file {}", path.display()))?;
-    let written = file
-        .write_all(format!("{}\n", encode_lower_hex(pkcs8)).as_bytes())
-        .and_then(|()| file.sync_all());
-    if let Err(error) = written {
+    let persisted = (|| -> Result<()> {
+        file.write_all(format!("{}\n", encode_lower_hex(pkcs8)).as_bytes())
+            .and_then(|()| file.sync_all())
+            .context("failed to write authority key file")?;
+        #[cfg(unix)]
+        std::fs::File::open(&directory)
+            .and_then(|directory| directory.sync_all())
+            .context("failed to persist the authority key directory")?;
+        Ok(())
+    })();
+    // Any failure after the file exists removes it, so no key outlives a
+    // write that did not complete.
+    if let Err(error) = persisted {
         let _ = std::fs::remove_file(&path);
-        return Err(error).context("failed to write authority key file");
+        return Err(error);
     }
-    #[cfg(unix)]
-    std::fs::File::open(&directory)
-        .and_then(|directory| directory.sync_all())
-        .context("failed to persist the authority key directory")?;
     Ok(path)
 }
 
@@ -525,6 +560,16 @@ fn public_key_der_hex(key_pair: &Ed25519KeyPair) -> String {
     let mut der = ED25519_SPKI_PREFIX.to_vec();
     der.extend_from_slice(key_pair.public_key().as_ref());
     encode_lower_hex(&der)
+}
+
+/// The store keeps millisecond timestamps. Lifecycle times are reduced to that
+/// precision first, so returned records equal the persisted ones and window
+/// comparisons agree with the stored `CHECK`.
+fn persisted(value: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    use chrono::DurationRound;
+    value
+        .duration_trunc(chrono::TimeDelta::milliseconds(1))
+        .context("authority key time cannot be stored")
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
@@ -618,8 +663,8 @@ mod tests {
         distinct.dedup();
         assert_eq!(distinct.len(), 4, "each role has its own key");
 
-        let keys = trusted_keys(&conn).unwrap();
         for key in &seen {
+            let keys = trusted_keys(&conn, key.record().role).unwrap();
             assert_eq!(authenticate(&keys, key, at(11), 7), Ok(()));
             // A key authenticates only its own producer.
             assert_eq!(
@@ -647,6 +692,7 @@ mod tests {
             );
         }
         // Another role's key cannot answer for this role's identifier.
+        let keys = trusted_keys(&conn, seen[0].record().role).unwrap();
         assert_eq!(
             keys.authenticate(
                 &seen[0].record().key_id,
@@ -658,6 +704,33 @@ mod tests {
             ),
             Err(KeyRefusal::Invalid)
         );
+    }
+
+    #[test]
+    fn a_trust_set_authenticates_only_its_own_role() {
+        let (temp, conn) = store();
+        let keys: Vec<_> = AuthorityKeyRole::ALL
+            .into_iter()
+            .map(|role| current_signing_key(&conn, temp.path(), role, at(9)).unwrap())
+            .collect();
+        for verifier in AuthorityKeyRole::ALL {
+            let trusted = trusted_keys(&conn, verifier).unwrap();
+            for signer in &keys {
+                // The signer's own identifiers and a valid signature: only the
+                // role the verifier checks for may pass.
+                let expected = if signer.record().role == verifier {
+                    Ok(())
+                } else {
+                    Err(KeyRefusal::Untrusted)
+                };
+                assert_eq!(
+                    authenticate(&trusted, signer, at(10), 5),
+                    expected,
+                    "{:?} evidence checked as {verifier:?}",
+                    signer.record().role
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -696,7 +769,7 @@ mod tests {
         );
         assert!(!old_path.exists(), "a retired key can no longer sign");
 
-        let keys = trusted_keys(&conn).unwrap();
+        let keys = trusted_keys(&conn, role).unwrap();
         // Evidence the old key signed inside its window still verifies.
         assert_eq!(authenticate(&keys, &old, at(11), 3), Ok(()));
         assert_eq!(authenticate(&keys, &old, at(12), 3), Err(KeyRefusal::Stale));
@@ -735,7 +808,7 @@ mod tests {
             .unwrap()
             .exists());
 
-        let keys = trusted_keys(&conn).unwrap();
+        let keys = trusted_keys(&conn, role).unwrap();
         // Revocation is not a window: earlier signatures stop verifying too.
         assert_eq!(authenticate(&keys, &key, at(9), 4), Err(KeyRefusal::Stale));
         let record = key_records(&conn)
@@ -751,7 +824,7 @@ mod tests {
         let fresh = current_signing_key(&conn, temp.path(), role, at(12)).unwrap();
         assert_ne!(fresh.record().key_id, key.record().key_id);
         assert_eq!(
-            authenticate(&trusted_keys(&conn).unwrap(), &fresh, at(12), 4),
+            authenticate(&trusted_keys(&conn, role).unwrap(), &fresh, at(12), 4),
             Ok(())
         );
     }
@@ -790,6 +863,74 @@ mod tests {
                 .record(),
             rotated.record()
         );
+    }
+
+    #[test]
+    fn cleanup_finishes_deletions_that_failed_earlier() {
+        let (temp, conn) = store();
+        let role = AuthorityKeyRole::TerminalObserver;
+        let first = current_signing_key(&conn, temp.path(), role, at(9)).unwrap();
+        let first_path = private_key_path(temp.path(), &first.record().key_id).unwrap();
+        rotate_signing_key(&conn, temp.path(), role, at(10)).unwrap();
+        // As if that rotation committed but failed to delete the retired file.
+        std::fs::write(&first_path, "left behind\n").unwrap();
+        rotate_signing_key(&conn, temp.path(), role, at(11)).unwrap();
+        assert!(
+            !first_path.exists(),
+            "a later rotation finishes the deletion"
+        );
+
+        let revoked = current_signing_key(&conn, temp.path(), role, at(12)).unwrap();
+        let revoked_path = private_key_path(temp.path(), &revoked.record().key_id).unwrap();
+        assert!(revoke_key(
+            &conn,
+            temp.path(),
+            &revoked.record().key_id,
+            "rotated out",
+            at(13)
+        )
+        .unwrap());
+        // As if the first revocation committed but failed to delete the file.
+        std::fs::write(&revoked_path, "left behind\n").unwrap();
+        assert!(!revoke_key(
+            &conn,
+            temp.path(),
+            &revoked.record().key_id,
+            "again",
+            at(14)
+        )
+        .unwrap());
+        assert!(
+            !revoked_path.exists(),
+            "a repeated revocation finishes the deletion"
+        );
+    }
+
+    #[test]
+    fn lifecycle_times_are_kept_at_the_stored_precision() {
+        let (temp, conn) = store();
+        let role = AuthorityKeyRole::DispatchAuthority;
+        let created_at = at(9) + chrono::TimeDelta::microseconds(123_100);
+        let key = current_signing_key(&conn, temp.path(), role, created_at).unwrap();
+        assert_eq!(
+            key.record().valid_from,
+            at(9) + chrono::TimeDelta::milliseconds(123)
+        );
+        // The returned record is exactly what a reload reads back.
+        assert_eq!(&key_records(&conn).unwrap()[0], key.record());
+        // Within the same stored millisecond, rotation is refused cleanly
+        // rather than by the store's window CHECK.
+        let same_millisecond = at(9) + chrono::TimeDelta::microseconds(123_900);
+        let refused = rotate_signing_key(&conn, temp.path(), role, same_millisecond).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("cannot be rotated before it becomes valid"),
+            "{refused:#}"
+        );
+        let next_millisecond = at(9) + chrono::TimeDelta::microseconds(124_000);
+        let rotated = rotate_signing_key(&conn, temp.path(), role, next_millisecond).unwrap();
+        let records = key_records(&conn).unwrap();
+        assert_eq!(records[0].valid_until, Some(rotated.record().valid_from));
+        assert_eq!(&records[1], rotated.record());
     }
 
     #[test]
