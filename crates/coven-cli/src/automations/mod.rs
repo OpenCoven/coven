@@ -19,6 +19,10 @@ pub mod contract;
 pub mod daemon_tick;
 pub mod definition;
 pub mod diagnostics;
+// Role keys for the daemon's Runtime Authority signers; no production caller
+// until the trusted adapter lands (coven#857).
+#[allow(dead_code)]
+pub mod authority_keys;
 // Accepting verifiers for evidence no production producer signs yet (coven#857).
 #[allow(dead_code)]
 pub mod ed25519_trust;
