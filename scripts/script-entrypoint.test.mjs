@@ -83,7 +83,23 @@ for (const script of scripts) {
 // GitHub Release step failed exactly so (#1204). Every entrypoint must start
 // its CLI after its last such declaration.
 const cliStart = /^if \((?:isMainModule\(|process\.argv\[1\]|import\.meta\.url ===)/m;
-const topLevelBinding = /^(?:export )?(?:const|let|class) (\w+)/gm;
+// The binding is a name or an object or array destructuring pattern.
+const topLevelBinding = /^(?:export\s+)?(?:const|let|class)\s+(\w+|\{[^}]*\}|\[[^\]]*\])/gm;
+
+function lateBindings(source) {
+  const start = source.search(cliStart);
+  return start === -1 ? [] : [...source.slice(start).matchAll(topLevelBinding)].map((match) => match[1]);
+}
+
+test('the late-binding scan sees every top-level binding form', () => {
+  const cli = 'if (isMainModule()) {\n  main();\n}\n';
+  assert.deepEqual(lateBindings(
+    `${cli}const plain = 1;\nlet counter = 0;\nclass Shape {}\nexport const exported = 2;\n` +
+    'const { value, other: renamed } = source;\nlet [first, second] = pair;\nconst {\n  multi\n} = nested;\n'
+  ), ['plain', 'counter', 'Shape', 'exported', '{ value, other: renamed }', '[first, second]', '{\n  multi\n}']);
+  assert.deepEqual(lateBindings(`const { value } = source;\nconst [first] = pair;\n${cli}`), []);
+  assert.deepEqual(lateBindings(`${cli}function hoisted() {}\n  const nested = 1;\n`), []);
+});
 
 test('entrypoint scripts start their CLI after every top-level binding', () => {
   const scriptsDirectory = path.join(repositoryRoot, 'scripts');
@@ -96,8 +112,7 @@ test('entrypoint scripts start their CLI after every top-level binding', () => {
     'the entrypoint scan must find the release packager'
   );
   for (const { name, source } of entrypoints) {
-    const start = source.search(cliStart);
-    const late = [...source.slice(start).matchAll(topLevelBinding)].map((match) => match[1]);
+    const late = lateBindings(source);
     assert.deepEqual(late, [], `${name} declares ${late.join(', ')} after starting its CLI`);
   }
 });
