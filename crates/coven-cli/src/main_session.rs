@@ -24,8 +24,8 @@
 // (#1177, second PR) is the first production consumer. Drop this when it does.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use anyhow::{bail, ensure, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -86,6 +86,21 @@ pub struct RotatedMainSession {
     pub record: MainSessionRecord,
     pub previous_conversation_id: String,
     pub previous_session_id: Option<String>,
+}
+
+/// What a stale-id rotation did. The caller names the conversation id that
+/// actually failed, and the pointer is rotated only if it still holds that
+/// id: with concurrent clients, or a reset racing a delayed stale response,
+/// rotating "whatever is current" would invalidate a conversation that was
+/// just created and works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleIdRotation {
+    /// The pointer still held the failed id and now holds a fresh one.
+    Rotated(RotatedMainSession),
+    /// The pointer no longer holds the failed id; a reset or another
+    /// rollover already replaced it. Nothing changed. Carries the current
+    /// pointer so the caller can simply retry its turn.
+    AlreadyRotated(MainSessionRecord),
 }
 
 /// Scope keys are stored, logged, and later used in event payloads and route
@@ -235,30 +250,45 @@ pub fn bind_main_session(
     Ok(record)
 }
 
-fn rotate(
-    conn: &mut Connection,
-    scope_key: &str,
+fn begin_rotation(conn: &mut Connection) -> Result<Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to begin main session rotation")
+}
+
+/// Rotates from a pointer the caller loaded inside `transaction`, so the
+/// decision to rotate and the rotation itself see the same snapshot. The
+/// UPDATE is conditioned on that snapshot's conversation id as well; under
+/// the IMMEDIATE transaction it cannot miss, and the check keeps it that way.
+fn rotate_in(
+    transaction: &Transaction<'_>,
+    previous: MainSessionRecord,
     now: &str,
     count_as_reset: bool,
 ) -> Result<RotatedMainSession> {
-    let transaction = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .context("failed to begin main session rotation")?;
-    let previous = load_main_session(&transaction, scope_key)?;
     let reset_increment: i64 = if count_as_reset { 1 } else { 0 };
-    transaction
+    let updated = transaction
         .execute(
             "UPDATE main_sessions
              SET conversation_id = ?2,
                  current_session_id = NULL,
                  reset_count = reset_count + ?3,
                  updated_at = ?4
-             WHERE scope_key = ?1",
-            params![scope_key, new_conversation_id(), reset_increment, now],
+             WHERE scope_key = ?1 AND conversation_id = ?5",
+            params![
+                previous.scope_key,
+                new_conversation_id(),
+                reset_increment,
+                now,
+                previous.conversation_id
+            ],
         )
         .context("failed to rotate main session conversation")?;
-    let record = load_main_session(&transaction, scope_key)?;
-    transaction.commit()?;
+    ensure!(
+        updated == 1,
+        "main session {} changed during rotation",
+        previous.scope_key
+    );
+    let record = load_main_session(transaction, &previous.scope_key)?;
     Ok(RotatedMainSession {
         record,
         previous_conversation_id: previous.conversation_id,
@@ -275,17 +305,32 @@ pub fn reset_main_session(
     scope_key: &str,
     now: &str,
 ) -> Result<RotatedMainSession> {
-    rotate(conn, scope_key, now, true)
+    let transaction = begin_rotation(conn)?;
+    let previous = load_main_session(&transaction, scope_key)?;
+    let rotated = rotate_in(&transaction, previous, now, true)?;
+    transaction.commit()?;
+    Ok(rotated)
 }
 
 /// Recovery from a conversation id the harness no longer recognises. Same
-/// rotation as a reset, but not counted, because the user did not ask for it.
+/// rotation as a reset, but not counted, because the user did not ask for
+/// it, and compare-and-swap on `failed_conversation_id`: see
+/// [`StaleIdRotation`].
 pub fn rotate_main_session_conversation(
     conn: &mut Connection,
     scope_key: &str,
+    failed_conversation_id: &str,
     now: &str,
-) -> Result<RotatedMainSession> {
-    rotate(conn, scope_key, now, false)
+) -> Result<StaleIdRotation> {
+    let transaction = begin_rotation(conn)?;
+    let previous = load_main_session(&transaction, scope_key)?;
+    if previous.conversation_id != failed_conversation_id {
+        // Read-only so far; dropping the transaction rolls nothing back.
+        return Ok(StaleIdRotation::AlreadyRotated(previous));
+    }
+    let rotated = rotate_in(&transaction, previous, now, false)?;
+    transaction.commit()?;
+    Ok(StaleIdRotation::Rotated(rotated))
 }
 
 #[cfg(test)]
@@ -498,8 +543,15 @@ mod tests {
         let (_temp, mut conn) = temp_store();
         let resolved =
             resolve_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, None, "claude", NOW).unwrap();
-        let rotated =
-            rotate_main_session_conversation(&mut conn, INSTANCE_MAIN_SCOPE_KEY, LATER).unwrap();
+        let StaleIdRotation::Rotated(rotated) = rotate_main_session_conversation(
+            &mut conn,
+            INSTANCE_MAIN_SCOPE_KEY,
+            &resolved.record.conversation_id,
+            LATER,
+        )
+        .unwrap() else {
+            panic!("the failed id was current, so it must rotate");
+        };
         assert_eq!(
             rotated.previous_conversation_id,
             resolved.record.conversation_id
@@ -526,7 +578,55 @@ mod tests {
     fn rotation_of_a_missing_pointer_fails_closed() {
         let (_temp, mut conn) = temp_store();
         assert!(reset_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, NOW).is_err());
-        assert!(rotate_main_session_conversation(&mut conn, INSTANCE_MAIN_SCOPE_KEY, NOW).is_err());
+        assert!(
+            rotate_main_session_conversation(&mut conn, INSTANCE_MAIN_SCOPE_KEY, "c1", NOW)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_id_rotation_only_replaces_the_conversation_that_failed() {
+        // Two connections stand in for two daemon requests (or a mobile and
+        // a desktop client) that both saw the same conversation fail.
+        let (temp, mut first) = temp_store();
+        let mut second = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let failed = resolve_main_session(&mut first, INSTANCE_MAIN_SCOPE_KEY, None, "claude", NOW)
+            .unwrap()
+            .record
+            .conversation_id;
+
+        let StaleIdRotation::Rotated(winner) =
+            rotate_main_session_conversation(&mut first, INSTANCE_MAIN_SCOPE_KEY, &failed, LATER)
+                .unwrap()
+        else {
+            panic!("first rollover must rotate");
+        };
+        let fresh = winner.record.conversation_id.clone();
+
+        // The delayed duplicate must not rotate the fresh, working id away.
+        let late =
+            rotate_main_session_conversation(&mut second, INSTANCE_MAIN_SCOPE_KEY, &failed, LATER)
+                .unwrap();
+        let StaleIdRotation::AlreadyRotated(current) = late else {
+            panic!("a rollover for a replaced id must not rotate: {late:?}");
+        };
+        assert_eq!(current.conversation_id, fresh);
+
+        // Same for a stale response that arrives after an explicit reset.
+        let reset = reset_main_session(&mut second, INSTANCE_MAIN_SCOPE_KEY, LATER).unwrap();
+        let after_reset =
+            rotate_main_session_conversation(&mut first, INSTANCE_MAIN_SCOPE_KEY, &fresh, LATER)
+                .unwrap();
+        assert_eq!(
+            after_reset,
+            StaleIdRotation::AlreadyRotated(reset.record.clone())
+        );
+
+        let stored = get_main_session(&first, INSTANCE_MAIN_SCOPE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.conversation_id, reset.record.conversation_id);
+        assert_eq!(stored.reset_count, 1, "only the explicit reset counts");
     }
 
     #[test]
