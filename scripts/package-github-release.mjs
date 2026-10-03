@@ -977,28 +977,45 @@ function npmPackageSubjectName(packageName, npmVersion) {
 // until the deadline; anything else, and the deadline itself, still refuse.
 const REGISTRY_VISIBILITY_DEADLINE_MS = 15 * 60 * 1000;
 const REGISTRY_RETRY_DELAYS_MS = [10_000, 20_000, 30_000, 60_000];
+const REGISTRY_REQUEST_TIMEOUT_MS = 30_000;
 
 function isRegistryRetryable(error) {
   const status = error?.status;
-  return status === 404 || status === 429 || (Number.isInteger(status) && status >= 500);
+  return (
+    error?.timedOut === true ||
+    status === 404 ||
+    status === 429 ||
+    (Number.isInteger(status) && status >= 500)
+  );
 }
 
+// The deadline bounds the whole wait: each request is given at most the time
+// that remains (and never more than 30 s), no retry sleeps into the deadline,
+// and an answer that arrives after it is refused.
 export async function fetchJsonWhenVisible(url, {
   fetchJson = fetchJsonFromNetwork,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   now = () => Date.now(),
   deadlineMs = REGISTRY_VISIBILITY_DEADLINE_MS,
   retryDelaysMs = REGISTRY_RETRY_DELAYS_MS,
+  requestTimeoutMs = REGISTRY_REQUEST_TIMEOUT_MS,
   log = (message) => console.log(message)
 } = {}) {
   const startedAt = now();
   for (let attempt = 0; ; attempt += 1) {
+    const remaining = deadlineMs - (now() - startedAt);
     try {
-      return await fetchJson(url);
+      const value = await fetchJson(url, { timeoutMs: Math.min(requestTimeoutMs, remaining) });
+      if (now() - startedAt > deadlineMs) {
+        throw new Error(
+          `GET ${url} answered after the ${Math.round(deadlineMs / 1000)}s npm registry deadline.`
+        );
+      }
+      return value;
     } catch (error) {
       const delay = retryDelaysMs[Math.min(attempt, retryDelaysMs.length - 1)];
       const waited = now() - startedAt;
-      if (!isRegistryRetryable(error) || waited + delay > deadlineMs) {
+      if (!isRegistryRetryable(error) || waited + delay >= deadlineMs) {
         if (isRegistryRetryable(error) && attempt > 0) {
           error.message = `${error.message} Still unavailable after waiting ${Math.round(waited / 1000)}s for the npm registry.`;
         }
@@ -1838,21 +1855,33 @@ async function ghApiJson(endpoint) {
   return JSON.parse(output);
 }
 
-async function fetchJsonFromNetwork(url) {
+async function fetchJsonFromNetwork(url, { timeoutMs } = {}) {
   if (!url) {
     throw new Error('Expected npm provenance URL, got empty value.');
   }
-  const response = await fetch(url, {
-    headers: {
-      accept: 'application/json'
+  // One signal covers the connection and the body read.
+  const signal = timeoutMs === undefined ? undefined : AbortSignal.timeout(Math.max(1, timeoutMs));
+  try {
+    const response = await fetch(url, {
+      headers: {
+        accept: 'application/json'
+      },
+      signal
+    });
+    if (!response.ok) {
+      const error = new Error(`GET ${url} failed with HTTP ${response.status}.`);
+      error.status = response.status;
+      throw error;
     }
-  });
-  if (!response.ok) {
-    const error = new Error(`GET ${url} failed with HTTP ${response.status}.`);
-    error.status = response.status;
+    return await response.json();
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+      const timedOut = new Error(`GET ${url} timed out after ${timeoutMs}ms.`);
+      timedOut.timedOut = true;
+      throw timedOut;
+    }
     throw error;
   }
-  return response.json();
 }
 
 function decodeDssePayload(dsseEnvelope) {

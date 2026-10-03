@@ -1649,7 +1649,7 @@ test('fetchJsonWhenVisible retries only not-yet-visible or transient registry re
   }
 });
 
-test('fetchJsonWhenVisible gives up at its deadline and says how long it waited', async () => {
+test('fetchJsonWhenVisible gives up rather than sleep into its deadline, and says how long it waited', async () => {
   const clock = fakeClock();
   let calls = 0;
   await assert.rejects(
@@ -1664,10 +1664,62 @@ test('fetchJsonWhenVisible gives up at its deadline and says how long it waited'
         deadlineMs: 120_000,
         log() {}
       }),
-    /HTTP 404\. Still unavailable after waiting 120s for the npm registry\./
+    /HTTP 404\. Still unavailable after waiting 60s for the npm registry\./
   );
-  assert.deepEqual(clock.sleeps, [10_000, 20_000, 30_000, 60_000]);
-  assert.equal(calls, 5);
+  // The fourth 404 lands at 60 s; another 60 s sleep would reach the deadline.
+  assert.deepEqual(clock.sleeps, [10_000, 20_000, 30_000]);
+  assert.equal(calls, 4);
+});
+
+test('fetchJsonWhenVisible bounds each request by the time left and refuses a late answer', async () => {
+  const clock = fakeClock();
+  const timeouts = [];
+  let calls = 0;
+  // A 404 that takes 5 s, then a response that takes 30 s against a 40 s
+  // deadline: it would land at 45 s.
+  await assert.rejects(
+    () =>
+      fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+        async fetchJson(url, { timeoutMs }) {
+          timeouts.push(timeoutMs);
+          calls += 1;
+          if (calls === 1) {
+            await clock.sleep(5_000);
+            throw httpError(404);
+          }
+          await clock.sleep(30_000);
+          return { late: true };
+        },
+        sleep: clock.sleep,
+        now: clock.now,
+        deadlineMs: 40_000,
+        log() {}
+      }),
+    /answered after the 40s npm registry deadline/
+  );
+  // The first request may take the 30 s cap; the second only the 25 s left.
+  assert.deepEqual(timeouts, [30_000, 25_000]);
+});
+
+test('fetchJsonWhenVisible retries a request that timed out', async () => {
+  const clock = fakeClock();
+  let calls = 0;
+  const timedOut = new Error('GET https://registry.npmjs.org/example timed out after 30000ms.');
+  timedOut.timedOut = true;
+  const value = await fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+    async fetchJson() {
+      calls += 1;
+      if (calls === 1) {
+        throw timedOut;
+      }
+      return { ok: true };
+    },
+    sleep: clock.sleep,
+    now: clock.now,
+    log() {}
+  });
+  assert.deepEqual(value, { ok: true });
+  assert.deepEqual(clock.sleeps, [10_000]);
 });
 
 test('verifyPackageProvenance accepts the real npm attestation shape for every release package', async () => {
