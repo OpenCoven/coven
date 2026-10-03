@@ -610,7 +610,10 @@ fn validate_event_index(event: &EventEnvelope, stored: &StoredEventEvidence) -> 
 struct DurableCorrelation {
     automation_id: String,
     automation_revision: i64,
+    /// The digest published for the run's revision (`rich_definition::published_digest`).
     definition_digest: Option<String>,
+    /// The run's stored snapshot digest, the internal fence.
+    snapshot_digest: Option<String>,
     occurrence_id: String,
     familiar_id: Option<String>,
     runtime: String,
@@ -903,16 +906,20 @@ fn durable_correlation(
     receipt: &AutomationReceipt,
 ) -> Result<DurableCorrelation> {
     conn.query_row(
-        "SELECT run.automation_id, run.automation_revision, run.definition_digest,
-                run.occurrence_id, run.familiar_id, run.runtime, run.authority_profile,
-                run.status, run.receipt_id, attempt.occurrence_id, attempt.attempt_number,
-                attempt.adoption_key, attempt.occurrence_fence_generation,
-                attempt.authority_extension_json, attempt.state, attempt.failure_class,
-                attempt.state_reason, run.finished_at, attempt.settled_at
-         FROM automation_runs AS run
-         JOIN automation_attempts AS attempt
-           ON attempt.run_id = run.id
-         WHERE run.id = ?1 AND attempt.id = ?2",
+        &format!(
+            "SELECT run.automation_id, run.automation_revision, {digest},
+                    run.occurrence_id, run.familiar_id, run.runtime, run.authority_profile,
+                    run.status, run.receipt_id, attempt.occurrence_id, attempt.attempt_number,
+                    attempt.adoption_key, attempt.occurrence_fence_generation,
+                    attempt.authority_extension_json, attempt.state, attempt.failure_class,
+                    attempt.state_reason, run.finished_at, attempt.settled_at,
+                    run.definition_digest
+             FROM automation_runs AS run
+             JOIN automation_attempts AS attempt
+               ON attempt.run_id = run.id
+             WHERE run.id = ?1 AND attempt.id = ?2",
+            digest = super::rich_definition::published_digest_sql("run"),
+        ),
         params![receipt.run_id.as_str(), receipt.attempt_id.as_str()],
         |row| {
             Ok(DurableCorrelation {
@@ -935,6 +942,7 @@ fn durable_correlation(
                 state_reason: row.get(16)?,
                 run_finished_at: row.get(17)?,
                 attempt_settled_at: row.get(18)?,
+                snapshot_digest: row.get(19)?,
             })
         },
     )
@@ -955,12 +963,18 @@ fn validate_durable_correlation(
         u64::try_from(durable.automation_revision).ok() == Some(receipt.automation_revision.get()),
         "automation receipt revision does not match its run"
     );
+    // New bindings, and so new receipts, pin the published digest. A binding
+    // persisted before richly authored revisions published their document
+    // digest pinned the snapshot digest, and a receipt built from it may be
+    // committed or read now. Both identify this run's revision; the exact
+    // value is held to the signed binding where Runtime Authority applies.
+    let pinned = receipt
+        .definition_digest
+        .as_ref()
+        .map(|digest| digest.value.as_str());
     anyhow::ensure!(
-        durable.definition_digest.as_deref()
-            == receipt
-                .definition_digest
-                .as_ref()
-                .map(|digest| digest.value.as_str()),
+        durable.definition_digest.as_deref() == pinned
+            || durable.snapshot_digest.as_deref() == pinned,
         "automation receipt definition digest does not match its run"
     );
     anyhow::ensure!(
@@ -2245,6 +2259,54 @@ mod tests {
                 [],
             )
             .is_err());
+    }
+
+    /// A receipt names its revision by the digest Coven publishes for it: for
+    /// a richly authored revision, the recorded document's integrity. A
+    /// receipt built from a binding persisted earlier names the run's snapshot
+    /// digest, which identifies the same revision. No other digest does.
+    #[test]
+    fn receipts_pin_the_published_or_snapshot_digest_of_their_revision() {
+        let document_digest = "a".repeat(64);
+        let commit_and_read = |pin: &dyn Fn(&Fixture) -> String| {
+            let fixture = fixture();
+            fixture
+                .conn
+                .execute(
+                    "INSERT INTO automation_rich_definition_revisions
+                        (automation_id, revision, rich_definition_json, integrity, recorded_at)
+                     VALUES ('daily', 1, '{}', ?1, '2026-10-03T00:00:00.000Z')",
+                    [&document_digest],
+                )
+                .unwrap();
+            let digest = pin(&fixture);
+            let receipt = mutate_receipt(make_receipt(&fixture, "receipt-daily-1"), |value| {
+                value["definitionDigest"]["value"] = json!(digest);
+            });
+            let event = receipt_event(&fixture.conn, &receipt, 0);
+            commit_receipt(&fixture.conn, &receipt, &event)
+                .map(|outcome| {
+                    let read = read_receipt(&fixture.conn, "receipt-daily-1")
+                        .unwrap()
+                        .unwrap();
+                    (outcome, read == receipt)
+                })
+                .map_err(|error| format!("{error:#}"))
+        };
+
+        assert_eq!(
+            commit_and_read(&|_| document_digest.clone()),
+            Ok((ReceiptCommitOutcome::Committed, true))
+        );
+        assert_eq!(
+            commit_and_read(&|fixture| fixture.definition_digest.clone()),
+            Ok((ReceiptCommitOutcome::Committed, true))
+        );
+        let refused = commit_and_read(&|_| "b".repeat(64)).unwrap_err();
+        assert!(
+            refused.contains("definition digest does not match its run"),
+            "{refused}"
+        );
     }
 
     #[test]

@@ -164,16 +164,27 @@ pub(crate) fn history_sort_key(column: &str) -> String {
 /// identical to `history_sort_key("scheduled_for")`.
 pub(crate) fn occurrence_history_sql() -> String {
     format!(
-        "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
-                kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
-                failure_reason, created_at, updated_at
+        "SELECT {columns}
          FROM automation_occurrences
          WHERE automation_id = ?1
            AND (?2 IS NULL OR {key} < {after} OR ({key} = {after} AND id < ?3))
          ORDER BY {key} DESC, id DESC
          LIMIT ?4",
+        columns = occurrence_columns(),
         key = history_sort_key("scheduled_for"),
         after = history_sort_key("?2"),
+    )
+}
+
+/// Occurrence projection columns. `definition_digest` is the published digest
+/// for the pinned revision, not the internal snapshot fence.
+fn occurrence_columns() -> String {
+    format!(
+        "id, automation_id, automation_revision,
+         {digest} AS definition_digest, scheduled_for,
+         kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+         failure_reason, created_at, updated_at",
+        digest = super::rich_definition::published_digest_sql("automation_occurrences"),
     )
 }
 
@@ -269,14 +280,13 @@ fn list_by_query(
     automation_id: Option<&str>,
 ) -> Result<Vec<OccurrenceRecord>> {
     let query = format!(
-        "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
-                kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
-                failure_reason, created_at, updated_at
+        "SELECT {columns}
          FROM automation_occurrences
          WHERE ({predicate})
            AND (?3 IS NULL OR automation_id = ?3)
          ORDER BY scheduled_for ASC, id ASC
-         LIMIT ?2"
+         LIMIT ?2",
+        columns = occurrence_columns(),
     );
     let mut statement = conn
         .prepare(&query)
@@ -297,11 +307,12 @@ fn list_by_query(
 
 fn occurrence_by_id(conn: &Connection, id: &str) -> Result<Option<OccurrenceRecord>> {
     conn.query_row(
-        "SELECT id, automation_id, automation_revision, definition_digest, scheduled_for,
-                kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
-                failure_reason, created_at, updated_at
-         FROM automation_occurrences
-         WHERE id = ?1",
+        &format!(
+            "SELECT {columns}
+             FROM automation_occurrences
+             WHERE id = ?1",
+            columns = occurrence_columns(),
+        ),
         [id],
         occurrence_record_from_row,
     )
@@ -330,15 +341,14 @@ fn occurrence_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Occur
 
 fn list_runs_for_occurrence(conn: &Connection, occurrence_id: &str) -> Result<Vec<RunInspection>> {
     let mut statement = conn
-        .prepare(
-            "SELECT id, automation_id, automation_revision, definition_digest, occurrence_id,
-                    authority_profile, receipt_id, session_id, familiar_id, runtime, status,
-                    exit_code, log_json, output_commit, started_at, timeout_at, finished_at
+        .prepare(&format!(
+            "SELECT {columns}
              FROM automation_runs
              WHERE occurrence_id = ?1
              ORDER BY started_at ASC, id ASC
              LIMIT ?2",
-        )
+            columns = run_columns(),
+        ))
         .context("failed to prepare automation occurrence run inspection")?;
     let rows = statement
         .query_map(
@@ -354,10 +364,16 @@ fn list_runs_for_occurrence(conn: &Connection, occurrence_id: &str) -> Result<Ve
         .context("failed to read automation occurrence run inspection")
 }
 
-const RUN_COLUMNS: &str =
-    "id, automation_id, automation_revision, definition_digest, occurrence_id,
-     authority_profile, receipt_id, session_id, familiar_id, runtime, status,
-     exit_code, log_json, output_commit, started_at, timeout_at, finished_at";
+/// Run projection columns, with the published digest as for occurrences.
+fn run_columns() -> String {
+    format!(
+        "id, automation_id, automation_revision,
+         {digest} AS definition_digest, occurrence_id,
+         authority_profile, receipt_id, session_id, familiar_id, runtime, status,
+         exit_code, log_json, output_commit, started_at, timeout_at, finished_at",
+        digest = super::rich_definition::published_digest_sql("automation_runs"),
+    )
+}
 
 /// One run and its attempts, read from a single snapshot. Diagnostic only:
 /// it neither renews leases nor mutates lifecycle rows.
@@ -367,7 +383,10 @@ pub fn inspect_run(conn: &Connection, id: &str) -> Result<Option<RunInspection>>
         .context("failed to begin automation run detail snapshot")?;
     let run = transaction
         .query_row(
-            &format!("SELECT {RUN_COLUMNS} FROM automation_runs WHERE id = ?1"),
+            &format!(
+                "SELECT {columns} FROM automation_runs WHERE id = ?1",
+                columns = run_columns()
+            ),
             [id],
             run_record_from_row,
         )

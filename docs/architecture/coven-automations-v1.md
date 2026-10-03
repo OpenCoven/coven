@@ -382,6 +382,8 @@ An envelope `definition.create.v1` or `.revise.v1` carries a rich `AutomationDef
 
 The projection runs through the same create and revise transactions, validation, capability negotiation, adoption and events as a routine body. The rich body is stored verbatim (canonical JCS) beside the routine. `definition.get.v1` returns it as `definition`, regenerated for the row's current `revision` and `lifecycleState` with its integrity recomputed, so it stays accurate after activate, pause or disable.
 
+**Published digest.** A richly authored revision is identified everywhere by its document's `integrity`, the value create and revise return. Lifecycle events, occurrence and run reads, and the Runtime Authority execution binding, and therefore receipts, all publish it. Scheduling and dispatch still fence on the digest of the executable routine JSON, stored as `definition_digest` and recomputed by the scheduler and runner. A revision with no rich document publishes that routine digest instead: a legacy definition, a routine-bodied revision, or a revision committed by a binary without rich bodies. Migrated history with no stored digest is not attributable to a revision, so it still publishes none. Events are immutable, so a v0.4.7 event keeps the routine digest it was written with. A stored receipt may name either digest of its revision, because a binding persisted before this change pinned the routine digest.
+
 The rules:
 
 - **Create** must be `revision: 1` in `lifecycleState: "draft"`: new definitions start in draft and run nothing until activated.

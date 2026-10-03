@@ -425,23 +425,31 @@ pub fn execute_definition_command(
             } else {
                 record.lifecycle_state.as_str()
             };
+            // Record the rich revision first, so the event publishes the same
+            // document digest the command result returns.
+            super::rich_definition::record_revision(
+                &transaction,
+                automation_id,
+                &effective_adopted_at,
+            )?;
+            let definition_digest = super::rich_definition::published_digest(
+                &transaction,
+                automation_id,
+                revision,
+                record.definition_digest.as_deref(),
+            )?;
             response.event_ref = Some(super::contract::events::append_definition_event(
                 &transaction,
                 super::contract::events::DefinitionEventInput {
                     command: command_name,
                     automation_id,
                     revision,
-                    definition_digest: record.definition_digest.as_deref(),
+                    definition_digest: definition_digest.as_deref(),
                     lifecycle_state,
                     adoption_key: adoption_key.as_str(),
                     observed_at: &effective_adopted_at,
                 },
             )?);
-            super::rich_definition::record_revision(
-                &transaction,
-                automation_id,
-                &effective_adopted_at,
-            )?;
         }
     }
     let stored = match (&response.result, &response.error) {
