@@ -85,13 +85,6 @@ function isMainModule(argv1 = process.argv[1], moduleUrl = import.meta.url) {
   return Boolean(argv1) && pathToFileURL(argv1).href === moduleUrl;
 }
 
-if (isMainModule()) {
-  main().catch((error) => {
-    console.error(error?.message ?? String(error));
-    process.exit(1);
-  });
-}
-
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command) {
@@ -2029,4 +2022,15 @@ function bufferToTrimmedString(value) {
     return '';
   }
   return Buffer.isBuffer(value) ? value.toString('utf8').trim() : String(value).trim();
+}
+
+// Start the CLI only after every top-level declaration has run. `main()`
+// executes synchronously until its first `await`, so a `const` declared below
+// this call would still be uninitialized: v0.4.8's release step failed that way
+// on REGISTRY_VISIBILITY_DEADLINE_MS (#1204).
+if (isMainModule()) {
+  main().catch((error) => {
+    console.error(error?.message ?? String(error));
+    process.exit(1);
+  });
 }
