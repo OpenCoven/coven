@@ -225,6 +225,8 @@ retained adopted/reserved sessions.
 
 If the daemon starts and finds daemon-owned sessions that were marked `running` from a previous daemon lifetime, those sessions are marked `orphaned`. Externally registered running sessions are exempt because the daemon does not own their lifecycle. Generic stale-created recovery marks only unowned `created` rows without launch-adoption or historical reservation evidence as `failed`; retained adopted/reserved `created` rows are left unchanged.
 
+A running daemon also reconciles its own sessions without waiting for a restart (#1196). Every 30 seconds it checks each session it registered. A session counts as lost once it has left the live registry, or, on Unix, once its harness process group no longer exists. If a lost session's row still says `running` after a two-minute grace, the daemon marks it `orphaned`, records the ids in the daemon recovery log, and releases the session's live registry handle, as a normal exit would. Rows that already reached a terminal status, externally registered sessions, and sessions the daemon never registered (such as `coven run`) are left alone. A late exit event still replaces `orphaned` with the harness's real outcome.
+
 An orphaned session means Coven no longer owns a live process for that record. The event log may still be useful, but live input and kill operations should fail.
 
 ## Event durability

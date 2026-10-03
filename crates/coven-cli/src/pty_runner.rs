@@ -57,6 +57,9 @@ pub struct CodexJsonRunResult {
 pub struct DetachedPtySession {
     pub input: Box<dyn Write + Send>,
     pub killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The harness root. The PTY spawn makes it a session leader, so on Unix
+    /// this is also its process group.
+    pub process_id: Option<u32>,
 }
 
 pub struct DetachedPtyObserver {
@@ -1572,6 +1575,21 @@ impl SharedStrictChildProcessTree {
         wait_for_unix_process_group_exit(pid, timeout)
     }
 
+    /// The Unix process group that contains this tree, for liveness probes.
+    pub(crate) fn process_group(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            Some(match self.process_tree.lock() {
+                Ok(process_tree) => process_tree.0.pid,
+                Err(poisoned) => poisoned.into_inner().0.pid,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     pub(crate) fn wait_for_quiescence(&self, timeout: Duration) -> Result<()> {
         match wait_for_piped_child_reap(&self.child_wait_state, timeout) {
             PIPED_CHILD_REAPED => Ok(()),
@@ -2171,6 +2189,23 @@ pub(crate) fn write_containment_receipt(path: &Path, receipt: &[u8]) -> io::Resu
         .open(path)?;
     file.write_all(receipt)?;
     file.sync_all()
+}
+
+/// Whether any process remains in Unix process group `pid`. `None` when the
+/// probe itself fails, so callers can treat an unreadable group as live.
+/// macOS reports `EPERM` for a group whose members have all exited, which
+/// [`wait_for_unix_process_group_exit`] already treats as gone.
+#[cfg(unix)]
+pub(crate) fn unix_process_group_live(pid: u32) -> Option<bool> {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+    if result == 0 {
+        return Some(true);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(false),
+        Some(libc::EPERM) if cfg!(target_os = "macos") => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
@@ -4738,6 +4773,7 @@ fn spawn_detached_with_observer_and_timeout(
     let input: Box<dyn Write + Send> = Box::new(shared_writer.clone());
     let killer = shared_pty_killer(child.as_ref());
     let timeout_killer = killer.clone_killer();
+    let process_id = child.process_id();
 
     // 0 = waiting for meaningful output, 1 = output or exit observed,
     // 2 = startup timeout won the race. VT queries do not count because the
@@ -4822,6 +4858,7 @@ fn spawn_detached_with_observer_and_timeout(
     Ok(DetachedPtySession {
         input,
         killer: Box::new(killer),
+        process_id,
     })
 }
 
@@ -7164,6 +7201,55 @@ mod tests {
         session.input.flush()?;
         session.killer.kill()?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_pty_root_leads_a_process_group_the_liveness_probe_can_see() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let command = HarnessCommand {
+            program: "cat".to_string(),
+            args: vec![],
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+            env_overrides: Vec::new(),
+        };
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let mut session = spawn_detached_with_observer(&command, Some(observer))?;
+        let pid = session.process_id.context("detached PTY root has no pid")?;
+        assert_eq!(
+            unsafe { libc::getpgid(pid as libc::pid_t) },
+            pid as libc::pid_t
+        );
+        assert_eq!(unix_process_group_live(pid), Some(true));
+
+        session.killer.kill()?;
+        exit_rx.recv_timeout(Duration::from_secs(30))?;
+        // The exit observer runs after the root is reaped. Poll rather than
+        // assert immediately so a slow kernel teardown cannot flake this.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while unix_process_group_live(pid) != Some(false) {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "process group {pid} stayed live after its only member was reaped"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_group_probe_sees_the_current_group() {
+        let group = unsafe { libc::getpgrp() } as u32;
+        assert_eq!(unix_process_group_live(group), Some(true));
     }
 
     #[cfg(unix)]
