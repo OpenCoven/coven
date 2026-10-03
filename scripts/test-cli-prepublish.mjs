@@ -50,6 +50,16 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const distRoot = path.join(repoRoot, 'npm', 'dist');
 export const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
+// Windows keeps a file locked briefly after the process holding it exits, so
+// the temp project can still be held by the daemon the journey just stopped.
+// rmSync retries EBUSY, EPERM and ENOTEMPTY with a linear backoff, about
+// 5.5 s in all, before the cleanup fails the run (#1201).
+export const TEMP_PROJECT_CLEANUP_OPTIONS = Object.freeze({
+  recursive: true,
+  force: true,
+  maxRetries: 10,
+  retryDelay: 100
+});
 const CARGO_GATE_TIMEOUT_MS = 20 * 60_000;
 
 const PLATFORM_TARGETS = {
@@ -246,7 +256,7 @@ export async function main() {
     process.exitCode = 1;
   } finally {
     if (tempDir && !keepTempdir) {
-      rmSync(tempDir, { recursive: true, force: true });
+      rmSync(tempDir, TEMP_PROJECT_CLEANUP_OPTIONS);
     } else if (tempDir) {
       console.log(`\nTemp project left at ${tempDir} (--keep-tempdir).`);
     }
