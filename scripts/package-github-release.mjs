@@ -796,14 +796,24 @@ export async function verifyPackageProvenance({
   };
 }
 
+// npm reported the trusted-publisher configuration as `oidc:<id>` through
+// v0.4.6 and as the bare UUID from v0.4.7 on, for the same configuration.
+const OIDC_CONFIG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function isTrustedPublisherConfigId(value) {
+  return (
+    typeof value === 'string' &&
+    ((value.startsWith('oidc:') && value.length > 'oidc:'.length) || OIDC_CONFIG_UUID.test(value))
+  );
+}
+
 function validateTrustedPublisherMetadata(packageMetadata, { packageName, npmVersion }) {
   const npmUser = packageMetadata?._npmUser;
   const trustedPublisher = npmUser?.trustedPublisher;
   if (
     !trustedPublisher ||
     typeof trustedPublisher !== 'object' ||
-    typeof trustedPublisher.oidcConfigId !== 'string' ||
-    !trustedPublisher.oidcConfigId.startsWith('oidc:')
+    !isTrustedPublisherConfigId(trustedPublisher.oidcConfigId)
   ) {
     throw new Error(
       `Refusing GitHub release: ${packageName}@${npmVersion} npm metadata must include trusted publisher metadata from GitHub Actions.`
