@@ -2187,6 +2187,7 @@ fn command_adoption_case_matches(case: &CommandAdoptionVectorCase) -> Result<boo
             definition: case.definition.clone(),
         },
         "2026-08-30T09:00:00.000Z",
+        super::owner_grants::CommandAuthority::OwnerLocal,
     )
     .map_err(|_| "conformance suite execution failed")?;
     let exact_replay = execute_definition_command(
@@ -2196,6 +2197,7 @@ fn command_adoption_case_matches(case: &CommandAdoptionVectorCase) -> Result<boo
             definition: case.definition.clone(),
         },
         "2026-08-30T09:01:00.000Z",
+        super::owner_grants::CommandAuthority::OwnerLocal,
     )
     .map_err(|_| "conformance suite execution failed")?;
     let conflicting_replay = execute_definition_command(
@@ -2205,6 +2207,7 @@ fn command_adoption_case_matches(case: &CommandAdoptionVectorCase) -> Result<boo
             definition: case.conflicting_definition.clone(),
         },
         "2026-08-30T09:02:00.000Z",
+        super::owner_grants::CommandAuthority::OwnerLocal,
     )
     .map_err(|_| "conformance suite execution failed")?;
 
@@ -2306,6 +2309,7 @@ fn definition_lifecycle_case_matches(
         &format!("adopt:lifecycle:{}:operation", case.case_id),
         lifecycle_operation_command(&automation_id, case.operation, current_revision),
         "2026-08-30T09:02:00.000Z",
+        super::owner_grants::CommandAuthority::OwnerLocal,
     )
     .map_err(|_| "conformance suite execution failed")?;
     let (final_state, revision) = observed_definition_lifecycle(&conn, &automation_id)?;
@@ -2361,6 +2365,7 @@ fn prepare_definition_lifecycle_state(
             None,
         ),
         "2026-08-30T09:00:00.000Z",
+        super::owner_grants::CommandAuthority::OwnerLocal,
     )
     .map_err(|_| "conformance suite execution failed")?;
     if created.outcome != DefinitionCommandOutcome::Committed {
@@ -2379,6 +2384,7 @@ fn prepare_definition_lifecycle_state(
             &format!("adopt:lifecycle:{automation_id}:setup"),
             lifecycle_operation_command(automation_id, operation, Some(1)),
             "2026-08-30T09:01:00.000Z",
+            super::owner_grants::CommandAuthority::OwnerLocal,
         )
         .map_err(|_| "conformance suite execution failed")?;
         if setup.outcome != DefinitionCommandOutcome::Committed {

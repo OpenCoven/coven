@@ -31,6 +31,10 @@ pub mod import_legacy;
 pub mod inspection;
 pub mod leadership;
 pub mod occurrences;
+// Owner grants: production records them; the trusted adapter (coven#857 slice 6)
+// is their only reader, so the resolver has no production caller yet.
+#[allow(dead_code)]
+pub mod owner_grants;
 pub mod receipts;
 #[cfg(test)]
 mod release_upgrade_tests;

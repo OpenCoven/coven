@@ -1,5 +1,6 @@
 //! Transactional adoption for definition-mutating automation commands.
 
+pub use super::owner_grants::CommandAuthority;
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
@@ -309,6 +310,7 @@ pub fn execute_definition_command(
     adoption_key: &str,
     command: DefinitionCommand,
     adopted_at: &str,
+    authority: CommandAuthority,
 ) -> Result<DefinitionCommandResponse> {
     let adoption_key = match AdoptionKey::new(adoption_key.to_owned()) {
         Ok(adoption_key) => adoption_key,
@@ -450,6 +452,19 @@ pub fn execute_definition_command(
                     observed_at: &effective_adopted_at,
                 },
             )?);
+            // The owner command that made this revision active is what later
+            // authorizes its scheduled runs (coven#857).
+            super::owner_grants::record_grant_if_activating(
+                &transaction,
+                authority,
+                command_name,
+                lifecycle_state,
+                automation_id,
+                revision,
+                adoption_key.as_str(),
+                request_digest,
+                &effective_adopted_at,
+            )?;
         }
     }
     let stored = match (&response.result, &response.error) {
@@ -2241,6 +2256,7 @@ mod tests {
                     &adoption_key,
                     command.clone(),
                     "2026-09-03T09:01:00.000Z",
+                    CommandAuthority::OwnerLocal,
                 )
                 .unwrap();
 
@@ -2282,6 +2298,7 @@ mod tests {
                         &adoption_key,
                         default_explicit_command,
                         "2026-09-03T09:01:30.000Z",
+                        CommandAuthority::OwnerLocal,
                     )
                     .unwrap();
                     assert_eq!(
@@ -2308,6 +2325,7 @@ mod tests {
                     &adoption_key,
                     changed_command,
                     "2026-09-03T09:02:00.000Z",
+                    CommandAuthority::OwnerLocal,
                 )
                 .unwrap();
                 assert_eq!(
@@ -2325,6 +2343,7 @@ mod tests {
                             expected_revision: Some(8),
                         },
                         "2026-09-03T09:03:00.000Z",
+                        CommandAuthority::OwnerLocal,
                     )
                     .unwrap();
                     assert_eq!(
@@ -2399,6 +2418,7 @@ mod tests {
                 &adoption_key,
                 command.clone(),
                 "2026-09-03T09:01:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
             assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
@@ -2441,6 +2461,7 @@ mod tests {
                 &adoption_key,
                 command.clone(),
                 "2026-09-03T09:02:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
             assert_eq!(repeated.error, replay.error);
@@ -2507,6 +2528,7 @@ mod tests {
                 &mismatch_key,
                 changed_command,
                 "2026-09-03T09:03:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
             assert_eq!(
@@ -2565,6 +2587,7 @@ mod tests {
                     &adoption_key,
                     command.clone(),
                     "2026-09-03T09:01:00.000Z",
+                    CommandAuthority::OwnerLocal,
                 )
                 .unwrap();
                 assert_eq!(
@@ -2590,6 +2613,7 @@ mod tests {
                     &adoption_key,
                     changed_command,
                     "2026-09-03T09:02:00.000Z",
+                    CommandAuthority::OwnerLocal,
                 )
                 .unwrap();
                 assert_eq!(
@@ -2615,6 +2639,7 @@ mod tests {
             "adopt:create:unsupported:0001",
             command.clone(),
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
@@ -2640,6 +2665,7 @@ mod tests {
             "adopt:create:unsupported:0001",
             command,
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
@@ -2658,6 +2684,7 @@ mod tests {
                 definition: unsupported,
             },
             "2026-09-03T09:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(
@@ -2680,6 +2707,7 @@ mod tests {
             "adopt:create:partial-unsupported:0001",
             command.clone(),
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -2696,6 +2724,7 @@ mod tests {
             "adopt:create:partial-unsupported:0001",
             command,
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
@@ -2709,6 +2738,7 @@ mod tests {
                 definition: definition("partial-unsupported", "Corrected"),
             },
             "2026-09-03T09:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(
@@ -2773,6 +2803,7 @@ mod tests {
                     definition: invalid,
                 },
                 "2026-09-03T09:00:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
 
@@ -2847,6 +2878,7 @@ mod tests {
                     &adoption_key,
                     command.clone(),
                     "2026-09-03T09:00:00.000Z",
+                    CommandAuthority::OwnerLocal,
                 )
                 .unwrap();
 
@@ -2887,6 +2919,7 @@ mod tests {
                     &adoption_key,
                     command,
                     "2026-09-03T09:01:00.000Z",
+                    CommandAuthority::OwnerLocal,
                 )
                 .unwrap();
                 assert_eq!(replay.error, first.error, "{command_kind} {case} replay");
@@ -2916,6 +2949,7 @@ mod tests {
             "adopt:create:unsupported-retry-class:0001",
             DefinitionCommand::Create { definition: retry },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(
@@ -2941,6 +2975,7 @@ mod tests {
                 definition: retention,
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(
@@ -2966,6 +3001,7 @@ mod tests {
                 definition: definition("revise-target", "Original"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(definition_event_count(&conn, "revise-target"), 1);
@@ -2981,6 +3017,7 @@ mod tests {
             "adopt:revise:unsupported:0002",
             command.clone(),
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
@@ -3002,6 +3039,7 @@ mod tests {
             "adopt:revise:unsupported:0002",
             command,
             "2026-09-03T09:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
@@ -3020,6 +3058,7 @@ mod tests {
                 expected_revision: Some(1),
             },
             "2026-09-03T09:03:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(
@@ -3043,6 +3082,7 @@ mod tests {
                 definition: unsupported,
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3059,6 +3099,7 @@ mod tests {
                 definition: definition("immutable", "Immutable"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3145,6 +3186,7 @@ mod tests {
                 definition: definition("invalid-key", "Invalid key"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3170,6 +3212,7 @@ mod tests {
                 definition: invalid,
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(rejected.outcome, DefinitionCommandOutcome::Rejected);
@@ -3186,6 +3229,7 @@ mod tests {
                 definition: definition("unsafe-integer", "Corrected"),
             },
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(
@@ -3210,6 +3254,7 @@ mod tests {
             "adopt:create:daily:0001",
             command,
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let replay = execute_definition_command(
@@ -3219,6 +3264,7 @@ mod tests {
                 definition: replay_definition,
             },
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3297,6 +3343,7 @@ mod tests {
                 "adopt:create:local-resolution-failure:0001",
                 command.clone(),
                 "2026-09-03T09:00:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
 
@@ -3336,6 +3383,7 @@ mod tests {
                 "adopt:create:local-resolution-failure:0001",
                 command,
                 "2026-09-03T09:01:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
 
@@ -3376,6 +3424,7 @@ mod tests {
                     definition: original,
                 },
                 "2026-09-03T09:00:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
 
@@ -3391,6 +3440,7 @@ mod tests {
                 "adopt:revise:local-resolution-failure:0002",
                 command.clone(),
                 "2026-09-03T09:01:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
 
@@ -3413,6 +3463,7 @@ mod tests {
                 "adopt:revise:local-resolution-failure:0002",
                 command,
                 "2026-09-03T09:02:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
 
@@ -3453,6 +3504,7 @@ mod tests {
                     definition: definition("exact-local-normalized", "Exact local normalized"),
                 },
                 "2026-09-03T09:00:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap();
 
@@ -3490,6 +3542,7 @@ mod tests {
                 definition: definition("local-normalized", "Local normalized"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3516,6 +3569,7 @@ mod tests {
                 definition: invalid,
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3544,6 +3598,7 @@ mod tests {
             "adopt:create:evented:0001",
             command.clone(),
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let replay = execute_definition_command(
@@ -3551,6 +3606,7 @@ mod tests {
             "adopt:create:evented:0001",
             command,
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3597,6 +3653,7 @@ mod tests {
                 definition: definition("lifecycle", "Lifecycle"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let mut revised = definition("lifecycle", "Lifecycle revised");
@@ -3609,6 +3666,7 @@ mod tests {
                 expected_revision: Some(1),
             },
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let rejected = execute_definition_command(
@@ -3619,6 +3677,7 @@ mod tests {
                 expected_revision: Some(1),
             },
             "2026-09-03T09:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(rejected.outcome, DefinitionCommandOutcome::Rejected);
@@ -3630,6 +3689,7 @@ mod tests {
                 expected_revision: Some(2),
             },
             "2026-09-03T09:03:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3690,6 +3750,7 @@ mod tests {
                 definition: definition("atomic-event", "Atomic event"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap_err();
 
@@ -3723,6 +3784,7 @@ mod tests {
                 definition: definition("no-op-delete", "No-op delete"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3733,6 +3795,7 @@ mod tests {
                 automation_id: "no-op-delete".to_owned(),
             },
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3764,6 +3827,7 @@ mod tests {
                 definition: with_extension,
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let replay = execute_definition_command(
@@ -3773,6 +3837,7 @@ mod tests {
                 definition: definition("legacy-replay", "Legacy replay"),
             },
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3792,6 +3857,7 @@ mod tests {
                 definition: definition("daily", "Daily"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3802,6 +3868,7 @@ mod tests {
                 definition: definition("daily", "Changed"),
             },
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3827,6 +3894,7 @@ mod tests {
                 definition: definition("daily", "Daily"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let command = DefinitionCommand::Revise {
@@ -3839,6 +3907,7 @@ mod tests {
             "adopt:revise:daily:0002",
             command.clone(),
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let replay = execute_definition_command(
@@ -3846,6 +3915,7 @@ mod tests {
             "adopt:revise:daily:0002",
             command,
             "2026-09-03T09:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3866,6 +3936,7 @@ mod tests {
                 definition: definition("clock-regression", "Clock regression"),
             },
             "2026-09-03T12:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let mut revised = definition("clock-regression", "Clock regression revised");
@@ -3879,6 +3950,7 @@ mod tests {
                 expected_revision: Some(1),
             },
             "2026-09-03T10:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -3972,6 +4044,7 @@ mod tests {
                 expected_revision: Some(1),
             },
             "2026-09-03T11:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -4008,6 +4081,7 @@ mod tests {
                 definition: definition("daily", "Daily"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -4019,6 +4093,7 @@ mod tests {
                 expected_revision: Some(7),
             },
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -4045,6 +4120,7 @@ mod tests {
             "adopt:create:invalid:0001",
             invalid.clone(),
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let replay = execute_definition_command(
@@ -4052,6 +4128,7 @@ mod tests {
             "adopt:create:invalid:0001",
             invalid,
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -4072,6 +4149,7 @@ mod tests {
                 definition: definition("valid-now", "Corrected"),
             },
             "2026-09-03T09:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(changed.outcome, DefinitionCommandOutcome::Rejected);
@@ -4093,6 +4171,7 @@ mod tests {
                 definition: definition("tombstone", "Retained"),
             },
             "2026-09-03T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let command = DefinitionCommand::Delete {
@@ -4105,6 +4184,7 @@ mod tests {
             "adopt:delete:tombstone:0002",
             command.clone(),
             "2026-09-03T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         let replay = execute_definition_command(
@@ -4112,6 +4192,7 @@ mod tests {
             "adopt:delete:tombstone:0002",
             command,
             "2026-09-03T09:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
 
@@ -4180,6 +4261,7 @@ mod tests {
                 definition: definition(automation_id, automation_id),
             },
             "2026-09-27T09:00:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(created.outcome, DefinitionCommandOutcome::Committed);
@@ -4195,6 +4277,7 @@ mod tests {
             "adopt:activate-switch",
             activate("switch", 1),
             "2026-09-27T09:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(activated.outcome, DefinitionCommandOutcome::Committed);
@@ -4218,6 +4301,7 @@ mod tests {
             "adopt:activate-switch",
             activate("switch", 1),
             "2026-09-27T09:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(replay.outcome, DefinitionCommandOutcome::Replayed);
@@ -4229,6 +4313,7 @@ mod tests {
             "adopt:pause-switch",
             pause("switch", 2),
             "2026-09-27T09:03:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(paused.outcome, DefinitionCommandOutcome::Committed);
@@ -4258,9 +4343,14 @@ mod tests {
                 stored_status(&conn, "held"),
                 definition_event_count(&conn, "held"),
             );
-            let response =
-                execute_definition_command(&conn, key, command, "2026-09-27T10:00:00.000Z")
-                    .unwrap();
+            let response = execute_definition_command(
+                &conn,
+                key,
+                command,
+                "2026-09-27T10:00:00.000Z",
+                CommandAuthority::OwnerLocal,
+            )
+            .unwrap();
             assert_eq!(
                 response.outcome,
                 DefinitionCommandOutcome::Rejected,
@@ -4294,6 +4384,7 @@ mod tests {
             "adopt:activate-held",
             activate("held", 1),
             "2026-09-27T10:01:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(active.outcome, DefinitionCommandOutcome::Committed);
@@ -4318,6 +4409,7 @@ mod tests {
                 reason: None,
             },
             "2026-09-27T10:02:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(disabled.outcome, DefinitionCommandOutcome::Committed);
@@ -4341,6 +4433,7 @@ mod tests {
                 expected_revision: Some(3),
             },
             "2026-09-27T10:03:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(tombstoned.outcome, DefinitionCommandOutcome::Committed);
@@ -4349,6 +4442,7 @@ mod tests {
             "adopt:activate-tombstoned",
             activate("held", 4),
             "2026-09-27T10:04:00.000Z",
+            CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(response.error.unwrap().code(), ErrorCode::GoneTombstoned);
@@ -4374,6 +4468,7 @@ mod tests {
                     expected_revision: Some(1),
                 },
                 "2026-09-28T11:00:00.000Z",
+                CommandAuthority::OwnerLocal,
             )
             .unwrap()
         };

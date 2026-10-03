@@ -911,11 +911,29 @@ fn handle_request_with_runtime_authority_and_automation_time(
                     );
                 }
             };
-            let (status, response) = match automation_recorded_at {
-                Some(recorded_at) => {
-                    control_plane::route_action_at(payload, &conn, runtime, recorded_at)
+            // Grants follow the transport that actually authenticated the request.
+            let command_authority = match authority {
+                RequestAuthority::OwnerLocalIpc => {
+                    crate::automations::owner_grants::CommandAuthority::OwnerLocal
                 }
-                None => control_plane::route_action(payload, &conn, runtime),
+                RequestAuthority::Tcp => {
+                    crate::automations::owner_grants::CommandAuthority::Unauthenticated
+                }
+            };
+            let (status, response) = match automation_recorded_at {
+                Some(recorded_at) => control_plane::route_action_at(
+                    payload,
+                    &conn,
+                    runtime,
+                    recorded_at,
+                    command_authority,
+                ),
+                None => control_plane::route_action_with_authority(
+                    payload,
+                    &conn,
+                    runtime,
+                    command_authority,
+                ),
             };
             if status == 200
                 && response.accepted

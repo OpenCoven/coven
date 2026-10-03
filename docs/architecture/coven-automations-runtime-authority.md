@@ -1,6 +1,7 @@
 # Coven Automations Runtime Authority: trust decisions
 
-Status: maintainer decisions recorded 2026-10-03; implementation not started
+Status: maintainer decisions recorded 2026-10-03; slices 1 and 2 implemented,
+Runtime Authority not yet constructed
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
 OpenCoven/coven-runtimes#48 (terminal observations), #858 (certification)
@@ -91,15 +92,19 @@ What it does not protect against:
   - A manual run's grant is its own run command.
   - A scheduled run is created by the scheduler, so no command arrives with
     it. Its grant is the owner command that made the current revision active:
-    `definition.activate.v1`, or a revise of an active definition.
+    `definition.activate.v1`, or a `definition.create.v1` or
+    `definition.revise.v1` that leaves the definition active. The grant
+    authorizes that revision only: once a revise, pause, disable or tombstone
+    supersedes it, its occurrences no longer dispatch under it.
 
   `operation` names the dispatch kind. `requestId` and `requestDigest` are the
   grant's adoption key and request digest. The scheduler authenticates no one;
   it presents the grant with a nonce and validity window issued for each
-  attempt, and replay is checked against the occurrence fence and the attempt.
-  A revision that became active without an owner command (a legacy import, a
-  migration or an unversioned update) has no grant, and cannot dispatch under
-  Runtime Authority.
+  attempt, and replay is checked against the occurrence fence and the attempt:
+  the runner refuses a binding that does not match the claimed attempt's
+  identity and fence generation. A revision that became active without an
+  owner command (a legacy import, a migration or an unversioned update) has no
+  grant, and cannot dispatch under Runtime Authority.
 - **`familiar`.** The root and identity revision come from the daemon's
   familiar ledger, with the declaration and embodiment digests from the
   binding the daemon issues. Status, revocation, retirement and freshness are
@@ -128,13 +133,14 @@ unadvertised until slice 6.
    store, with rotation and revocation. Build `TrustedKeys` from the active
    records. Do not ship fixture keys.
 2. **Owner grants and the authorization binding.** Record an owner grant
-   whenever an owner command authorizes dispatch (run-now) or makes a revision
-   active (activate, or a revise of an active definition). Each grant stores
-   the command's adoption key, request digest, revision and transport. Derive
-   the principal and authorization binding from the grant, for manual and
-   scheduled runs alike, and refuse a revision that has none. Issue the nonce
-   and validity for each attempt, and check replay against the fence and the
-   attempt.
+   whenever an owner command makes a revision active (activate, or a create or
+   revise that leaves the definition active). Each grant stores the command's
+   adoption key, request digest, revision and transport. Derive the principal
+   and authorization from the grant, and refuse a revision that has none or
+   is no longer current and active at dispatch. Issue the nonce and validity
+   for each attempt, and check replay against the fence and the attempt. The
+   unversioned run carries no adoption key, so the manual run's grant lands
+   with `occurrence.runNow.v1` in slice 7.
 3. **Familiar ledger and embodiment bindings.** Build a root and revision
    ledger from the familiar roster, with declaration digests and status,
    revocation and retirement. Issue Familiar Contract embodiment bindings
@@ -157,7 +163,8 @@ unadvertised until slice 6.
    and advertise the profile only once its conformance passes.
 7. **Approvals and held commands.** Implement the approval lifecycle, then the
    five versioned commands #1054 holds for #857. These are
-   `occurrence.runNow.v1`, now compatibility-only, and the unsupported
+   `occurrence.runNow.v1` (which records its own owner grant), now
+   compatibility-only, and the unsupported
    `occurrence.cancel.v1`, `attempt.cancel.v1`, `attempt.retry.v1` and
    `occurrence.recover.v1`.
 8. **Certification.** #858 Runtime Authority certification, then SDK Phase 3
