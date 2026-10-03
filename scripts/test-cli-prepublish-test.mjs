@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
   buildLocalInstallArgs,
   DEFAULT_COMMAND_TIMEOUT_MS,
-  synthesizeDryRunVersion
+  synthesizeDryRunVersion,
+  TEMP_PROJECT_CLEANUP_OPTIONS
 } from './test-cli-prepublish.mjs';
 
 test('local tarball install is offline and disables registry extras', () => {
@@ -82,6 +85,28 @@ test('synthesizeDryRunVersion bumps the published patch version for dry-run pack
   });
 
   assert.equal(version, '1.2.4');
+});
+
+test('temp project cleanup retries transient Windows locks', () => {
+  assert.deepEqual(TEMP_PROJECT_CLEANUP_OPTIONS, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 100
+  });
+  const script = readFileSync(new URL('./test-cli-prepublish.mjs', import.meta.url), 'utf8');
+  assert.match(script, /rmSync\(tempDir, TEMP_PROJECT_CLEANUP_OPTIONS\)/);
+
+  const root = mkdtempSync(path.join(os.tmpdir(), 'coven-prepublish-cleanup-'));
+  try {
+    const project = path.join(root, 'project');
+    mkdirSync(path.join(project, 'node_modules', '.bin'), { recursive: true });
+    writeFileSync(path.join(project, 'node_modules', '.bin', 'coven'), '');
+    rmSync(project, TEMP_PROJECT_CLEANUP_OPTIONS);
+    assert.equal(existsSync(project), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('prepublish failures preserve finally cleanup', () => {
