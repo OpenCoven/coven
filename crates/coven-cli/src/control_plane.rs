@@ -204,10 +204,20 @@ pub(crate) fn automation_transport_rejection(
     authority: crate::request_authority::RequestAuthority,
 ) -> Option<(u16, ControlActionResponse)> {
     let action = payload.get("action")?.as_str()?.trim();
-    if !action.starts_with("coven.automations.")
-        || TCP_AUTOMATION_READS.contains(&action)
-        || authority.allows_owner_automation_access()
-    {
+    if authority.allows_owner_automation_access() {
+        return None;
+    }
+    // The familiar ledger has no TCP reads: its revisions hold declarations.
+    if action.starts_with(crate::familiar_ledger::ACTION_PREFIX) {
+        return Some(typed_rejection(
+            action,
+            automation_error(
+                crate::automations::contract::error::ErrorCode::AuthorityRequired,
+                "Familiar ledger commands require owner-local IPC.",
+            ),
+        ));
+    }
+    if !action.starts_with("coven.automations.") || TCP_AUTOMATION_READS.contains(&action) {
         return None;
     }
     let reason = match action {

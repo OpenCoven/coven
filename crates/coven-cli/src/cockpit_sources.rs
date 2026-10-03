@@ -145,6 +145,58 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
     Ok(out)
 }
 
+/// A roster entry's identity fields and resolved workspace, as the familiar
+/// ledger records them. Display-only fields (emoji, icon, description,
+/// channel) are not identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RosterIdentity {
+    pub id: String,
+    pub name: Option<String>,
+    pub display_name: String,
+    pub role: String,
+    pub pronouns: Option<String>,
+    pub person: Option<String>,
+    pub coven: Option<String>,
+    pub workspace: PathBuf,
+}
+
+/// The result of looking one familiar up in the roster by exact id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RosterLookup {
+    Found(RosterIdentity),
+    Missing,
+    /// The id is configured more than once, so it names no one familiar.
+    Duplicate,
+}
+
+/// Looks `familiar_id` up in `familiars.toml`. Unlike
+/// [`familiar_workspace`], a read error is an error and a duplicated id is
+/// reported rather than resolved to its first entry.
+pub(crate) fn roster_identity(coven_home: &Path, familiar_id: &str) -> Result<RosterLookup> {
+    let mut matches = read_familiar_entries(coven_home)?
+        .into_iter()
+        .filter(|entry| entry.id == familiar_id);
+    let Some(entry) = matches.next() else {
+        return Ok(RosterLookup::Missing);
+    };
+    if matches.next().is_some() {
+        return Ok(RosterLookup::Duplicate);
+    }
+    Ok(RosterLookup::Found(RosterIdentity {
+        workspace: entry
+            .workspace
+            .map(expand_workspace)
+            .unwrap_or_else(|| coven_home.join("familiars").join(&entry.id)),
+        id: entry.id,
+        name: entry.name,
+        display_name: entry.display_name,
+        role: entry.role,
+        pronouns: entry.pronouns,
+        person: entry.person,
+        coven: entry.coven,
+    }))
+}
+
 pub(crate) fn read_familiar_entries(coven_home: &Path) -> Result<Vec<FamiliarEntry>> {
     let path = coven_home.join(FAMILIARS_CONFIG_FILE);
     let bytes = match fs::read(&path) {
