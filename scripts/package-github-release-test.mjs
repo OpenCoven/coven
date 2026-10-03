@@ -11,10 +11,12 @@ import {
   assertChecksumManifest,
   captureCommandOutputToFile,
   canonicalReleaseAssetNames,
+  fetchJsonWhenVisible,
   packageGitHubRelease,
   resolveReleaseSourceAcceptance,
   resolveReleaseSource,
   syncGitHubRelease,
+  verifyAllPackageProvenance,
   verifyAnnotatedTag,
   verifyNpmRegistrySignatures,
   verifyPackageProvenance,
@@ -1548,6 +1550,176 @@ test('verifyNpmRegistrySignatures rejects package-lock entries missing resolved 
       }
     ]);
   });
+});
+
+function httpError(status) {
+  const error = new Error(`GET https://registry.npmjs.org/example failed with HTTP ${status}.`);
+  error.status = status;
+  return error;
+}
+
+function fakeClock() {
+  let elapsed = 0;
+  const sleeps = [];
+  return {
+    sleeps,
+    now: () => elapsed,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      elapsed += ms;
+    }
+  };
+}
+
+test('verifyAllPackageProvenance waits for a just-published version to become visible', async () => {
+  const fixtures = new Map();
+  for (const [index, packageName] of RELEASE_PACKAGES.entries()) {
+    const tarballBytes = Buffer.from(`${packageName} tarball fixture ${index}`);
+    const metadata = makePackageMetadata(packageName, integrityFor(tarballBytes));
+    fixtures.set(`https://registry.npmjs.org/${encodeURIComponent(packageName)}/${NPM_VERSION}`, metadata);
+    fixtures.set(
+      metadata.dist.attestations.url,
+      buildAttestations({
+        packageName,
+        subjectDigest: createHash('sha512').update(tarballBytes).digest('hex')
+      })
+    );
+  }
+  // The registry answers 404 twice for the wrapper's metadata, as it did for
+  // v0.4.4, v0.4.6 and v0.4.7, then serves it.
+  const unseen = new Map([[`https://registry.npmjs.org/${encodeURIComponent('@opencoven/cli')}/${NPM_VERSION}`, 2]]);
+  const clock = fakeClock();
+  await verifyAllPackageProvenance({
+    releaseTag: RELEASE_TAG,
+    npmVersion: NPM_VERSION,
+    headSha: HEAD_SHA,
+    sourceRunId: SOURCE_RUN_ID,
+    sourceRunAttempt: SOURCE_RUN_ATTEMPT,
+    async fetchJson(url) {
+      const remaining = unseen.get(url) ?? 0;
+      if (remaining > 0) {
+        unseen.set(url, remaining - 1);
+        throw httpError(404);
+      }
+      return fixtures.get(url);
+    },
+    registryWait: { sleep: clock.sleep, now: clock.now, log() {} }
+  });
+  assert.deepEqual(clock.sleeps, [10_000, 20_000]);
+});
+
+test('fetchJsonWhenVisible retries only not-yet-visible or transient registry responses', async () => {
+  for (const status of [404, 429, 500, 503]) {
+    const clock = fakeClock();
+    let calls = 0;
+    const value = await fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+      async fetchJson() {
+        calls += 1;
+        if (calls < 3) {
+          throw httpError(status);
+        }
+        return { ok: status };
+      },
+      sleep: clock.sleep,
+      now: clock.now,
+      log() {}
+    });
+    assert.deepEqual(value, { ok: status });
+    assert.equal(calls, 3, String(status));
+  }
+
+  for (const error of [httpError(401), httpError(403), new Error('Expected npm provenance URL, got empty value.')]) {
+    const clock = fakeClock();
+    let calls = 0;
+    await assert.rejects(
+      () =>
+        fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+          async fetchJson() {
+            calls += 1;
+            throw error;
+          },
+          sleep: clock.sleep,
+          now: clock.now,
+          log() {}
+        }),
+      error
+    );
+    assert.equal(calls, 1);
+    assert.deepEqual(clock.sleeps, []);
+  }
+});
+
+test('fetchJsonWhenVisible gives up rather than sleep into its deadline, and says how long it waited', async () => {
+  const clock = fakeClock();
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+        async fetchJson() {
+          calls += 1;
+          throw httpError(404);
+        },
+        sleep: clock.sleep,
+        now: clock.now,
+        deadlineMs: 120_000,
+        log() {}
+      }),
+    /HTTP 404\. Still unavailable after waiting 60s for the npm registry\./
+  );
+  // The fourth 404 lands at 60 s; another 60 s sleep would reach the deadline.
+  assert.deepEqual(clock.sleeps, [10_000, 20_000, 30_000]);
+  assert.equal(calls, 4);
+});
+
+test('fetchJsonWhenVisible bounds each request by the time left and refuses a late answer', async () => {
+  const clock = fakeClock();
+  const timeouts = [];
+  let calls = 0;
+  // A 404 that takes 5 s, then a response that takes 30 s against a 40 s
+  // deadline: it would land at 45 s.
+  await assert.rejects(
+    () =>
+      fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+        async fetchJson(url, { timeoutMs }) {
+          timeouts.push(timeoutMs);
+          calls += 1;
+          if (calls === 1) {
+            await clock.sleep(5_000);
+            throw httpError(404);
+          }
+          await clock.sleep(30_000);
+          return { late: true };
+        },
+        sleep: clock.sleep,
+        now: clock.now,
+        deadlineMs: 40_000,
+        log() {}
+      }),
+    /answered after the 40s npm registry deadline/
+  );
+  // The first request may take the 30 s cap; the second only the 25 s left.
+  assert.deepEqual(timeouts, [30_000, 25_000]);
+});
+
+test('fetchJsonWhenVisible retries a request that timed out', async () => {
+  const clock = fakeClock();
+  let calls = 0;
+  const timedOut = new Error('GET https://registry.npmjs.org/example timed out after 30000ms.');
+  timedOut.timedOut = true;
+  const value = await fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+    async fetchJson() {
+      calls += 1;
+      if (calls === 1) {
+        throw timedOut;
+      }
+      return { ok: true };
+    },
+    sleep: clock.sleep,
+    now: clock.now,
+    log() {}
+  });
+  assert.deepEqual(value, { ok: true });
+  assert.deepEqual(clock.sleeps, [10_000]);
 });
 
 test('verifyPackageProvenance accepts the real npm attestation shape for every release package', async () => {
