@@ -810,8 +810,10 @@ description = "Builds and debugs."
         set_status(&h, first["session"]["id"].as_str().unwrap(), "exited");
         let other_dir = h._temp.path().join("other-project");
         std::fs::create_dir_all(&other_dir).unwrap();
-        let other = other_dir
-            .canonicalize()
+        // The daemon's own normalization, not `Path::canonicalize`: on
+        // Windows the latter adds a `\\?\` prefix that `launch_session`
+        // strips, so the two spellings would never compare equal.
+        let other = crate::project::canonical_project_root(&other_dir)
             .unwrap()
             .to_string_lossy()
             .into_owned();
