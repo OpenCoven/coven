@@ -10,7 +10,8 @@
 //!   `conversation: resume` when the conversation has history and `init`
 //!   when it has none, and the pointer is bound to the new row.
 //! - `POST /main-session/reset` is the user's clean slate: rotate the
-//!   conversation id, kill and archive the old row, count it.
+//!   conversation id, kill and archive the old row, count it, and apply any
+//!   replacement harness, familiar, or project root it carries.
 //! - `POST /main-session/rollover` is recovery from a conversation id the
 //!   harness no longer recognises: same rotation, archive, not counted.
 //!
@@ -36,8 +37,8 @@ use crate::{
     api_response::{api_error, json_response, ApiResponse},
     harness::harness_supports_stream_mode,
     main_session::{
-        self, MainSessionRecord, RotatedMainSession, DEFAULT_MAIN_SESSION_FAMILIAR_ID,
-        DEFAULT_MAIN_SESSION_HARNESS, INSTANCE_MAIN_SCOPE_KEY,
+        self, MainSessionRecord, MainSessionSettings, RotatedMainSession,
+        DEFAULT_MAIN_SESSION_FAMILIAR_ID, DEFAULT_MAIN_SESSION_HARNESS, INSTANCE_MAIN_SCOPE_KEY,
     },
     request_authority::RequestAuthority,
     store,
@@ -65,6 +66,18 @@ fn optional_string<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// Like `optional_string`, but a present value that is not a non-empty
+/// string is an error rather than silently ignored: a reset that was asked
+/// to change a setting must not quietly keep the old one.
+fn optional_setting<'a>(payload: &'a Value, key: &str) -> Result<Option<&'a str>, anyhow::Error> {
+    match payload.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => optional_string(payload, key)
+            .map(Some)
+            .with_context(|| format!("`{key}` must be a non-empty string")),
+    }
 }
 
 fn scope_from(payload: &Value, query: &str) -> Result<String, anyhow::Error> {
@@ -177,7 +190,7 @@ pub(crate) fn turn(
                 return api_error(
                     409,
                     "main_session_mismatch",
-                    "The main session already exists with different settings; reset it to change them.",
+                    "The main session already exists with different settings; reset it with the new settings to change them.",
                     Some(json!({
                         "scopeKey": scope,
                         "fields": mismatched,
@@ -303,6 +316,7 @@ pub(crate) fn turn(
 /// rotation on it so the event stream names both conversation ids, and
 /// optionally kill its process.
 fn finish_rotation(
+    coven_home: &Path,
     conn: &rusqlite::Connection,
     rotated: &RotatedMainSession,
     kind: &str,
@@ -323,8 +337,11 @@ fn finish_rotation(
             let _ = runtime.kill_session(previous_id);
         }
     }
-    store::insert_event(
+    // `reason` is client-supplied, so the event goes through the instance's
+    // configured privacy policy like every other persisted event.
+    store::insert_event_with_privacy(
         conn,
+        coven_home,
         &store::EventRecord {
             seq: 0,
             id: Uuid::new_v4().to_string(),
@@ -371,12 +388,30 @@ pub(crate) fn reset(
         Err(error) => return invalid_request(error),
     };
     let reason = optional_string(&payload, "reason").unwrap_or("user");
+    let settings = match (|| {
+        Ok::<_, anyhow::Error>(MainSessionSettings {
+            familiar_id: optional_setting(&payload, "familiarId")?,
+            harness: optional_setting(&payload, "harness")?,
+            project_root: optional_setting(&payload, "projectRoot")?,
+        })
+    })() {
+        Ok(settings) => settings,
+        Err(error) => return invalid_request(error),
+    };
     let mut conn = store::open_store(&store_path(coven_home))?;
     if main_session::get_main_session(&conn, &scope)?.is_none() {
         return not_found(&scope);
     }
-    let rotated = main_session::reset_main_session(&mut conn, &scope, &current_timestamp())?;
-    let archived = finish_rotation(&conn, &rotated, EVENT_KIND_RESET, reason, Some(runtime))?;
+    let rotated =
+        main_session::reset_main_session(&mut conn, &scope, &settings, &current_timestamp())?;
+    let archived = finish_rotation(
+        coven_home,
+        &conn,
+        &rotated,
+        EVENT_KIND_RESET,
+        reason,
+        Some(runtime),
+    )?;
     rotation_response(&rotated, archived)
 }
 
@@ -396,7 +431,14 @@ pub(crate) fn rollover(coven_home: &Path, body: Option<&str>) -> Result<ApiRespo
     }
     let rotated =
         main_session::rotate_main_session_conversation(&mut conn, &scope, &current_timestamp())?;
-    let archived = finish_rotation(&conn, &rotated, EVENT_KIND_ROLLOVER, reason, None)?;
+    let archived = finish_rotation(
+        coven_home,
+        &conn,
+        &rotated,
+        EVENT_KIND_ROLLOVER,
+        reason,
+        None,
+    )?;
     rotation_response(&rotated, archived)
 }
 
@@ -757,6 +799,121 @@ description = "Builds and debugs."
             Some(ConversationHint::Init {
                 id: new_conversation.to_string()
             })
+        );
+    }
+
+    #[test]
+    fn reset_with_settings_unsticks_a_rootless_pointer_and_changes_settings() {
+        let h = home();
+        let first = first_turn(&h);
+        // Not live, so the next turn has to launch rather than pipe input.
+        set_status(&h, first["session"]["id"].as_str().unwrap(), "exited");
+        let other_dir = h._temp.path().join("other-project");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = other_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // A pointer from before `project_root` existed cannot launch...
+        let conn = store::open_store(&store_path(&h.home)).unwrap();
+        conn.execute("UPDATE main_sessions SET project_root = NULL", [])
+            .unwrap();
+        drop(conn);
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(json!({ "prompt": "stuck" })),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], "main_session_project_root_missing");
+
+        // ...and the reset its error message asks for repairs it, along with
+        // any other setting the reset carries.
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/reset",
+            Some(json!({ "projectRoot": other, "familiarId": "cody" })),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["mainSession"]["projectRoot"], other);
+        assert_eq!(body["mainSession"]["familiarId"], "cody");
+        assert_eq!(body["mainSession"]["harness"], "claude");
+
+        // A turn that names the new settings is no longer a mismatch, and
+        // the launch uses them.
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(json!({ "prompt": "unstuck", "familiarId": "cody", "projectRoot": other })),
+        );
+        assert_eq!(status, 201, "{body}");
+        let launches = h.runtime.launches.borrow();
+        let last = launches.last().unwrap();
+        assert_eq!(last.project_root, other);
+        assert_eq!(last.familiar_id.as_deref(), Some("cody"));
+    }
+
+    #[test]
+    fn reset_rejects_malformed_settings_without_rotating() {
+        let h = home();
+        let first = first_turn(&h);
+        for body in [
+            json!({ "harness": 7 }),
+            json!({ "projectRoot": "   " }),
+            json!({ "familiarId": ["nova"] }),
+        ] {
+            let (status, response) =
+                call(&h, "POST", "/api/v1/main-session/reset", Some(body.clone()));
+            assert_eq!(status, 400, "{body}: {response}");
+            assert_eq!(response["error"]["code"], "invalid_request");
+        }
+        let (_, get) = call(&h, "GET", "/api/v1/main-session", None);
+        assert_eq!(
+            get["mainSession"]["conversationId"],
+            first["mainSession"]["conversationId"]
+        );
+        assert_eq!(get["mainSession"]["resetCount"], 0);
+    }
+
+    #[test]
+    fn rotation_events_honour_the_configured_privacy_policy() {
+        let h = home();
+        std::fs::write(
+            h.home.join("privacy.toml"),
+            "extra_patterns = [\"custom-sensitive-[0-9]+\"]\n",
+        )
+        .unwrap();
+        let first = first_turn(&h);
+        let old_session = first["session"]["id"].as_str().unwrap().to_string();
+
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/reset",
+            Some(json!({ "reason": "custom-sensitive-1234" })),
+        );
+        assert_eq!(status, 200, "{body}");
+
+        let conn = store::open_store(&store_path(&h.home)).unwrap();
+        let events = store::list_events(&conn, &old_session).unwrap();
+        let reset = events
+            .iter()
+            .find(|event| event.kind == EVENT_KIND_RESET)
+            .expect("reset event recorded");
+        assert!(
+            !reset.payload_json.contains("custom-sensitive-1234"),
+            "{}",
+            reset.payload_json
+        );
+        assert!(
+            reset.payload_json.contains("[REDACTED]"),
+            "{}",
+            reset.payload_json
         );
     }
 

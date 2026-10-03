@@ -79,9 +79,11 @@ pub struct MainSessionRecord {
     pub familiar_id: Option<String>,
     pub harness: String,
     /// Project root every launch of this conversation uses. Fixed for the
-    /// pointer's lifetime: a conversation resumed under a different root is
-    /// a different conversation. `None` only for rows created before the
-    /// column existed; the next reset repopulates it.
+    /// conversation's lifetime: a conversation resumed under a different
+    /// root is a different conversation, so only a reset (which mints a new
+    /// conversation id) may change it. `None` only for rows created before
+    /// the column existed; a reset that carries a project root repopulates
+    /// it.
     pub project_root: Option<String>,
     /// The id handed to the harness for resume (`claude --resume`, `codex
     /// exec resume`). Rotated by reset and rotate; never edited in place.
@@ -101,6 +103,32 @@ pub struct MainSessionRecord {
 pub struct ResolvedMainSession {
     pub record: MainSessionRecord,
     pub created: bool,
+}
+
+/// Replacement settings a reset may carry; `None` keeps the current value.
+/// Only a reset may change them, because it also mints a fresh conversation
+/// id: no harness-native history is ever carried to another harness,
+/// familiar, or root.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MainSessionSettings<'a> {
+    pub familiar_id: Option<&'a str>,
+    pub harness: Option<&'a str>,
+    pub project_root: Option<&'a str>,
+}
+
+impl MainSessionSettings<'_> {
+    fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("familiar id", self.familiar_id),
+            ("harness", self.harness),
+            ("project root", self.project_root),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                bail!("main session {field} must not be empty");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The outcome of a reset or rotate: the new pointer plus what it replaced,
@@ -275,9 +303,11 @@ pub fn bind_main_session(
 fn rotate(
     conn: &mut Connection,
     scope_key: &str,
+    settings: &MainSessionSettings<'_>,
     now: &str,
     count_as_reset: bool,
 ) -> Result<RotatedMainSession> {
+    settings.validate()?;
     let transaction = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to begin main session rotation")?;
@@ -289,9 +319,20 @@ fn rotate(
              SET conversation_id = ?2,
                  current_session_id = NULL,
                  reset_count = reset_count + ?3,
-                 updated_at = ?4
+                 updated_at = ?4,
+                 familiar_id = COALESCE(?5, familiar_id),
+                 harness = COALESCE(?6, harness),
+                 project_root = COALESCE(?7, project_root)
              WHERE scope_key = ?1",
-            params![scope_key, new_conversation_id(), reset_increment, now],
+            params![
+                scope_key,
+                new_conversation_id(),
+                reset_increment,
+                now,
+                settings.familiar_id,
+                settings.harness,
+                settings.project_root
+            ],
         )
         .context("failed to rotate main session conversation")?;
     let record = load_main_session(&transaction, scope_key)?;
@@ -317,25 +358,28 @@ pub fn delete_main_session(conn: &Connection, scope_key: &str) -> Result<bool> {
 }
 
 /// The user asked for a clean slate. Rotates the conversation id, clears the
-/// binding, and counts the reset. Archiving the previous session row and
+/// binding, counts the reset, and applies any replacement `settings` in the
+/// same transaction, so the new conversation starts on them. Archiving the previous session row and
 /// emitting the `main_session.reset` event are the caller's job, using the
 /// returned `previous_*` fields.
 pub fn reset_main_session(
     conn: &mut Connection,
     scope_key: &str,
+    settings: &MainSessionSettings<'_>,
     now: &str,
 ) -> Result<RotatedMainSession> {
-    rotate(conn, scope_key, now, true)
+    rotate(conn, scope_key, settings, now, true)
 }
 
 /// Recovery from a conversation id the harness no longer recognises. Same
 /// rotation as a reset, but not counted, because the user did not ask for it.
+/// Settings are kept: recovery is not a request to change them.
 pub fn rotate_main_session_conversation(
     conn: &mut Connection,
     scope_key: &str,
     now: &str,
 ) -> Result<RotatedMainSession> {
-    rotate(conn, scope_key, now, false)
+    rotate(conn, scope_key, &MainSessionSettings::default(), now, false)
 }
 
 #[cfg(test)]
@@ -560,7 +604,13 @@ mod tests {
         insert_session(&conn, "home-1", Some(&old_conversation));
         bind_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, "home-1", NOW).unwrap();
 
-        let reset = reset_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, LATER).unwrap();
+        let reset = reset_main_session(
+            &mut conn,
+            INSTANCE_MAIN_SCOPE_KEY,
+            &MainSessionSettings::default(),
+            LATER,
+        )
+        .unwrap();
         assert_eq!(reset.previous_conversation_id, old_conversation);
         assert_eq!(reset.previous_session_id.as_deref(), Some("home-1"));
         assert_ne!(reset.record.conversation_id, old_conversation);
@@ -583,6 +633,69 @@ mod tests {
 
         // A stale binding can no longer be re-established on the old thread.
         assert!(bind_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, "home-1", LATER).is_err());
+    }
+
+    #[test]
+    fn reset_applies_replacement_settings_and_rollover_keeps_them() {
+        let (_temp, mut conn) = temp_store();
+        resolve_main_session(
+            &mut conn,
+            INSTANCE_MAIN_SCOPE_KEY,
+            Some("nova"),
+            "claude",
+            "/repo/a",
+            NOW,
+        )
+        .unwrap();
+        // A pointer from before `project_root` existed.
+        conn.execute("UPDATE main_sessions SET project_root = NULL", [])
+            .unwrap();
+
+        let partial = MainSessionSettings {
+            project_root: Some("/repo/b"),
+            ..Default::default()
+        };
+        let reset = reset_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, &partial, LATER)
+            .unwrap()
+            .record;
+        assert_eq!(reset.project_root.as_deref(), Some("/repo/b"));
+        assert_eq!(reset.harness, "claude", "omitted settings are kept");
+        assert_eq!(reset.familiar_id.as_deref(), Some("nova"));
+
+        let full = MainSessionSettings {
+            familiar_id: Some("cody"),
+            harness: Some("codex"),
+            project_root: Some("/repo/c"),
+        };
+        let reset = reset_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, &full, LATER)
+            .unwrap()
+            .record;
+        assert_eq!(
+            (
+                reset.familiar_id.as_deref(),
+                reset.harness.as_str(),
+                reset.project_root.as_deref()
+            ),
+            (Some("cody"), "codex", Some("/repo/c"))
+        );
+
+        let rolled = rotate_main_session_conversation(&mut conn, INSTANCE_MAIN_SCOPE_KEY, LATER)
+            .unwrap()
+            .record;
+        assert_eq!(rolled.harness, "codex");
+        assert_eq!(rolled.project_root.as_deref(), Some("/repo/c"));
+
+        // Blank replacements are refused without rotating anything.
+        let blank = MainSessionSettings {
+            harness: Some("  "),
+            ..Default::default()
+        };
+        assert!(reset_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, &blank, LATER).is_err());
+        let after = get_main_session(&conn, INSTANCE_MAIN_SCOPE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.conversation_id, rolled.conversation_id);
+        assert_eq!(after.reset_count, 2);
     }
 
     #[test]
@@ -610,8 +723,20 @@ mod tests {
         );
         assert_eq!(rotated.record.reset_count, 0);
 
-        reset_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, LATER).unwrap();
-        reset_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, LATER).unwrap();
+        reset_main_session(
+            &mut conn,
+            INSTANCE_MAIN_SCOPE_KEY,
+            &MainSessionSettings::default(),
+            LATER,
+        )
+        .unwrap();
+        reset_main_session(
+            &mut conn,
+            INSTANCE_MAIN_SCOPE_KEY,
+            &MainSessionSettings::default(),
+            LATER,
+        )
+        .unwrap();
         assert_eq!(
             get_main_session(&conn, INSTANCE_MAIN_SCOPE_KEY)
                 .unwrap()
@@ -645,7 +770,13 @@ mod tests {
     #[test]
     fn rotation_of_a_missing_pointer_fails_closed() {
         let (_temp, mut conn) = temp_store();
-        assert!(reset_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, NOW).is_err());
+        assert!(reset_main_session(
+            &mut conn,
+            INSTANCE_MAIN_SCOPE_KEY,
+            &MainSessionSettings::default(),
+            NOW
+        )
+        .is_err());
         assert!(rotate_main_session_conversation(&mut conn, INSTANCE_MAIN_SCOPE_KEY, NOW).is_err());
     }
 

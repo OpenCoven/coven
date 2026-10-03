@@ -989,18 +989,30 @@ turn is a clean first turn rather than a mismatch.
 
 ### `POST /api/v1/main-session/reset`
 
-Body optional: `{ "scope": "…", "reason": "…" }`. The user's clean slate:
-rotates the conversation id, clears the binding, increments `resetCount`,
-kills the previous session's process if it is still running (best effort),
-records a `main_session.reset` event on that session naming both conversation
-ids and the reason, and archives it. Returns `200` with `mainSession`,
+Body optional: `{ "scope": "…", "reason": "…", "harness": "…",
+"familiarId": "…", "projectRoot": "…" }`. The user's clean slate: rotates the
+conversation id, clears the binding, increments `resetCount`, kills the
+previous session's process if it is still running (best effort), records a
+`main_session.reset` event on that session naming both conversation ids and
+the reason, and archives it.
+
+`harness`, `familiarId`, and `projectRoot` are optional replacements, applied
+in the same store transaction as the rotation; an omitted field keeps its
+current value. Reset is the only way to change them, which is what the turn
+route's `409 main_session_mismatch` and `409 main_session_project_root_missing`
+ask for. A present field that is not a non-empty string is `400
+invalid_request` and nothing rotates. The values are validated the way the
+turn route validates them, at the next launch: an unknown harness or familiar
+is refused there with the launch route's error, and another reset can correct
+it. The event is stored through the instance's `privacy.toml` policy. Returns `200` with `mainSession`,
 `previousConversationId`, `previousSessionId`, and `archived`. The next turn
 launches with `conversation.mode = "init"`. `404 main_session_not_found`
 before the first turn.
 
 ### `POST /api/v1/main-session/rollover`
 
-Same body and response as reset, for recovery from a conversation id the
+Same response as reset, and the same body without the replacement settings
+(rollover never changes them), for recovery from a conversation id the
 harness no longer recognises: the same rotation, event kind
 `main_session.rollover` (default reason `stale-conversation`), archive of the
 previous row, **no** kill and **no** `resetCount` increment. Claude and Codex
