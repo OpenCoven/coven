@@ -42,6 +42,7 @@ mod adoption_gate;
 mod automations;
 mod executor_node;
 mod familiar_identity;
+mod familiar_ledger;
 mod handoff;
 mod harness;
 /// Public at the crate root so every adapter entrypoint shares one contract

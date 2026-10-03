@@ -57,4 +57,5 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/OpenCoven/coven-runtimes",
     "https://github.com/OpenCoven/coven-threads",
+    "https://github.com/OpenCoven/familiar-contract",
 ]
