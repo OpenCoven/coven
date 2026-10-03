@@ -40,6 +40,14 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+# Crate-scoped exceptions, each reviewed on its own rather than allowed for the
+# whole graph.
+exceptions = [
+    # MIT-0 is MIT without the attribution clause: OSI-approved and strictly
+    # more permissive. jsonschema pulls it in (referencing -> fluent-uri), and it
+    # became a runtime dependency with the pinned familiar-contract verifier.
+    { allow = ["MIT-0"], crate = "borrow-or-share" },
+]
 
 [bans]
 # Duplicate transitive versions are common and noisy — surface but don't fail.
