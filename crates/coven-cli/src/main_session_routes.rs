@@ -13,7 +13,9 @@
 //!   conversation id, kill and archive the old row, count it, and apply any
 //!   replacement harness, familiar, or project root it carries.
 //! - `POST /main-session/rollover` is recovery from a conversation id the
-//!   harness no longer recognises: same rotation, archive, not counted.
+//!   harness no longer recognises: same rotation, archive, not counted, and
+//!   only if the pointer still holds the id that failed (compare-and-swap),
+//!   so a late duplicate never rotates away a fresh conversation.
 //!
 //! The handlers compose the existing `launch_session` and `record_input`
 //! handlers rather than re-implementing a launch, so every gate those routes
@@ -37,7 +39,7 @@ use crate::{
     api_response::{api_error, json_response, ApiResponse},
     harness::harness_supports_stream_mode,
     main_session::{
-        self, MainSessionRecord, MainSessionSettings, RotatedMainSession,
+        self, MainSessionRecord, MainSessionSettings, RotatedMainSession, StaleIdRotation,
         DEFAULT_MAIN_SESSION_FAMILIAR_ID, DEFAULT_MAIN_SESSION_HARNESS, INSTANCE_MAIN_SCOPE_KEY,
     },
     request_authority::RequestAuthority,
@@ -425,12 +427,40 @@ pub(crate) fn rollover(coven_home: &Path, body: Option<&str>) -> Result<ApiRespo
         Err(error) => return invalid_request(error),
     };
     let reason = optional_string(&payload, "reason").unwrap_or(DEFAULT_ROLLOVER_REASON);
+    // The id the caller saw fail. Required: rotating "whatever is current"
+    // would let a late duplicate invalidate a conversation that works.
+    let Some(failed_conversation_id) = optional_string(&payload, "conversationId") else {
+        return api_error(
+            400,
+            "invalid_request",
+            "rollover requires `conversationId`, the conversation id that failed",
+            None,
+        );
+    };
     let mut conn = store::open_store(&store_path(coven_home))?;
     if main_session::get_main_session(&conn, &scope)?.is_none() {
         return not_found(&scope);
     }
-    let rotated =
-        main_session::rotate_main_session_conversation(&mut conn, &scope, &current_timestamp())?;
+    let rotated = match main_session::rotate_main_session_conversation(
+        &mut conn,
+        &scope,
+        failed_conversation_id,
+        &current_timestamp(),
+    )? {
+        StaleIdRotation::Rotated(rotated) => rotated,
+        StaleIdRotation::AlreadyRotated(current) => {
+            return api_error(
+                409,
+                "main_session_conversation_changed",
+                "The conversation that failed was already replaced; retry the turn on the current one.",
+                Some(json!({
+                    "scopeKey": scope,
+                    "failedConversationId": failed_conversation_id,
+                    "mainSession": current,
+                })),
+            );
+        }
+    };
     let archived = finish_rotation(
         coven_home,
         &conn,
@@ -925,8 +955,14 @@ description = "Builds and debugs."
         let first = first_turn(&h);
         let old_session = first["session"]["id"].as_str().unwrap().to_string();
         set_status(&h, &old_session, "exited");
+        let failed = first["mainSession"]["conversationId"].clone();
 
-        let (status, body) = call(&h, "POST", "/api/v1/main-session/rollover", None);
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/rollover",
+            Some(json!({ "conversationId": failed })),
+        );
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["mainSession"]["resetCount"], 0);
         assert_eq!(body["archived"], true);
@@ -947,13 +983,50 @@ description = "Builds and debugs."
     }
 
     #[test]
+    fn a_late_rollover_for_a_replaced_conversation_changes_nothing() {
+        let h = home();
+        let first = first_turn(&h);
+        set_status(&h, first["session"]["id"].as_str().unwrap(), "exited");
+        let failed = first["mainSession"]["conversationId"].clone();
+
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/rollover",
+            Some(json!({ "conversationId": failed })),
+        );
+        assert_eq!(status, 200, "{body}");
+        let fresh = body["mainSession"]["conversationId"].clone();
+
+        // A duplicate report of the same failure arrives late.
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/rollover",
+            Some(json!({ "conversationId": failed })),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], "main_session_conversation_changed");
+        let (_, get) = call(&h, "GET", "/api/v1/main-session", None);
+        assert_eq!(get["mainSession"]["conversationId"], fresh);
+
+        // Rollover without the failed id is refused outright.
+        let (status, body) = call(&h, "POST", "/api/v1/main-session/rollover", None);
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[test]
     fn reset_and_rollover_before_any_pointer_are_not_found() {
         let h = home();
-        for route in [
-            "/api/v1/main-session/reset",
-            "/api/v1/main-session/rollover",
+        for (route, body) in [
+            ("/api/v1/main-session/reset", None),
+            (
+                "/api/v1/main-session/rollover",
+                Some(json!({ "conversationId": "c1" })),
+            ),
         ] {
-            let (status, body) = call(&h, "POST", route, None);
+            let (status, body) = call(&h, "POST", route, body);
             assert_eq!(status, 404, "{route}: {body}");
             assert_eq!(body["error"]["code"], "main_session_not_found");
         }

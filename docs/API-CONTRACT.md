@@ -1011,8 +1011,16 @@ before the first turn.
 
 ### `POST /api/v1/main-session/rollover`
 
-Same response as reset, and the same body without the replacement settings
-(rollover never changes them), for recovery from a conversation id the
+Body: `{ "conversationId": "…", "scope": "…", "reason": "…" }`.
+`conversationId` is required: it is the conversation id the caller saw fail.
+The pointer is rotated only if it still holds that id. If a reset or an
+earlier rollover already replaced it, the response is `409
+main_session_conversation_changed` with the current `mainSession`, nothing
+changes, and the caller should simply retry its turn. This keeps a late or
+duplicate report from rotating away a fresh conversation that works.
+
+Otherwise the response is the same as reset's (rollover never changes the
+harness, familiar, or project root), for recovery from a conversation id the
 harness no longer recognises: the same rotation, event kind
 `main_session.rollover` (default reason `stale-conversation`), archive of the
 previous row, **no** kill and **no** `resetCount` increment. Claude and Codex
