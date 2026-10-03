@@ -234,9 +234,12 @@ pub(crate) fn authorize_scheduled_dispatch(
     now: DateTime<Utc>,
     validity: TimeDelta,
 ) -> Result<std::result::Result<OwnerAuthorization, OwnerAuthorizationRefusal>> {
+    // Contract timestamps carry at most milliseconds, so a shorter or
+    // fractional window could not be stated without collapsing or shifting it.
     anyhow::ensure!(
-        validity > TimeDelta::zero(),
-        "an owner authorization needs a positive validity"
+        validity.num_milliseconds() > 0
+            && validity == TimeDelta::milliseconds(validity.num_milliseconds()),
+        "an owner authorization needs a positive, whole-millisecond validity"
     );
     let current = match super::store::get_definition_with_tombstone(conn, automation_id, true)? {
         Some(record) if record.revision == revision => record,
@@ -509,7 +512,25 @@ mod tests {
             (first.issued_at, first.valid_until),
             (truncated, truncated + TimeDelta::minutes(5))
         );
-        assert!(authorize_scheduled_dispatch(&conn, "owned", 2, at(), TimeDelta::zero()).is_err());
+        for invalid in [
+            TimeDelta::zero(),
+            TimeDelta::milliseconds(-1),
+            TimeDelta::microseconds(1),
+            TimeDelta::microseconds(1_500),
+        ] {
+            assert!(
+                authorize_scheduled_dispatch(&conn, "owned", 2, at(), invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        let shortest =
+            authorize_scheduled_dispatch(&conn, "owned", 2, at(), TimeDelta::milliseconds(1))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            shortest.valid_until - shortest.issued_at,
+            TimeDelta::milliseconds(1)
+        );
     }
 
     #[test]
