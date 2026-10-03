@@ -578,16 +578,21 @@ fn persist_launch_with_clock(
             "automation authority profile changed across attempts; refusing downgrade".to_string(),
         );
     }
+    // The binding pins the published digest, so the receipt it yields names
+    // the same revision digest that events and read projections publish.
     let request = transaction
         .query_row(
-            "SELECT r.automation_revision, r.definition_digest, o.scheduled_for, o.kind,
-                    a.id, a.adoption_key, a.occurrence_fence_generation
-                 FROM automation_runs AS r
-                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
-                 JOIN automation_attempts AS a ON a.run_id = r.id
-                 WHERE r.id = ?1
-                   AND a.attempt_number = ?2
-                   AND a.state = 'adopted'",
+            &format!(
+                "SELECT r.automation_revision, {digest}, o.scheduled_for, o.kind,
+                        a.id, a.adoption_key, a.occurrence_fence_generation
+                     FROM automation_runs AS r
+                     JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                     JOIN automation_attempts AS a ON a.run_id = r.id
+                     WHERE r.id = ?1
+                       AND a.attempt_number = ?2
+                       AND a.state = 'adopted'",
+                digest = super::rich_definition::published_digest_sql("r"),
+            ),
             rusqlite::params![run_id, i64::from(attempt_number)],
             |row| {
                 let revision: i64 = row.get(0)?;
@@ -6300,6 +6305,83 @@ mod tests {
         assert_ne!(
             authority["receiptEvidence"]["authentication"]["signature"],
             authority["executionBinding"]["authentication"]["signature"]
+        );
+    }
+
+    #[test]
+    fn runtime_authority_binding_and_receipt_pin_the_rich_revision_document_digest() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily-notes");
+        insert_definition(&conn, &routine).unwrap();
+        // Revision 1 as a richly authored definition would record it.
+        let document_digest = "d".repeat(64);
+        conn.execute(
+            "INSERT INTO automation_rich_definition_revisions
+                (automation_id, revision, rich_definition_json, integrity, recorded_at)
+             VALUES (?1, 1, '{}', ?2, '2026-09-03T12:00:00.000Z')",
+            rusqlite::params![routine.id, document_digest],
+        )
+        .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.daily-notes-rich-digest";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now)
+                .unwrap()
+        );
+        let mut clock = || now;
+        let cancelled = || false;
+        let authority = CountingAuthority::default();
+        let runtime = ForgingAuthorityUnsupportedRuntime {
+            launches: Cell::new(0),
+        };
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&authority),
+            scheduler_fence: None,
+        };
+        let DispatchAttempt::Completed(outcome) = dispatch_occurrence_with_clock(
+            &conn,
+            &runtime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        )
+        .unwrap() else {
+            panic!("authority-bound dispatch must settle");
+        };
+
+        let (snapshot_digest, extension_json, receipt_id): (String, String, String) = conn
+            .query_row(
+                "SELECT r.definition_digest, a.authority_extension_json, r.receipt_id
+                 FROM automation_runs AS r
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        // The run keeps the snapshot fence; the binding and the receipt carry
+        // the digest published for the revision.
+        assert_ne!(snapshot_digest, document_digest);
+        let extension: serde_json::Value = serde_json::from_str(&extension_json).unwrap();
+        assert_eq!(
+            extension["executionBinding"]["base"]["definitionDigest"]["value"],
+            json!(document_digest)
+        );
+        let receipt =
+            super::super::receipts::read_authorized_receipt(&conn, &receipt_id, &VectorAuthority)
+                .unwrap()
+                .expect("authorized receipt");
+        assert_eq!(
+            receipt
+                .receipt
+                .definition_digest
+                .as_ref()
+                .map(|digest| digest.value.as_str()),
+            Some(document_digest.as_str())
         );
     }
 

@@ -939,6 +939,277 @@ mod tests {
         );
     }
 
+    /// What `rich_revision_history` committed.
+    struct RichHistory {
+        created: Value,
+        revised: Value,
+        /// The stored routine digest at revision 4, the scheduler's fence.
+        snapshot_at_4: String,
+    }
+
+    /// Revisions 1-4 of `rich-notes` (create, revise, activate, pause) and a
+    /// routine-bodied revision 5, which has no rich document.
+    fn rich_revision_history(conn: &rusqlite::Connection) -> RichHistory {
+        let (_, created) = send(
+            conn,
+            rich_command(
+                "definition.create.v1",
+                "adopt:digest:create",
+                None,
+                rich(1, "draft", |_| {}),
+            ),
+        );
+        let (_, revised) = send(
+            conn,
+            rich_command(
+                "definition.revise.v1",
+                "adopt:digest:revise",
+                Some(1),
+                rich(2, "paused", |definition| {
+                    definition["action"]["prompt"] = json!("Reflect briefly.")
+                }),
+            ),
+        );
+        for (command, key, expected) in [
+            ("definition.activate.v1", "adopt:digest:activate", 2),
+            ("definition.pause.v1", "adopt:digest:pause", 3),
+        ] {
+            let (status, response) = send(
+                conn,
+                envelope(
+                    command,
+                    key,
+                    Some(expected),
+                    json!({ "automationId": "rich-notes" }),
+                ),
+            );
+            assert_eq!(status, 200, "{command}: {response:?}");
+        }
+        let record = crate::automations::store::get_definition(conn, "rich-notes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.revision, 4);
+        let snapshot_at_4 = record.definition_digest.unwrap();
+        let mut routine: Value = serde_json::from_str(&record.definition_json).unwrap();
+        routine["prompt"] = json!("Plain routine now.");
+        let (status, flat) = crate::control_plane::route_action(
+            json!({
+                "action": "coven.automations.definition.revise.v1",
+                "adoptionKey": "adopt:digest:flat-revise",
+                "expectedRevision": 4,
+                "definition": routine,
+            }),
+            conn,
+            &NoopSessionRuntime,
+        );
+        assert_eq!(status, 200, "{flat:?}");
+        RichHistory {
+            created: created.result.unwrap(),
+            revised: revised.result.unwrap(),
+            snapshot_at_4,
+        }
+    }
+
+    fn recorded_integrity(conn: &rusqlite::Connection, revision: i64) -> String {
+        conn.query_row(
+            "SELECT integrity FROM automation_rich_definition_revisions
+             WHERE automation_id = 'rich-notes' AND revision = ?1",
+            [revision],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rich_revisions_publish_their_document_digest_on_lifecycle_events() {
+        let (_temp, conn) = store();
+        let history = rich_revision_history(&conn);
+        let published: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT event_json FROM automation_events
+                 WHERE stream_kind = 'automation' AND stream_id = 'rich-notes'
+                 ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|json| {
+                let event: Value = serde_json::from_str(&json.unwrap()).unwrap();
+                (
+                    event["payload"]["revision"].as_i64().unwrap(),
+                    event["payload"]["definitionDigest"]["value"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            published
+                .iter()
+                .map(|(revision, _)| *revision)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+
+        // Each richly authored revision publishes its recorded document's
+        // integrity, which is what create and revise returned.
+        for (revision, digest) in &published[..4] {
+            assert_eq!(
+                digest,
+                &recorded_integrity(&conn, *revision),
+                "revision {revision}"
+            );
+        }
+        assert_eq!(
+            published[0].1,
+            history.created["result"]["definition"]["integrity"]["value"]
+        );
+        assert_eq!(
+            published[1].1,
+            history.revised["result"]["definition"]["integrity"]["value"]
+        );
+        // Revisions 2 and 4 are both paused with the same body, so their
+        // routine projections match; their documents name their revision.
+        assert_ne!(published[1].1, published[3].1);
+
+        // Revision 5 has no rich document, so it publishes the routine digest,
+        // and the stored fence is still the routine digest.
+        let record = crate::automations::store::get_definition(&conn, "rich-notes")
+            .unwrap()
+            .unwrap();
+        let snapshot =
+            crate::automations::contract::migration::definition_digest(&record.definition_json)
+                .unwrap();
+        assert_eq!(record.definition_digest.as_deref(), Some(snapshot.as_str()));
+        assert_eq!(published[4], (5, snapshot));
+    }
+
+    #[test]
+    fn rich_revision_digest_reaches_occurrence_and_run_projections() {
+        let (_temp, conn) = store();
+        let history = rich_revision_history(&conn);
+        let snapshot_at_5 = crate::automations::store::get_definition(&conn, "rich-notes")
+            .unwrap()
+            .unwrap()
+            .definition_digest
+            .unwrap();
+        // Occurrences and runs store the snapshot digest the scheduler fenced
+        // on: one at revision 4 (rich) and one at revision 5 (routine-bodied).
+        let fences = [
+            (4, history.snapshot_at_4.clone()),
+            (5, snapshot_at_5.clone()),
+        ];
+        for (revision, digest) in &fences {
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, attempt, created_at, updated_at)
+                 VALUES (?1, 'rich-notes', ?2, ?3, ?4, 'scheduled', 'succeeded', 1, ?4, ?4)",
+                rusqlite::params![
+                    format!("occurrence-{revision}"),
+                    revision,
+                    digest,
+                    format!("2026-10-0{revision}T09:00:00.000Z"),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO automation_runs
+                    (id, automation_id, automation_revision, definition_digest, occurrence_id,
+                     runtime, status, started_at)
+                 VALUES (?1, 'rich-notes', ?2, ?3, ?4, 'coven-code', 'succeeded', ?5)",
+                rusqlite::params![
+                    format!("run-{revision}"),
+                    revision,
+                    digest,
+                    format!("occurrence-{revision}"),
+                    format!("2026-10-0{revision}T09:00:01.000Z"),
+                ],
+            )
+            .unwrap();
+        }
+        // Migrated history that cannot be attributed to a revision keeps no
+        // digest, even at a revision that has a rich document.
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             VALUES ('occurrence-unverifiable', 'rich-notes', 4, NULL,
+                     '2026-09-01T09:00:00.000Z', 'scheduled', 'succeeded', 1,
+                     '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        let read = |request: Value| {
+            let (status, response) =
+                crate::control_plane::route_action(request, &conn, &NoopSessionRuntime);
+            assert_eq!(status, 200, "{response:?}");
+            response.event.unwrap().payload
+        };
+        let published = [(4, recorded_integrity(&conn, 4)), (5, snapshot_at_5)];
+        assert_ne!(published[0].1, history.snapshot_at_4);
+        for (revision, digest) in &published {
+            let occurrence = read(json!({
+                "action": "coven.automations.occurrence.get.v1",
+                "id": format!("occurrence-{revision}"),
+            }))["occurrence"]
+                .clone();
+            assert_eq!(
+                occurrence["definitionDigest"],
+                json!(digest),
+                "revision {revision}"
+            );
+            assert_eq!(
+                occurrence["runs"][0]["definitionDigest"],
+                json!(digest),
+                "revision {revision}"
+            );
+            let run = read(json!({
+                "action": "coven.automations.run.get.v1",
+                "id": format!("run-{revision}"),
+            }))["run"]
+                .clone();
+            assert_eq!(
+                run["definitionDigest"],
+                json!(digest),
+                "revision {revision}"
+            );
+        }
+        let page = read(json!({
+            "action": "coven.automations.occurrence.history.v1",
+            "automationId": "rich-notes",
+        }));
+        assert_eq!(
+            page["occurrences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|occurrence| occurrence["definitionDigest"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(published[1].1), json!(published[0].1), Value::Null]
+        );
+        assert_eq!(
+            read(json!({
+                "action": "coven.automations.occurrence.get.v1",
+                "id": "occurrence-unverifiable",
+            }))["occurrence"]["definitionDigest"],
+            Value::Null
+        );
+        // The rows themselves still carry the snapshot fence.
+        let stored: Vec<Option<String>> = conn
+            .prepare("SELECT definition_digest FROM automation_occurrences ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            stored,
+            vec![Some(fences[0].1.clone()), Some(fences[1].1.clone()), None]
+        );
+    }
+
     #[test]
     fn rich_creates_refuse_invalid_unsupported_and_unlawful_bodies_without_writes() {
         let validator = response_validator();

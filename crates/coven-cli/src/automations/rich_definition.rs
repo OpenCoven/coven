@@ -204,6 +204,53 @@ pub(crate) fn clear_stale_rich_bodies(conn: &Connection) -> anyhow::Result<usize
     )?)
 }
 
+/// The digest Coven publishes for one revision of a definition.
+///
+/// A richly authored revision is identified by its recorded document's
+/// `integrity`: the value `definition.create.v1` and `definition.revise.v1`
+/// return, and the one a receipt verifier compares against. Any other revision
+/// falls back to `snapshot_digest`, the digest of the executable routine JSON.
+/// That snapshot digest stays the internal fence the scheduler and runner
+/// recompute; this only changes what lifecycle events, read projections and
+/// execution bindings publish. Both values identify the same revision. A row
+/// with no snapshot digest is not verifiably pinned to its revision, so it
+/// publishes none rather than borrowing that revision's document digest.
+pub(crate) fn published_digest(
+    conn: &Connection,
+    automation_id: &str,
+    revision: u64,
+    snapshot_digest: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(snapshot_digest) = snapshot_digest else {
+        return Ok(None);
+    };
+    let recorded = conn
+        .query_row(
+            "SELECT integrity
+             FROM automation_rich_definition_revisions
+             WHERE automation_id = ?1 AND revision = ?2",
+            rusqlite::params![automation_id, i64::try_from(revision)?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(Some(recorded.unwrap_or_else(|| snapshot_digest.to_owned())))
+}
+
+/// [`published_digest`] as a SQL expression over `table`: the name or alias of
+/// an `automation_occurrences` or `automation_runs` row, which pins
+/// `automation_id`, `automation_revision` and `definition_digest`.
+pub(crate) fn published_digest_sql(table: &str) -> String {
+    format!(
+        "COALESCE(
+            (SELECT recorded.integrity
+             FROM automation_rich_definition_revisions AS recorded
+             WHERE {table}.definition_digest IS NOT NULL
+               AND recorded.automation_id = {table}.automation_id
+               AND recorded.revision = {table}.automation_revision),
+            {table}.definition_digest)"
+    )
+}
+
 /// Records what the definition's current revision means in rich terms, when
 /// it was authored richly. Called once per committed revision, inside its
 /// transaction, so every revision's rich body stays recoverable.
