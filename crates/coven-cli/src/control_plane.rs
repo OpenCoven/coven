@@ -1,3 +1,4 @@
+use crate::automations::owner_grants::CommandAuthority;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -228,12 +229,25 @@ pub(crate) fn automation_transport_rejection(
     ))
 }
 
+/// Routes one control action as the owner, as the API's default entry does.
+/// Test-only, so production callers always state the authority they hold.
+#[cfg(test)]
 pub fn route_action(
     payload: Value,
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
 ) -> (u16, ControlActionResponse) {
-    route_action_at(payload, conn, runtime, &now_iso())
+    route_action_with_authority(payload, conn, runtime, CommandAuthority::OwnerLocal)
+}
+
+/// Routes one control action for a caller authenticated as `authority`.
+pub(crate) fn route_action_with_authority(
+    payload: Value,
+    conn: &rusqlite::Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+    authority: CommandAuthority,
+) -> (u16, ControlActionResponse) {
+    route_action_at(payload, conn, runtime, &now_iso(), authority)
 }
 
 pub(crate) fn route_action_at(
@@ -241,6 +255,7 @@ pub(crate) fn route_action_at(
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
     recorded_at: &str,
+    authority: CommandAuthority,
 ) -> (u16, ControlActionResponse) {
     if !payload.is_object() {
         return (
@@ -331,6 +346,7 @@ pub(crate) fn route_action_at(
                             definition,
                         },
                         recorded_at,
+                        authority,
                     ),
                 ),
                 Err(error) => (400, rejected_action(action, error)),
@@ -350,6 +366,7 @@ pub(crate) fn route_action_at(
                             definition,
                         },
                         recorded_at,
+                        authority,
                     ),
                 ),
                 Err(error) => (400, rejected_action(action, error)),
@@ -369,6 +386,7 @@ pub(crate) fn route_action_at(
                             automation_id: id,
                         },
                         recorded_at,
+                        authority,
                     ),
                 ),
                 Err(error) => (400, rejected_action(action, error)),
@@ -427,6 +445,7 @@ pub(crate) fn route_action_at(
                             &adoption_key,
                             command,
                             recorded_at,
+                            authority,
                         ),
                     )
                 }
@@ -466,6 +485,7 @@ pub(crate) fn route_action_at(
                             &adoption_key,
                             command,
                             recorded_at,
+                            authority,
                         ),
                     )
                 }
@@ -505,6 +525,7 @@ pub(crate) fn route_action_at(
                             &adoption_key,
                             command,
                             recorded_at,
+                            authority,
                         ),
                     )
                 }
@@ -516,7 +537,7 @@ pub(crate) fn route_action_at(
             &payload,
             action,
             (origin, intent_id),
-            recorded_at,
+            (recorded_at, authority),
             "definition.disable.v1",
             |automation_id, expected_revision, reason| {
                 crate::automations::command_adoption::DefinitionCommand::Disable {
@@ -531,7 +552,7 @@ pub(crate) fn route_action_at(
             &payload,
             action,
             (origin, intent_id),
-            recorded_at,
+            (recorded_at, authority),
             "definition.activate.v1",
             |automation_id, expected_revision, reason| {
                 crate::automations::command_adoption::DefinitionCommand::Activate {
@@ -546,7 +567,7 @@ pub(crate) fn route_action_at(
             &payload,
             action,
             (origin, intent_id),
-            recorded_at,
+            (recorded_at, authority),
             "definition.pause.v1",
             |automation_id, expected_revision, reason| {
                 crate::automations::command_adoption::DefinitionCommand::Pause {
@@ -595,11 +616,18 @@ pub(crate) fn route_action_at(
                     &adoption_key,
                     command,
                     recorded_at,
+                    authority,
                 ),
             )
         }
         crate::automations::command_envelope::ACTION => {
-            crate::automations::command_envelope::route(&payload, conn, runtime, recorded_at)
+            crate::automations::command_envelope::route(
+                &payload,
+                conn,
+                runtime,
+                recorded_at,
+                authority,
+            )
         }
         "coven.automations.run.cancel.v1" => {
             match crate::automations::cancellation::execute_run_cancellation(
@@ -877,7 +905,7 @@ fn definition_status_command(
     payload: &Value,
     action: &str,
     (origin, intent_id): (Option<String>, Option<String>),
-    recorded_at: &str,
+    (recorded_at, authority): (&str, CommandAuthority),
     command: &str,
     build: impl FnOnce(
         String,
@@ -912,6 +940,7 @@ fn definition_status_command(
             &adoption_key,
             command,
             recorded_at,
+            authority,
         ),
     )
 }

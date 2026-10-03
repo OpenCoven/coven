@@ -418,6 +418,7 @@ prompt = "Do the legacy thing."
                 key,
                 super::super::command_adoption::DefinitionCommand::LegacyImport { dry_run },
                 "2026-09-28T09:00:00.000Z",
+                super::super::owner_grants::CommandAuthority::OwnerLocal,
             )
             .unwrap()
         })
@@ -516,6 +517,7 @@ prompt = "Do the legacy thing."
                 reason: None,
             },
             "2026-09-28T09:01:00.000Z",
+            super::super::owner_grants::CommandAuthority::OwnerLocal,
         )
         .unwrap();
         assert_eq!(
@@ -543,6 +545,7 @@ prompt = "Do the legacy thing."
                     expected_revision: Some(1),
                 },
                 "2026-09-28T09:02:00.000Z",
+                super::super::owner_grants::CommandAuthority::OwnerLocal,
             )
             .unwrap()
         };

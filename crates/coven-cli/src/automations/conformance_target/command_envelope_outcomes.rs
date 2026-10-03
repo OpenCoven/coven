@@ -178,6 +178,7 @@ fn case_matches(case: &Case) -> Result<bool, &'static str> {
             &conn,
             &crate::api::NoopSessionRuntime,
             &recorded_at,
+            crate::automations::owner_grants::CommandAuthority::OwnerLocal,
         );
         let body = response.result.unwrap_or(Value::Null);
         let after = durable_state(&conn)?;

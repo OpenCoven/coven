@@ -49,6 +49,7 @@ pub(crate) fn route(
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
     recorded_at: &str,
+    authority: super::owner_grants::CommandAuthority,
 ) -> (u16, ControlActionResponse) {
     let Some(object) = payload.as_object() else {
         return validation_rejection(ACTION, "request body must be a JSON object".to_owned());
@@ -115,11 +116,12 @@ pub(crate) fn route(
                     adoption_key.as_str().unwrap_or_default(),
                     rich,
                     recorded_at,
+                    authority,
                 ),
             )
         }
         _ => match flat_request(&command_name, envelope, &request) {
-            Ok(flat) => route_action_at(flat, conn, runtime, recorded_at),
+            Ok(flat) => route_action_at(flat, conn, runtime, recorded_at, authority),
             Err(message) => return refuse(ErrorCode::CapabilityUnsupported, message),
         },
     };
