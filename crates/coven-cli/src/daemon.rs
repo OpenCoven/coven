@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 #[cfg(unix)]
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -171,6 +171,13 @@ pub trait RuntimeKiller: Send {
     fn wait_for_shutdown_quiescence(&mut self, _timeout: Duration) -> Result<()> {
         Ok(())
     }
+
+    /// The Unix process group that holds this session's harness, when the
+    /// killer owns one. The liveness sweep probes it to catch a harness that
+    /// is gone while its exit observer never reported back (#1196).
+    fn process_group(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Sentinel error returned by `LiveSessionRuntime::send_input` and
@@ -215,6 +222,9 @@ pub struct LiveSessionRuntime {
     sessions: Arc<Mutex<HashMap<String, LiveSessionHandle>>>,
     shutting_down: AtomicBool,
     launch_gate: Arc<LiveLaunchGate>,
+    /// Every session this daemon registered, with the moment the liveness
+    /// sweep first found it without a live harness (#1196).
+    liveness: Mutex<HashMap<String, Option<Instant>>>,
 }
 
 #[derive(Default)]
@@ -260,6 +270,13 @@ impl RuntimeKiller for SharedLaunchKiller {
         match self.killer.lock() {
             Ok(mut killer) => killer.wait_for_shutdown_quiescence(timeout),
             Err(poisoned) => poisoned.into_inner().wait_for_shutdown_quiescence(timeout),
+        }
+    }
+
+    fn process_group(&self) -> Option<u32> {
+        match self.killer.lock() {
+            Ok(killer) => killer.process_group(),
+            Err(poisoned) => poisoned.into_inner().process_group(),
         }
     }
 }
@@ -445,6 +462,7 @@ struct LiveSessionHandle {
     input: Arc<Mutex<Box<dyn Write + Send>>>,
     killer: Arc<Mutex<Box<dyn RuntimeKiller>>>,
     registration: Arc<LiveSessionRegistration>,
+    process_group: Option<u32>,
 }
 
 struct LiveSessionRegistration {
@@ -530,6 +548,7 @@ impl LiveSessionRuntime {
             sessions: Arc::default(),
             shutting_down: AtomicBool::new(false),
             launch_gate: Arc::default(),
+            liveness: Mutex::default(),
         })
     }
 
@@ -591,6 +610,7 @@ impl LiveSessionRuntime {
         mut killer: Box<dyn RuntimeKiller>,
         registration: Arc<LiveSessionRegistration>,
     ) -> Result<()> {
+        let process_group = killer.process_group();
         let mut sessions = self
             .sessions
             .lock()
@@ -609,6 +629,7 @@ impl LiveSessionRuntime {
                 input: Arc::new(Mutex::new(input)),
                 killer: Arc::new(Mutex::new(killer)),
                 registration: Arc::clone(&registration),
+                process_group,
             },
         );
         let removed = if registration.exited.load(Ordering::Acquire)
@@ -623,7 +644,107 @@ impl LiveSessionRuntime {
         drop(sessions);
         drop(replaced);
         drop(removed);
+        self.track_liveness(session_id);
         Ok(())
+    }
+
+    fn track_liveness(&self, session_id: String) {
+        self.liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id, None);
+    }
+
+    /// Registered sessions whose harness has been missing for at least
+    /// [`LOST_SESSION_GRACE`] as of `now`. A harness is missing once its
+    /// session has left the live registry, or while the session's process
+    /// group is gone according to `group_live`. The second case catches an
+    /// exit observer that never returned.
+    fn lost_sessions(&self, now: Instant, group_live: impl Fn(u32) -> bool) -> Vec<String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let registered: Vec<(String, Option<u32>)> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(id, handle)| (id.clone(), handle.process_group))
+            .collect();
+        // Probe outside the registry lock, which also guards input and kill.
+        let live: HashSet<String> = registered
+            .into_iter()
+            .filter(|(_, group)| group.is_none_or(&group_live))
+            .map(|(id, _)| id)
+            .collect();
+        let mut liveness = self
+            .liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut lost = Vec::new();
+        for (id, missing_since) in liveness.iter_mut() {
+            if live.contains(id) {
+                *missing_since = None;
+                continue;
+            }
+            let since = *missing_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= LOST_SESSION_GRACE {
+                lost.push(id.clone());
+            }
+        }
+        lost.sort();
+        lost
+    }
+
+    /// Orphan each lost session whose row still says `running`, then stop
+    /// tracking every lost session the store has settled. Returns the ids
+    /// this call orphaned. A row that is already terminal, external, or gone
+    /// is left as it is. A late exit still overwrites `orphaned` with the
+    /// harness's real result.
+    fn settle_lost_sessions(
+        &self,
+        conn: &rusqlite::Connection,
+        lost: &[String],
+        updated_at: &str,
+    ) -> Vec<String> {
+        let mut orphaned = Vec::new();
+        let mut settled = Vec::new();
+        for id in lost {
+            if !self.still_missing(id) {
+                continue;
+            }
+            match crate::store::mark_session_orphaned_if_running(conn, id, updated_at) {
+                Ok(changed) => {
+                    if changed {
+                        orphaned.push(id.clone());
+                    }
+                    settled.push(id);
+                }
+                Err(error) => eprintln!(
+                    "coven daemon: liveness sweep could not reconcile session `{id}`: {error:#}"
+                ),
+            }
+        }
+        let mut liveness = self
+            .liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in settled {
+            // A relaunch under the same id re-registers it and clears the
+            // timer. Keep tracking that newer registration.
+            if liveness.get(id).is_some_and(Option::is_some) {
+                liveness.remove(id);
+            }
+        }
+        orphaned
+    }
+
+    fn still_missing(&self, session_id: &str) -> bool {
+        self.liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .is_some_and(Option::is_some)
     }
 
     /// Stop admitting sessions, remove every owned handle, and explicitly
@@ -1170,7 +1291,10 @@ impl LiveSessionRuntime {
 
         let (input, provisional_killer) = launch_admission.spawn_owned(|publish| {
             let detached = pty_runner::spawn_detached_with_observer(&command, observer)?;
-            let killer: Box<dyn RuntimeKiller> = Box::new(detached.killer);
+            let killer: Box<dyn RuntimeKiller> = Box::new(DetachedPtyKiller {
+                killer: detached.killer,
+                process_id: detached.process_id,
+            });
             publish(killer)?;
             Ok(detached.input)
         })?;
@@ -1418,11 +1542,36 @@ impl RuntimeKiller for pty_runner::SharedStrictChildProcessTree {
         pty_runner::SharedStrictChildProcessTree::wait_for_shutdown_quiescence(self, timeout)
             .context("contained piped harness process tree did not finish shutdown cleanup")
     }
+
+    fn process_group(&self) -> Option<u32> {
+        pty_runner::SharedStrictChildProcessTree::process_group(self)
+    }
 }
 
 impl RuntimeKiller for Box<dyn portable_pty::ChildKiller + Send + Sync> {
     fn kill(&mut self) -> Result<()> {
         self.as_mut().kill().context("failed to kill live session")
+    }
+}
+
+/// A detached PTY session's killer plus its root pid. The PTY spawn makes the
+/// root a session leader, so on Unix that pid is also the process group.
+struct DetachedPtyKiller {
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    process_id: Option<u32>,
+}
+
+impl RuntimeKiller for DetachedPtyKiller {
+    fn kill(&mut self) -> Result<()> {
+        self.killer.kill()
+    }
+
+    fn process_group(&self) -> Option<u32> {
+        if cfg!(unix) {
+            self.process_id
+        } else {
+            None
+        }
     }
 }
 
@@ -4542,6 +4691,74 @@ fn start_threads_proposal_scheduler(coven_home: &Path) -> Result<()> {
 /// Starts asynchronous, bounded SQLite retention. The initial pass waits for
 /// the interval so daemon startup never pays maintenance latency, and the
 /// store helper intentionally performs no automatic VACUUM.
+/// How often the daemon checks its registered sessions for a missing harness.
+const LIVENESS_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a registered session may lack a live harness before a `running`
+/// row is orphaned (#1196). A normal exit persists within milliseconds of
+/// leaving the registry. The margin absorbs an event-writer backlog, so the
+/// sweep only settles exits that were never going to land.
+const LOST_SESSION_GRACE: Duration = Duration::from_secs(120);
+
+/// Reconcile sessions whose harness died without a persisted exit. Before
+/// this, only a daemon restart moved them out of `running` (#1196).
+fn start_session_liveness_sweeper(
+    coven_home: &Path,
+    runtime: &Arc<LiveSessionRuntime>,
+) -> Result<()> {
+    let home = coven_home.to_path_buf();
+    let runtime = Arc::downgrade(runtime);
+    std::thread::Builder::new()
+        .name("coven-session-liveness".into())
+        .spawn(move || loop {
+            std::thread::sleep(LIVENESS_SWEEP_INTERVAL);
+            let Some(runtime) = runtime.upgrade() else {
+                return;
+            };
+            if runtime.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            let lost = runtime.lost_sessions(Instant::now(), process_group_live);
+            if lost.is_empty() {
+                continue;
+            }
+            let conn = match crate::store::open_store(&home.join("coven.sqlite3")) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    eprintln!("coven daemon: liveness sweep could not open the store: {error:#}");
+                    continue;
+                }
+            };
+            let orphaned =
+                runtime.settle_lost_sessions(&conn, &lost, &crate::api::current_timestamp());
+            if !orphaned.is_empty() {
+                append_daemon_recovery_log(
+                    &home,
+                    &format!(
+                        "orphaned sessions with no live harness: {}",
+                        orphaned.join(", ")
+                    ),
+                );
+            }
+        })
+        .context("failed to spawn session liveness sweeper")?;
+    Ok(())
+}
+
+/// Whether any process remains in `group`. An unreadable group counts as
+/// live, so the sweep never orphans a session it cannot prove dead.
+fn process_group_live(group: u32) -> bool {
+    #[cfg(unix)]
+    {
+        pty_runner::unix_process_group_live(group).unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = group;
+        true
+    }
+}
+
 fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
     const INTERVAL: Duration = Duration::from_secs(60);
     let home = coven_home.to_path_buf();
@@ -5164,6 +5381,7 @@ pub fn serve_forever(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
+    start_session_liveness_sweeper(coven_home, &runtime)?;
     let automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     let mobile_gateway =
@@ -6295,6 +6513,7 @@ fn serve_forever_with_lifetime_job_installer(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
+    start_session_liveness_sweeper(coven_home, &runtime)?;
     let _automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     let _mobile_gateway =
@@ -11127,6 +11346,168 @@ mod tests {
         assert_eq!(updated, 1);
         assert_eq!(session_status(&sessions, "running"), "orphaned");
         assert_eq!(session_status(&sessions, "killed"), "killed");
+        Ok(())
+    }
+
+    /// A live-registry killer whose harness sits in a fixed process group.
+    struct GroupedKiller(u32);
+
+    impl RuntimeKiller for GroupedKiller {
+        fn kill(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn process_group(&self) -> Option<u32> {
+            Some(self.0)
+        }
+    }
+
+    fn register_for_liveness(
+        runtime: &LiveSessionRuntime,
+        id: &str,
+        killer: Box<dyn RuntimeKiller>,
+    ) -> Result<()> {
+        runtime.register(id.to_string(), Box::new(SharedBuffer::default()), killer)
+    }
+
+    fn statuses(coven_home: &Path) -> Result<Vec<crate::store::SessionRecord>> {
+        let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+        crate::store::list_sessions(&conn)
+    }
+
+    #[test]
+    fn liveness_sweep_orphans_a_session_that_left_the_registry_without_an_exit() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        crate::store::insert_session(&conn, &session_record("lost"))?;
+        crate::store::insert_session(&conn, &session_record("live"))?;
+        let runtime = LiveSessionRuntime::default();
+        register_for_liveness(&runtime, "lost", Box::new(RecordingKiller::default()))?;
+        register_for_liveness(&runtime, "live", Box::new(RecordingKiller::default()))?;
+        // The exit observer removed the handle, but the exit never persisted.
+        runtime.sessions.lock().unwrap().remove("lost");
+
+        let start = Instant::now();
+        let probe = |_| true;
+        assert!(runtime.lost_sessions(start, probe).is_empty());
+        let almost = start + LOST_SESSION_GRACE - Duration::from_secs(1);
+        assert!(runtime.lost_sessions(almost, probe).is_empty());
+        let lost = runtime.lost_sessions(start + LOST_SESSION_GRACE, probe);
+        assert_eq!(lost, vec!["lost".to_string()]);
+
+        let orphaned = runtime.settle_lost_sessions(&conn, &lost, "2026-10-02T23:00:00Z");
+        assert_eq!(orphaned, vec!["lost".to_string()]);
+        let sessions = statuses(temp_dir.path())?;
+        assert_eq!(session_status(&sessions, "lost"), "orphaned");
+        assert_eq!(session_status(&sessions, "live"), "running");
+        // Settled sessions are no longer tracked.
+        let later = start + LOST_SESSION_GRACE * 3;
+        assert!(runtime.lost_sessions(later, probe).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_sweep_orphans_a_registered_session_whose_process_group_is_gone() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        for id in ["stuck", "alive", "ungrouped"] {
+            crate::store::insert_session(&conn, &session_record(id))?;
+        }
+        let runtime = LiveSessionRuntime::default();
+        register_for_liveness(&runtime, "stuck", Box::new(GroupedKiller(41)))?;
+        register_for_liveness(&runtime, "alive", Box::new(GroupedKiller(42)))?;
+        // No process group to probe: only leaving the registry can lose it.
+        register_for_liveness(&runtime, "ungrouped", Box::new(RecordingKiller::default()))?;
+
+        let start = Instant::now();
+        let probe = |group| group == 42;
+        assert!(runtime.lost_sessions(start, probe).is_empty());
+        let lost = runtime.lost_sessions(start + LOST_SESSION_GRACE, probe);
+        assert_eq!(lost, vec!["stuck".to_string()]);
+        let orphaned = runtime.settle_lost_sessions(&conn, &lost, "2026-10-02T23:00:00Z");
+        assert_eq!(orphaned, vec!["stuck".to_string()]);
+
+        let sessions = statuses(temp_dir.path())?;
+        assert_eq!(session_status(&sessions, "stuck"), "orphaned");
+        assert_eq!(session_status(&sessions, "alive"), "running");
+        assert_eq!(session_status(&sessions, "ungrouped"), "running");
+        // The handle stays registered: a late exit still owns its cleanup.
+        assert!(runtime.sessions.lock().unwrap().contains_key("stuck"));
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_sweep_leaves_settled_external_and_unregistered_rows_alone() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let mut completed = session_record("completed");
+        completed.status = "completed".to_string();
+        let mut external = session_record("external");
+        external.external = true;
+        crate::store::insert_session(&conn, &completed)?;
+        crate::store::insert_session(&conn, &external)?;
+        // A `coven run` session writes the store directly and never registers
+        // with this daemon, so the sweep has no claim on it.
+        crate::store::insert_session(&conn, &session_record("cli-run"))?;
+        let runtime = LiveSessionRuntime::default();
+        register_for_liveness(&runtime, "completed", Box::new(RecordingKiller::default()))?;
+        register_for_liveness(&runtime, "external", Box::new(RecordingKiller::default()))?;
+        runtime.sessions.lock().unwrap().clear();
+
+        let start = Instant::now();
+        assert!(runtime.lost_sessions(start, |_| false).is_empty());
+        let lost = runtime.lost_sessions(start + LOST_SESSION_GRACE, |_| false);
+        assert_eq!(lost, vec!["completed".to_string(), "external".to_string()]);
+        let orphaned = runtime.settle_lost_sessions(&conn, &lost, "2026-10-02T23:00:00Z");
+        assert!(orphaned.is_empty());
+
+        let sessions = statuses(temp_dir.path())?;
+        assert_eq!(session_status(&sessions, "completed"), "completed");
+        assert_eq!(session_status(&sessions, "external"), "running");
+        assert_eq!(session_status(&sessions, "cli-run"), "running");
+        let later = start + LOST_SESSION_GRACE * 3;
+        assert!(runtime.lost_sessions(later, |_| false).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_sweep_spares_a_session_relaunched_under_the_same_id() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        crate::store::insert_session(&conn, &session_record("resumed"))?;
+        let runtime = LiveSessionRuntime::default();
+        register_for_liveness(&runtime, "resumed", Box::new(RecordingKiller::default()))?;
+        runtime.sessions.lock().unwrap().remove("resumed");
+
+        let start = Instant::now();
+        assert!(runtime.lost_sessions(start, |_| true).is_empty());
+        let lost = runtime.lost_sessions(start + LOST_SESSION_GRACE, |_| true);
+        assert_eq!(lost, vec!["resumed".to_string()]);
+        // The next turn registers the same id before the sweep settles it.
+        register_for_liveness(&runtime, "resumed", Box::new(RecordingKiller::default()))?;
+        assert!(runtime
+            .settle_lost_sessions(&conn, &lost, "2026-10-02T23:00:00Z")
+            .is_empty());
+
+        let sessions = statuses(temp_dir.path())?;
+        assert_eq!(session_status(&sessions, "resumed"), "running");
+        let later = start + LOST_SESSION_GRACE * 3;
+        assert!(runtime.lost_sessions(later, |_| true).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_sweep_stands_down_during_shutdown() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        register_for_liveness(&runtime, "draining", Box::new(RecordingKiller::default()))?;
+        runtime.sessions.lock().unwrap().clear();
+        runtime.shutting_down.store(true, Ordering::Release);
+
+        let start = Instant::now();
+        assert!(runtime.lost_sessions(start, |_| false).is_empty());
+        assert!(runtime
+            .lost_sessions(start + LOST_SESSION_GRACE * 2, |_| false)
+            .is_empty());
         Ok(())
     }
 

@@ -144,6 +144,8 @@ When the daemon starts, it recovers stale unowned rows:
 3. Marks stale daemon-owned `running` rows as `orphaned`, preserving their unresolved outcome. Externally registered running sessions are exempt because the daemon does not own their lifecycle.
 4. Refuses to re-attach to a PTY it no longer owns.
 
+While it runs, the daemon repeats the `running` check for the sessions it launched. A session whose harness has been gone for two minutes without a recorded exit becomes `orphaned`. That holds whether the session left the live registry or, on Unix, its process group disappeared. A restart is no longer the only way out of a phantom `running` row.
+
 See [Orphan recovery](/daemon/orphan-recovery).
 
 ## Related

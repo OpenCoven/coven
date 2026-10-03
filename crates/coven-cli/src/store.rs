@@ -2315,6 +2315,29 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
     Ok(updated)
 }
 
+/// Live-daemon counterpart to [`mark_running_sessions_orphaned`] for one
+/// session (#1196). The row changes only while it is still `running` and
+/// daemon-hosted, so a late exit write or an external owner always wins.
+/// Returns whether the row changed.
+pub fn mark_session_orphaned_if_running(
+    conn: &Connection,
+    id: &str,
+    updated_at: &str,
+) -> Result<bool> {
+    let updated = conn
+        .execute(
+            "UPDATE sessions
+             SET status = 'orphaned',
+                 updated_at = ?2
+             WHERE id = ?1
+               AND status = 'running'
+               AND external = 0",
+            params![id, updated_at],
+        )
+        .context("failed to mark session orphaned")?;
+    Ok(updated == 1)
+}
+
 /// Companion reaper to [`mark_running_sessions_orphaned`]: `coven run`
 /// inserts the session row as `created` and only flips it to `running`
 /// right before launching the harness. A run process that dies between
@@ -6977,6 +7000,40 @@ END;
             .unwrap();
         assert_eq!(ne.status, "orphaned");
         assert_eq!(ex.status, "running", "external session must stay running");
+        Ok(())
+    }
+
+    #[test]
+    fn orphans_one_session_only_while_it_is_daemon_hosted_and_running() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let mut running = session_record("running", "2026-04-27T06:00:00Z");
+        running.status = "running".to_string();
+        let mut neighbour = session_record("neighbour", "2026-04-27T06:00:00Z");
+        neighbour.status = "running".to_string();
+        let mut completed = session_record("completed", "2026-04-27T06:00:00Z");
+        completed.status = "completed".to_string();
+        let mut external = session_record("external", "2026-04-27T06:00:00Z");
+        external.status = "running".to_string();
+        external.external = true;
+        for session in [&running, &neighbour, &completed, &external] {
+            insert_session(&conn, session)?;
+        }
+
+        let at = "2026-04-27T07:00:00Z";
+        assert!(mark_session_orphaned_if_running(&conn, "running", at)?);
+        assert!(!mark_session_orphaned_if_running(&conn, "running", at)?);
+        assert!(!mark_session_orphaned_if_running(&conn, "completed", at)?);
+        assert!(!mark_session_orphaned_if_running(&conn, "external", at)?);
+        assert!(!mark_session_orphaned_if_running(&conn, "missing", at)?);
+
+        let sessions = list_sessions(&conn)?;
+        let session = |id: &str| sessions.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(session("running").status, "orphaned");
+        assert_eq!(session("running").updated_at, at);
+        assert_eq!(session("neighbour").status, "running");
+        assert_eq!(session("completed").status, "completed");
+        assert_eq!(session("external").status, "running");
         Ok(())
     }
 
