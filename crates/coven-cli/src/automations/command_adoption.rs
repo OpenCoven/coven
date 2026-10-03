@@ -990,7 +990,7 @@ fn apply_command(
             expected_revision,
         } => apply_rich_revise(conn, &definition, expected_revision, adopted_at),
         DefinitionCommand::LegacyImport { dry_run } => {
-            let report = super::import_legacy::import_codex_as_draft(conn, dry_run)?;
+            let report = super::import_legacy::import_codex_as_draft(conn, dry_run, adopted_at)?;
             Ok(DefinitionCommandResponse {
                 outcome: DefinitionCommandOutcome::Committed,
                 revision: None,
