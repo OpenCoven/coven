@@ -218,8 +218,11 @@ pub fn resolve_main_session(
 }
 
 /// Records the `sessions` row that now hosts the conversation. The row must
-/// exist (FK) and must carry the pointer's conversation id, so a binding can
-/// never point Home at some other thread.
+/// exist (FK), carry the pointer's conversation id, and run on the pointer's
+/// harness, so a binding can never point Home at some other thread. The
+/// harness check matters because conversation ids are harness-native: the
+/// same string on a Codex row names a different conversation than on a
+/// Claude row, and a follow-up turn would be routed to the wrong process.
 pub fn bind_main_session(
     conn: &mut Connection,
     scope_key: &str,
@@ -230,20 +233,28 @@ pub fn bind_main_session(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to begin main session bind")?;
     let record = load_main_session(&transaction, scope_key)?;
-    let session_conversation: Option<Option<String>> = transaction
+    let session: Option<(String, Option<String>)> = transaction
         .query_row(
-            "SELECT conversation_id FROM sessions WHERE id = ?1",
+            "SELECT harness, conversation_id FROM sessions WHERE id = ?1",
             [session_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .context("failed to read session for main session bind")?;
-    match session_conversation {
+    match session {
         None => bail!("session {session_id} does not exist"),
-        Some(conversation) if conversation.as_deref() != Some(record.conversation_id.as_str()) => {
+        Some((_, conversation))
+            if conversation.as_deref() != Some(record.conversation_id.as_str()) =>
+        {
             bail!(
                 "session {session_id} does not belong to main session conversation {}",
                 record.conversation_id
+            )
+        }
+        Some((harness, _)) if harness != record.harness => {
+            bail!(
+                "session {session_id} runs on harness {harness}, but main session {scope_key} is bound to {}",
+                record.harness
             )
         }
         Some(_) => {}
@@ -344,11 +355,20 @@ mod tests {
     }
 
     fn insert_session(conn: &Connection, id: &str, conversation_id: Option<&str>) {
+        insert_session_on(conn, id, "claude", conversation_id);
+    }
+
+    fn insert_session_on(
+        conn: &Connection,
+        id: &str,
+        harness: &str,
+        conversation_id: Option<&str>,
+    ) {
         conn.execute(
             "INSERT INTO sessions (
                 id, project_root, harness, title, status, created_at, updated_at, conversation_id
-            ) VALUES (?1, '/tmp/project', 'claude', 'Home', 'running', ?2, ?2, ?3)",
-            params![id, NOW, conversation_id],
+            ) VALUES (?1, '/tmp/project', ?2, 'Home', 'running', ?3, ?3, ?4)",
+            params![id, harness, NOW, conversation_id],
         )
         .unwrap();
     }
@@ -477,6 +497,13 @@ mod tests {
             bind_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, "no-conversation", LATER)
                 .is_err()
         );
+        // The same conversation id on another harness names a different
+        // conversation; it must not become Home either.
+        insert_session_on(&conn, "codex-twin", "codex", Some(&conversation));
+        let refused = bind_main_session(&mut conn, INSTANCE_MAIN_SCOPE_KEY, "codex-twin", LATER)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("harness codex"), "{refused}");
         assert_eq!(
             get_main_session(&conn, INSTANCE_MAIN_SCOPE_KEY)
                 .unwrap()
