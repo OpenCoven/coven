@@ -1573,6 +1573,37 @@ test('verifyPackageProvenance accepts the real npm attestation shape for every r
   });
 });
 
+test('verifyPackageProvenance accepts npm trusted publisher config ids with and without the oidc prefix', async () => {
+  const packageName = '@opencoven/cli';
+  const tarballBytes = Buffer.from('npm package tarball fixture');
+  const attestationDocument = buildAttestations({
+    packageName,
+    subjectDigest: createHash('sha512').update(tarballBytes).digest('hex')
+  });
+  // npm's own forms for the same configuration: v0.4.6 and v0.4.7.
+  for (const oidcConfigId of [
+    'oidc:9e7a4cff-90eb-4d37-89b2-8aa9544b4280',
+    '9e7a4cff-90eb-4d37-89b2-8aa9544b4280'
+  ]) {
+    await assert.doesNotReject(
+      () =>
+        verifyPackageProvenance({
+          packageName,
+          npmVersion: NPM_VERSION,
+          releaseTag: RELEASE_TAG,
+          headSha: HEAD_SHA,
+          sourceRunId: SOURCE_RUN_ID,
+          sourceRunAttempt: SOURCE_RUN_ATTEMPT,
+          packageMetadata: makePackageMetadata(packageName, integrityFor(tarballBytes), {
+            npmUser: trustedPublisherMetadata({ trustedPublisher: { oidcConfigId } })
+          }),
+          attestationDocument
+        }),
+      oidcConfigId
+    );
+  }
+});
+
 test('verifyPackageProvenance rejects malformed or mismatched attestation payloads, workflow provenance, and GitHub trusted publisher metadata', async () => {
   const packageName = '@opencoven/cli';
   const tarballBytes = Buffer.from('npm package tarball fixture');
@@ -1719,7 +1750,16 @@ test('verifyPackageProvenance rejects malformed or mismatched attestation payloa
         npmUser: trustedPublisherMetadata({ trustedPublisher: { id: 'gitlab' } })
       }),
       error: /GitHub trusted publisher/
-    }
+    },
+    ...['', 'oidc:', 'github-actions-config', '9E7A4CFF-90EB-4D37-89B2-8AA9544B4280', 42].map(
+      (oidcConfigId) => ({
+        name: `unrecognised trusted publisher config id ${JSON.stringify(oidcConfigId)}`,
+        packageMetadata: makePackageMetadata(packageName, integrityFor(tarballBytes), {
+          npmUser: trustedPublisherMetadata({ trustedPublisher: { oidcConfigId } })
+        }),
+        error: /trusted publisher metadata/
+      })
+    )
   ];
 
   for (const { name, attestationDocument, packageMetadata, error } of cases) {
