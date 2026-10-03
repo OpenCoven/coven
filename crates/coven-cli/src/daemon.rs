@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 #[cfg(unix)]
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -222,9 +222,23 @@ pub struct LiveSessionRuntime {
     sessions: Arc<Mutex<HashMap<String, LiveSessionHandle>>>,
     shutting_down: AtomicBool,
     launch_gate: Arc<LiveLaunchGate>,
-    /// Every session this daemon registered, with the moment the liveness
-    /// sweep first found it without a live harness (#1196).
-    liveness: Mutex<HashMap<String, Option<Instant>>>,
+    /// Every session this daemon registered, followed by the liveness sweep
+    /// until the store settles it (#1196).
+    liveness: Mutex<HashMap<String, TrackedRegistration>>,
+}
+
+/// One registration the liveness sweep follows. Holding the registration
+/// itself, not just the id, keeps a sweep that saw an older registration from
+/// settling or releasing a newer one under the same id.
+struct TrackedRegistration {
+    registration: Arc<LiveSessionRegistration>,
+    missing_since: Option<Instant>,
+}
+
+/// A registration whose harness stayed missing for the whole grace period.
+struct LostSession {
+    id: String,
+    registration: Arc<LiveSessionRegistration>,
 }
 
 #[derive(Default)]
@@ -644,107 +658,142 @@ impl LiveSessionRuntime {
         drop(sessions);
         drop(replaced);
         drop(removed);
-        self.track_liveness(session_id);
+        self.track_liveness(session_id, registration);
         Ok(())
     }
 
-    fn track_liveness(&self, session_id: String) {
+    fn track_liveness(&self, session_id: String, registration: Arc<LiveSessionRegistration>) {
         self.liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(session_id, None);
+            .insert(
+                session_id,
+                TrackedRegistration {
+                    registration,
+                    missing_since: None,
+                },
+            );
     }
 
-    /// Registered sessions whose harness has been missing for at least
+    /// Registrations whose harness has been missing for at least
     /// [`LOST_SESSION_GRACE`] as of `now`. A harness is missing once its
-    /// session has left the live registry, or while the session's process
-    /// group is gone according to `group_live`. The second case catches an
-    /// exit observer that never returned.
-    fn lost_sessions(&self, now: Instant, group_live: impl Fn(u32) -> bool) -> Vec<String> {
+    /// registration has left the live registry, or while its process group
+    /// is gone according to `group_live`. The second case catches an exit
+    /// observer that never returned.
+    fn lost_sessions(&self, now: Instant, group_live: impl Fn(u32) -> bool) -> Vec<LostSession> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Vec::new();
         }
-        let registered: Vec<(String, Option<u32>)> = self
+        let registered: Vec<(String, Arc<LiveSessionRegistration>, Option<u32>)> = self
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .map(|(id, handle)| (id.clone(), handle.process_group))
+            .map(|(id, handle)| {
+                (
+                    id.clone(),
+                    Arc::clone(&handle.registration),
+                    handle.process_group,
+                )
+            })
             .collect();
         // Probe outside the registry lock, which also guards input and kill.
-        let live: HashSet<String> = registered
+        let live: HashMap<String, Arc<LiveSessionRegistration>> = registered
             .into_iter()
-            .filter(|(_, group)| group.is_none_or(&group_live))
-            .map(|(id, _)| id)
+            .filter(|(_, _, group)| group.is_none_or(&group_live))
+            .map(|(id, registration, _)| (id, registration))
             .collect();
         let mut liveness = self
             .liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut lost = Vec::new();
-        for (id, missing_since) in liveness.iter_mut() {
-            if live.contains(id) {
-                *missing_since = None;
+        for (id, tracked) in liveness.iter_mut() {
+            if live
+                .get(id)
+                .is_some_and(|registration| Arc::ptr_eq(registration, &tracked.registration))
+            {
+                tracked.missing_since = None;
                 continue;
             }
-            let since = *missing_since.get_or_insert(now);
+            let since = *tracked.missing_since.get_or_insert(now);
             if now.saturating_duration_since(since) >= LOST_SESSION_GRACE {
-                lost.push(id.clone());
+                lost.push(LostSession {
+                    id: id.clone(),
+                    registration: Arc::clone(&tracked.registration),
+                });
             }
         }
-        lost.sort();
+        lost.sort_by(|left, right| left.id.cmp(&right.id));
         lost
     }
 
-    /// Orphan each lost session whose row still says `running`, then stop
-    /// tracking every lost session the store has settled. Returns the ids
-    /// this call orphaned. A row that is already terminal, external, or gone
-    /// is left as it is. A late exit still overwrites `orphaned` with the
-    /// harness's real result.
+    /// Orphan each lost session whose row still says `running`, release the
+    /// registry handle a stuck exit observer would otherwise hold until
+    /// restart, and stop tracking it. Returns the ids this call orphaned.
+    /// A row that is already terminal, external, or gone keeps its status.
+    /// A late exit still overwrites `orphaned` with the harness's real result.
     fn settle_lost_sessions(
         &self,
         conn: &rusqlite::Connection,
-        lost: &[String],
+        lost: &[LostSession],
         updated_at: &str,
     ) -> Vec<String> {
         let mut orphaned = Vec::new();
         let mut settled = Vec::new();
-        for id in lost {
-            if !self.still_missing(id) {
+        for session in lost {
+            if !self.still_missing(session) {
                 continue;
             }
-            match crate::store::mark_session_orphaned_if_running(conn, id, updated_at) {
+            match crate::store::mark_session_orphaned_if_running(conn, &session.id, updated_at) {
                 Ok(changed) => {
                     if changed {
-                        orphaned.push(id.clone());
+                        orphaned.push(session.id.clone());
                     }
-                    settled.push(id);
+                    settled.push(session);
                 }
                 Err(error) => eprintln!(
-                    "coven daemon: liveness sweep could not reconcile session `{id}`: {error:#}"
+                    "coven daemon: liveness sweep could not reconcile session `{}`: {error:#}",
+                    session.id
                 ),
             }
+        }
+        for session in &settled {
+            // The same cleanup a normal exit runs. It removes the handle only
+            // while this exact registration is still the registered one.
+            LiveSessionExitCleanup {
+                session_id: session.id.clone(),
+                sessions: Arc::downgrade(&self.sessions),
+                registration: Arc::clone(&session.registration),
+            }
+            .mark_exited();
         }
         let mut liveness = self
             .liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for id in settled {
-            // A relaunch under the same id re-registers it and clears the
-            // timer. Keep tracking that newer registration.
-            if liveness.get(id).is_some_and(Option::is_some) {
-                liveness.remove(id);
+        for session in settled {
+            if liveness
+                .get(&session.id)
+                .is_some_and(|tracked| Arc::ptr_eq(&tracked.registration, &session.registration))
+            {
+                liveness.remove(&session.id);
             }
         }
         orphaned
     }
 
-    fn still_missing(&self, session_id: &str) -> bool {
+    /// Whether `session`'s registration is still the tracked one and still
+    /// missing. A newer registration under the same id resets tracking.
+    fn still_missing(&self, session: &LostSession) -> bool {
         self.liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(session_id)
-            .is_some_and(Option::is_some)
+            .get(&session.id)
+            .is_some_and(|tracked| {
+                Arc::ptr_eq(&tracked.registration, &session.registration)
+                    && tracked.missing_since.is_some()
+            })
     }
 
     /// Stop admitting sessions, remove every owned handle, and explicitly
@@ -11370,6 +11419,10 @@ mod tests {
         runtime.register(id.to_string(), Box::new(SharedBuffer::default()), killer)
     }
 
+    fn lost_ids(lost: &[LostSession]) -> Vec<&str> {
+        lost.iter().map(|session| session.id.as_str()).collect()
+    }
+
     fn statuses(coven_home: &Path) -> Result<Vec<crate::store::SessionRecord>> {
         let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
         crate::store::list_sessions(&conn)
@@ -11393,7 +11446,7 @@ mod tests {
         let almost = start + LOST_SESSION_GRACE - Duration::from_secs(1);
         assert!(runtime.lost_sessions(almost, probe).is_empty());
         let lost = runtime.lost_sessions(start + LOST_SESSION_GRACE, probe);
-        assert_eq!(lost, vec!["lost".to_string()]);
+        assert_eq!(lost_ids(&lost), ["lost"]);
 
         let orphaned = runtime.settle_lost_sessions(&conn, &lost, "2026-10-02T23:00:00Z");
         assert_eq!(orphaned, vec!["lost".to_string()]);
@@ -11423,7 +11476,7 @@ mod tests {
         let probe = |group| group == 42;
         assert!(runtime.lost_sessions(start, probe).is_empty());
         let lost = runtime.lost_sessions(start + LOST_SESSION_GRACE, probe);
-        assert_eq!(lost, vec!["stuck".to_string()]);
+        assert_eq!(lost_ids(&lost), ["stuck"]);
         let orphaned = runtime.settle_lost_sessions(&conn, &lost, "2026-10-02T23:00:00Z");
         assert_eq!(orphaned, vec!["stuck".to_string()]);
 
@@ -11431,8 +11484,12 @@ mod tests {
         assert_eq!(session_status(&sessions, "stuck"), "orphaned");
         assert_eq!(session_status(&sessions, "alive"), "running");
         assert_eq!(session_status(&sessions, "ungrouped"), "running");
-        // The handle stays registered: a late exit still owns its cleanup.
-        assert!(runtime.sessions.lock().unwrap().contains_key("stuck"));
+        // Its exit observer is stuck, so the sweep releases the handle that
+        // observer would have removed. Live sessions keep theirs.
+        let sessions = runtime.sessions.lock().unwrap();
+        assert!(!sessions.contains_key("stuck"));
+        assert!(sessions.contains_key("alive"));
+        assert!(sessions.contains_key("ungrouped"));
         Ok(())
     }
 
@@ -11457,7 +11514,7 @@ mod tests {
         let start = Instant::now();
         assert!(runtime.lost_sessions(start, |_| false).is_empty());
         let lost = runtime.lost_sessions(start + LOST_SESSION_GRACE, |_| false);
-        assert_eq!(lost, vec!["completed".to_string(), "external".to_string()]);
+        assert_eq!(lost_ids(&lost), ["completed", "external"]);
         let orphaned = runtime.settle_lost_sessions(&conn, &lost, "2026-10-02T23:00:00Z");
         assert!(orphaned.is_empty());
 
@@ -11471,7 +11528,7 @@ mod tests {
     }
 
     #[test]
-    fn liveness_sweep_spares_a_session_relaunched_under_the_same_id() -> Result<()> {
+    fn liveness_sweep_spares_a_newer_registration_under_the_same_id() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
         crate::store::insert_session(&conn, &session_record("resumed"))?;
@@ -11482,8 +11539,9 @@ mod tests {
         let start = Instant::now();
         assert!(runtime.lost_sessions(start, |_| true).is_empty());
         let lost = runtime.lost_sessions(start + LOST_SESSION_GRACE, |_| true);
-        assert_eq!(lost, vec!["resumed".to_string()]);
-        // The next turn registers the same id before the sweep settles it.
+        assert_eq!(lost_ids(&lost), ["resumed"]);
+        // A newer registration under the same id lands before the sweep
+        // settles the older one.
         register_for_liveness(&runtime, "resumed", Box::new(RecordingKiller::default()))?;
         assert!(runtime
             .settle_lost_sessions(&conn, &lost, "2026-10-02T23:00:00Z")
@@ -11491,6 +11549,7 @@ mod tests {
 
         let sessions = statuses(temp_dir.path())?;
         assert_eq!(session_status(&sessions, "resumed"), "running");
+        assert!(runtime.sessions.lock().unwrap().contains_key("resumed"));
         let later = start + LOST_SESSION_GRACE * 3;
         assert!(runtime.lost_sessions(later, |_| true).is_empty());
         Ok(())
