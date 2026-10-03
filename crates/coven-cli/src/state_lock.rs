@@ -214,6 +214,12 @@ mod tests {
                 "    pub(crate) fn acquire(",
                 "\n    pub(crate) fn fence",
             ),
+            (
+                "main-session scope",
+                include_str!("main_session_routes.rs"),
+                "    pub(crate) fn acquire(",
+                "\n        Ok(Self { file })",
+            ),
         ] {
             let source = source
                 .split(start)

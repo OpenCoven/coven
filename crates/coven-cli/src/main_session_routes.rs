@@ -17,6 +17,13 @@
 //!   only if the pointer still holds the id that failed (compare-and-swap),
 //!   so a late duplicate never rotates away a fresh conversation.
 //!
+//! Turn, reset, and rollover each hold a per-scope [`ScopeGate`] for their
+//! whole read → launch/rotate → bind sequence, so two requests for the same
+//! Home never interleave: no duplicate launch of one conversation, and no
+//! reset slipping between a launch and its bind. If the pointer still moves
+//! under a launch (a writer outside the gate), the turn stops the session it
+//! launched rather than leave it running with nothing pointing at it.
+//!
 //! The handlers compose the existing `launch_session` and `record_input`
 //! handlers rather than re-implementing a launch, so every gate those routes
 //! enforce (maintenance writer, harness validation, authority, context
@@ -28,10 +35,12 @@
 //! own output stream for that phrase, the client that observes it calls
 //! `/rollover`; the daemon-side detector will call the same store path.
 
-use std::path::Path;
+use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -50,6 +59,46 @@ const EVENT_KIND_RESET: &str = "main_session.reset";
 const EVENT_KIND_ROLLOVER: &str = "main_session.rollover";
 const DEFAULT_ROLLOVER_REASON: &str = "stale-conversation";
 const HOME_TITLE: &str = "Home";
+const SCOPE_LOCK_DIR: &str = "main-session-locks";
+
+/// Exclusive per-scope gate for every main-session mutation. It is an OS
+/// file lock, so it excludes other daemon worker threads (each acquisition
+/// opens its own descriptor) and any other process on the same COVEN_HOME.
+/// Lock files stay on disk and drop only unlocks, for the reason
+/// `AdoptionGate` gives: unlinking would split waiters across inodes. The
+/// descriptor is close-on-exec, so a harness launched while the gate is held
+/// never inherits it.
+pub(crate) struct ScopeGate {
+    file: fs::File,
+}
+
+impl Drop for ScopeGate {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl ScopeGate {
+    pub(crate) fn acquire(coven_home: &Path, scope_key: &str) -> Result<Self> {
+        crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?;
+        let directory = coven_home.join(SCOPE_LOCK_DIR);
+        fs::create_dir_all(&directory).with_context(|| {
+            format!(
+                "failed to create main-session lock directory {}",
+                directory.display()
+            )
+        })?;
+        let digest = Sha256::digest(scope_key.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = directory.join(format!("{digest}.lock"));
+        let file = crate::state_lock::open_lock_file(&path)?;
+        file.lock_exclusive()
+            .with_context(|| format!("failed to acquire main-session lock {}", path.display()))?;
+        Ok(Self { file })
+    }
+}
 
 fn parse_optional_body(body: Option<&str>) -> Result<Value, anyhow::Error> {
     match body.map(str::trim).filter(|body| !body.is_empty()) {
@@ -166,6 +215,7 @@ pub(crate) fn turn(
     let requested_root = optional_string(&payload, "projectRoot");
     let model = optional_string(&payload, "model");
 
+    let _scope_gate = ScopeGate::acquire(coven_home, &scope)?;
     let mut conn = store::open_store(&store_path(coven_home))?;
     let existing = main_session::get_main_session(&conn, &scope)?;
     // `created` is the store's verdict from the IMMEDIATE transaction inside
@@ -300,8 +350,40 @@ pub(crate) fn turn(
     let session: store::SessionRecord = serde_json::from_str(&response.body)
         .context("launch_session returned 201 with a non-session body")?;
     let mut conn = store::open_store(&store_path(coven_home))?;
-    let record =
-        main_session::bind_main_session(&mut conn, &scope, &session.id, &current_timestamp())?;
+    let record = match main_session::bind_main_session(
+        &mut conn,
+        &scope,
+        &session.id,
+        &current_timestamp(),
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            // Never leave a launched harness running with nothing
+            // pointing at it. Under the scope gate this only happens when
+            // a writer outside the gate moved the pointer mid-launch.
+            let _ = runtime.kill_session(&session.id);
+            let current = main_session::get_main_session(&conn, &scope)?;
+            let moved = match &current {
+                None => true,
+                Some(current) => {
+                    session.conversation_id.as_deref() != Some(current.conversation_id.as_str())
+                }
+            };
+            if !moved {
+                return Err(error);
+            }
+            return api_error(
+                    409,
+                    "main_session_changed",
+                    "The main session changed while this turn was launching; the launched session was stopped. Retry the turn.",
+                    Some(json!({
+                        "scopeKey": scope,
+                        "stoppedSessionId": session.id,
+                        "mainSession": current,
+                    })),
+                );
+        }
+    };
     json_response(
         201,
         &json!({
@@ -400,6 +482,7 @@ pub(crate) fn reset(
         Ok(settings) => settings,
         Err(error) => return invalid_request(error),
     };
+    let _scope_gate = ScopeGate::acquire(coven_home, &scope)?;
     let mut conn = store::open_store(&store_path(coven_home))?;
     if main_session::get_main_session(&conn, &scope)?.is_none() {
         return not_found(&scope);
@@ -437,6 +520,7 @@ pub(crate) fn rollover(coven_home: &Path, body: Option<&str>) -> Result<ApiRespo
             None,
         );
     };
+    let _scope_gate = ScopeGate::acquire(coven_home, &scope)?;
     let mut conn = store::open_store(&store_path(coven_home))?;
     if main_session::get_main_session(&conn, &scope)?.is_none() {
         return not_found(&scope);
@@ -484,11 +568,17 @@ mod tests {
         launches: RefCell<Vec<SessionLaunch>>,
         inputs: RefCell<Vec<(String, String)>>,
         kills: RefCell<Vec<String>>,
+        /// Runs inside `launch_session`, i.e. between a turn's launch and its
+        /// bind. Lets a test move the pointer at exactly that moment.
+        during_launch: RefCell<Option<Box<dyn Fn()>>>,
     }
 
     impl SessionRuntime for RecordingRuntime {
         fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
             self.launches.borrow_mut().push(launch.clone());
+            if let Some(hook) = self.during_launch.borrow().as_ref() {
+                hook();
+            }
             Ok(())
         }
 
@@ -1030,6 +1120,119 @@ description = "Builds and debugs."
             assert_eq!(status, 404, "{route}: {body}");
             assert_eq!(body["error"]["code"], "main_session_not_found");
         }
+    }
+
+    #[test]
+    fn scope_gate_serializes_one_scope_and_leaves_others_free() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let h = home();
+        let held = ScopeGate::acquire(&h.home, INSTANCE_MAIN_SCOPE_KEY).unwrap();
+
+        // Another scope is never blocked by this one.
+        drop(ScopeGate::acquire(&h.home, "familiar:nova:main").unwrap());
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender_home = h.home.clone();
+        let contender = std::thread::spawn(move || {
+            let gate = ScopeGate::acquire(&contender_home, INSTANCE_MAIN_SCOPE_KEY).unwrap();
+            acquired_tx.send(()).unwrap();
+            drop(gate);
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "a second holder of the same scope must wait"
+        );
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("released gate must admit the waiter");
+        contender.join().unwrap();
+    }
+
+    #[test]
+    fn mutating_routes_wait_for_the_scope_gate() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let h = home();
+        let first = first_turn(&h);
+        set_status(&h, first["session"]["id"].as_str().unwrap(), "exited");
+
+        for (route, body) in [
+            ("/api/v1/main-session/turn", json!({ "prompt": "queued" })),
+            ("/api/v1/main-session/reset", json!({ "reason": "queued" })),
+        ] {
+            let held = ScopeGate::acquire(&h.home, INSTANCE_MAIN_SCOPE_KEY).unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let request_home = h.home.clone();
+            let request_body = body.to_string();
+            let request = std::thread::spawn(move || {
+                // Its own runtime: the recording runtime is not `Sync`.
+                let runtime = RecordingRuntime::default();
+                let response = handle_request_with_runtime(
+                    "POST",
+                    route,
+                    &request_home,
+                    None,
+                    Some(&request_body),
+                    &runtime,
+                )
+                .unwrap();
+                done_tx.send(response.status).unwrap();
+            });
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "{route} must not proceed while another request holds the scope"
+            );
+            drop(held);
+            let status = done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("{route} never finished"));
+            assert!(matches!(status, 200 | 201), "{route}: {status}");
+            request.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_pointer_moved_mid_launch_stops_the_launched_session() {
+        let h = home();
+        let first = first_turn(&h);
+        set_status(&h, first["session"]["id"].as_str().unwrap(), "exited");
+
+        // A writer outside the gate resets Home while the next turn is
+        // between its launch and its bind.
+        let store_file = store_path(&h.home);
+        *h.runtime.during_launch.borrow_mut() = Some(Box::new(move || {
+            let mut conn = store::open_store(&store_file).unwrap();
+            main_session::reset_main_session(
+                &mut conn,
+                INSTANCE_MAIN_SCOPE_KEY,
+                &MainSessionSettings::default(),
+                &current_timestamp(),
+            )
+            .unwrap();
+        }));
+
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(json!({ "prompt": "raced" })),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], "main_session_changed");
+        let stopped = body["error"]["details"]["stoppedSessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no stoppedSessionId in {body}"))
+            .to_string();
+        assert_eq!(*h.runtime.kills.borrow(), vec![stopped]);
+
+        let (_, get) = call(&h, "GET", "/api/v1/main-session", None);
+        assert!(get["mainSession"]["currentSessionId"].is_null());
     }
 
     #[test]

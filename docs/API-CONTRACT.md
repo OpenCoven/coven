@@ -987,6 +987,15 @@ admission. Their error envelopes are returned as-is. When such a refusal hits
 the very first turn, the just-created pointer is removed again, so the next
 turn is a clean first turn rather than a mismatch.
 
+Turn, reset, and rollover are serialized per `scope`: each holds an
+exclusive lock (`$COVEN_HOME/main-session-locks/`) for its whole
+read → launch or rotate → bind sequence, so two requests for the same Home
+never launch the same conversation twice and a reset cannot land between a
+launch and its bind. If the pointer still moves under a launch (a writer
+outside the daemon), the turn stops the session it just launched and answers
+`409 main_session_changed` with `stoppedSessionId` and the current
+`mainSession`; retry the turn. `GET` takes no lock.
+
 ### `POST /api/v1/main-session/reset`
 
 Body optional: `{ "scope": "…", "reason": "…", "harness": "…",
