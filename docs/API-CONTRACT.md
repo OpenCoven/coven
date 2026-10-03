@@ -282,6 +282,9 @@ API errors use the following stable envelope. Clients must branch on `error.code
 | `input_lease_release_failed` | 500 | The adopted-input lease could not be released after adoption. Details are the marker-only adopted postcommit shape. |
 | `input_coordination_failed` | 500 | Runtime input coordination failed after adoption. Details are the marker-only adopted postcommit shape. |
 | `event_persistence_failed` | 500 | The adopted input event could not be persisted after adoption. Details are the marker-only adopted postcommit shape. |
+| `main_session_not_found` | 404 | No main-session pointer exists for the requested scope; send a first turn with `projectRoot`. |
+| `main_session_mismatch` | 409 | A turn named a `harness`, `familiarId`, or `projectRoot` that differs from the existing pointer. `details.fields` lists them; reset to change them. |
+| `main_session_project_root_missing` | 409 | The pointer predates project roots and cannot relaunch; reset it with `projectRoot`. |
 
 ## Capability catalog shape (`v1`)
 
@@ -905,6 +908,135 @@ Marks an externally-registered session finished. The daemon updates the session 
 ### Kill on an external session
 
 `POST /api/v1/sessions/:id/kill` returns `422 external_session_not_killable` when the target session has `external: true`. The kill endpoint is only valid for daemon-managed sessions.
+
+## Main session (`v1`)
+
+Home — the single persistent chat on mobile and desktop — never carries a
+harness conversation id. The daemon keeps one **main-session pointer** per
+scope (`instance:main` by default; `scope` may name another key matching
+`[a-z0-9:_-]`) that records the harness, familiar, project root, current
+conversation id, and the `sessions` row currently hosting it. The daemon
+decides init-versus-resume; clients only send prompts.
+
+The pointer is created by the first turn and keeps its harness, familiar, and
+project root for its lifetime. A turn that names different values is a
+`409 main_session_mismatch`, never a silent switch: reset to change them.
+
+### `GET /api/v1/main-session[?scope=…]`
+
+```json
+{
+  "mainSession": {
+    "scopeKey": "instance:main",
+    "familiarId": "nova",
+    "harness": "claude",
+    "projectRoot": "/repo/familiars/nova",
+    "conversationId": "5f0d…",
+    "currentSessionId": "a91c…",
+    "resetCount": 0,
+    "createdAt": "2026-09-29T14:00:00.000000000Z",
+    "updatedAt": "2026-09-29T14:05:00.000000000Z"
+  },
+  "currentSession": { "id": "a91c…", "status": "running", "…": "session record" },
+  "hasHistory": true
+}
+```
+
+`currentSession` is `null` when nothing hosts the conversation yet (before the
+first launch, after a reset or rollover, or once the row was deleted).
+`hasHistory` is whether any session row has ever carried the current
+conversation id, which is what the next turn uses to pick `init` or `resume`.
+`404 main_session_not_found` before the first turn.
+
+### `POST /api/v1/main-session/turn`
+
+```json
+{
+  "prompt": "what did we decide about the mobile app?",
+  "projectRoot": "/repo/familiars/nova",
+  "scope": "instance:main",
+  "harness": "claude",
+  "familiarId": "nova",
+  "model": "anthropic/claude-sonnet-4.5"
+}
+```
+
+`prompt` is required. `projectRoot` is required on the first turn (it must be
+an existing directory) and optional afterwards. `harness` defaults to `claude`
+and `familiarId` to `nova` on creation; the familiar must be declared in
+`familiars.toml` exactly as for `POST /sessions`. `model` is forwarded to the
+launch when a launch happens.
+
+The daemon then does one of two things, and the response says which:
+
+- **`202` `mode: "input"`** — the bound session is `running`, so the prompt
+  was piped into it exactly as `POST /sessions/:id/input` would. The body
+  carries `session` and `mainSession`.
+- **`201` `mode: "launched"`** — nothing live hosts the conversation, so a
+  session was launched through the same path as `POST /sessions` with
+  `launchMode: "stream"` (when the harness declares stream support, else
+  `nonInteractive`), `conversation: {mode, id}` where `mode` is `"resume"`
+  when the conversation has history and `"init"` when it has none, and
+  `conversationId` set to the pointer's id. The pointer is bound to the new
+  row. The body carries `conversation` (`"init"` or `"resume"`), `session`,
+  and `mainSession`.
+
+Every gate the composed routes enforce applies unchanged: harness validation,
+familiar resolution, the maintenance writer gate, authority, and context
+admission. Their error envelopes are returned as-is. When such a refusal hits
+the very first turn, the just-created pointer is removed again, so the next
+turn is a clean first turn rather than a mismatch.
+
+Turn, reset, and rollover are serialized per `scope`: each holds an
+exclusive lock (`$COVEN_HOME/main-session-locks/`) for its whole
+read → launch or rotate → bind sequence, so two requests for the same Home
+never launch the same conversation twice and a reset cannot land between a
+launch and its bind. If the pointer still moves under a launch (a writer
+outside the daemon), the turn stops the session it just launched and answers
+`409 main_session_changed` with `stoppedSessionId` and the current
+`mainSession`; retry the turn. `GET` takes no lock.
+
+### `POST /api/v1/main-session/reset`
+
+Body optional: `{ "scope": "…", "reason": "…", "harness": "…",
+"familiarId": "…", "projectRoot": "…" }`. The user's clean slate: rotates the
+conversation id, clears the binding, increments `resetCount`, kills the
+previous session's process if it is still running (best effort), records a
+`main_session.reset` event on that session naming both conversation ids and
+the reason, and archives it.
+
+`harness`, `familiarId`, and `projectRoot` are optional replacements, applied
+in the same store transaction as the rotation; an omitted field keeps its
+current value. Reset is the only way to change them, which is what the turn
+route's `409 main_session_mismatch` and `409 main_session_project_root_missing`
+ask for. A present field that is not a non-empty string is `400
+invalid_request` and nothing rotates. The values are validated the way the
+turn route validates them, at the next launch: an unknown harness or familiar
+is refused there with the launch route's error, and another reset can correct
+it. The event is stored through the instance's `privacy.toml` policy. Returns `200` with `mainSession`,
+`previousConversationId`, `previousSessionId`, and `archived`. The next turn
+launches with `conversation.mode = "init"`. `404 main_session_not_found`
+before the first turn.
+
+### `POST /api/v1/main-session/rollover`
+
+Body: `{ "conversationId": "…", "scope": "…", "reason": "…" }`.
+`conversationId` is required: it is the conversation id the caller saw fail.
+The pointer is rotated only if it still holds that id. If a reset or an
+earlier rollover already replaced it, the response is `409
+main_session_conversation_changed` with the current `mainSession`, nothing
+changes, and the caller should simply retry its turn. This keeps a late or
+duplicate report from rotating away a fresh conversation that works.
+
+Otherwise the response is the same as reset's (rollover never changes the
+harness, familiar, or project root), for recovery from a conversation id the
+harness no longer recognises: the same rotation, event kind
+`main_session.rollover` (default reason `stale-conversation`), archive of the
+previous row, **no** kill and **no** `resetCount` increment. Claude and Codex
+exit 0 on a stale id and only print a phrase (see
+[chat-persistence](chat-persistence.md)); until the daemon watches its own
+output stream for it, the client that observes the phrase calls this route.
+The daemon-side detector will use the same store path.
 
 ## Psyche execution binding contract (`v1`)
 
