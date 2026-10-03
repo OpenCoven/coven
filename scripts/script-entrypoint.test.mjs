@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -77,3 +77,27 @@ for (const script of scripts) {
     }
   });
 }
+
+// A CLI started before a top-level `const`, `let` or `class` runs synchronously
+// until its first `await` while that binding is still uninitialized. v0.4.8's
+// GitHub Release step failed exactly so (#1204). Every entrypoint must start
+// its CLI after its last such declaration.
+const cliStart = /^if \((?:isMainModule\(|process\.argv\[1\]|import\.meta\.url ===)/m;
+const topLevelBinding = /^(?:export )?(?:const|let|class) (\w+)/gm;
+
+test('entrypoint scripts start their CLI after every top-level binding', () => {
+  const scriptsDirectory = path.join(repositoryRoot, 'scripts');
+  const entrypoints = readdirSync(scriptsDirectory)
+    .filter((name) => name.endsWith('.mjs'))
+    .map((name) => ({ name, source: readFileSync(path.join(scriptsDirectory, name), 'utf8') }))
+    .filter(({ source }) => cliStart.test(source));
+  assert.ok(
+    entrypoints.some(({ name }) => name === 'package-github-release.mjs'),
+    'the entrypoint scan must find the release packager'
+  );
+  for (const { name, source } of entrypoints) {
+    const start = source.search(cliStart);
+    const late = [...source.slice(start).matchAll(topLevelBinding)].map((match) => match[1]);
+    assert.deepEqual(late, [], `${name} declares ${late.join(', ')} after starting its CLI`);
+  }
+});
