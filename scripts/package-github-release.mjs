@@ -970,18 +970,60 @@ function npmPackageSubjectName(packageName, npmVersion) {
   return `pkg:npm/${encodedName}@${npmVersion}`;
 }
 
+// The npm workflow triggers this one as soon as it finishes, and the
+// registry serves a just-published version a few minutes later: v0.4.4,
+// v0.4.6 and v0.4.7 each failed here on HTTP 404 and needed a manual
+// recovery. Not-yet-visible and transient responses are retried with backoff
+// until the deadline; anything else, and the deadline itself, still refuse.
+const REGISTRY_VISIBILITY_DEADLINE_MS = 15 * 60 * 1000;
+const REGISTRY_RETRY_DELAYS_MS = [10_000, 20_000, 30_000, 60_000];
+
+function isRegistryRetryable(error) {
+  const status = error?.status;
+  return status === 404 || status === 429 || (Number.isInteger(status) && status >= 500);
+}
+
+export async function fetchJsonWhenVisible(url, {
+  fetchJson = fetchJsonFromNetwork,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+  deadlineMs = REGISTRY_VISIBILITY_DEADLINE_MS,
+  retryDelaysMs = REGISTRY_RETRY_DELAYS_MS,
+  log = (message) => console.log(message)
+} = {}) {
+  const startedAt = now();
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fetchJson(url);
+    } catch (error) {
+      const delay = retryDelaysMs[Math.min(attempt, retryDelaysMs.length - 1)];
+      const waited = now() - startedAt;
+      if (!isRegistryRetryable(error) || waited + delay > deadlineMs) {
+        if (isRegistryRetryable(error) && attempt > 0) {
+          error.message = `${error.message} Still unavailable after waiting ${Math.round(waited / 1000)}s for the npm registry.`;
+        }
+        throw error;
+      }
+      log(`${error.message} Retrying in ${delay / 1000}s while the npm registry catches up.`);
+      await sleep(delay);
+    }
+  }
+}
+
 export async function verifyAllPackageProvenance({
   releaseTag,
   npmVersion,
   headSha,
   sourceRunId,
   sourceRunAttempt,
-  fetchJson = fetchJsonFromNetwork
+  fetchJson = fetchJsonFromNetwork,
+  registryWait = {}
 }) {
+  const fetchVisible = (url) => fetchJsonWhenVisible(url, { fetchJson, ...registryWait });
   for (const packageName of RELEASE_PACKAGES) {
     const encodedPackageName = encodeURIComponent(packageName);
-    const metadata = await fetchJson(`https://registry.npmjs.org/${encodedPackageName}/${npmVersion}`);
-    const attestations = await fetchJson(metadata?.dist?.attestations?.url);
+    const metadata = await fetchVisible(`https://registry.npmjs.org/${encodedPackageName}/${npmVersion}`);
+    const attestations = await fetchVisible(metadata?.dist?.attestations?.url);
     await verifyPackageProvenance({
       packageName,
       npmVersion,
@@ -1806,7 +1848,9 @@ async function fetchJsonFromNetwork(url) {
     }
   });
   if (!response.ok) {
-    throw new Error(`GET ${url} failed with HTTP ${response.status}.`);
+    const error = new Error(`GET ${url} failed with HTTP ${response.status}.`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }

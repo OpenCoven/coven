@@ -11,10 +11,12 @@ import {
   assertChecksumManifest,
   captureCommandOutputToFile,
   canonicalReleaseAssetNames,
+  fetchJsonWhenVisible,
   packageGitHubRelease,
   resolveReleaseSourceAcceptance,
   resolveReleaseSource,
   syncGitHubRelease,
+  verifyAllPackageProvenance,
   verifyAnnotatedTag,
   verifyNpmRegistrySignatures,
   verifyPackageProvenance,
@@ -1548,6 +1550,124 @@ test('verifyNpmRegistrySignatures rejects package-lock entries missing resolved 
       }
     ]);
   });
+});
+
+function httpError(status) {
+  const error = new Error(`GET https://registry.npmjs.org/example failed with HTTP ${status}.`);
+  error.status = status;
+  return error;
+}
+
+function fakeClock() {
+  let elapsed = 0;
+  const sleeps = [];
+  return {
+    sleeps,
+    now: () => elapsed,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      elapsed += ms;
+    }
+  };
+}
+
+test('verifyAllPackageProvenance waits for a just-published version to become visible', async () => {
+  const fixtures = new Map();
+  for (const [index, packageName] of RELEASE_PACKAGES.entries()) {
+    const tarballBytes = Buffer.from(`${packageName} tarball fixture ${index}`);
+    const metadata = makePackageMetadata(packageName, integrityFor(tarballBytes));
+    fixtures.set(`https://registry.npmjs.org/${encodeURIComponent(packageName)}/${NPM_VERSION}`, metadata);
+    fixtures.set(
+      metadata.dist.attestations.url,
+      buildAttestations({
+        packageName,
+        subjectDigest: createHash('sha512').update(tarballBytes).digest('hex')
+      })
+    );
+  }
+  // The registry answers 404 twice for the wrapper's metadata, as it did for
+  // v0.4.4, v0.4.6 and v0.4.7, then serves it.
+  const unseen = new Map([[`https://registry.npmjs.org/${encodeURIComponent('@opencoven/cli')}/${NPM_VERSION}`, 2]]);
+  const clock = fakeClock();
+  await verifyAllPackageProvenance({
+    releaseTag: RELEASE_TAG,
+    npmVersion: NPM_VERSION,
+    headSha: HEAD_SHA,
+    sourceRunId: SOURCE_RUN_ID,
+    sourceRunAttempt: SOURCE_RUN_ATTEMPT,
+    async fetchJson(url) {
+      const remaining = unseen.get(url) ?? 0;
+      if (remaining > 0) {
+        unseen.set(url, remaining - 1);
+        throw httpError(404);
+      }
+      return fixtures.get(url);
+    },
+    registryWait: { sleep: clock.sleep, now: clock.now, log() {} }
+  });
+  assert.deepEqual(clock.sleeps, [10_000, 20_000]);
+});
+
+test('fetchJsonWhenVisible retries only not-yet-visible or transient registry responses', async () => {
+  for (const status of [404, 429, 500, 503]) {
+    const clock = fakeClock();
+    let calls = 0;
+    const value = await fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+      async fetchJson() {
+        calls += 1;
+        if (calls < 3) {
+          throw httpError(status);
+        }
+        return { ok: status };
+      },
+      sleep: clock.sleep,
+      now: clock.now,
+      log() {}
+    });
+    assert.deepEqual(value, { ok: status });
+    assert.equal(calls, 3, String(status));
+  }
+
+  for (const error of [httpError(401), httpError(403), new Error('Expected npm provenance URL, got empty value.')]) {
+    const clock = fakeClock();
+    let calls = 0;
+    await assert.rejects(
+      () =>
+        fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+          async fetchJson() {
+            calls += 1;
+            throw error;
+          },
+          sleep: clock.sleep,
+          now: clock.now,
+          log() {}
+        }),
+      error
+    );
+    assert.equal(calls, 1);
+    assert.deepEqual(clock.sleeps, []);
+  }
+});
+
+test('fetchJsonWhenVisible gives up at its deadline and says how long it waited', async () => {
+  const clock = fakeClock();
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      fetchJsonWhenVisible('https://registry.npmjs.org/example', {
+        async fetchJson() {
+          calls += 1;
+          throw httpError(404);
+        },
+        sleep: clock.sleep,
+        now: clock.now,
+        deadlineMs: 120_000,
+        log() {}
+      }),
+    /HTTP 404\. Still unavailable after waiting 120s for the npm registry\./
+  );
+  assert.deepEqual(clock.sleeps, [10_000, 20_000, 30_000, 60_000]);
+  assert.equal(calls, 5);
 });
 
 test('verifyPackageProvenance accepts the real npm attestation shape for every release package', async () => {

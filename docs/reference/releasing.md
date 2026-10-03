@@ -336,6 +336,12 @@ the reports with the release record alongside the checksum verification above.
 
 ### Recover GitHub Release assets without touching npm
 
+The automatic workflow starts as soon as the npm workflow finishes, and npm
+serves a just-published version a few minutes later. Its provenance check
+therefore retries HTTP 404, 429 and 5xx registry responses with backoff for up
+to 15 minutes before refusing; any other response refuses immediately. v0.4.4,
+v0.4.6 and v0.4.7 each failed on that 404 before the wait existed.
+
 If the automatic GitHub-only workflow fails after the npm publication succeeded, rerun **Publish GitHub Release** with **Run workflow** / `workflow_dispatch` from the default branch and provide:
 
 - `release_tag`: the immutable signed tag (`vX.Y.Z`)
