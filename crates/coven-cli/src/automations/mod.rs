@@ -47,6 +47,9 @@ pub mod runs;
 pub mod runtime_terminal_evidence;
 pub mod schedule;
 pub mod store;
+// Wired into every session ending; it observes only Runtime Authority attempts,
+// which nothing dispatches until the trusted adapter (coven#857 slice 6).
+pub mod terminal_observer;
 pub mod transition_events;
 #[cfg(test)]
 mod transport_authority_tests;

@@ -1,7 +1,7 @@
 # Coven Automations Runtime Authority: trust decisions
 
-Status: maintainer decisions recorded 2026-10-03; slices 1 and 2 implemented,
-Runtime Authority not yet constructed
+Status: maintainer decisions recorded 2026-10-03; slices 1, 2 and 5
+implemented, Runtime Authority not yet constructed
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
 OpenCoven/coven-runtimes#48 (terminal observations), #858 (certification)
@@ -156,6 +156,21 @@ unadvertised until slice 6.
    effects and results as observed-complete, observed-partial or unknown,
    never derived from grants. It signs the observation with the observer key
    and is idempotent across restart.
+
+   As built, the observation is written by whichever writer ends the session,
+   inside the transaction that records the ending:
+   - the event writer's exit;
+   - a confirmed timeout or cancellation stop;
+   - restart containment recovery.
+
+   A writer that loses the race to end the session observes nothing.
+   Plain-text launches (`--print`, codex without `--json`) are the only kind
+   today. For them, capabilities, side effects, result and delivery are all
+   `unknown`, so the evidence consumer holds those runs. An ending recovered
+   after a restart is `ambiguous`, because the exit was not seen. A failed
+   observation stores nothing and goes to the daemon recovery log, and the run
+   is held. An operator kill records no evidence, so its run is held too. The
+   observer key must exist before dispatch, and slice 6 creates it.
 6. **Trusted adapter.** Compose slices 1–5 into `AutomationDispatchAuthority`
    and the verifiers. Sign the execution binding and the receipt authority
    evidence with the `dispatch-authority` key. Construct Runtime Authority only

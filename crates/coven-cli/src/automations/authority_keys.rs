@@ -183,6 +183,19 @@ pub(crate) fn current_signing_key(
     Ok(key)
 }
 
+/// The role's current key, if it has one. It creates nothing and opens no
+/// transaction, so a caller can use it inside its own write transaction.
+pub(crate) fn existing_signing_key(
+    conn: &Connection,
+    coven_home: &Path,
+    role: AuthorityKeyRole,
+) -> Result<Option<RoleSigningKey>> {
+    ensure_authority_keys_schema(conn)?;
+    current_record(conn, role)?
+        .map(|record| load_signing_key(coven_home, record))
+        .transpose()
+}
+
 /// Commits a key-creating transaction. A new key whose record did not commit
 /// takes its private file with it, so no key exists without a record.
 fn commit_or_discard(
