@@ -525,6 +525,8 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     migrate_historical_request_adoptions(conn)?;
     ensure_node_registry_dispatch_columns(conn)?;
     ensure_session_external_columns(conn)?;
+    conn.execute_batch(crate::main_session::MAIN_SESSIONS_SCHEMA_SQL)
+        .context("failed to initialize main_sessions schema")?;
     conn.execute_batch(crate::automations::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
         .context("failed to initialize automation_definitions schema")?;
     crate::automations::store::ensure_definition_command_columns(conn)?;
