@@ -42,6 +42,10 @@ mod adoption_gate;
 mod automations;
 mod executor_node;
 mod familiar_identity;
+// Familiar Contract binding issuer; no production caller until the trusted
+// Runtime Authority adapter (coven#857 slice 6).
+#[allow(dead_code)]
+mod familiar_issuer;
 mod familiar_ledger;
 mod handoff;
 mod harness;

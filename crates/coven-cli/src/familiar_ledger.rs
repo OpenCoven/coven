@@ -473,6 +473,18 @@ fn revisions(conn: &Connection, root_id: &str) -> Result<Vec<RevisionRecord>> {
         .context("failed to read familiar ledger revisions")
 }
 
+/// One revision by id.
+#[cfg_attr(not(test), allow(dead_code))] // Read by the binding issuer.
+pub(crate) fn revision(conn: &Connection, revision_id: &str) -> Result<Option<RevisionRecord>> {
+    conn.query_row(
+        &format!("SELECT {REVISION_COLUMNS} FROM familiar_ledger_revisions WHERE revision_id = ?1"),
+        [revision_id],
+        revision_from_row,
+    )
+    .optional()
+    .context("failed to read familiar ledger revision")
+}
+
 /// The live root answering to `roster_id`, and its latest revision.
 #[cfg_attr(not(test), allow(dead_code))] // Read by the binding issuer (slice 3).
 pub(crate) fn live_head(conn: &Connection, roster_id: &str) -> Result<Option<LedgerHead>> {
@@ -1287,19 +1299,19 @@ fn random_hex() -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::TimeZone;
 
     const WARD: &str = "principal_key_fingerprint = \"SHA256:abc\"\nprotected_surface = [\"SOUL.md\"]\n\n[[surface]]\npath = \"SOUL.md\"\ntier = 0\n";
 
-    struct Home {
-        dir: tempfile::TempDir,
-        conn: Connection,
+    pub(crate) struct Home {
+        pub(crate) dir: tempfile::TempDir,
+        pub(crate) conn: Connection,
     }
 
     impl Home {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let path = crate::api::store_path(dir.path());
             crate::store::initialize_store(&path).unwrap();
@@ -1316,12 +1328,12 @@ mod tests {
             home
         }
 
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             self.dir.path()
         }
 
         /// Writes familiars.toml with `(id, display name, extra TOML)` entries.
-        fn roster(&self, entries: &[(&str, &str, &str)]) {
+        pub(crate) fn roster(&self, entries: &[(&str, &str, &str)]) {
             let text: String = entries
                 .iter()
                 .map(|(id, display, extra)| {
@@ -1331,17 +1343,17 @@ mod tests {
             std::fs::write(self.path().join("familiars.toml"), text).unwrap();
         }
 
-        fn write(&self, familiar: &str, file: &str, text: &str) {
+        pub(crate) fn write(&self, familiar: &str, file: &str, text: &str) {
             let dir = self.path().join("familiars").join(familiar);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(file), text).unwrap();
         }
 
-        fn remove(&self, familiar: &str, file: &str) {
+        pub(crate) fn remove(&self, familiar: &str, file: &str) {
             std::fs::remove_file(self.path().join("familiars").join(familiar).join(file)).unwrap();
         }
 
-        fn act_as(
+        pub(crate) fn act_as(
             &self,
             authority: CommandAuthority,
             request: Value,
@@ -1349,17 +1361,17 @@ mod tests {
             route(&request, &self.conn, self.path(), authority, at(0))
         }
 
-        fn act(&self, request: Value) -> (u16, ControlActionResponse) {
+        pub(crate) fn act(&self, request: Value) -> (u16, ControlActionResponse) {
             self.act_as(CommandAuthority::OwnerLocal, request)
         }
 
-        fn ok(&self, request: Value) -> Value {
+        pub(crate) fn ok(&self, request: Value) -> Value {
             let (status, response) = self.act(request);
             assert_eq!(status, 200, "{response:?}");
             response.result.unwrap()
         }
 
-        fn refused(&self, request: Value) -> (u16, String) {
+        pub(crate) fn refused(&self, request: Value) -> (u16, String) {
             let (status, response) = self.act(request);
             assert_ne!(status, 200, "{response:?}");
             (
@@ -1368,22 +1380,22 @@ mod tests {
             )
         }
 
-        fn register(&self, key: &str) -> Value {
+        pub(crate) fn register(&self, key: &str) -> Value {
             self.ok(json!({"action": REGISTER, "adoptionKey": key, "familiarId": "sage"}))
         }
 
-        fn adopt(&self, key: &str, expected: &str) -> (u16, ControlActionResponse) {
+        pub(crate) fn adopt(&self, key: &str, expected: &str) -> (u16, ControlActionResponse) {
             self.act(json!({
                 "action": ADOPT, "adoptionKey": key, "familiarId": "sage",
                 "expectedRevisionId": expected,
             }))
         }
 
-        fn head(&self) -> LedgerHead {
+        pub(crate) fn head(&self) -> LedgerHead {
             live_head(&self.conn, "sage").unwrap().expect("live head")
         }
 
-        fn count(&self, table: &str) -> i64 {
+        pub(crate) fn count(&self, table: &str) -> i64 {
             self.conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                     row.get(0)
@@ -1392,13 +1404,13 @@ mod tests {
         }
     }
 
-    fn at(seconds: i64) -> DateTime<Utc> {
+    pub(crate) fn at(seconds: i64) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 3, 21, 0, 0).unwrap()
             + chrono::TimeDelta::seconds(seconds)
             + chrono::TimeDelta::microseconds(400)
     }
 
-    fn revision_id(result: &Value) -> String {
+    pub(crate) fn revision_id(result: &Value) -> String {
         result["revision"]["revisionId"]
             .as_str()
             .unwrap()

@@ -1,7 +1,7 @@
 # Coven Automations Runtime Authority: trust decisions
 
-Status: maintainer decisions recorded 2026-10-03; slices 1 and 2 and slice 3's
-familiar ledger implemented, Runtime Authority not yet constructed
+Status: maintainer decisions recorded 2026-10-03; slices 1 to 3 implemented,
+Runtime Authority not yet constructed
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
 OpenCoven/coven-runtimes#48 (terminal observations), #858 (certification)
@@ -72,6 +72,20 @@ These follow from Decision 2 and were decided on 2026-10-03 for slice 3.
   required, exclusive one.
 - **Generation.** Every change to a root advances its generation by one; the
   trusted-ledger observation a binding is decided against carries it.
+- **Issuance.** A binding is issued only for a live root whose head is active
+  and whose declarations still match it. Within one transaction the daemon:
+  - reads the head;
+  - builds and signs the binding with the `familiar-binding` key;
+  - runs the pinned contract verifier against the head's retained bundle and
+    a fresh trusted-ledger observation;
+  - requires the binding, and every lineage transition it cites, to be signed
+    by a `familiar-binding` key the daemon trusted when each was signed;
+  - records the binding.
+
+  A rotated key still vouches for the transitions it signed; a revoked one
+  stops every binding that cites them. The binding states no `notAfter`, so
+  Coven's projection closes the window at the decision time plus the
+  300-second freshness bound.
 
 ### Ledger commands
 
