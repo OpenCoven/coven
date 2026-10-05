@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Memory Import CI Repair Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -201,13 +205,12 @@ gh pr checks 568 --watch
 Expected: both `Rust checks (ubuntu-latest)` and
 `Rust checks (windows-latest)` pass.
 
-- [ ] **Step 6: Update Beads**
+- [ ] **Step 6: Update GitHub issues**
 
 Run:
 
-```bash
-bd comments add cmem-0b9 "PR #568 CI repaired: stable Windows compilation and isolated Unix migration fixtures now pass hosted checks."
-bd close cmem-0b9 --reason="PR #568 implementation and hosted CI are complete."
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Expected: `cmem-0b9` is closed with current CI evidence.
+
+Expected: the canonical memory-import repair issue retains the exact PR #568 merge and CI evidence before closure.

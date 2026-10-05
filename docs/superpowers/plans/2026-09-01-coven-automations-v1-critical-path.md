@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Coven Automations v1 Critical-Path Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -6,9 +10,12 @@
 
 **Architecture:** Coven's Rust daemon remains the only automation lifecycle authority. Familiar Contract supplies immutable embodiment identity, Coven Threads supplies operation-specific authority and approval decisions, runtimes execute replaceable work, and Cave/SDK/Psyche consume versioned artifacts without creating parallel truth. Work advances through dependency-gated repository lanes, each with its own issue, worktree, claim, tests, pull request, and immutable evidence receipt.
 
-**Tech Stack:** Rust, SQLite, JSON Schema 2020-12, TypeScript, Node.js 24, pnpm, Next.js/React, GitHub Actions, Beads 1.3.0-rc.1 with embedded Dolt schema v66, npm OIDC trusted publishing.
+**Tech Stack:** Rust, SQLite, JSON Schema 2020-12, TypeScript, Node.js 24, pnpm, Next.js/React, GitHub Actions, GitHub issue tracking, npm OIDC trusted publishing.
 
 ---
+
+Tracking procedures were migrated in #1222. The source/status snapshot below is
+historical; use the current GitHub issue graph for execution readiness.
 
 ## Scope and status snapshot
 
@@ -19,7 +26,7 @@ Snapshot refreshed on 2026-09-03:
 | Outcome | State | Evidence |
 | --- | --- | --- |
 | Native durable-routine foundation | Closed and released | OpenCoven/coven#816 closed by merged PR #896; correctness hardening landed in #906 and shipped in `v0.4.3` |
-| Tracker roadmap and drift-check source | Closed and operational | OpenCoven/coven#859, OpenCoven/coven-cave#5220, and Cave beads `cave-hlv.10` / `cave-tmegk` are closed; #900, #901, OpenCoven/coven-cave#5277, and OpenCoven/coven-cave#5278 carry the evidence |
+| Tracker roadmap and drift-check source | Closed and operational | OpenCoven/coven#859, OpenCoven/coven-cave#5220, are closed; #900, #901, OpenCoven/coven-cave#5277, and OpenCoven/coven-cave#5278 carry the evidence |
 | `coven.automations.v1` specification | Artifacts landed, runtime implementation open | OpenCoven/coven#855 remains open; `spec/coven-automations/v1/` exists |
 | Scheduler hardening | Open | OpenCoven/coven#856 |
 | Familiar embodiment profile | Open | OpenCoven/familiar-contract#17 |
@@ -69,7 +76,7 @@ Task 0 is an optional source-build dogfood lane. It may run immediately, but it 
 1. Run each outcome from its canonical repository and a fresh issue-scoped worktree.
 2. Check active claims and open PRs before creating a branch.
 3. Acquire the exact issue-keyed claim named by that task from inside its worktree; Task 2, for example, uses `coven claim acquire issue-855`.
-4. A Beads assignment does not replace the repository write claim.
+4. A GitHub issue assignment does not replace the repository write claim.
 5. Keep the primary checkout read-only.
 6. Do not start a dependent lane until the prerequisite's merge commit and focused behavioral receipt are both recorded.
 7. Do not treat a merged specification, test vector, commit, or PR as production behavior unless the production path executes it.
@@ -87,7 +94,7 @@ export COVEN_CAVE_REPO="$OPENCOVEN_ROOT/coven-cave"
 
 ## Evidence packet shape
 
-Each lane appends this exact information to its GitHub issue and Bead:
+Each lane appends this exact information to its GitHub issue:
 
 ```json
 {
@@ -279,169 +286,27 @@ Record the automation id, run id, terminal state, and exit result. Do not publis
 
 ---
 
-### Task 1: Provision and verify the canonical Beads execution graph
+### Task 1: Verify the GitHub issue execution graph
 
-**Owner:** OpenCoven/coven-cave#5220 and OpenCoven/coven#859
+**Owner:** OpenCoven/coven#1222; historical control outcome OpenCoven/coven#859.
 
-**Files:**
-- Modify: `OpenCoven/coven-cave/docs/roadmaps/coven-automations-v1.mapping.json`
-- Modify: `OpenCoven/coven-cave/docs/roadmaps/coven-automations-v1.md`
-- Modify: `OpenCoven/coven/docs/roadmaps/coven-automations-v1.mapping.json`
-- Regenerate: `OpenCoven/coven/docs/roadmaps/coven-automations-v1.md`
-- Verify: `OpenCoven/coven/docs/roadmaps/drift-check.mjs`
-- Never edit directly: `OpenCoven/coven-cave/.beads/issues.jsonl`
+- [x] Retain one canonical issue per in-repository and cross-repository outcome.
+- [x] Preserve explicit prerequisite direction, priority, ownership, acceptance,
+  and immutable delivery evidence in the reviewed mapping.
+- [x] Replace local tracker provisioning and synchronization with GitHub issues.
+- [ ] Before final #854 release rollup, refresh GitHub state and exact evidence;
+  a clean committed snapshot is not live readiness or release certification.
 
-- [x] **Step 1: Load Cave's local Beads and repository-coordination skills**
-
-Read both repositories' `AGENTS.md` files and the Beads workflow skill referenced
-by the Cave instructions.
-
-- [x] **Step 2: Create or reuse the bootstrap Bead from an exclusively claimed Cave root**
-
-```bash
-cd "$COVEN_CAVE_REPO"
-bd list --json | jq -r '.[] | select((.external_ref // .externalRef // "") == "https://github.com/OpenCoven/coven-cave/issues/5220") | .id'
-```
-
-If exactly one id is returned, reuse it. If none is returned, acquire the repository write claim `issue-5220-bootstrap` for the Beads/Dolt surface only, then run:
-
-```bash
-pnpm beads:create --surface shared \
-  --title "P0: Seed Coven Automations v1 into Cave's canonical Beads/Dolt execution graph" \
-  --description "Execute OpenCoven/coven-cave#5220; GitHub owns public acceptance, Cave Beads owns execution state, and Coven owns production automation state." \
-  --type task \
-  --priority 1 \
-  --labels "program:automations-v1,release-blocker,verification-required,familiar:cody" \
-  --external-ref "https://github.com/OpenCoven/coven-cave/issues/5220" \
-  --json
-```
-
-After creation, resolve and verify the single id:
-
-```bash
-export SEED_BEAD_ID="$(
-  bd list --json |
-    jq -er '[.[] | select((.external_ref // .externalRef // "") == "https://github.com/OpenCoven/coven-cave/issues/5220")] | if length == 1 then .[0].id else error("expected exactly one #5220 Bead") end'
-)"
-bd show "$SEED_BEAD_ID" --json
-```
-
-If the query reports zero or multiple matching Beads, stop and reconcile before any dependency mutation. If the root cannot be exclusively claimed, Task 1 is blocked; do not bypass the managed lifecycle.
-
-- [x] **Step 3: Create the managed writer worktree**
-
-Using the verified `SEED_BEAD_ID`, run:
-
-```bash
-pnpm beads:worktrees:create \
-  --bead "$SEED_BEAD_ID" \
-  --branch "feat/5220-automations-v1-beads" \
-  --owner "Cody" \
-  --purpose "Seed and verify the Coven Automations v1 Beads/Dolt graph"
-```
-
-Use the exact path printed by the command. From that path:
-
-```bash
-coven claim acquire issue-5220
-pnpm beads:prime
-pnpm beads:doctor
-pnpm beads:surfaces
-bd --version
-bd show cave-hlv --json
-git rev-parse refs/dolt/data
-```
-
-Expected: doctor and surface audit pass, `cave-hlv` exists, and the pre-mutation Dolt OID is recorded.
-
-- [x] **Step 4: Create or reuse one program epic and one Bead per outcome**
-
-Use `pnpm beads:create` after searching by each exact GitHub URL. Create nothing when exactly one matching Bead already exists.
-
-Required mappings:
-
-```text
-OpenCoven/coven#854
-OpenCoven/coven#859
-OpenCoven/coven#855
-OpenCoven/coven#856
-OpenCoven/familiar-contract#17
-OpenCoven/coven-threads#29
-OpenCoven/coven#857
-OpenCoven/coven#858
-OpenCoven/sdk#80
-OpenCoven/coven-cave#5217
-OpenCoven/psyche#18
-OpenCoven/coven-docs#76
-OpenCoven/.github#2
-```
-
-Do not recreate the closed foundation as pending work. Map OpenCoven/coven#816 as `verified-foundation` with PR #896 and merge commit `0d8c2004c3557019e39e5e4db70ae34c9d49a65a`.
-
-- [x] **Step 5: Add dependencies one edge at a time**
-
-Before each edge:
-
-```bash
-bd dep --help
-```
-
-Add each edge with blocked-first semantics:
-
-```bash
-bd dep add "$BLOCKED_BEAD_ID" --blocked-by "$BLOCKER_BEAD_ID" --json
-bd dep list "$BLOCKED_BEAD_ID" --direction down --json
-bd dep list "$BLOCKER_BEAD_ID" --direction up --json
-bd ready --json
-```
-
-For each edge, set `BLOCKED_BEAD_ID` and `BLOCKER_BEAD_ID` from the single ids just written to the reviewed mapping. The mutation receipt must show `issue_id` equal to the blocked id and `depends_on_id` equal to the blocker id.
-
-The verified graph must match the graph at the top of this plan. Reverse any edge that makes a prerequisite wait on its consumer.
-
-- [x] **Step 6: Synchronize and prove durability**
-
-```bash
-pnpm beads:doctor
-pnpm beads:surfaces
-pnpm beads:sync
-git rev-parse refs/dolt/data
-bd ready --json
-```
-
-Expected: post-sync OID differs when mutations occurred; a fresh `bd` read returns every mapped id and dependency.
-
-- [x] **Step 7: Update both reviewed roadmap mappings**
-
-Replace every pending `bead.id` with its real id, update dispositions and sync metadata in the Cave mapping, and open its reviewed PR. Then create the Coven issue worktree:
-
-```bash
-cd "$COVEN_REPO"
-git fetch origin main
-git worktree add -b docs/859-automations-v1-mapping \
-  "$HOME/.coven/worktrees/coven-issue-859" origin/main
-cd "$HOME/.coven/worktrees/coven-issue-859"
-coven claim acquire issue-859
+```sh
 node docs/roadmaps/drift-check.mjs --render
 node docs/roadmaps/drift-check.mjs --strict
 node docs/roadmaps/drift-check.mjs --selftest
 ```
 
-Expected: strict drift check exits 0 with no `W010` pending-provisioning warnings.
-
-- [x] **Step 8: Open reviewed PRs and attach the evidence packet**
-
-Required receipts: pre/post Dolt OIDs, Beads version/schema, exact mapping, `bd dep list` output summary, `bd ready --json` summary, drift-check exit codes, PR URLs, and merge SHAs.
-
-**Exit gate:** #854/#859 and every P0/P1 child map one-to-one to durable Beads; dependency direction is proven; strict drift check is green.
-
-**Completion receipt (2026-09-03):** OpenCoven/coven-cave#5277 and
-OpenCoven/coven-cave#5278 seeded and terminally reconciled the graph;
-OpenCoven/coven#900 and OpenCoven/coven#901 landed the Coven mapping and drift
-controls; OpenCoven/coven-cave#5220, OpenCoven/coven#859, `cave-tmegk`, and
-`cave-hlv.10` are closed. A checksum-verified Beads 1.3.0-rc.1 client read the
-schema-v66 store, `pnpm beads:sync` completed pull and push, and #855 plus
-OpenCoven/familiar-contract#17 are the ready implementation outcomes.
+Current tracking uses the owning repository's issue, a task worktree,
+`coven claim acquire issue-<N>`, a scoped PR, and exact delivery evidence.
+The checker optionally accepts a local GitHub REST issue-array snapshot with
+`--issues-export PATH`. Runtime lifecycle state remains solely in Coven.
 
 ---
 
@@ -1084,31 +949,11 @@ corepack pnpm@10.11.1 pack:public
 - Retire after migration: `src/lib/coven-automations-facade.ts`
 - Retire after migration: `src/app/api/codex-automations/**`
 
-- [ ] Resolve the single `cave-oversight` Bead from `docs/roadmaps/coven-automations-v1.mapping.json`, create its managed worktree, and claim the issue:
+- [ ] Resolve the canonical OpenCoven/coven-cave#5217 outcome from `docs/roadmaps/coven-automations-v1.mapping.json`, create its managed worktree, and claim the issue:
 
-```bash
-cd "$COVEN_CAVE_REPO"
-export CAVE_AUTOMATIONS_BEAD_ID="$(
-  jq -er '
-    [.outcomes[] |
-      select(.github == "OpenCoven/coven-cave#5217") |
-      .beadId] |
-    if length == 1 and .[0] != null
-    then .[0]
-    else error("expected one provisioned #5217 Bead")
-    end
-  ' docs/roadmaps/coven-automations-v1.mapping.json
-)"
-pnpm beads:worktrees:create \
-  --bead "$CAVE_AUTOMATIONS_BEAD_ID" \
-  --branch "feat/5217-coven-automations-v1" \
-  --owner "Cody" \
-  --purpose "Ship Cave oversight and recovery for Coven Automations v1"
-export CAVE_AUTOMATIONS_WORKTREE="$COVEN_CAVE_REPO/.worktrees/5217-coven-automations-v1"
-test -d "$CAVE_AUTOMATIONS_WORKTREE"
-cd "$CAVE_AUTOMATIONS_WORKTREE"
-coven claim acquire issue-5217
-```
+Track this historical step through the owning GitHub issue and the
+issue/worktree/claim workflow in `AGENTS.md`. Retain exact acceptance evidence.
+
 
 - [ ] Consume packed v1 artifacts and use adopted commands.
 - [ ] Render definition -> occurrence -> run -> attempt -> receipt from changefeed state.
@@ -1127,7 +972,7 @@ pnpm build
 ```
 
 **Exit gate:** Cave renders one live Coven truth and can approve/recover safely
-without authoring lifecycle state. Close OpenCoven/coven-cave#5217 and its Bead
+without authoring lifecycle state. Close OpenCoven/coven-cave#5217
 after the implementation PR and pre-release exact-bundle canary pass. Task 7
 owns a separate post-release acceptance receipt and does not reopen this
 implementation outcome.
@@ -1215,7 +1060,7 @@ pnpm check:production
 - [ ] Schedule stale-reference checks with issue deduplication.
 - [ ] Prove Coven, Familiar Contract, Threads, SDK, Cave, Psyche, and docs consume the workflows.
 
-**Exit gate:** every supported repository reports producer/consumer revision, profile results, and drift without leaking Beads or runtime payloads.
+**Exit gate:** every supported repository reports producer/consumer revision, profile results, and drift without leaking private work metadata or runtime payloads.
 
 **Exit gate:** the packed SDK, Cave, Psyche, docs, and organization workflows all consume the same immutable Task 5 candidate and report compatible profile evidence.
 
@@ -1534,7 +1379,7 @@ the detached verification worktree.
 - Regenerate: `docs/roadmaps/coven-automations-v1.md`
 - Create: `docs/roadmaps/coven-automations-v1.release.json`
 
-- [ ] Update every Bead and GitHub outcome from exact merge/release evidence.
+- [ ] Update every GitHub outcome from exact merge/release evidence.
 - [ ] Run strict roadmap drift and self-tests.
 - [ ] Verify no P2 work became a v1 blocker or undocumented shipped behavior.
 - [ ] Confirm every downstream canary pins the released artifact, not a branch or source-relative file.
@@ -1558,7 +1403,7 @@ node docs/roadmaps/drift-check.mjs --selftest
 | Lane | Earliest safe start | Must stop when |
 | --- | --- | --- |
 | Task 0 dogfood | Now | Any external mutation is requested or daemon/runtime state diverges |
-| Task 1 tracker | Now | Managed worktree or Beads writer is unavailable; do not bypass |
+| Task 1 tracker | Now | Task worktree or GitHub issue ownership is unavailable; do not bypass |
 | Task 2 protocol | After Task 1 creates canonical ownership | Schema and implementation disagree; correct the specification or code before consumers |
 | Task 3A scheduler | Task 2 merge | A state/error needed by scheduler is not ratified |
 | Task 3B identity | Now | Identity work starts encoding authority or scheduler semantics |
@@ -1580,4 +1425,4 @@ Coven-native automation is up and running only when:
 5. Cave and the SDK consume packed immutable artifacts, replay the changefeed safely, and never fall back to Codex files or direct runtime launch;
 6. Psyche composes orchestration evidence without owning schedules;
 7. conformance, privacy, security, SLO, provider, platform, package-provenance, checksum, and fresh-install receipts all resolve to the same release commit;
-8. the Beads/GitHub roadmap is drift-free and the final #854 rollup is machine-readable.
+8. the GitHub roadmap is drift-free and the final #854 rollup is machine-readable.

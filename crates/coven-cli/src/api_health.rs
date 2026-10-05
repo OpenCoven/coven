@@ -101,9 +101,9 @@ impl MountCapability {
     ///
     /// `false` on every platform and build without a backend, and `false` by
     /// default even where one exists: the NFS export serves a single delta
-    /// rather than the merged base+delta view DESIGN.md §3.2 specifies (bead
-    /// `coven-vlw`), and an agent process could not write through the mount on
-    /// macOS (bead `coven-x77`). Advertising a backend before those close
+    /// rather than the merged base+delta view DESIGN.md §3.2 specifies (issue
+    /// `OpenCoven/coven#701`), and an agent process could not write through the mount on
+    /// macOS (issue `OpenCoven/coven#684`). Advertising a backend before those close
     /// would promise something the daemon cannot deliver, so the opt-in in
     /// `afs_mount` gates it.
     pub fn detect() -> Self {

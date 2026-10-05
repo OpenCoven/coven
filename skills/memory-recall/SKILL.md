@@ -9,7 +9,7 @@ kind: "agent"
 # Memory Recall
 
 Retrieval-side contract for the Coven memory layer (Authoritative Plan v1 hole #7;
-bead `cmem-pbr`). Any familiar, under any runtime, uses this skill to pull
+issue `the memory recall implementation`). Any familiar, under any runtime, uses this skill to pull
 already-promoted facts back into working context. It does **not** write, promote,
 or mutate anything under `~/.coven/memory` — that is the promotion layer's job
 (`coven memory promote`, schema: `familiar-contract/schemas/coven-memory-schema.md` §11).

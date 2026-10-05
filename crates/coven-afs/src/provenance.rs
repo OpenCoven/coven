@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS afs_session (
   project_root      TEXT,
   coven_session_id  TEXT,
   familiar_id       TEXT,
-  bead_id           TEXT,
+  issue_ref        TEXT,
   created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at        INTEGER NOT NULL DEFAULT (unixepoch())
 );
@@ -46,13 +46,13 @@ CREATE TABLE IF NOT EXISTS afs_provenance (
   afs_session_id    TEXT,
   coven_session_id  TEXT,
   familiar_id       TEXT,
-  bead_id           TEXT,
+  issue_ref        TEXT,
   turn              INTEGER,
   tool_call_id      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_afs_provenance_path ON afs_provenance(path, seq);
 CREATE INDEX IF NOT EXISTS idx_afs_provenance_session ON afs_provenance(coven_session_id, seq);
-CREATE INDEX IF NOT EXISTS idx_afs_provenance_bead ON afs_provenance(bead_id, seq);
+CREATE INDEX IF NOT EXISTS idx_afs_provenance_issue ON afs_provenance(issue_ref, seq);
 CREATE INDEX IF NOT EXISTS idx_afs_provenance_tool_call ON afs_provenance(tool_call_id);
 
 CREATE TABLE IF NOT EXISTS afs_commit (
@@ -86,7 +86,7 @@ pub struct SessionBinding {
     pub project_root: Option<String>,
     pub coven_session_id: Option<String>,
     pub familiar_id: Option<String>,
-    pub bead_id: Option<String>,
+    pub issue_ref: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -99,7 +99,7 @@ pub struct Actor {
     pub afs_session_id: Option<String>,
     pub coven_session_id: Option<String>,
     pub familiar_id: Option<String>,
-    pub bead_id: Option<String>,
+    pub issue_ref: Option<String>,
     /// The session's event cursor (`MAX(events.rowid)`) when the operation ran.
     pub turn: Option<i64>,
     pub tool_call_id: Option<i64>,
@@ -132,13 +132,51 @@ pub struct CommitRecord {
     pub created_at: i64,
 }
 
+fn extension_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns)
+}
+
+/// The retired column is read only to preserve attribution in existing deltas.
+/// New databases and the next metadata write use the issue reference column.
+fn issue_reference_column(conn: &rusqlite::Connection, table: &str) -> Result<&'static str> {
+    if extension_columns(conn, table)?
+        .iter()
+        .any(|column| column == "issue_ref")
+    {
+        Ok("issue_ref")
+    } else {
+        Ok("bead_id")
+    }
+}
+
 impl AgentFs {
     /// Create the coven extension tables if they are absent.
     ///
     /// Safe to call on a database produced by upstream `agentfs`; that is what
     /// makes rule E3 hold in the coven-reads-foreign direction.
     pub fn init_extensions(&self) -> Result<()> {
-        self.conn.execute_batch(EXTENSION_DDL)?;
+        // Metadata upgrades are atomic and leave the filesystem tables untouched.
+        let tx = self.conn.unchecked_transaction()?;
+        for table in ["afs_session", "afs_provenance"] {
+            let columns = extension_columns(&tx, table)?;
+            if columns.iter().any(|column| column == "bead_id") {
+                if columns.iter().any(|column| column == "issue_ref") {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "ambiguous work-reference columns in {table}"
+                    )));
+                }
+                tx.execute_batch("DROP INDEX IF EXISTS idx_afs_provenance_bead")?;
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME COLUMN bead_id TO issue_ref"
+                ))?;
+            }
+        }
+        tx.execute_batch(EXTENSION_DDL)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -183,7 +221,7 @@ impl AgentFs {
         self.conn.execute(
             "INSERT INTO afs_session
                (id, name, state, base_fingerprint, base_commit, project_root,
-                coven_session_id, familiar_id, bead_id, created_at, updated_at)
+                coven_session_id, familiar_id, issue_ref, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
@@ -193,7 +231,7 @@ impl AgentFs {
                project_root = excluded.project_root,
                coven_session_id = excluded.coven_session_id,
                familiar_id = excluded.familiar_id,
-               bead_id = excluded.bead_id,
+               issue_ref = excluded.issue_ref,
                updated_at = excluded.updated_at",
             params![
                 binding.id,
@@ -204,7 +242,7 @@ impl AgentFs {
                 binding.project_root,
                 binding.coven_session_id,
                 binding.familiar_id,
-                binding.bead_id,
+                binding.issue_ref,
                 secs,
             ],
         )?;
@@ -216,12 +254,16 @@ impl AgentFs {
         if !self.has_extensions()? {
             return Ok(None);
         }
+        // Read-only inspection of an old delta must not require a migration.
+        let issue_column = issue_reference_column(&self.conn, "afs_session")?;
         Ok(self
             .conn
             .query_row(
-                "SELECT id, name, state, base_fingerprint, base_commit, project_root,
-                        coven_session_id, familiar_id, bead_id, created_at, updated_at
-                 FROM afs_session ORDER BY created_at ASC LIMIT 1",
+                &format!(
+                    "SELECT id, name, state, base_fingerprint, base_commit, project_root,
+                        coven_session_id, familiar_id, {issue_column}, created_at, updated_at
+                 FROM afs_session ORDER BY created_at ASC LIMIT 1"
+                ),
                 [],
                 |r| {
                     Ok(SessionBinding {
@@ -233,7 +275,7 @@ impl AgentFs {
                         project_root: r.get(5)?,
                         coven_session_id: r.get(6)?,
                         familiar_id: r.get(7)?,
-                        bead_id: r.get(8)?,
+                        issue_ref: r.get(8)?,
                         created_at: r.get(9)?,
                         updated_at: r.get(10)?,
                     })
@@ -270,7 +312,7 @@ impl AgentFs {
         self.conn.execute(
             "INSERT INTO afs_provenance
                (op, path, to_path, ino, base_ino, bytes, at, at_nsec,
-                afs_session_id, coven_session_id, familiar_id, bead_id, turn, tool_call_id)
+                afs_session_id, coven_session_id, familiar_id, issue_ref, turn, tool_call_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 op,
@@ -284,7 +326,7 @@ impl AgentFs {
                 actor.afs_session_id,
                 actor.coven_session_id,
                 actor.familiar_id,
-                actor.bead_id,
+                actor.issue_ref,
                 actor.turn,
                 actor.tool_call_id,
             ],
@@ -300,11 +342,12 @@ impl AgentFs {
         if !self.has_extensions()? {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
+        let issue_column = issue_reference_column(&self.conn, "afs_provenance")?;
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT seq, op, path, to_path, ino, base_ino, bytes, at, at_nsec,
-                    afs_session_id, coven_session_id, familiar_id, bead_id, turn, tool_call_id
-             FROM afs_provenance WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
-        )?;
+                    afs_session_id, coven_session_id, familiar_id, {issue_column}, turn, tool_call_id
+             FROM afs_provenance WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2"
+        ))?;
         let rows = stmt
             .query_map(params![since, limit as i64], |r| {
                 Ok(ProvenanceRecord {
@@ -321,7 +364,7 @@ impl AgentFs {
                         afs_session_id: r.get(9)?,
                         coven_session_id: r.get(10)?,
                         familiar_id: r.get(11)?,
-                        bead_id: r.get(12)?,
+                        issue_ref: r.get(12)?,
                         turn: r.get(13)?,
                         tool_call_id: r.get(14)?,
                     },
@@ -409,12 +452,100 @@ impl AgentFs {
 mod tests {
     use super::*;
 
+    fn initialize_legacy_extensions(fs: &AgentFs) {
+        fs.conn
+            .execute_batch(
+                &EXTENSION_DDL
+                    .replace("issue_ref", "bead_id")
+                    .replace("idx_afs_provenance_issue", "idx_afs_provenance_bead"),
+            )
+            .unwrap();
+        fs.conn
+            .execute_batch(
+                "INSERT INTO afs_session (id, bead_id) VALUES ('afs-old', 'legacy-work');
+                 INSERT INTO afs_provenance (op, path, bead_id, turn)
+                   VALUES ('write', '/retained', 'legacy-work', 7);",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn issue_reference_upgrade_preserves_attribution_and_filesystem_data() {
+        let mut fs = AgentFs::in_memory().unwrap();
+        fs.write_file("/retained", b"original content").unwrap();
+        initialize_legacy_extensions(&fs);
+        fs.init_extensions().unwrap();
+        fs.init_extensions().unwrap();
+        assert_eq!(fs.read_file("/retained").unwrap(), b"original content");
+        assert_eq!(
+            fs.session_binding().unwrap().unwrap().issue_ref.as_deref(),
+            Some("legacy-work")
+        );
+        let records = fs.provenance_since(0, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].actor.issue_ref.as_deref(), Some("legacy-work"));
+        assert_eq!(records[0].actor.turn, Some(7));
+        for table in ["afs_session", "afs_provenance"] {
+            let columns = extension_columns(&fs.conn, table).unwrap();
+            assert!(columns.iter().any(|column| column == "issue_ref"));
+            assert!(!columns.iter().any(|column| column == "bead_id"));
+        }
+        let old_indexes: i64 = fs
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_afs_provenance_bead'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_indexes, 0);
+    }
+
+    #[test]
+    fn legacy_attribution_can_be_inspected_without_writing_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delta.db");
+        {
+            let fs = AgentFs::create(&path).unwrap();
+            initialize_legacy_extensions(&fs);
+        }
+        let fs = AgentFs::open_read_only(&path).unwrap();
+        assert_eq!(
+            fs.session_binding().unwrap().unwrap().issue_ref.as_deref(),
+            Some("legacy-work")
+        );
+        assert_eq!(fs.provenance_since(0, 10).unwrap()[0].actor.turn, Some(7));
+        assert!(extension_columns(&fs.conn, "afs_session")
+            .unwrap()
+            .iter()
+            .any(|column| column == "bead_id"));
+    }
+
+    #[test]
+    fn conflicting_work_columns_refuse_an_upgrade_without_partial_changes() {
+        let fs = AgentFs::in_memory().unwrap();
+        initialize_legacy_extensions(&fs);
+        fs.conn
+            .execute_batch("ALTER TABLE afs_provenance ADD COLUMN issue_ref TEXT")
+            .unwrap();
+        assert!(fs
+            .init_extensions()
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous work-reference"));
+        assert!(extension_columns(&fs.conn, "afs_session")
+            .unwrap()
+            .iter()
+            .any(|column| column == "bead_id"));
+        assert_eq!(fs.provenance_since(0, 10).unwrap().len(), 1);
+    }
+
     fn actor() -> Actor {
         Actor {
             afs_session_id: Some("afs-1".into()),
             coven_session_id: Some("sess-1".into()),
             familiar_id: Some("sage".into()),
-            bead_id: Some("coven-5kt".into()),
+            issue_ref: Some("OpenCoven/coven#684".into()),
             turn: Some(42),
             tool_call_id: None,
         }
@@ -440,7 +571,7 @@ mod tests {
             id: "afs-1".into(),
             name: Some("spike".into()),
             state: STATE_OPEN.into(),
-            bead_id: Some("coven-5kt".into()),
+            issue_ref: Some("OpenCoven/coven#684".into()),
             ..Default::default()
         };
         fs.bind_session(&binding).unwrap();

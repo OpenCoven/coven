@@ -1,10 +1,14 @@
+---
+source_adjacent_reason: "Preserves producer-owned design and adoption evidence with GitHub-only tracking."
+---
+
 # Psyche Integration Review Dossier
 
 **Status:** Maintainer review candidate for W0/G1
 **Review scope:** Complete Psyche-to-Coven integration definition and first
 production surface
 **Delivery:** [OpenCoven/coven PR #546](https://github.com/OpenCoven/coven/pull/546)
-**Work unit:** `coven-psy0`
+**Historical delivery:** [W0 specification reconciliation, PR #546](https://github.com/OpenCoven/coven/pull/546)
 
 > This document is a non-normative review aid. It introduces no architecture,
 > contract, capability, requirement, or implementation assignment. The

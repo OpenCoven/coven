@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Issue #670 Docs Program — Status and Decision Record (2026-08-30)
 
 **Scope:** Verified status of
@@ -19,20 +23,20 @@ lane are on `main`; the canonical journey and docs CI live and run in
 ## Program structure (evidence)
 
 Maintainer comment on #670 (BunsDev, 2026-08-20T23:16:48Z) tracks execution as
-Beads epic `coven-v8l` with children:
+GitHub program issue `OpenCoven/coven#670` with children:
 
-| Child | Beads | Title | State (2026-08-30) |
+| Child | GitHub issues | Title | State (2026-08-30) |
 | --- | --- | --- | --- |
-| #774 | `coven-v8l.1` | feat(cli): add progressive help disclosure and help contract | open — implementation merged on main |
-| #775 | `coven-v8l.2` | docs: reshape canonical first-session and troubleshooting journey | open — canonical journey live in coven-docs |
-| #776 | `coven-v8l.3` | docs: remove duplicate local public documentation | open — partially done, largest remaining slice |
-| #777 | `coven-v8l.4` | test(cli): add packaged first-session E2E journey | **closed** — merged via #835 |
-| #778 | `coven-v8l.5` | ci(docs): add canonical docs build, link, and browser journey | open — workflow live in coven-docs |
-| #779 | `coven-v8l.6` | test: certify Coven end-to-end from packaged artifact through recovery and release evidence | open — matrix not yet evidenced |
+| #774 | `OpenCoven/coven#774` | feat(cli): add progressive help disclosure and help contract | open — implementation merged on main |
+| #775 | `OpenCoven/coven#775` | docs: reshape canonical first-session and troubleshooting journey | open — canonical journey live in coven-docs |
+| #776 | `OpenCoven/coven#776` | docs: remove duplicate local public documentation | open — partially done, largest remaining slice |
+| #777 | `OpenCoven/coven#777` | test(cli): add packaged first-session E2E journey | **closed** — merged via #835 |
+| #778 | `OpenCoven/coven#778` | ci(docs): add canonical docs build, link, and browser journey | open — workflow live in coven-docs |
+| #779 | `OpenCoven/coven#779` | test: certify Coven end-to-end from packaged artifact through recovery and release evidence | open — matrix not yet evidenced |
 
 GitHub Project 3 / Project 8 rollup state is not verifiable here: the task
 constraints forbid GraphQL, and the REST v3 API exposes no project state for
-this token. Beads state is cited only from the maintainer comment above.
+this token. Historical tracker state is cited only from the maintainer comment above.
 
 ## What exists on `main` today (with evidence)
 
@@ -142,7 +146,7 @@ work under #776.
 | 6 | README is a concise landing page rather than a second manual | **Not met** | `README.md` on main is 867 lines / 47,904 bytes with Commands Reference, Local API, Architecture, Repository Structure, Configuration, FAQ, and Troubleshooting sections |
 | 7 | Packaged CLI E2E proves doctor, daemon, run, inspect, lifecycle actions, failure guidance, shutdown | **Met** | `scripts/user-journey-e2e.mjs` + `test-cli-prepublish.mjs`; CI lanes `npm-onboarding-pr`/`npm-onboarding-main` (#835) |
 | 8 | `coven-docs` PR CI builds, validates links, and browser-tests the primary journey | **Met (coven-docs)** | `docs.yml` verify + smoke (Chromium) on PR and push |
-| 9 | Delivery tracked in Beads and Project 3; certification evidence under Project 8 | **Partially verified** | Beads IDs confirmed via maintainer comment (2026-08-20); Project state unverifiable under REST-only constraints |
+| 9 | Delivery tracked in GitHub issues and Project 3; certification evidence under Project 8 | **Partially verified** | GitHub issues IDs confirmed via maintainer comment (2026-08-20); Project state unverifiable under REST-only constraints |
 
 ## What remains
 
@@ -150,8 +154,8 @@ work under #776.
    finish the local public-page reduction that #668 started (the three
    2026-08-07 wave plans hold the residual page list); add the CI guard that
    enforces the "only approved pointers or source-adjacent exceptions" rule
-   from `docs/DOCS-MAINTENANCE.md`. Its recorded blockers (`coven-v8l.1`,
-   `coven-v8l.2`) are satisfied on the ground — help (#834) and the canonical
+   from `docs/DOCS-MAINTENANCE.md`. Its recorded blockers (`OpenCoven/coven#774`,
+   `OpenCoven/coven#775`) are satisfied on the ground — help (#834) and the canonical
    journey (coven-docs) have landed.
 2. **#779 certification.** Execute and evidence the certification matrix
    (hermetic lane evidence exists via #777; real providers, remote hosts,
@@ -161,8 +165,8 @@ work under #776.
    #804, #807, #808 feed it.
 3. **Issue close-out.** #774, #775, and #778 are still open although their
    implementation surfaces are merged/live; they need maintainer verification
-   and closure (Beads `coven-v8l.1`, `.2`, `.5`), then #670 and the
-   `coven-v8l` epic can close.
+   and closure (GitHub issues `OpenCoven/coven#774`, `.2`, `.5`), then #670 and the
+   `OpenCoven/coven#670` epic can close.
 
 ## Critical path
 
@@ -174,7 +178,7 @@ work under #776.
 
 - Investigated 2026-08-30 via GitHub REST only (`gh api`); GraphQL was not
   used, so GitHub Project rollup state is unverified.
-- Beads state cited from the maintainer comment on #670; bead records were
+- Historical tracker state cited from the maintainer comment on #670; issue records were
   not read or modified.
 - No Rust toolchain or Python in the executing environment; Rust/Python CI
   checks were not run locally. The two Node docs guards were run locally and

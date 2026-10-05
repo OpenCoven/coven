@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Coven Automations v1 Program Status Record — 2026-08-30
 
 **Type:** status/decision record (verified facts; no task plan)
@@ -6,6 +10,10 @@
 **Deconfliction:** no open PR references #854 upstream, and no `agent/*854*` branch exists on the CompleteDotTech/coven fork (checked 2026-08-30 ~15:08 UTC)
 
 ---
+
+This is a dated source assessment. The tracker procedure below is historical;
+#1222 supersedes it with GitHub-only work tracking. Current dispositions are
+in `docs/roadmaps/coven-automations-v1.mapping.json`.
 
 ## Verdict
 
@@ -39,7 +47,7 @@ Module size: `crates/coven-cli/src/automations/` is 11 files / 2,719 lines with 
 - No automations spec under `specs/` (12 spec directories, none for automations) and no `coven.automations.v1` schema, state-machine, typed-error, idempotency, or changefeed contract anywhere on main → #855.
 - No automations documentation under `docs/` (grep for "automations" returns nothing) → coven-docs#76.
 - No automation surface in the npm SDK `npm/coven/src` (no matches) → sdk#80.
-- No Beads store in this repo (`.beads` absent) and no live-Dolt mutation yet → #859 (its 2026-08-30 comment states mutation of Cave's embedded-Dolt Beads graph is "not yet completed").
+- The reviewed execution graph had not yet been provisioned → #859 (historical 2026-08-30 observation).
 - No conformance, chaos, load/SLO, or release-receipt gate → #858.
 - No principal/capability/approval/receipt binding: `familiar_id` is an optional unversioned string validated only for length (`definition.rs:68,131-134`); `automation_runs` carries no authority evidence → #857 (+ familiar-contract#17, coven-threads#29, cross-repo).
 - Scheduler cadence is a fixed wall-clock `thread::sleep(60s)` loop (`daemon_tick.rs:35-50`) with no virtual-time, DST-transition, clock-jump, or leader-fencing contract → #856.
@@ -55,7 +63,7 @@ Module size: `crates/coven-cli/src/automations/` is 11 files / 2,719 lines with 
 | #856 time/fencing/crash hardening | open | 2026-08-30T13:38:31Z | no activity |
 | #857 authority binding + receipts | open | 2026-08-30T13:39:54Z | 1 design comment (receipt replay resistance, 14:23:31Z) |
 | #858 conformance/chaos/SLO | open | 2026-08-30T13:40:55Z | no activity |
-| #859 Beads/GitHub mirrors | open | 2026-08-30T13:41:50Z | 1 comment routing the graph to Cave's embedded Dolt DB (`cave-hlv` epic; coven-cave#5219 roadmap PR; coven-cave#5220 seed/verification task) |
+| #859 execution-graph controls | open | 2026-08-30T13:41:50Z | 1 comment routing the graph to the historical tracker (`OpenCoven/coven#854` epic; coven-cave#5219 roadmap PR; coven-cave#5220 seed/verification task) |
 
 Cross-repo outcomes cited by the #854 checkpoint comment (not independently verified in this sweep): P0 — OpenCoven/familiar-contract#17, OpenCoven/coven-threads#29; P1 — OpenCoven/sdk#80, OpenCoven/coven-cave#5217, OpenCoven/psyche#18, OpenCoven/coven-docs#76, OpenCoven/.github#2. Zero PRs are open upstream at snapshot time; no PR implements any of #855–#859 yet.
 
@@ -65,13 +73,13 @@ Cross-repo outcomes cited by the #854 checkpoint comment (not independently veri
 - **Gate B (identity and authority):** not met — optional string `familiar_id` only; no principal authorization, capability grants, approval path, or exercised-authority receipts on any run record (#857, familiar-contract#17, coven-threads#29).
 - **Gate C (public contract):** not met — the wire contract lives in Rust structs (`definition.rs`) with no independent versioned schemas or golden vectors; the SDK has no automation surface (#855, sdk#80).
 - **Gate D (operations):** partial — health snapshot and run-history projections exist and are CLI/API-observable; chaos/restart certification, load/SLO evidence, alerts/retention/redaction exercise, and a machine-readable release receipt do not exist (#858 open).
-- **Tracker (Beads/GitHub graph):** not started — the canonical graph lives in Cave's Dolt database; the seeding/verification task (coven-cave#5220) has not been executed (#859 open).
+- **Tracker (execution graph):** not started — the graph was then planned in the historical tracker; the seeding/verification task (coven-cave#5220) has not been executed (#859 open).
 
 ## Critical path
 
-The #854 checkpoint comment (2026-08-30T14:06:20Z) fixes the engineering sequence, which matches the issue's Beads dependency rules and this record's code findings:
+The #854 checkpoint comment (2026-08-30T14:06:20Z) fixes the engineering sequence, which matches the issue's dependency rules and this record's code findings:
 
-1. coven-cave#5220 / #859 — seed and verify the Automations v1 delivery epic in Cave's embedded-Dolt Beads graph (first executable action).
+1. coven-cave#5220 / #859 — seed and verify the Automations v1 delivery epic in the then-planned execution graph (first executable action).
 2. #816 — attach landed-series evidence (PRs #846/#847 + parts 6–8 commits, clean-clone test run, migration and daemon/restart verification), then close #816 as the landed foundation.
 3. #855 — versioned `coven.automations.v1` schemas, state machines, idempotency, typed errors, changefeed.
 4. In parallel: #856 (deterministic time, DST, retries, cancellation, fencing, crash recovery) + familiar-contract#17 + coven-threads#29.
@@ -84,7 +92,7 @@ The #854 checkpoint comment (2026-08-30T14:06:20Z) fixes the engineering sequenc
 
 - Do **not** close #854, #816, #855–#859. #854 is correctly decomposed; its verdict ("foundation-ready, not yet v1-certified") is independently confirmed by the code inspection above.
 - Unattended external side effects stay out of scope until #857 and #858 pass at exact immutable artifacts (per the #854 safety gate).
-- Next executable actions: coven-cave#5220 (live Beads seeding) and #816 evidence closure; both precede any #855 contract work.
+- Next executable actions: coven-cave#5220 (historical graph provisioning) and #816 evidence closure; both precede any #855 contract work.
 
 ## Sources
 

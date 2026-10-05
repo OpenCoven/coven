@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche Familiar Runtime Program Plan
 
 > **For agentic workers:** This is a dependency-gated program plan, not an
@@ -11,7 +15,7 @@ merged in PR #574. Corrective continuation, stream-identity, and
 process-supervision behavior merged in PR #622; the approved O1.1 annex merged
 in PR #633; its implementation plan merged in PR #639; and the remaining
 conformance coverage merged in PR #664 with all 12 hosted checks successful.
-Issue #567 and Bead `coven-psy-o1` remain the closed O1 trackers and receive an
+GitHub issue `OpenCoven/coven#567` remains closed and receives an
 append-only O1.1 evidence note. This closes only C-S1 vocabulary and C-S8
 documentation. C-S3-C-S6 and C-S9-C-S12 remain separate work, while G4, G6,
 and production child dispatch remain blocked.
@@ -309,7 +313,7 @@ Every post-W1 workstream requires a child plan that:
 
 1. names exact files, schemas, state transitions, and public boundaries;
 2. starts with failing unit/contract/property/crash tests;
-3. uses one bounded worktree, issue/Bead, and shared claim;
+3. uses one bounded worktree, GitHub issue, and shared claim;
 4. preserves the Rust authority boundary and thin TypeScript packages;
 5. defines fake and real conformance without adapter-only relaxation;
 6. lists security/privacy/secret failure cases;
@@ -328,7 +332,7 @@ enable child dispatch before G6, or treat add-ons as sandboxed.
 - Human attribution preserved with GitHub-linked trailers.
 - Local required gates pass before PR; remote matrix and review threads reach
   terminal state before merge.
-- Beads, claims, PRs, gates, and live branch state are reconciled before work.
+- GitHub issues, claims, PRs, gates, and live branch state are reconciled before work.
 - No implementation issue exists merely because this program names a future
   workstream; issue creation follows G3 and an approved child plan.
 

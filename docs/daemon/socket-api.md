@@ -267,7 +267,7 @@ never grant permission.
 
 Commit creates a git worktree at the session's `base_commit`, applies the
 change set, and produces a **signed** commit carrying `Coven-Session`,
-`Coven-Familiar`, `Coven-Bead`, and `Coven-Afs-Session` trailers. It does not
+`Coven-Familiar`, `Coven-Issue`, and `Coven-Afs-Session` trailers. It does not
 push, open a PR, or run CI. Materialization is all-or-nothing: if the project
 root has moved off `base_commit` (`afs.base_diverged`), a path would escape the
 repository or write under `.git/` (`afs.path_outside_root`), a file exceeds the

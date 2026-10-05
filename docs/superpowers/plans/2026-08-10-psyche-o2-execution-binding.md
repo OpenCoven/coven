@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche O2 Execution Binding Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -1719,7 +1723,7 @@ After Tasks 1-5 are green, change the O2 header to:
 **Status:** Approved; implementation complete pending final repository verification.
 ```
 
-Do not mark the contract fully implemented yet. Leave issue/Bead evidence unchecked until those records contain final merge and verification links.
+Do not mark the contract fully implemented yet. Leave GitHub issue evidence unchecked until those records contain final merge and verification links.
 
 - [x] **Step 6: Validate terminology**
 

@@ -1,8 +1,12 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche W2 Workspace Bootstrap Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stand up the standalone `OpenCoven/psyche` Rust workspace with a daemon, CLI, strict versioned configuration, structured redacting logs, a full CI gate, and a checksum-verified npm distribution — proving every `coven-psy1` acceptance criterion without implementing any Telegram, graph, identity, or Coven execution behaviour.
+**Goal:** Stand up the standalone `OpenCoven/psyche` Rust workspace with a daemon, CLI, strict versioned configuration, structured redacting logs, a full CI gate, and a checksum-verified npm distribution — proving every the historical W2 bootstrap outcome acceptance criterion without implementing any Telegram, graph, identity, or Coven execution behaviour.
 
 **Architecture:** Four crates only. `psyche-core` owns versioned schema identifiers, error types, and the `SecretRef` newtype that structurally cannot hold a literal secret. `psyche-config` parses TOML strictly — unknown fields are errors outside a versioned `extensions` table, and unknown `schema_version` is denied *before* field validation so a future config reports the real reason. `psyche-runtime` is the sole composition root and owns a three-state lifecycle with graceful shutdown. `psyche-cli` exposes `psyche` and `psyched` with `start`/`stop`/`status`/`doctor`, all of which run with no Telegram credentials present. The npm wrapper resolves a platform companion package and verifies its SHA-256 before exec.
 
@@ -12,7 +16,7 @@
 
 ## Scope boundary
 
-**This plan is the `coven-psy1` bootstrap slice only.** It is deliberately narrower than workstream W2 as a whole.
+**This plan is the the historical W2 bootstrap outcome bootstrap slice only.** It is deliberately narrower than workstream W2 as a whole.
 
 | In scope | Out of scope (and where it goes) |
 |---|---|
@@ -30,7 +34,7 @@
 |---|---|---|
 | 1 | Names exact files, schemas, state transitions, public boundaries | "File map" below; lifecycle transitions in Task 4; `psyche.config.v1` in Task 2 |
 | 2 | Starts with failing unit/contract/property/crash tests | Every task's Step 1 writes a failing test; Step 2 runs it and records the expected failure |
-| 3 | One bounded worktree, issue/Bead, and shared claim | Task 0 |
+| 3 | One bounded worktree, GitHub issue, and shared claim | Task 0 |
 | 4 | Preserves Rust authority boundary and thin TypeScript packages | Task 8 — the npm package resolves and execs a binary; it holds no daemon, storage, identity, or policy logic |
 | 5 | Defines fake and real conformance without adapter-only relaxation | Task 7 runs the identical gate locally and in CI; no CI-only skips |
 | 6 | Lists security/privacy/secret failure cases | "Security and privacy failure cases" below; enforced in Tasks 3, 6, 7, 8 |
@@ -119,35 +123,23 @@ whatever directory you happened to be in. Verified.
 **Files:**
 - None (coordination only)
 
-- [ ] **Step 1: Verify the child plan is approved before any code**
+- [ ] **Step 1: Verify the implementation approval**
 
-Run:
+Inspect the approved child plan (delivery PR #579) and current parent issue
+#1238. This historical plan does not authorize implementation: retain the
+`implementation_authorized` and `child_plan_approved` decisions on the owning
+GitHub issue before starting code. Stop if approval or current scope is absent.
 
-```bash
-cd ~/Documents/GitHub/OpenCoven/coven
-bd show coven-psy1 | grep -E "implementation_authorized|child_plan_approved"
-```
+- [ ] **Step 2: Reconcile the historical gate**
 
-Expected: `implementation_authorized: false` until this plan is reviewed. **If it still reads `false`, stop here** — PLAN.md §6.9 requires stopping at approval gates, and `coven-psy1`'s own notes say "Do not create production code until that child plan is reviewed and approved".
-
-- [ ] **Step 2: Close the gate bead that tracks this plan**
-
-Once the reviewer approves, run:
-
-```bash
-bd close coven-bin --reason "W2 bootstrap child plan approved at <PLAN_COMMIT_SHA>."
-bd ready
-```
-
-Expected: `coven-psy1` appears in `bd ready` for the first time; `coven-bin` no longer does.
+Record the exact reviewed plan SHA and approval evidence on the owning issue.
+Do not create a second tracker or treat the documentation PR as a work issue.
 
 - [ ] **Step 3: Record the shared claim**
 
-```bash
-bd note coven-psy1 "Claimed for W2 bootstrap execution on branch feat/psyche-w2-bootstrap. Scope: psyche-core, psyche-config, psyche-runtime, psyche-cli, CI, npm dry-run only."
-```
-
-Expected: `✓ Note added to coven-psy1`.
+Inspect open PRs and shared claims, enter the current task worktree, then acquire
+`coven claim acquire issue-<N>` for the canonical implementation issue. Record
+its scope, branch, and plan reference on that issue.
 
 - [ ] **Step 4: Create the repository (operator action)**
 
@@ -513,7 +505,7 @@ git commit -m "feat(core): deny unknown configuration schema versions"
 
 **Why this lands with no consumer yet.** No config field in this slice holds a
 secret — accounts and principal bindings arrive with the surface workstreams.
-`SecretRef` is built now because `coven-psy1` acceptance requires logs that
+`SecretRef` is built now because the historical W2 bootstrap outcome acceptance requires logs that
 "redact secret-bearing fields", and the redaction primitive has to exist and be
 proven *before* the first secret-bearing field is added, not retrofitted after.
 It is deliberately the only type permitted to carry a secret reference, so
@@ -3224,7 +3216,7 @@ fn doctor_json_emits_a_versioned_document() {
 
 #[test]
 fn start_and_stop_run_without_any_telegram_credentials() {
-    // coven-psy1 acceptance requires all four subcommands to run with no
+    // OpenCoven/coven#566 acceptance requires all four subcommands to run with no
     // credentials present, not just doctor and status.
     //
     // `start` is driven with `--shutdown-after-start` because it now actually
@@ -6122,13 +6114,11 @@ PLAN.md §6.9 requires stopping at approval gates and §7 requires review thread
 
 Once merged, and only then:
 
-```bash
-cd ~/Documents/GitHub/OpenCoven/coven
-SHA=$(gh pr view <PR_NUMBER> --repo OpenCoven/psyche --json mergeCommit --jq '.mergeCommit.oid')
-bd note coven-psy1 "W2 bootstrap merged at $SHA. Scope: workspace, config, runtime, CLI, CI, npm dry-run. G2 not claimed: schemas, migrations, fakes, and state-machine/property/crash tests remain in the follow-on plan. Production child dispatch remains unauthorized."
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Expected: `✓ Note added to coven-psy1`. Leave `coven-psy1` **open** — its acceptance is met, but W2's G2 exit is not, and the follow-on plan attaches here.
+
+Record the merge and bounded verification receipt on the owning GitHub issue. Keep the W2 G2 exit open until the follow-on schemas, migrations, and conformance acceptance is evidenced.
 
 ---
 

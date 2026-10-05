@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Preserves producer-owned design and adoption evidence with GitHub-only tracking."
+---
+
 # Maintenance Participant Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -780,7 +784,7 @@ gh pr create \
 Fill the PR readiness packet with:
 
 - issue #795;
-- downstream `cave-cgk9v`;
+- downstream Cave adoption outcome linked from Coven #795;
 - exact local validation commands and results;
 - compatibility statement for old owner JSON and existing Cave clients;
 - explicit statement that unrelated live writers still block.
@@ -790,7 +794,7 @@ Fill the PR readiness packet with:
 Require every required check to pass on the current `headRefOid`, resolve every
 actionable review thread, and squash-merge without administrative bypass.
 
-- [ ] **Step 9: Reconcile both trackers**
+- [ ] **Step 9: Reconcile producer and downstream issues**
 
 After a released Coven version contains the merge:
 
@@ -798,5 +802,5 @@ After a released Coven version contains the merge:
 2. add a Cave integration contract proving managed worktree creation succeeds
    from a Coven-launched harness;
 3. remove the last-resort guidance that describes the catch-22;
-4. close `cave-cgk9v` with the Coven issue, PR, release, Cave adoption PR, and
+4. close the downstream Cave adoption outcome linked from Coven #795 with the Coven issue, PR, release, Cave adoption PR, and
    exact-head CI evidence.

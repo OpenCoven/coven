@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche O1 Coven Contract Design
 
 **Status:** Complete - O1 merged in PR #574; corrective O1.1 delivery and
@@ -5,7 +9,7 @@ conformance evidence merged in PRs #622, #633, #639, and #664
 
 **Decision date:** 2026-08-02
 
-**Work item:** `coven-psy-o1`
+**Work item:** `OpenCoven/coven#567`
 
 **GitHub issue:** [#567](https://github.com/OpenCoven/coven/issues/567)
 
@@ -257,6 +261,6 @@ O1 is complete only when:
 1. this written design is approved;
 2. an exact-file, test-first child implementation plan is approved;
 3. the scoped implementation and documentation land through a green PR;
-4. issue #567 and Bead `coven-psy-o1` record the merge and verification
+4. GitHub issue `OpenCoven/coven#567` records the merge and verification
    evidence; and
 5. no O2-O8 behavior or production child dispatch is represented as complete.

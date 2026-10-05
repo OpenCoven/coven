@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche O3 Request Adoption Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -68,36 +72,27 @@
 | `specs/psyche/O3_CONTRACT_DESIGN.md` | Record implementation evidence only after every acceptance gate passes. |
 | `specs/psyche/PLAN.md` | Change O3 from approved-design to implemented only after the green implementation merge. |
 
-### Task 0: Create the implementation Bead and claim the work
+### Task 0: Inspect the implementation issue and claim the work
 
 **Files:**
 - No repository files.
-- External records: GitHub issue `OpenCoven/coven#741`, Bead `coven-psy-o3`.
+- External record: GitHub issue `OpenCoven/coven#741`.
 
-- [ ] **Step 1: Create the O3 Bead if it does not already exist**
+- [ ] **Step 1: Inspect O3 issue #741 and existing PRs**
 
-```bash
-bd show coven-psy-o3 || bd create \
-  --id coven-psy-o3 \
-  --type feature \
-  --priority 1 \
-  --external-ref gh-741 \
-  --title "Psyche O3 stable request adoption" \
-  --description "Implement the approved O3 request-adoption contract for bound launch/input, one-attempt/one-session, durable replay/conflict, and retention-safe evidence." \
-  --acceptance "All O3 contract section 8 tests and repository gates pass; implementation and evidence PRs merge; issue #741 and this Bead contain checkable receipts."
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Expected: `bd show coven-psy-o3` displays an open feature linked to `gh-741`.
+
+Expected: GitHub issue #741 records the exact scope and approved plan before implementation.
 
 - [ ] **Step 2: Record the worktree and plan**
 
-```bash
-bd update coven-psy-o3 --append-notes \
-  "Execution plan: docs/superpowers/plans/2026-08-14-psyche-o3-request-adoption.md"
-bd show coven-psy-o3
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Expected: the Bead remains open and names this exact plan.
+
+Expected: the GitHub issue retains the plan and any unresolved acceptance gates.
 
 ### Task 1: Implement the closed request-adoption value object
 
@@ -1161,18 +1156,13 @@ gh pr create --base main --head docs/psyche-o3-implementation-evidence \
 
 Run the documentation checker on the evidence branch, merge its green PR, then
 append both PR URLs, both merge SHAs, the implementation CI URL, focused test
-counts, and final contract path to issue #741 and Bead `coven-psy-o3`. Use:
+counts, and final contract path to GitHub issue `OpenCoven/coven#741`. Use:
 
-```bash
-bd update coven-psy-o3 --append-notes \
-  "O3 implementation and evidence merged; receipts are recorded on GitHub issue #741."
-bd close coven-psy-o3 \
-  --reason "O3 implementation, green CI, and evidence merge are recorded on issue #741."
-bd show coven-psy-o3
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Close #741 only after the evidence commit is visible on `main` and `bd show`
-reports the Bead closed with the same receipt scope.
+
+Close #741 only after the evidence commit is visible on `main` and its acceptance evidence is complete and recorded on the issue.
 
 ## Plan self-review checklist
 

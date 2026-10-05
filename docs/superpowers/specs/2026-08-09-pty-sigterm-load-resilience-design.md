@@ -1,7 +1,11 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # PTY SIGTERM Load-Resilience Design
 
 **Status:** Approved for implementation
-**Bead:** `coven-047`
+**Issue:** `OpenCoven/coven#699`
 
 ## Problem
 
