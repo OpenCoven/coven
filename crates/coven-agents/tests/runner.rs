@@ -10,9 +10,11 @@ use std::{
 use async_trait::async_trait;
 use coven_agents::{
     Agent, BoxError, ConfigError, GuardrailStage, GuardrailVerdict, Handoff, HandoffCall,
-    InMemorySession, InputGuardrail, InvocationContext, InvocationId, Model, ModelAction,
-    ModelRequest, ModelResponse, OutputGuardrail, RunError, RunEvent, RunFailureKind, RunItem,
-    RunObserver, RunOptions, Runner, SessionStore, Tool, ToolCall, ToolDefinition,
+    InMemorySession, InputGuardrail, InvocationContext, InvocationEvent, InvocationEventKind,
+    InvocationFailureKind, InvocationId, InvocationObserver, Model, ModelAction, ModelRequest,
+    ModelResponse, OutputGuardrail, ProposalReview, ReviewOutcome, ReviewVerdict, RunError,
+    RunEvent, RunFailureKind, RunItem, RunObserver, RunOptions, RunResult, Runner, SessionStore,
+    Tool, ToolCall, ToolDefinition, ToolProposal,
 };
 use serde_json::{json, Value};
 
@@ -210,6 +212,41 @@ impl RecordingObserver {
 impl RunObserver for RecordingObserver {
     fn on_event(&self, event: &RunEvent) {
         self.events.lock().unwrap().push(event.clone());
+    }
+}
+
+#[derive(Clone)]
+enum ObservedEvent {
+    Run(RunEvent),
+    Invocation(InvocationEvent),
+}
+
+#[derive(Default)]
+struct RecordingCombinedObserver {
+    events: Mutex<Vec<ObservedEvent>>,
+}
+
+impl RecordingCombinedObserver {
+    fn events(&self) -> Vec<ObservedEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl RunObserver for RecordingCombinedObserver {
+    fn on_event(&self, event: &RunEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ObservedEvent::Run(event.clone()));
+    }
+}
+
+impl InvocationObserver for RecordingCombinedObserver {
+    fn on_event(&self, event: &InvocationEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ObservedEvent::Invocation(event.clone()));
     }
 }
 
@@ -1552,4 +1589,478 @@ async fn handoff_cannot_be_combined_with_tool_calls() {
         RunError::InvalidModelResponse { ref reason, .. } if reason == "a handoff cannot be combined with other actions"
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+// ---------------------------------------------------------------------------
+// ProposalReview: pre-dispatch review of resolved tool calls (#1151)
+// ---------------------------------------------------------------------------
+
+/// Returns a fixed verdict and records every proposal it is shown.
+struct ScriptedReview {
+    name: &'static str,
+    verdict: ReviewVerdict,
+    seen: Mutex<Vec<(String, String, Value)>>,
+}
+
+impl ScriptedReview {
+    fn new(name: &'static str, verdict: ReviewVerdict) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            verdict,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// `(call_id, tool, arguments)` for each proposal reviewed, in order.
+    fn seen(&self) -> Vec<(String, String, Value)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ProposalReview<()> for ScriptedReview {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    async fn review(
+        &self,
+        proposal: &ToolProposal<'_>,
+        _context: &(),
+    ) -> Result<ReviewVerdict, BoxError> {
+        self.seen.lock().unwrap().push((
+            proposal.call_id.to_owned(),
+            proposal.tool.to_owned(),
+            proposal.arguments.clone(),
+        ));
+        Ok(self.verdict.clone())
+    }
+}
+
+struct FailingReview;
+
+#[async_trait]
+impl ProposalReview<()> for FailingReview {
+    fn name(&self) -> &str {
+        "failing-review"
+    }
+
+    async fn review(
+        &self,
+        _proposal: &ToolProposal<'_>,
+        _context: &(),
+    ) -> Result<ReviewVerdict, BoxError> {
+        Err(Box::new(io::Error::other("reviewer exploded")) as BoxError)
+    }
+}
+
+struct ReviewedRun {
+    result: RunResult,
+    calls: Arc<AtomicUsize>,
+    events: Vec<RunEvent>,
+    model: Arc<QueueModel>,
+}
+
+/// Runs one agent that proposes `add(call-1, {left: 2, right: 3})` and then
+/// finishes, with the given reviewers registered in order.
+async fn run_reviewed(reviews: Vec<Arc<dyn ProposalReview<()>>>) -> ReviewedRun {
+    let model = Arc::new(QueueModel::new([
+        ModelResponse::actions(vec![ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({ "left": 2, "right": 3 }),
+        ))]),
+        ModelResponse::final_output("Done."),
+    ]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new("worker", "Worker", "Use tools.", model.clone()).with_tool(
+        Arc::new(CountingCallTool {
+            calls: calls.clone(),
+        }),
+    );
+    for review in reviews {
+        agent = agent.with_proposal_review(review);
+    }
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([agent])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let result = runner
+        .run("worker", "Add 2 and 3.", &(), RunOptions::default())
+        .await
+        .unwrap();
+
+    ReviewedRun {
+        result,
+        calls,
+        events: observer.events(),
+        model,
+    }
+}
+
+fn reviewed_outcomes(events: &[RunEvent]) -> Vec<(String, ReviewOutcome)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RunEvent::ProposalReviewed {
+                reviewer, verdict, ..
+            } => Some((reviewer.clone(), *verdict)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Asserts the non-permit contract: the tool never ran, no dispatch events
+/// were emitted, the transcript carries the proposal followed by an
+/// `executed: false` result naming the deciding reviewer, and the model saw
+/// that result on its next turn.
+fn assert_not_executed(run: &ReviewedRun, reviewer: &str, verdict: &str, reason: &str) {
+    assert_eq!(run.calls.load(Ordering::SeqCst), 0, "tool must not execute");
+    assert_eq!(run.result.final_output, "Done.", "the run stays alive");
+    assert_eq!(run.result.turns, 2);
+    assert!(
+        !run.events.iter().any(|event| matches!(
+            event,
+            RunEvent::ToolStarted { .. } | RunEvent::ToolCompleted { .. }
+        )),
+        "no dispatch events for an unexecuted call, got {:?}",
+        run.events
+    );
+    assert_paired_lifecycle(&run.events);
+
+    let expected = json!({
+        "executed": false,
+        "review": { "reviewer": reviewer, "verdict": verdict, "reason": reason },
+    });
+    let items = &run.result.new_items;
+    let call_index = items
+        .iter()
+        .position(|item| matches!(item, RunItem::ToolCall { call, .. } if call.id == "call-1"))
+        .expect("the proposal is still transcript");
+    assert!(
+        matches!(
+            &items[call_index + 1],
+            RunItem::ToolResult { call_id, tool, output, .. }
+                if call_id == "call-1" && tool == "add" && output == &expected
+        ),
+        "expected an executed:false result after the call, got {items:?}"
+    );
+    let second_request = &run.model.requests()[1];
+    assert!(
+        second_request.items.iter().any(|item| matches!(
+            item,
+            RunItem::ToolResult { output, .. } if output == &expected
+        )),
+        "the model must see the review result as an ordinary tool result"
+    );
+}
+
+#[tokio::test]
+async fn permitted_proposal_executes_the_tool() {
+    let review = ScriptedReview::new("permit-all", ReviewVerdict::Permit);
+    let run = run_reviewed(vec![review.clone()]).await;
+
+    assert_eq!(run.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(run.result.final_output, "Done.");
+    assert_eq!(
+        reviewed_outcomes(&run.events),
+        [("permit-all".to_owned(), ReviewOutcome::Permit)]
+    );
+    let reviewed = run
+        .events
+        .iter()
+        .position(|event| matches!(event, RunEvent::ProposalReviewed { .. }))
+        .unwrap();
+    let started = run
+        .events
+        .iter()
+        .position(
+            |event| matches!(event, RunEvent::ToolStarted { call_id, .. } if call_id == "call-1"),
+        )
+        .expect("permitted call is dispatched");
+    assert!(
+        run.events.iter().any(|event| {
+            matches!(event, RunEvent::ToolCompleted { call_id, .. } if call_id == "call-1")
+        }),
+        "permitted call completes"
+    );
+    assert!(reviewed < started, "review precedes dispatch");
+    assert!(run.result.new_items.iter().any(|item| matches!(
+        item,
+        RunItem::ToolResult { output, .. } if output == &json!({ "ok": true })
+    )));
+}
+
+#[tokio::test]
+async fn proposal_only_verdict_records_the_call_without_executing_it() {
+    let review = ScriptedReview::new("scripted", ReviewVerdict::proposal_only("needs sign-off"));
+    let run = run_reviewed(vec![review]).await;
+
+    assert_not_executed(&run, "scripted", "proposal_only", "needs sign-off");
+    assert_eq!(
+        reviewed_outcomes(&run.events),
+        [("scripted".to_owned(), ReviewOutcome::ProposalOnly)]
+    );
+}
+
+#[tokio::test]
+async fn reject_verdict_records_the_call_without_executing_it() {
+    let review = ScriptedReview::new("scripted", ReviewVerdict::reject("out of policy"));
+    let run = run_reviewed(vec![review]).await;
+
+    assert_not_executed(&run, "scripted", "reject", "out of policy");
+    assert_eq!(
+        reviewed_outcomes(&run.events),
+        [("scripted".to_owned(), ReviewOutcome::Reject)]
+    );
+}
+
+#[tokio::test]
+async fn unavailable_verdict_records_the_call_without_executing_it() {
+    let review = ScriptedReview::new("scripted", ReviewVerdict::unavailable("reviewer offline"));
+    let run = run_reviewed(vec![review]).await;
+
+    assert_not_executed(&run, "scripted", "unavailable", "reviewer offline");
+    assert_eq!(
+        reviewed_outcomes(&run.events),
+        [("scripted".to_owned(), ReviewOutcome::Unavailable)]
+    );
+}
+
+#[tokio::test]
+async fn reviewer_error_fails_the_run_with_proposal_review_kind() {
+    let model = Arc::new(QueueModel::new([
+        ModelResponse::actions(vec![ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({ "left": 2, "right": 3 }),
+        ))]),
+        ModelResponse::final_output("Done."),
+    ]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new("worker", "Worker", "Use tools.", model)
+        .with_tool(Arc::new(CountingCallTool {
+            calls: calls.clone(),
+        }))
+        .with_proposal_review(Arc::new(FailingReview));
+    let observer = Arc::new(RecordingCombinedObserver::default());
+    let runner = Runner::new([agent])
+        .unwrap()
+        .with_observer(observer.clone())
+        .with_invocation_observer(observer.clone());
+
+    let failure = runner
+        .run("worker", "Add 2 and 3.", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::ProposalReviewFailed {
+            ref reviewer,
+            ref source,
+            ..
+        } if reviewer == "failing-review" && source.to_string() == "reviewer exploded"
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let events = observer.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservedEvent::Run(RunEvent::RunFailed {
+            kind: RunFailureKind::ProposalReview,
+            ..
+        })
+    )));
+    let reviewed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                ObservedEvent::Run(RunEvent::ProposalReviewed {
+                    reviewer,
+                    verdict: ReviewOutcome::Unavailable,
+                    ..
+                }) if reviewer == "failing-review"
+            )
+        })
+        .expect("reviewer error still emits a review event");
+    let failed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                ObservedEvent::Run(RunEvent::RunFailed {
+                    kind: RunFailureKind::ProposalReview,
+                    ..
+                })
+            )
+        })
+        .expect("reviewer error emits run failure");
+    assert!(
+        reviewed < failed,
+        "proposal review event must be observed before run failure"
+    );
+    let invocation_failed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                ObservedEvent::Invocation(InvocationEvent {
+                    event: InvocationEventKind::Failed {
+                        kind: InvocationFailureKind::ProposalReview,
+                        ..
+                    },
+                    ..
+                })
+            )
+        })
+        .expect("invocation observer records proposal-review failure kind");
+    assert!(
+        reviewed < invocation_failed,
+        "proposal review event must be observed before invocation failure"
+    );
+}
+
+#[tokio::test]
+async fn first_non_permit_verdict_wins_and_every_consulted_reviewer_is_observed() {
+    let first = ScriptedReview::new("first", ReviewVerdict::Permit);
+    let second = ScriptedReview::new("second", ReviewVerdict::reject("second says no"));
+    let run = run_reviewed(vec![first.clone(), second.clone()]).await;
+
+    assert_not_executed(&run, "second", "reject", "second says no");
+    assert_eq!(first.seen().len(), 1);
+    assert_eq!(second.seen().len(), 1);
+    assert_eq!(
+        reviewed_outcomes(&run.events),
+        [
+            ("first".to_owned(), ReviewOutcome::Permit),
+            ("second".to_owned(), ReviewOutcome::Reject),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn reviewers_after_a_non_permit_verdict_are_not_consulted() {
+    let first = ScriptedReview::new("first", ReviewVerdict::reject("first says no"));
+    let second = ScriptedReview::new("second", ReviewVerdict::Permit);
+    let run = run_reviewed(vec![first.clone(), second.clone()]).await;
+
+    assert_not_executed(&run, "first", "reject", "first says no");
+    assert_eq!(first.seen().len(), 1);
+    assert!(
+        second.seen().is_empty(),
+        "a later reviewer must not see a call already decided"
+    );
+    assert_eq!(
+        reviewed_outcomes(&run.events),
+        [("first".to_owned(), ReviewOutcome::Reject)]
+    );
+}
+
+#[tokio::test]
+async fn reviewer_sees_the_exact_call_the_model_proposed() {
+    let review = ScriptedReview::new("recording", ReviewVerdict::Permit);
+    let run = run_reviewed(vec![review.clone()]).await;
+
+    assert_eq!(run.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        review.seen(),
+        [(
+            "call-1".to_owned(),
+            "add".to_owned(),
+            json!({ "left": 2, "right": 3 })
+        )]
+    );
+}
+
+#[tokio::test]
+async fn handoff_target_reviewers_apply_to_its_own_tool_calls() {
+    let triage_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-worker")),
+    ])]));
+    let worker_model = Arc::new(QueueModel::new([
+        ModelResponse::actions(vec![ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({}),
+        ))]),
+        ModelResponse::final_output("Worker done."),
+    ]));
+    let triage_review = ScriptedReview::new("triage-review", ReviewVerdict::Permit);
+    let worker_review =
+        ScriptedReview::new("worker-review", ReviewVerdict::reject("worker policy"));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let triage = Agent::new("triage", "Triage", "Route.", triage_model)
+        .with_handoff(Handoff::new("to-worker", "Route to the worker", "worker"))
+        .with_proposal_review(triage_review.clone());
+    let worker = Agent::new("worker", "Worker", "Use tools.", worker_model)
+        .with_tool(Arc::new(CountingCallTool {
+            calls: calls.clone(),
+        }))
+        .with_proposal_review(worker_review.clone());
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([triage, worker])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let result = runner
+        .run("triage", "Please route this.", &(), RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.final_agent.as_str(), "worker");
+    assert_eq!(result.handoffs, 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the target's reviewer gates its tools"
+    );
+    assert_eq!(worker_review.seen().len(), 1);
+    assert!(
+        triage_review.seen().is_empty(),
+        "the previous agent's reviewers do not review the target's calls"
+    );
+    let events = observer.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunEvent::ProposalReviewed { agent, reviewer, tool, call_id, verdict: ReviewOutcome::Reject, .. }
+            if agent.as_str() == "worker"
+                && reviewer == "worker-review"
+                && tool == "add"
+                && call_id == "call-1"
+    )));
+    assert!(result.new_items.iter().any(|item| matches!(
+        item,
+        RunItem::ToolResult { agent, output, .. }
+            if agent.as_str() == "worker" && output["executed"] == json!(false)
+    )));
+}
+
+#[tokio::test]
+async fn agents_without_reviewers_emit_no_review_events() {
+    let run = run_reviewed(Vec::new()).await;
+
+    assert_eq!(run.calls.load(Ordering::SeqCst), 1);
+    assert!(reviewed_outcomes(&run.events).is_empty());
+}
+
+#[test]
+fn duplicate_proposal_review_names_are_rejected() {
+    let model = Arc::new(QueueModel::default());
+    let agent = Agent::new("worker", "Worker", "Use tools.", model)
+        .with_proposal_review(ScriptedReview::new("scripted", ReviewVerdict::Permit))
+        .with_proposal_review(ScriptedReview::new("scripted", ReviewVerdict::Permit));
+
+    let error = Runner::new([agent])
+        .err()
+        .expect("duplicate reviewer names fail");
+
+    assert_eq!(
+        error,
+        ConfigError::DuplicateProposalReview {
+            agent: "worker".into(),
+            name: "scripted".to_owned(),
+        }
+    );
 }

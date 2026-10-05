@@ -3,8 +3,8 @@ use std::{fmt, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentRef, AgentRefError, AgentRevision, InputGuardrail, Model, OutputGuardrail, Tool,
-    ToolDefinition,
+    AgentRef, AgentRefError, AgentRevision, InputGuardrail, Model, OutputGuardrail, ProposalReview,
+    Tool, ToolDefinition,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -81,6 +81,7 @@ where
     pub(crate) handoffs: Vec<Handoff>,
     pub(crate) input_guardrails: Vec<Arc<dyn InputGuardrail<C>>>,
     pub(crate) output_guardrails: Vec<Arc<dyn OutputGuardrail<C>>>,
+    pub(crate) proposal_reviews: Vec<Arc<dyn ProposalReview<C>>>,
 }
 
 impl<C> Agent<C>
@@ -103,6 +104,7 @@ where
             handoffs: Vec::new(),
             input_guardrails: Vec::new(),
             output_guardrails: Vec::new(),
+            proposal_reviews: Vec::new(),
         }
     }
 
@@ -152,6 +154,14 @@ where
 
     pub fn with_output_guardrail(mut self, guardrail: Arc<dyn OutputGuardrail<C>>) -> Self {
         self.output_guardrails.push(guardrail);
+        self
+    }
+
+    /// Registers a pre-dispatch reviewer. Reviewers run in registration order
+    /// before every tool call this agent makes; the first non-permit verdict
+    /// wins and the tool is not executed.
+    pub fn with_proposal_review(mut self, review: Arc<dyn ProposalReview<C>>) -> Self {
+        self.proposal_reviews.push(review);
         self
     }
 }

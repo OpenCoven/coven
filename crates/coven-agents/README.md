@@ -8,6 +8,7 @@ applications, and familiar runtimes can share:
 - journaled goal loops with explicit exit criteria
 - agent handoffs
 - blocking input and output guardrails
+- fail-closed review of proposed tool calls before dispatch
 - pluggable session journals
 - persistent loop journals that can be rediscovered after process or machine restart
 - explicit offline reconciliation before ambiguous work resumes
@@ -18,6 +19,23 @@ applications, and familiar runtimes can share:
 Input guardrails apply to the starting agent, and output guardrails apply to the
 agent that produces the final output. A `SessionStore` must serialize writers
 for each session id or implement optimistic concurrency control.
+
+`ProposalReview<C>` sits beside the guardrail traits. Reviewers are registered
+per agent with `Agent::with_proposal_review` and see each resolved tool call
+(name and arguments) before it runs, returning `Permit`, `ProposalOnly`,
+`Reject`, or `Unavailable`. Reviewers run in registration order and the first
+non-permit verdict wins. The seam fails closed: a reviewer that returns an error
+fails the run with `RunFailureKind::ProposalReview`; there is no default
+permit. A non-permitted call does not fail the run. The runner records the
+`RunItem::ToolCall`, skips execution, and appends a `RunItem::ToolResult` of
+`{"executed": false, "review": {"reviewer", "verdict", "reason"}}` so the model
+sees the decision as an ordinary tool result. Observers receive one
+`RunEvent::ProposalReviewed` per reviewer consulted, carrying the payload-free
+`ReviewOutcome` and never the reason. A handoff target's reviewers gate its own
+tool calls. Verdicts are evidence, not authorization: a permit records that a
+named reviewer raised no objection, it grants no capability and is not an
+operator approval. The crate ships the seam and fake reviewers only; a live
+reviewer is an adapter that implements the trait outside this crate.
 
 A failed run returns `RunFailure`, which carries the transcript produced before
 the failure alongside the error, so a failing tool never costs the caller the
@@ -77,7 +95,8 @@ applications should adapt `LoopJournal` to their authoritative store; the crate
 does not own SQLite, daemon scheduling, GitHub labels, or UI state.
 
 The crate deliberately does not include an OpenAI client, a daemon command,
-MCP, sandbox execution, voice, or realtime transport. Those are adapters and
+MCP, sandbox execution, voice, realtime transport, or an HTTP-backed proposal
+reviewer. Those are adapters and
 application concerns. Keeping this crate as a workspace leaf also allows it to
 move into its own repository if the API stabilizes.
 
