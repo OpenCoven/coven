@@ -8,7 +8,14 @@ use std::path::PathBuf;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = fs::read_to_string(std::env::current_exe()?.with_extension("settings"))?;
     let mut lines = settings.lines();
-    let exit_code: i32 = lines.next().ok_or("missing exit code")?.parse()?;
+    let mode = lines.next().ok_or("missing mode or exit code")?;
+    if mode == "git" {
+        let status = std::process::Command::new(lines.next().ok_or("missing Git path")?)
+            .args(std::env::args_os().skip(1))
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    let exit_code: i32 = mode.parse()?;
     let hold = lines.next().ok_or("missing hold setting")? == "true";
     let record = PathBuf::from(lines.next().ok_or("missing record path")?);
     let args: Vec<String> = std::env::args().skip(1).collect();

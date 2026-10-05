@@ -101,6 +101,22 @@ fn write_recording_harness(
         build().map_err(|error| format!("{error:#}"))
     });
     let (_, probe) = probe.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+    if name == "coven-code" {
+        // Coven resolves the shared claim directory through Git before launch.
+        // Proxy only Git, rather than exposing the inherited provider PATH.
+        let output = Command::new("where.exe").arg("git.exe").output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Git is required by the parity fixture"
+        );
+        let paths = String::from_utf8(output.stdout)?;
+        let git = paths
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Git not found"))?;
+        fs::copy(probe, bin_dir.join("git.exe"))?;
+        fs::write(bin_dir.join("git.settings"), format!("git\n{git}\n"))?;
+    }
     let native = if name == "codex" {
         // Noninteractive Codex resolves its official npm shim to this native
         // executable. A fake arbitrary batch file must remain rejected.
