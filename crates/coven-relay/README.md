@@ -38,12 +38,14 @@ The current server bounds:
 
 - active rooms: 1,024;
 - peers per room: one host and one client;
-- WebSocket message size: 4 MiB;
-- WebSocket frame size: 64 KiB;
-- queued live frames per peer: 32;
+- inbound WebSocket message size: 4 MiB;
+- inbound WebSocket frame size: 64 KiB;
+- queued application messages per peer: 32;
 - queued and in-flight application data across the relay: 16 MiB;
 - outbound send lifetime: 10 seconds;
 - idle lifetime: 120 seconds.
+
+Fragmented inbound messages are reassembled and forwarded as one binary message with unchanged payload bytes. Outbound frame boundaries can differ from inbound frame boundaries.
 
 These defaults are deliberately conservative and may become explicit deployment configuration after production measurements. The diagnostic subscriber accepts only relay-owned event targets, even with `RUST_LOG=trace`: dependency logs can contain HTTP credentials or frame data and are suppressed. Relay-owned diagnostics must never include room identifiers, credentials, or application frames.
 
@@ -53,7 +55,7 @@ Run the transport suite independently:
 
 ```sh
 CARGO_TARGET_DIR=/tmp/coven-relay-target cargo test -p coven-relay --locked ws::wire
-cargo clippy -p coven-relay --all-targets --locked -- -D warnings
+CARGO_TARGET_DIR=/tmp/coven-relay-target cargo clippy -p coven-relay --all-targets --locked -- -D warnings
 ```
 
 The suite starts the actual Axum handler on ephemeral loopback TCP ports and
