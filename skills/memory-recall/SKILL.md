@@ -12,7 +12,9 @@ Retrieval-side contract for the Coven memory layer (Authoritative Plan v1 hole #
 issue `the memory recall implementation`). Any familiar, under any runtime, uses this skill to pull
 already-promoted facts back into working context. It does **not** write, promote,
 or mutate anything under `~/.coven/memory` — that is the promotion layer's job
-(`coven memory promote`, schema: `familiar-contract/schemas/coven-memory-schema.md` §11).
+(schema: `familiar-contract/schemas/coven-memory-schema.md` §11). A
+`coven memory promote` command is planned but does not exist yet; see
+[`docs/memory/attested-promotion.md`](../../docs/memory/attested-promotion.md).
 
 ## When to use
 
