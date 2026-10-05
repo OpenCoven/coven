@@ -41,6 +41,9 @@ pub mod recovery;
 mod release_upgrade_tests;
 pub mod rich_definition;
 pub mod rrule;
+// Runtime Authority launch envelopes; slice 6 launches them.
+#[allow(dead_code)]
+pub mod runtime_envelope;
 // The inbox is intentionally internal until a trusted runtime adapter exists.
 pub mod runner;
 pub mod runs;
@@ -48,6 +51,7 @@ pub mod runs;
 pub mod runtime_terminal_evidence;
 pub mod schedule;
 pub mod store;
+pub mod stream_observation;
 // Wired into every session ending; it observes only Runtime Authority attempts,
 // which nothing dispatches until the trusted adapter (coven#857 slice 6).
 pub mod terminal_observer;

@@ -7,14 +7,18 @@
 //! `terminal-observer` key, and stores it through the evidence inbox (#1193),
 //! which verifies it against the attempt's pinned execution binding.
 //!
-//! It reports only what it observed, never what the binding granted. Today's
-//! launches print plain text (`--print`, and codex without `--json`), so the
-//! executor sees how the process ended but not which capabilities it
-//! exercised, what effects they had, what result it produced or whether that
-//! result was delivered. Each of those is `unknown`. Evidence with an unknown
-//! member classifies as `authenticated_unknown`, which the evidence consumer
-//! holds for recovery rather than settling. Structured tool events wait for the
-//! Threads capability vocabulary (slice 4).
+//! It reports only what it observed, never what the binding granted.
+//! - **Plain-text launch.** The executor sees how the process ended, but not
+//!   which capabilities it exercised, what effects they had, what result it
+//!   produced or whether that result was delivered. Each of those is
+//!   `unknown`. Evidence with an unknown member classifies as
+//!   `authenticated_unknown`, which the evidence consumer holds for recovery
+//!   rather than settling.
+//! - **Structured envelope.** When the binding pins a structured runtime
+//!   envelope ([`super::runtime_envelope`]), the session's recorded stream is
+//!   classified instead ([`super::stream_observation`]). A stream that
+//!   accounts for everything yields complete evidence. Anything it cannot
+//!   account for leaves coverage partial, and the run is held.
 
 use std::path::{Path, PathBuf};
 
@@ -34,7 +38,9 @@ use super::contract::runtime_terminal_evidence::{
 };
 use super::contract::types::TerminalOutcome;
 use super::ed25519_trust::Ed25519TerminalEvidenceVerifier;
+use super::runtime_envelope::{self, StreamFormat};
 use super::runtime_terminal_evidence::{self, RuntimeTerminalEvidenceStoreOutcome};
+use super::stream_observation::{classify_claude_stream, StreamObservation, StreamResult};
 
 /// Why a plain-text launch leaves capabilities and side effects unknown.
 const UNSTRUCTURED_OUTPUT: &str = "unstructured_runtime_output";
@@ -94,9 +100,23 @@ pub(crate) fn record(
         let key =
             authority_keys::existing_signing_key(conn, &home, AuthorityKeyRole::TerminalObserver)?
                 .context("there is no terminal-observer key")?;
+        let stream = match runtime_envelope::by_descriptor_digest(
+            binding.runtime.descriptor_digest.value.as_str(),
+        ) {
+            Some(envelope) => {
+                let (output, altered) = session_output(conn, session_id)?;
+                Some(match envelope.stream {
+                    StreamFormat::ClaudeStreamJson => {
+                        classify_claude_stream(envelope, &output, altered)
+                    }
+                })
+            }
+            None => None,
+        };
         let observation = TerminalObservation {
             session_id,
             disposition,
+            stream: stream.as_ref(),
         };
         let evidence = observe(&key, &binding, &observation, now)?;
         let trusted = authority_keys::trusted_keys(conn, AuthorityKeyRole::TerminalObserver)?;
@@ -142,11 +162,46 @@ fn store_home(conn: &Connection) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// The session's recorded output in order, and whether it differs from what
+/// the harness emitted, because some was dropped under pressure or redacted.
+fn session_output(conn: &Connection, session_id: &str) -> Result<(String, bool)> {
+    let mut statement = conn
+        .prepare(
+            "SELECT kind, payload_json, redaction_status FROM events
+             WHERE session_id = ?1 AND kind IN ('output', 'output_truncated')
+             ORDER BY rowid",
+        )
+        .context("failed to prepare the session output read")?;
+    let mut rows = statement
+        .query([session_id])
+        .context("failed to read the session output")?;
+    let mut output = String::new();
+    let mut altered = false;
+    while let Some(row) = rows.next().context("failed to read session output")? {
+        let kind: String = row.get(0)?;
+        let status: String = row.get(2)?;
+        if kind == "output_truncated" || status != "clean" {
+            altered = true;
+            continue;
+        }
+        let payload: Value =
+            serde_json::from_str(&row.get::<_, String>(1)?).context("output payload is JSON")?;
+        output.push_str(
+            payload["data"]
+                .as_str()
+                .context("an output event carries its data")?,
+        );
+    }
+    Ok((output, altered))
+}
+
 /// What the executor saw when the session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TerminalObservation<'a> {
     pub session_id: &'a str,
     pub disposition: TerminalOutcome,
+    /// The classified stream, when the binding pins a structured envelope.
+    pub stream: Option<&'a StreamObservation>,
 }
 
 /// The signed evidence for `observation` of the attempt `binding` pins,
@@ -161,6 +216,42 @@ pub(crate) fn observe(
         .duration_trunc(TimeDelta::milliseconds(1))
         .context("observation time cannot be represented")?;
     let unknown = |reason: &str| json!({ "state": "unknown", "reasonCode": reason });
+    let (side_effects, capabilities, result, delivery) = match observation.stream {
+        None => (
+            unknown(UNSTRUCTURED_OUTPUT),
+            unknown(UNSTRUCTURED_OUTPUT),
+            unknown(RESULT_NOT_OBSERVED),
+            unknown(DELIVERY_NOT_OBSERVED),
+        ),
+        Some(stream) => {
+            let coverage = if stream.complete {
+                "complete"
+            } else {
+                "partial"
+            };
+            let result = match &stream.result {
+                StreamResult::Produced(text) => {
+                    let canonical = canonicalize(&json!(text)).context("a result is I-JSON")?;
+                    json!({ "state": "produced", "digest": digest_value(&sha256_hex(&canonical)) })
+                }
+                StreamResult::NotProduced => json!({ "state": "not_produced" }),
+                StreamResult::Unobserved => unknown(RESULT_NOT_OBSERVED),
+            };
+            // An envelope's tools cannot deliver anything. When coverage is
+            // partial, something the stream did not account for may have.
+            let delivery = if stream.complete {
+                json!({ "state": "not_attempted" })
+            } else {
+                unknown(DELIVERY_NOT_OBSERVED)
+            };
+            (
+                json!({ "state": "observed", "maximumClass": stream.side_effects, "coverage": coverage }),
+                json!({ "state": "observed", "values": stream.capabilities, "coverage": coverage }),
+                result,
+                delivery,
+            )
+        }
+    };
     let mut evidence = json!({
         "profile": RUNTIME_TERMINAL_EVIDENCE_PROFILE,
         // One observation per attempt: the inbox keys evidence by attempt.
@@ -178,10 +269,10 @@ pub(crate) fn observe(
         },
         "producedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
         "disposition": observation.disposition,
-        "sideEffects": unknown(UNSTRUCTURED_OUTPUT),
-        "exercisedCapabilities": unknown(UNSTRUCTURED_OUTPUT),
-        "result": unknown(RESULT_NOT_OBSERVED),
-        "delivery": unknown(DELIVERY_NOT_OBSERVED),
+        "sideEffects": side_effects,
+        "exercisedCapabilities": capabilities,
+        "result": result,
+        "delivery": delivery,
         "producer": {
             "component": PRODUCER_COMPONENT,
             "instanceId": PRODUCER_INSTANCE_ID,
@@ -249,13 +340,22 @@ pub(crate) mod test_support {
     /// Seeds the store under `home`. With `observer_key`, the daemon's
     /// terminal-observer key exists from before the run started.
     pub(crate) fn seed(home: &Path, observer_key: bool) -> Connection {
+        seed_with_binding(home, observer_key, fixture("binding"))
+    }
+
+    /// [`seed`], with the attempt pinned to `binding`.
+    pub(crate) fn seed_with_binding(
+        home: &Path,
+        observer_key: bool,
+        binding: serde_json::Value,
+    ) -> Connection {
         let path = home.join(crate::STORE_FILE_NAME);
         crate::store::initialize_store(&path).unwrap();
         let conn = crate::store::open_initialized_store(&path).unwrap();
         let extension = json!({
             "profile": "coven.automations.authority.v1",
             "kind": "AutomationAuthorityExtension",
-            "executionBinding": fixture("binding"),
+            "executionBinding": binding,
             "receiptEvidence": null
         });
         conn.execute_batch(
@@ -358,6 +458,7 @@ mod tests {
             let observation = TerminalObservation {
                 session_id: "session-daily-notes-1",
                 disposition,
+                stream: None,
             };
             let evidence = observe(&key, &binding, &observation, at(10)).unwrap();
             let value = serde_json::to_value(&evidence).unwrap();
@@ -386,6 +487,7 @@ mod tests {
         let observation = TerminalObservation {
             session_id: "session-daily-notes-1",
             disposition: TerminalOutcome::Succeeded,
+            stream: None,
         };
         let refusal = |role: AuthorityKeyRole, produced: DateTime<Utc>| {
             let key = authority_keys::current_signing_key(&conn, temp.path(), role, at(9)).unwrap();
@@ -609,5 +711,155 @@ mod tests {
         );
         // How the process ended was not seen.
         assert_eq!(stored(&conn).unwrap()["disposition"], json!("ambiguous"));
+    }
+
+    /// A store whose attempt's binding pins the R0 claude envelope, with
+    /// `output` recorded for its session in `chunks`.
+    fn seed_stream(home: &std::path::Path, chunks: &[(&str, &str)]) -> Connection {
+        use crate::automations::contract::authority::test_support::{fixture, resign_binding};
+        let mut binding = fixture("binding");
+        binding["runtime"]["descriptorDigest"]["value"] =
+            json!(crate::automations::runtime_envelope::CLAUDE_R0_READ.descriptor_digest());
+        resign_binding(&mut binding);
+        let conn = test_support::seed_with_binding(home, true, binding);
+        for (index, (data, status)) in chunks.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO events (id, session_id, kind, payload_json, created_at, redaction_status)
+                 VALUES (?1, ?2, 'output', ?3, '2026-09-03T12:10:00.000Z', ?4)",
+                rusqlite::params![
+                    format!("event-{index}"),
+                    SESSION_ID,
+                    json!({ "data": data }).to_string(),
+                    status
+                ],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn classification(conn: &Connection) -> RuntimeTerminalEvidenceClassification {
+        read_verified_runtime_terminal_evidence(
+            conn,
+            RuntimeTerminalEvidenceLookup::AttemptId("attempt.daily-notes-1-1"),
+            &Ed25519TerminalEvidenceVerifier(
+                &authority_keys::trusted_keys(conn, AuthorityKeyRole::TerminalObserver).unwrap(),
+            ),
+        )
+        .unwrap()
+        .unwrap()
+        .classification
+    }
+
+    #[test]
+    fn a_clean_structured_read_run_yields_receipt_eligible_evidence() {
+        use crate::automations::stream_observation::test_support::{read_run, stream};
+        let temp = tempfile::tempdir().unwrap();
+        let output = stream(&read_run());
+        // Chunks split lines; the observer reads them back in order.
+        let (first, second) = output.split_at(output.len() / 2);
+        let conn = seed_stream(temp.path(), &[(first, "clean"), (second, "clean")]);
+        assert_eq!(
+            record(&conn, SESSION_ID, TerminalOutcome::Succeeded, ended_at()),
+            Recorded::Stored
+        );
+        assert_eq!(
+            classification(&conn),
+            RuntimeTerminalEvidenceClassification::ReceiptEligibleComplete
+        );
+        let evidence: Value = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT canonical_json FROM automation_runtime_terminal_evidence",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence["exercisedCapabilities"],
+            json!({ "state": "observed", "values": ["analysis.read"], "coverage": "complete" })
+        );
+        assert_eq!(
+            evidence["sideEffects"],
+            json!({ "state": "observed", "maximumClass": "local_read", "coverage": "complete" })
+        );
+        assert_eq!(evidence["result"]["state"], json!("produced"));
+        assert_eq!(evidence["delivery"], json!({ "state": "not_attempted" }));
+    }
+
+    #[test]
+    fn a_structured_run_with_an_unknown_system_event_is_held() {
+        use crate::automations::stream_observation::test_support::{read_run, stream};
+        let temp = tempfile::tempdir().unwrap();
+        let mut lines = read_run();
+        lines.insert(
+            2,
+            json!({ "type": "system", "subtype": "unrecognized_activity" }).to_string(),
+        );
+        let output = stream(&lines);
+        let conn = seed_stream(temp.path(), &[(output.as_str(), "clean")]);
+        assert_eq!(
+            record(&conn, SESSION_ID, TerminalOutcome::Succeeded, ended_at()),
+            Recorded::Stored
+        );
+        assert!(matches!(
+            classification(&conn),
+            RuntimeTerminalEvidenceClassification::AuthenticatedPartialOrAmbiguous
+                | RuntimeTerminalEvidenceClassification::AuthenticatedUnknown
+        ));
+    }
+
+    #[test]
+    fn a_structured_run_with_altered_output_is_held() {
+        use crate::automations::stream_observation::test_support::{read_run, stream};
+        for status in ["redacted", "clean"] {
+            let temp = tempfile::tempdir().unwrap();
+            let output = stream(&read_run());
+            // Either a redacted chunk, or a stream cut short by the kill.
+            let (data, status) = if status == "redacted" {
+                (output.as_str(), "redacted")
+            } else {
+                (&output[..output.len() / 2], "clean")
+            };
+            let conn = seed_stream(temp.path(), &[(data, status)]);
+            assert_eq!(
+                record(&conn, SESSION_ID, TerminalOutcome::TimedOut, ended_at()),
+                Recorded::Stored
+            );
+            let held = classification(&conn);
+            assert!(
+                matches!(
+                    held,
+                    RuntimeTerminalEvidenceClassification::AuthenticatedPartialOrAmbiguous
+                        | RuntimeTerminalEvidenceClassification::AuthenticatedUnknown
+                ),
+                "{status}: {held:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_that_looks_like_a_stream_is_not_classified() {
+        use crate::automations::stream_observation::test_support::{read_run, stream};
+        let temp = tempfile::tempdir().unwrap();
+        // The fixture binding pins no envelope: its output is plain text,
+        // whatever it looks like.
+        let conn = test_support::seed(temp.path(), true);
+        conn.execute(
+            "INSERT INTO events (id, session_id, kind, payload_json, created_at, redaction_status)
+             VALUES ('event-0', ?1, 'output', ?2, '2026-09-03T12:10:00.000Z', 'clean')",
+            rusqlite::params![
+                SESSION_ID,
+                json!({ "data": stream(&read_run()) }).to_string()
+            ],
+        )
+        .unwrap();
+        record(&conn, SESSION_ID, TerminalOutcome::Succeeded, ended_at());
+        assert_eq!(
+            classification(&conn),
+            RuntimeTerminalEvidenceClassification::AuthenticatedUnknown
+        );
     }
 }
