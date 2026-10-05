@@ -920,6 +920,24 @@ fn handle_request_with_runtime_authority_and_automation_time(
                     crate::automations::owner_grants::CommandAuthority::Unauthenticated
                 }
             };
+            if payload
+                .get("action")
+                .and_then(Value::as_str)
+                .is_some_and(|action| {
+                    action
+                        .trim()
+                        .starts_with(crate::familiar_ledger::ACTION_PREFIX)
+                })
+            {
+                let (status, response) = crate::familiar_ledger::route(
+                    &payload,
+                    &conn,
+                    coven_home,
+                    command_authority,
+                    Utc::now(),
+                );
+                return json_response(status, &response);
+            }
             let (status, response) = match automation_recorded_at {
                 Some(recorded_at) => control_plane::route_action_at(
                     payload,

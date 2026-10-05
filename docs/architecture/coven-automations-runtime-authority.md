@@ -1,6 +1,6 @@
 # Coven Automations Runtime Authority: trust decisions
 
-Status: maintainer decisions recorded 2026-10-03; slices 1, 2 and 5
+Status: maintainer decisions recorded 2026-10-03; slices 1–3 and 5
 implemented, Runtime Authority not yet constructed
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
@@ -29,6 +29,83 @@ an authenticated, operation-bound principal path may exist. It names what
 authenticates the principal and what binds the operation. It does not by
 itself reopen the Threads promotion seam (`ward_updated`); that remains a
 separate Threads decision.
+
+Decision 2 supersedes #1137's "Coven must not mint roots, provision trust": the
+daemon mints familiar roots and signs their evidence with its own
+`familiar-binding` key. The rest of that line still holds: Coven shells out to
+no verifier, accepts no request-supplied ledger observation, and trusts a
+binding only through its own key policy, never the key the binding carries.
+
+## Familiar ledger
+
+These follow from Decision 2 and were decided on 2026-10-03 for slice 3.
+
+- **The verifier belongs to the contract.** The `familiar.embodiment_binding.v1`
+  verifier is the `familiar-contract` crate in OpenCoven/familiar-contract,
+  tested there against the contract's vectors and against the JavaScript
+  reference. Coven pins it by revision, as it pins `coven-threads-core`.
+- **Only owner commands change the ledger.** Coven has no committed declaration
+  state: `SOUL.md`, `IDENTITY.md` and `ward.toml` are read from disk, and the
+  roster can change out of band. So nothing is minted on observation.
+  Owner-local commands register a familiar (genesis), adopt its current
+  declarations as a new revision, retire it, revoke a revision, or restore a
+  retired familiar. The issuer re-reads the declarations and refuses a binding
+  when they no longer match the head, so a changed declaration needs an
+  explicit adopt before it can be embodied.
+- **What a revision declares.** Each revision retains a
+  `familiar.identity_bundle.v1` whose components wrap the exact declaration
+  text in JSON objects: the identity declaration holds the roster's identity
+  fields (`id`, `name`, `displayName`, `role`, `pronouns`, `person`, `coven`)
+  and `IDENTITY.md`; the soul declaration holds `SOUL.md`; the Ward declaration
+  holds `ward.toml` when there is one. Renaming or re-roling a familiar is
+  therefore an identity change. Display-only fields and the workspace path are
+  not declared. A familiar without both Markdown files cannot be registered.
+- **Bundles are kept exactly.** A bundle's digest covers its retention state,
+  so the retained bundle of every revision is stored as built and never
+  rewritten. Redacted forms, when they exist, are history only.
+- **Identifiers.** A root is `familiar:<32 hex>`, never derived from the roster
+  id, which is an alias that can be reused; at most one live root answers to
+  it. A revision is `familiar-revision:<root hex>:<position>`.
+- **Vocabulary.** The ledger stores the contract's statuses (`active`,
+  `superseded`, `retired`, `revoked`). The issuer maps `superseded` to Coven's
+  `stale`, and the contract's optional, inclusive `notAfter` to Coven's
+  required, exclusive one.
+- **Generation.** Every change to a root advances its generation by one; the
+  trusted-ledger observation a binding is decided against carries it.
+- **Issuance.** A binding is issued only for a live root whose head is active
+  and whose declarations still match it. Within one transaction the daemon:
+  - reads the head;
+  - builds and signs the binding with the `familiar-binding` key;
+  - runs the pinned contract verifier against the head's retained bundle and
+    a fresh trusted-ledger observation;
+  - requires the binding, and every lineage transition it cites, to be signed
+    by a `familiar-binding` key the daemon trusted when each was signed;
+  - records the binding.
+
+  A rotated key still vouches for the transitions it signed; a revoked one
+  stops every binding that cites them. The binding states no `notAfter`, so
+  Coven's projection closes the window at the decision time plus the
+  300-second freshness bound.
+
+### Ledger commands
+
+Control actions sent to `POST /api/v1/actions`. Every one, reads included,
+requires owner-local IPC: revisions hold declaration text, so the transport
+guard refuses them over TCP before the store opens, and the ledger refuses
+them again for any other caller. Each mutation takes an `adoptionKey`; a
+retry with the same key and request replays the first answer, a different
+request under the key is `ADOPTION_REPLAY_MISMATCH`, and a refused command
+adopts nothing. Commands that change a root's head take `expectedRevisionId`
+and answer `REVISION_CONFLICT` when the head has moved.
+
+| Action | Request | Effect |
+| --- | --- | --- |
+| `coven.familiars.ledger.register.v1` | `familiarId` | Mints a root and its genesis revision from the roster entry and declarations. |
+| `coven.familiars.ledger.adopt.v1` | `familiarId`, `expectedRevisionId` | Records changed declarations as the next revision and supersedes the head; unchanged declarations answer `unchanged`. |
+| `coven.familiars.ledger.retire.v1` | `familiarId`, `expectedRevisionId` | Retires the root and its active head; the roster id is free to register again. |
+| `coven.familiars.ledger.revoke.v1` | `revisionId`, `reason` | Revokes one revision. A revoked head can only be replaced by adopting changed declarations. |
+| `coven.familiars.ledger.restore.v1` | `rootId`, `expectedRevisionId` | Restores a retired root with a restoration revision, when no other root holds its roster id. |
+| `coven.familiars.ledger.get.v1` | `familiarId` or `rootId` | Every root under the roster id, or one root, with revision history but no declaration text. |
 
 ## Signing roles
 
@@ -108,7 +185,9 @@ What it does not protect against:
 - **`familiar`.** The root and identity revision come from the daemon's
   familiar ledger, with the declaration and embodiment digests from the
   binding the daemon issues. Status, revocation, retirement and freshness are
-  read at decision time, never cached from definition time.
+  read at decision time, never cached from definition time, and a familiar
+  whose declarations have changed since its head revision gets no binding
+  until the owner adopts them.
 - **`threads`, `capabilities`, `approval`, `risk`.** These come from the
   signed Threads decision for this exact request: the protected-surface
   manifest digest, requested, granted, denied and degraded capabilities, the
@@ -141,11 +220,14 @@ unadvertised until slice 6.
    for each attempt, and check replay against the fence and the attempt. The
    unversioned run carries no adoption key, so the manual run's grant lands
    with `occurrence.runNow.v1` in slice 7.
-3. **Familiar ledger and embodiment bindings.** Build a root and revision
-   ledger from the familiar roster, with declaration digests and status,
-   revocation and retirement. Issue Familiar Contract embodiment bindings
-   signed by the `familiar-binding` key, and run all 87 Familiar Contract vectors against
-   the issuer.
+3. **Familiar ledger and embodiment bindings.** In two pull requests:
+   - **Ledger.** The root and revision ledger with its owner commands,
+     retained bundles, signed lineage transitions and trusted-ledger
+     observation, as set out under "Familiar ledger" above.
+   - **Issuer.** Issue Familiar Contract embodiment bindings signed by the
+     `familiar-binding` key, verify every one with the pinned
+     `familiar-contract` crate, and map them into the execution binding. The
+     contract's own vectors run in its repository.
 4. **Threads decisions.** Evaluate the automation-authority profile in Rust:
    risk class, capability grant, denial and downgrade, the approval
    requirement, and degrade-to-proposal. Put the evaluator in

@@ -823,6 +823,7 @@ dependencies = [
  "coven-threads-core",
  "crossterm",
  "dirs-next",
+ "familiar-contract",
  "flate2",
  "fs2",
  "globset",
@@ -1603,6 +1604,18 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "familiar-contract"
+version = "0.7.0"
+source = "git+https://github.com/OpenCoven/familiar-contract?rev=93f486cf9e7b66f7f3a49131fbcfd003dd9da8ac#93f486cf9e7b66f7f3a49131fbcfd003dd9da8ac"
+dependencies = [
+ "jsonschema",
+ "ring",
+ "ryu-js",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "fancy-regex"
