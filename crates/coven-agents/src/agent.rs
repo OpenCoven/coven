@@ -39,6 +39,10 @@ impl From<String> for AgentId {
     }
 }
 
+/// Legacy control transfer within one run, preserving its invocation identity,
+/// accumulated transcript, and host context. The target uses its own configured
+/// model, tools, and policy. This does not create a child invocation or attenuate
+/// authority; bounded delegation remains a separate contract (see #804).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handoff {
     pub name: String,

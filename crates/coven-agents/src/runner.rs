@@ -367,8 +367,10 @@ where
     /// A failure returns [`RunFailure`], which carries the transcript the run
     /// produced before it failed. A tool that fails mid-turn does not erase the
     /// user message, assistant message, and tool calls that preceded it, so
-    /// those items are handed back rather than dropped. The runner never
-    /// appends a failed run's items to the session store.
+    /// those items are handed back rather than dropped. Execution or policy
+    /// failure prevents session append. After final output passes policy, an
+    /// append error also returns a failure; it does not prove the store wrote
+    /// nothing or undo earlier tool effects.
     ///
     /// Input guardrails are enforced at every agent boundary: the starting
     /// agent's before its first model turn, and each handoff target's against

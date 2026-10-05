@@ -2064,3 +2064,336 @@ fn duplicate_proposal_review_names_are_rejected() {
         }
     );
 }
+
+struct PermitFirstThenError;
+
+#[async_trait]
+impl ProposalReview<()> for PermitFirstThenError {
+    fn name(&self) -> &str {
+        "batch-review"
+    }
+
+    async fn review(
+        &self,
+        proposal: &ToolProposal<'_>,
+        _context: &(),
+    ) -> Result<ReviewVerdict, BoxError> {
+        if proposal.call_id == "first" {
+            Ok(ReviewVerdict::Permit)
+        } else {
+            Err(Box::new(io::Error::other("second review failed")))
+        }
+    }
+}
+
+#[tokio::test]
+async fn review_error_after_handoff_preserves_prior_batch_effect_and_correlation() {
+    let source_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-worker")),
+    ])]));
+    let worker_model = Arc::new(QueueModel::new([ModelResponse::actions(
+        ["first", "refused", "never-reviewed"]
+            .into_iter()
+            .map(|id| ModelAction::ToolCall(ToolCall::new(id, "add", json!({}))))
+            .collect(),
+    )]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source = Agent::new("source", "Source", "", source_model)
+        .with_revision("rev-source".parse().unwrap())
+        .with_handoff(Handoff::new("to-worker", "", "worker"));
+    let worker = Agent::new("worker", "Worker", "", worker_model.clone())
+        .with_revision("rev-worker".parse().unwrap())
+        .with_tool(Arc::new(CountingCallTool {
+            calls: calls.clone(),
+        }))
+        .with_proposal_review(Arc::new(PermitFirstThenError));
+    let observer = Arc::new(RecordingCombinedObserver::default());
+    let session = Arc::new(InMemorySession::default());
+    let invocation = InvocationContext::child(InvocationId::new(), InvocationId::new());
+    let failure = Runner::new([source, worker])
+        .unwrap()
+        .with_observer(observer.clone())
+        .with_invocation_observer(observer.clone())
+        .with_session(session.clone())
+        .run_with_invocation(
+            "source",
+            "Batch.",
+            &(),
+            RunOptions {
+                session_id: Some("batch".into()),
+                ..RunOptions::default()
+            },
+            invocation.clone(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(failure.error, RunError::ProposalReviewFailed { ref agent, .. } if agent.as_str() == "worker")
+    );
+    assert_eq!(*failure.invocation, invocation);
+    assert_eq!((failure.turns, failure.handoffs), (2, 1));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the first call may dispatch"
+    );
+    assert_eq!(
+        worker_model.requests().len(),
+        1,
+        "review error stops the model loop"
+    );
+    assert!(session.items("batch").await.unwrap().is_empty());
+    assert_eq!(
+        failure.new_items.as_ref(),
+        [
+            RunItem::UserMessage {
+                content: "Batch.".into()
+            },
+            RunItem::Handoff {
+                from: "source".into(),
+                to: "worker".into(),
+                name: "to-worker".into()
+            },
+            RunItem::ToolCall {
+                agent: "worker".into(),
+                call: ToolCall::new("first", "add", json!({}))
+            },
+            RunItem::ToolResult {
+                agent: "worker".into(),
+                call_id: "first".into(),
+                tool: "add".into(),
+                output: json!({"ok": true})
+            },
+        ]
+    );
+    let events = observer.events();
+    let runs: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ObservedEvent::Run(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_paired_lifecycle(&runs);
+    assert!(runs.iter().all(|e| e.invocation() == &invocation));
+    assert_eq!(
+        reviewed_outcomes(&runs),
+        [
+            ("batch-review".into(), ReviewOutcome::Permit),
+            ("batch-review".into(), ReviewOutcome::Unavailable),
+        ]
+    );
+    assert_eq!(
+        runs.iter()
+            .filter_map(|e| match e {
+                RunEvent::ToolStarted { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["first"]
+    );
+    let canonical: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ObservedEvent::Invocation(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(canonical.len(), 3);
+    assert!(canonical.iter().all(|e| e.invocation == invocation
+        && e.requested_target
+            == coven_agents::AgentRef::with_revision("source", "rev-source").unwrap()));
+    assert!(matches!(
+        canonical[0].event,
+        InvocationEventKind::Started {}
+    ));
+    assert!(
+        matches!(&canonical[1].event, InvocationEventKind::ControlTransferred { from, to, .. }
+        if from.id().as_str() == "source" && to.id().as_str() == "worker")
+    );
+    assert!(matches!(&canonical[2].event, InvocationEventKind::Failed {
+        failed_at: Some(agent), kind: InvocationFailureKind::ProposalReview
+    } if agent == &coven_agents::AgentRef::with_revision("worker", "rev-worker").unwrap()));
+}
+
+#[tokio::test]
+async fn cyclic_handoff_limits_pair_terminal_events_and_recheck_ingress_on_reentry() {
+    for (max_turns, max_handoffs, transfers, failed_at) in [(2, 8, 2, "first"), (8, 1, 1, "second")]
+    {
+        let route =
+            |name| ModelResponse::actions(vec![ModelAction::Handoff(HandoffCall::new(name))]);
+        let first_model = Arc::new(QueueModel::new([route("to-second")]));
+        let second_model = Arc::new(QueueModel::new([route("to-first")]));
+        let ingress = Arc::new(RecordingInputGuardrail::default());
+        let first = Agent::new("first", "First", "", first_model.clone())
+            .with_input_guardrail(ingress.clone())
+            .with_handoff(Handoff::new("to-second", "", "second"));
+        let second = Agent::new("second", "Second", "", second_model.clone())
+            .with_handoff(Handoff::new("to-first", "", "first"));
+        let observer = Arc::new(RecordingCombinedObserver::default());
+        let invocation = InvocationContext::child(InvocationId::new(), InvocationId::new());
+        let failure = Runner::new([first, second])
+            .unwrap()
+            .with_observer(observer.clone())
+            .with_invocation_observer(observer.clone())
+            .run_with_invocation(
+                "first",
+                "Original.",
+                &(),
+                RunOptions {
+                    max_turns,
+                    max_handoffs,
+                    ..RunOptions::default()
+                },
+                invocation.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            (&failure.error, max_turns),
+            (RunError::MaxTurnsExceeded { limit: 2 }, 2)
+                | (RunError::MaxHandoffsExceeded { limit: 1 }, 8)
+        ));
+        assert_eq!(*failure.invocation, invocation);
+        assert_eq!((failure.turns, failure.handoffs), (2, 2));
+        assert_eq!(first_model.requests().len(), 1);
+        assert_eq!(second_model.requests().len(), 1);
+        assert_eq!(ingress.seen(), vec!["Original."; transfers]);
+        assert_eq!(
+            failure
+                .new_items
+                .iter()
+                .filter(|e| matches!(e, RunItem::Handoff { .. }))
+                .count(),
+            transfers
+        );
+        let events = observer.events();
+        let runs: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ObservedEvent::Run(event) => Some(event.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_paired_lifecycle(&runs);
+        assert!(runs.iter().all(|e| e.invocation() == &invocation));
+        let canonical: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ObservedEvent::Invocation(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(canonical.len(), transfers + 2);
+        assert!(canonical
+            .iter()
+            .all(|e| e.invocation == invocation && e.requested_target.id().as_str() == "first"));
+        assert!(matches!(
+            canonical[0].event,
+            InvocationEventKind::Started {}
+        ));
+        assert!(canonical[1..=transfers]
+            .iter()
+            .all(|e| matches!(e.event, InvocationEventKind::ControlTransferred { .. })));
+        assert!(
+            matches!(&canonical.last().unwrap().event, InvocationEventKind::Failed {
+            failed_at: Some(agent), kind: InvocationFailureKind::Limit
+        } if agent.id().as_str() == failed_at)
+        );
+    }
+}
+
+struct RefuseFirstThenPermit;
+
+#[async_trait]
+impl ProposalReview<()> for RefuseFirstThenPermit {
+    fn name(&self) -> &str {
+        "selective-review"
+    }
+
+    async fn review(
+        &self,
+        proposal: &ToolProposal<'_>,
+        _context: &(),
+    ) -> Result<ReviewVerdict, BoxError> {
+        Ok(if proposal.call_id == "refused" {
+            ReviewVerdict::reject("first call refused")
+        } else {
+            ReviewVerdict::Permit
+        })
+    }
+}
+
+#[tokio::test]
+async fn refusal_in_a_batch_keeps_its_result_and_allows_a_later_permitted_call() {
+    let model = Arc::new(QueueModel::new([
+        ModelResponse::actions(
+            ["refused", "permitted"]
+                .into_iter()
+                .map(|id| ModelAction::ToolCall(ToolCall::new(id, "add", json!({}))))
+                .collect(),
+        ),
+        ModelResponse::final_output("Done."),
+    ]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observer = Arc::new(RecordingObserver::default());
+    let agent = Agent::new("worker", "Worker", "", model.clone())
+        .with_tool(Arc::new(CountingCallTool {
+            calls: calls.clone(),
+        }))
+        .with_proposal_review(Arc::new(RefuseFirstThenPermit));
+    let result = Runner::new([agent])
+        .unwrap()
+        .with_observer(observer.clone())
+        .run("worker", "Batch.", &(), RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let expected = [
+        RunItem::ToolCall {
+            agent: "worker".into(),
+            call: ToolCall::new("refused", "add", json!({})),
+        },
+        RunItem::ToolResult {
+            agent: "worker".into(),
+            call_id: "refused".into(),
+            tool: "add".into(),
+            output: json!({
+                "executed": false, "review": {"reviewer": "selective-review", "verdict": "reject", "reason": "first call refused"}
+            }),
+        },
+        RunItem::ToolCall {
+            agent: "worker".into(),
+            call: ToolCall::new("permitted", "add", json!({})),
+        },
+        RunItem::ToolResult {
+            agent: "worker".into(),
+            call_id: "permitted".into(),
+            tool: "add".into(),
+            output: json!({"ok": true}),
+        },
+    ];
+    assert_eq!(&result.new_items[1..5], &expected);
+    assert_eq!(&model.requests()[1].items[1..], &expected);
+    let events = observer.events();
+    assert_paired_lifecycle(&events);
+    assert_eq!(
+        reviewed_outcomes(&events),
+        [
+            ("selective-review".into(), ReviewOutcome::Reject),
+            ("selective-review".into(), ReviewOutcome::Permit),
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::ToolStarted { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["permitted"]
+    );
+}

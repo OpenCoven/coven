@@ -1,12 +1,14 @@
 # coven-agents
 
-`coven-agents` is an experimental, provider-neutral Rust run loop for
-OpenCoven. It supplies the orchestration primitives that model adapters,
-applications, and familiar runtimes can share:
+The Rust `coven/crates/coven-agents` crate is an experimental, provider-neutral,
+in-process behavior loop for OpenCoven. It is distinct from the
+[OpenCoven/coven-agents cloud product](https://github.com/OpenCoven/coven-agents).
+Model adapters, applications, and familiar runtimes can share its local
+primitives:
 
 - bounded model/tool loops
 - journaled goal loops with explicit exit criteria
-- agent handoffs
+- agent handoffs (control transfer within one run, not child delegation)
 - blocking input and output guardrails
 - fail-closed review of proposed tool calls before dispatch
 - pluggable session journals
@@ -16,9 +18,31 @@ applications, and familiar runtimes can share:
 - validated logical agent references with optional immutable revisions
 - versioned, serializable invocation lifecycle events
 
-Input guardrails apply to the starting agent, and output guardrails apply to the
-agent that produces the final output. A `SessionStore` must serialize writers
-for each session id or implement optimistic concurrency control.
+## Policy and context boundaries
+
+Input guardrails apply to the starting agent and every handoff target before
+that agent's next model turn or tool execution, including when re-entering a
+previous agent. Each checks the same **original user input**, not session
+history or intermediate assistant/tool output. Output guardrails apply only
+to the agent that produces the final output; they do not screen intermediate
+contributions from other agents.
+
+A handoff preserves the accumulated model transcript, including loaded session
+history, and passes the same host-provided `&C` to models, tools, guardrails,
+and proposal reviewers. The target uses its own instructions, tools, handoffs,
+and reviewers. The runner does not select a bounded child context, attenuate
+host authority, or establish cross-principal isolation. Use this compatibility
+behavior only within a host-established trust boundary; target ingress parity
+is not a complete delegation policy.
+
+Durable invocation ownership belongs to Psyche's orchestration contracts;
+process execution, transport, and remote placement belong to Coven's existing
+daemon/client/hub boundaries. The
+[invocation/delegation migration](https://github.com/OpenCoven/coven/issues/804)
+must preserve that split rather than turn this runner into a second distributed
+runtime.
+
+## Tool proposal review
 
 `ProposalReview<C>` sits beside the guardrail traits. Reviewers are registered
 per agent with `Agent::with_proposal_review` and see each resolved tool call
@@ -37,10 +61,27 @@ named reviewer raised no objection, it grants no capability and is not an
 operator approval. The crate ships the seam and fake reviewers only; a live
 reviewer is an adapter that implements the trait outside this crate.
 
+Review is per call, not transactional across a model response: an earlier
+permitted call can execute before a later reviewer errors. An errored proposal
+has a review event but is not appended as a `RunItem::ToolCall`. Ordinary
+non-permit verdicts retain their call/result pair and allow later calls to be
+reviewed. Input rejection prevents target model execution and proposal review.
+
+## Persistence and invocation boundaries
+
+A `SessionStore` must serialize writers for each session id or implement
+optimistic concurrency control.
+
 A failed run returns `RunFailure`, which carries the transcript produced before
 the failure alongside the error, so a failing tool never costs the caller the
-items the run already produced. The runner does not append a failed run's items
-to the session; persisting them is the caller's decision.
+items the run already produced. Execution or policy failure prevents session
+append; persisting those partial items is the caller's decision. After final
+output passes policy, the runner attempts append before reporting success,
+so an append error returns a failure even if the store already wrote items.
+A tool can succeed before a later model, guardrail, reviewer, or session append
+fails. Neither a failed run nor missing
+session output proves that no side effect occurred; the transcript is not a
+per-effect ledger and does not authorize automatic retry.
 
 Each `Runner::run` call creates a fresh root `InvocationContext`. The same
 context is carried by every `RunEvent`, the successful `RunResult`, and any
@@ -117,3 +158,34 @@ running checkpoints retain that id and an attempt id so the live owner also
 cannot revoke its own claim under the guise of recovery. Blocked decisions are
 checkpointed with their reason and require an explicit journal transition
 before execution.
+
+
+`LoopRecoveryFence` is a trusted host assertion, not independently verified
+executor termination. The host/reconciler must establish that the previous
+executor cannot act before supplying it; a nonempty evidence string alone does
+not establish distributed fencing.
+
+## Supported checkpoint and deferred orchestration
+
+The existing `Runner` provides local control transfer and correlation.
+`GoalLoopRunner` journals iteration boundaries; it does not supply durable
+child invocation adoption or shared executor conformance. Structured
+`DelegationSpec`, bounded/provenanced context, authority attenuation,
+`AgentLoop` extraction, deadlines/cancellation, durable invocation
+adoption/recovery, remote executors, and removal of legacy handoff/context
+behavior remain deferred under #804.
+
+## Behavioral evidence
+
+[`tests/runner.rs`](tests/runner.rs) covers direct/handoff ingress parity,
+multi-hop rejection before target execution, tool-call correlation, limits,
+session behavior, proposal refusal, and terminal event pairing.
+[`tests/invocation_contract.rs`](tests/invocation_contract.rs) covers validated
+references, revision binding, and canonical invocation metadata.
+[`tests/legacy_boundary.rs`](tests/legacy_boundary.rs) characterizes inherited
+history, original-input-only checks, final-only output policy, shared host
+context, and a successful effect followed by session-append failure.
+[`tests/loop_runner.rs`](tests/loop_runner.rs) covers local checkpoint and
+reconciliation behavior. These are in-process tests with scripted models and
+tools, not real-daemon, provider-containment, packaged-client, or external A2A
+conformance.
