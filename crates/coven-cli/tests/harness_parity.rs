@@ -12,18 +12,14 @@
 //! forwarded*, not about what a struct declares. No network, no provider
 //! accounts, no installed CLIs.
 
-//! Unix-only: the fake harnesses are `#!/bin/sh` scripts made executable via
-//! the Unix permission bits, and Windows resolves harness executables through
-//! `.cmd` shims instead. What these tests exercise -- the flag translation in
-//! `built_in_harness_specs` -- is platform-independent, so Unix coverage does
-//! prove the contract itself. Windows-specific *executable resolution* is
-//! covered separately by `windows_daemon_lifecycle.rs` and by the Windows leg
-//! of the npm onboarding smoke. Extending these fakes to `.cmd` so parity runs
-//! on all three platforms is tracked as follow-up work.
-#![cfg(unix)]
+//! Unix fixtures use shell scripts. Windows fixtures use npm-style `.cmd`
+//! shims and a native argv recorder, including the validated Codex npm layout.
+//! The recorder observes tokens after shell parsing, rather than echoing `%*`
+//! and accidentally treating a split argument as successful forwarding.
 
 use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -39,6 +35,7 @@ fn coven_bin() -> PathBuf {
 /// Write a fake harness that appends its full argv to `record`, one argument
 /// per line, then exits 0. `hold` makes it sleep instead so cancellation has
 /// something to cancel; `exit_code` lets a case prove exit propagation.
+#[cfg(unix)]
 fn write_recording_harness(
     bin_dir: &Path,
     name: &str,
@@ -68,6 +65,116 @@ exit {exit_code}
     Ok(())
 }
 
+#[cfg(windows)]
+fn write_recording_harness(
+    bin_dir: &Path,
+    name: &str,
+    record: &Path,
+    exit_code: i32,
+    hold: bool,
+) -> anyhow::Result<()> {
+    // Compile once for the parallel suite; each invocation has its own record
+    // and exit settings, so no process-wide environment or shared output races.
+    static PROBE: std::sync::OnceLock<Result<(tempfile::TempDir, PathBuf), String>> =
+        std::sync::OnceLock::new();
+    let probe = PROBE.get_or_init(|| {
+        let build = || -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
+            let temp = tempfile::tempdir()?;
+            let binary = temp.path().join("parity-probe.exe");
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc.exe".into());
+            let output = Command::new(rustc)
+                .arg("--edition=2021")
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/harness_parity_probe.rs"),
+                )
+                .arg("-o")
+                .arg(&binary)
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "native parity probe compilation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok((temp, binary))
+        };
+        build().map_err(|error| format!("{error:#}"))
+    });
+    let (_, probe) = probe.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+    if name == "coven-code" {
+        // Coven resolves the shared claim directory through Git before launch.
+        // Proxy only Git, rather than exposing the inherited provider PATH.
+        let output = Command::new("where.exe").arg("git.exe").output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Git is required by the parity fixture"
+        );
+        let paths = String::from_utf8(output.stdout)?;
+        let git = paths
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Git not found"))?;
+        fs::copy(probe, bin_dir.join("git.exe"))?;
+        fs::write(bin_dir.join("git.settings"), format!("git\n{git}\n"))?;
+    }
+    let native = if name == "codex" {
+        // Noninteractive Codex resolves its official npm shim to this native
+        // executable. A fake arbitrary batch file must remain rejected.
+        let package = bin_dir.join("node_modules/@openai/codex");
+        fs::create_dir_all(package.join("bin"))?;
+        fs::write(package.join("bin/codex.js"), "// hermetic npm entry\n")?;
+        let (target, cpu, triple) = if cfg!(target_arch = "aarch64") {
+            ("codex-win32-arm64", "arm64", "aarch64-pc-windows-msvc")
+        } else {
+            ("codex-win32-x64", "x64", "x86_64-pc-windows-msvc")
+        };
+        fs::write(
+            package.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@openai/codex", "bin": {"codex": "bin/codex.js"},
+                "optionalDependencies": {format!("@openai/{target}"): "0.0.0"}
+            }))?,
+        )?;
+        let target_root = bin_dir.join("node_modules/@openai").join(target);
+        let native_dir = target_root.join("vendor").join(triple).join("bin");
+        fs::create_dir_all(&native_dir)?;
+        fs::write(
+            target_root.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@openai/codex", "os": ["win32"], "cpu": [cpu]
+            }))?,
+        )?;
+        native_dir.join("codex.exe")
+    } else {
+        let native_dir = bin_dir.join("recorders");
+        fs::create_dir_all(&native_dir)?;
+        native_dir.join(format!("{name}.exe"))
+    };
+    fs::copy(probe, &native)?;
+    // Settings are stored beside each native recorder, including Codex's
+    // nested executable, so concurrent fixtures never share mutable state.
+    fs::write(
+        native.with_extension("settings"),
+        format!("{exit_code}\n{hold}\n{}", record.display()),
+    )?;
+    let shim = if name == "codex" {
+        "@echo off\r\n\"%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n".to_owned()
+    } else {
+        format!("@echo off\r\n\"%~dp0recorders\\{name}.exe\" %*\r\n")
+    };
+    fs::write(bin_dir.join(format!("{name}.cmd")), shim)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hermetic_path(bin_dir: &Path) -> OsString {
+    // Only Windows system commands accompany the fakes; no real provider CLI
+    // may be resolved through the developer's inherited PATH.
+    let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+    std::env::join_paths([bin_dir.to_path_buf(), system.join("System32"), system])
+        .expect("valid fixture PATH")
+}
+
 /// Every harness executable a run may resolve, so a missing fake never silently
 /// falls through to a real CLI on the developer's PATH.
 fn write_all_harnesses(
@@ -84,6 +191,7 @@ fn write_all_harnesses(
 
 /// PATH containing only the fake harness directory plus the system basics the
 /// fakes themselves need (`sh`, `sleep`, `printf`).
+#[cfg(unix)]
 fn hermetic_path(bin_dir: &Path) -> OsString {
     let mut value = OsString::from(bin_dir);
     value.push(":/usr/bin:/bin");
@@ -120,8 +228,8 @@ impl Fixture {
     fn new(exit_code: i32, hold: bool) -> anyhow::Result<Self> {
         let temp = tempfile::tempdir()?;
         let coven_home = temp.path().join("coven-home");
-        let project = temp.path().join("project");
-        let bin_dir = temp.path().join("bin");
+        let project = temp.path().join("project with spaces");
+        let bin_dir = temp.path().join("bin with spaces");
         let record = temp.path().join("argv.txt");
         fs::create_dir_all(&coven_home)?;
         fs::create_dir_all(&project)?;
@@ -143,10 +251,32 @@ impl Fixture {
             .args(args)
             .env("COVEN_HOME", &self.coven_home)
             .env("PATH", hermetic_path(&self.bin_dir))
-            .env("COVEN_ENGINE_BIN", self.bin_dir.join("coven-code"))
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+            .env_remove("COVEN_HARNESS_ADAPTER_MANIFEST")
+            .env_remove("COVEN_HARNESS_ADAPTER_DIRS")
+            .env(
+                "COVEN_ENGINE_BIN",
+                self.bin_dir.join(if cfg!(windows) {
+                    "recorders/coven-code.exe"
+                } else {
+                    "coven-code"
+                }),
+            )
             .current_dir(&self.project)
             .output()
             .map_err(Into::into)
+    }
+
+    fn prompt_received(&self, argv: &[String], prompt: &str) -> anyhow::Result<bool> {
+        if argv
+            .iter()
+            .any(|arg| arg == prompt || arg == &format!("--prompt={prompt}"))
+        {
+            return Ok(true);
+        }
+        // Windows Codex uses stdin to keep user text out of cmd.exe argv.
+        let stdin = self.record.with_extension("stdin");
+        Ok(stdin.exists() && fs::read_to_string(stdin)? == prompt)
     }
 
     /// Argv the fake harness observed, one token per line.
@@ -166,15 +296,37 @@ impl Fixture {
 fn every_harness_forwards_the_prompt() -> anyhow::Result<()> {
     for harness in HARNESSES {
         let fixture = Fixture::new(0, false)?;
-        let output = fixture.run(&["run", harness, "parity-prompt-marker"])?;
+        let output = fixture.run(&["run", harness, "parity prompt marker with spaces"])?;
         let argv = fixture.recorded()?;
         assert!(
-            argv.iter().any(|arg| arg.contains("parity-prompt-marker")),
+            fixture.prompt_received(&argv, "parity prompt marker with spaces")?,
             "{harness} never received the prompt (exit {:?}, argv {argv:?}, stderr {})",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn codex_npm_shim_refuses_a_missing_native_package() -> anyhow::Result<()> {
+    let fixture = Fixture::new(0, false)?;
+    fs::remove_dir_all(fixture.bin_dir.join("node_modules/@openai").join(
+        if cfg!(target_arch = "aarch64") {
+            "codex-win32-arm64"
+        } else {
+            "codex-win32-x64"
+        },
+    ))?;
+    let output = fixture.run(&["run", "codex", "prompt"])?;
+    assert!(!output.status.success());
+    assert!(fixture.recorded()?.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not validate its native"),
+        "unexpected failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(())
 }
 
@@ -241,8 +393,8 @@ fn every_harness_maps_permission_policy_to_its_native_sandbox_flag() -> anyhow::
 fn every_harness_forwards_each_add_dir_grant() -> anyhow::Result<()> {
     for harness in HARNESSES {
         let fixture = Fixture::new(0, false)?;
-        let first = fixture.project.join("granted-one");
-        let second = fixture.project.join("granted-two");
+        let first = fixture.project.join("granted one");
+        let second = fixture.project.join("granted two");
         fs::create_dir_all(&first)?;
         fs::create_dir_all(&second)?;
         fixture.run(&[
