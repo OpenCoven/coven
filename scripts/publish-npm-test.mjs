@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
 import {
   chmodSync,
   copyFileSync,
@@ -61,11 +62,23 @@ test('release staging removes stale generated npm output before regeneration', (
   }
 });
 
-test('wrapper dry-run cannot reuse a stale generated package version', () => {
+test('wrapper dry-run cannot reuse a stale generated package version', async () => {
   const fixture = realpathSync(
     mkdtempSync(path.join(tmpdir(), 'coven-stale-dist-dry-run-'))
   );
+  // A dry-run still asks npm for the registry packument unless offline mode
+  // is explicit. The unit fixture must neither depend on registry availability
+  // nor spend the prepublish budget waiting for an unanswered metadata fetch.
+  let registryRequests = 0;
+  const registry = createServer((_request, response) => {
+    registryRequests += 1;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ 'dist-tags': {}, versions: {} }));
+  });
+  let child;
   try {
+    registry.listen(0, '127.0.0.1');
+    await once(registry, 'listening');
     mkdirSync(path.join(fixture, 'scripts'), { recursive: true });
     copyFileSync(
       fileURLToPath(new URL('publish-npm.mjs', import.meta.url)),
@@ -90,17 +103,30 @@ test('wrapper dry-run cannot reuse a stale generated package version', () => {
     // it passes until that version ships, then fails forever. v0.4.1 was
     // hardcoded here and broke every onboarding smoke on main the moment
     // v0.4.1 was published.
-    const result = spawnSync(
+    child = spawn(
       process.execPath,
       [path.join(fixture, 'scripts', 'publish-npm.mjs'), '--wrapper-only', '--dry-run'],
       {
-        encoding: 'utf8',
         cwd: fixture,
-        env: { ...process.env, COVEN_NPM_VERSION: DRY_RUN_SENTINEL_VERSION }
+        env: {
+          ...process.env,
+          COVEN_NPM_VERSION: DRY_RUN_SENTINEL_VERSION,
+          NPM_CONFIG_OFFLINE: 'true',
+          npm_config_offline: 'true',
+          npm_config_registry: `http://127.0.0.1:${registry.address().port}`,
+          npm_config_fetch_retries: '0'
+        }
       }
     );
-
-    assert.equal(result.status, 0, result.stderr);
+    let stderr = '';
+    child.stdout.resume();
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const [code] = await once(child, 'close');
+    assert.equal(code, 0, stderr);
+    assert.equal(registryRequests, 0, 'the staging fixture must not query the npm registry');
     assert.equal(
       JSON.parse(readFileSync(stalePackage, 'utf8')).version,
       DRY_RUN_SENTINEL_VERSION,
@@ -118,6 +144,12 @@ test('wrapper dry-run cannot reuse a stale generated package version', () => {
       'source manifest must remain a release-time placeholder'
     );
   } finally {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+      await once(child, 'close');
+    }
+    registry.closeAllConnections();
+    await new Promise((resolve) => registry.close(resolve));
     rmSync(fixture, { recursive: true, force: true });
   }
 });
