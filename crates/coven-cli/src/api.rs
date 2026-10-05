@@ -24949,13 +24949,19 @@ pub(crate) mod tests {
         let home = temp.path().to_path_buf();
         let first_body = body.clone();
         let first_runtime = std::sync::Arc::clone(&runtime);
-        let first = std::thread::spawn(move || {
-            post_adopted_launch(&home, &first_body, first_runtime.as_ref())
-        });
+        let first = spawn_commit_window_launch(home, first_body, first_runtime);
 
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .context("first launch must enter runtime after commit")?;
+        match entered_rx.recv().context("observe first launch progress")? {
+            CommitWindowEvent::Entered => {}
+            CommitWindowEvent::Finished => {
+                let response = first.join().expect("first adopted launch thread")?;
+                anyhow::bail!(
+                    "first launch finished before runtime entry: status={} body={}",
+                    response.status,
+                    response.body
+                );
+            }
+        }
         let replay_runtime = ConcurrentRecordingRuntime::default();
         let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
         assert_eq!(replay.status, 200, "{}", replay.body);
@@ -24973,6 +24979,30 @@ pub(crate) mod tests {
             "running"
         );
         assert_eq!(runtime.launch_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_commit_window_announces_failure_before_runtime_entry() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (_release_tx, release_rx) = std::sync::mpsc::channel();
+        let runtime = std::sync::Arc::new(CommitWindowRuntime {
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        // Invalid input returns before the runtime seam. The same progress
+        // protocol must report completion rather than wait forever for entry.
+        let first = spawn_commit_window_launch(
+            temp.path().to_path_buf(),
+            json!({}),
+            std::sync::Arc::clone(&runtime),
+        );
+        assert!(matches!(entered_rx.recv()?, CommitWindowEvent::Finished));
+        let response = first.join().expect("first adopted launch thread")?;
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert_eq!(runtime.launch_count(), 0);
         Ok(())
     }
 
@@ -28401,9 +28431,35 @@ pub(crate) mod tests {
         }
     }
 
+    enum CommitWindowEvent {
+        Entered,
+        Finished,
+    }
+
+    struct CommitWindowCompletion(std::sync::mpsc::Sender<CommitWindowEvent>);
+
+    impl Drop for CommitWindowCompletion {
+        fn drop(&mut self) {
+            let _ = self.0.send(CommitWindowEvent::Finished);
+        }
+    }
+
+    fn spawn_commit_window_launch(
+        home: PathBuf,
+        body: Value,
+        runtime: std::sync::Arc<CommitWindowRuntime>,
+    ) -> std::thread::JoinHandle<Result<ApiResponse>> {
+        std::thread::spawn(move || {
+            // Also announce an early return/panic, so readiness cannot hang
+            // when launch fails before reaching the runtime seam.
+            let _finished = CommitWindowCompletion(runtime.entered.clone());
+            post_adopted_launch(&home, &body, runtime.as_ref())
+        })
+    }
+
     struct CommitWindowRuntime {
         launches: std::sync::atomic::AtomicUsize,
-        entered: std::sync::mpsc::Sender<()>,
+        entered: std::sync::mpsc::Sender<CommitWindowEvent>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
@@ -28480,11 +28536,13 @@ pub(crate) mod tests {
         fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
             self.launches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.entered.send(()).context("announce runtime entry")?;
+            self.entered
+                .send(CommitWindowEvent::Entered)
+                .context("announce runtime entry")?;
             self.release
                 .lock()
                 .expect("release lock")
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv()
                 .context("wait for runtime release")?;
             Ok(())
         }

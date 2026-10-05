@@ -202,6 +202,16 @@ Two things do not show up in a local `cargo test`:
 
   Report the observed duration in the failure message, or the next flake tells
   you nothing.
+- **Short budgets passed into code under test also select races.** Audit
+  `recv_timeout(...)` and timeout arguments as well as `elapsed()` assertions.
+  For test sequencing, wait for an explicit readiness/completion event, and
+  announce early failure so the wait cannot silently wedge. For negative
+  channel assertions, join the producer before checking the final sequence.
+  Keep genuine timeout tests: make the slow path explicit (for example a
+  reader that always returns `WouldBlock`), and assert its failure class.
+  If asynchronous cleanup can validly choose multiple errors, retain the
+  status and containment assertions and exercise each permitted branch
+  deterministically. Do not widen production deadlines or all test budgets.
 - Prefer the fast loop (`cargo check`, debug builds) over `--release` unless you
   specifically need optimized output.
 

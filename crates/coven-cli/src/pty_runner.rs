@@ -6923,9 +6923,11 @@ mod tests {
             sizes_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             resized_again,
         );
-        assert!(sizes_rx.recv_timeout(Duration::from_millis(25)).is_err());
         watcher.stop();
         dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Joining closes the sender and fixes the observed sequence. Waiting
+        // 25ms before stopping could miss a duplicate from a delayed worker.
+        assert_eq!(sizes_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     }
 
     #[test]
@@ -7679,6 +7681,19 @@ exec sleep 10
     #[test]
     fn codex_json_runner_reaps_a_pipe_holding_descendant_after_wrapper_exit() -> anyhow::Result<()>
     {
+        assert_codex_reaps_pipe_holding_descendant(Duration::from_millis(25))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_json_runner_reaps_descendant_when_pipe_drain_deadline_wins() -> anyhow::Result<()> {
+        // Force the same failure branch that scheduling pressure can select
+        // with a 25ms drain. The descendant must still be contained/reaped.
+        assert_codex_reaps_pipe_holding_descendant(Duration::ZERO)
+    }
+
+    #[cfg(unix)]
+    fn assert_codex_reaps_pipe_holding_descendant(drain_timeout: Duration) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = fake_claude_spawn_guard();
@@ -7712,14 +7727,23 @@ exit 0
             &command,
             CODEX_JSON_TEST_STARTUP_TIMEOUT,
             Duration::from_secs(1),
-            Duration::from_millis(25),
+            drain_timeout,
             |_| Ok(()),
         )?;
 
-        assert!(outcome
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("without an assistant message")));
+        // The wrapper exits without an assistant reply. Reader closure may
+        // arrive before or after the drain deadline; both are the expected
+        // failed-turn class, and neither changes the containment obligation.
+        assert_eq!(outcome.process.status, "failed");
+        assert_eq!(outcome.process.exit_code, Some(1));
+        assert!(!outcome.emitted_assistant);
+        assert!(
+            outcome.error.as_deref().is_some_and(|error| {
+                error == "Codex completed without an assistant message"
+                    || error == "Codex exited but its output pipes remained open; terminated remaining process tree"
+            }),
+            "unexpected failed-turn error: {:?}", outcome.error
+        );
         let pid = std::fs::read_to_string(temp_dir.path().join("descendant.pid"))?
             .trim()
             .parse::<u32>()?;
@@ -10017,11 +10041,12 @@ exit 0
             env_overrides: Vec::new(),
         };
 
-        let started = Instant::now();
+        // The shim never reads or exits. As in the Unix blocked-writer case,
+        // the terminated outcome proves the deadline covers prompt delivery;
+        // measuring total elapsed time additionally measures runner scheduling.
         let outcome =
             stream_codex_json_with_timeout(&command, Duration::from_millis(50), |_| Ok(()))?;
 
-        assert!(started.elapsed() < Duration::from_secs(3));
         assert!(outcome
             .error
             .as_deref()

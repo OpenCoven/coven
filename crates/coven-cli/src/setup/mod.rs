@@ -555,7 +555,11 @@ fn run_action(
     let ephemeral_state = if action == SetupAction::Verification {
         match verify::EphemeralState::create() {
             Ok(state) => Some(state),
-            Err(_) => return action_result(failure_outcome(action)),
+            Err(_error) => {
+                #[cfg(test)]
+                trace_setup_test_failure("create verification state", &_error);
+                return action_result(failure_outcome(action));
+            }
         }
     } else {
         None
@@ -573,14 +577,22 @@ fn run_action(
     };
     let mut process = match runtime.launcher.launch(&request) {
         Ok(process) => process,
-        Err(_) => return action_result(failure_outcome(action)),
+        Err(_error) => {
+            #[cfg(test)]
+            trace_setup_test_failure("launch", &_error);
+            return action_result(failure_outcome(action));
+        }
     };
     let mut outcome = match wait_bounded(process.as_mut(), runtime.clock, timeout) {
         Ok(BoundedProcessResult::TimedOut) => Outcome::TimedOut,
         Ok(BoundedProcessResult::Exited(ProcessExit::Exited(0))) => Outcome::Completed,
         Ok(BoundedProcessResult::Exited(ProcessExit::Exited(_))) => failure_outcome(action),
         Ok(BoundedProcessResult::Exited(ProcessExit::Signalled)) => Outcome::Cancelled,
-        Err(_) => failure_outcome(action),
+        Err(_error) => {
+            #[cfg(test)]
+            trace_setup_test_failure("wait and terminate", &_error);
+            failure_outcome(action)
+        }
     };
     drop(process);
     let mut version = None;
@@ -608,11 +620,23 @@ fn run_action(
         }
     }
     if let Some(state) = ephemeral_state {
-        if state.cleanup().is_err() {
+        if let Err(_error) = state.cleanup() {
+            #[cfg(test)]
+            trace_setup_test_failure("clean verification state", &_error);
             return action_result(failure_outcome(action));
         }
     }
     ActionResult { outcome, version }
+}
+
+#[cfg(test)]
+fn trace_setup_test_failure(phase: &str, error: &io::Error) {
+    // Keep the failed native seam without exposing provider text or private paths.
+    eprintln!(
+        "setup fixture failure: phase={phase} kind={:?} os_code={:?}",
+        error.kind(),
+        error.raw_os_error()
+    );
 }
 
 fn action_result(outcome: Outcome) -> ActionResult {

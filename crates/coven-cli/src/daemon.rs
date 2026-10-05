@@ -7666,13 +7666,13 @@ mod tests {
 
     #[test]
     fn http_response_reader_times_out_when_peer_never_responds() {
-        let started = Instant::now();
+        // This reader always WouldBlocks: the deadline is the only possible
+        // exit. A wall-clock promptness assertion would also time scheduling.
         let error =
             read_http_response_with_deadline(&mut NeverReady, Duration::from_millis(30), 1024)
                 .unwrap_err();
 
         assert!(error.to_string().contains("timed out"), "got: {error:#}");
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
@@ -7880,8 +7880,8 @@ mod tests {
         let socket = daemon_socket_path(home.path());
         let _listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-        let started = Instant::now();
-
+        // The bound belongs to the probe under test. The bound socket never
+        // serves a response, so no successful response races this timeout.
         let error =
             unix_daemon_transport_is_occupied_with_timeout(home.path(), Duration::from_millis(50))
                 .unwrap_err();
@@ -7890,7 +7890,6 @@ mod tests {
             format!("{error:#}").contains("timed out"),
             "unexpected probe failure: {error:#}"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
         Ok(())
     }
 
