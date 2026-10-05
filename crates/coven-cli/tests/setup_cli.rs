@@ -1410,8 +1410,14 @@ fn every_provider_login_and_verify_timeout_reaps_descendants() -> Result<()> {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(String::from_utf8_lossy(&output.stdout)
-                .contains(&format!("{}: timed_out", provider_label(provider))));
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("{}: timed_out", provider_label(provider))),
+                "{} {action} did not report the injected timeout\nstdout:\n{}\nstderr:\n{}",
+                provider.as_str(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             let state = fs::read_to_string(&state_path).with_context(|| {
                 format!(
                     "read {} {action} timeout state\nstdout:\n{}\nstderr:\n{}",
