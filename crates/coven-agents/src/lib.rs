@@ -1,7 +1,8 @@
-//! Provider-neutral agent runtime primitives for OpenCoven.
+//! Provider-neutral, in-process agent behavior primitives for OpenCoven.
 //!
-//! The crate owns deterministic orchestration, not provider transport,
-//! persistence, sandboxing, or user interface concerns.
+//! The crate owns bounded model/tool loops and local control transfer.
+//! Host adapters supply provider transport, session persistence, and policy;
+//! durable invocation orchestration remains outside this crate.
 
 mod agent;
 mod error;
