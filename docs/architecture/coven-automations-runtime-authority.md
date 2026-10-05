@@ -304,7 +304,7 @@ unadvertised until slice 6.
    R3 and R4, and advertise the profile only once its conformance passes.
 7. **Held commands, then approvals.** The five versioned commands #1054
    holds for #857:
-   - `occurrence.runNow.v1`, now compatibility-only;
+   - `occurrence.runNow.v1`;
    - `occurrence.cancel.v1`;
    - `attempt.cancel.v1`;
    - `attempt.retry.v1`;
@@ -317,6 +317,10 @@ unadvertised until slice 6.
    - **runNow.** An owner's `occurrence.runNow.v1` for a routine that
      declares authority is a one-run owner grant, exactly like an
      activation. It is not a per-run approval.
+
+   `occurrence.runNow.v1` is implemented for ordinary routines: it plans,
+   claims and dispatches a manual occurrence. Its one-run grant for a routine
+   that declares authority follows with the adapter.
 
    `occurrence.recover.v1` is implemented. The owner settles a
    `recovery_required` occurrence `failed_deterministic`, or opens its next

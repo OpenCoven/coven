@@ -337,7 +337,7 @@ This producer does not implement the whole catalog. `automations/command_matrix.
 | `definition.pause.v1` | implemented | `coven.automations.definition.pause.v1` |
 | `definition.disable.v1` | implemented | `coven.automations.definition.disable.v1` |
 | `definition.tombstone.v1` | implemented | `coven.automations.definition.tombstone.v1` |
-| `occurrence.runNow.v1` | compatibility-only | `coven.automations.run` |
+| `occurrence.runNow.v1` | implemented | `coven.automations.occurrence.runNow.v1` |
 | `occurrence.cancel.v1` | unsupported | none |
 | `run.cancel.v1` | implemented | `coven.automations.run.cancel.v1` |
 | `attempt.cancel.v1` | unsupported | none |

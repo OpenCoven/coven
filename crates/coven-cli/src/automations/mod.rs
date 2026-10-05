@@ -41,6 +41,7 @@ pub mod recovery;
 mod release_upgrade_tests;
 pub mod rich_definition;
 pub mod rrule;
+pub mod run_now;
 // Runtime Authority launch envelopes; slice 6 launches them.
 #[allow(dead_code)]
 pub mod runtime_envelope;
