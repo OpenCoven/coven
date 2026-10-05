@@ -200,6 +200,47 @@ What it does not protect against:
   verifiers check it against the trusted set built from the daemon's key
   records.
 
+## Runtime Authority launches
+
+These were decided on 2026-10-04 for slice 6.
+
+- **The grant is the owner's activation.** #857 lets R0 and R1 run unattended
+  only under an explicit narrow grant. That grant is the owner command that
+  activates a revision declaring R0 or R1 authority, which is the slice 2
+  owner grant. It is bound to:
+  - the revision's digest;
+  - its familiar and runtime;
+  - its declared capabilities and scopes.
+
+  It lapses when the revision stops being current. There is no separate grant
+  store.
+- **A definition declares its own authority.** An optional `authority` block
+  on the routine definition holds the action type, risk class, capabilities,
+  scopes and whether the action is proposal-safe. Only owner create and revise
+  commands set it, and the definition digest covers it. Its presence opts the
+  definition into Runtime Authority. Prompt text never declares risk.
+- **v1 launches only what the harness can enforce.** Only an R0
+  `analysis.read` grant launches. It runs on claude with only the read tools,
+  in plan (read-only) permission mode, in restricted mode with no MCP servers.
+  Every other grant gets a no-launch receipt until a scoped enforcement
+  exists. A runtime accepts an authority projection only for an envelope it
+  enforces, and an environment override such as
+  `COVEN_CLAUDE_BYPASS_PERMISSIONS` never widens one.
+- **The launch is observed, not assumed.** Each launch shape is a runtime
+  envelope. The execution binding pins its descriptor digest as
+  `runtime.descriptorDigest`, so the terminal observer knows from signed
+  evidence that a session's output is the harness's own event stream, not
+  model text that looks like one.
+  - **Complete stream.** The observer classifies the stream. A stream that
+    accounts for everything yields complete evidence, and a clean R0 run
+    settles on its own:
+    - an init event within the envelope;
+    - only known events;
+    - only the envelope's tools;
+    - exactly one result;
+    - no dropped or redacted output.
+  - **Anything else.** Coverage is partial, and the run is held.
+
 ## Ordered slices
 
 Each slice is one pull request. Runtime Authority stays unconstructed and
@@ -253,11 +294,14 @@ unadvertised until slice 6.
    observation stores nothing and goes to the daemon recovery log, and the run
    is held. An operator kill records no evidence, so its run is held too. The
    observer key must exist before dispatch, and slice 6 creates it.
-6. **Trusted adapter.** Compose slices 1–5 into `AutomationDispatchAuthority`
-   and the verifiers. Sign the execution binding and the receipt authority
-   evidence with the `dispatch-authority` key. Construct Runtime Authority only
-   for definitions that opt in, with the #857 approval policy for R3 and R4,
-   and advertise the profile only once its conformance passes.
+6. **Trusted adapter.** First, the runtime envelopes and the structured
+   observation that classifies their streams, as set out under "Runtime
+   Authority launches" above. Then compose slices 1–5 into
+   `AutomationDispatchAuthority` and the verifiers. Sign the execution binding
+   and the receipt authority evidence with the `dispatch-authority` key.
+   Construct Runtime Authority only for definitions that declare authority,
+   launch only what an envelope enforces, apply the #857 approval policy for
+   R3 and R4, and advertise the profile only once its conformance passes.
 7. **Held commands, then approvals.** The five versioned commands #1054
    holds for #857:
    - `occurrence.runNow.v1`, now compatibility-only;
