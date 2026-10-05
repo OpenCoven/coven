@@ -41,6 +41,7 @@ mod request_adoption;
 mod adoption_gate;
 mod automations;
 mod executor_node;
+mod familiar_cli;
 mod familiar_identity;
 // Familiar Contract binding issuer; no production caller until the trusted
 // Runtime Authority adapter (coven#857 slice 6).
@@ -407,6 +408,11 @@ enum Command {
     Ward {
         #[command(subcommand)]
         command: WardCommand,
+    },
+    #[command(about = "Record familiar identities in the familiar ledger")]
+    FamiliarLedger {
+        #[command(subcommand)]
+        command: familiar_cli::FamiliarCommand,
     },
     #[command(about = "Run Coven jobs on this machine for a remote hub")]
     #[command(
@@ -1590,6 +1596,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             unreachable!("process supervisor runs before state initialization")
         }
         Some(Command::Ward { command }) => run_ward_command(command),
+        Some(Command::FamiliarLedger { command }) => familiar_cli::run(command),
         Some(Command::Executor { command }) => run_executor_command(command),
         Some(Command::Run {
             harness,
@@ -7725,6 +7732,47 @@ mod tests {
             }
             other => panic!("expected ward migrate command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_parses_familiar_ledger_commands() {
+        let cli = Cli::parse_from([
+            "coven",
+            "familiar-ledger",
+            "revoke",
+            "familiar-revision:abc:2",
+            "--reason",
+            "compromised",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Command::FamiliarLedger {
+                command:
+                    familiar_cli::FamiliarCommand::Revoke {
+                        revision,
+                        reason,
+                        json,
+                    },
+            }) => {
+                assert_eq!(revision, "familiar-revision:abc:2");
+                assert_eq!(reason, "compromised");
+                assert!(json);
+            }
+            other => panic!("expected familiar revoke command, got {other:?}"),
+        }
+        // `--reason` is required.
+        assert!(Cli::try_parse_from([
+            "coven",
+            "familiar-ledger",
+            "revoke",
+            "familiar-revision:abc:2"
+        ])
+        .is_err());
+        // `coven familiar <id>` still shows one familiar's Ward surface.
+        assert!(matches!(
+            Cli::parse_from(["coven", "familiar", "sage"]).command,
+            Some(Command::Familiars { id: Some(_), .. })
+        ));
     }
 
     #[test]
