@@ -52,6 +52,7 @@ const PUBLIC_COMMANDS: &[&str] = &[
     "patch",
     "pc",
     "ward",
+    "familiar-ledger",
     "executor",
 ];
 const GROUP_IDS: &[&str] = &[

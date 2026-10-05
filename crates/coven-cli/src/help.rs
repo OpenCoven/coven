@@ -150,6 +150,7 @@ const HELP_GROUPS: &[HelpGroupSpec] = &[
             HelpCommandSpec::new("patch", "/cli/patch-openclaw"),
             HelpCommandSpec::new("pc", "/cli/pc"),
             HelpCommandSpec::new("ward", "/cli/repo-workflow"),
+            HelpCommandSpec::new("familiar-ledger", "/cli/repo-workflow"),
             HelpCommandSpec::new("executor", "/cli/hub-scheduler"),
         ],
     },
