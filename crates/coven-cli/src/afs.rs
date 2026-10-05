@@ -42,7 +42,7 @@ const INGEST_EXCLUDES: &[&str] = &[".git", "target", "node_modules", ".worktrees
 /// Largest single file copied into a base, and the largest first-write
 /// copy-up a session will absorb.
 ///
-/// Justified by the coven-110 measurements in `MOUNT-SPIKE.md` §2: copy-up is
+/// Justified by the OpenCoven/coven#658 measurements in `MOUNT-SPIKE.md` §2: copy-up is
 /// linear at roughly 135–300 MiB/s (1 MiB → 3.3 ms, 8 MiB → 57 ms, 32 MiB →
 /// 238 ms). 16 MiB keeps a worst-case first write near ~120 ms, which stays
 /// inside a plausible interactive budget; 32 MiB would not.
@@ -53,7 +53,7 @@ pub const UNIFIED_DIFF_MAX_BYTES: usize = 256 * 1024;
 ///
 /// Only the codes the implemented operations can actually raise live here, so
 /// the enum never advertises a contract the daemon does not honour. The commit
-/// codes arrived with materialization (`coven-fty`).
+/// codes arrived with materialization (`OpenCoven/coven#690`).
 #[derive(Debug)]
 pub enum AfsError {
     SessionNotFound(String),
@@ -183,7 +183,7 @@ pub struct CreateRequest {
     #[serde(default)]
     pub familiar_id: Option<String>,
     #[serde(default)]
-    pub bead_id: Option<String>,
+    pub issue_ref: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -206,7 +206,7 @@ pub struct CommitRequest {
     pub dry_run: bool,
 }
 
-/// What a `dryRun` commit reports (bead `coven-fty` follow-up `coven-y7a`).
+/// What a `dryRun` commit reports (delivery PRs `OpenCoven/coven#690` and `OpenCoven/coven#696`).
 ///
 /// `wouldCommit` is only ever `true`: a preview that would be refused returns
 /// the refusal itself, as the same dotted error a real commit would raise, so
@@ -264,7 +264,7 @@ pub struct BaseView {
 pub struct BindingView {
     pub session_id: Option<String>,
     pub familiar_id: Option<String>,
-    pub bead_id: Option<String>,
+    pub issue_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,7 +363,7 @@ pub struct TimelineEntry {
     pub at: i64,
     pub session_id: Option<String>,
     pub familiar_id: Option<String>,
-    pub bead_id: Option<String>,
+    pub issue_ref: Option<String>,
     pub turn: Option<i64>,
     pub tool_call_id: Option<i64>,
     pub tool_call: Option<TimelineToolCallView>,
@@ -411,7 +411,7 @@ impl AfsStore {
     ///
     /// WAL is not the crate default because it costs the single-file property
     /// a portable delta depends on. A daemon-owned session delta is scratch
-    /// state whose durability story is "discard or commit", and the coven-110
+    /// state whose durability story is "discard or commit", and the OpenCoven/coven#658
     /// benchmarks put whole-file writes at 8.84x the host filesystem without
     /// it versus 1.29x with it, so the daemon always turns it on.
     fn open_delta(&self, id: &str) -> AfsResult<AgentFs> {
@@ -493,7 +493,7 @@ impl AfsStore {
             project_root: Some(project_root.to_string_lossy().into_owned()),
             coven_session_id: request.session_id.clone(),
             familiar_id: request.familiar_id.clone(),
-            bead_id: request.bead_id.clone(),
+            issue_ref: request.issue_ref.clone(),
             ..Default::default()
         };
         delta.bind_session(&binding).map_err(AfsError::from)?;
@@ -512,7 +512,7 @@ impl AfsStore {
             binding: BindingView {
                 session_id: binding.coven_session_id.clone(),
                 familiar_id: binding.familiar_id.clone(),
-                bead_id: binding.bead_id.clone(),
+                issue_ref: binding.issue_ref.clone(),
             },
             mount: None,
             changes: ChangeCounts {
@@ -586,7 +586,7 @@ impl AfsStore {
             binding: BindingView {
                 session_id: binding.coven_session_id.clone(),
                 familiar_id: binding.familiar_id.clone(),
-                bead_id: binding.bead_id.clone(),
+                issue_ref: binding.issue_ref.clone(),
             },
             mount: crate::afs_mount::current(self.coven_home(), id),
             changes: counts,
@@ -779,7 +779,7 @@ impl AfsStore {
                     at: record.at,
                     session_id: record.actor.coven_session_id,
                     familiar_id: record.actor.familiar_id,
-                    bead_id: record.actor.bead_id,
+                    issue_ref: record.actor.issue_ref,
                     turn: record.actor.turn,
                     tool_call_id,
                     tool_call,
@@ -1472,8 +1472,8 @@ fn commit_message(binding: &SessionBinding, request: &CommitRequest) -> String {
     if let Some(familiar) = &binding.familiar_id {
         message.push_str(&format!("Coven-Familiar: {familiar}\n"));
     }
-    if let Some(bead) = &binding.bead_id {
-        message.push_str(&format!("Coven-Bead: {bead}\n"));
+    if let Some(issue) = &binding.issue_ref {
+        message.push_str(&format!("Coven-Issue: {issue}\n"));
     }
     message.push_str(&format!("Coven-Afs-Session: {}\n", binding.id));
     for author in &request.co_authors {
@@ -1781,7 +1781,7 @@ mod tests {
         store
             .create(&CreateRequest {
                 project_root: root.to_string_lossy().into_owned(),
-                bead_id: Some("coven-5kt".into()),
+                issue_ref: Some("OpenCoven/coven#684".into()),
                 ..Default::default()
             })
             .unwrap()
@@ -2020,7 +2020,7 @@ mod tests {
         let message = git_ok(&root, &["log", "-1", "--format=%B", &committed.commit]);
         assert!(message.contains("afs: land the delta"));
         assert!(message.contains(&format!("Coven-Afs-Session: {}", view.id)));
-        assert!(message.contains("Coven-Bead: coven-5kt"));
+        assert!(message.contains("Coven-Issue: OpenCoven/coven#684"));
         assert!(message.contains(&format!("Co-authored-by: {CO_AUTHOR}")));
 
         // The change set is on the branch, not merely staged somewhere.
@@ -2492,7 +2492,10 @@ mod tests {
         assert_eq!(view.base.files, 2, "src/main.rs and README.md only");
         assert!(view.base.skipped >= 1, "target/ must be excluded");
         assert_eq!(view.changes.added, 0);
-        assert_eq!(view.binding.bead_id.as_deref(), Some("coven-5kt"));
+        assert_eq!(
+            view.binding.issue_ref.as_deref(),
+            Some("OpenCoven/coven#684")
+        );
     }
 
     #[test]

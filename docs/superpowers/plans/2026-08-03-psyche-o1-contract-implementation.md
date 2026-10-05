@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche O1 Coven Contract Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -1071,7 +1075,7 @@ Expected: every command exits 0.
 Change the O1 design status to:
 
 ```markdown
-**Status:** Implementation verified; delivery evidence is tracked in issue #567 and Bead `coven-psy-o1`
+**Status:** Implementation verified; delivery evidence is tracked in GitHub issue `OpenCoven/coven#567`
 ```
 
 Add an O1 evidence line to `specs/psyche/PLAN.md`:
@@ -1079,8 +1083,7 @@ Add an O1 evidence line to `specs/psyche/PLAN.md`:
 ```markdown
 **O1 implementation candidate:** Named-contract negotiation and lifecycle
 vocabulary pass focused Rust, TypeScript, and documentation guardrail tests.
-O1 remains incomplete until the reviewed PR merges and issue #567 plus Bead
-`coven-psy-o1` record the merge evidence. This candidate addresses only C-S1
+O1 remains incomplete until the reviewed PR merges and GitHub issue `OpenCoven/coven#567` records the merge evidence. This candidate addresses only C-S1
 vocabulary and C-S8 documentation; C-S3-C-S6 and C-S9-C-S12 remain planned,
 and G4/G6 remain blocked.
 ```
@@ -1155,14 +1158,13 @@ Review the branch diff against the O1 design and confirm:
 
 - [ ] **Step 8: Record completion only after the reviewed PR merges**
 
-After merge, update GitHub issue #567 and Bead `coven-psy-o1` with:
+After merge, update GitHub issue `OpenCoven/coven#567` with:
 
 Record the observed merge commit SHA together with this exact evidence
 statement: focused Rust API/lifecycle tests, OpenClaw bridge typecheck/Vitest,
 documentation contract guardrail, full Rust workspace checks, secret scan, and
 staged plus whole-branch privacy guards passed in the merged PR. Scope closed
 is C-S1 vocabulary and C-S8 documentation only. C-S3-C-S6, C-S9-C-S12, G4,
-G6, and production child dispatch remain blocked. Close issue #567 and mark
-Bead `coven-psy-o1` complete only after both trackers contain that observed
+G6, and production child dispatch remain blocked. Close GitHub issue `OpenCoven/coven#567` only after the issue contains that observed
 merge evidence. Do not substitute a branch HEAD, proposed PR number, or
 expected commit for the merge commit reported by GitHub.

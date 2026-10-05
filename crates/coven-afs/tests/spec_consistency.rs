@@ -403,7 +403,7 @@ fn coven_extensions_are_droppable_without_changing_filesystem_semantics() {
     fs.bind_session(&SessionBinding {
         id: "afs-conformance".into(),
         state: STATE_OPEN.into(),
-        bead_id: Some("coven-5kt".into()),
+        issue_ref: Some("OpenCoven/coven#684".into()),
         ..Default::default()
     })
     .unwrap();

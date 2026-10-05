@@ -59,6 +59,14 @@ Without an explicit `COVEN_AGENT_ID`, Coven identifies the owner as
 `$USER@<worktree-slug>`. Set distinct explicit IDs only when multiple agents
 must share one worktree.
 
+## Durable work tracking
+
+GitHub issues in the owning repository are the sole work tracker. Record
+assignees, priority, acceptance criteria, blockers/sub-issues, and exact delivery
+evidence there. Follow [`docs/work-tracking.md`](docs/work-tracking.md).
+Repository coordination still uses issue-keyed Coven claims and task worktrees.
+Do not initialize a separate local tracking database or sync branch.
+
 ## Branch & PR workflow (all agents)
 
 - **Coordinate before editing** (see above) — check `coven claim status` and

@@ -1,34 +1,14 @@
 {
   "schema": "coven.automations-v1.tracker-mapping",
-  "schema_version": 1,
-  "description": "Machine-readable Bead <-> GitHub outcome mapping for the Coven Automations v1 program (OpenCoven/coven#854), operationalized by OpenCoven/coven#859. GitHub owns public outcomes, acceptance gates, and durable evidence links. Beads (in the OpenCoven/coven-cave embedded Dolt database `cave`) owns the implementation dependency graph, execution ownership, and mirror inputs. This file is the reconciliation contract between the two; it is hand-reviewed, not hand-synced.",
+  "schema_version": 2,
+  "description": "Reviewed GitHub issue graph for the Coven Automations v1 program. GitHub owns outcomes, execution ownership, dependencies, acceptance gates, and delivery evidence. Runtime state stays in Coven.",
   "sync": {
-    "last_sync": "2026-09-03T06:09:12Z",
-    "source_branch": "docs/coven-automations-critical-path",
-    "writer": "One canonical writer/process is designated for this setup; see docs/superpowers/plans/2026-08-30-issue-859-coven-automations-v1-tracker-operationalization.md (Decision D1). Persisted tracker changes land only through reviewed PRs.",
-    "canonical_bead_store": "OpenCoven/coven-cave embedded Dolt database `cave`; provisioning was executed through OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277). A competing Beads database must not be initialized in OpenCoven/coven (operational correction on OpenCoven/coven#859, 2026-08-30).",
-    "public_bead_export": "OpenCoven/coven-cave `.beads/issues.jsonl` is a public-scrubbed review export, never canonical state and never a hand-edited sync mechanism.",
-    "beads_tool_reference": "Beads 1.3.0-rc.1 (schema v66 capable), bead schema_version 1 (live). The 2026-09-03 reconciliation used the checksum-verified darwin-arm64 release because Homebrew Beads 1.2.2 only supports the older v53 schema.",
-    "beads_provisioning": {
-      "seed_task": "OpenCoven/coven-cave#5220",
-      "seed_bead": "cave-tmegk",
-      "program_control": "OpenCoven/coven#859 -> Cave bead cave-hlv.10 (closed 2026-09-03 after tracker operationalization, reconciliation, drift control, and evidence semantics were verified)",
-      "release_rollup": "OpenCoven/coven#854 -> Cave bead cave-hlv.9 (release go/no-go rollup; blocked-first by the other 13 in-program outcomes)",
-      "cross_repository_children": "OpenCoven/familiar-contract#17 -> cave-6jswi; OpenCoven/coven-threads#29 -> cave-m9tw3; OpenCoven/sdk#80 -> cave-90hwl; OpenCoven/coven-cave#5217 -> cave-e52qp; OpenCoven/psyche#18 -> cave-yaul2; OpenCoven/coven-docs#76 -> cave-qwnxq; OpenCoven/.github#2 -> cave-xqbs4",
-      "graph_shape": "15 canonical beads (14 mapped outcomes plus the OpenCoven/coven-cave#5220 seed bead cave-tmegk) and 30 in-program blocked-first edges, no cycles. cave-hlv.9 and cave-hlv.10 additionally carry a pre-existing parent-epic edge to the closed Cave epic cave-hlv, which is outside the Automations v1 program set.",
-      "remote_ref": "refs/dolt/data",
-      "dolt_commit_evidence": "Embedded-Dolt pre/post commit OIDs, the reconciled local/remote Dolt commit, and the durable refs/dolt/data git OID are recorded in Cave PR OpenCoven/coven-cave#5277 and the seed-run execution ledger (exact transient OIDs are kept out of this committed file so this reconciliation contract cannot go stale against a moving remote; the ledger is the exact-evidence surface).",
-      "remote_sync_status": "synchronized and terminal: Cave PR OpenCoven/coven-cave#5278 reconciled the terminal mapping after the initial seed in OpenCoven/coven-cave#5277, OpenCoven/coven-cave#5220 is closed, and a fresh `pnpm beads:sync` pull+push completed successfully on 2026-09-03 after closing program-control bead cave-hlv.10. The shared remote carries the reviewed 15-bead / 30-edge graph; no force-push or schema-skew bypass was used.",
-      "dependency_proof": "bd dep list (both directions), bd dep cycles (none), bd ready --json; recorded on Cave PR OpenCoven/coven-cave#5277."
-    },
-    "drift_check": "node docs/roadmaps/drift-check.mjs (add --beads-export <issues.jsonl> to cross-check an export; --strict to fail on pending provisioning; --selftest to verify detection rules)",
-    "priority_policy": {
-      "P0": "Current v1 correctness, security, data-loss/duplicate-execution risk, authority violation, broken migration, or certification blocker.",
-      "P1": "Committed SDK/product/docs/ecosystem work required to make the certified core usable and operable.",
-      "P2": "Post-v1 expansion or research that must not silently enter the release critical path."
-    }
+    "last_sync": "2026-10-05",
+    "source_branch": "chore/github-issue-tracking",
+    "source": "GitHub REST issue state; reviewed snapshot, not a live readiness report.",
+    "drift_check": "node docs/roadmaps/drift-check.mjs --strict; optionally --issues-export PATH with a local GitHub REST JSON issue array."
   },
-  "program": "https://github.com/OpenCoven/coven/issues/854",
+  "program": "OpenCoven/coven#854",
   "outcomes": [
     {
       "slug": "program",
@@ -37,24 +17,14 @@
         "repo": "OpenCoven/coven",
         "issue": 854,
         "url": "https://github.com/OpenCoven/coven/issues/854",
-        "title": "Program: Coven Automations v1 — reliable, identity-bound familiar routines",
+        "title": "Program: Coven Automations v1 \u2014 reliable, identity-bound familiar routines",
         "state": "open",
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/program",
-        "surface": "shared",
-        "title": "Coven Automations v1 — release go/no-go rollup (GitHub OpenCoven/coven#854)",
-        "id": "cave-hlv.9",
-        "cave_outcome_key": "release-go-no-go",
-        "cave_label": "automations-v1:release-go-no-go",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "active:release-gate-ownership",
-        "gate": "Owns release gates and cross-repository rollup; final #854 release rollup must be generable from reconciled tracker state and exact evidence. Must not be used as a catch-all implementation task.",
-        "evidence_status": "none",
-        "evidence": []
-      },
+      "acceptance_gate": "Owns release gates and cross-repository rollup; final #854 release rollup must be generable from reconciled tracker state and exact evidence. Must not be used as a catch-all implementation task.",
+      "disposition": "active:release-gate-ownership",
+      "evidence": [],
       "depends_on": [
         "program-control",
         "foundation",
@@ -70,10 +40,7 @@
         "documentation",
         "organization-canaries"
       ],
-      "depends_on_external": [
-        "Cave bead cave-hlv (closed 'Operationalize Beads for familiar issue tracking' epic) — pre-existing parent-epic edge in the Cave graph, outside the Automations v1 program set and not a v1 release blocker"
-      ],
-      "notes": "#854 is the release rollup outcome. It gates the release but must not absorb implementation work; every dependency listed here is a live blocked-first edge on Cave bead cave-hlv.9 (13 in-program edges, verified with bd dep list --direction down)."
+      "depends_on_external": []
     },
     {
       "slug": "program-control",
@@ -82,37 +49,22 @@
         "repo": "OpenCoven/coven",
         "issue": 859,
         "url": "https://github.com/OpenCoven/coven/issues/859",
-        "title": "P0 control: Operationalize Coven Automations v1 through Cave's canonical Beads graph and GitHub mirrors",
+        "title": "P0 control: Operationalize Coven Automations v1 through the reviewed issue graph and delivery evidence",
         "state": "closed",
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/program-control",
-        "surface": "shared",
-        "title": "Coven Automations v1 — program control and GitHub mirror operationalization (GitHub OpenCoven/coven#859)",
-        "id": "cave-hlv.10",
-        "cave_outcome_key": "program-control",
-        "cave_label": "automations-v1:program-control",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "closed:tracker-operationalized",
-        "gate": "Tracker operationalization is complete when: every #854 P0/P1 outcome maps one-to-one to a live Cave bead; dependency direction is proven in both directions with bd dep list and bd ready; this mapping and the generated roadmap block reconcile with the live graph under node docs/roadmaps/drift-check.mjs --strict; and the canonical Cave Dolt state is durable on the shared remote ref refs/dolt/data.",
-        "evidence_status": "verified",
-        "evidence": [
-          "OpenCoven/coven-cave#5277 (merged 2026-09-01; canonical Beads graph seeded)",
-          "OpenCoven/coven-cave#5278 (merged 2026-09-01; terminal Cave mapping reconciliation)",
-          "https://github.com/OpenCoven/coven/pull/900 (initial tracker-mapping reconciliation)",
-          "https://github.com/OpenCoven/coven/pull/901 (durable-sync narrative and drift invariant reconciliation)",
-          "OpenCoven/coven-cave#5220 closed 2026-09-01 with the seed and terminal mapping receipts",
-          "Cave bead cave-hlv.10 closed 2026-09-03; `pnpm beads:sync` pull+push exited 0 using checksum-verified Beads 1.3.0-rc.1",
-          "OpenCoven/coven#859 closed 2026-09-03 after `node docs/roadmaps/drift-check.mjs --strict` and `--selftest` passed"
-        ]
-      },
-      "depends_on": [],
-      "depends_on_external": [
-        "Cave bead cave-hlv (closed 'Operationalize Beads for familiar issue tracking' epic) — pre-existing parent-epic edge in the Cave graph, outside the Automations v1 program set and not a v1 release blocker"
+      "acceptance_gate": "Program issues, ownership, dependencies, and delivery evidence are published and reviewable.",
+      "disposition": "closed:accepted-github-outcome",
+      "evidence": [
+        "OpenCoven/coven#900 (reviewed program mapping)",
+        "OpenCoven/coven#901 (reviewed graph consistency controls)",
+        "OpenCoven/coven-cave#5277 (historical program provisioning)",
+        "OpenCoven/coven-cave#5278 (historical reconciliation)",
+        "OpenCoven/coven#859 (accepted control outcome)"
       ],
-      "notes": "#859 completed tracker operationalization and remains a closed dependency of the release rollup and organization canaries. Its closure does not certify Automations v1; #854 stays open until every implementation, consumer, certification, and release gate resolves."
+      "depends_on": [],
+      "depends_on_external": []
     },
     {
       "slug": "foundation",
@@ -126,28 +78,17 @@
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/foundation",
-        "surface": "shared",
-        "title": "Coven Automations v1 — native routine foundation (GitHub OpenCoven/coven#816)",
-        "id": "cave-stsf7",
-        "cave_outcome_key": "foundation",
-        "cave_label": "automations-v1:foundation",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277); bead closed as verified-foundation",
-        "disposition": "closed:verified-foundation",
-        "gate": "#816 evidence checklist: landed commit/PR series linked with an exact final foundation revision; clean-clone automation-test verification; pre-automations schema migration and rollback proof; daemon startup/tick/shutdown/restart proof on supported platforms; one scheduled and one manual run shown to traverse the same claim/ledger/runtime/delivery path; stale lease cannot block the next eligible occurrence indefinitely; failed output delivery cannot report success; every original acceptance criterion reconciled as implemented, deferred, or superseded; Cave ownership migration (OpenCoven/coven-cave#4990) linked with remaining compatibility facade documented.",
-        "evidence_status": "verified",
-        "evidence": [
-          "https://github.com/OpenCoven/coven/issues/816 (CLOSED)",
-          "https://github.com/OpenCoven/coven/pull/896 (merged 2026-09-01; settle automation runs from terminal evidence)",
-          "foundation merge commit for #896 recorded in Cave PR OpenCoven/coven-cave#5277 (exact SHA kept out of this file per the repository secret guard)",
-          "https://github.com/OpenCoven/coven/pull/846 (merged 2026-08-28; routine definitions and control actions, part 1)",
-          "https://github.com/OpenCoven/coven/pull/847 (merged 2026-08-28; legacy import series, parts 5-8)"
-        ]
-      },
+      "acceptance_gate": "#816 evidence checklist: landed commit/PR series linked with an exact final foundation revision; clean-clone automation-test verification; pre-automations schema migration and rollback proof; daemon startup/tick/shutdown/restart proof on supported platforms; one scheduled and one manual run shown to traverse the same claim/ledger/runtime/delivery path; stale lease cannot block the next eligible occurrence indefinitely; failed output delivery cannot report success; every original acceptance criterion reconciled as implemented, deferred, or superseded; Cave ownership migration (OpenCoven/coven-cave#4990) linked with remaining compatibility facade documented.",
+      "disposition": "closed:accepted-github-outcome",
+      "evidence": [
+        "https://github.com/OpenCoven/coven/issues/816 (CLOSED)",
+        "https://github.com/OpenCoven/coven/pull/896 (merged 2026-09-01; settle automation runs from terminal evidence)",
+        "foundation merge commit for #896 recorded in Cave PR OpenCoven/coven-cave#5277 (exact SHA kept out of this file per the repository secret guard)",
+        "https://github.com/OpenCoven/coven/pull/846 (merged 2026-08-28; routine definitions and control actions, part 1)",
+        "https://github.com/OpenCoven/coven/pull/847 (merged 2026-08-28; legacy import series, parts 5-8)"
+      ],
       "depends_on": [],
-      "depends_on_external": [],
-      "notes": "Foundation implementation landed on main (crates/coven-cli/src/automations/); #816 is CLOSED and represented here as verified-foundation, not pending work. Downstream P0 workstreams depend on it via the Cave Beads graph (bead cave-stsf7, closed)."
+      "depends_on_external": []
     },
     {
       "slug": "protocol",
@@ -157,26 +98,23 @@
         "issue": 855,
         "url": "https://github.com/OpenCoven/coven/issues/855",
         "title": "P0: Specify coven.automations.v1 schemas, state machines, idempotency, and changefeed",
-        "state": "open",
+        "state": "closed",
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/protocol",
-        "surface": "shared",
-        "title": "Coven Automations v1 — protocol schemas, state, idempotency, changefeed (GitHub OpenCoven/coven#855)",
-        "id": "cave-tm1y0",
-        "cave_outcome_key": "protocol",
-        "cave_label": "automations-v1:protocol",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "ready:foundation-verified (bead cave-tm1y0 unblocked in the Cave graph)",
-        "gate": "coven.automations.v1 schemas, state machines, idempotency rules, and changefeed contract are specified, reviewed, and covered by tests; schema/conformance artifact revisions recorded as evidence.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["foundation"],
-      "depends_on_external": [],
-      "notes": "Feeds SDK read/types/changefeed (P1), SDK mutations/approvals (P1), Cave oversight/recovery (P1), and Psyche adapter (P1) once those outcomes are created."
+      "acceptance_gate": "coven.automations.v1 schemas, state machines, idempotency rules, and changefeed contract are specified, reviewed, and covered by tests; schema/conformance artifact revisions recorded as evidence.",
+      "disposition": "closed:accepted-github-outcome",
+      "evidence": [
+        {
+          "kind": "accepted-outcome",
+          "ref": "OpenCoven/coven#855",
+          "closed_at": "2026-09-10T11:44:02Z"
+        }
+      ],
+      "depends_on": [
+        "foundation"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "scheduler",
@@ -186,26 +124,24 @@
         "issue": 856,
         "url": "https://github.com/OpenCoven/coven/issues/856",
         "title": "P0: Harden automation time, retries, cancellation, fencing, and crash recovery",
-        "state": "open",
+        "state": "closed",
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/scheduler",
-        "surface": "shared",
-        "title": "Coven Automations v1 — time, retry, cancel, fencing, recovery (GitHub OpenCoven/coven#856)",
-        "id": "cave-1sh6p",
-        "cave_outcome_key": "scheduler-reliability",
-        "cave_label": "automations-v1:scheduler",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "blocked:pending-protocol (bead cave-1sh6p; foundation verified)",
-        "gate": "Time, retry, cancellation, fencing, and crash-recovery behaviors verified by tests, including stale-lease recovery, misfire semantics, and cancellation without duplicate execution.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["foundation", "protocol"],
-      "depends_on_external": [],
-      "notes": "Depends on #816 and #855 where state/error semantics are required."
+      "acceptance_gate": "Time, retry, cancellation, fencing, and crash-recovery behaviors verified by tests, including stale-lease recovery, misfire semantics, and cancellation without duplicate execution.",
+      "disposition": "closed:accepted-github-outcome",
+      "evidence": [
+        {
+          "kind": "accepted-outcome",
+          "ref": "OpenCoven/coven#856",
+          "closed_at": "2026-09-09T13:38:17Z"
+        }
+      ],
+      "depends_on": [
+        "foundation",
+        "protocol"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "authority",
@@ -219,22 +155,15 @@
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/authority",
-        "surface": "shared",
-        "title": "Coven Automations v1 — principal/familiar/authority/approval/receipt binding (GitHub OpenCoven/coven#857)",
-        "id": "cave-dbkng",
-        "cave_outcome_key": "trust-integration",
-        "cave_label": "automations-v1:trust-integration",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277); Cave outcome slug trust-integration",
-        "disposition": "blocked:pending-protocol-and-identity-authority-profiles (bead cave-dbkng)",
-        "gate": "Runs are bound to principal authority, familiar revisions, capabilities, approvals, and receipts; negative tests prove authority bypass fails closed; receipts are tamper-evident and out of tracker scope.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["protocol", "familiar-embodiment", "automation-authority"],
-      "depends_on_external": [],
-      "notes": "Live Cave bead cave-dbkng is blocked-first by cave-tm1y0 (protocol), cave-6jswi (familiar embodiment) and cave-m9tw3 (automation authority); those are the exact direct edges recorded here. #816 (foundation) reaches this outcome transitively through protocol and is not a direct edge. The upstream Familiar Contract (OpenCoven/familiar-contract#17) and Threads (OpenCoven/coven-threads#29) profile outcomes are now first-class cross-repository children of this mapping rather than untyped external references."
+      "acceptance_gate": "Runs are bound to principal authority, familiar revisions, capabilities, approvals, and receipts; negative tests prove authority bypass fails closed; receipts are tamper-evident and out of tracker scope.",
+      "disposition": "open:acceptance-incomplete",
+      "evidence": [],
+      "depends_on": [
+        "protocol",
+        "familiar-embodiment",
+        "automation-authority"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "certification",
@@ -248,22 +177,15 @@
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/certification",
-        "surface": "shared",
-        "title": "Coven Automations v1 — conformance, chaos, SLO, operator diagnostics (GitHub OpenCoven/coven#858)",
-        "id": "cave-x28j6",
-        "cave_outcome_key": "conformance",
-        "cave_label": "automations-v1:conformance",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277); Cave outcome slug conformance",
-        "disposition": "blocked:pending-protocol-scheduler-trust (bead cave-x28j6)",
-        "gate": "Conformance, chaos, SLO, and operator-diagnostics suites exist and run without ambient production credentials; the v1 release gate report is produced from them and linked here.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["protocol", "scheduler", "authority"],
-      "depends_on_external": [],
-      "notes": "Certification blocker for the v1 release gate owned by the program outcome."
+      "acceptance_gate": "Conformance, chaos, SLO, and operator-diagnostics suites exist and run without ambient production credentials; the v1 release gate report is produced from them and linked here.",
+      "disposition": "open:acceptance-incomplete",
+      "evidence": [],
+      "depends_on": [
+        "protocol",
+        "scheduler",
+        "authority"
+      ],
+      "depends_on_external": []
     }
   ],
   "cross_repository_children": [
@@ -274,26 +196,23 @@
         "repo": "OpenCoven/familiar-contract",
         "issue": 17,
         "title": "P0 profile: Define universal familiar embodiment binding for automation and direct runs",
-        "state": "open",
+        "state": "closed",
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/familiar-embodiment",
-        "surface": "shared",
-        "title": "Coven Automations v1 — universal familiar embodiment binding (GitHub OpenCoven/familiar-contract#17)",
-        "id": "cave-6jswi",
-        "cave_outcome_key": "familiar-embodiment",
-        "cave_label": "automations-v1:familiar-embodiment",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "ready:foundation-verified (bead cave-6jswi unblocked in the Cave graph)",
-        "gate": "A universal familiar embodiment binding is specified and reviewed so an automation run and a direct run resolve the same familiar revision, capabilities, and identity; conformance covers both entry paths.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["foundation"],
-      "depends_on_external": [],
-      "notes": "Upstream identity profile that OpenCoven/coven#857 (authority) depends on. Live Cave bead cave-6jswi blocks cave-m9tw3, cave-dbkng, and cave-hlv.9."
+      "acceptance_gate": "A universal familiar embodiment binding is specified and reviewed so an automation run and a direct run resolve the same familiar revision, capabilities, and identity; conformance covers both entry paths.",
+      "disposition": "closed:accepted-github-outcome",
+      "evidence": [
+        {
+          "kind": "accepted-outcome",
+          "ref": "OpenCoven/familiar-contract#17",
+          "closed_at": "2026-09-03T10:39:20Z"
+        }
+      ],
+      "depends_on": [
+        "foundation"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "automation-authority",
@@ -302,26 +221,23 @@
         "repo": "OpenCoven/coven-threads",
         "issue": 29,
         "title": "P0 profile: Define automation authority, approvals, and degrade-to-proposal semantics",
-        "state": "open",
+        "state": "closed",
         "priority": "P0",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/automation-authority",
-        "surface": "shared",
-        "title": "Coven Automations v1 — automation authority, approvals, degrade-to-proposal (GitHub OpenCoven/coven-threads#29)",
-        "id": "cave-m9tw3",
-        "cave_outcome_key": "automation-authority",
-        "cave_label": "automations-v1:automation-authority",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "blocked:pending-familiar-embodiment (bead cave-m9tw3)",
-        "gate": "Automation authority, approval requirements, and degrade-to-proposal semantics are specified with negative tests proving an under-authorized run degrades to a proposal instead of executing.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["familiar-embodiment"],
-      "depends_on_external": [],
-      "notes": "Upstream authority profile that OpenCoven/coven#857 depends on. Live Cave bead cave-m9tw3 blocks cave-dbkng and cave-hlv.9."
+      "acceptance_gate": "Automation authority, approval requirements, and degrade-to-proposal semantics are specified with negative tests proving an under-authorized run degrades to a proposal instead of executing.",
+      "disposition": "closed:accepted-github-outcome",
+      "evidence": [
+        {
+          "kind": "accepted-outcome",
+          "ref": "OpenCoven/coven-threads#29",
+          "closed_at": "2026-09-03T15:10:47Z"
+        }
+      ],
+      "depends_on": [
+        "familiar-embodiment"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "sdk",
@@ -334,22 +250,13 @@
         "priority": "P1",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/sdk",
-        "surface": "shared",
-        "title": "Coven Automations v1 — constrained SDK types, subscriptions, verification, commands (GitHub OpenCoven/sdk#80)",
-        "id": "cave-90hwl",
-        "cave_outcome_key": "sdk",
-        "cave_label": "automations-v1:sdk",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "blocked:pending-certification (bead cave-90hwl)",
-        "gate": "SDK automation types, subscriptions, verification helpers, and authority-aware commands are published against the certified core, with the exact package version and conformance run recorded as evidence.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["certification"],
-      "depends_on_external": [],
-      "notes": "Live Cave bead cave-90hwl is blocked-first by cave-x28j6 (certification) and blocks cave-hlv.9."
+      "acceptance_gate": "SDK automation types, subscriptions, verification helpers, and authority-aware commands are published against the certified core, with the exact package version and conformance run recorded as evidence.",
+      "disposition": "open:acceptance-incomplete",
+      "evidence": [],
+      "depends_on": [
+        "certification"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "cave-oversight",
@@ -362,22 +269,13 @@
         "priority": "P1",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/cave-oversight",
-        "surface": "shared",
-        "title": "Coven Automations v1 — oversight, approvals, recovery, compatibility retirement (GitHub OpenCoven/coven-cave#5217)",
-        "id": "cave-e52qp",
-        "cave_outcome_key": "cave-oversight",
-        "cave_label": "automations-v1:cave-oversight",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "blocked:pending-certification (bead cave-e52qp)",
-        "gate": "Cave operator oversight, approval handling, and recovery surfaces run against the certified core, and the pre-automations compatibility facade is retired or its remaining scope is documented.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["certification"],
-      "depends_on_external": [],
-      "notes": "Live Cave bead cave-e52qp is blocked-first by cave-x28j6 and blocks cave-hlv.9."
+      "acceptance_gate": "Cave operator oversight, approval handling, and recovery surfaces run against the certified core, and the pre-automations compatibility facade is retired or its remaining scope is documented.",
+      "disposition": "open:acceptance-incomplete",
+      "evidence": [],
+      "depends_on": [
+        "certification"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "psyche-adapter",
@@ -390,22 +288,13 @@
         "priority": "P1",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/psyche-adapter",
-        "surface": "shared",
-        "title": "Coven Automations v1 — Psyche adapter for automation-triggered orchestration (GitHub OpenCoven/psyche#18)",
-        "id": "cave-yaul2",
-        "cave_outcome_key": "psyche-adapter",
-        "cave_label": "automations-v1:psyche-adapter",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "blocked:pending-certification (bead cave-yaul2)",
-        "gate": "Psyche consumes automation triggers through the certified public contract and demonstrably does not own schedules, occurrences, leases, or run state.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["certification"],
-      "depends_on_external": [],
-      "notes": "Live Cave bead cave-yaul2 is blocked-first by cave-x28j6 and blocks cave-hlv.9."
+      "acceptance_gate": "Psyche consumes automation triggers through the certified public contract and demonstrably does not own schedules, occurrences, leases, or run state.",
+      "disposition": "open:acceptance-incomplete",
+      "evidence": [],
+      "depends_on": [
+        "certification"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "documentation",
@@ -418,22 +307,13 @@
         "priority": "P1",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/documentation",
-        "surface": "shared",
-        "title": "Coven Automations v1 — protocol, operator, migration, troubleshooting docs (GitHub OpenCoven/coven-docs#76)",
-        "id": "cave-qwnxq",
-        "cave_outcome_key": "documentation",
-        "cave_label": "automations-v1:documentation",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "blocked:pending-certification (bead cave-qwnxq)",
-        "gate": "Protocol, operator, migration, and troubleshooting documentation is published against the certified contract revision and links the exact schema/conformance artifacts.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["certification"],
-      "depends_on_external": [],
-      "notes": "Live Cave bead cave-qwnxq is blocked-first by cave-x28j6 and blocks cave-hlv.9."
+      "acceptance_gate": "Protocol, operator, migration, and troubleshooting documentation is published against the certified contract revision and links the exact schema/conformance artifacts.",
+      "disposition": "open:acceptance-incomplete",
+      "evidence": [],
+      "depends_on": [
+        "certification"
+      ],
+      "depends_on_external": []
     },
     {
       "slug": "organization-canaries",
@@ -446,25 +326,17 @@
         "priority": "P1",
         "owner": "BunsDev"
       },
-      "bead": {
-        "label": "automations-v1/organization-canaries",
-        "surface": "shared",
-        "title": "Coven Automations v1 — reusable conformance, contract-drift, roadmap checks (GitHub OpenCoven/.github#2)",
-        "id": "cave-xqbs4",
-        "cave_outcome_key": "organization-canaries",
-        "cave_label": "automations-v1:organization-canaries",
-        "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "blocked:pending-certification (program control closed; bead cave-xqbs4)",
-        "gate": "Reusable organization-level conformance, contract-drift, and roadmap checks run on consumer repositories without ambient production credentials and fail closed on drift.",
-        "evidence_status": "none",
-        "evidence": []
-      },
-      "depends_on": ["program-control", "certification"],
-      "depends_on_external": [],
-      "notes": "Live Cave bead cave-xqbs4 still depends on closed cave-hlv.10 for historical graph integrity and remains blocked only by open certification bead cave-x28j6; it blocks cave-hlv.9."
+      "acceptance_gate": "Reusable organization-level conformance, contract-drift, and roadmap checks run on consumer repositories without ambient production credentials and fail closed on drift.",
+      "disposition": "open:acceptance-incomplete",
+      "evidence": [],
+      "depends_on": [
+        "program-control",
+        "certification"
+      ],
+      "depends_on_external": []
     }
   ],
-  "cross_repository_children_policy": "One Bead per SDK, Cave, Psyche, docs, organization-canary, Familiar Contract, and Threads outcome created under OpenCoven/coven#854. All seven are provisioned and mapped one-to-one above, and each row carries the same evidence semantics as an in-repository outcome: a live bead id, an acceptance gate, a disposition, an evidence_status, and an evidence list that stays empty until exact PR/test/release references exist. They are mirrored in the canonical Cave mapping (docs/roadmaps/coven-automations-v1.mapping.json in OpenCoven/coven-cave; Cave PR OpenCoven/coven-cave#5277), where familiar-embodiment and automation-authority use the same keys and sdk/cave-oversight/psyche-adapter/documentation/organization-canaries depend on the Cave key `conformance` (this file's `certification` slug). node docs/roadmaps/drift-check.mjs enforces the membership contract: omitting any of these seven, or the #859 program-control outcome, is an E011 error in both default and strict mode.",
+  "cross_repository_children_policy": "Each child is tracked in its owning repository. Preserve the seven declared cross-repository outcomes and their explicit dependencies; a closed profile prerequisite does not certify the production consumer.",
   "p2_exclusions": [
     "Event triggers",
     "Multi-host routing",
@@ -473,14 +345,13 @@
   ],
   "p2_exclusions_policy": "These remain post-v1 (P2) and must not be encoded as implicit P0 blockers anywhere in the graph.",
   "invariants": [
-    "Each GitHub outcome maps to exactly one Bead; each Bead maps to exactly one GitHub outcome. Cross-repository children are held to the same one-to-one rule as in-repository outcomes.",
-    "Program membership is fixed and pinned inside the checker, not inside this file: seven in-repository outcomes (OpenCoven/coven#854, #859, #816, #855, #856, #857, #858) and seven cross-repository children (OpenCoven/familiar-contract#17, OpenCoven/coven-threads#29, OpenCoven/sdk#80, OpenCoven/coven-cave#5217, OpenCoven/psyche#18, OpenCoven/coven-docs#76, OpenCoven/.github#2). Omitting a member, emptying cross_repository_children, or filing a member in the wrong section is an E011 error in both default and --strict mode.",
-    "Every depends_on entry names a live blocked-first edge in the canonical Cave graph; transitive prerequisites are not restated as direct edges.",
-    "Dependencies and P0/P1/P2 priorities in Beads match this file and the roadmap table generated from it.",
-    "A P0 Bead has one accountable owner, one canonical GitHub outcome, explicit dependencies, a current acceptance gate, an active or explicitly blocked disposition, evidence requirements, and no contradictory closed public mirror.",
-    "A Bead closes only when the corresponding GitHub acceptance criteria are satisfied or the outcome is explicitly cancelled/superseded with rationale.",
-    "Generated mirror bodies (including the generated mapping table in docs/roadmaps/coven-automations-v1.md) change only through the generator contract (node docs/roadmaps/drift-check.mjs --render).",
-    "Tracker data is never queried as production automation state; the Coven runtime owns definitions, occurrences, runs, attempts, leases, approvals, artifacts, events, and receipts.",
-    "Tracker output must not contain secrets, private prompts, terminal dumps, credentials, unrestricted personal paths, or sensitive identity/authority payloads."
-  ]
+    "Every program outcome has one canonical GitHub issue and a unique slug.",
+    "Required program and cross-repository membership is pinned in the checker.",
+    "Dependencies name declared outcomes, remain acyclic, and never query production runtime state.",
+    "P0 outcomes name an accountable owner, acceptance gate, and explicit disposition.",
+    "Closed outcomes retain public delivery evidence; issue state alone is not production certification.",
+    "Generated roadmap rows change through node docs/roadmaps/drift-check.mjs --render.",
+    "Tracker artifacts contain no credentials, private prompts, raw terminal output, or personal paths."
+  ],
+  "tracker": "GitHub issues in the owning repository"
 }

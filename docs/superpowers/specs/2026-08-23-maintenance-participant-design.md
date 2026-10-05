@@ -1,7 +1,11 @@
+---
+source_adjacent_reason: "Preserves producer-owned design and adoption evidence with GitHub-only tracking."
+---
+
 # Maintenance Participant Design
 
 Issue: [OpenCoven/coven#795](https://github.com/OpenCoven/coven/issues/795)  
-Downstream tracker: `cave-cgk9v`
+Downstream adoption: record the Cave issue, PR, and release receipt on [Coven #795](https://github.com/OpenCoven/coven/issues/795)
 
 ## Problem
 
@@ -139,4 +143,4 @@ while the supervisor writer remains live.
 The implementation lands in `OpenCoven/coven` through issue #795 and a protected
 pull request. Cave adoption must require the first released Coven version that
 contains this protocol before removing its last-resort guidance for
-`cave-cgk9v`.
+the downstream Cave adoption outcome linked from Coven #795.

@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Native OpenCoven Agent File System (AFS) — Research Brief
 
 Deep-research run, 2026-08-03 (Sage). Ad-hoc mission; ledger inline below.
@@ -10,7 +14,7 @@ Confidence: **high** = inspected primary source; **medium** = primary w/ caveats
 3. **macOS mounting without kexts is a solved problem**: AgentFS serves NFSv3 in userspace via HuggingFace's `nfsserve` crate and uses macOS's native `mount_nfs`. Linux uses `fuser` (FUSE3). FSKit (macOS 15+) is the strategic future path but immature. [S5][S7][S12] (high)
 4. **The design space splits into four families** — SQLite VFS (AgentFS), microVM snapshots (E2B/Firecracker), CoW filesystems (ZFS/btrfs), and convention-only isolation (git worktrees, what OpenCoven uses today). Only the SQLite family combines SQL-queryable audit, a single-file standalone mode, and cross-platform mounts. [S8–S11] (medium)
 5. **git worktrees' known weakness is exactly OpenCoven's pain**: isolation is conventional, not enforced — nothing stops an agent writing outside its worktree (cf. the GitHub Desktop worktree destruction incidents in coven-cave). An AFS overlay plus an OS sandbox closes that hole; the mount alone does not restrict absolute-path writes. [S4][S11] (high fact, inference re: fit)
-6. **Recommendation: build native, spec-compatible.** Implement a `coven-afs` crate inside the coven daemon (already Rust + rusqlite 0.40), adopting AgentFS SPEC v0.4's schema as the base contract, extending it with coven-native audit (session/familiar/bead provenance). Reuse `fuser` + `nfsserve` for mounts. Do NOT adopt the Turso SDK as a dependency — the spec is the valuable artifact, the code is beta. (inference)
+6. **Recommendation: build native, spec-compatible.** Implement a `coven-afs` crate inside the coven daemon (already Rust + rusqlite 0.40), adopting AgentFS SPEC v0.4's schema as the base contract, extending it with coven-native audit (session/familiar/issue provenance). Reuse `fuser` + `nfsserve` for mounts. Do NOT adopt the Turso SDK as a dependency — the spec is the valuable artifact, the code is beta. (inference)
 
 ## Findings per RQ
 
@@ -33,7 +37,7 @@ From the surveyed products (high, per-source): (a) POSIX view so git/grep/existi
 ### RQ4 — Right native architecture for OpenCoven? (inference, grounded in above)
 
 - **`coven-afs` crate** in the coven workspace, owned by the daemon. rusqlite 0.40 already bundled — zero new storage deps.
-- **Schema: AgentFS SPEC v0.4 as baseline** (fs_config/inode/dentry/data/symlink, whiteouts, origin, kv, tool_calls), plus coven extension tables: `afs_provenance(op → session_id, familiar, bead_id, turn)` joining file mutations to coven's existing session events. Spec-compatibility keeps `agentfs` CLI/tooling usable against our DBs for free.
+- **Schema: AgentFS SPEC v0.4 as baseline** (fs_config/inode/dentry/data/symlink, whiteouts, origin, kv, tool_calls), plus coven extension tables: `afs_provenance(op → session_id, familiar, issue_ref, turn)` joining file mutations to coven's existing session events. Spec-compatibility keeps `agentfs` CLI/tooling usable against our DBs for free.
 - **Mounts**: `fuser` on Linux, `nfsserve` on 127.0.0.1 for macOS (same as AgentFS — proven, kext-free). Windows: SDK-only initially (AgentFS also has no Windows mount).
 - **Enforcement**: pair the mount with a platform sandbox that denies writes outside the mounted workspace. Linux namespaces/bubblewrap are the proven path; macOS needs a separately validated sandbox strategy. Overlay semantics protect the base only when all writes are forced through the merged view.
 - **API surface**: extend `coven.daemon.v1` socket API — `afs.session.create/join/diff/discard/commit`, `afs.mount`, `afs.timeline`. Cave desktop renders diff/timeline as a UI surface.

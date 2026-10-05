@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Native Automations readiness
 
 Coven has a durable native scheduler, but it is not yet certified for
@@ -157,10 +161,9 @@ or profile artifacts are prerequisites, not proof that #854's broader gates
 passed. #857, #858, and #937 remain open; #1054 records the deferred executable
 contract work.
 
-The [Beads mapping](coven-automations-v1.md) is a reviewed 2026-09-03 graph
-snapshot. Its generated dispositions are not a live readiness report. This
-source assessment does not rewrite the canonical Cave Beads/Dolt database or
-pretend it has been synchronized. Reconcile that graph through its designated
-writer and drift check before the final #854 rollup, including child-work
-tracking for #1054 and OpenCoven/coven-runtimes#48. A passing check of the
-existing mapping does not prove those new work items have been provisioned.
+The [GitHub issue graph](coven-automations-v1.md) was refreshed on 2026-10-05.
+Its generated dispositions remain a reviewed snapshot rather than a live
+readiness report. #1222 establishes GitHub-only work tracking. Refresh current
+issue and immutable delivery evidence before the final #854 rollup, including
+#1054 and OpenCoven/coven-runtimes#48. The source findings above retain their
+original review date and do not claim acceptance of later, unmerged work.

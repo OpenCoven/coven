@@ -1,7 +1,11 @@
+---
+source_adjacent_reason: "Preserves producer-owned design and adoption evidence with GitHub-only tracking."
+---
+
 # Psyche Product Specification
 
 **Status:** Approved product baseline - W0 reconciled and G1 verified 2026-08-01
-**Work unit:** `coven-psy0`
+**Historical delivery:** [W0 specification reconciliation, PR #546](https://github.com/OpenCoven/coven/pull/546)
 **Product home:** standalone `OpenCoven/psyche` repository
 **Canonical decision:** [Familiar runtime design](./RUNTIME_DESIGN.md)
 **Companions:** [Decision dossier](./DECISION_DOSSIER.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Coven prerequisites](./COVEN_PREREQUISITES.md), [Program plan](./PLAN.md)

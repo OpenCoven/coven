@@ -1,12 +1,16 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche O1.1 Delivery Closure Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Finish O1.1 by reconciling the canonical Psyche documents and closed O1 trackers with the conformance implementation that already merged.
+**Goal:** Finish O1.1 by reconciling the canonical Psyche documents and closed O1 issue with the conformance implementation that already merged.
 
-**Architecture:** Preserve the merged runtime and regression baseline unchanged. Update only the O1 annex, parent O1 design, and Psyche program plan to record the observed plan, corrective-runtime, annex, and conformance merge commits; then append the same bounded evidence to the already-closed O1 issue and Bead without reopening or re-closing them.
+**Architecture:** Preserve the merged runtime and regression baseline unchanged. Update only the O1 annex, parent O1 design, and Psyche program plan to record the observed plan, corrective-runtime, annex, and conformance merge commits; then append the same bounded evidence to the already-closed O1 issue without reopening or re-closing them.
 
-**Tech Stack:** Markdown, Python 3 repository guards, Git, GitHub CLI, Beads CLI.
+**Tech Stack:** Markdown, Python 3 repository guards, Git, GitHub CLI.
 
 ---
 
@@ -24,7 +28,7 @@ including Ubuntu and Windows Rust checks, OpenClaw bridge, secret guard,
 dependency audit, engine contract, channels package, CLI performance, and npm
 onboarding checks.
 
-GitHub issue #567 and Bead `coven-psy-o1` are already closed with the original
+GitHub issue `OpenCoven/coven#567` are already closed with the original
 O1 merge evidence. O1.1 closure must append evidence to those records; it must
 not reopen them, close them a second time, or claim completion of C-S3-C-S6,
 C-S9-C-S12, G4, G6, or production child dispatch.
@@ -145,7 +149,7 @@ merged in PR #574. Corrective continuation, stream-identity, and
 process-supervision behavior merged in PR #622; the approved O1.1 annex merged
 in PR #633; its implementation plan merged in PR #639; and the remaining
 conformance coverage merged in PR #664 with all 12 hosted checks successful.
-Issue #567 and Bead `coven-psy-o1` remain the closed O1 trackers and receive an
+GitHub issue `OpenCoven/coven#567` remains closed and receives an
 append-only O1.1 evidence note. This closes only C-S1 vocabulary and C-S8
 documentation. C-S3-C-S6 and C-S9-C-S12 remain separate work, while G4, G6,
 and production child dispatch remain blocked.
@@ -280,7 +284,7 @@ repository's protected-branch merge procedure; do not bypass a failing check.
 
 **Files:**
 - External append-only record: GitHub issue `OpenCoven/coven#567`
-- External append-only record: Bead `coven-psy-o1`
+- External append-only record: Issue `OpenCoven/coven#567`
 
 - [ ] **Step 1: Resolve the observed closure merge**
 
@@ -314,24 +318,19 @@ scope exclusion.
 
 Run:
 
-```bash
-gh issue comment 567 --repo OpenCoven/coven --body "$EVIDENCE"
-bd comments add coven-psy-o1 "$EVIDENCE"
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Expected: both closed trackers accept the append-only evidence.
 
-- [ ] **Step 4: Verify both trackers remain closed**
+Expected: the closed issue accepts the append-only evidence.
+
+- [ ] **Step 4: Verify the issue remains closed**
 
 Run:
 
-```bash
-gh issue view 567 --repo OpenCoven/coven \
-  --json state,comments \
-  --jq '{state,lastComment:.comments[-1].body}'
-bd show coven-psy-o1
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Expected: issue #567 and Bead `coven-psy-o1` remain closed and display the same
-O1.1 closure evidence. Do not run an issue-close, issue-reopen, `bd close`, or
-`bd reopen` command.
+
+Expected: GitHub issue `OpenCoven/coven#567` remains closed and displays the appended
+O1.1 closure evidence. Do not close or reopen this already-closed issue.

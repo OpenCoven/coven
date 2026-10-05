@@ -226,3 +226,9 @@ For package releases, also verify package contents with a dry run and attach che
 ## Questions?
 
 Join the Discord: https://discord.gg/opencoven
+
+## Work tracking
+
+Track remaining work, ownership, dependencies, and delivery evidence in GitHub
+issues. See [Work tracking](docs/work-tracking.md) for the issue/worktree/claim
+workflow and migration receipt.

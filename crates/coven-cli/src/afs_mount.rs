@@ -18,7 +18,7 @@
 //!
 //! What mount availability does *not* claim is that every process can read
 //! through the mount. macOS refuses `open()` on network volumes for processes
-//! without the right privacy consent (bead `coven-x77`), which is a property
+//! without the right privacy consent (issue `OpenCoven/coven#684`), which is a property
 //! of the calling process, not of the export. Capabilities advertise
 //! availability and never grant permission.
 
@@ -632,7 +632,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replacing_a_registry_entry_terminates_the_export_it_displaces() {
-        // The reachable path for coven-384: `mount()` guards on the on-disk
+        // The reachable path for OpenCoven/coven#714: `mount()` guards on the on-disk
         // record, so a session whose record went away without `unmount()`
         // running can mount again and displace a live entry here.
         let mut registry: HashMap<String, Export> = HashMap::new();

@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Memory Open Daemon Auto-Start Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -332,9 +336,7 @@ EOF
 The PR body must summarize daemon auto-start, fail-before-launch behavior,
 process-level coverage, documentation, and validation.
 
-- [ ] **Step 5: Update Beads**
+- [ ] **Step 5: Update GitHub issues**
 
-```bash
-bd comments add cmem-h06 "Implemented daemon auto-start for coven memory open and opened the Coven pull request."
-bd close cmem-h06 --reason="Packaged Memory launch now establishes daemon readiness before opening the dashboard."
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.

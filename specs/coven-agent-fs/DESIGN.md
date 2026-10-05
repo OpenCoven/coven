@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Native OpenCoven Agent File System (AFS) — Design
 
 **Status:** Draft v1 · 2026-08-08
@@ -141,7 +145,7 @@ POST /api/v1/afs/sessions
 {
   "projectRoot": "/workspace/project",
   "sessionId": "01J...",         // optional: bind to a Coven session
-  "beadId": "coven-vhw",         // optional
+  "issueRef": "OpenCoven/coven#678",         // optional
   "name": "vhw-design"           // optional: joinable handle, unique while open
 }
 ```
@@ -152,7 +156,7 @@ POST /api/v1/afs/sessions
   "name": "vhw-design",
   "state": "open",
   "base": { "fingerprint": "sha256:…", "commit": "74d6207", "ingestedAt": "…" },
-  "binding": { "sessionId": "01J…", "familiarId": "…", "beadId": "coven-vhw" },
+  "binding": { "sessionId": "01J…", "familiarId": "…", "issueRef": "OpenCoven/coven#678" },
   "mount": null,
   "changes": { "added": 0, "modified": 0, "deleted": 0, "bytes": 0 }
 }
@@ -296,7 +300,7 @@ CREATE TABLE IF NOT EXISTS afs_session (
   project_root      TEXT NOT NULL,
   coven_session_id  TEXT,                   -- sessions.id in the coven store
   familiar_id       TEXT,                   -- sessions.familiar_id
-  bead_id           TEXT,
+  issue_ref        TEXT,
   created_at        INTEGER NOT NULL,
   updated_at        INTEGER NOT NULL
 );
@@ -318,19 +322,19 @@ CREATE TABLE IF NOT EXISTS afs_provenance (
   afs_session_id    TEXT NOT NULL,
   coven_session_id  TEXT,
   familiar_id       TEXT,
-  bead_id           TEXT,
+  issue_ref        TEXT,
   turn              INTEGER,                -- events.rowid cursor at the time of the op
   tool_call_id      INTEGER REFERENCES tool_calls(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_afs_provenance_path ON afs_provenance(path, seq);
 CREATE INDEX IF NOT EXISTS idx_afs_provenance_session ON afs_provenance(coven_session_id, seq);
-CREATE INDEX IF NOT EXISTS idx_afs_provenance_bead ON afs_provenance(bead_id, seq);
+CREATE INDEX IF NOT EXISTS idx_afs_provenance_issue ON afs_provenance(issue_ref, seq);
 CREATE INDEX IF NOT EXISTS idx_afs_provenance_tool_call ON afs_provenance(tool_call_id);
 ```
 
 `tool_call_id` is a real foreign key: `tool_calls` lives in the same delta
-database. `coven_session_id`, `familiar_id`, `bead_id`, and `turn` are
+database. `coven_session_id`, `familiar_id`, `issue_ref`, and `turn` are
 **by-value** references into the daemon store (`<COVEN_HOME>/coven.db`) — a
 different SQLite file, so no constraint can enforce them. That is deliberate:
 the delta must stay self-describing when copied off the host, and a delta whose
@@ -338,7 +342,7 @@ originating session was pruned must still read.
 
 **Why the identity columns repeat per row instead of living only in
 `afs_session`:** `afs.session.join` exists, so more than one actor can write to
-one delta. The acting session, familiar, bead, and turn are properties of the
+one delta. The acting session, familiar, issue, and turn are properties of the
 *operation*, not of the delta. `afs_session` records who opened it;
 `afs_provenance` records who did each thing.
 
@@ -404,7 +408,7 @@ machinery: the branch enters the existing PR pipeline described in
    fails with `afs.commit_unsigned` if signing is unavailable or fails. Coven
    never disables signing to make a commit land.
 7. **Attribute.** Trailers carry the provenance the branch would otherwise
-   lose: `Coven-Session`, `Coven-Familiar`, `Coven-Bead`, `Coven-Afs-Session`,
+   lose: `Coven-Session`, `Coven-Familiar`, `Coven-Issue`, `Coven-Afs-Session`,
    plus `Co-authored-by:` lines in the numeric-id no-reply form required by
    AGENTS.md.
 8. **Record.** Insert `afs_commit`; `state → committed`. The delta survives
@@ -447,7 +451,7 @@ configurable per-file cap (`afs.copy_up_max_bytes`) fails the write with
 `afs.copy_up_too_large` rather than silently absorbing a multi-gigabyte artifact
 into a delta. Ingest filters exclude the obvious offenders (`target/`,
 `node_modules/`, `.git/objects/`) from the base by default. The cap's default
-value is set from the `coven-110` mount benchmark, not guessed here.
+value is set from the `OpenCoven/coven#658` mount benchmark, not guessed here.
 
 **Orphan recovery.** A delta whose daemon died stays `open` with a stale mount.
 Startup sweeps `<COVEN_HOME>/afs/sessions/`, unmounts anything mounted by a dead
@@ -455,7 +459,7 @@ pid, and leaves the delta intact — the same posture as
 [orphan recovery](../../docs/daemon/orphan-recovery.md) for sessions. Deltas are
 never auto-discarded; unreviewed work is not garbage.
 
-**Loopback NFS exposure (decided 2026-08-09, `coven-75e`).** The macOS backend
+**Loopback NFS exposure (decided 2026-08-09, `OpenCoven/coven#697`).** The macOS backend
 serves NFSv3 on loopback. Any local user can reach a loopback port, so a bare
 port grants a second account on the machine read/write access to a session's
 files.
@@ -579,7 +583,7 @@ mount is separate work and is not claimed by this design.
 - **Copy-up cap default**: the mount spike establishes a cap in the low tens
   of MiB as the policy target, but the configurable cap is not implemented
   yet.
-- **Loopback NFS access control**: decided in §7 (`coven-75e`) — authenticated
+- **Loopback NFS access control**: decided in §7 (`OpenCoven/coven#697`) — authenticated
   file handles plus a VFS token gate on an ephemeral loopback port. Mount stays
   opt-in because token secrecy is the whole boundary; enabling it by default
   needs a second factor, not a stronger token.
@@ -588,11 +592,11 @@ mount is separate work and is not claimed by this design.
 
 ## 9. Delivery sequencing
 
-| Step | Bead | State |
+| Step | Issue | State |
 |---|---|---|
-| Storage engine + overlay | `coven-d4p` | merged — PR #658, `e2da654` |
-| macOS mount + benchmark | `coven-110` | merged experimental spike — PR #680, Terminal mounted-I/O confirmation passed; macOS network-volume/privacy access must be assessed per client/harness or deployment |
-| This design | `coven-vhw` | — |
+| Storage engine + overlay | `OpenCoven/coven#658` | merged — PR #658, `e2da654` |
+| macOS mount + benchmark | `OpenCoven/coven#658` | merged experimental spike — PR #680, Terminal mounted-I/O confirmation passed; macOS network-volume/privacy access must be assessed per client/harness or deployment |
+| This design | `OpenCoven/coven#678` | — |
 | Daemon API + extension tables | not yet filed | ready to file |
 | Cave surfaces | not yet filed | needs the daemon API |
 

@@ -1,6 +1,10 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # coven-afs mount spike — results and go/no-go
 
-**Status:** Spike complete · 2026-08-08 · bead `coven-110`
+**Status:** Spike complete · 2026-08-08 · issue `OpenCoven/coven#658`
 **Follows:** [RESEARCH.md](./RESEARCH.md) next step 2 · [DESIGN.md](./DESIGN.md) §3, §7
 **Code:** `crates/coven-afs/src/ino.rs`, `src/nfs.rs`, `examples/afs_serve.rs`,
 `examples/afs_bench.rs`

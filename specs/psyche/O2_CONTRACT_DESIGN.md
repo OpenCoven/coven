@@ -1,8 +1,12 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche O2 Coven Contract Design
 
 **Status:** Approved and implemented; merge/verification evidence is recorded by the implementation issue and PR.
 
-**Depends on:** O1, merged (issue #567, Bead `coven-psy-o1`).
+**Depends on:** O1, merged (issue #567, Issue `OpenCoven/coven#567`).
 
 **Scope:** O2 only, per `specs/psyche/COVEN_W1_AUDIT.md` §8: the opaque
 canonical execution-binding tuple that resolves C-S3, C-M1, and the O2 exact-
@@ -676,7 +680,7 @@ This design consumes the approved O1 result. O2 is complete only when:
 1. this written design is approved;
 2. an exact-file, test-first child implementation plan is approved;
 3. the scoped implementation and documentation land through a green PR;
-4. an issue and Bead recording this work are opened and record merge and
+4. an issue and Issue recording this work are opened and record merge and
    verification evidence; and
 5. no O3-O8 behavior or production child dispatch is represented as
    complete.

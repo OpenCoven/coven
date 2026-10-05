@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # AgentFS macOS Consent Confirmation Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -161,7 +165,7 @@ git commit -m "docs: clarify AFS macOS consent result" \
   -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
-### Task 3: Validate, integrate, and close the bead
+### Task 3: Validate, integrate, and close the issue
 
 **Files:**
 - No additional repository files.
@@ -193,9 +197,10 @@ consent and all remaining mount-safety gates are unchanged.
 Merge both PRs only when their required checks are green. Do not bypass branch
 protection or weaken any documentation, security, or privacy gate to merge.
 
-- [ ] **Step 4: Close `coven-x77` with exact evidence**
+- [ ] **Step 4: Record the consent outcome with exact evidence**
 
-After both merges, add this evidence to the bead and close it:
+After both merges, record this evidence on the canonical consent follow-up issue.
+PR #684 is the earlier daemon implementation receipt, not an issue to close:
 
 ```text
 Verified on macOS 2026-08-09: afs_serve listened on 127.0.0.1:12049;

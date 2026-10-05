@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche O3 Request Adoption Contract Design
 
 **Status:** Implemented 2026-08-17 in
@@ -829,6 +833,6 @@ This evidence closes only O3. It adds no adoption lookup,
 `proven-not-adopted`/`unknown` disposition, fence or generation (O4), recovery
 or cancellation acknowledgement (O5), scheduler behavior (O6), automatic
 reconciliation or redispatch (O7), artifact binding (O8), real Psyche adapter
-conformance, or production child dispatch. Issue #741 and Bead
-`coven-psy-o3` receive the same bounded receipts only after this evidence
+conformance, or production child dispatch. Issue #741 and Issue
+`OpenCoven/coven#741` receive the same bounded receipts only after this evidence
 update is visible on `main`.

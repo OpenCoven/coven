@@ -1,7 +1,11 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # AgentFS macOS Consent Confirmation Documentation Design
 
 **Status:** Approved documentation update
-**Bead:** `coven-x77`
+**Issue:** `OpenCoven/coven#684`
 
 ## Evidence
 
@@ -20,7 +24,7 @@ write/read is the accepted confirmation.
 
 The macOS NFS path is viable for a client process granted the required
 network-volume access. This resolves the manual confirmation gate from
-`coven-x77`; it does not make the NFS export a supported CLI workflow,
+`OpenCoven/coven#684`; it does not make the NFS export a supported CLI workflow,
 sandbox, access-control boundary, or default-on feature.
 
 The prior agent-process `EPERM` observation remains relevant: client-process
@@ -36,7 +40,7 @@ default-on safety remain unresolved.
 - Update the public AgentFS guide, architecture overview, and security posture
   so they distinguish passed Terminal validation from the unresolved
   process-consent and security boundaries.
-- Add the observed command outcome to `coven-x77`, then close it after both
+- Add the observed command outcome to `OpenCoven/coven#684`, then close it after both
   source and public documentation PRs merge.
 
 ## Validation

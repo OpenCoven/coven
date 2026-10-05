@@ -197,7 +197,7 @@ impl MaintenanceGate {
     pub fn discover_optional(project_root: &Path) -> Result<Option<Self>> {
         // Every session launch calls this, and spawning `git` costs more than
         // the rest of launch-to-first-output put together (~14 ms of the
-        // ~37 ms floor on macOS, measured in bead coven-mwb). A directory with
+        // ~37 ms floor on macOS, measured in issue OpenCoven/coven#682). A directory with
         // no repository anywhere above it cannot be a worktree, and that check
         // is a handful of stats. Anything that might be a repository still
         // goes to `git`, which stays the authority.

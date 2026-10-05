@@ -16989,8 +16989,8 @@ fn afs_write(coven_home: &Path, path: &str, body: Option<&str>) -> Result<ApiRes
                     .get("familiarId")
                     .and_then(|value| value.as_str())
                     .map(str::to_owned),
-                bead_id: payload
-                    .get("beadId")
+                issue_ref: payload
+                    .get("issueRef")
                     .and_then(|value| value.as_str())
                     .map(str::to_owned),
                 turn: payload.get("turn").and_then(|value| value.as_i64()),
@@ -19018,13 +19018,13 @@ pub(crate) mod tests {
             "/api/v1/afs/sessions",
             temp.path(),
             None,
-            Some(&json!({ "projectRoot": root, "beadId": "coven-5kt" }).to_string()),
+            Some(&json!({ "projectRoot": root, "issueRef": "OpenCoven/coven#684" }).to_string()),
         )?;
         assert_eq!(created.status, 201);
         let view: serde_json::Value = serde_json::from_str(&created.body)?;
         let id = view["id"].as_str().unwrap().to_string();
         assert_eq!(view["state"], "open");
-        assert_eq!(view["binding"]["beadId"], "coven-5kt");
+        assert_eq!(view["binding"]["issueRef"], "OpenCoven/coven#684");
 
         let fetched = handle_request(
             "GET",

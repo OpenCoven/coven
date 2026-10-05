@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Retains producer-owned contracts, acceptance, or historical evidence with current GitHub issue tracking."
+---
+
 # Psyche O1.1 Conformance Closure Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -6,7 +10,7 @@
 
 **Architecture:** Treat merged PR #622 (`f68be0a0af373caf81780b70a5d3bf7d680e0f6e`) as the implementation baseline and merged PR #633 (`c183d923e6d9e9d8172f39a193d624fe40095892`) as the approved normative annex. Add focused black-box tests for the few annex statements not yet directly exercised, reuse the existing process-supervision and OpenClaw suites for the rest, then update the annex and Psyche status documents with bounded candidate evidence. Do not change runtime behavior unless a new regression test demonstrates that `origin/main` violates the approved annex.
 
-**Tech Stack:** Rust 2021, Clap, rusqlite, Unix shell fixtures, TypeScript, Vitest, Python 3 repository guards, Markdown, GitHub CLI, Beads CLI.
+**Tech Stack:** Rust 2021, Clap, rusqlite, Unix shell fixtures, TypeScript, Vitest, Python 3 repository guards, Markdown, GitHub CLI.
 
 ---
 
@@ -550,7 +554,7 @@ merged in PR #574. Corrective continuation, stream-identity, and
 process-supervision behavior merged in PR #622, and its approved O1.1 annex
 merged in PR #633. The conformance closure adds direct regression coverage for
 the remaining annex assertions and reruns the frozen repository gates. O1
-remains incomplete until issue #567 and Bead `coven-psy-o1` record the observed
+remains incomplete until GitHub issue `OpenCoven/coven#567` record the observed
 conformance merge SHA and verification evidence. This closes only C-S1
 vocabulary and C-S8 documentation; C-S3-C-S6 and C-S9-C-S12 remain planned,
 and G4/G6 plus production child dispatch remain blocked.
@@ -587,7 +591,7 @@ git commit -s -m "docs(psyche): record O1.1 conformance candidate" \
 **Files:**
 - Verify: entire repository
 - External record after merge: GitHub issue `OpenCoven/coven#567`
-- External record after merge: Bead `coven-psy-o1`
+- External record after merge: Issue `OpenCoven/coven#567`
 
 - [ ] **Step 1: Run the complete annex gate set**
 
@@ -658,41 +662,22 @@ printf '%s\n' "$MERGE_SHA"
 
 Expected: the exact GitHub merge commit SHA, not a branch head or expected value.
 
-- [ ] **Step 5: Update both completion trackers**
+- [ ] **Step 5: Update the completion issue**
 
 Run:
 
-```bash
-MERGE_SHA="$(gh pr view \
-  docs/psyche-o1-1-conformance-closure \
-  --repo OpenCoven/coven \
-  --json mergeCommit \
-  --jq '.mergeCommit.oid // empty')"
-test -n "$MERGE_SHA"
-EVIDENCE="O1.1 conformance merged at ${MERGE_SHA}. Corrective runtime baseline: f68be0a0af373caf81780b70a5d3bf7d680e0f6e (PR #622). Approved annex baseline: c183d923e6d9e9d8172f39a193d624fe40095892 (PR #633). Continuation matrix, stream identity, malformed native frames, command-build failure persistence, cancellation races, descendant cleanup, PID safety, Windows containment, OpenClaw terminal mapping, full Rust/OpenClaw/docs/secret/privacy gates, and hosted checks passed. Scope closed remains C-S1 vocabulary and C-S8 documentation only; C-S3-C-S6, C-S9-C-S12, G4, G6, and production child dispatch remain blocked."
-gh issue comment 567 --repo OpenCoven/coven --body "$EVIDENCE"
-bd comments add coven-psy-o1 "$EVIDENCE"
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Expected: issue #567 and Bead `coven-psy-o1` both display the same observed merge SHA and bounded scope statement.
 
-- [ ] **Step 6: Close only after both records are readable**
+Expected: GitHub issue `OpenCoven/coven#567` displays the observed merge SHA and bounded scope statement.
+
+- [ ] **Step 6: Close only after the evidence is readable**
 
 Run:
 
-```bash
-MERGE_SHA="$(gh pr view \
-  docs/psyche-o1-1-conformance-closure \
-  --repo OpenCoven/coven \
-  --json mergeCommit \
-  --jq '.mergeCommit.oid // empty')"
-test -n "$MERGE_SHA"
-gh issue view 567 --repo OpenCoven/coven --comments
-bd show coven-psy-o1
-gh issue close 567 --repo OpenCoven/coven \
-  --comment "O1/O1.1 delivery evidence is recorded above; later Psyche contracts and G4/G6 remain open."
-bd close coven-psy-o1 \
-  --reason "O1/O1.1 merge and verification evidence recorded at ${MERGE_SHA}; later Psyche contracts and gates remain blocked."
-```
+Use the canonical GitHub issue and its acceptance/dependency links.
+The current issue/worktree/claim workflow is in `AGENTS.md`.
 
-Expected: both records contain the evidence before either is closed. Do not close a later Psyche work item, G4, G6, or any production child-dispatch gate.
+
+Expected: the issue contains the evidence before it is closed. Do not close a later Psyche work item, G4, G6, or any production child-dispatch gate.
