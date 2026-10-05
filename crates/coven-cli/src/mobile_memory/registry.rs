@@ -1,3 +1,7 @@
+mod introduction;
+#[cfg(test)]
+pub(super) use introduction::fail_after_introduction_write;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,6 +25,7 @@ use super::config::{atomic_replace_private, ensure_private_mobile_dir, validate_
 use super::contract::{MobileDeviceScope, MobilePairedDevice};
 pub use super::grant::DeviceScope;
 use super::grant::{AssuranceLevel, DeviceGrant};
+use super::introduction::IntroductionTransition;
 
 pub const DEVICES_FILE: &str = "devices.json";
 const DEVICE_REGISTRY_VERSION: u16 = 2;
@@ -32,8 +37,8 @@ const MAX_DEVICE_NAME_CHARS: usize = 80;
 const DEVICE_REGISTRY_LOCK_FILE: &str = ".devices.lock";
 static DEVICE_REGISTRY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 #[cfg(test)]
-static FAIL_DEVICE_REGISTRY_WRITE: LazyLock<Mutex<Option<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(None));
+static FAIL_DEVICE_REGISTRY_WRITE: LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 struct DeviceRegistryStoreLock {
     _process: MutexGuard<'static, ()>,
@@ -147,6 +152,8 @@ struct StoredDeviceRegistry {
     rotation_transitions: Vec<DeviceRotationAuditTransition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     grant_reissue_transitions: Vec<DeviceGrantReissueAuditTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    introduction_transitions: Vec<IntroductionTransition>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,6 +184,7 @@ struct LoadedRegistry {
     devices: Vec<GrantedDeviceRecord>,
     rotation_transitions: Vec<DeviceRotationAuditTransition>,
     grant_reissue_transitions: Vec<DeviceGrantReissueAuditTransition>,
+    introduction_transitions: Vec<IntroductionTransition>,
     migrated: bool,
 }
 
@@ -1104,6 +1112,7 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
                 devices: Vec::new(),
                 rotation_transitions: Vec::new(),
                 grant_reissue_transitions: Vec::new(),
+                introduction_transitions: Vec::new(),
                 migrated: false,
             });
         }
@@ -1136,6 +1145,7 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
                     .collect::<Result<Vec<_>>>()?,
                 rotation_transitions: Vec::new(),
                 grant_reissue_transitions: Vec::new(),
+                introduction_transitions: Vec::new(),
                 migrated: true,
             }
         }
@@ -1149,6 +1159,7 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
                 devices: stored.devices,
                 rotation_transitions: stored.rotation_transitions,
                 grant_reissue_transitions: stored.grant_reissue_transitions,
+                introduction_transitions: stored.introduction_transitions,
                 migrated: false,
             }
         }
@@ -1157,6 +1168,7 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
     validate_devices(&loaded.devices)?;
     validate_rotation_transitions(&loaded.devices, &loaded.rotation_transitions)?;
     validate_grant_reissue_transitions(&loaded.devices, &loaded.grant_reissue_transitions)?;
+    super::introduction::validate_transitions(&loaded.introduction_transitions)?;
     Ok(loaded)
 }
 
@@ -1192,14 +1204,35 @@ fn write_registry(
     rotation_transitions: &[DeviceRotationAuditTransition],
     grant_reissue_transitions: &[DeviceGrantReissueAuditTransition],
 ) -> Result<()> {
+    // All writers hold DeviceRegistryStoreLock. Preserve the one-time introduction
+    // receipts even when another lifecycle operation updates or forgets devices.
+    let introductions = read_registry(path)?.introduction_transitions;
+    write_registry_with_introductions(
+        path,
+        devices,
+        rotation_transitions,
+        grant_reissue_transitions,
+        &introductions,
+    )
+}
+
+fn write_registry_with_introductions(
+    path: &Path,
+    devices: &[GrantedDeviceRecord],
+    rotation_transitions: &[DeviceRotationAuditTransition],
+    grant_reissue_transitions: &[DeviceGrantReissueAuditTransition],
+    introduction_transitions: &[IntroductionTransition],
+) -> Result<()> {
     validate_devices(devices)?;
     validate_rotation_transitions(devices, rotation_transitions)?;
     validate_grant_reissue_transitions(devices, grant_reissue_transitions)?;
+    super::introduction::validate_transitions(introduction_transitions)?;
     let stored = StoredDeviceRegistry {
         version: DEVICE_REGISTRY_VERSION,
         devices: devices.to_vec(),
         rotation_transitions: rotation_transitions.to_vec(),
         grant_reissue_transitions: grant_reissue_transitions.to_vec(),
+        introduction_transitions: introduction_transitions.to_vec(),
     };
     let mut encoded =
         serde_json::to_vec_pretty(&stored).context("failed to encode mobile device registry")?;
@@ -1209,11 +1242,7 @@ fn write_registry(
         let mut failure = FAIL_DEVICE_REGISTRY_WRITE
             .lock()
             .map_err(|_| anyhow::anyhow!("device registry write failure hook poisoned"))?;
-        if failure
-            .as_ref()
-            .is_some_and(|failure_path| failure_path == path)
-        {
-            *failure = None;
+        if failure.remove(path) {
             bail!("injected mobile device registry write failure");
         }
     }
@@ -1221,8 +1250,11 @@ fn write_registry(
 }
 
 #[cfg(test)]
-fn fail_next_device_registry_write(path: &Path) {
-    *FAIL_DEVICE_REGISTRY_WRITE.lock().unwrap() = Some(path.to_path_buf());
+pub(super) fn fail_next_device_registry_write(path: &Path) {
+    FAIL_DEVICE_REGISTRY_WRITE
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf());
 }
 
 fn validate_grant_reissue_transitions(

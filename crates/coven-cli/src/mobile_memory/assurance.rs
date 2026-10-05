@@ -629,7 +629,7 @@ pub fn verify_and_consume_assurance(
     })
 }
 
-fn verify_assurance_signature(
+pub(super) fn verify_assurance_signature(
     public_key_x963: &str,
     canonical: &[u8],
     signature_b64url: &str,
@@ -797,6 +797,25 @@ impl AuthorizationKeyRegistry {
             .map_err(|_| anyhow::anyhow!("mobile authorization-key registry lock poisoned"))? =
             loaded;
         Ok(active)
+    }
+
+    /// Keep the current key protected from revocation until the registry commit.
+    /// Lock order is device registry -> authorization keys -> challenges.
+    pub(super) fn with_active_key<T>(
+        &self,
+        device_id: Uuid,
+        operation: impl FnOnce(&DeviceAuthorizationKeyRecord) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = AUTHORIZATION_KEY_STORE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
+        let keys = read_authorization_keys(&self.path)?;
+        let key = keys
+            .iter()
+            .find(|key| key.device_id == device_id && key.revoked_at.is_none())
+            .context("introduction requires an active authorization key")?;
+        operation(key)
     }
 
     pub fn enroll_initial(
