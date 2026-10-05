@@ -17,7 +17,7 @@ use axum::extract::{RawQuery, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 const RELAY_PROTOCOL_VERSION: &str = "1";
@@ -96,15 +96,18 @@ impl RelayState {
 
         let peer_id = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
         let (sender, inbox) = mpsc::channel(self.limits.channel_capacity);
+        let (disconnect, disconnected) = watch::channel(None);
         *slot = Some(ConnectedPeer {
             id: peer_id,
             sender,
+            disconnect,
         });
         Ok(Registration {
             room_id: room_id.to_owned(),
             role,
             peer_id,
             inbox,
+            disconnected,
         })
     }
 
@@ -134,7 +137,7 @@ impl RelayState {
                 }
                 *slot = None;
                 (
-                    room.peer(role).map(|peer| peer.sender.clone()),
+                    room.peer(role).map(|peer| peer.disconnect.clone()),
                     room.host.is_none() && room.client.is_none(),
                 )
             };
@@ -144,10 +147,14 @@ impl RelayState {
             peer_to_notify
         };
         if let Some(peer) = peer_to_notify {
-            let _ = peer.try_send(QueuedMessage::control(close_message(
-                1001,
-                "relay peer disconnected",
-            )));
+            signal_disconnect(&peer, close_message(1001, "relay peer disconnected"));
+        }
+    }
+
+    async fn notify_peer_close(&self, room_id: &str, role: PeerRole, message: Message) {
+        let registry = self.inner.lock().await;
+        if let Some(peer) = registry.rooms.get(room_id).and_then(|room| room.peer(role)) {
+            signal_disconnect(&peer.disconnect, message);
         }
     }
 
@@ -194,6 +201,8 @@ impl RelayRoom {
 struct ConnectedPeer {
     id: u64,
     sender: mpsc::Sender<QueuedMessage>,
+    // Disconnects must survive a full data queue. Preserve the first close.
+    disconnect: watch::Sender<Option<Message>>,
 }
 
 struct QueuedMessage {
@@ -201,13 +210,14 @@ struct QueuedMessage {
     _byte_budget: Option<OwnedSemaphorePermit>,
 }
 
-impl QueuedMessage {
-    fn control(message: Message) -> Self {
-        Self {
-            message,
-            _byte_budget: None,
+fn signal_disconnect(sender: &watch::Sender<Option<Message>>, message: Message) {
+    sender.send_if_modified(|pending| {
+        if pending.is_some() {
+            return false;
         }
-    }
+        *pending = Some(message);
+        true
+    });
 }
 
 struct Registration {
@@ -215,6 +225,7 @@ struct Registration {
     role: PeerRole,
     peer_id: u64,
     inbox: mpsc::Receiver<QueuedMessage>,
+    disconnected: watch::Receiver<Option<Message>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,8 +363,17 @@ async fn serve(mut socket: WebSocket, state: RelayState, request: RelayRequest) 
         role,
         peer_id,
         mut inbox,
+        mut disconnected,
     } = registration;
-    relay_loop(&mut socket, &state, &room_id, role, &mut inbox).await;
+    relay_loop(
+        &mut socket,
+        &state,
+        &room_id,
+        role,
+        &mut inbox,
+        &mut disconnected,
+    )
+    .await;
     state.unregister(&room_id, role, peer_id).await;
 }
 
@@ -363,19 +383,50 @@ async fn relay_loop(
     room_id: &str,
     role: PeerRole,
     inbox: &mut mpsc::Receiver<QueuedMessage>,
+    disconnected: &mut watch::Receiver<Option<Message>>,
 ) {
+    enum Event {
+        Disconnected,
+        Incoming(Option<Result<Message, axum::Error>>),
+        Outgoing(Option<QueuedMessage>),
+        Idle,
+    }
+
     let idle = tokio::time::sleep(IDLE_TIMEOUT);
     tokio::pin!(idle);
     loop {
-        tokio::select! {
-            incoming = socket.recv() => {
+        let event = tokio::select! {
+            // Prioritize disconnect without imposing a priority between reads
+            // and writes. Process sends outside the selects so an in-flight
+            // message keeps its byte permit until completion or its deadline.
+            biased;
+            _ = disconnected.changed() => Event::Disconnected,
+            event = async {
+                tokio::select! {
+                    incoming = socket.recv() => Event::Incoming(incoming),
+                    outgoing = inbox.recv() => Event::Outgoing(outgoing),
+                    () = &mut idle => Event::Idle,
+                }
+            } => event,
+        };
+        match event {
+            Event::Disconnected => {
+                let close = disconnected.borrow_and_update().clone();
+                if let Some(close) = close {
+                    let _ = send_with_timeout(socket, close).await;
+                }
+                break;
+            }
+            Event::Incoming(incoming) => {
                 idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
-                let Some(Ok(message)) = incoming else { break; };
+                let Some(Ok(message)) = incoming else {
+                    break;
+                };
                 match message {
                     Message::Binary(payload) => {
-                        if let Err(close) = forward_to_peer(
-                            state, room_id, role, Message::Binary(payload),
-                        ).await {
+                        if let Err(close) =
+                            forward_to_peer(state, room_id, role, Message::Binary(payload)).await
+                        {
                             let _ = send_with_timeout(socket, close).await;
                             break;
                         }
@@ -390,25 +441,30 @@ async fn relay_loop(
                     }
                     Message::Ping(_) | Message::Pong(_) => {}
                     Message::Close(frame) => {
-                        if let Some(peer) = state.peer_sender(room_id, role).await {
-                            let _ = peer.try_send(QueuedMessage::control(Message::Close(frame)));
-                        }
+                        state
+                            .notify_peer_close(room_id, role, Message::Close(frame.clone()))
+                            .await;
+                        // Reading Close queues Tungstenite's acknowledgement.
+                        // A subsequent recv flushes that reply and completes the
+                        // server close; send would reject writing after Close.
+                        let _ = tokio::time::timeout(SEND_TIMEOUT, socket.recv()).await;
                         break;
                     }
                 }
             }
-            outgoing = inbox.recv() => {
+            Event::Outgoing(outgoing) => {
                 idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
-                let Some(outgoing) = outgoing else { break; };
-                let (send_result, is_close) = deliver_queued_message(
-                    outgoing,
-                    |message| send_with_timeout(socket, message),
-                ).await;
+                let Some(outgoing) = outgoing else {
+                    break;
+                };
+                let (send_result, is_close) =
+                    deliver_queued_message(outgoing, |message| send_with_timeout(socket, message))
+                        .await;
                 if send_result.is_err() || is_close {
                     break;
                 }
             }
-            () = &mut idle => {
+            Event::Idle => {
                 let _ = send_with_timeout(socket, close_message(1001, "relay idle timeout")).await;
                 break;
             }
@@ -517,3 +573,6 @@ fn close_message(code: u16, reason: &'static str) -> Message {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wire;

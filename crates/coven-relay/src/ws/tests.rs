@@ -332,12 +332,10 @@ async fn disconnect_notifies_the_remaining_peer() {
     state
         .unregister(&room, PeerRole::Client, client.peer_id)
         .await;
+    host.disconnected.changed().await.unwrap();
     assert!(matches!(
-        host.inbox.recv().await,
-        Some(QueuedMessage {
-            message: Message::Close(_),
-            ..
-        })
+        *host.disconnected.borrow(),
+        Some(Message::Close(_))
     ));
     state.unregister(&room, PeerRole::Host, host.peer_id).await;
 }
