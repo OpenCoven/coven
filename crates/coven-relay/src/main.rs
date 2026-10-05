@@ -8,17 +8,33 @@ use anyhow::Result;
 use axum::{response::IntoResponse, routing::any, routing::get, Router};
 use std::net::SocketAddr;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter::filter_fn, fmt::MakeWriter, prelude::*, EnvFilter};
+
+fn diagnostic_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_filter(filter)
+            // Dependency trace/debug events can include HTTP credentials and
+            // WebSocket payloads. RUST_LOG must never enable those events.
+            .with_filter(filter_fn(|metadata| {
+                metadata.target() == "coven_relay" || metadata.target().starts_with("coven_relay::")
+            })),
+    )
+}
 
 mod ws;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    diagnostic_subscriber(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        std::io::stderr,
+    )
+    .init();
 
     let addr: SocketAddr = std::env::var("LISTEN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".into())
