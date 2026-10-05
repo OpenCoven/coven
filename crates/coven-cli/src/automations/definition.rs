@@ -180,6 +180,74 @@ impl RoutineRetryPolicy {
     }
 }
 
+/// A routine's declared Runtime Authority (coven#857): what its action is, the
+/// risk class it runs at, and the capabilities and scopes it needs. The values
+/// use the Threads automation-authority profile's vocabulary, and the profile
+/// judges them when the daemon decides each dispatch. Only an owner's versioned
+/// create or revise sets them, and the definition digest covers them. Prompt
+/// text never declares any of this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutineAuthority {
+    /// The profile's action type, e.g. `analysis.read`.
+    pub action_type: String,
+    pub risk_class: RoutineRiskClass,
+    /// The profile capabilities the action needs, e.g. `analysis.read`.
+    pub capabilities: Vec<String>,
+    /// The profile's scope objects, e.g. a filesystem root, path and access.
+    pub scopes: Vec<Value>,
+    /// Whether the action may run as a proposal when it cannot run outright.
+    pub proposal_safe: bool,
+}
+
+/// The #857 risk classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoutineRiskClass {
+    R0,
+    R1,
+    R2,
+    R3,
+    R4,
+}
+
+const AUTHORITY_LIST_MAX: usize = 32;
+
+impl RoutineAuthority {
+    fn validate(&self) -> Result<(), String> {
+        let vocabulary = |value: &str| {
+            let bytes = value.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 96
+                && bytes[0].is_ascii_lowercase()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'.' | b'_'))
+        };
+        if !vocabulary(&self.action_type) {
+            return Err("authority.actionType must be a profile action type".to_string());
+        }
+        if self.capabilities.is_empty() || self.capabilities.len() > AUTHORITY_LIST_MAX {
+            return Err(format!(
+                "authority.capabilities must list 1..={AUTHORITY_LIST_MAX} capabilities"
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for capability in &self.capabilities {
+            if !vocabulary(capability) || !seen.insert(capability.as_str()) {
+                return Err(
+                    "authority.capabilities must be unique profile capabilities".to_string()
+                );
+            }
+        }
+        if self.scopes.len() > AUTHORITY_LIST_MAX || !self.scopes.iter().all(Value::is_object) {
+            return Err(format!(
+                "authority.scopes must list at most {AUTHORITY_LIST_MAX} scope objects"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A validated routine definition. Serialized to `definition_json` in the
 /// store with camelCase keys, mirroring the control-plane wire style.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +281,10 @@ pub struct RoutineDefinition {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tags: Vec<String>,
+    /// Declared Runtime Authority. Validation refuses it until the daemon
+    /// advertises Runtime Authority (coven#857), as it refuses `outputTarget`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub authority: Option<RoutineAuthority>,
 }
 
 impl RoutineDefinition {
@@ -227,6 +299,13 @@ impl RoutineDefinition {
     }
 
     pub fn from_legacy_json(value: &Value) -> Result<Self, String> {
+        // The legacy projection drops fields it does not know. Dropping a
+        // declared authority would leave the routine running unrestricted.
+        if value.get("authority").is_some() {
+            return Err(
+                "authority can only be declared through the versioned definition API".to_string(),
+            );
+        }
         Self::from_json(&Self::legacy_wire_projection(value))
     }
 
@@ -330,6 +409,13 @@ impl RoutineDefinition {
         if self.output_target.is_some() {
             return Err(
                 "outputTarget is not supported until atomic delivery is certified".to_string(),
+            );
+        }
+        if let Some(authority) = &self.authority {
+            authority.validate()?;
+            return Err(
+                "authority is not supported until this daemon advertises Runtime Authority"
+                    .to_string(),
             );
         }
         Ok(())
@@ -556,5 +642,89 @@ mod tests {
         assert!(RoutineDefinition::from_legacy_json(&value).is_ok());
         let error = RoutineDefinition::from_json(&value).unwrap_err();
         assert!(error.contains("unknown field `futureField`"), "{error}");
+    }
+
+    fn with_authority(authority: Value) -> Value {
+        let mut value = valid_definition();
+        value["authority"] = authority;
+        value
+    }
+
+    fn r0_authority() -> Value {
+        json!({
+            "actionType": "analysis.read",
+            "riskClass": "R0",
+            "capabilities": ["analysis.read"],
+            "scopes": [{
+                "kind": "filesystem",
+                "root": "workspace",
+                "path": "notes",
+                "access": "read",
+                "recursive": true
+            }],
+            "proposalSafe": true
+        })
+    }
+
+    #[test]
+    fn a_declared_authority_is_refused_until_runtime_authority_is_advertised() {
+        let error = RoutineDefinition::from_json(&with_authority(r0_authority())).unwrap_err();
+        assert!(
+            error.contains("until this daemon advertises Runtime Authority"),
+            "{error}"
+        );
+        // A definition that declares nothing serializes as before, so existing
+        // definition digests do not move.
+        let plain = RoutineDefinition::from_json(&valid_definition()).unwrap();
+        assert_eq!(plain.authority, None);
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("authority")
+            .is_none());
+    }
+
+    #[test]
+    fn a_malformed_authority_is_refused_for_what_is_wrong() {
+        let edit = |change: &dyn Fn(&mut Value)| {
+            let mut authority = r0_authority();
+            change(&mut authority);
+            RoutineDefinition::from_json(&with_authority(authority)).unwrap_err()
+        };
+        for (error, expected) in [
+            (
+                edit(&|a| a["actionType"] = json!("Analysis Read")),
+                "authority.actionType",
+            ),
+            (
+                edit(&|a| a["capabilities"] = json!([])),
+                "authority.capabilities",
+            ),
+            (
+                edit(&|a| a["capabilities"] = json!(["analysis.read", "analysis.read"])),
+                "authority.capabilities",
+            ),
+            (
+                edit(&|a| a["scopes"] = json!(["notes"])),
+                "authority.scopes",
+            ),
+            (edit(&|a| a["riskClass"] = json!("R5")), "unknown variant"),
+            (edit(&|a| a["grant"] = json!(true)), "unknown field"),
+            (
+                edit(&|a| {
+                    a.as_object_mut().unwrap().remove("proposalSafe");
+                }),
+                "missing field",
+            ),
+        ] {
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_api_refuses_rather_than_drops_a_declared_authority() {
+        let error =
+            RoutineDefinition::from_legacy_json(&with_authority(r0_authority())).unwrap_err();
+        assert!(error.contains("versioned definition API"), "{error}");
+        assert!(RoutineDefinition::from_legacy_json(&valid_definition()).is_ok());
     }
 }
