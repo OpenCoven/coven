@@ -36,6 +36,7 @@ pub mod occurrences;
 #[allow(dead_code)]
 pub mod owner_grants;
 pub mod receipts;
+pub mod recovery;
 #[cfg(test)]
 mod release_upgrade_tests;
 pub mod rich_definition;

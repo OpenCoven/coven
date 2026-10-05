@@ -176,11 +176,25 @@ unadvertised until slice 6.
    evidence with the `dispatch-authority` key. Construct Runtime Authority only
    for definitions that opt in, with the #857 approval policy for R3 and R4,
    and advertise the profile only once its conformance passes.
-7. **Approvals and held commands.** Implement the approval lifecycle, then the
-   five versioned commands #1054 holds for #857. These are
-   `occurrence.runNow.v1` (which records its own owner grant), now
-   compatibility-only, and the unsupported
-   `occurrence.cancel.v1`, `attempt.cancel.v1`, `attempt.retry.v1` and
-   `occurrence.recover.v1`.
+7. **Held commands, then approvals.** The five versioned commands #1054
+   holds for #857:
+   - `occurrence.runNow.v1`, now compatibility-only;
+   - `occurrence.cancel.v1`;
+   - `attempt.cancel.v1`;
+   - `attempt.retry.v1`;
+   - `occurrence.recover.v1`.
+
+   Decided on 2026-10-05:
+   - **Commands first.** These commands come first. The approval lifecycle
+     waits for an envelope that can write, because v1 launches only the R0
+     read envelope, and an approval would unlock nothing.
+   - **runNow.** An owner's `occurrence.runNow.v1` for a routine that
+     declares authority is a one-run owner grant, exactly like an
+     activation. It is not a per-run approval.
+
+   `occurrence.recover.v1` is implemented. The owner settles a
+   `recovery_required` occurrence `failed_deterministic`, or opens its next
+   attempt with `retry_with_new_attempt`. Recovering a Runtime Authority run
+   needs authority-evidenced receipts, so it follows with the adapter.
 8. **Certification.** #858 Runtime Authority certification, then SDK Phase 3
    authority-bearing commands.

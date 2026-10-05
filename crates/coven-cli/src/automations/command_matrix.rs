@@ -46,7 +46,7 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
     entry("run.cancel.v1", Implemented),
     entry("attempt.cancel.v1", Unsupported),
     entry("attempt.retry.v1", Unsupported),
-    entry("occurrence.recover.v1", Unsupported),
+    entry("occurrence.recover.v1", Implemented),
     entry("definition.list.v1", Implemented),
     entry("definition.get.v1", Implemented),
     entry("run.history.v1", Implemented),

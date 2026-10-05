@@ -948,6 +948,7 @@ fn handle_request_with_runtime_authority_and_automation_time(
                         | "coven.automations.definition.pause.v1"
                         | "coven.automations.definition.tombstone.v1"
                         | "coven.automations.run.cancel.v1"
+                        | "coven.automations.occurrence.recover.v1"
                         | "coven.automations.run"
                         | "coven.automations.tick"
                         | "coven.automations.unquarantine"

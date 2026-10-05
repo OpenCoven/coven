@@ -133,6 +133,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.pause.v1",
                     "coven.automations.definition.tombstone.v1",
                     "coven.automations.run.cancel.v1",
+                    "coven.automations.occurrence.recover.v1",
                     "coven.automations.events.read.v1",
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
@@ -661,6 +662,47 @@ pub(crate) fn route_action_at(
                     )
                 }
                 Ok(crate::automations::cancellation::CancellationExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
+            }
+        }
+        crate::automations::recovery::RECOVER_ACTION => {
+            match crate::automations::recovery::execute_occurrence_recovery(
+                conn,
+                payload.clone(),
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::automations::recovery::RecoveryExecution::Success {
+                    payload: result,
+                    replayed,
+                }) => (
+                    200,
+                    ControlActionResponse {
+                        ok: true,
+                        accepted: true,
+                        action: action.to_string(),
+                        status: ActionStatus::Completed,
+                        reason: replayed
+                            .then(|| "replayed previously adopted recovery".to_string()),
+                        error: None,
+                        result: Some(result.clone()),
+                        event: Some(ControlEvent {
+                            kind: "automations.occurrence.recovery",
+                            action: action.to_string(),
+                            origin,
+                            intent_id,
+                            payload: result,
+                        }),
+                    },
+                ),
+                Ok(crate::automations::recovery::RecoveryExecution::Rejected(error)) => {
                     typed_rejection(action, error)
                 }
                 Err(error) => typed_rejection(
