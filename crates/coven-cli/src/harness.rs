@@ -1987,6 +1987,79 @@ fn command_parts_for_harness_with_conversation_inner(
     )
 }
 
+/// The command for a Runtime Authority envelope launch (coven#857).
+///
+/// The envelope fixes every argument that decides what the session can do.
+/// Only content is added: the model, the familiar's identity, and the prompt
+/// behind an options terminator. The permission bypass
+/// (`COVEN_CLAUDE_BYPASS_PERMISSIONS`), sandbox, add-dir and launch-policy
+/// options never apply, because any of them could widen the envelope.
+pub fn command_parts_for_envelope(
+    harness_id: &str,
+    envelope_args: &[&str],
+    prompt: &str,
+    familiar: Option<&FamiliarContext>,
+    model: Option<&str>,
+) -> Result<(String, Vec<String>)> {
+    envelope_command_parts_with_specs(
+        &configured_harness_specs()?,
+        harness_id,
+        envelope_args,
+        prompt,
+        familiar,
+        model,
+        spawn_executable_for_platform,
+    )
+}
+
+/// Environment-free core of [`command_parts_for_envelope`]. Nothing in it can
+/// read the bypass switch.
+fn envelope_command_parts_with_specs(
+    specs: &[HarnessCommandSpec],
+    harness_id: &str,
+    envelope_args: &[&str],
+    prompt: &str,
+    familiar: Option<&FamiliarContext>,
+    model: Option<&str>,
+    resolve_program: impl Fn(&str) -> String,
+) -> Result<(String, Vec<String>)> {
+    let configured_ids = specs
+        .iter()
+        .map(|spec| spec.id.as_str())
+        .collect::<Vec<_>>();
+    let spec = specs
+        .iter()
+        .find(|spec| spec.id == harness_id)
+        .ok_or_else(|| anyhow!(unsupported_harness_message(harness_id, &configured_ids)))?;
+    let program = resolve_program(&spec.executable);
+    let mut args: Vec<String> = envelope_args
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect();
+    if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
+        args.extend(spec.model_args(model)?);
+    }
+    let prompt = match (familiar, spec.system_prompt_flag.as_deref()) {
+        (Some(familiar), Some(flag)) => {
+            args.push(flag.to_owned());
+            args.push(familiar.identity_preamble());
+            prompt.to_owned()
+        }
+        (Some(familiar), None) => format!("{}\n\n{prompt}", familiar.identity_preamble()),
+        (None, _) => prompt.to_owned(),
+    };
+    // The prompt is user data, so it always rides behind the terminator.
+    args.push("--".to_owned());
+    args.push(prompt);
+    let args = sanitize_argv_for_program(
+        harness_id,
+        HarnessLaunchMode::NonInteractive,
+        &program,
+        args,
+    );
+    Ok((program, args))
+}
+
 /// Environment-free core of command construction. The three env-dependent
 /// inputs — the resolved spec set, the Claude permission-bypass decision, and
 /// executable resolution — are supplied by the caller, so the argv logic
@@ -6470,5 +6543,68 @@ mod tests {
         let specs = load_external_harness_specs(&manifest, &built_in_harness_specs())?;
         assert!(specs.iter().any(|spec| spec.id == "templated"));
         Ok(())
+    }
+
+    #[test]
+    fn an_envelope_launch_adds_only_model_identity_and_prompt() {
+        use crate::automations::runtime_envelope::CLAUDE_R0_READ;
+        let specs = built_in_harness_specs();
+        let familiar = FamiliarContext {
+            id: "charm".to_owned(),
+            display_name: "Charm".to_owned(),
+            role: None,
+        };
+        let (_, args) = envelope_command_parts_with_specs(
+            &specs,
+            "claude",
+            CLAUDE_R0_READ.args,
+            "-rf everything",
+            Some(&familiar),
+            Some("anthropic/claude-opus-5-5"),
+            |executable| executable.to_owned(),
+        )
+        .unwrap();
+        let mut expected: Vec<String> = CLAUDE_R0_READ
+            .args
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect();
+        expected.extend([
+            "--model".to_owned(),
+            "claude-opus-5-5".to_owned(),
+            "--system-prompt".to_owned(),
+            familiar.identity_preamble(),
+            "--".to_owned(),
+            "-rf everything".to_owned(),
+        ]);
+        assert_eq!(args, expected);
+
+        let (_, bare) = envelope_command_parts_with_specs(
+            &specs,
+            "claude",
+            CLAUDE_R0_READ.args,
+            "Summarise the notes.",
+            None,
+            None,
+            |executable| executable.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(&bare[..CLAUDE_R0_READ.args.len()], CLAUDE_R0_READ.args);
+        assert_eq!(
+            &bare[CLAUDE_R0_READ.args.len()..],
+            ["--", "Summarise the notes."]
+        );
+        // The envelope's own permission mode is the only one.
+        assert!(!bare.iter().any(|arg| arg == "bypassPermissions"));
+        assert!(envelope_command_parts_with_specs(
+            &specs,
+            "no-such-harness",
+            CLAUDE_R0_READ.args,
+            "x",
+            None,
+            None,
+            |executable| executable.to_owned(),
+        )
+        .is_err());
     }
 }

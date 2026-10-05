@@ -1022,6 +1022,44 @@ impl SessionRuntime for LiveSessionRuntime {
         self.launch_session_inner(launch, writer, Some(ownership_established), true)
     }
 
+    /// The daemon enforces a projection by launching under the runtime
+    /// envelope it pins, so it accepts exactly the projections that pin one.
+    fn accepts_automation_authority_projection(&self) -> bool {
+        true
+    }
+
+    fn launch_authorized_contained_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        authority: Option<
+            &crate::automations::authority_projection::AutomationAuthorityConsumerProjection,
+        >,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let envelope = match authority {
+            None => None,
+            Some(projection) => Some(
+                crate::automations::runtime_envelope::for_projection(projection, &launch.harness)
+                    .filter(|_| {
+                        launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive
+                            && launch.conversation.is_none()
+                            && launch.launch_policy.is_none()
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED)
+                    })?,
+            ),
+        };
+        self.launch_session_with_envelope(
+            launch,
+            writer,
+            Some(ownership_established),
+            true,
+            envelope,
+        )
+    }
+
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
         LiveSessionRuntime::send_input(self, session_id, payload)
     }
@@ -1147,6 +1185,31 @@ impl LiveSessionRuntime {
         ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
         strict_containment: bool,
     ) -> Result<()> {
+        self.launch_session_with_envelope(
+            launch,
+            writer,
+            ownership_established,
+            strict_containment,
+            None,
+        )
+    }
+
+    /// Launches `launch`, under `envelope` when Runtime Authority pins one.
+    /// An envelope launch is built from the envelope alone and runs strictly
+    /// contained, with stderr wrapped as stream events, so its whole output is
+    /// the harness's event stream.
+    fn launch_session_with_envelope(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
+        strict_containment: bool,
+        envelope: Option<&'static crate::automations::runtime_envelope::RuntimeEnvelope>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            envelope.is_none() || strict_containment,
+            "a Runtime Authority envelope launch must be strictly contained"
+        );
         if self.shutting_down.load(Ordering::Acquire) {
             self.record_no_process_receipt(launch, strict_containment)?;
             return Err(anyhow::Error::new(
@@ -1167,7 +1230,16 @@ impl LiveSessionRuntime {
             launch_policy: launch.launch_policy.as_ref(),
             ..Default::default()
         };
-        let mut command = if launch.harness == "codex"
+        let mut command = if let Some(envelope) = envelope {
+            pty_runner::build_envelope_harness_command(
+                &launch.harness,
+                envelope.args,
+                &launch.prompt,
+                Path::new(&launch.cwd),
+                familiar_ctx.as_ref(),
+                launch.model.as_deref(),
+            )?
+        } else if launch.harness == "codex"
             && launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive
         {
             pty_runner::build_piped_harness_command_with_conversation(
@@ -1230,6 +1302,7 @@ impl LiveSessionRuntime {
             command,
             ownership_established,
             strict_containment,
+            envelope.is_some(),
         )
     }
 
@@ -1240,6 +1313,7 @@ impl LiveSessionRuntime {
         command: pty_runner::HarnessCommand,
         mut ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
         strict_containment: bool,
+        wrap_stderr: bool,
     ) -> Result<()> {
         let (observer, registration) =
             self.observer_for_session_with_writer(launch.id.clone(), writer);
@@ -1309,7 +1383,7 @@ impl LiveSessionRuntime {
             && (strict_containment || cfg!(windows) || launch.harness == "codex")
         {
             let (piped, _provisional_killer) = launch_admission.spawn_owned(|publish| {
-                let piped = pty_runner::spawn_piped_with_observer(&command, observer, false)?;
+                let piped = pty_runner::spawn_piped_with_observer(&command, observer, wrap_stderr)?;
                 let killer: Box<dyn RuntimeKiller> = Box::new(piped.cancellation_handle());
                 publish(killer)?;
                 Ok(piped)
@@ -8930,6 +9004,7 @@ mod tests {
                 command,
                 Some(&mut publish_running),
                 false,
+                false,
             );
             let _ = launch_tx.send(result);
         });
@@ -15672,6 +15747,60 @@ mod tests {
             daemon_socket_path(temp_dir.path()).exists(),
             "socket file should still exist while the loop is running"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_live_runtime_refuses_a_projection_that_pins_no_envelope() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf());
+        assert!(runtime.accepts_automation_authority_projection());
+        // The contract's fixture binding pins a runtime descriptor that is not
+        // one of Coven's envelopes.
+        let extension: crate::automations::contract::authority::AutomationAuthorityExtension =
+            serde_json::from_value(
+                crate::automations::contract::authority::test_support::authority_extensions_value()
+                    [crate::automations::contract::authority::AUTHORITY_EXTENSION_KEY]
+                    .clone(),
+            )?;
+        let projection =
+            crate::automations::authority_projection::AutomationAuthorityConsumerProjection::from_validated(
+                &extension,
+            );
+        let launch = SessionLaunch {
+            id: "session-envelope-refusal".to_string(),
+            project_root: temp_dir.path().display().to_string(),
+            cwd: temp_dir.path().display().to_string(),
+            harness: "claude".to_string(),
+            model: None,
+            launch_mode: crate::harness::HarnessLaunchMode::NonInteractive,
+            launch_policy: None,
+            prompt: "Read the notes.".to_string(),
+            title: "envelope refusal".to_string(),
+            conversation: None,
+            conversation_id: None,
+            familiar_id: None,
+            caller_familiar_id: None,
+        };
+        let mut published = false;
+        let error = runtime
+            .launch_authorized_contained_adopted_session(
+                &launch,
+                Some(&projection),
+                None,
+                &mut || {
+                    published = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED),
+            "{error:#}"
+        );
+        assert!(!published, "nothing launched");
         Ok(())
     }
 }

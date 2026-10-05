@@ -16,6 +16,7 @@
 
 use serde_json::{json, Value};
 
+use super::authority_projection::AutomationAuthorityConsumerProjection;
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::types::SideEffectClass;
 
@@ -135,8 +136,30 @@ pub(crate) fn by_descriptor_digest(digest: &str) -> Option<&'static RuntimeEnvel
         .find(|envelope| envelope.descriptor_digest() == digest)
 }
 
+/// The envelope a launch on `harness` may run under for `projection`. That is
+/// the envelope the projection's runtime binding pins, by descriptor digest and
+/// version, for the same harness, holding every capability the projection
+/// grants.
+pub(crate) fn for_projection(
+    projection: &AutomationAuthorityConsumerProjection,
+    harness: &str,
+) -> Option<&'static RuntimeEnvelope> {
+    let envelope = by_descriptor_digest(projection.runtime.descriptor_digest.value.as_str())?;
+    let granted = projection.granted_capabilities.as_slice();
+    let grant_matches = granted.len() == envelope.capabilities.len()
+        && granted
+            .iter()
+            .all(|capability| envelope.capabilities.contains(&capability.as_str()));
+    (envelope.harness == harness
+        && projection.runtime.descriptor_version.as_str() == envelope.descriptor_version
+        && grant_matches)
+        .then_some(envelope)
+}
+
 /// The envelope for a grant of exactly `capabilities` on `harness`, if v1
 /// launches one.
+// The trusted adapter (coven#857 slice 6) picks the envelope it pins with this.
+#[allow(dead_code)]
 pub(crate) fn for_grant(harness: &str, capabilities: &[&str]) -> Option<&'static RuntimeEnvelope> {
     let mut wanted: Vec<&str> = capabilities.to_vec();
     wanted.sort_unstable();
@@ -189,5 +212,49 @@ mod tests {
             .tools
             .iter()
             .all(|tool| tool.side_effect == SideEffectClass::LocalRead));
+    }
+
+    fn projection(
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> AutomationAuthorityConsumerProjection {
+        use crate::automations::contract::authority::test_support::{
+            authority_extensions_value, resign_binding,
+        };
+        use crate::automations::contract::authority::AUTHORITY_EXTENSION_KEY;
+        let mut extension = authority_extensions_value()[AUTHORITY_EXTENSION_KEY].clone();
+        let binding = &mut extension["executionBinding"];
+        binding["runtime"]["descriptorDigest"]["value"] =
+            serde_json::json!(CLAUDE_R0_READ.descriptor_digest());
+        binding["runtime"]["descriptorVersion"] = serde_json::json!("r0-read.1");
+        binding["capabilities"]["granted"] = serde_json::json!(["analysis.read"]);
+        edit(binding);
+        resign_binding(binding);
+        AutomationAuthorityConsumerProjection::from_validated(
+            &serde_json::from_value(extension).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_projection_runs_under_the_envelope_its_binding_pins() {
+        assert_eq!(
+            for_projection(&projection(|_| {}), "claude"),
+            Some(&CLAUDE_R0_READ)
+        );
+        // Another harness, version, unknown envelope or broader grant has none.
+        assert_eq!(for_projection(&projection(|_| {}), "codex"), None);
+        let refused: [fn(&mut serde_json::Value); 4] = [
+            |binding| binding["runtime"]["descriptorVersion"] = serde_json::json!("r0-read.2"),
+            |binding| {
+                binding["runtime"]["descriptorDigest"]["value"] = serde_json::json!("0".repeat(64))
+            },
+            |binding| {
+                binding["capabilities"]["granted"] =
+                    serde_json::json!(["analysis.read", "artifact.write"])
+            },
+            |binding| binding["capabilities"]["granted"] = serde_json::json!([]),
+        ];
+        for edit in refused {
+            assert_eq!(for_projection(&projection(edit), "claude"), None);
+        }
     }
 }

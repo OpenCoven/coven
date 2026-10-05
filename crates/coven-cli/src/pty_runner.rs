@@ -368,6 +368,38 @@ pub fn build_harness_command_with_conversation(
     )
 }
 
+/// The command for a Runtime Authority envelope launch. The prompt rides in
+/// argv behind `--`, and nothing from the harness defaults or the environment
+/// widens the envelope ([`crate::harness::command_parts_for_envelope`]).
+pub fn build_envelope_harness_command(
+    harness_id: &str,
+    envelope_args: &[&str],
+    prompt: &str,
+    cwd: &Path,
+    familiar: Option<&crate::harness::FamiliarContext>,
+    model: Option<&str>,
+) -> Result<HarnessCommand> {
+    let (program, args) = crate::harness::command_parts_for_envelope(
+        harness_id,
+        envelope_args,
+        prompt,
+        familiar,
+        model,
+    )?;
+    let (program, env_overrides) = prepare_harness_program(
+        harness_id,
+        crate::harness::HarnessLaunchMode::NonInteractive,
+        program,
+    )?;
+    Ok(HarnessCommand {
+        program,
+        args,
+        cwd: cwd.to_path_buf(),
+        stdin_prompt: None,
+        env_overrides,
+    })
+}
+
 /// Build a daemon-owned noninteractive command whose Codex prompt is carried
 /// on stdin on every platform. Ordinary interactive/attached CLI construction
 /// keeps its existing argv/PTY behavior; this contract is for the piped daemon
