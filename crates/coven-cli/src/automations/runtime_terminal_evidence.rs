@@ -348,7 +348,7 @@ pub fn store_runtime_terminal_evidence(
     Ok(outcome)
 }
 
-fn store_runtime_terminal_evidence_in(
+pub(crate) fn store_runtime_terminal_evidence_in(
     conn: &Connection,
     evidence: &RuntimeTerminalEvidence,
     verifier: &dyn RuntimeTerminalEvidenceVerifier,
@@ -604,6 +604,46 @@ fn pinned_binding(
     evidence: &RuntimeTerminalEvidence,
     stored_read: bool,
 ) -> Result<AutomationExecutionBinding, RuntimeTerminalEvidenceError> {
+    let (durable, binding) = durable_binding(conn, evidence.attempt_id.as_str(), stored_read)?;
+    validate_durable_correlation(&durable, &binding, evidence, stored_read)?;
+    Ok(binding)
+}
+
+/// The execution binding pinned to the Runtime Authority attempt that
+/// `session_id` runs, or `None` when the session runs no such attempt.
+pub(crate) fn session_binding(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<AutomationExecutionBinding>, RuntimeTerminalEvidenceError> {
+    let attempt_id: Option<String> = conn
+        .query_row(
+            "SELECT attempt.id
+             FROM automation_attempts AS attempt
+             JOIN automation_runs AS run ON run.id = attempt.run_id
+             WHERE attempt.session_id = ?1 AND run.authority_profile = ?2",
+            params![session_id, AUTHORITY_PROFILE],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| evidence_error(RuntimeTerminalEvidenceErrorCode::StoreUnavailable))?;
+    let Some(attempt_id) = attempt_id else {
+        return Ok(None);
+    };
+    durable_binding(conn, &attempt_id, false).map(|(_, binding)| Some(binding))
+}
+
+/// An attempt's durable correlation and its validated execution binding.
+fn durable_binding(
+    conn: &Connection,
+    attempt_id: &str,
+    stored_read: bool,
+) -> Result<
+    (
+        DurableRuntimeTerminalEvidenceBinding,
+        AutomationExecutionBinding,
+    ),
+    RuntimeTerminalEvidenceError,
+> {
     let durable: Option<DurableRuntimeTerminalEvidenceBinding> = conn
         .query_row(
             "SELECT run.id, run.automation_id, run.automation_revision,
@@ -616,7 +656,7 @@ fn pinned_binding(
              JOIN automation_runs AS run ON run.id = attempt.run_id
              JOIN sessions AS session ON session.id = attempt.session_id
              WHERE attempt.id = ?1",
-            [evidence.attempt_id.as_str()],
+            [attempt_id],
             |row| {
                 Ok(DurableRuntimeTerminalEvidenceBinding {
                     run_id: row.get(0)?,
@@ -673,13 +713,7 @@ fn pinned_binding(
             RuntimeTerminalEvidenceErrorCode::StoredEvidenceInvalid,
         ));
     };
-    validate_durable_correlation(
-        &durable,
-        &extension.execution_binding,
-        evidence,
-        stored_read,
-    )?;
-    Ok(extension.execution_binding)
+    Ok((durable, extension.execution_binding))
 }
 
 fn validate_durable_correlation(

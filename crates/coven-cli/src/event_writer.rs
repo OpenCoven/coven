@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::automations::contract::types::TerminalOutcome;
 use crate::{pty_runner::PtyRunResult, store, STORE_FILE_NAME};
 
 const DEFAULT_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
@@ -854,13 +855,29 @@ fn record_exit(
         } else {
             result.status
         };
-        store::update_session_terminal_if_active(
+        let ended = store::update_session_terminal_if_active(
             conn,
             session_id,
             persisted_status,
             result.exit_code,
             created_at,
         )?;
+        if ended {
+            // The observation commits in this batch, with the exit event.
+            let disposition = match result.status {
+                "completed" => TerminalOutcome::Succeeded,
+                "failed" => TerminalOutcome::Failed,
+                _ => TerminalOutcome::Ambiguous,
+            };
+            let observed_at = chrono::DateTime::parse_from_rfc3339(created_at)
+                .map_or_else(|_| chrono::Utc::now(), |at| at.with_timezone(&chrono::Utc));
+            crate::automations::terminal_observer::record(
+                conn,
+                session_id,
+                disposition,
+                observed_at,
+            );
+        }
     }
     store::insert_event_with_privacy(
         conn,
@@ -1927,5 +1944,72 @@ mod tests {
         assert_eq!(health.state, "failed");
         assert_eq!(health.queued_events, 0);
         assert_eq!(health.queued_bytes, 0);
+    }
+
+    #[test]
+    fn a_runtime_authority_exit_commits_its_terminal_evidence_with_the_exit_event() {
+        use crate::automations::terminal_observer::test_support::{seed, SESSION_ID};
+        let temp = tempfile::tempdir().unwrap();
+        let conn = seed(temp.path(), true);
+        let transaction = conn.unchecked_transaction().unwrap();
+        record_exit(
+            &transaction,
+            temp.path(),
+            SESSION_ID,
+            &PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+            "2026-09-03T12:30:00.000Z",
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let (disposition, exits): (String, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT json_extract(canonical_json, '$.disposition')
+                     FROM automation_runtime_terminal_evidence WHERE session_id = ?1),
+                    (SELECT COUNT(*) FROM events WHERE session_id = ?1 AND kind = 'exit')",
+                [SESSION_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((disposition.as_str(), exits), ("succeeded", 1));
+    }
+
+    #[test]
+    fn an_exit_that_lost_the_race_to_end_its_session_observes_nothing() {
+        use crate::automations::terminal_observer::test_support::{seed, SESSION_ID};
+        let temp = tempfile::tempdir().unwrap();
+        let conn = seed(temp.path(), true);
+        // A confirmed stop ended the session first.
+        store::update_session_terminal_if_active(
+            &conn,
+            SESSION_ID,
+            "killed",
+            None,
+            "2026-09-03T12:29:00.000Z",
+        )
+        .unwrap();
+        record_exit(
+            &conn,
+            temp.path(),
+            SESSION_ID,
+            &PtyRunResult {
+                status: "failed",
+                exit_code: Some(1),
+            },
+            "2026-09-03T12:30:00.000Z",
+        )
+        .unwrap();
+        let evidence: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_runtime_terminal_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence, 0);
+        assert!(!crate::daemon::daemon_recovery_log_path(temp.path()).exists());
     }
 }

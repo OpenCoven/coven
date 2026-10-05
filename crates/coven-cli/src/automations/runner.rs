@@ -142,8 +142,11 @@ pub(crate) fn recover_restart_containment(
         if !disposition_proven {
             continue;
         }
+        let transaction = conn.unchecked_transaction().map_err(|error| {
+            format!("failed to begin restart containment for session `{session_id}`: {error}")
+        })?;
         if crate::store::update_session_terminal_if_active(
-            conn,
+            &transaction,
             &session_id,
             "killed",
             None,
@@ -152,8 +155,19 @@ pub(crate) fn recover_restart_containment(
         .map_err(|error| {
             format!("failed to record restart containment for session `{session_id}`: {error}")
         })? {
+            // The process ended while the daemon was down, so how it ended
+            // was not seen.
+            super::terminal_observer::record(
+                &transaction,
+                &session_id,
+                TerminalOutcome::Ambiguous,
+                now,
+            );
             recovered += 1;
         }
+        transaction.commit().map_err(|error| {
+            format!("failed to commit restart containment for session `{session_id}`: {error}")
+        })?;
     }
     Ok(recovered)
 }
@@ -3113,6 +3127,10 @@ pub(crate) fn settle_confirmed_stop(
                 None,
             ),
         };
+    let observed = match disposition {
+        ConfirmedStop::Cancelled => TerminalOutcome::Cancelled,
+        ConfirmedStop::TimedOut => TerminalOutcome::TimedOut,
+    };
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| format!("failed to begin automation stop settlement: {error}"))?;
@@ -3260,6 +3278,9 @@ pub(crate) fn settle_confirmed_stop(
             format!("automation run `{run_id}` changed before stop settlement completed")
         })?;
     if authority_profile.as_deref() == Some(AUTHORITY_PROFILE) {
+        // The observation commits with the stop. The run is held either way:
+        // only the evidence consumer settles a Runtime Authority run.
+        super::terminal_observer::record(&transaction, session_id, observed, now);
         hold_runtime_authority_terminal_settlement_in(
             &transaction,
             run_id,
