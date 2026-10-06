@@ -14,6 +14,9 @@ pub enum CommandSupport {
     Implemented,
     /// Refused under its versioned name. The legacy action covers part of the
     /// behaviour but takes no caller adoption key or expected revision.
+    // No command is compatibility-only since `occurrence.runNow.v1` landed;
+    // the category stays for a command whose legacy action outlives it.
+    #[allow(dead_code)]
     CompatibilityOnly { legacy_action: &'static str },
     /// Refused; nothing in this producer performs it.
     Unsupported,
@@ -36,12 +39,7 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
     entry("definition.pause.v1", Implemented),
     entry("definition.disable.v1", Implemented),
     entry("definition.tombstone.v1", Implemented),
-    entry(
-        "occurrence.runNow.v1",
-        CompatibilityOnly {
-            legacy_action: "coven.automations.run",
-        },
-    ),
+    entry("occurrence.runNow.v1", Implemented),
     entry("occurrence.cancel.v1", Unsupported),
     entry("run.cancel.v1", Implemented),
     entry("attempt.cancel.v1", Unsupported),

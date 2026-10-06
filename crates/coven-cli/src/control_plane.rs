@@ -134,6 +134,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.tombstone.v1",
                     "coven.automations.run.cancel.v1",
                     "coven.automations.occurrence.recover.v1",
+                    "coven.automations.occurrence.runNow.v1",
                     "coven.automations.events.read.v1",
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
@@ -672,6 +673,47 @@ pub(crate) fn route_action_at(
                     )
                 }
                 Ok(crate::automations::cancellation::CancellationExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
+            }
+        }
+        crate::automations::run_now::RUN_NOW_ACTION => {
+            match crate::automations::run_now::execute_run_now(
+                conn,
+                runtime,
+                payload.clone(),
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::automations::run_now::RunNowExecution::Success {
+                    payload: result,
+                    replayed,
+                }) => (
+                    200,
+                    ControlActionResponse {
+                        ok: true,
+                        accepted: true,
+                        action: action.to_string(),
+                        status: ActionStatus::Completed,
+                        reason: replayed.then(|| "replayed previously adopted run".to_string()),
+                        error: None,
+                        result: Some(result.clone()),
+                        event: Some(ControlEvent {
+                            kind: "automations.occurrence.runNow",
+                            action: action.to_string(),
+                            origin,
+                            intent_id,
+                            payload: result,
+                        }),
+                    },
+                ),
+                Ok(crate::automations::run_now::RunNowExecution::Rejected(error)) => {
                     typed_rejection(action, error)
                 }
                 Err(error) => typed_rejection(

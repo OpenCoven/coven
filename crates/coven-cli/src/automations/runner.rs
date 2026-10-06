@@ -2078,12 +2078,31 @@ pub fn run_routine_now(
             error: Some("routine already has a nonterminal run; overlap is forbidden".to_string()),
         });
     }
+    let _ = cwd;
+    dispatch_manual_occurrence(conn, runtime, definition, &occurrence_id, now)
+}
 
+/// Dispatches a claimed manual occurrence through the scheduled path. A
+/// dispatch that refuses before runtime ownership settles the occurrence
+/// failed with its reason.
+pub(crate) fn dispatch_manual_occurrence(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    definition: &RoutineDefinition,
+    occurrence_id: &str,
+    now: DateTime<Utc>,
+) -> Result<RunOutcome, String> {
+    let cwd = definition
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .ok_or_else(|| "routine has no cwd; add a cwd before running".to_string())?;
     let dispatch_now = Utc::now().max(now);
-    match dispatch_occurrence(conn, runtime, definition, &occurrence_id, cwd, dispatch_now) {
+    match dispatch_occurrence(conn, runtime, definition, occurrence_id, cwd, dispatch_now) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
-            if !settle_occurrence(conn, &occurrence_id, "failed", Some(&error), dispatch_now)? {
+            if !settle_occurrence(conn, occurrence_id, "failed", Some(&error), dispatch_now)? {
                 return Err(format!(
                     "{error}; manual occurrence changed before rejection settlement"
                 ));
