@@ -5,7 +5,7 @@
     "Machine-readable compatibility matrix for coven.automations.v1.",
     "changeClass defines what a future change to any field or variant is, and what a v1 consumer/producer must do when it meets it.",
     "Consumers and producers must refuse incompatible profiles explicitly with SCHEMA_VERSION_UNSUPPORTED; they never approximate or degrade silently.",
-    "This profile is still proposed. The UTC/IANA timezone correction is a pre-stabilization contract revision: older source-bound bundles remain immutable historical artifacts, and consumers must pin the exact bundle they validated."
+    "This profile is still proposed. The UTC/IANA timezone correction and operator-retry hold transitions are pre-stabilization contract revisions: older source-bound bundles remain immutable historical artifacts, and consumers must pin the exact bundle they validated."
   ],
   "changeClasses": [
     {
@@ -36,7 +36,7 @@
       "id": "state-machine-change",
       "definition": "A state, transition, guard, or invariant in state-machines.json changes.",
       "v1ConsumerBehavior": "refuse; lifecycle semantics are the contract's core and are never evolved additively.",
-      "profileImpact": "new major profile"
+      "profileImpact": "new major profile after stabilization; while proposed, source-bound revisions may refine transitions under protocol-version.json profileLifecycle without changing historical bundles"
     }
   ],
   "objectFields": [

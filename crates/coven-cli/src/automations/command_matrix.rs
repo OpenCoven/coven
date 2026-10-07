@@ -19,6 +19,9 @@ pub enum CommandSupport {
     #[allow(dead_code)]
     CompatibilityOnly { legacy_action: &'static str },
     /// Refused; nothing in this producer performs it.
+    // Every v1 command is implemented since `attempt.retry.v1` landed; the
+    // category stays for a command a later contract revision adds.
+    #[allow(dead_code)]
     Unsupported,
 }
 
@@ -43,7 +46,7 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
     entry("occurrence.cancel.v1", Implemented),
     entry("run.cancel.v1", Implemented),
     entry("attempt.cancel.v1", Implemented),
-    entry("attempt.retry.v1", Unsupported),
+    entry("attempt.retry.v1", Implemented),
     entry("occurrence.recover.v1", Implemented),
     entry("definition.list.v1", Implemented),
     entry("definition.get.v1", Implemented),
@@ -159,10 +162,14 @@ mod tests {
 
     #[test]
     fn refuses_only_versioned_names_that_are_not_implemented() {
-        assert_eq!(
-            refused_command("coven.automations.attempt.retry.v1").map(|entry| entry.support),
-            Some(Unsupported)
-        );
+        // Every v1 command is implemented, so no versioned name is refused.
+        for entry in COMMAND_MATRIX {
+            assert!(
+                refused_command(&action_name(entry.command)).is_none(),
+                "{}",
+                entry.command
+            );
+        }
         assert!(refused_command("coven.automations.definition.revise.v1").is_none());
         assert!(refused_command("coven.automations.update").is_none());
         assert!(refused_command("attempt.retry.v1").is_none());

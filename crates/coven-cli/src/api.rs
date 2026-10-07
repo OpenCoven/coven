@@ -970,6 +970,7 @@ fn handle_request_with_runtime_authority_and_automation_time(
                         | "coven.automations.occurrence.runNow.v1"
                         | "coven.automations.occurrence.cancel.v1"
                         | "coven.automations.attempt.cancel.v1"
+                        | "coven.automations.attempt.retry.v1"
                         | "coven.automations.run"
                         | "coven.automations.tick"
                         | "coven.automations.unquarantine"
@@ -18347,6 +18348,151 @@ pub(crate) mod tests {
             history["event"]["payload"]["runs"][0]["attempts"][0]["state"],
             "succeeded"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn base_cancellation_recovery_preserves_unknown_failed_stop() -> anyhow::Result<()> {
+        assert_failed_stop_restart_recovery(false)
+    }
+
+    #[test]
+    fn base_cancellation_recovery_resumes_after_ambiguity_was_committed() -> anyhow::Result<()> {
+        assert_failed_stop_restart_recovery(true)
+    }
+
+    fn assert_failed_stop_restart_recovery(already_ambiguous: bool) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:base-failed-recovery",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "do not authorize retry after an unknown stop",
+        );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        crate::automations::runner::mark_active_attempts_for_restart_reconciliation(
+            &conn,
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(store::update_session_terminal_if_active(
+            &conn,
+            &session_id,
+            "failed",
+            Some(1),
+            &current_timestamp(),
+        )?);
+        if already_ambiguous {
+            crate::automations::runner::mark_terminal_stop_for_recovery(
+                &conn,
+                &run_id,
+                &session_id,
+                "stop outcome lost before cancellation finalization",
+                Utc::now(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        if already_ambiguous {
+            let before_expiry = crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?;
+            assert_eq!(
+                before_expiry.failed, 0,
+                "pending cancellation must adopt its recovery outcome before aggregate settlement"
+            );
+        }
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:base-failed-recovery",
+                expired
+            ],
+        )?;
+        conn.execute(
+            "UPDATE automation_stop_fences
+             SET execution_expires_at = ?2
+             WHERE operation_key = ?1",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:base-failed-recovery",
+                expired
+            ],
+        )?;
+
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &NoopSessionRuntime,
+                Utc::now(),
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        drop(conn);
+
+        let recovered = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(recovered.status, 200, "{}", recovered.body);
+        let recovered: Value = serde_json::from_str(&recovered.body)?;
+        assert_eq!(recovered["event"]["payload"]["status"], "recovery_required");
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let states: (String, String, String) = conn.query_row(
+            "SELECT r.status, o.state, a.state FROM automation_runs r
+             JOIN automation_occurrences o ON o.id = r.occurrence_id
+             JOIN automation_attempts a ON a.run_id = r.id WHERE r.id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "running".into(),
+                "recovery_required".into(),
+                "ambiguous".into()
+            )
+        );
+        let retried = crate::automations::attempt_retry::execute_attempt_retry(
+            &conn,
+            json!({
+                "action": crate::automations::attempt_retry::RETRY_ACTION,
+                "adoptionKey": "adopt:retry:unknown-failed-stop", "runId": run_id,
+                "priorAttemptNumber": 1, "priorDisposition": "failed"
+            }),
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(matches!(
+            retried,
+            crate::automations::attempt_retry::RetryExecution::Rejected(_)
+        ));
+        let attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?
+                .failed,
+            1
+        );
+        let final_attempt: String = conn.query_row(
+            "SELECT state FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(final_attempt, "ambiguous");
         Ok(())
     }
 

@@ -326,10 +326,23 @@ unadvertised until slice 6.
    yet dispatched is cancelled at once, and dispatched work is stopped through
    the run cancellation.
 
-   `attempt.retry.v1` will hold for an operator retry, decided on
-   2026-10-05. A failure with no automatic retry left keeps its run `running`
-   until the run's deadline, so the owner can open the next attempt. When the
-   deadline lapses, the run settles failed.
+   `attempt.retry.v1` is implemented for ordinary runs. A known failure with
+   no automatic retry left holds its run `running` while the original deadline
+   is open and fewer than ten attempts have been used. The occurrence retains
+   `claimed` after a pre-ownership refusal or `running` after a started attempt.
+   You can open the next attempt by naming the exact failed attempt and its
+   disposition. The command replans that occurrence without rewriting the
+   failed attempt or extending the deadline.
+
+   Release retry quarantine explicitly before retrying. A pending cancellation
+   or unresolved stop fence blocks both retry and cancellation of a held
+   failure. Stop-lease expiry alone never proves success or authorizes retry.
+   Unknown outcomes enter recovery; conclusive successful base completion still
+   wins a losing cancellation. Once the deadline passes, a held failure settles `failed`, even
+   if its provisional session has been deleted. Under `overlap: forbid`, the
+   held run blocks the next occurrence until it settles. Within the retry
+   window, `occurrence.cancel.v1` can release a hold with no unresolved stop.
+   Retrying a Runtime Authority run follows with the adapter.
 
    `occurrence.recover.v1` is implemented. The owner settles a
    `recovery_required` occurrence `failed_deterministic`, or opens its next

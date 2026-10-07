@@ -3,7 +3,7 @@
   "version": 1,
   "notes": [
     "Authoritative state machines for coven.automations.v1. Clients do not author state: transitions are committed by command handlers or the scheduler, never by arbitrary client writes.",
-    "`on` names the cause class; `actor` names who may commit the transition; `guard` names the condition that must hold. Property tests consume this file to prove invariant preservation."
+    "`on` names the cause class; `actor` names who may commit the transition; `guard` names the condition that must hold. Native operator-retry tests compare observed occurrence transitions against this file; the conformance manifest defines the broader required proof."
   ],
   "machines": [
     {
@@ -35,6 +35,9 @@
         { "from": "eligible", "to": "skipped", "on": "misfire", "actor": "scheduler" },
         { "from": "eligible", "to": "superseded", "on": "definition_superseded", "actor": "scheduler" },
         { "from": "eligible", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler" },
+        { "from": "claimed", "to": "planned", "on": "operator_retry", "actor": "command_handler", "guard": "attempt.retry.v1 names the latest immutable failed attempt of an ordinary held run; original deadline remains open, fewer than ten attempts exist, quarantine is released, and no cancellation or stop ownership is unresolved; opens a new adopted attempt" },
+        { "from": "claimed", "to": "planned", "on": "automatic_retry", "actor": "dispatcher", "guard": "proven pre-ownership failure is retryable under the pinned policy; opens the next attempt with prior disposition and backoff; the original run deadline still bounds dispatch" },
+        { "from": "claimed", "to": "failed", "on": "run_settled", "actor": "dispatcher", "guard": "known pre-ownership failure has no automatic retry or operator hold window, or its held run deadline expires; prior terminal attempt stays immutable" },
         { "from": "claimed", "to": "dispatching", "on": "attempt_adopted", "actor": "dispatcher", "guard": "attempt created with adoptionKey; fence generation matches the claim" },
         { "from": "claimed", "to": "recovering", "on": "lease_expired", "actor": "scheduler", "guard": "leaseExpiresAt < now and no runtime evidence recorded" },
         { "from": "claimed", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation reconciled before dispatch" },
@@ -42,8 +45,9 @@
         { "from": "dispatching", "to": "failed", "on": "launch_refused", "actor": "dispatcher", "guard": "launch failed deterministically before any side effect; occurrence settles failed with reason launch_refused" },
         { "from": "dispatching", "to": "recovering", "on": "lease_expired", "actor": "scheduler", "guard": "no runtime evidence before lease expiry" },
         { "from": "dispatching", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "no attempt reached started; otherwise cancellation waits for reconciliation" },
+        { "from": "running", "to": "planned", "on": "operator_retry", "actor": "command_handler", "guard": "attempt.retry.v1 names the latest immutable failed attempt of an ordinary held run; original deadline remains open, fewer than ten attempts exist, quarantine is released, and no cancellation or stop ownership is unresolved; opens a new adopted attempt" },
         { "from": "running", "to": "succeeded", "on": "run_settled", "actor": "dispatcher", "guard": "runtime evidence proves completion; receipt recorded" },
-        { "from": "running", "to": "failed", "on": "run_settled", "actor": "dispatcher", "guard": "runtime evidence proves failure" },
+        { "from": "running", "to": "failed", "on": "run_settled", "actor": "dispatcher", "guard": "runtime evidence proves failure and no operator hold window remains, or the held run deadline expires; prior terminal attempt stays immutable" },
         { "from": "running", "to": "timed_out", "on": "timeout", "actor": "scheduler", "guard": "perRunMinutes elapsed without settled evidence" },
         { "from": "running", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation acknowledged by runtime or reconciled by recovery" },
         { "from": "running", "to": "recovery_required", "on": "evidence_lost", "actor": "scheduler", "guard": "runtime lost mid-run: outcome cannot be determined automatically" },
@@ -77,6 +81,7 @@
         { "from": "dispatching", "to": "ambiguous", "on": "dispatch_unconfirmed", "actor": "dispatcher", "guard": "dispatch sent but no deterministic ack before lease expiry; terminal for the attempt" },
         { "from": "dispatching", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation acknowledged before runtime start" },
         { "from": "started", "to": "observing", "on": "evidence_stream_open", "actor": "worker", "guard": "output/event cursors established" },
+        { "from": "started", "to": "failed", "on": "run_settled", "actor": "worker", "guard": "terminal failure evidence without an observing phase; terminal attempt remains immutable even when the ordinary run holds for operator retry" },
         { "from": "started", "to": "succeeded", "on": "run_settled", "actor": "worker", "guard": "terminal evidence without an observing phase" },
         { "from": "started", "to": "ambiguous", "on": "evidence_lost", "actor": "scheduler", "guard": "session vanished before evidence" },
         { "from": "observing", "to": "succeeded", "on": "run_settled", "actor": "worker", "guard": "verified completion evidence" },
@@ -105,7 +110,7 @@
         { "from": "accepted", "to": "failed", "on": "launch_refused", "actor": "dispatcher", "guard": "every attempt failed deterministically before evidence" },
         { "from": "accepted", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler" },
         { "from": "running", "to": "succeeded", "on": "attempt_settled", "actor": "dispatcher", "guard": "an attempt settled succeeded; receipt recorded" },
-        { "from": "running", "to": "failed", "on": "attempt_settled", "actor": "dispatcher", "guard": "an attempt settled failed and retry policy opens no further attempt" },
+        { "from": "running", "to": "failed", "on": "attempt_settled", "actor": "dispatcher", "guard": "an attempt settled failed, retry policy opens no further attempt, and no operator hold window remains; held ordinary runs retain running until cancellation or their original deadline" },
         { "from": "running", "to": "timed_out", "on": "timeout", "actor": "scheduler" },
         { "from": "running", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler" },
         { "from": "running", "to": "ambiguous", "on": "attempt_ambiguous", "actor": "dispatcher", "guard": "the current attempt settled ambiguous and no operator recovery has resolved it" }

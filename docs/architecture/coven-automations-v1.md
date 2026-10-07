@@ -341,7 +341,7 @@ This producer does not implement the whole catalog. `automations/command_matrix.
 | `occurrence.cancel.v1` | implemented | `coven.automations.occurrence.cancel.v1` |
 | `run.cancel.v1` | implemented | `coven.automations.run.cancel.v1` |
 | `attempt.cancel.v1` | implemented | `coven.automations.attempt.cancel.v1` |
-| `attempt.retry.v1` | unsupported | none |
+| `attempt.retry.v1` | implemented | `coven.automations.attempt.retry.v1` |
 | `occurrence.recover.v1` | implemented | `coven.automations.occurrence.recover.v1` |
 | `definition.list.v1` | implemented | `coven.automations.definition.list.v1` |
 | `definition.get.v1` | implemented | `coven.automations.definition.get.v1` |
