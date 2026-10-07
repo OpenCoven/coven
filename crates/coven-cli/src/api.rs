@@ -968,6 +968,8 @@ fn handle_request_with_runtime_authority_and_automation_time(
                         | "coven.automations.run.cancel.v1"
                         | "coven.automations.occurrence.recover.v1"
                         | "coven.automations.occurrence.runNow.v1"
+                        | "coven.automations.occurrence.cancel.v1"
+                        | "coven.automations.attempt.cancel.v1"
                         | "coven.automations.run"
                         | "coven.automations.tick"
                         | "coven.automations.unquarantine"

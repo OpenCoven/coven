@@ -135,6 +135,8 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.run.cancel.v1",
                     "coven.automations.occurrence.recover.v1",
                     "coven.automations.occurrence.runNow.v1",
+                    "coven.automations.occurrence.cancel.v1",
+                    "coven.automations.attempt.cancel.v1",
                     "coven.automations.events.read.v1",
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
@@ -673,6 +675,90 @@ pub(crate) fn route_action_at(
                     )
                 }
                 Ok(crate::automations::cancellation::CancellationExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
+            }
+        }
+        crate::automations::cancel_commands::OCCURRENCE_CANCEL_ACTION => {
+            match crate::automations::cancel_commands::execute_occurrence_cancel(
+                conn,
+                runtime,
+                payload.clone(),
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::automations::cancel_commands::CancelExecution::Success {
+                    payload: result,
+                    replayed,
+                }) => (
+                    200,
+                    ControlActionResponse {
+                        ok: true,
+                        accepted: true,
+                        action: action.to_string(),
+                        status: ActionStatus::Completed,
+                        reason: replayed
+                            .then(|| "replayed previously adopted cancellation".to_string()),
+                        error: None,
+                        result: Some(result.clone()),
+                        event: Some(ControlEvent {
+                            kind: "automations.occurrence.cancellation",
+                            action: action.to_string(),
+                            origin,
+                            intent_id,
+                            payload: result,
+                        }),
+                    },
+                ),
+                Ok(crate::automations::cancel_commands::CancelExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
+            }
+        }
+        crate::automations::cancel_commands::ATTEMPT_CANCEL_ACTION => {
+            match crate::automations::cancel_commands::execute_attempt_cancel(
+                conn,
+                runtime,
+                payload.clone(),
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::automations::cancel_commands::CancelExecution::Success {
+                    payload: result,
+                    replayed,
+                }) => (
+                    200,
+                    ControlActionResponse {
+                        ok: true,
+                        accepted: true,
+                        action: action.to_string(),
+                        status: ActionStatus::Completed,
+                        reason: replayed
+                            .then(|| "replayed previously adopted cancellation".to_string()),
+                        error: None,
+                        result: Some(result.clone()),
+                        event: Some(ControlEvent {
+                            kind: "automations.attempt.cancellation",
+                            action: action.to_string(),
+                            origin,
+                            intent_id,
+                            payload: result,
+                        }),
+                    },
+                ),
+                Ok(crate::automations::cancel_commands::CancelExecution::Rejected(error)) => {
                     typed_rejection(action, error)
                 }
                 Err(error) => typed_rejection(

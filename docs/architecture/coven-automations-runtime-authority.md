@@ -322,6 +322,15 @@ unadvertised until slice 6.
    claims and dispatches a manual occurrence. Its one-run grant for a routine
    that declares authority follows with the adapter.
 
+   `occurrence.cancel.v1` and `attempt.cancel.v1` are implemented. Work not
+   yet dispatched is cancelled at once, and dispatched work is stopped through
+   the run cancellation.
+
+   `attempt.retry.v1` will hold for an operator retry, decided on
+   2026-10-05. A failure with no automatic retry left keeps its run `running`
+   until the run's deadline, so the owner can open the next attempt. When the
+   deadline lapses, the run settles failed.
+
    `occurrence.recover.v1` is implemented. The owner settles a
    `recovery_required` occurrence `failed_deterministic`, or opens its next
    attempt with `retry_with_new_attempt`. Recovering a Runtime Authority run
