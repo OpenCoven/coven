@@ -577,6 +577,67 @@ fn plan_in(
             }
             Ok(Ok(Plan::Settled(payload)))
         }
+        // A run held for an operator retry (`attempt.retry.v1`): its attempt
+        // has settled, so the run and occurrence are released now instead of
+        // at the run's deadline. The settled attempt itself is not cancelled.
+        Some((_, "failed"))
+            if target == Target::Occurrence
+                && matches!(occurrence_state.as_str(), "claimed" | "running") =>
+        {
+            let (run_id, session_id) = run.clone().expect("a latest attempt has its run");
+            if super::cancellation::has_unresolved_stop(conn, &run_id)? {
+                return refuse(
+                    ErrorCode::CancelPending,
+                    "the held run has an unresolved stop; reconcile it before cancellation"
+                        .to_owned(),
+                );
+            }
+            let timeout_at: Option<String> = conn
+                .query_row(
+                    "SELECT timeout_at FROM automation_runs WHERE id = ?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("failed to read held cancellation deadline: {error}"))?;
+            let deadline_open = timeout_at
+                .map(|value| DateTime::parse_from_rfc3339(&value))
+                .transpose()
+                .map_err(|error| format!("invalid held cancellation deadline: {error}"))?
+                .is_some_and(|deadline| deadline > now);
+            if !deadline_open {
+                // Reconciliation settles the run failed without rewriting its
+                // immutable failed attempt. Cancellation cannot win afterward.
+                return refuse(
+                    ErrorCode::IllegalTransition,
+                    "the held run has no remaining retry window; reconcile its failure".to_owned(),
+                );
+            }
+            let finished = record_run_finish(
+                conn,
+                &run_id,
+                RunFinish {
+                    status: "cancelled",
+                    exit_code: None,
+                    session_id,
+                    log_json: None,
+                    output_commit: None,
+                },
+                now,
+            )
+            .map_err(|error| format!("failed to cancel the held run: {error:#}"))?;
+            if !finished
+                || !settle_occurrence(conn, &occurrence_id, "cancelled", Some(&reason), now)?
+            {
+                return Err("the held run changed during cancellation".to_owned());
+            }
+            Ok(Ok(Plan::Settled(json!({
+                "occurrenceId": occurrence_id,
+                "status": "cancelled",
+                "reason": reason,
+                "cancelledAt": iso(now),
+                "runId": run_id,
+            }))))
+        }
         _ => refuse(
             ErrorCode::IllegalTransition,
             format!("the occurrence is `{occurrence_state}`, with nothing left to cancel"),

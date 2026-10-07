@@ -56,6 +56,14 @@ Cave, the SDK, Psyche adapters, runtimes, and future implementations consume the
   jitter bounded to one day. Retry waiting remains inside the original run
   timeout, and exhaustion quarantines the definition until an explicit
   operator release.
+- For an ordinary run, a known failed attempt can hold the run until its
+  original deadline when fewer than ten attempts have been used. The occurrence
+  retains `claimed` for a pre-ownership failure or `running` after a started
+  attempt. `attempt.retry.v1` replans it with a new immutable attempt, after
+  checking the exact prior attempt, deadline, quarantine, and stop ownership.
+  You must release retry quarantine explicitly. Pending cancellation and
+  unresolved stop ownership block retry. Deadline expiry settles the held
+  failure; ambiguity remains a recovery outcome and never opens this hold.
 
 ## Conformance
 

@@ -77,8 +77,8 @@ pub const AUTOMATION_CANCELLATIONS_SCHEMA_SQL: &str = "
         adoption_key TEXT PRIMARY KEY NOT NULL,
         request_digest TEXT NOT NULL,
         automation_id TEXT NOT NULL,
-        run_id TEXT NOT NULL UNIQUE,
-        attempt_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL UNIQUE,
         session_id TEXT NOT NULL,
         scope TEXT NOT NULL CHECK (scope = 'run'),
         requested_by_json TEXT NOT NULL,
@@ -92,6 +92,9 @@ pub const AUTOMATION_CANCELLATIONS_SCHEMA_SQL: &str = "
         reconciled_at TEXT,
         result_json TEXT
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS automation_cancellations_active_run
+        ON automation_cancellations(run_id)
+        WHERE state IN ('requested', 'stopping');
     CREATE TABLE IF NOT EXISTS automation_stop_fences (
         run_id TEXT PRIMARY KEY NOT NULL,
         session_id TEXT NOT NULL,
@@ -105,6 +108,7 @@ pub const AUTOMATION_CANCELLATIONS_SCHEMA_SQL: &str = "
 pub(crate) fn ensure_cancellation_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch("SAVEPOINT automation_cancellation_schema")?;
     let result = ensure_cancellation_schema_inner(conn)
+        .and_then(|()| migrate_run_unique_cancellations(conn))
         .and_then(|()| reconcile_cancellation_adoption_ledger(conn));
     match result {
         Ok(()) => {
@@ -119,6 +123,43 @@ pub(crate) fn ensure_cancellation_schema(conn: &Connection) -> anyhow::Result<()
             Err(error)
         }
     }
+}
+
+fn migrate_run_unique_cancellations(conn: &Connection) -> anyhow::Result<()> {
+    let run_unique: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_index_list('automation_cancellations') i
+             WHERE i.\"unique\" = 1 AND i.partial = 0
+               AND (SELECT COUNT(*) FROM pragma_index_info(i.name)) = 1
+               AND EXISTS(SELECT 1 FROM pragma_index_info(i.name) WHERE name = 'run_id')
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !run_unique {
+        return Ok(());
+    }
+    // Modern rows already carry execution leases and durable results. Unlike
+    // the pre-lease migration, this rebuild must not transform either state or time.
+    conn.execute_batch(
+        "ALTER TABLE automation_cancellations RENAME TO automation_cancellations_run_unique;",
+    )?;
+    conn.execute_batch(AUTOMATION_CANCELLATIONS_SCHEMA_SQL)?;
+    conn.execute_batch(
+        "INSERT INTO automation_cancellations (
+             adoption_key, request_digest, automation_id, run_id, attempt_id,
+             session_id, scope, requested_by_json, reason, state, requested_at,
+             execution_expires_at, acknowledged_at, reconciled_at, result_json
+         ) SELECT adoption_key, request_digest, automation_id, run_id, attempt_id,
+                  session_id, scope, requested_by_json, reason, state, requested_at,
+                  execution_expires_at, acknowledged_at, reconciled_at, result_json
+           FROM automation_cancellations_run_unique;
+         DROP TABLE automation_cancellations_run_unique;",
+    )?;
+    // An index with this name may have followed the renamed table. Ensure it
+    // exists on the replacement after dropping that table and its indexes.
+    conn.execute_batch(AUTOMATION_CANCELLATIONS_SCHEMA_SQL)?;
+    Ok(())
 }
 
 fn ensure_cancellation_schema_inner(conn: &Connection) -> anyhow::Result<()> {
@@ -369,25 +410,28 @@ struct CancellationLifecycle {
     session_state: String,
     settled_at: Option<String>,
     authority_profile: Option<String>,
+    session_exit_code: Option<i64>,
 }
 
 fn lifecycle_requires_recovery(lifecycle: &CancellationLifecycle) -> bool {
     if lifecycle.run_state != "running" || lifecycle.occurrence_state != "recovery_required" {
         return false;
     }
+    // The attempt's immutable ambiguity survives a crash before cancellation
+    // finalization, including when terminal session evidence arrives meanwhile.
+    if lifecycle.attempt_state == "ambiguous" {
+        return true;
+    }
     let terminal_session = matches!(
         lifecycle.session_state.as_str(),
         "completed" | "failed" | "cancelled" | "killed" | "idle"
     );
-    if terminal_session {
-        lifecycle.authority_profile.as_deref() == Some(AUTHORITY_PROFILE)
-            && matches!(
-                lifecycle.attempt_state.as_str(),
-                "dispatching" | "started" | "observing" | "ambiguous"
-            )
-    } else {
-        lifecycle.attempt_state == "ambiguous"
-    }
+    terminal_session
+        && lifecycle.authority_profile.as_deref() == Some(AUTHORITY_PROFILE)
+        && matches!(
+            lifecycle.attempt_state.as_str(),
+            "dispatching" | "started" | "observing"
+        )
 }
 
 fn cancellation_lifecycle(
@@ -396,7 +440,7 @@ fn cancellation_lifecycle(
 ) -> Result<Option<CancellationLifecycle>, String> {
     conn.query_row(
         "SELECT r.status, a.state, o.state, s.status, a.settled_at,
-                r.authority_profile
+                r.authority_profile, s.exit_code
          FROM automation_runs AS r
          JOIN automation_attempts AS a ON a.run_id = r.id
          JOIN automation_occurrences AS o ON o.id = r.occurrence_id
@@ -415,11 +459,46 @@ fn cancellation_lifecycle(
                 session_state: row.get(3)?,
                 settled_at: row.get(4)?,
                 authority_profile: row.get(5)?,
+                session_exit_code: row.get(6)?,
             })
         },
     )
     .optional()
     .map_err(|error| format!("failed to reconcile reserved cancellation: {error}"))
+}
+
+fn recover_known_base_completion(
+    conn: &Connection,
+    reservation: &ReservedCancellation,
+    now: DateTime<Utc>,
+) -> Result<Option<CancellationExecution>, String> {
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to inspect known cancellation completion: {error}"))?;
+    let known_completion =
+        cancellation_lifecycle(&transaction, reservation)?.is_some_and(|lifecycle| {
+            lifecycle.authority_profile.is_none()
+                && lifecycle.run_state == "running"
+                && lifecycle.session_state == "completed"
+                && lifecycle.session_exit_code == Some(0)
+                && matches!(
+                    lifecycle.attempt_state.as_str(),
+                    "dispatching" | "started" | "observing"
+                )
+        });
+    if known_completion {
+        let error =
+            illegal_transition_error("automation completion already won the cancellation race");
+        let finalized = finalize_rejection_in(&transaction, reservation, &error, now)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit known cancellation completion: {error}"))?;
+        if finalized {
+            super::runner::settle_finished_runs(conn, now)?;
+            return Ok(Some(CancellationExecution::Rejected(error)));
+        }
+        return load_adopted_response(conn, &reservation.request.adoption_key, &reservation.digest);
+    }
+    Ok(None)
 }
 
 fn recover_settled_result(
@@ -428,6 +507,9 @@ fn recover_settled_result(
     now: DateTime<Utc>,
     unknown_stop_outcome: bool,
 ) -> Result<Option<CancellationExecution>, String> {
+    if let Some(execution) = recover_known_base_completion(conn, reservation, now)? {
+        return Ok(Some(execution));
+    }
     let Some(mut lifecycle) = cancellation_lifecycle(conn, reservation)? else {
         return Ok(None);
     };
@@ -461,17 +543,19 @@ fn recover_settled_result(
             .optional()
             .map_err(|error| format!("failed to inspect cancellation stop ownership: {error}"))?
             .is_some();
-        if unknown_stop_outcome
-            && cancellation_owns_stop
-            && lifecycle.occurrence_state != "recovery_required"
-        {
-            super::runner::mark_terminal_stop_for_recovery(
+        if unknown_stop_outcome && cancellation_owns_stop {
+            if let Err(error) = super::runner::mark_terminal_stop_for_recovery(
                 conn,
                 &reservation.request.run_id,
                 &reservation.request.runtime_correlation.session_id,
                 "cancellation stop outcome was not durably recorded",
                 now,
-            )?;
+            ) {
+                if let Some(execution) = recover_known_base_completion(conn, reservation, now)? {
+                    return Ok(Some(execution));
+                }
+                return Err(error);
+            }
             let payload = cancellation_payload(reservation, "recovery_required", None, None);
             finalize_success(conn, reservation, "recovery_required", &payload, now)?;
             return Ok(Some(CancellationExecution::Success(CancellationSuccess {
@@ -499,7 +583,8 @@ fn recover_settled_result(
         occurrence_state,
         session_state,
         settled_at,
-        authority_profile: _,
+        authority_profile,
+        session_exit_code: _,
     } = lifecycle;
     let terminal_session = matches!(
         session_state.as_str(),
@@ -523,7 +608,21 @@ fn recover_settled_result(
             replayed: true,
         })));
     }
-    if matches!(
+    let held_failure = run_state == "running"
+        && attempt_state == "failed"
+        && matches!(occurrence_state.as_str(), "claimed" | "running")
+        && authority_profile.is_none()
+        && terminal_session
+        && !conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automation_stop_fences WHERE run_id = ?1)",
+                [&reservation.request.run_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| {
+                format!("failed to inspect held cancellation stop ownership: {error}")
+            })?;
+    let terminal_completion = matches!(
         run_state.as_str(),
         "succeeded" | "failed" | "timed_out" | "ambiguous"
     ) && matches!(
@@ -532,8 +631,8 @@ fn recover_settled_result(
     ) && matches!(
         occurrence_state.as_str(),
         "succeeded" | "failed" | "timed_out" | "recovery_required"
-    ) && terminal_session
-    {
+    ) && terminal_session;
+    if held_failure || terminal_completion {
         let error = typed_error(
             ErrorCode::IllegalTransition,
             "automation completion already won the cancellation race",
@@ -560,13 +659,32 @@ pub enum CancellationExecution {
     Rejected(ErrorEnvelope),
 }
 
+/// Call under the command's write transaction before releasing held work.
+/// An expired stop lease is still an unknown outcome, not permission to retry.
+pub(crate) fn has_unresolved_stop(conn: &Connection, run_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM automation_cancellations
+             WHERE run_id = ?1 AND state IN ('requested', 'stopping')
+         ) OR EXISTS(
+             SELECT 1 FROM automation_stop_fences WHERE run_id = ?1
+         )",
+        [run_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("failed to inspect unresolved automation stop: {error}"))
+}
+
 pub fn cancellation_for_run(conn: &Connection, run_id: &str) -> Result<Option<Value>, String> {
     let row = conn
         .query_row(
             "SELECT scope, requested_by_json, reason, state, requested_at,
                     acknowledged_at, reconciled_at
              FROM automation_cancellations
-             WHERE run_id = ?1",
+             WHERE run_id = ?1 AND attempt_id = (
+                 SELECT id FROM automation_attempts WHERE run_id = ?1
+                 ORDER BY attempt_number DESC LIMIT 1
+             )",
             [run_id],
             |row| {
                 Ok((
@@ -962,13 +1080,20 @@ fn execute_reserved_cancellation(
             }
         }
         Err(_) => {
+            // Conclusive base completion wins a failed stop acknowledgement;
+            // a failed session still needs ambiguity, never an operator hold.
+            if let Some(execution) = recover_settled_result(conn, &reservation, now, true)? {
+                return Ok(execution);
+            }
             if let Err(mark_error) = super::runner::mark_unconfirmed_stop_for_recovery(
                 conn,
                 &reservation.request.run_id,
                 "cancellation stop was not confirmed",
                 now,
             ) {
-                if let Some(execution) = recover_settled_result(conn, &reservation, now, false)? {
+                // A failed acknowledgement is an unknown stop outcome even
+                // when the session became terminal while the stop was issued.
+                if let Some(execution) = recover_settled_result(conn, &reservation, now, true)? {
                     return Ok(execution);
                 }
                 return Err(mark_error);
@@ -1388,7 +1513,7 @@ fn reserve_cancellation(
         .query_row(
             "SELECT adoption_key
              FROM automation_cancellations
-             WHERE run_id = ?1",
+             WHERE run_id = ?1 AND state IN ('requested', 'stopping')",
             [&request.run_id],
             |row| row.get::<_, String>(0),
         )
@@ -1639,10 +1764,22 @@ fn finalize_rejection(
     error: &ErrorEnvelope,
     now: DateTime<Utc>,
 ) -> Result<bool, String> {
-    let transaction = conn
-        .unchecked_transaction()
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin cancellation rejection: {error}"))?;
-    let changed = transaction
+    let changed = finalize_rejection_in(&transaction, reservation, error, now)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit cancellation rejection: {error}"))?;
+    Ok(changed)
+}
+
+fn finalize_rejection_in(
+    conn: &Connection,
+    reservation: &ReservedCancellation,
+    error: &ErrorEnvelope,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let changed = conn
         .execute(
             "UPDATE automation_cancellations
              SET state = 'rejected',
@@ -1661,44 +1798,36 @@ fn finalize_rejection(
         )
         .map_err(|error| format!("failed to finalize cancellation rejection: {error}"))?;
     if changed != 1 {
-        transaction
-            .rollback()
-            .map_err(|error| format!("failed to close stale cancellation rejection: {error}"))?;
         return Ok(false);
     }
-    transaction
-        .execute(
-            "DELETE FROM automation_command_reservations
+    conn.execute(
+        "DELETE FROM automation_command_reservations
              WHERE adoption_key = ?1
                AND command = 'run.cancel.v1'
                AND request_digest = ?2",
-            params![reservation.request.adoption_key, reservation.digest],
-        )
-        .map_err(|error| format!("failed to release rejected cancellation reservation: {error}"))?;
-    transaction
-        .execute(
-            "DELETE FROM automation_stop_fences
+        params![reservation.request.adoption_key, reservation.digest],
+    )
+    .map_err(|error| format!("failed to release rejected cancellation reservation: {error}"))?;
+    conn.execute(
+        "DELETE FROM automation_stop_fences
              WHERE run_id = ?1
                AND session_id = ?2
                AND owner = 'cancellation'
                AND operation_key = ?3",
-            params![
-                reservation.request.run_id,
-                reservation.request.runtime_correlation.session_id,
-                reservation.request.adoption_key
-            ],
-        )
-        .map_err(|error| format!("failed to release rejected cancellation stop fence: {error}"))?;
+        params![
+            reservation.request.run_id,
+            reservation.request.runtime_correlation.session_id,
+            reservation.request.adoption_key
+        ],
+    )
+    .map_err(|error| format!("failed to release rejected cancellation stop fence: {error}"))?;
     insert_adoption(
-        &transaction,
+        conn,
         reservation,
         "rejected",
         &json!({"outcome": "rejected", "error": error}),
         now,
     )?;
-    transaction
-        .commit()
-        .map_err(|error| format!("failed to commit cancellation rejection: {error}"))?;
     Ok(true)
 }
 
@@ -1898,6 +2027,101 @@ mod tests {
             result_json TEXT
         );
     ";
+
+    #[test]
+    fn modern_migration_preserves_history_and_allows_next_attempt() -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            super::super::command_adoption::AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL,
+        )?;
+        // The shipped format has execution leases but still allows only one
+        // cancellation per run. Do not derive this fixture from the new schema.
+        let modern = LEGACY_SCHEMA
+            .replace(
+                "'requested', 'cancelled'",
+                "'requested', 'stopping', 'cancelled'",
+            )
+            .replace(
+                "requested_at TEXT NOT NULL,",
+                "requested_at TEXT NOT NULL, execution_expires_at TEXT NOT NULL,",
+            );
+        conn.execute_batch(&modern)?;
+        for state in [
+            "requested",
+            "stopping",
+            "cancelled",
+            "recovery_required",
+            "rejected",
+        ] {
+            let terminal = !matches!(state, "requested" | "stopping");
+            let result = if state == "rejected" {
+                json!({"error": typed_error(ErrorCode::IllegalTransition, "completion won")})
+            } else {
+                json!({"status": state, "preserved": true})
+            };
+            conn.execute(
+                "INSERT INTO automation_cancellations VALUES
+                 (?1, ?2, 'automation', ?3, ?4, ?5, 'run',
+                  '{\"principalId\":\"owner\"}', 'keep reason', ?6,
+                  '2026-01-01T00:00:00.000Z', '2026-01-01T00:05:00.000Z', ?7, ?8, ?9)",
+                params![
+                    format!("adopt:{state}"),
+                    format!("digest-{state}"),
+                    format!("run-{state}"),
+                    format!("attempt-{state}-1"),
+                    format!("session-{state}"),
+                    state,
+                    terminal.then_some("2026-01-01T00:00:01.000Z"),
+                    terminal.then_some("2026-01-01T00:00:02.000Z"),
+                    terminal.then(|| result.to_string())
+                ],
+            )?;
+        }
+        let snapshot = || -> rusqlite::Result<Vec<Vec<rusqlite::types::Value>>> {
+            conn.prepare("SELECT * FROM automation_cancellations ORDER BY adoption_key")?
+                .query_map([], |row| (0..15).map(|index| row.get(index)).collect())?
+                .collect()
+        };
+        let before = snapshot()?;
+        ensure_cancellation_schema(&conn)?;
+        ensure_cancellation_schema(&conn)?;
+        assert_eq!(
+            snapshot()?,
+            before,
+            "modern rows must be copied without legacy transformations"
+        );
+        let (reservations, adoptions): (i64, i64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM automation_command_reservations),
+                    (SELECT COUNT(*) FROM automation_command_adoptions)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((reservations, adoptions), (2, 3));
+        let insert_next = |key: &str, run: &str, attempt: &str| {
+            conn.execute(
+                "INSERT INTO automation_cancellations
+             (adoption_key, request_digest, automation_id, run_id, attempt_id, session_id,
+              scope, requested_by_json, state, requested_at, execution_expires_at)
+             VALUES (?1, 'new-digest', 'automation', ?2, ?3, 'new-session', 'run',
+                     '{\"principalId\":\"owner\"}', 'requested',
+                     '2026-01-01T00:01:00.000Z', '2026-01-01T00:06:00.000Z')",
+                params![key, run, attempt],
+            )
+        };
+        assert!(
+            insert_next("adopt:duplicate", "run-rejected", "attempt-rejected-1").is_err(),
+            "a historical attempt cancellation must remain unique"
+        );
+        insert_next("adopt:next", "run-rejected", "attempt-rejected-2")?;
+        assert!(
+            insert_next("adopt:overlap", "run-rejected", "attempt-rejected-3").is_err(),
+            "one active cancellation must own a run"
+        );
+        // Ledger reconstruction must also work after one run has multiple records.
+        ensure_cancellation_schema(&conn)?;
+        assert_eq!(snapshot()?.len(), 6);
+        Ok(())
+    }
 
     #[test]
     fn migration_conservatively_fences_legacy_in_flight_cancellations() -> anyhow::Result<()> {

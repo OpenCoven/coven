@@ -6,6 +6,7 @@
 //! claim/lease, and run delivery land in follow-up modules on the same
 //! seams.
 
+pub mod attempt_retry;
 pub mod authority_projection;
 pub mod cancel_commands;
 pub mod cancellation;

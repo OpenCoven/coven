@@ -137,6 +137,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.occurrence.runNow.v1",
                     "coven.automations.occurrence.cancel.v1",
                     "coven.automations.attempt.cancel.v1",
+                    "coven.automations.attempt.retry.v1",
                     "coven.automations.events.read.v1",
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
@@ -759,6 +760,46 @@ pub(crate) fn route_action_at(
                     },
                 ),
                 Ok(crate::automations::cancel_commands::CancelExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
+            }
+        }
+        crate::automations::attempt_retry::RETRY_ACTION => {
+            match crate::automations::attempt_retry::execute_attempt_retry(
+                conn,
+                payload.clone(),
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::automations::attempt_retry::RetryExecution::Success {
+                    payload: result,
+                    replayed,
+                }) => (
+                    200,
+                    ControlActionResponse {
+                        ok: true,
+                        accepted: true,
+                        action: action.to_string(),
+                        status: ActionStatus::Completed,
+                        reason: replayed.then(|| "replayed previously adopted retry".to_string()),
+                        error: None,
+                        result: Some(result.clone()),
+                        event: Some(ControlEvent {
+                            kind: "automations.attempt.retry",
+                            action: action.to_string(),
+                            origin,
+                            intent_id,
+                            payload: result,
+                        }),
+                    },
+                ),
+                Ok(crate::automations::attempt_retry::RetryExecution::Rejected(error)) => {
                     typed_rejection(action, error)
                 }
                 Err(error) => typed_rejection(
@@ -2036,7 +2077,10 @@ fn automation_run_payload(
     match crate::automations::runner::load_definition_for_run(conn, id) {
         Ok(Some(definition)) => {
             match crate::automations::runner::run_routine_now(conn, runtime, &definition, now) {
-                Ok(outcome) if matches!(outcome.status.as_str(), "running" | "retry_scheduled") => {
+                Ok(outcome)
+                    if outcome.status == "retry_scheduled"
+                        || (outcome.status == "running" && outcome.session_id.is_some()) =>
+                {
                     Ok(json!({
                     "runId": outcome.run_id,
                     "status": outcome.status,
@@ -3150,11 +3194,12 @@ mod tests {
         );
         let before = store_snapshot(&conn);
 
+        // Every v1 command is implemented now. The loop still holds any command
+        // a later contract revision leaves unimplemented to writing nothing.
         let refused = COMMAND_MATRIX
             .iter()
             .filter(|entry| entry.support != CommandSupport::Implemented)
             .collect::<Vec<_>>();
-        assert!(!refused.is_empty());
         for entry in refused {
             // Every field any of these commands could plausibly act on, so a
             // partial adapter would have something to write.
