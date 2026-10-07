@@ -338,9 +338,9 @@ This producer does not implement the whole catalog. `automations/command_matrix.
 | `definition.disable.v1` | implemented | `coven.automations.definition.disable.v1` |
 | `definition.tombstone.v1` | implemented | `coven.automations.definition.tombstone.v1` |
 | `occurrence.runNow.v1` | implemented | `coven.automations.occurrence.runNow.v1` |
-| `occurrence.cancel.v1` | unsupported | none |
+| `occurrence.cancel.v1` | implemented | `coven.automations.occurrence.cancel.v1` |
 | `run.cancel.v1` | implemented | `coven.automations.run.cancel.v1` |
-| `attempt.cancel.v1` | unsupported | none |
+| `attempt.cancel.v1` | implemented | `coven.automations.attempt.cancel.v1` |
 | `attempt.retry.v1` | unsupported | none |
 | `occurrence.recover.v1` | implemented | `coven.automations.occurrence.recover.v1` |
 | `definition.list.v1` | implemented | `coven.automations.definition.list.v1` |

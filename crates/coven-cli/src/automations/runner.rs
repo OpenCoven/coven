@@ -2684,7 +2684,7 @@ fn settle_waiting_retry_timeout(
         .map_err(|error| format!("failed to commit retry timeout settlement: {error}"))
 }
 
-fn settle_waiting_retry_timeout_in(
+pub(super) fn settle_waiting_retry_timeout_in(
     conn: &Connection,
     run_id: &str,
     occurrence_id: &str,
