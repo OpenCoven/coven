@@ -262,10 +262,6 @@ pub(crate) struct AutomationAuthorityRequest {
     pub runtime_id: String,
 }
 
-// The dispatch path constructs this request, but every
-// `AutomationDispatchAuthority` that reads its fields is still a test double:
-// the trusted-state adapter that consumes them in production has not landed.
-#[allow(dead_code)]
 pub(crate) struct AutomationTerminalAuthorityRequest<'a> {
     pub execution_binding: &'a AutomationExecutionBinding,
     pub receipt: &'a AutomationReceipt,
@@ -286,8 +282,6 @@ pub(crate) trait AutomationDispatchAuthority: AuthorityEvidenceVerifier {
 #[derive(Clone, Copy)]
 pub(crate) enum AutomationAuthorityMode<'a> {
     BaseV1,
-    // Production construction remains blocked until the trusted-state adapter lands.
-    #[allow(dead_code)]
     RuntimeAuthority(&'a dyn AutomationDispatchAuthority),
 }
 
@@ -1212,6 +1206,15 @@ fn dispatch_occurrence(
     cwd: &str,
     now: DateTime<Utc>,
 ) -> Result<RunOutcome, String> {
+    // A manual run carries no owner grant of its own until
+    // `occurrence.runNow.v1` (coven#857 slice 7), so a routine that declares
+    // authority runs only on its schedule.
+    if definition.authority.is_some() {
+        return Err(format!(
+            "routine `{}` declares Runtime Authority, so it runs only on its schedule",
+            definition.id
+        ));
+    }
     let mut clock = Utc::now;
     let cancelled = || false;
     let mut control = DispatchControl {
@@ -2435,10 +2438,38 @@ fn dispatch_claimed_occurrences_inner(
             ));
             continue;
         }
+        // A routine that declares authority dispatches only under Runtime
+        // Authority, through the trusted adapter, and never as an ordinary run.
+        let authority_home = if definition.authority.is_some() {
+            match prepare_runtime_authority(conn, dispatch_now) {
+                Ok(home) => Some(home),
+                Err(reason) => {
+                    let reason = format!("{automation_id}: {reason}");
+                    settle_dispatch_occurrence(
+                        conn,
+                        &occurrence_id,
+                        Some(&reason),
+                        dispatch_now,
+                        scheduler_fence,
+                    )?;
+                    report.failed.push(reason);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let trusted = authority_home
+            .as_deref()
+            .map(|home| super::trusted_authority::TrustedAuthority::new(conn, home, dispatch_now));
         let mut control = DispatchControl {
             clock: &mut clock,
             cancelled: &cancelled,
-            authority: AutomationAuthorityMode::BaseV1,
+            authority: trusted
+                .as_ref()
+                .map_or(AutomationAuthorityMode::BaseV1, |trusted| {
+                    AutomationAuthorityMode::RuntimeAuthority(trusted)
+                }),
             scheduler_fence,
         };
         match dispatch_occurrence_with_clock(
@@ -3712,12 +3743,43 @@ pub fn settle_finished_runs(
     conn: &Connection,
     now: DateTime<Utc>,
 ) -> Result<SettlementReport, String> {
-    settle_finished_runs_with(conn, now, None)
+    // Runtime Authority runs settle from terminal evidence the terminal
+    // observer signed, through the trusted adapter.
+    let Some(home) = super::authority_keys::store_home(conn) else {
+        return settle_finished_runs_with(conn, now, None);
+    };
+    let observer_keys = super::authority_keys::trusted_keys(
+        conn,
+        super::authority_keys::AuthorityKeyRole::TerminalObserver,
+    )
+    .map_err(|error| format!("failed to read the terminal-observer keys: {error:#}"))?;
+    let trusted = super::trusted_authority::TrustedAuthority::new(conn, &home, now);
+    let evidence = super::ed25519_trust::Ed25519TerminalEvidenceVerifier(&observer_keys);
+    settle_finished_runs_with(
+        conn,
+        now,
+        Some(RuntimeAuthoritySettlement {
+            authority: &trusted,
+            evidence: &evidence,
+        }),
+    )
+}
+
+/// Prepares Runtime Authority for a dispatch at `now`: the daemon's
+/// `COVEN_HOME`, and every role key, created before the launch transaction
+/// opens because the trusted adapter only loads keys.
+fn prepare_runtime_authority(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<std::path::PathBuf, String> {
+    let home = super::authority_keys::store_home(conn)
+        .ok_or_else(|| "Runtime Authority needs the daemon's COVEN_HOME".to_string())?;
+    super::authority_keys::ensure_role_keys(conn, &home, now)
+        .map_err(|error| format!("failed to prepare the Runtime Authority keys: {error:#}"))?;
+    Ok(home)
 }
 
 /// What terminal settlement needs to consume Runtime Authority evidence.
-/// Production supplies none, so every terminal Runtime Authority session is
-/// held for recovery until a trusted adapter exists (coven#857).
 #[derive(Clone, Copy)]
 pub(crate) struct RuntimeAuthoritySettlement<'a> {
     pub authority: &'a dyn AutomationDispatchAuthority,
@@ -11975,5 +12037,194 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.status, "failed");
         assert!(outcome.error.as_deref().unwrap().contains("no cwd"));
+    }
+
+    /// Records the authority projection a launch carried.
+    struct ProjectionRecordingRuntime {
+        projected: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl SessionRuntime for ProjectionRecordingRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch must use strict containment")
+        }
+
+        fn accepts_automation_authority_projection(&self) -> bool {
+            true
+        }
+
+        fn launch_authorized_contained_adopted_session(
+            &self,
+            launch: &SessionLaunch,
+            authority: Option<&AutomationAuthorityConsumerProjection>,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let authority =
+                authority.ok_or_else(|| anyhow::anyhow!("launched without a projection"))?;
+            self.projected.lock().unwrap().push((
+                launch.harness.clone(),
+                authority
+                    .runtime
+                    .descriptor_digest
+                    .value
+                    .as_str()
+                    .to_owned(),
+            ));
+            ownership_established()
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_routine_that_declares_authority_dispatches_only_under_runtime_authority() {
+        use crate::automations::owner_grants::CommandAuthority;
+        let home = crate::familiar_ledger::tests::Home::new();
+        home.register("adopt:ledger:register");
+        let routine = json!({
+            "schemaVersion": 1, "id": "notes", "name": "Notes", "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
+            "overlap": "forbid", "timeoutMinutes": 30, "runtime": "claude",
+            "familiarId": "sage", "cwd": home.path().display().to_string(),
+            "prompt": "Summarise the notes.",
+            "authority": {
+                "actionType": "analysis.read", "riskClass": "R0",
+                "capabilities": ["analysis.read"],
+                "scopes": [{ "kind": "filesystem", "root": "workspace", "path": "notes/today.md",
+                             "access": "read", "recursive": false }],
+                "proposalSafe": true
+            }
+        });
+        let (status, response) = crate::control_plane::route_action_with_authority(
+            json!({ "action": "coven.automations.definition.create.v1",
+                    "adoptionKey": "adopt:notes:create", "definition": routine }),
+            &home.conn,
+            &crate::api::NoopSessionRuntime,
+            CommandAuthority::OwnerLocal,
+        );
+        assert!(status == 200 && response.accepted, "{response:?}");
+        let now =
+            chrono::DurationRound::duration_trunc(Utc::now(), chrono::TimeDelta::milliseconds(1))
+                .unwrap();
+        assert!(crate::automations::occurrences::insert_claimed_occurrence(
+            &home.conn,
+            "occurrence.notes-1",
+            "notes",
+            "daemon",
+            60,
+            now,
+        )
+        .unwrap());
+
+        let runtime = ProjectionRecordingRuntime {
+            projected: std::sync::Mutex::new(Vec::new()),
+        };
+        let report =
+            dispatch_claimed_occurrences_with_clock(&home.conn, &runtime, now, || now).unwrap();
+        assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
+        assert_eq!(
+            runtime.projected.lock().unwrap().as_slice(),
+            [(
+                "claude".to_owned(),
+                crate::automations::runtime_envelope::CLAUDE_R0_READ.descriptor_digest()
+            )]
+        );
+
+        // The session ends cleanly: its stream accounts for everything, and the
+        // writer that ends it records the terminal observer's evidence.
+        let session_id: String = home
+            .conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE id = ?1",
+                [&report.dispatched[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ended = now + chrono::TimeDelta::seconds(30);
+        let event = |kind: &str, payload: serde_json::Value| crate::store::EventRecord {
+            seq: 0,
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.clone(),
+            kind: kind.to_owned(),
+            payload_json: payload.to_string(),
+            created_at: ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        let stream = crate::automations::stream_observation::test_support::stream(
+            &crate::automations::stream_observation::test_support::read_run(),
+        );
+        let transaction = home.conn.unchecked_transaction().unwrap();
+        crate::store::insert_event(&transaction, &event("output", json!({ "data": stream })))
+            .unwrap();
+        assert!(crate::store::update_session_terminal_if_active(
+            &transaction,
+            &session_id,
+            "completed",
+            Some(0),
+            &ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+        crate::store::insert_event(
+            &transaction,
+            &event("exit", json!({ "status": "completed", "exitCode": 0 })),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::automations::terminal_observer::record(
+                &transaction,
+                &session_id,
+                TerminalOutcome::Succeeded,
+                ended,
+            ),
+            crate::automations::terminal_observer::Recorded::Stored
+        );
+        transaction.commit().unwrap();
+
+        // Settlement consumes the evidence and settles the run through the
+        // adapter, with the launched receipt and its authority evidence.
+        let settled = settle_finished_runs(&home.conn, ended).unwrap();
+        assert_eq!(settled.succeeded, 1, "{settled:?}");
+        let status: String = home
+            .conn
+            .query_row(
+                "SELECT status FROM automation_runs WHERE id = ?1",
+                [&report.dispatched[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "succeeded");
+
+        // A manual run carries no owner grant of its own yet.
+        let definition: RoutineDefinition = serde_json::from_str(
+            &home
+                .conn
+                .query_row(
+                    "SELECT definition_json FROM automation_definitions WHERE id = 'notes'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let error = dispatch_occurrence(
+            &home.conn,
+            &runtime,
+            &definition,
+            "occurrence.manual",
+            home.path().to_str().unwrap(),
+            now,
+        )
+        .unwrap_err();
+        assert!(error.contains("runs only on its schedule"), "{error}");
     }
 }

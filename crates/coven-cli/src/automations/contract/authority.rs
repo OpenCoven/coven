@@ -21,8 +21,9 @@ pub const AUTHORITY_EXTENSION_KEY: &str = AUTHORITY_PROFILE;
 pub const BASE_PROFILE: &str = "coven.automations.v1";
 pub const RUNTIME_AUTHORITY_CAPABILITY: &str = "automations.runtime-authority.v1";
 
-const BINDING_DOMAIN: &[u8] = b"opencoven:coven-automations-authority-binding:v1";
-const RECEIPT_DOMAIN: &[u8] = b"opencoven:coven-automations-authority-receipt-evidence:v1";
+pub(crate) const BINDING_DOMAIN: &[u8] = b"opencoven:coven-automations-authority-binding:v1";
+pub(crate) const RECEIPT_DOMAIN: &[u8] =
+    b"opencoven:coven-automations-authority-receipt-evidence:v1";
 const AUTHORITY_EXTENSION_FIELDS: [&str; 4] =
     ["profile", "kind", "executionBinding", "receiptEvidence"];
 const EXECUTION_BINDING_FIELDS: [&str; 19] = [
