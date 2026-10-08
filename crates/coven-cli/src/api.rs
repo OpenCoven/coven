@@ -590,6 +590,15 @@ pub trait SessionRuntime {
         drop(writer);
         self.launch_session(launch)
     }
+    /// Launch with harness startup confirmation for durable main-session binding.
+    fn launch_main_session(
+        &self,
+        _launch: &SessionLaunch,
+        _writer: Option<crate::maintenance_gate::WriterLease>,
+    ) -> Result<crate::main_session_start::StartupOutcome> {
+        anyhow::bail!("runtime does not support main-session startup observation")
+    }
+
     /// Launch a durably adopted session and publish runtime ownership at the
     /// implementation's exact establishment boundary.
     ///
@@ -654,6 +663,14 @@ pub trait SessionRuntime {
         }
         self.launch_contained_adopted_session(launch, writer, ownership_established)
     }
+    /// Whether the registered process accepts another conversation turn.
+    /// `None` means no live process; `Some(false)` is a live one-shot or PTY.
+    /// Runtimes must opt in rather than infer this from the harness name.
+    fn live_session_accepts_turn(&self, _session_id: &str) -> Result<Option<bool>> {
+        // Unknown implementations cannot prove either safe input or absence.
+        Ok(Some(false))
+    }
+
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 
@@ -1347,6 +1364,16 @@ fn handle_request_with_runtime_authority_and_automation_time(
         }
         ("GET", "/sessions") => list_sessions_response(coven_home, query),
         ("POST", "/sessions") => launch_session(coven_home, body, runtime, authority),
+        ("GET", "/main-session") => crate::main_session_routes::get_main_session(coven_home, query),
+        ("POST", "/main-session/turn") => {
+            crate::main_session_routes::turn(coven_home, body, runtime, authority)
+        }
+        ("POST", "/main-session/reset") => {
+            crate::main_session_routes::reset(coven_home, body, runtime)
+        }
+        ("POST", "/main-session/rollover") => {
+            crate::main_session_routes::rollover(coven_home, body)
+        }
         ("POST", "/adopted-sessions") => {
             launch_adopted_session(coven_home, body, runtime, authority)
         }
@@ -2393,11 +2420,31 @@ fn queue_pressure_label(queue_pressure: i64) -> &'static str {
     }
 }
 
-fn launch_session(
+pub(crate) fn launch_session(
     coven_home: &Path,
     body: Option<&str>,
     runtime: &dyn SessionRuntime,
     authority: RequestAuthority,
+) -> Result<ApiResponse> {
+    launch_session_with_executor(
+        coven_home,
+        body,
+        authority,
+        &mut |launch, writer| match writer {
+            Some(writer) => runtime.launch_session_with_writer(launch, writer),
+            None => runtime.launch_session(launch),
+        },
+    )
+}
+
+pub(crate) fn launch_session_with_executor(
+    coven_home: &Path,
+    body: Option<&str>,
+    authority: RequestAuthority,
+    execute: &mut dyn FnMut(
+        &SessionLaunch,
+        Option<crate::maintenance_gate::WriterLease>,
+    ) -> Result<()>,
 ) -> Result<ApiResponse> {
     // Client-side validation errors (malformed JSON, bad fields,
     // unsupported launchMode, malformed `conversation` object, …) must
@@ -2682,10 +2729,7 @@ fn launch_session(
             store::insert_session(&conn, &record)?;
         }
     }
-    if let Err(error) = match writer {
-        Some(writer) => runtime.launch_session_with_writer(&launch, writer),
-        None => runtime.launch_session(&launch),
-    } {
+    if let Err(error) = execute(&launch, writer) {
         // Don't propagate to the accept loop — that crashes the daemon.
         // Runtime launch failures are user-facing (missing harness CLI,
         // missing auth, child closed stdin during stream-mode init):
@@ -2694,14 +2738,19 @@ fn launch_session(
         // Cancellation can win while a large launch-time stdin prompt is
         // still being delivered. Preserve that terminal decision: only a row
         // that is still owned by the failing launch may transition to failed.
-        let _ = store::update_session_status_if_current(
-            &conn,
-            &record.id,
-            "running",
-            "failed",
-            None,
-            &current_timestamp(),
-        )?;
+        let ownership_retained = error
+            .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
+            .is_some();
+        if !ownership_retained {
+            let _ = store::update_session_status_if_current(
+                &conn,
+                &record.id,
+                "running",
+                "failed",
+                None,
+                &current_timestamp(),
+            )?;
+        }
         return api_error(
             500,
             "launch_failed",
@@ -4447,7 +4496,7 @@ fn record_adopted_input(
     }
 }
 
-fn record_input(
+pub(crate) fn record_input(
     coven_home: &Path,
     session_id: &str,
     body: Option<&str>,
@@ -23867,6 +23916,9 @@ pub(crate) mod tests {
             "/sessions/s/kill",
             "/sessions/s/handoffs",
             "/sessions/s/complete",
+            "/main-session/turn",
+            "/main-session/reset",
+            "/main-session/rollover",
         ] {
             let response = handle_request_with_runtime(
                 "POST",

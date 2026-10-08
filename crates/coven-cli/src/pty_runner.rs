@@ -4247,7 +4247,7 @@ impl PipedSession {
         self.activate_with_prompt_timeout(PIPED_PROMPT_DELIVERY_TIMEOUT, register)
     }
 
-    fn activate_with_prompt_timeout<R>(
+    pub(crate) fn activate_with_prompt_timeout<R>(
         self,
         prompt_timeout: Duration,
         register: impl FnOnce(Box<dyn Write + Send>, SharedStrictChildProcessTree) -> Result<R>,
@@ -4461,6 +4461,14 @@ fn wait_at_piped_prepublication_test_barrier() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipedOutputSource {
+    Stdout,
+    Stderr,
+}
+
+pub(crate) type PipedStatusObserver = Box<dyn FnMut(PipedOutputSource, &[u8]) + Send + 'static>;
+
 /// Spawn `command` as a plain piped child process (no PTY) and stream its
 /// stdout to `observer`. Used by stream-mode harness launches where the
 /// child reads newline-delimited JSON from stdin and writes
@@ -4471,10 +4479,22 @@ fn wait_at_piped_prepublication_test_barrier() -> Result<()> {
 /// forwarded to `observer.on_output` wrapped in a stream-json
 /// `{"type":"system","subtype":"stderr","text":"…"}` envelope so chat
 /// surfaces auth/setup errors instead of swallowing them.
+#[cfg(test)]
 pub fn spawn_piped_with_observer(
     command: &HarnessCommand,
     observer: Option<DetachedPtyObserver>,
     wrap_stderr_as_stream_json: bool,
+) -> Result<PipedSession> {
+    spawn_piped_with_status_observer(command, observer, wrap_stderr_as_stream_json, None)
+}
+
+/// Observes source-tagged output before display wrapping or source merging.
+/// Startup decisions must not confuse assistant stdout with harness stderr.
+pub(crate) fn spawn_piped_with_status_observer(
+    command: &HarnessCommand,
+    observer: Option<DetachedPtyObserver>,
+    wrap_stderr_as_stream_json: bool,
+    status_observer: Option<PipedStatusObserver>,
 ) -> Result<PipedSession> {
     use std::process::Command as StdCommand;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -4594,6 +4614,8 @@ pub fn spawn_piped_with_observer(
     // (rare but seen in some sandboxed environments) doesn't truncate
     // the stream at the first decode error — which `BufRead::lines()`
     // would do.
+    let status_observer = Arc::new(StdMutex::new(status_observer));
+    let stderr_status = Arc::clone(&status_observer);
     let stderr_callback = Arc::clone(&on_output_shared);
     let stderr_thread = thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
@@ -4603,6 +4625,11 @@ pub fn spawn_piped_with_observer(
             match reader.read_until(b'\n', &mut buf) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
+                    if let Ok(mut status) = stderr_status.lock() {
+                        if let Some(callback) = status.as_mut() {
+                            callback(PipedOutputSource::Stderr, &buf);
+                        }
+                    }
                     // Strip the trailing newline (if any) for cleaner
                     // display; the JSON envelope adds its own.
                     let trimmed = match buf.last() {
@@ -4665,6 +4692,11 @@ pub fn spawn_piped_with_observer(
     let stdout_thread = thread::spawn(move || {
         let mut reader = stdout;
         let mut bridge: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+            if let Ok(mut status) = status_observer.lock() {
+                if let Some(callback) = status.as_mut() {
+                    callback(PipedOutputSource::Stdout, &chunk);
+                }
+            }
             if let Ok(mut cb) = stdout_callback.lock() {
                 cb(chunk);
             }
@@ -9336,6 +9368,55 @@ exit 0
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
             "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\n--\nhello prompt\n"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn piped_status_observer_preserves_output_source_before_wrapping() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let command = HarnessCommand::fixture(
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                "printf 'assistant output\\n'; printf 'harness status\\n' >&2".to_string(),
+            ],
+            temp.path().to_path_buf(),
+        );
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&records);
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let session = spawn_piped_with_status_observer(
+            &command,
+            Some(observer),
+            true,
+            Some(Box::new(move |source, bytes| {
+                observed.lock().unwrap().push((source, bytes.to_vec()));
+            })),
+        )?;
+        let process = session.activate(|_input, process| Ok(process))?;
+        // A hang guard only; output identity is asserted after both drains join.
+        let result = exit_rx.recv_timeout(Duration::from_secs(60))?;
+        assert_eq!(result.exit_code, Some(0));
+        let records = records.lock().unwrap();
+        for (source, expected) in [
+            (PipedOutputSource::Stdout, b"assistant output\n".as_slice()),
+            (PipedOutputSource::Stderr, b"harness status\n".as_slice()),
+        ] {
+            let bytes: Vec<u8> = records
+                .iter()
+                .filter(|(kind, _)| *kind == source)
+                .flat_map(|(_, bytes)| bytes.iter().copied())
+                .collect();
+            assert_eq!(bytes, expected);
+        }
+        drop(process);
         Ok(())
     }
 
