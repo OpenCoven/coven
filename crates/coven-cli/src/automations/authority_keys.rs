@@ -2,13 +2,14 @@
 //!
 //! The maintainer decisions in
 //! `docs/architecture/coven-automations-runtime-authority.md` make the local
-//! daemon the trust root. It signs four kinds of artifact, each with its own
+//! daemon the trust root. It signs five kinds of artifact, each with its own
 //! key, so one can be rotated or revoked without touching the others:
 //!
 //! - the execution binding at dispatch, and the receipt-correlated authority
 //!   evidence at settlement (`dispatch-authority`);
 //! - familiar embodiment bindings (`familiar-binding`);
 //! - Threads automation-authority decisions (`threads-decision`);
+//! - authorization requests on the owner principal's behalf (`owner-principal`);
 //! - runtime terminal observations (`terminal-observer`).
 //!
 //! Each key's public half, `keyId`, `proofRef`, producer and validity window
@@ -57,7 +58,8 @@ pub(crate) const AUTOMATION_AUTHORITY_KEYS_SCHEMA_SQL: &str = "
         key_id TEXT PRIMARY KEY NOT NULL,
         role TEXT NOT NULL
             CHECK (role IN (
-                'dispatch-authority', 'familiar-binding', 'threads-decision', 'terminal-observer'
+                'dispatch-authority', 'familiar-binding', 'threads-decision',
+                'owner-principal', 'terminal-observer'
             )),
         proof_ref TEXT NOT NULL UNIQUE,
         producer_component TEXT NOT NULL,
@@ -84,14 +86,16 @@ pub(crate) enum AuthorityKeyRole {
     DispatchAuthority,
     FamiliarBinding,
     ThreadsDecision,
+    OwnerPrincipal,
     TerminalObserver,
 }
 
 impl AuthorityKeyRole {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::DispatchAuthority,
         Self::FamiliarBinding,
         Self::ThreadsDecision,
+        Self::OwnerPrincipal,
         Self::TerminalObserver,
     ];
 
@@ -100,6 +104,7 @@ impl AuthorityKeyRole {
             Self::DispatchAuthority => "dispatch-authority",
             Self::FamiliarBinding => "familiar-binding",
             Self::ThreadsDecision => "threads-decision",
+            Self::OwnerPrincipal => "owner-principal",
             Self::TerminalObserver => "terminal-observer",
         }
     }
@@ -157,8 +162,52 @@ impl RoleSigningKey {
 }
 
 pub(crate) fn ensure_authority_keys_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(AUTOMATION_AUTHORITY_KEYS_SCHEMA_SQL)
-        .context("failed to initialize automation authority keys schema")
+    // A savepoint also works when the caller already owns a transaction.
+    // CREATE TABLE IF NOT EXISTS alone cannot widen an existing role CHECK.
+    conn.execute_batch("SAVEPOINT automation_authority_keys_upgrade")?;
+    let result = (|| -> Result<()> {
+        let schema: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table'
+                 AND name = 'automation_authority_keys'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if schema.is_some_and(|sql| !sql.contains("'owner-principal'")) {
+            conn.execute_batch(
+                "ALTER TABLE automation_authority_keys
+                     RENAME TO automation_authority_keys_four_roles;
+                 DROP INDEX IF EXISTS idx_automation_authority_keys_current;",
+            )?;
+            conn.execute_batch(AUTOMATION_AUTHORITY_KEYS_SCHEMA_SQL)?;
+            // Copy all persisted fields, including creation times and revoked or
+            // retired records. Private key files and key identifiers do not change.
+            conn.execute_batch(
+                "INSERT INTO automation_authority_keys (
+                     key_id, role, proof_ref, producer_component, producer_instance_id,
+                     public_key_der_hex, valid_from, valid_until, revoked_at,
+                     revocation_reason, created_at
+                 ) SELECT key_id, role, proof_ref, producer_component, producer_instance_id,
+                          public_key_der_hex, valid_from, valid_until, revoked_at,
+                          revocation_reason, created_at
+                   FROM automation_authority_keys_four_roles;
+                 DROP TABLE automation_authority_keys_four_roles;",
+            )?;
+        } else {
+            conn.execute_batch(AUTOMATION_AUTHORITY_KEYS_SCHEMA_SQL)?;
+        }
+        conn.execute_batch("RELEASE SAVEPOINT automation_authority_keys_upgrade")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT automation_authority_keys_upgrade;
+             RELEASE SAVEPOINT automation_authority_keys_upgrade;",
+        )
+        .context("failed to roll back automation authority keys upgrade")?;
+    }
+    result.context("failed to initialize automation authority keys schema")
 }
 
 /// The role's current key, created on first use.
@@ -619,6 +668,33 @@ mod tests {
     use crate::automations::ed25519_trust::KeyRefusal;
     use chrono::TimeZone;
 
+    // Schema shipped before the owner-principal role; keep this fixture frozen.
+    const FOUR_ROLE_SCHEMA_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS automation_authority_keys (
+            key_id TEXT PRIMARY KEY NOT NULL,
+            role TEXT NOT NULL
+                CHECK (role IN (
+                    'dispatch-authority', 'familiar-binding', 'threads-decision', 'terminal-observer'
+                )),
+            proof_ref TEXT NOT NULL UNIQUE,
+            producer_component TEXT NOT NULL,
+            producer_instance_id TEXT NOT NULL,
+            public_key_der_hex TEXT NOT NULL UNIQUE,
+            valid_from TEXT NOT NULL,
+            valid_until TEXT,
+            revoked_at TEXT,
+            revocation_reason TEXT,
+            created_at TEXT NOT NULL,
+            CHECK (valid_until IS NULL OR valid_until > valid_from),
+            CHECK ((revoked_at IS NULL) = (revocation_reason IS NULL))
+        );
+
+        -- At most one current key per role: open-ended and not revoked.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_authority_keys_current
+            ON automation_authority_keys(role)
+            WHERE valid_until IS NULL AND revoked_at IS NULL;
+    ";
+
     fn store() -> (tempfile::TempDir, Connection) {
         let temp = tempfile::tempdir().unwrap();
         let conn = Connection::open(temp.path().join("store.sqlite")).unwrap();
@@ -657,6 +733,288 @@ mod tests {
     }
 
     #[test]
+    fn four_role_upgrade_accepts_owner_principal_rows() {
+        let (temp, conn) = store();
+        conn.execute_batch(FOUR_ROLE_SCHEMA_SQL).unwrap();
+        let key = create_signing_key(
+            &conn,
+            temp.path(),
+            AuthorityKeyRole::DispatchAuthority,
+            at(9),
+        )
+        .unwrap();
+        ensure_authority_keys_schema(&conn).unwrap();
+        conn.execute(
+            "UPDATE automation_authority_keys SET role = 'owner-principal' WHERE key_id = ?1",
+            [&key.record().key_id],
+        )
+        .expect("upgraded role constraint must accept owner-principal");
+    }
+
+    fn four_role_store(conn: &Connection, home: &Path) -> Vec<RoleSigningKey> {
+        conn.execute_batch(FOUR_ROLE_SCHEMA_SQL).unwrap();
+        let mut keys = Vec::new();
+        for role in [
+            AuthorityKeyRole::DispatchAuthority,
+            AuthorityKeyRole::FamiliarBinding,
+            AuthorityKeyRole::ThreadsDecision,
+            AuthorityKeyRole::TerminalObserver,
+        ] {
+            // Seed through the pre-migration insert primitive, so fixture setup
+            // never calls the schema upgrader under test.
+            let retired = create_signing_key(conn, home, role, at(9)).unwrap();
+            conn.execute(
+                "UPDATE automation_authority_keys SET valid_until = ?2 WHERE key_id = ?1",
+                params![retired.record().key_id, timestamp(at(10))],
+            )
+            .unwrap();
+            remove_private_key(home, &retired.record().key_id).unwrap();
+            let revoked = create_signing_key(conn, home, role, at(10)).unwrap();
+            conn.execute(
+                "UPDATE automation_authority_keys SET revoked_at = ?2,
+                 revocation_reason = 'fixture revocation' WHERE key_id = ?1",
+                params![revoked.record().key_id, timestamp(at(11))],
+            )
+            .unwrap();
+            remove_private_key(home, &revoked.record().key_id).unwrap();
+            let current = create_signing_key(conn, home, role, at(12)).unwrap();
+            keys.extend([retired, revoked, current]);
+        }
+        // created_at is independent of the validity window and must also survive.
+        conn.execute(
+            "UPDATE automation_authority_keys SET created_at = ?1",
+            [timestamp(at(8))],
+        )
+        .unwrap();
+        keys
+    }
+
+    fn stored_rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        conn.prepare("SELECT * FROM automation_authority_keys ORDER BY key_id")
+            .unwrap()
+            .query_map([], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|index| row.get(index))
+                    .collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn stored_schema(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare("SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn four_role_upgrade_preserves_records_and_signers_on_reopen() {
+        let (temp, conn) = store();
+        let keys = four_role_store(&conn, temp.path());
+        let before = stored_rows(&conn);
+        let private_files: Vec<_> = keys
+            .iter()
+            .filter_map(|key| {
+                let path = private_key_path(temp.path(), &key.record().key_id).unwrap();
+                path.exists()
+                    .then(|| (path.clone(), std::fs::read(path).unwrap()))
+            })
+            .collect();
+
+        ensure_authority_keys_schema(&conn).unwrap();
+        assert_eq!(stored_rows(&conn), before);
+        for (index, key) in keys.iter().enumerate() {
+            let trusted = trusted_keys(&conn, key.record().role).unwrap();
+            match index % 3 {
+                0 => {
+                    assert_eq!(authenticate(&trusted, key, at(9), 1), Ok(()));
+                    assert_eq!(
+                        authenticate(&trusted, key, at(10), 1),
+                        Err(KeyRefusal::Stale)
+                    );
+                }
+                1 => assert_eq!(
+                    authenticate(&trusted, key, at(10), 1),
+                    Err(KeyRefusal::Stale)
+                ),
+                _ => {
+                    let loaded =
+                        current_signing_key(&conn, temp.path(), key.record().role, at(13)).unwrap();
+                    assert_eq!(loaded.record(), key.record());
+                    assert_eq!(loaded.sign_digest(&digest(1)), key.sign_digest(&digest(1)));
+                }
+            }
+        }
+        for (path, contents) in &private_files {
+            assert_eq!(std::fs::read(path).unwrap(), *contents);
+        }
+
+        let owner = current_signing_key(
+            &conn,
+            temp.path(),
+            AuthorityKeyRole::parse("owner-principal").unwrap(),
+            at(13),
+        )
+        .expect("an upgraded store must provision the owner-principal role");
+        assert_eq!(
+            authenticate(
+                &trusted_keys(&conn, AuthorityKeyRole::parse("owner-principal").unwrap()).unwrap(),
+                &owner,
+                at(13),
+                1
+            ),
+            Ok(())
+        );
+        let upgraded = stored_rows(&conn);
+        let schema = stored_schema(&conn);
+        let schema_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        let reopened = Connection::open(temp.path().join("store.sqlite")).unwrap();
+        ensure_authority_keys_schema(&reopened).unwrap();
+        ensure_authority_keys_schema(&reopened).unwrap();
+        assert_eq!(stored_rows(&reopened), upgraded);
+        assert_eq!(stored_schema(&reopened), schema);
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema_version
+        );
+        let reloaded = current_signing_key(
+            &reopened,
+            temp.path(),
+            AuthorityKeyRole::parse("owner-principal").unwrap(),
+            at(14),
+        )
+        .unwrap();
+        assert_eq!(reloaded.record(), owner.record());
+        assert_eq!(
+            reloaded.sign_digest(&digest(1)),
+            owner.sign_digest(&digest(1))
+        );
+    }
+
+    #[test]
+    fn four_role_upgrade_preserves_table_constraints() {
+        let (temp, conn) = store();
+        let keys = four_role_store(&conn, temp.path());
+        ensure_authority_keys_schema(&conn).unwrap();
+        let owner = current_signing_key(
+            &conn,
+            temp.path(),
+            AuthorityKeyRole::parse("owner-principal").unwrap(),
+            at(13),
+        )
+        .expect("an upgraded store must provision the owner-principal role");
+        let before = stored_rows(&conn);
+        for assignment in [
+            "role = 'unsupported-role'",
+            "role = 'dispatch-authority'",
+            "valid_until = valid_from",
+            "revoked_at = valid_from",
+            "revocation_reason = 'unpaired reason'",
+            "key_id = NULL",
+            "role = NULL",
+            "proof_ref = NULL",
+            "producer_component = NULL",
+            "producer_instance_id = NULL",
+            "public_key_der_hex = NULL",
+            "valid_from = NULL",
+            "created_at = NULL",
+        ] {
+            let result = conn.execute(
+                &format!("UPDATE automation_authority_keys SET {assignment} WHERE key_id = ?1"),
+                [&owner.record().key_id],
+            );
+            assert!(result.is_err(), "upgrade lost constraint: {assignment}");
+        }
+        for (column, value) in [
+            ("key_id", &keys[0].record().key_id),
+            ("proof_ref", &keys[0].record().proof_ref),
+            ("public_key_der_hex", &keys[0].record().public_key_der_hex),
+        ] {
+            let result = conn.execute(
+                &format!("UPDATE automation_authority_keys SET {column} = ?2 WHERE key_id = ?1"),
+                params![owner.record().key_id, value],
+            );
+            assert!(result.is_err(), "upgrade lost uniqueness: {column}");
+        }
+        assert_eq!(stored_rows(&conn), before);
+    }
+
+    #[test]
+    fn four_role_upgrade_rolls_back_on_failure_and_can_retry() {
+        let (temp, conn) = store();
+        four_role_store(&conn, temp.path());
+        let before = stored_rows(&conn);
+        let schema = stored_schema(&conn);
+        // An active reader allows copying rows but prevents dropping the old
+        // table, inducing a real SQLite failure during the table rebuild.
+        let mut reader = conn
+            .prepare("SELECT key_id FROM automation_authority_keys")
+            .unwrap();
+        let mut rows = reader.query([]).unwrap();
+        assert!(rows.next().unwrap().is_some());
+        let error = ensure_authority_keys_schema(&conn)
+            .expect_err("an active reader must block the schema rebuild");
+        assert!(format!("{error:#}").contains("locked"), "{error:#}");
+        assert!(
+            conn.is_autocommit(),
+            "failed migration leaked its transaction"
+        );
+        assert_eq!(stored_rows(&conn), before);
+        assert_eq!(stored_schema(&conn), schema);
+        drop(rows);
+        drop(reader);
+
+        ensure_authority_keys_schema(&conn).unwrap();
+        assert_eq!(stored_rows(&conn), before);
+        current_signing_key(
+            &conn,
+            temp.path(),
+            AuthorityKeyRole::parse("owner-principal").unwrap(),
+            at(13),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn four_role_upgrade_respects_the_callers_transaction() {
+        let (temp, conn) = store();
+        let keys = four_role_store(&conn, temp.path());
+        let before = stored_rows(&conn);
+        let schema = stored_schema(&conn);
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let loaded = existing_signing_key(
+            &transaction,
+            temp.path(),
+            AuthorityKeyRole::DispatchAuthority,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            loaded.sign_digest(&digest(1)),
+            keys[2].sign_digest(&digest(1))
+        );
+        assert!(!transaction.is_autocommit());
+        assert_ne!(
+            stored_schema(&transaction),
+            schema,
+            "the legacy schema must upgrade inside the transaction"
+        );
+        transaction.rollback().unwrap();
+        assert_eq!(stored_schema(&conn), schema);
+        assert_eq!(stored_rows(&conn), before);
+    }
+
+    #[test]
     fn each_role_gets_one_persistent_key_that_the_trust_set_authenticates() {
         let (temp, conn) = store();
         let mut seen = Vec::new();
@@ -674,7 +1032,7 @@ mod tests {
             .collect();
         distinct.sort();
         distinct.dedup();
-        assert_eq!(distinct.len(), 4, "each role has its own key");
+        assert_eq!(distinct.len(), 5, "each role has its own key");
 
         for key in &seen {
             let keys = trusted_keys(&conn, key.record().role).unwrap();
