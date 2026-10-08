@@ -67,9 +67,9 @@ coven-runtime-spec = { git = "https://github.com/OpenCoven/coven-runtimes", tag 
 # The authority-boundary gate layer for familiar protected surfaces
 # (PHASE-0-DESIGN.md in OpenCoven/coven-threads; RFC-0001 §5). The daemon is
 # the only caller: familiar-controlled processes never reach this crate.
-# Draft pin includes the admission-channel fix and automation-authority evaluator.
-# Re-pin after coven-threads#82 receives human review and merges.
-coven-threads-core = { git = "https://github.com/OpenCoven/coven-threads", rev = "045cc70b8c18dd69177ed180a01042fcb6f28db4", version = "0.2.0" }
+# Draft pin completes the automation-authority port for the trusted adapter.
+# Re-pin after coven-threads#82 and #84 satisfy review and merge gates.
+coven-threads-core = { git = "https://github.com/OpenCoven/coven-threads", rev = "7ccae83f3449694eba6d21832f5afa2336931fbf", version = "0.2.0" }
 # The Familiar Contract's own `familiar.embodiment_binding.v1` verifier, owned
 # and vector-tested in the contract repository (Runtime Authority Decision 2).
 # Pinned by revision: the crate embeds the contract's schemas and is never

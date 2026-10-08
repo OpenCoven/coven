@@ -61,6 +61,22 @@ pub(crate) const AUTOMATION_THREADS_DECISIONS_SCHEMA_SQL: &str = "
     CREATE TRIGGER IF NOT EXISTS automation_threads_decisions_retained
     BEFORE DELETE ON automation_threads_decisions
     BEGIN SELECT RAISE(ABORT, 'Threads decisions are retained'); END;
+
+    -- The Threads consumption store, as events: a decided request is adopted,
+    -- and a dispatch consumes its decision once. The revision orders the store.
+    CREATE TABLE IF NOT EXISTS automation_threads_store_events (
+        revision INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK (kind IN ('adoption', 'consumption')),
+        decision_id TEXT NOT NULL REFERENCES automation_threads_decisions (decision_id),
+        recorded_at TEXT NOT NULL,
+        UNIQUE (kind, decision_id)
+    );
+    CREATE TRIGGER IF NOT EXISTS automation_threads_store_events_immutable
+    BEFORE UPDATE ON automation_threads_store_events
+    BEGIN SELECT RAISE(ABORT, 'Threads store events are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS automation_threads_store_events_retained
+    BEFORE DELETE ON automation_threads_store_events
+    BEGIN SELECT RAISE(ABORT, 'Threads store events are retained'); END;
 ";
 
 /// A signed request and its signed decision, as recorded.
@@ -175,6 +191,35 @@ pub(crate) fn decide(
     policy: &Value,
     now: DateTime<Utc>,
 ) -> Result<std::result::Result<ThreadsDecision, DecisionRefusal>> {
+    ensure_threads_decisions_schema(conn)?;
+    // The key store opens its own transactions, so the keys come first.
+    for role in [
+        AuthorityKeyRole::OwnerPrincipal,
+        AuthorityKeyRole::ThreadsDecision,
+    ] {
+        authority_keys::current_signing_key(conn, coven_home, role, now)?;
+    }
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("failed to begin Threads decision transaction")?;
+    let decided = decide_in(&transaction, coven_home, draft, policy, now)?;
+    if decided.is_ok() {
+        transaction
+            .commit()
+            .context("failed to commit the Threads decision")?;
+    }
+    Ok(decided)
+}
+
+/// [`decide`] inside the caller's open write transaction. It opens no
+/// transaction of its own, so the `owner-principal` and `threads-decision`
+/// keys must already exist.
+pub(crate) fn decide_in(
+    conn: &Connection,
+    coven_home: &Path,
+    draft: &Value,
+    policy: &Value,
+    now: DateTime<Utc>,
+) -> Result<std::result::Result<ThreadsDecision, DecisionRefusal>> {
     let now = now
         .duration_trunc(TimeDelta::milliseconds(1))
         .context("decision time cannot be represented")?;
@@ -184,22 +229,17 @@ pub(crate) fn decide(
         "a Threads request draft must be unsigned"
     );
     ensure_threads_decisions_schema(conn)?;
-    // The key store opens its own transactions, so the keys come first.
-    let request_key = authority_keys::current_signing_key(
-        conn,
-        coven_home,
-        AuthorityKeyRole::OwnerPrincipal,
-        now,
-    )?;
-    let decision_key = authority_keys::current_signing_key(
-        conn,
-        coven_home,
-        AuthorityKeyRole::ThreadsDecision,
-        now,
-    )?;
-    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .context("failed to begin Threads decision transaction")?;
-    let owner = owner_grants::owner_principal_id(&transaction, &at)?;
+    let key = |role: AuthorityKeyRole| {
+        authority_keys::existing_signing_key(conn, coven_home, role)?.with_context(|| {
+            format!(
+                "there is no {} key; dispatch provisions it first",
+                role.as_str()
+            )
+        })
+    };
+    let request_key = key(AuthorityKeyRole::OwnerPrincipal)?;
+    let decision_key = key(AuthorityKeyRole::ThreadsDecision)?;
+    let owner = owner_grants::owner_principal_id(conn, &at)?;
 
     // The owner is the only principal, and the daemon's clock the only clock.
     let mut request = draft.clone();
@@ -215,12 +255,12 @@ pub(crate) fn decide(
         Ok(signed) => signed,
         Err(error) => return Ok(Err(error.into())),
     };
-    let keyring = keyring_at(&transaction, &owner, now)?;
+    let keyring = keyring_at(conn, &owner, now)?;
     let unsigned = match evaluate_authorization(&request, &policy, &keyring, &Ed25519) {
         Ok(decision) => decision,
         Err(error) => return Ok(Err(error.into())),
     };
-    if replayed(&transaction, &request)? {
+    if replayed(conn, &request)? {
         return Ok(Err(DecisionRefusal::Replayed));
     }
     let decision = sign_artifact(&unsigned, Domain::Decision, &RoleSigner(&decision_key))
@@ -237,31 +277,139 @@ pub(crate) fn decide(
         decided_at: now,
     };
 
-    transaction
-        .execute(
-            "INSERT INTO automation_threads_decisions
+    conn.execute(
+        "INSERT INTO automation_threads_decisions
                 (decision_id, decision_digest, request_id, request_digest, nonce, adoption_key,
                  outcome, request_json, decision_json, policy_json, decided_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                decided.decision["decision_id"].as_str(),
-                decided.decision_digest,
-                decided.request["request_id"].as_str(),
-                decided.request_digest,
-                decided.request["replay"]["nonce"].as_str(),
-                decided.request["replay"]["adoption_key"].as_str(),
-                decided.outcome,
-                decided.request.to_string(),
-                decided.decision.to_string(),
-                decided.policy.to_string(),
-                at,
-            ],
-        )
-        .context("failed to record the Threads decision")?;
-    transaction
-        .commit()
-        .context("failed to commit the Threads decision")?;
+        params![
+            decided.decision["decision_id"].as_str(),
+            decided.decision_digest,
+            decided.request["request_id"].as_str(),
+            decided.request_digest,
+            decided.request["replay"]["nonce"].as_str(),
+            decided.request["replay"]["adoption_key"].as_str(),
+            decided.outcome,
+            decided.request.to_string(),
+            decided.decision.to_string(),
+            decided.policy.to_string(),
+            at,
+        ],
+    )
+    .context("failed to record the Threads decision")?;
+    // Deciding a request adopts it.
+    conn.execute(
+        "INSERT INTO automation_threads_store_events (kind, decision_id, recorded_at)
+         VALUES ('adoption', ?1, ?2)",
+        params![decided.decision["decision_id"].as_str(), at],
+    )
+    .context("failed to record the Threads request adoption")?;
     Ok(Ok(decided))
+}
+
+/// The Threads consumption store as it bears on `decided`, signed by the
+/// decision key as the profile's `consumption_snapshot`:
+/// - every adoption that shares the request's digest, nonce or adoption key;
+/// - this decision's consumption, if it has one;
+/// - no approval heads, since an approved dispatch is slice 7's;
+/// - the store's current revision.
+///
+/// The store's constraints keep the adoptions unique. So a fresh dispatch's
+/// snapshot shows exactly its own adoption and no consumption, and a replay
+/// shows the consumption that refuses it.
+pub(crate) fn consumption_snapshot_in(
+    conn: &Connection,
+    coven_home: &Path,
+    decided: &ThreadsDecision,
+    now: DateTime<Utc>,
+) -> Result<Value> {
+    let decision_id = decided.decision["decision_id"]
+        .as_str()
+        .context("a decision has an id")?;
+    let replay = &decided.request["replay"];
+    let mut statement = conn
+        .prepare(
+            "SELECT request_digest, nonce, adoption_key FROM automation_threads_decisions
+             WHERE request_digest = ?1 OR nonce = ?2 OR adoption_key = ?3
+             ORDER BY decided_at, decision_id",
+        )
+        .context("failed to prepare the adoption read")?;
+    let adoptions = statement
+        .query_map(
+            params![
+                decided.request_digest,
+                replay["nonce"].as_str(),
+                replay["adoption_key"].as_str()
+            ],
+            |row| {
+                Ok(json!({
+                    "request_digest": row.get::<_, String>(0)?,
+                    "nonce": row.get::<_, String>(1)?,
+                    "adoption_key": row.get::<_, String>(2)?,
+                }))
+            },
+        )
+        .context("failed to read the adoptions")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read an adoption")?;
+    let consumed: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM automation_threads_store_events
+                            WHERE kind = 'consumption' AND decision_id = ?1)",
+            [decision_id],
+            |row| row.get(0),
+        )
+        .context("failed to read the decision's consumption")?;
+    let revision: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(revision), 0) FROM automation_threads_store_events",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to read the Threads store revision")?;
+    anyhow::ensure!(revision >= 1, "the Threads store has no events");
+    let consumptions = if consumed {
+        vec![decided.decision_digest.clone()]
+    } else {
+        Vec::new()
+    };
+    let snapshot = json!({
+        "schema_version": "opencoven.automation-consumption-snapshot/v1",
+        "snapshot_id": format!("consumption-snapshot:{revision}:{decision_id}"),
+        "recorded_at": timestamp(now),
+        "store_revision": revision,
+        "request_adoptions": adoptions,
+        "decision_consumptions": consumptions,
+        "approval_heads": [],
+    });
+    let key =
+        authority_keys::existing_signing_key(conn, coven_home, AuthorityKeyRole::ThreadsDecision)?
+            .context("there is no threads-decision key; dispatch provisions it first")?;
+    sign_artifact(&snapshot, Domain::ConsumptionSnapshot, &RoleSigner(&key))
+        .context("the consumption snapshot could not be signed")
+}
+
+/// Consumes `decided` for one dispatch, returning the store's new revision.
+/// A decision is consumed at most once.
+pub(crate) fn consume_in(
+    conn: &Connection,
+    decided: &ThreadsDecision,
+    now: DateTime<Utc>,
+) -> Result<std::result::Result<i64, DecisionRefusal>> {
+    let decision_id = decided.decision["decision_id"]
+        .as_str()
+        .context("a decision has an id")?;
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO automation_threads_store_events (kind, decision_id, recorded_at)
+             VALUES ('consumption', ?1, ?2)",
+            params![decision_id, timestamp(now)],
+        )
+        .context("failed to record the decision's consumption")?;
+    if inserted == 0 {
+        return Ok(Err(DecisionRefusal::Replayed));
+    }
+    Ok(Ok(conn.last_insert_rowid()))
 }
 
 /// The recorded decision `decision_id`, verified again under the keyring as
@@ -318,7 +466,7 @@ pub(crate) fn recorded(
 /// `threads_authority` keys, and the `owner-principal` keys become `principal`
 /// keys bound to the owner. A key is included only inside its validity window,
 /// and never once revoked. No other role's key is included.
-fn keyring_at(conn: &Connection, owner: &str, at: DateTime<Utc>) -> Result<Keyring> {
+pub(crate) fn keyring_at(conn: &Connection, owner: &str, at: DateTime<Utc>) -> Result<Keyring> {
     let mut records = Vec::new();
     for record in authority_keys::key_records(conn)? {
         let mut entry = match record.role {
@@ -357,7 +505,7 @@ fn replayed(conn: &Connection, request: &Value) -> Result<bool> {
 }
 
 /// A role key as the profile's signer.
-struct RoleSigner<'a>(&'a RoleSigningKey);
+pub(crate) struct RoleSigner<'a>(pub(crate) &'a RoleSigningKey);
 
 impl ArtifactSigner for RoleSigner<'_> {
     fn key_id(&self) -> &str {
@@ -370,7 +518,7 @@ impl ArtifactSigner for RoleSigner<'_> {
 }
 
 /// The profile's signature check, by `ring`.
-struct Ed25519;
+pub(crate) struct Ed25519;
 
 impl SignatureVerifier for Ed25519 {
     fn verify_ed25519(

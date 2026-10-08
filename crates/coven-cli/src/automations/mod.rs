@@ -63,8 +63,10 @@ pub mod terminal_observer;
 #[allow(dead_code)]
 pub mod threads_decisions;
 pub mod transition_events;
+// The trusted Runtime Authority adapter (coven#857, slice 6).
 #[cfg(test)]
 mod transport_authority_tests;
+pub mod trusted_authority;
 
 #[allow(unused_imports)]
 pub use definition::RoutineDefinition;
