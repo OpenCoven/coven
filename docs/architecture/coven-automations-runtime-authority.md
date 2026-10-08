@@ -116,13 +116,20 @@ Each kind of signed artifact has its own role key:
 | `dispatch-authority` | The `AutomationExecutionBinding` at dispatch, and the receipt-correlated `AutomationReceiptAuthorityEvidence` at settlement |
 | `familiar-binding` | Familiar Contract embodiment bindings (decision 2) |
 | `threads-decision` | Threads automation-authority decisions (decision 3) |
+| `owner-principal` | Authorization requests on the owner principal's behalf (producer remains gated by #1212) |
 | `terminal-observer` | Runtime terminal observations (decision 4) |
 
 The execution binding and the receipt authority evidence share one key: both
 are the dispatcher's own attestations about the same run, made by the same
-component, so a second key would separate no trust. All four roles share one
+component, so a second key would separate no trust. All five roles share one
 lifecycle: one current key per role, rotation that closes its window, and
 revocation that makes it authenticate nothing.
+
+Existing four-role stores upgrade atomically when the key schema is initialized.
+The upgrade preserves every public record, retired and revoked history, and
+current private key file. It can roll back with a caller transaction. Adding
+`owner-principal` key support does not enable Threads decisions or Runtime
+Authority dispatch; those remain gated by their implementation prerequisites.
 
 ## Trust model
 
