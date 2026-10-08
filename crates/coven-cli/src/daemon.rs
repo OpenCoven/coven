@@ -220,6 +220,7 @@ pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
     event_writer: Option<crate::event_writer::EventWriter>,
     sessions: Arc<Mutex<HashMap<String, LiveSessionHandle>>>,
+    main_session_starts: Mutex<HashMap<String, Arc<crate::main_session_start::StartupMonitor>>>,
     shutting_down: AtomicBool,
     launch_gate: Arc<LiveLaunchGate>,
     /// Every session this daemon registered, followed by the liveness sweep
@@ -560,6 +561,7 @@ impl LiveSessionRuntime {
             coven_home: Some(coven_home),
             event_writer: Some(event_writer),
             sessions: Arc::default(),
+            main_session_starts: Mutex::default(),
             shutting_down: AtomicBool::new(false),
             launch_gate: Arc::default(),
             liveness: Mutex::default(),
@@ -1060,6 +1062,36 @@ impl SessionRuntime for LiveSessionRuntime {
         )
     }
 
+    fn launch_main_session(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+    ) -> Result<crate::main_session_start::StartupOutcome> {
+        self.launch_main_session_observed(launch, Duration::from_secs(30), || {
+            self.launch_session_inner(launch, writer, None, false)
+        })
+    }
+
+    fn live_session_accepts_turn(&self, session_id: &str) -> Result<Option<bool>> {
+        let kind = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?
+            .get(session_id)
+            .map(|session| session.kind);
+        let mut starts = self
+            .main_session_starts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("main-session startup registry lock poisoned"))?;
+        let Some(kind) = kind else {
+            starts.remove(session_id);
+            return Ok(None);
+        };
+        Ok(Some(
+            !starts.contains_key(session_id) && kind == LiveSessionKind::Stream,
+        ))
+    }
+
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
         LiveSessionRuntime::send_input(self, session_id, payload)
     }
@@ -1176,6 +1208,74 @@ impl LiveSessionRuntime {
             );
         }
         Ok(())
+    }
+
+    fn launch_main_session_observed(
+        &self,
+        launch: &SessionLaunch,
+        startup_budget: Duration,
+        execute: impl FnOnce() -> Result<()>,
+    ) -> Result<crate::main_session_start::StartupOutcome> {
+        use crate::main_session_start::{StartupMonitor, StartupOutcome};
+        anyhow::ensure!(
+            crate::main_session_start::supports_harness(&launch.harness),
+            "main-session startup observation requires Claude or Codex"
+        );
+        let (monitor, receiver) = StartupMonitor::with_budget(&launch.harness, startup_budget);
+        {
+            let mut starts = self
+                .main_session_starts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("main-session startup registry lock poisoned"))?;
+            anyhow::ensure!(
+                !starts.contains_key(&launch.id),
+                "main-session launch already pending"
+            );
+            starts.insert(launch.id.clone(), Arc::clone(&monitor));
+        }
+        // Both initial prompt delivery and this readiness wait use the same
+        // deadline. Prompt writers own their input handles independently, so a
+        // failed kill can return retained ownership without wedging this thread.
+        let launched = execute();
+        let mut outcome = match launched {
+            Ok(()) => receiver
+                .recv_timeout(monitor.remaining())
+                .context(
+                    "harness did not report its conversation identity within the startup budget",
+                )
+                .and_then(|outcome| outcome.map_err(anyhow::Error::msg)),
+            Err(error) => {
+                if error
+                    .downcast_ref::<RuntimeOwnershipRetainedError>()
+                    .is_some()
+                {
+                    return Err(error);
+                }
+                // Ordinary initial-delivery failures have completed cleanup;
+                // retain a stale diagnostic drained before stdin closed.
+                match receiver.try_recv() {
+                    Ok(Ok(StartupOutcome::Stale)) => Ok(StartupOutcome::Stale),
+                    _ => Err(error),
+                }
+            }
+        };
+        if monitor.timed_out() {
+            outcome = Err(anyhow::anyhow!(
+                "harness exceeded main-session startup budget"
+            ));
+        }
+        if !matches!(outcome, Ok(StartupOutcome::Ready(_))) {
+            if let Err(error) = self.kill_session(&launch.id) {
+                if error.downcast_ref::<NotLiveError>().is_none() {
+                    return Err(anyhow::Error::new(RuntimeOwnershipRetainedError));
+                }
+            }
+        }
+        self.main_session_starts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&launch.id);
+        outcome
     }
 
     fn launch_session_inner(
@@ -1317,7 +1417,17 @@ impl LiveSessionRuntime {
     ) -> Result<()> {
         let (observer, registration) =
             self.observer_for_session_with_writer(launch.id.clone(), writer);
-        let observer = Some(observer);
+        let startup = self
+            .main_session_starts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("main-session startup registry lock poisoned"))?
+            .get(&launch.id)
+            .cloned();
+        let status_observer = startup.as_ref().map(|monitor| monitor.status_observer());
+        let observer = Some(match startup.as_ref() {
+            Some(monitor) => monitor.observe_exit(observer),
+            None => observer,
+        });
         // Hold admission from before the OS spawn until the exact process-tree
         // handle is in the live registry. Shutdown closes and drains this gate,
         // so a detached request handler cannot lose a pre-registration Unix
@@ -1349,7 +1459,12 @@ impl LiveSessionRuntime {
                 );
             }
             let (piped, _provisional_killer) = launch_admission.spawn_owned(|publish| {
-                let piped = pty_runner::spawn_piped_with_observer(&command, observer, true)?;
+                let piped = pty_runner::spawn_piped_with_status_observer(
+                    &command,
+                    observer,
+                    true,
+                    status_observer,
+                )?;
                 let killer: Box<dyn RuntimeKiller> = Box::new(piped.cancellation_handle());
                 publish(killer)?;
                 Ok(piped)
@@ -1363,7 +1478,12 @@ impl LiveSessionRuntime {
                     registration,
                 )?;
                 launch_admission.release();
-                publish_established_runtime_ownership(&mut ownership_established)
+                publish_established_runtime_ownership(&mut ownership_established)?;
+                anyhow::ensure!(
+                    !startup.as_ref().is_some_and(|monitor| monitor.timed_out()),
+                    "harness exceeded main-session startup budget before prompt delivery"
+                );
+                Ok(())
             });
             self.classify_piped_activation_result(activation)?;
             // Cancellation registration and adopted `running` publication
@@ -1383,12 +1503,17 @@ impl LiveSessionRuntime {
             && (strict_containment || cfg!(windows) || launch.harness == "codex")
         {
             let (piped, _provisional_killer) = launch_admission.spawn_owned(|publish| {
-                let piped = pty_runner::spawn_piped_with_observer(&command, observer, wrap_stderr)?;
+                let piped = pty_runner::spawn_piped_with_status_observer(
+                    &command,
+                    observer,
+                    wrap_stderr,
+                    status_observer,
+                )?;
                 let killer: Box<dyn RuntimeKiller> = Box::new(piped.cancellation_handle());
                 publish(killer)?;
                 Ok(piped)
             })?;
-            let activation = piped.activate(|input, process_tree| {
+            let register = |input, process_tree| {
                 self.register_kind_with_registration(
                     launch.id.clone(),
                     LiveSessionKind::Pty,
@@ -1397,8 +1522,17 @@ impl LiveSessionRuntime {
                     registration,
                 )?;
                 launch_admission.release();
-                publish_established_runtime_ownership(&mut ownership_established)
-            });
+                publish_established_runtime_ownership(&mut ownership_established)?;
+                anyhow::ensure!(
+                    !startup.as_ref().is_some_and(|monitor| monitor.timed_out()),
+                    "harness exceeded main-session startup budget before prompt delivery"
+                );
+                Ok(())
+            };
+            let activation = match startup.as_ref() {
+                Some(monitor) => piped.activate_with_prompt_timeout(monitor.remaining(), register),
+                None => piped.activate(register),
+            };
             return self.classify_piped_activation_result(activation);
         }
 
@@ -1467,13 +1601,80 @@ impl LiveSessionRuntime {
         })
     }
 
+    fn write_initial_stream_prompt_bounded(
+        &self,
+        launch: &SessionLaunch,
+        budget: Duration,
+    ) -> Result<()> {
+        let input = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+            let session = sessions.get(&launch.id).ok_or_else(|| {
+                anyhow::Error::new(NotLiveError {
+                    session_id: launch.id.clone(),
+                })
+            })?;
+            anyhow::ensure!(
+                session.kind == LiveSessionKind::Stream,
+                "initial stream prompt requires a stream process"
+            );
+            Arc::clone(&session.input)
+        };
+        let prompt = launch.prompt.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::Builder::new()
+            .name("coven-main-prompt".into())
+            .spawn(move || {
+                let result = input
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("live session input lock poisoned"))
+                    .and_then(|mut input| write_stream_message(input.as_mut(), &prompt));
+                let _ = completed_tx.send(result);
+            })
+            .context("failed to start bounded main-session prompt delivery")?;
+        match completed_rx.recv_timeout(budget) {
+            Ok(result) => {
+                writer
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("main-session prompt writer panicked"))?;
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The worker owns its writer. Caller cleanup uses the separate
+                // killer; if that fails, the registered handles remain usable.
+                drop(writer);
+                anyhow::bail!(
+                    "harness exceeded main-session startup budget during initial prompt delivery"
+                )
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = writer.join();
+                anyhow::bail!("main-session prompt writer stopped without reporting delivery")
+            }
+        }
+    }
+
     fn deliver_initial_stream_prompt(&self, launch: &SessionLaunch) -> Result<()> {
         if launch.prompt.is_empty() {
             return Ok(());
         }
-        if let Err(error) =
-            SessionRuntime::send_input(self, &launch.id, &json!({ "data": launch.prompt.as_str() }))
-        {
+        let startup = self
+            .main_session_starts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("main-session startup registry lock poisoned"))?
+            .get(&launch.id)
+            .cloned();
+        let delivery = match startup {
+            Some(monitor) => self.write_initial_stream_prompt_bounded(launch, monitor.remaining()),
+            None => SessionRuntime::send_input(
+                self,
+                &launch.id,
+                &json!({ "data": launch.prompt.as_str() }),
+            ),
+        };
+        if let Err(error) = delivery {
             let cleanup = SessionRuntime::kill_session(self, &launch.id);
             let primary = error.context(format!(
                 "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
@@ -9648,6 +9849,271 @@ mod tests {
             familiar_id: None,
             caller_familiar_id: None,
         }
+    }
+
+    #[test]
+    fn main_session_startup_cleanup_failure_returns_while_writer_remains_owned() -> Result<()> {
+        struct HeldWriter {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            returned: std::sync::mpsc::Sender<()>,
+        }
+        impl Write for HeldWriter {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                let _ = self.returned.send(());
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "released test writer",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let runtime = Arc::new(LiveSessionRuntime::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let id = "main-retained-blocked-input";
+        runtime.register_kind(
+            id.to_string(),
+            LiveSessionKind::Stream,
+            Box::new(HeldWriter {
+                entered: entered_tx,
+                release: release_rx,
+                returned: returned_tx,
+            }),
+            Box::new(FailingKiller("injected termination failure")),
+        )?;
+        let worker_runtime = Arc::clone(&runtime);
+        let mut launch = stream_launch_fixture(id, "hello");
+        launch.harness = "claude".to_string();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_runtime.launch_main_session_observed(
+                &launch,
+                Duration::from_millis(100),
+                || worker_runtime.deliver_initial_stream_prompt(&launch),
+            );
+            let retained = result.as_ref().err().is_some_and(|error| {
+                error
+                    .downcast_ref::<RuntimeOwnershipRetainedError>()
+                    .is_some()
+            });
+            let _ = done_tx.send(retained);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(60))?;
+        // Hang guard only: the writer is deterministically held until this
+        // test releases it, and the killer deterministically refuses cleanup.
+        let result = done_rx.recv_timeout(Duration::from_secs(10));
+        let pending = runtime.live_session_accepts_turn(id)?;
+        let _ = release_tx.send(());
+        returned_rx.recv_timeout(Duration::from_secs(60))?;
+        worker.join().expect("startup worker panicked");
+        assert!(result.context("failed cleanup kept startup blocked on its writer")?);
+        assert_eq!(pending, Some(false));
+        assert!(runtime.sessions.lock().unwrap().contains_key(id));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_session_startup_deadline_interrupts_blocked_initial_prompt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = Arc::new(LiveSessionRuntime::default());
+        let worker_runtime = Arc::clone(&runtime);
+        let mut launch = stream_launch_fixture("blocked-main-startup", &"x".repeat(1024 * 1024));
+        launch.harness = "claude".to_string();
+        let command = pty_runner::HarnessCommand::fixture(
+            "/bin/sh",
+            vec!["-c".to_string(), "exec sleep 60".to_string()],
+            temp.path().to_path_buf(),
+        );
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_runtime.launch_main_session_observed(
+                &launch,
+                Duration::from_secs(1),
+                || {
+                    let mut registered = || {
+                        let _ = registered_tx.send(());
+                        Ok(())
+                    };
+                    worker_runtime.launch_prepared_session(
+                        &launch,
+                        None,
+                        command,
+                        Some(&mut registered),
+                        false,
+                        false,
+                    )
+                },
+            );
+            let _ = done_tx.send(result.map_err(|error| format!("{error:#}")));
+        });
+        registered_rx.recv_timeout(Duration::from_secs(60))?;
+        // Hang guard, not a promptness assertion. The child never reads stdin;
+        // the deadline must cancel a real blocked write and report its cause.
+        let result = done_rx.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            let _ = runtime.kill_session("blocked-main-startup");
+        }
+        worker.join().expect("startup worker panicked");
+        let error = result
+            .context("startup deadline did not interrupt initial prompt delivery")?
+            .expect_err("non-reading harness must time out");
+        assert!(error.contains("startup budget"), "{error}");
+        assert_eq!(
+            runtime.live_session_accepts_turn("blocked-main-startup")?,
+            None
+        );
+        assert!(runtime.main_session_starts.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_session_native_records_survive_real_pipe_eof() -> Result<()> {
+        use crate::main_session_start::StartupOutcome;
+        const NATIVE: &str = "b5c84cac-58cd-44c5-991b-516ff2635ed9";
+        for harness in ["claude", "codex"] {
+            for stale in [false, true] {
+                let temp = tempfile::tempdir()?;
+                let runtime = LiveSessionRuntime::default();
+                let mut launch = stream_launch_fixture("eof-startup", "hello");
+                launch.harness = harness.to_string();
+                let output = match (harness, stale) {
+                    ("claude", false) => format!("printf '%s' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{NATIVE}\"}}'"),
+                    ("claude", true) => "printf '%s' 'No conversation found with session ID: old' >&2".to_string(),
+                    (_, false) => format!("printf '%s' 'session id: {NATIVE}' >&2"),
+                    (_, true) => "printf '%s' 'no rollout found for thread id old' >&2".to_string(),
+                };
+                let consume = if harness == "claude" {
+                    "read -r line"
+                } else {
+                    launch.launch_mode = crate::harness::HarnessLaunchMode::NonInteractive;
+                    "cat >/dev/null"
+                };
+                let mut command = pty_runner::HarnessCommand::fixture(
+                    "/bin/sh",
+                    vec!["-c".into(), format!("{consume}; {output}")],
+                    temp.path().to_path_buf(),
+                );
+                if harness == "codex" {
+                    command.set_stdin_prompt_for_test(b"hello".to_vec());
+                }
+                let outcome = runtime.launch_main_session_observed(
+                    &launch,
+                    Duration::from_secs(60),
+                    || runtime.launch_prepared_session(&launch, None, command, None, false, false),
+                )?;
+                let expected = if stale {
+                    StartupOutcome::Stale
+                } else {
+                    StartupOutcome::Ready(NATIVE.into())
+                };
+                assert_eq!(outcome, expected, "{harness}, stale={stale}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_session_stale_diagnostic_survives_early_stdin_close() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = LiveSessionRuntime::default();
+        // Larger than the pipe buffer: delivery cannot succeed before the child
+        // closes its read end. The diagnostic is emitted before that closure.
+        let mut launch = stream_launch_fixture("stale-closed-stdin", &"x".repeat(1024 * 1024));
+        launch.harness = "claude".to_string();
+        let command = pty_runner::HarnessCommand::fixture(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "printf '%s' 'No conversation found with session ID: old' >&2; exec 0<&-; exit 1"
+                    .into(),
+            ],
+            temp.path().to_path_buf(),
+        );
+        let outcome =
+            runtime.launch_main_session_observed(&launch, Duration::from_secs(60), || {
+                runtime.launch_prepared_session(&launch, None, command, None, false, false)
+            })?;
+        assert_eq!(outcome, crate::main_session_start::StartupOutcome::Stale);
+        assert_eq!(runtime.live_session_accepts_turn(&launch.id)?, None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_session_startup_observes_real_pipes_before_process_exit() -> Result<()> {
+        use crate::main_session_start::{StartupMonitor, StartupOutcome};
+        const NATIVE: &str = "b5c84cac-58cd-44c5-991b-516ff2635ed9";
+        for harness in ["claude", "codex"] {
+            let temp = tempfile::tempdir()?;
+            let runtime = LiveSessionRuntime::default();
+            let mut launch = stream_launch_fixture("startup-fixture", "hello");
+            launch.harness = harness.to_string();
+            let script = if harness == "claude" {
+                format!("read -r line; printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{NATIVE}\"}}'")
+            } else {
+                launch.launch_mode = crate::harness::HarnessLaunchMode::NonInteractive;
+                format!("cat >/dev/null; printf 'thread/resume failed is assistant prose\\n'; printf 'session id: {NATIVE}\\n' >&2")
+            };
+            let mut command = pty_runner::HarnessCommand::fixture(
+                "/bin/sh",
+                vec!["-c".to_string(), script],
+                temp.path().to_path_buf(),
+            );
+            if harness == "codex" {
+                command.set_stdin_prompt_for_test(b"hello".to_vec());
+            }
+            let (monitor, receiver) = StartupMonitor::new(harness);
+            runtime
+                .main_session_starts
+                .lock()
+                .unwrap()
+                .insert(launch.id.clone(), monitor);
+            runtime.launch_prepared_session(&launch, None, command, None, false, false)?;
+            // Hang guard only; native identity is the discriminating assertion.
+            let outcome = receiver
+                .recv_timeout(Duration::from_secs(60))?
+                .map_err(anyhow::Error::msg)?;
+            assert_eq!(
+                outcome,
+                StartupOutcome::Ready(NATIVE.to_string()),
+                "{harness}"
+            );
+            runtime
+                .main_session_starts
+                .lock()
+                .unwrap()
+                .remove(&launch.id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn main_session_turn_capability_uses_registered_process_kind() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        assert_eq!(runtime.live_session_accepts_turn("missing")?, None);
+        for (id, kind, expected) in [
+            ("stream", LiveSessionKind::Stream, true),
+            ("one-shot", LiveSessionKind::Pty, false),
+        ] {
+            runtime.register_kind(
+                id.to_string(),
+                kind,
+                Box::new(Vec::<u8>::new()),
+                Box::new(RecordingKiller::default()),
+            )?;
+            assert_eq!(runtime.live_session_accepts_turn(id)?, Some(expected));
+        }
+        Ok(())
     }
 
     #[test]

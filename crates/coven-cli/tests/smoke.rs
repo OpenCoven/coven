@@ -339,6 +339,102 @@ fn daemon_start_is_idempotent_when_daemon_is_already_running() -> anyhow::Result
 }
 
 #[test]
+fn main_session_native_conversation_survives_real_daemon_restart() -> anyhow::Result<()> {
+    const NATIVE: &str = "b5c84cac-58cd-44c5-991b-516ff2635ed9";
+    for harness in ["claude", "codex"] {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let home = root.join("home");
+        let project = root.join("project");
+        let bin = root.join("bin");
+        for dir in [&home, &project, &bin] {
+            fs::create_dir(dir)?;
+        }
+        fs::write(
+            home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "nova"
+display_name = "Nova"
+role = "Lead"
+description = "Main session fixture"
+"#,
+        )?;
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'fixture 1.0.0'; exit 0; fi
+record="$(dirname "$0")/../argv"
+printf '%s\n' "$@" > "$record"
+if [ "{harness}" = claude ]; then
+  IFS= read -r prompt || exit 1
+  printf '%s\n' '{{"type":"system","subtype":"init","session_id":"{NATIVE}"}}'
+  while IFS= read -r prompt; do :; done
+else
+  cat >/dev/null
+  printf 'session id: {NATIVE}\n' >&2
+fi
+"#
+        );
+        let executable = bin.join(harness);
+        fs::write(&executable, script)?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        let path = std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])?;
+        let coven = coven_bin();
+        let _guard = DaemonGuard {
+            coven: coven.clone(),
+            coven_home: home.clone(),
+            path: path.clone(),
+        };
+        let started = run_coven(&coven, &home, &path, &["daemon", "start"])?;
+        assert_success("main session daemon start", &started);
+        let initial_identity = wait_for_daemon_identity(&home)?;
+        let body =
+            json!({"prompt":"first turn", "projectRoot":project, "harness":harness}).to_string();
+        let (status, body) = unix_http_request_with_read_timeout(
+            &home,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(&body),
+            Some(Duration::from_secs(120)), // Hang guard beyond the startup budget.
+        )?;
+        assert_eq!(status, 201, "{harness}: {body}");
+        let first: Value = serde_json::from_str(&body)?;
+        assert_eq!(first["mainSession"]["conversationId"], NATIVE);
+        assert_eq!(first["conversation"], "init");
+        let restarted = run_coven(&coven, &home, &path, &["daemon", "restart"])?;
+        assert_success("main session daemon restart", &restarted);
+        let new_identity = wait_for_daemon_identity(&home)?;
+        assert_ne!(initial_identity["pid"], new_identity["pid"]);
+        let (status, body) = unix_http_request_with_read_timeout(
+            &home,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(r#"{"prompt":"second turn"}"#),
+            Some(Duration::from_secs(120)),
+        )?;
+        assert_eq!(status, 201, "{harness}: {body}");
+        let second: Value = serde_json::from_str(&body)?;
+        assert_eq!(second["conversation"], "resume");
+        assert_eq!(second["mainSession"]["conversationId"], NATIVE);
+        assert_eq!(second["session"]["conversation_id"], NATIVE);
+        assert_ne!(first["session"]["id"], second["session"]["id"]);
+        let argv = fs::read_to_string(root.join("argv"))?;
+        let argv: Vec<_> = argv.lines().collect();
+        let resume = if harness == "claude" {
+            "--resume"
+        } else {
+            "resume"
+        };
+        assert!(
+            argv.windows(2).any(|pair| pair == [resume, NATIVE]),
+            "{harness}: {argv:?}"
+        );
+        let stopped = run_coven(&coven, &home, &path, &["daemon", "stop"])?;
+        assert_success("main session daemon stop", &stopped);
+    }
+    Ok(())
+}
+
+#[test]
 fn managed_daemon_identity_matches_health_across_restart_and_stop() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -2801,12 +2897,23 @@ fn unix_http_request(
     path: &str,
     body: Option<&str>,
 ) -> anyhow::Result<(u16, String)> {
+    unix_http_request_with_read_timeout(coven_home, method, path, body, None)
+}
+
+fn unix_http_request_with_read_timeout(
+    coven_home: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    read_timeout: Option<Duration>,
+) -> anyhow::Result<(u16, String)> {
     let body = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     let mut stream = UnixStream::connect(coven_home.join("coven.sock"))?;
+    stream.set_read_timeout(read_timeout)?;
     stream.write_all(request.as_bytes())?;
     stream.shutdown(Shutdown::Write)?;
 
