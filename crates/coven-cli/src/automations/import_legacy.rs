@@ -244,10 +244,12 @@ pub fn import_legacy_codex_automations(conn: &Connection) -> Result<ImportReport
 
 /// `legacy.import.v1`: imports into the `draft` lifecycle state as v1-managed
 /// rows, inside the caller's transaction with one savepoint per definition.
-/// An id already in the store, tombstoned or not, is skipped. With
-/// `dry_run`, reports the same outcome without writing anything. Each row
-/// and its `definition.imported` event carry the adoption's `adopted_at`,
-/// kept monotonic against any earlier event on that id, not the wall clock.
+/// An id already in the store, tombstoned or not, is skipped as `already
+/// exists`; a later source file repeating an id this run has taken is skipped
+/// as `duplicate source id`. With `dry_run`, reports the same outcome without
+/// writing anything. Each row and its `definition.imported` event carry the
+/// adoption's `adopted_at`, kept monotonic against any earlier event on that
+/// id, not the wall clock.
 pub fn import_codex_as_draft(
     conn: &Connection,
     dry_run: bool,
@@ -257,17 +259,21 @@ pub fn import_codex_as_draft(
         candidates,
         mut report,
     } = plan_codex_import(&codex_automations_dir())?;
-    // Ids this run has already imported (or, dry, would have): a second
-    // source file with the same id is skipped either way.
+    // Track only ids absent from the store when first encountered. Check them
+    // before querying the store so this run's writes do not change the skip
+    // reason compared with a dry run. Pre-existing ids are never claimed.
     let mut claimed = std::collections::HashSet::new();
     for definition in candidates {
         let id = definition.id.clone();
-        if !claimed.insert(id.clone())
-            || super::store::get_definition_with_tombstone(conn, &id, true)?.is_some()
-        {
+        if claimed.contains(&id) {
+            report.skipped.push(format!("{id}: duplicate source id"));
+            continue;
+        }
+        if super::store::get_definition_with_tombstone(conn, &id, true)?.is_some() {
             report.skipped.push(format!("{id}: already exists"));
             continue;
         }
+        claimed.insert(id.clone());
         if dry_run {
             report.imported.push(id);
             continue;
@@ -481,7 +487,12 @@ prompt = "Do the legacy thing."
         assert_eq!(result["imported"], serde_json::json!(["nightly"]));
         let mut predicted = result["skipped"].as_array().unwrap().clone();
         assert_eq!(predicted.len(), 2);
+        // The store is empty: the twin is a duplicate within this run, not
+        // an id that already exists.
         assert!(predicted
+            .iter()
+            .any(|skip| skip == "nightly: duplicate source id"));
+        assert!(!predicted
             .iter()
             .any(|skip| skip == "nightly: already exists"));
         assert!(definition_rows(&conn).is_empty());
@@ -593,15 +604,26 @@ prompt = "Do the legacy thing."
             )]
         );
 
-        // A second import skips what is already present.
+        // A second import skips what is already present. Both source copies
+        // of `nightly` name the store hit; neither is called a duplicate.
         let again = draft_import(&conn, &root, "adopt:import:again", false);
         let again = again.result.unwrap();
         assert_eq!(again["imported"], serde_json::json!([]));
-        assert!(again["skipped"]
-            .as_array()
-            .unwrap()
+        let again_skipped = again["skipped"].as_array().unwrap();
+        assert_eq!(
+            again_skipped
+                .iter()
+                .filter(|skip| *skip == "nightly: already exists")
+                .count(),
+            2
+        );
+        assert!(!again_skipped
             .iter()
-            .any(|skip| skip == "nightly: already exists"));
+            .any(|skip| skip == "nightly: duplicate source id"));
+        let existing_dry = draft_import(&conn, &root, "adopt:import:existing-dry", true);
+        let existing_dry = existing_dry.result.unwrap();
+        assert_eq!(existing_dry["imported"], serde_json::json!([]));
+        assert_eq!(existing_dry["skipped"], again["skipped"]);
         // The import and the paused revise; the refused revise and the re-import append nothing.
         assert_eq!(event_count(&conn), 2);
     }
