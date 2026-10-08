@@ -3,9 +3,14 @@
 // Daemon-side implementation of the eval-loop skill.
 //
 // State is entirely filesystem-backed:
-//   <familiar-workspace>/results.tsv          ← iteration history (read)
-//   <familiar-workspace>/eval-loop/run.lock   ← in-progress lock (run trigger)
-//   <familiar-workspace>/eval-loop/run.json   ← pending run spec (run trigger)
+//   <familiar-workspace>/results.tsv            ← iteration history (read)
+//   <familiar-workspace>/eval-loop/run.lock     ← in-progress lock (run trigger)
+//   <familiar-workspace>/eval-loop/run.json     ← pending run spec (run trigger)
+//   <familiar-workspace>/eval-loop/skips.jsonl  ← refused `begin` attempts (v2, read)
+//   <familiar-workspace>/evals/<track>/noise.json ← noise floor per track (v2, read)
+//
+// The v2 driver (`coven eval-loop …`, see eval_loop_cli.rs) writes these files;
+// this module only reads and aggregates them for the daemon API.
 //
 // The daemon never executes the loop itself — it:
 //   1. Reads + aggregates the TSV for GET state
@@ -40,11 +45,24 @@ use uuid::Uuid;
 //   8  branch        git branch name
 //   9  proposer_reasoning  (may be empty)
 //  10  failure_modes       (may be empty)
+//
+// v2 rows (spec 2026-10-06-eval-loop-v2-design.md) append six columns. A row
+// with ≥ 17 columns is v2 and its cols 4–6 are the *test-split* metric:
+//  11  metric_train_before f64
+//  12  metric_train_after  f64
+//  13  noise_floor         f64
+//  14  eval_set_hash       blake3 hex of evals/<track>/cases.jsonl
+//  15  decision_reason     accepted | overfit | noise | regression | leak_detected | …
+//  16  run_id              daemon runId when adopted, else CLI uuid
 
-const RESULTS_TSV: &str = "results.tsv";
-const EVAL_LOOP_DIR: &str = "eval-loop";
-const RUN_SPEC_FILE: &str = "run.json";
-const RUN_LOCK_FILE: &str = "run.lock";
+pub(crate) const RESULTS_TSV: &str = "results.tsv";
+pub(crate) const EVAL_LOOP_DIR: &str = "eval-loop";
+pub(crate) const RUN_SPEC_FILE: &str = "run.json";
+pub(crate) const RUN_LOCK_FILE: &str = "run.lock";
+pub(crate) const SKIPS_FILE: &str = "skips.jsonl";
+pub(crate) const EVALS_DIR: &str = "evals";
+pub(crate) const NOISE_FILE: &str = "noise.json";
+pub(crate) const TRACKS: [&str; 3] = ["synthesis", "prompt", "memory"];
 const STALE_LOCK_AFTER_SECS: i64 = 60 * 60;
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
@@ -63,6 +81,48 @@ pub struct LoopIterationDto {
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    // ── v2 columns (None for v1 rows) ──
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric_train_before: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric_train_after: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_floor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_set_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// One refused `coven eval-loop begin` attempt (v2), read from
+/// `eval-loop/skips.jsonl`. Refusals never enter `results.tsv`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkipDto {
+    pub timestamp: String,
+    pub track: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// Per-track noise floor (v2), read from `evals/<track>/noise.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoiseDto {
+    pub track: String,
+    pub eval_set_hash: String,
+    pub runs: u32,
+    pub mean: f64,
+    pub stddev: f64,
+    pub floor: f64,
+    pub measured_at: String,
+    #[serde(default)]
+    pub accepts_since: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,6 +137,10 @@ pub struct EvalLoopStateDto {
     pub total_reverted: u32,
     pub running: bool,
     pub lock: EvalLoopLockDto,
+    // ── v2 ──
+    pub total_skipped: u32,
+    pub skips: Vec<SkipDto>,
+    pub noise: Vec<NoiseDto>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -109,6 +173,24 @@ pub struct RunSpec {
     pub requested_at: String,
 }
 
+/// Serializes CLI and daemon mutations across tracks and processes. The lock
+/// inode is permanent; run.lock is only the externally visible run marker.
+pub(crate) struct MutationLock(fs::File);
+
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+pub(crate) fn mutation_lock(workspace: &Path) -> Result<MutationLock> {
+    let dir = workspace.join(EVAL_LOOP_DIR);
+    fs::create_dir_all(&dir)?;
+    let file = crate::state_lock::open_lock_file(&dir.join("mutation.lock"))?;
+    fs2::FileExt::lock_exclusive(&file).context("failed to lock eval-loop mutation")?;
+    Ok(MutationLock(file))
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Read and aggregate eval-loop state for a familiar.
@@ -131,11 +213,13 @@ pub fn get_eval_loop_state(
     };
 
     let lock = eval_loop_lock(&workspace);
-    if raw.is_none() && !lock.locked && !lock.run_json_exists {
+    let skips = read_skips(&workspace)?;
+    if raw.is_none() && !lock.locked && !lock.run_json_exists && skips.is_empty() {
         return Ok(None);
     }
 
     let iterations = raw.as_deref().map(parse_results_tsv).unwrap_or_default();
+    let noise = read_noise(&workspace);
     let running = lock.locked;
 
     let mut track_counts = TrackCounts::default();
@@ -168,6 +252,9 @@ pub fn get_eval_loop_state(
         total_reverted,
         running,
         lock,
+        total_skipped: skips.len() as u32,
+        skips,
+        noise,
     }))
 }
 
@@ -178,6 +265,7 @@ pub fn get_eval_loop_state(
 pub fn enqueue_run(coven_home: &Path, familiar_id: &str, track: &str) -> Result<RunSpec> {
     let track = validate_track(track)?;
     let workspace = familiar_workspace(coven_home, familiar_id);
+    let _mutation = mutation_lock(&workspace)?;
     let eval_dir = workspace.join(EVAL_LOOP_DIR);
 
     fs::create_dir_all(&eval_dir)
@@ -196,7 +284,7 @@ pub fn enqueue_run(coven_home: &Path, familiar_id: &str, track: &str) -> Result<
     };
 
     // Write spec first, then lock — the familiar watches for lock disappearance
-    // to know a run completed. Atomic enough: both are small local writes.
+    // to know a run completed. The shared mutation lock excludes competing writers.
     let spec_path = eval_dir.join(RUN_SPEC_FILE);
     let spec_json = serde_json::to_string_pretty(&spec).context("failed to serialize run spec")?;
     fs::write(&spec_path, &spec_json)
@@ -214,6 +302,7 @@ pub fn enqueue_run(coven_home: &Path, familiar_id: &str, track: &str) -> Result<
 /// active familiar run is not interrupted by accident.
 pub fn clear_eval_loop_lock(coven_home: &Path, familiar_id: &str, force: bool) -> Result<bool> {
     let workspace = familiar_workspace(coven_home, familiar_id);
+    let _mutation = mutation_lock(&workspace)?;
     let eval_dir = workspace.join(EVAL_LOOP_DIR);
     let lock_path = eval_dir.join(RUN_LOCK_FILE);
 
@@ -235,11 +324,53 @@ pub fn clear_eval_loop_lock(coven_home: &Path, familiar_id: &str, force: bool) -
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn familiar_workspace(coven_home: &Path, familiar_id: &str) -> PathBuf {
+pub(crate) fn familiar_workspace(coven_home: &Path, familiar_id: &str) -> PathBuf {
     crate::cockpit_sources::familiar_workspace(coven_home, familiar_id)
 }
 
-fn eval_loop_lock(workspace: &Path) -> EvalLoopLockDto {
+/// Read `eval-loop/skips.jsonl`. Missing file ⇒ empty. Malformed lines are
+/// skipped rather than failing the whole state read.
+pub(crate) fn read_skips(workspace: &Path) -> Result<Vec<SkipDto>> {
+    let path = workspace.join(EVAL_LOOP_DIR).join(SKIPS_FILE);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    Ok(raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<SkipDto>(l).ok())
+        .collect())
+}
+
+/// Read every `evals/<track>/noise.json` that exists. Unreadable files are
+/// omitted; the CLI reports them precisely, the daemon state just skips them.
+pub(crate) fn read_noise(workspace: &Path) -> Vec<NoiseDto> {
+    TRACKS
+        .iter()
+        .filter_map(|track| {
+            let path = workspace.join(EVALS_DIR).join(track).join(NOISE_FILE);
+            let raw = fs::read_to_string(path).ok()?;
+            let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            Some(NoiseDto {
+                track: (*track).to_string(),
+                eval_set_hash: value.get("eval_set_hash")?.as_str()?.to_string(),
+                runs: value.get("runs")?.as_u64()? as u32,
+                mean: value.get("mean")?.as_f64()?,
+                stddev: value.get("stddev")?.as_f64()?,
+                floor: value.get("floor")?.as_f64()?,
+                measured_at: value.get("measured_at")?.as_str()?.to_string(),
+                accepts_since: value
+                    .get("accepts_since")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn eval_loop_lock(workspace: &Path) -> EvalLoopLockDto {
     let eval_dir = workspace.join(EVAL_LOOP_DIR);
     let lock_path = eval_dir.join(RUN_LOCK_FILE);
     let spec_path = eval_dir.join(RUN_SPEC_FILE);
@@ -297,14 +428,14 @@ fn read_run_requested_at(spec_path: &Path) -> Option<String> {
         })
 }
 
-fn validate_track(track: &str) -> Result<&str> {
+pub(crate) fn validate_track(track: &str) -> Result<&str> {
     match track {
         "synthesis" | "prompt" | "memory" => Ok(track),
         other => anyhow::bail!("track must be `synthesis`, `prompt`, or `memory`, got `{other}`"),
     }
 }
 
-fn parse_results_tsv(raw: &str) -> Vec<LoopIterationDto> {
+pub(crate) fn parse_results_tsv(raw: &str) -> Vec<LoopIterationDto> {
     let mut out = Vec::new();
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -336,6 +467,23 @@ fn parse_results_tsv(raw: &str) -> Vec<LoopIterationDto> {
                 (false, false) => Some(format!("{reasoning} | failures: {failures}")),
             }
         };
+        // v2 columns: present only when the row carries ≥ 17 columns.
+        let is_v2 = cols.len() >= 17;
+        let opt_f64 = |i: usize| -> Option<f64> {
+            if !is_v2 {
+                return None;
+            }
+            cols.get(i).and_then(|c| c.trim().parse::<f64>().ok())
+        };
+        let opt_str = |i: usize| -> Option<String> {
+            if !is_v2 {
+                return None;
+            }
+            cols.get(i)
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+        };
         out.push(LoopIterationDto {
             id: Uuid::new_v4().to_string(),
             timestamp: cols[0].to_string(),
@@ -347,6 +495,12 @@ fn parse_results_tsv(raw: &str) -> Vec<LoopIterationDto> {
             delta,
             outcome: cols[7].to_string(),
             notes,
+            metric_train_before: opt_f64(11),
+            metric_train_after: opt_f64(12),
+            noise_floor: opt_f64(13),
+            eval_set_hash: opt_str(14),
+            decision_reason: opt_str(15),
+            run_id: opt_str(16),
         });
     }
     out
@@ -655,6 +809,72 @@ mod tests {
         assert!(validate_track("").is_err());
         assert!(validate_track("harness").is_err());
         assert!(validate_track("SYNTHESIS").is_err()); // case-sensitive
+    }
+
+    // ── v2 schema ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_results_tsv_reads_v2_columns_and_leaves_v1_rows_none() {
+        let v1 = tsv_line(
+            "2026-06-05T10:00:00Z",
+            "prompt",
+            1,
+            "v1 row",
+            0.60,
+            0.68,
+            0.08,
+            "ACCEPT",
+        );
+        let v2 = "2026-10-06T10:00:00Z\tprompt\t2\tv2 row\t0.70\t0.80\t0.10\tACCEPT\teval-loop/prompt/ab12cd34\twhy\t\t0.65\t0.75\t0.04\tdeadbeef\taccepted\trun-123\n";
+        let rows = parse_results_tsv(&format!("{v1}{v2}"));
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].noise_floor.is_none());
+        assert!(rows[0].decision_reason.is_none());
+        let r = &rows[1];
+        assert_eq!(r.metric_train_before, Some(0.65));
+        assert_eq!(r.metric_train_after, Some(0.75));
+        assert_eq!(r.noise_floor, Some(0.04));
+        assert_eq!(r.eval_set_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(r.decision_reason.as_deref(), Some("accepted"));
+        assert_eq!(r.run_id.as_deref(), Some("run-123"));
+        assert!(
+            (r.metric_after - 0.80).abs() < 1e-9,
+            "cols 4-6 stay the reported (test) metric"
+        );
+    }
+
+    #[test]
+    fn state_includes_skips_and_noise_and_counts_them() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let ws = home.path().join("familiars").join("sage");
+        fs::create_dir_all(ws.join(EVAL_LOOP_DIR))?;
+        fs::create_dir_all(ws.join(EVALS_DIR).join("prompt"))?;
+        fs::write(
+            ws.join(EVAL_LOOP_DIR).join(SKIPS_FILE),
+            "{\"timestamp\":\"2026-10-06T00:00:00Z\",\"track\":\"prompt\",\"reason\":\"saturated\",\"detail\":{\"testMean\":0.97}}\nnot json\n",
+        )?;
+        fs::write(
+            ws.join(EVALS_DIR).join("prompt").join(NOISE_FILE),
+            r#"{"eval_set_hash":"abc","runs":3,"mean":0.71,"stddev":0.02,"floor":0.04,"measured_at":"2026-10-06T00:00:00Z"}"#,
+        )?;
+        // No results.tsv and no lock: skips alone make the skill "active".
+        let state = get_eval_loop_state(home.path(), "sage")?.expect("state present via skips");
+        assert_eq!(state.total_skipped, 1);
+        assert_eq!(state.skips[0].reason, "saturated");
+        assert_eq!(state.noise.len(), 1);
+        assert_eq!(state.noise[0].track, "prompt");
+        assert!((state.noise[0].floor - 0.04).abs() < 1e-9);
+        assert_eq!(state.noise[0].accepts_since, 0);
+        assert!(state.iterations.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn state_is_none_for_untouched_workspace() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        fs::create_dir_all(home.path().join("familiars").join("sage"))?;
+        assert!(get_eval_loop_state(home.path(), "sage")?.is_none());
+        Ok(())
     }
 }
 

@@ -33,6 +33,7 @@ mod encrypted_artifacts;
 mod engine;
 mod engine_install;
 mod eval_loop;
+mod eval_loop_cli;
 mod event_writer;
 mod execution_binding;
 mod install_conflict;
@@ -737,6 +738,23 @@ enum Command {
         #[arg(long, help = "Print familiars as JSON (machine-readable)")]
         json: bool,
     },
+    #[command(
+        name = "eval-loop",
+        about = "Drive the held-out eval loop for a familiar workspace (deterministic steps only; the harness proposes and judges)"
+    )]
+    #[command(after_help = "Examples:
+  coven eval-loop init --workspace . --track prompt
+  coven eval-loop noise start --workspace . --track prompt --runs 3
+  coven eval-loop noise finalize --workspace . --track prompt
+  coven eval-loop begin --familiar sage --track prompt
+  coven eval-loop cases --familiar sage --track prompt --split train
+  coven eval-loop decide --familiar sage --track prompt
+  coven eval-loop ack --familiar sage --track prompt
+Exit codes: 0 ok · 3 refused (JSON {refused, detail}) · 1 error")]
+    EvalLoop {
+        #[command(subcommand)]
+        command: EvalLoopCommand,
+    },
     #[command(about = "List installed skills from ~/.coven/skills/", alias = "skill")]
     Skills {
         #[arg(long, help = "Print skills as JSON (machine-readable)")]
@@ -1334,6 +1352,111 @@ enum LogsCommand {
     },
 }
 
+#[derive(clap::Args, Debug, Clone)]
+struct EvalLoopTarget {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Familiar workspace path (wins over --familiar)"
+    )]
+    workspace: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Familiar id, resolved through ~/.coven/familiars.toml"
+    )]
+    familiar: Option<String>,
+    #[arg(long, value_name = "TRACK", help = "synthesis | prompt | memory")]
+    track: String,
+}
+
+#[derive(Subcommand, Debug)]
+enum EvalLoopCommand {
+    #[command(about = "Scaffold evals/<track>/{cases.jsonl,judge.md,config.json}")]
+    Init {
+        #[command(flatten)]
+        target: EvalLoopTarget,
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Percent of cases held out as the test split"
+        )]
+        test_pct: u8,
+    },
+    #[command(about = "Estimate the noise floor from repeated baseline scorings")]
+    Noise {
+        #[command(subcommand)]
+        command: EvalLoopNoiseCommand,
+    },
+    #[command(
+        about = "Start one iteration: validate, check headroom/noise/baseline, lock, write context.json"
+    )]
+    Begin {
+        #[command(flatten)]
+        target: EvalLoopTarget,
+        #[arg(
+            long,
+            help = "Adopt the daemon-enqueued eval-loop/run.json instead of creating a new run"
+        )]
+        from_run_json: bool,
+        #[arg(
+            long,
+            help = "Proceed even if the previous iteration's trace was not acknowledged"
+        )]
+        ack_unreviewed: bool,
+    },
+    #[command(about = "Emit the cases for a split (test is gated on proposal.json)")]
+    Cases {
+        #[command(flatten)]
+        target: EvalLoopTarget,
+        #[arg(long, value_name = "SPLIT", help = "train | test")]
+        split: String,
+    },
+    #[command(
+        about = "Apply the accept rule, leak check, write the results.tsv row, release the lock"
+    )]
+    Decide {
+        #[command(flatten)]
+        target: EvalLoopTarget,
+    },
+    #[command(about = "Acknowledge the last iteration's trace (human read receipt)")]
+    Ack {
+        #[command(flatten)]
+        target: EvalLoopTarget,
+    },
+    #[command(about = "Show iteration history, noise, baseline and lock state for a track")]
+    Status {
+        #[command(flatten)]
+        target: EvalLoopTarget,
+        #[arg(
+            long,
+            default_value_t = 10,
+            help = "Number of most recent iterations to include"
+        )]
+        last: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EvalLoopNoiseCommand {
+    #[command(about = "Write the noise plan and print the cases the harness must score")]
+    Start {
+        #[command(flatten)]
+        target: EvalLoopTarget,
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Number of repeated test-split scorings"
+        )]
+        runs: u32,
+    },
+    #[command(about = "Compute stddev/floor from the passes and write noise.json + baseline.json")]
+    Finalize {
+        #[command(flatten)]
+        target: EvalLoopTarget,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum ClaimCommand {
     #[command(about = "Claim a branch for the current agent")]
@@ -1669,6 +1792,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         },
         Some(Command::Status { json }) => observe::run_status(json),
         Some(Command::Familiars { id, json }) => observe::run_familiars(id.as_deref(), json),
+        Some(Command::EvalLoop { command }) => run_eval_loop_command(command),
         Some(Command::Skills { json }) => observe::run_skills(json),
         Some(Command::Device { command }) => match command {
             DeviceCommand::List { json } => mobile_memory::device::run_list(json),
@@ -1892,6 +2016,65 @@ fn run_setup_command(
 
 fn setup_candidate_commit() -> String {
     env!("COVEN_BUILD_COMMIT").to_owned()
+}
+
+fn run_eval_loop_command(command: EvalLoopCommand) -> Result<()> {
+    use eval_loop_cli as elc;
+    fn resolve(target: &EvalLoopTarget) -> Result<(PathBuf, String)> {
+        let ws = elc::resolve_workspace(target.workspace.clone(), target.familiar.clone())?;
+        Ok((ws, target.track.clone()))
+    }
+    let outcome = match command {
+        EvalLoopCommand::Init { target, test_pct } => {
+            let (ws, track) = resolve(&target)?;
+            elc::init(&ws, &track, test_pct)?
+        }
+        EvalLoopCommand::Noise { command } => match command {
+            EvalLoopNoiseCommand::Start { target, runs } => {
+                let (ws, track) = resolve(&target)?;
+                elc::noise_start(&ws, &track, runs)?
+            }
+            EvalLoopNoiseCommand::Finalize { target } => {
+                let (ws, track) = resolve(&target)?;
+                elc::noise_finalize(&ws, &track)?
+            }
+        },
+        EvalLoopCommand::Begin {
+            target,
+            from_run_json,
+            ack_unreviewed,
+        } => {
+            let (ws, track) = resolve(&target)?;
+            elc::begin(&ws, &track, from_run_json, ack_unreviewed)?
+        }
+        EvalLoopCommand::Cases { target, split } => {
+            let (ws, track) = resolve(&target)?;
+            elc::cases(&ws, &track, &split)?
+        }
+        EvalLoopCommand::Decide { target } => {
+            let (ws, track) = resolve(&target)?;
+            elc::decide(&ws, &track)?
+        }
+        EvalLoopCommand::Ack { target } => {
+            let (ws, track) = resolve(&target)?;
+            elc::ack(&ws, &track)?
+        }
+        EvalLoopCommand::Status { target, last } => {
+            let (ws, track) = resolve(&target)?;
+            elc::status(&ws, &track, last)?
+        }
+    };
+    let mut stdout = io::stdout().lock();
+    writeln!(
+        stdout,
+        "{}",
+        serde_json::to_string_pretty(&outcome.to_json())?
+    )?;
+    stdout.flush()?;
+    if outcome.is_refused() {
+        std::process::exit(elc::EXIT_REFUSED);
+    }
+    Ok(())
 }
 
 fn maintenance_participant_from_value(

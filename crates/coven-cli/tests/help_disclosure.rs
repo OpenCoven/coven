@@ -35,6 +35,7 @@ const PUBLIC_COMMANDS: &[&str] = &[
     "kill",
     "familiars",
     "skills",
+    "eval-loop",
     "memory",
     "research",
     "calls",
@@ -378,6 +379,12 @@ fn full_help_json_has_stable_schema_routes_and_no_ansi() -> anyhow::Result<()> {
         "https://docs.opencoven.ai/docs/reference/cli-setup"
     );
 
+    let eval_loop = command_from_json(&json, "eval-loop").expect("eval-loop command");
+    assert_eq!(
+        eval_loop["docsUrl"],
+        "https://docs.opencoven.ai/docs/reference/api#skills-eval-loop"
+    );
+
     let status = command_from_json(&json, "status").expect("status command");
     assert_eq!(
         status["docsUrl"],
@@ -441,6 +448,7 @@ fn full_help_json_has_stable_schema_routes_and_no_ansi() -> anyhow::Result<()> {
                     || url.starts_with("https://docs.opencoven.ai/docs/daemon/")
                     || url.starts_with("https://docs.opencoven.ai/docs/memory-models")
                     || url == "https://docs.opencoven.ai/docs/reference/cli-setup"
+                    || url == "https://docs.opencoven.ai/docs/reference/api#skills-eval-loop"
                     || url == "https://docs.opencoven.ai/docs/reference/troubleshooting"
                     || url == "https://docs.opencoven.ai/docs/reference/support"
                     || url == "https://docs.opencoven.ai/docs/cli"
