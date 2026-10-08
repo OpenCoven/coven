@@ -502,6 +502,31 @@ staged edit. On approval, any logged edits in the proposal append their
 | POST | `/api/v1/skills/eval-loop/:familiarId/run` | Enqueue an eval-loop run (`{ track? }`, default `synthesis`). | `202 { ok, runId, track }` | `400`, `409 run_in_progress` |
 | DELETE | `/api/v1/skills/eval-loop/:familiarId/run-lock` | Clear a stale run lock (`{ force? }`). | `{ ok, cleared, familiarId }` | `409 lock_not_stale` |
 
+`state` is additive across schema versions. Rows written by the v2 driver
+(`coven eval-loop decide`) carry `metricTrainBefore`, `metricTrainAfter`,
+`noiseFloor`, `evalSetHash`, `decisionReason`, and `runId`; v1 rows omit them.
+In v2 rows `metricBefore`/`metricAfter`/`delta` are the held-out **test**
+split. `state` also includes `totalSkipped` and `skips[]` (refused `begin`
+attempts from `eval-loop/skips.jsonl`, never counted as iterations) and
+`noise[]` (one entry per track with an `evals/<track>/noise.json`). A workspace
+with only `skips.jsonl` is treated as active. The daemon never drives the loop;
+it reads what the CLI writes.
+
+The CLI serializes run mutations across tracks and validates the run ID and
+track before adopting or releasing a run. In Git workspaces, commit your
+proposal before requesting `cases --split test`. That command binds scoring
+to the commit and evaluation inputs; `decide` refuses dirty or changed
+proposals. Calibration and iteration state also fingerprint the split
+configuration and judge rubric. Changing either requires recalibration.
+
+Each `noise start` returns fresh `write_test_passes_to` and `write_train_to`
+paths. Write scores to those returned paths. Calibration records the measured
+implementation, and `begin` permits subsequent commits only when changes are
+confined to loop bookkeeping. If `noise finalize` or `decide` fails while
+publishing files, repair the filesystem error and retry the same command.
+It resumes the recorded result without counting the acceptance twice or
+reapplying a completed calibration over newer state.
+
 ## Store
 
 | Method | Path | Purpose | Success |

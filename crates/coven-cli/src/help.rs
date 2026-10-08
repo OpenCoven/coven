@@ -121,6 +121,7 @@ const HELP_GROUPS: &[HelpGroupSpec] = &[
         commands: &[
             HelpCommandSpec::new("familiars", "/cli/observe"),
             HelpCommandSpec::new("skills", "/cli/observe"),
+            HelpCommandSpec::new("eval-loop", "/reference/api#skills-eval-loop"),
             HelpCommandSpec::new("memory", "/memory-models"),
             HelpCommandSpec::new("research", "/cli/observe"),
             HelpCommandSpec::new("calls", "/cli/observe"),
