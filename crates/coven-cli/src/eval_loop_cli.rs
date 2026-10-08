@@ -2669,6 +2669,8 @@ mod tests {
         };
         fs::write(l.ws.join("SOUL.md"), "v0\n").unwrap();
         g(&["init", "-q"]);
+        // Keep the reset assertion independent of the host's checkout line endings.
+        g(&["config", "--local", "core.autocrlf", "false"]);
         g(&["add", "."]);
         g(&["commit", "-q", "-m", "base"]);
         establish_baseline(&l, 0.70, 0.60);
