@@ -1755,6 +1755,11 @@ mod tests {
         let out = init(&ws, "prompt", 30).unwrap();
         assert!(!out.is_refused());
         let l = Layout::new(&ws, "prompt").unwrap();
+        // Keep fixture splits reproducible: a random salt can put fewer than the
+        // required ten of sixty cases in the holdout set. This yields 19 test / 41 train.
+        let mut config: TrackConfig = read_json(&l.config()).unwrap();
+        config.salt = "eval-loop-test-fixture".into();
+        write_json(&l.config(), &config).unwrap();
         let lines: Vec<String> = (0..count)
             .map(|i| {
                 case(
