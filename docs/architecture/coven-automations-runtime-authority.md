@@ -8,8 +8,9 @@ source_adjacent_reason: "Records the trust decisions and staged integration requ
 
 # Coven Automations Runtime Authority: trust decisions
 
-Status: maintainer decisions recorded 2026-10-03; slices 1–5
-implemented, Runtime Authority not yet constructed
+Status: maintainer decisions recorded 2026-10-03; slices 1 to 6
+implemented. Runtime Authority is constructed for routines that declare
+authority, and only an R0 read grant launches. It is not yet advertised.
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
 OpenCoven/coven-runtimes#48 (terminal observations), #858 (certification)
@@ -18,9 +19,9 @@ Runtime Authority binds each automation run to an authenticated principal, an
 exact familiar revision, a Threads authorization decision and a runtime
 descriptor, and settles a launched run only from authenticated terminal
 evidence. The contract, the immutable sidecar, the Ed25519 verifiers (#1192)
-and the evidence consumer (#1193) have landed. Production still constructs no
-Runtime Authority, because four producers had no owner. These are the
-maintainer's decisions on them.
+and the evidence consumer (#1193) have landed. The trusted adapter composes
+the producers for scheduled routines that declare authority. The decisions
+below define their ownership and remaining integration requirements.
 
 ## Decisions
 
@@ -228,9 +229,10 @@ These follow from Decision 3 and were decided on 2026-10-04 for slice 4.
 
   It matches the reference on the profile's 44 evaluation vectors, and a
   differential test compares the two on about 39,000 mutants of those vectors.
-  Both run in coven-threads. The other 86 vectors (approvals, lifecycle,
-  consumption snapshots, proposals, evidence reads and dispatch) are ported
-  with slices 6 and 7, which use them. Coven pins the crate by revision.
+  Both run in coven-threads. Slice 6 ported the other 86 vectors (approvals,
+  lifecycle, consumption snapshots, proposals, evidence reads and dispatch):
+  all 130 now match, over about 78,000 mutants. Coven pins the crate by
+  revision.
 - **The daemon signs requests for the owner.** The profile authenticates each
   request by a `principal`-role key bound to the exact principal it speaks
   for. The daemon therefore holds a fifth role key, `owner-principal`, bound to
@@ -361,6 +363,33 @@ unadvertised until slice 6.
    Construct Runtime Authority only for definitions that declare authority,
    launch only what an envelope enforces, apply the #857 approval policy for
    R3 and R4, and advertise the profile only once its conformance passes.
+
+   As built, `TrustedAuthority` serves a routine that declares authority. It
+   works inside the runner's launch transaction, and the dispatch provisions
+   every role key before that transaction opens, because the producers inside
+   it only load keys. For each attempt it:
+   - checks the owner activation of the current revision;
+   - picks the envelope that enforces the grant;
+   - issues a familiar binding, verified by the Familiar Contract;
+   - decides the Threads request, with the activation as the recurring grant.
+
+   It then verifies the dispatch bundle against a Threads-signed consumption
+   snapshot, consumes the decision, and signs the binding. The snapshot covers
+   the adoptions and consumption that bear on this dispatch, and Coven's
+   store keeps them unique.
+
+   Only a `permit` dispatches:
+   - a grant no envelope enforces gets `RuntimeDowngrade`;
+   - a `requires_approval` decision gets `ApprovalRequired`, because
+     approvals are slice 7;
+   - R2 is refused by the profile, because a routine cannot yet declare the
+     safeguards R2 requires.
+
+   Manual runs remain refused until the Runtime Authority grant integration
+   for `occurrence.runNow.v1` lands.
+   Settlement verifies terminal evidence with the terminal-observer keys, so
+   a clean R0 run settles from its own evidence with a signed receipt. The
+   capability is not advertised yet: conformance comes first.
 7. **Held commands, then approvals.** The five versioned commands #1054
    holds for #857:
    - `occurrence.runNow.v1`;
