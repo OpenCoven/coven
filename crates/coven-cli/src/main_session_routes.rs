@@ -1193,7 +1193,11 @@ description = "Builds and debugs."
             body["mainSession"]["familiarId"],
             DEFAULT_MAIN_SESSION_FAMILIAR_ID
         );
-        assert_eq!(body["mainSession"]["projectRoot"], h.root);
+        let canonical = crate::project::canonical_project_root(Path::new(&h.root)).unwrap();
+        assert_eq!(
+            body["mainSession"]["projectRoot"],
+            canonical.to_string_lossy().as_ref()
+        );
         assert_eq!(body["session"]["conversation_id"], conversation);
         assert_eq!(body["session"]["title"], HOME_TITLE);
 
