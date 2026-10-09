@@ -528,6 +528,8 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::main_session::MAIN_SESSIONS_SCHEMA_SQL)
         .context("failed to initialize main_sessions schema")?;
     crate::main_session::ensure_main_session_columns(conn)?;
+    conn.execute_batch(crate::main_session_notices::SESSION_NOTICES_SCHEMA_SQL)
+        .context("failed to initialize session_notices schema")?;
     conn.execute_batch(crate::automations::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
         .context("failed to initialize automation_definitions schema")?;
     crate::automations::store::ensure_definition_command_columns(conn)?;

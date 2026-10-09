@@ -1059,6 +1059,50 @@ diagnostics, cleans up the rejected launch, and performs the rollover and one
 fresh retry automatically. Automatic rollover compares the complete pointer
 generation so a concurrently replaced binding cannot be rotated away.
 
+### Runtime notices (the main-session inbox)
+
+Daemon components can post a **notice** into a scope's main session: an
+automation that finished, a hub job that returned, a handoff that was
+acknowledged. Notices are stored per scope (`session_notices`) and are the
+"sub-agents report back into Home" path. Posting is daemon-internal in this
+version; an authenticated local-client route is a separate decision.
+
+Delivery happens in one of two ways, and never silently:
+
+- **Drained on the next turn.** `POST /main-session/turn` reads every pending
+  notice for its scope, oldest first, and prepends them to the prompt as a
+  runtime-notice prelude. The notices are marked delivered (with the session
+  id that received them) only once the prompt has reached a process, so a
+  turn that is refused, busy, or has its launch retained leaves them pending.
+- **Delivered as their own turn.** When a notice is posted while the bound
+  stream process is idle, every pending notice for the scope is sent as a
+  single prelude-only message under the scope gate. Each submitted stream
+  turn remains busy until its terminal result record arrives. A notice
+  posted mid-turn stays in the durable inbox for the next turn. Unknown
+  runtime state, a live one-shot process, a pending startup, or no live
+  process also leaves the notice queued.
+
+The prelude is explicit, untrusted framing. Each notice is wrapped as
+
+```text
+[Coven runtime notice: <created_at> <source_kind>[:<source_id>]]
+  <body, every line indented>
+[End of Coven runtime notice]
+```
+
+under a fixed header that says the notices came from daemon components, not
+the user. Notice bodies are sanitized before rendering: control characters
+other than newline and tab are dropped, and any body line that imitates the
+framing is escaped, so a notice can neither close its own block early nor open
+another. The user's text follows the prelude verbatim. A notice is never
+presented as user or system text.
+
+Pending notices are capped at 20 per scope: a 21st pending notice drops the
+oldest. A notice posted with a `context_key` replaces any pending notice with
+the same key, so a source that reports repeatedly on one subject leaves only
+its latest word. Delivered notices are kept as history and are never
+replaced or capped away. Notice bodies are limited to 16 KiB.
+
 ## Psyche execution binding contract (`v1`)
 
 Coven binds a session at launch to an immutable, opaque

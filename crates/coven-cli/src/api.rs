@@ -671,6 +671,12 @@ pub trait SessionRuntime {
         Ok(Some(false))
     }
 
+    /// Whether a live stream has completed all submitted turns. Unknown
+    /// runtimes must keep unsolicited notices queued.
+    fn live_session_is_idle(&self, _session_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 

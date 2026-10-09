@@ -50,6 +50,7 @@ use crate::{
         self, MainSessionRecord, MainSessionSettings, RotatedMainSession, StaleIdRotation,
         DEFAULT_MAIN_SESSION_FAMILIAR_ID, DEFAULT_MAIN_SESSION_HARNESS, INSTANCE_MAIN_SCOPE_KEY,
     },
+    main_session_notices,
     request_authority::RequestAuthority,
     store,
 };
@@ -306,6 +307,19 @@ pub(crate) fn turn(
         Ok(prompt) => prompt,
         Err(error) => return invalid_request(error),
     };
+    // Drain the inbox (coven#1178): pending notices ride ahead of the user's
+    // text as an explicit runtime-notice prelude. They are marked delivered
+    // only once this prompt has reached a process, so a refused turn leaves
+    // them pending for the next one.
+    let pending_notices = main_session_notices::pending_notices(&conn, &scope)?;
+    let prompt = main_session_notices::compose_turn_prompt(
+        main_session_notices::render_prelude(&pending_notices).as_deref(),
+        &prompt,
+    );
+    let pending_notice_ids: Vec<String> = pending_notices
+        .into_iter()
+        .map(|notice| notice.id)
+        .collect();
     // `created` is the store's verdict from the IMMEDIATE transaction inside
     // `resolve_main_session`, not `existing.is_none()`: two first turns can
     // both read `None`, but only one of them creates the pointer, and only
@@ -387,6 +401,12 @@ pub(crate) fn turn(
             let response =
                 crate::api::record_input(coven_home, &session.id, Some(&input_body), runtime)?;
             if response.status == 202 {
+                main_session_notices::mark_delivered(
+                    &conn,
+                    &pending_notice_ids,
+                    &session.id,
+                    &current_timestamp(),
+                )?;
                 return json_response(
                     202,
                     &json!({
@@ -576,6 +596,12 @@ pub(crate) fn turn(
         }
         let session = store::get_session(&conn, &session.id)?
             .context("bound main-session row disappeared")?;
+        main_session_notices::mark_delivered(
+            &conn,
+            &pending_notice_ids,
+            &session.id,
+            &current_timestamp(),
+        )?;
         return json_response(
             201,
             &json!({
@@ -772,6 +798,7 @@ mod tests {
         inputs: RefCell<Vec<(String, String)>>,
         kills: RefCell<Vec<String>>,
         retain_ownership: std::cell::Cell<bool>,
+        busy: std::cell::Cell<bool>,
         startup_outcomes:
             RefCell<std::collections::VecDeque<crate::main_session_start::StartupOutcome>>,
         /// Runs inside `launch_session`, i.e. between a turn's launch and its
@@ -819,6 +846,10 @@ mod tests {
                 .map(|launch| {
                     !self.retain_ownership.get() && launch.launch_mode == HarnessLaunchMode::Stream
                 }))
+        }
+
+        fn live_session_is_idle(&self, session_id: &str) -> Result<bool> {
+            Ok(self.live_session_accepts_turn(session_id)? == Some(true) && !self.busy.get())
         }
 
         fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
@@ -1245,6 +1276,315 @@ description = "Builds and debugs."
             *h.runtime.inputs.borrow(),
             vec![(session_id, "and again".to_string())]
         );
+    }
+
+    fn post(h: &Home, text: &str) -> main_session_notices::NoticeOutcome {
+        main_session_notices::post_notice(
+            &h.home,
+            &h.runtime,
+            &main_session_notices::NewNotice {
+                scope_key: INSTANCE_MAIN_SCOPE_KEY,
+                source_kind: "automation",
+                source_id: Some("nightly"),
+                text,
+                context_key: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn pending_texts(h: &Home) -> Vec<String> {
+        let conn = store::open_store(&store_path(&h.home)).unwrap();
+        main_session_notices::pending_notices(&conn, INSTANCE_MAIN_SCOPE_KEY)
+            .unwrap()
+            .into_iter()
+            .map(|notice| notice.text)
+            .collect()
+    }
+
+    #[test]
+    fn a_notice_posted_while_the_stream_session_is_idle_arrives_as_its_own_turn() {
+        let h = home();
+        let first = first_turn(&h);
+        let session_id = first["session"]["id"].as_str().unwrap().to_string();
+
+        let outcome = post(&h, "the nightly run finished");
+        let main_session_notices::NoticeOutcome::Delivered {
+            session_id: delivered_to,
+            delivered,
+            ..
+        } = outcome
+        else {
+            panic!("expected immediate delivery, got {outcome:?}");
+        };
+        assert_eq!(delivered_to, session_id);
+        assert_eq!(delivered, 1);
+        let inputs = h.runtime.inputs.borrow();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].0, session_id);
+        assert!(
+            inputs[0].1.starts_with("Coven runtime notices follow."),
+            "{}",
+            inputs[0].1
+        );
+        assert!(inputs[0]
+            .1
+            .contains("[Coven runtime notice: ")
+            && inputs[0].1.contains(" automation:nightly]\n  the nightly run finished\n[End of Coven runtime notice]"),
+            "{}",
+            inputs[0].1
+        );
+        assert!(pending_texts(&h).is_empty());
+        drop(inputs);
+
+        // Delivered means delivered: the next user turn carries no prelude.
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(json!({ "prompt": "thanks" })),
+        );
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(h.runtime.inputs.borrow()[1].1, "thanks");
+    }
+
+    #[test]
+    fn replacement_waits_until_in_flight_notice_has_a_delivery_receipt() {
+        use std::sync::mpsc;
+        struct NoticeRuntime {
+            entered: Option<mpsc::Sender<()>>,
+            release: Option<mpsc::Receiver<()>>,
+        }
+        impl SessionRuntime for NoticeRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                unreachable!()
+            }
+            fn live_session_is_idle(&self, _: &str) -> Result<bool> {
+                Ok(true)
+            }
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                if let Some(entered) = &self.entered {
+                    entered.send(())?;
+                }
+                if let Some(release) = &self.release {
+                    release.recv_timeout(std::time::Duration::from_secs(60))?;
+                }
+                Ok(())
+            }
+            fn kill_session(&self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+        }
+        let h = home();
+        first_turn(&h);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let home = h.home.clone();
+        let first = std::thread::spawn(move || {
+            main_session_notices::post_notice(
+                &home,
+                &NoticeRuntime {
+                    entered: Some(entered_tx),
+                    release: Some(release_rx),
+                },
+                &main_session_notices::NewNotice {
+                    scope_key: INSTANCE_MAIN_SCOPE_KEY,
+                    source_kind: "automation",
+                    source_id: Some("job"),
+                    text: "first update",
+                    context_key: Some("job"),
+                },
+            )
+        });
+        // Hang guards only: channel events establish the ordering.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        let home = h.home.clone();
+        let second = std::thread::spawn(move || {
+            main_session_notices::BEFORE_NOTICE_GATE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    gate_tx.send(()).unwrap();
+                }));
+            });
+            main_session_notices::post_notice(
+                &home,
+                &NoticeRuntime {
+                    entered: None,
+                    release: None,
+                },
+                &main_session_notices::NewNotice {
+                    scope_key: INSTANCE_MAIN_SCOPE_KEY,
+                    source_kind: "automation",
+                    source_id: Some("job"),
+                    text: "replacement",
+                    context_key: Some("job"),
+                },
+            )
+        });
+        gate_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        release_tx.send(()).unwrap();
+        for outcome in [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ] {
+            assert!(
+                matches!(
+                    outcome,
+                    main_session_notices::NoticeOutcome::Delivered { delivered: 1, .. }
+                ),
+                "{outcome:?}"
+            );
+        }
+        let conn = store::open_store(&store_path(&h.home)).unwrap();
+        let receipts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_notices WHERE context_key = 'job' AND delivered_at IS NOT NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            receipts, 2,
+            "replacement must preserve the first delivery receipt"
+        );
+    }
+
+    #[test]
+    fn a_notice_posted_during_a_stream_turn_stays_in_the_durable_inbox() {
+        let h = home();
+        first_turn(&h);
+        h.runtime.busy.set(true);
+        let outcome = post(&h, "background job finished");
+        assert!(
+            matches!(
+                outcome,
+                main_session_notices::NoticeOutcome::Queued { pending: 1, .. }
+            ),
+            "{outcome:?}"
+        );
+        assert!(h.runtime.inputs.borrow().is_empty());
+        assert_eq!(pending_texts(&h), vec!["background job finished"]);
+        h.runtime.busy.set(false);
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(json!({"prompt":"next turn"})),
+        );
+        assert_eq!(status, 202, "{body}");
+        assert!(h.runtime.inputs.borrow()[0]
+            .1
+            .contains("background job finished"));
+        assert!(pending_texts(&h).is_empty());
+    }
+
+    #[test]
+    fn a_notice_posted_while_busy_is_drained_at_the_start_of_the_next_turn() {
+        let h = home();
+        // A running one-shot process does not accept input, so the inbox
+        // must hold the notice rather than write to its stdin.
+        let (status, first) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(json!({"prompt": "hello", "projectRoot": h.root, "harness": "codex"})),
+        );
+        assert_eq!(status, 201, "{first}");
+        let first_session = first["session"]["id"].as_str().unwrap().to_string();
+
+        let outcome = post(&h, "job 7 returned");
+        assert!(
+            matches!(
+                outcome,
+                main_session_notices::NoticeOutcome::Queued { pending: 1, .. }
+            ),
+            "{outcome:?}"
+        );
+        assert!(h.runtime.inputs.borrow().is_empty());
+        assert_eq!(pending_texts(&h), vec!["job 7 returned".to_string()]);
+
+        set_status(&h, &first_session, "exited");
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(json!({ "prompt": "what came back?" })),
+        );
+        assert_eq!(status, 201, "{body}");
+        let second_session = body["session"]["id"].as_str().unwrap().to_string();
+        let launches = h.runtime.launches.borrow();
+        assert_eq!(launches.len(), 2);
+        let prompt = &launches[1].prompt;
+        assert!(
+            prompt.starts_with("Coven runtime notices follow."),
+            "{prompt}"
+        );
+        assert!(prompt.contains("\n  job 7 returned\n"), "{prompt}");
+        assert!(
+            prompt.ends_with("[End of Coven runtime notice]\n\nwhat came back?"),
+            "{prompt}"
+        );
+        drop(launches);
+        assert!(pending_texts(&h).is_empty());
+        let conn = store::open_store(&store_path(&h.home)).unwrap();
+        let delivered_to: Option<String> = conn
+            .query_row(
+                "SELECT delivered_session_id FROM session_notices WHERE text = 'job 7 returned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivered_to.as_deref(), Some(second_session.as_str()));
+    }
+
+    #[test]
+    fn notices_queued_before_any_pointer_ride_the_first_turn() {
+        let h = home();
+        let outcome = post(&h, "early bird");
+        assert!(
+            matches!(
+                outcome,
+                main_session_notices::NoticeOutcome::Queued { pending: 1, .. }
+            ),
+            "{outcome:?}"
+        );
+        let first = first_turn(&h);
+        let prompt = h.runtime.launches.borrow()[0].prompt.clone();
+        assert!(prompt.contains("\n  early bird\n"), "{prompt}");
+        assert!(prompt.ends_with("\n\nhello"), "{prompt}");
+        assert!(pending_texts(&h).is_empty());
+        let conn = store::open_store(&store_path(&h.home)).unwrap();
+        let delivered_to: Option<String> = conn
+            .query_row(
+                "SELECT delivered_session_id FROM session_notices WHERE text = 'early bird'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            delivered_to,
+            first["session"]["id"].as_str().map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn a_refused_turn_leaves_its_notices_pending() {
+        let h = home();
+        first_turn(&h);
+        h.runtime.retain_ownership.set(true);
+        post(&h, "still waiting");
+        // The bound process no longer accepts input and the launch is refused
+        // with retained ownership, so nothing reached a process.
+        let (status, body) = call(
+            &h,
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(json!({ "prompt": "again" })),
+        );
+        assert_ne!(status, 202, "{body}");
+        assert_ne!(status, 201, "{body}");
+        assert_eq!(pending_texts(&h), vec!["still waiting".to_string()]);
     }
 
     #[test]

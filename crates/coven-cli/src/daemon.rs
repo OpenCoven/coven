@@ -482,6 +482,7 @@ struct LiveSessionHandle {
 
 struct LiveSessionRegistration {
     exited: AtomicBool,
+    stream_turns: Mutex<crate::stream_turn_state::StreamTurnState>,
     writer: Mutex<Option<crate::maintenance_gate::WriterLease>>,
     event_order: Mutex<()>,
 }
@@ -490,9 +491,27 @@ impl LiveSessionRegistration {
     fn new(writer: Option<crate::maintenance_gate::WriterLease>) -> Self {
         Self {
             exited: AtomicBool::new(false),
+            stream_turns: Mutex::new(crate::stream_turn_state::StreamTurnState::default()),
             writer: Mutex::new(writer),
             event_order: Mutex::new(()),
         }
+    }
+
+    fn stream_status_observer(
+        self: &Arc<Self>,
+        mut startup: Option<pty_runner::PipedStatusObserver>,
+    ) -> pty_runner::PipedStatusObserver {
+        let registration = Arc::clone(self);
+        Box::new(move |source, bytes| {
+            if source == pty_runner::PipedOutputSource::Stdout {
+                if let Ok(mut turns) = registration.stream_turns.lock() {
+                    turns.observe(bytes);
+                }
+            }
+            if let Some(observer) = startup.as_mut() {
+                observer(source, bytes);
+            }
+        })
     }
 
     fn release_writer(&self) {
@@ -1092,6 +1111,25 @@ impl SessionRuntime for LiveSessionRuntime {
         ))
     }
 
+    fn live_session_is_idle(&self, session_id: &str) -> Result<bool> {
+        if self.live_session_accepts_turn(session_id)? != Some(true) {
+            return Ok(false);
+        }
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+        let Some(session) = sessions.get(session_id) else {
+            return Ok(false);
+        };
+        let turns = session
+            .registration
+            .stream_turns
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stream turn state lock poisoned"))?;
+        Ok(turns.idle())
+    }
+
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
         LiveSessionRuntime::send_input(self, session_id, payload)
     }
@@ -1424,6 +1462,11 @@ impl LiveSessionRuntime {
             .get(&launch.id)
             .cloned();
         let status_observer = startup.as_ref().map(|monitor| monitor.status_observer());
+        let status_observer = if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
+            Some(registration.stream_status_observer(status_observer))
+        } else {
+            status_observer
+        };
         let observer = Some(match startup.as_ref() {
             Some(monitor) => monitor.observe_exit(observer),
             None => observer,
@@ -1620,6 +1663,12 @@ impl LiveSessionRuntime {
                 session.kind == LiveSessionKind::Stream,
                 "initial stream prompt requires a stream process"
             );
+            session
+                .registration
+                .stream_turns
+                .lock()
+                .map_err(|_| anyhow::anyhow!("stream turn state lock poisoned"))?
+                .begin();
             Arc::clone(&session.input)
         };
         let prompt = launch.prompt.clone();
@@ -1724,7 +1773,7 @@ impl LiveSessionRuntime {
         // write indefinitely; holding the global map lock during that
         // would wedge every other session op (including a concurrent
         // /kill that wants to recover from exactly this state).
-        let (kind, input) = {
+        let (kind, input, registration) = {
             let sessions = self
                 .sessions
                 .lock()
@@ -1734,7 +1783,11 @@ impl LiveSessionRuntime {
                     session_id: session_id.to_string(),
                 })
             })?;
-            (session.kind, std::sync::Arc::clone(&session.input))
+            (
+                session.kind,
+                Arc::clone(&session.input),
+                Arc::clone(&session.registration),
+            )
         };
         let mut input = input
             .lock()
@@ -1749,6 +1802,13 @@ impl LiveSessionRuntime {
                     .context("failed to flush live session input")?;
             }
             LiveSessionKind::Stream => {
+                // Reserve before writing: the child may return a result before
+                // the write call returns. Failed writes leave idleness unknown.
+                registration
+                    .stream_turns
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("stream turn state lock poisoned"))?
+                    .begin();
                 write_stream_message(input.as_mut(), data)?;
             }
         }
@@ -10094,6 +10154,40 @@ mod tests {
                 .unwrap()
                 .remove(&launch.id);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn main_session_idle_requires_results_for_all_submitted_stream_turns() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let (_output, registration) =
+            runtime.observer_for_session_with_writer("stream".into(), None);
+        let mut observer = registration.stream_status_observer(None);
+        runtime.register_kind_with_registration(
+            "stream".into(),
+            LiveSessionKind::Stream,
+            Box::new(Vec::<u8>::new()),
+            Box::new(RecordingKiller::default()),
+            registration,
+        )?;
+        assert!(runtime.live_session_is_idle("stream")?);
+        runtime.send_input("stream", &json!({"data":"first"}))?;
+        runtime.send_input("stream", &json!({"data":"queued turn"}))?;
+        assert!(!runtime.live_session_is_idle("stream")?);
+        observer(
+            pty_runner::PipedOutputSource::Stdout,
+            b"{\"type\":\"result\"}\n",
+        );
+        assert!(!runtime.live_session_is_idle("stream")?);
+        observer(pty_runner::PipedOutputSource::Stdout, b"{\"type\":\"res");
+        observer(pty_runner::PipedOutputSource::Stderr, b"diagnostic\n");
+        assert!(!runtime.live_session_is_idle("stream")?);
+        observer(
+            pty_runner::PipedOutputSource::Stdout,
+            b"ult\",\"is_error\":true}\n",
+        );
+        assert!(runtime.live_session_is_idle("stream")?);
+        assert!(!runtime.live_session_is_idle("absent")?);
         Ok(())
     }
 
