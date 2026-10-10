@@ -1,6 +1,14 @@
+---
+title: "Coven Automations Runtime Authority trust decisions"
+summary: "Daemon signing roles, authority producers, and the ordered Runtime Authority implementation."
+read_when:
+  - Implementing authority producers or verifying their trust boundaries
+source_adjacent_reason: "Records the trust decisions and staged integration requirements for the Rust authority modules in this repository."
+---
+
 # Coven Automations Runtime Authority: trust decisions
 
-Status: maintainer decisions recorded 2026-10-03; slices 1–3 and 5
+Status: maintainer decisions recorded 2026-10-03; slices 1–5
 implemented, Runtime Authority not yet constructed
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
@@ -116,7 +124,7 @@ Each kind of signed artifact has its own role key:
 | `dispatch-authority` | The `AutomationExecutionBinding` at dispatch, and the receipt-correlated `AutomationReceiptAuthorityEvidence` at settlement |
 | `familiar-binding` | Familiar Contract embodiment bindings (decision 2) |
 | `threads-decision` | Threads automation-authority decisions (decision 3) |
-| `owner-principal` | Authorization requests on the owner principal's behalf (producer remains gated by #1212) |
+| `owner-principal` | Threads authorization requests on the owner principal's behalf (decision 3) |
 | `terminal-observer` | Runtime terminal observations (decision 4) |
 
 The execution binding and the receipt authority evidence share one key: both
@@ -207,6 +215,48 @@ What it does not protect against:
   verifiers check it against the trusted set built from the daemon's key
   records.
 
+## Threads decisions
+
+These follow from Decision 3 and were decided on 2026-10-04 for slice 4.
+
+- **The evaluator belongs to Threads.** `coven_threads_core::automation_authority`
+  ports the evaluation half of the profile's reference validator:
+  - strict parsing and canonical digests;
+  - request validation and adoption;
+  - `evaluateAuthorization`;
+  - decision verification and consumption.
+
+  It matches the reference on the profile's 44 evaluation vectors, and a
+  differential test compares the two on about 39,000 mutants of those vectors.
+  Both run in coven-threads. The other 86 vectors (approvals, lifecycle,
+  consumption snapshots, proposals, evidence reads and dispatch) are ported
+  with slices 6 and 7, which use them. Coven pins the crate by revision.
+- **The daemon signs requests for the owner.** The profile authenticates each
+  request by a `principal`-role key bound to the exact principal it speaks
+  for. The daemon therefore holds a fifth role key, `owner-principal`, bound to
+  the owner principal id from Decision 1. Per-principal keys stay a later
+  decision, with multiple principals.
+- **What a decision records.** The daemon stamps the owner principal and its
+  own clock onto each request and policy snapshot, and never takes either from
+  the caller. It signs the request and the decision, then verifies the pair as
+  an independent verifier would, before recording it. Recorded decisions are
+  immutable and retained. A request id, nonce or adoption key is decided at
+  most once. When a decision is read back, it is verified again under the keys
+  as they stood when it was made, so revoking a key invalidates what that key
+  signed.
+- **Digests stay the profile's.** In the execution binding, the decision and
+  manifest digests are the profile's own: SHA-256 over the JCS text, with the
+  artifact's domain prefix. That is how Threads and its approval records name
+  them.
+- **What slice 6 still composes.** The request's inputs:
+  - each opted-in definition's declared action, risk class, capabilities and
+    scopes;
+  - the policy and protected-surface manifest, with their digests;
+  - the recurring grants;
+  - the side-effect class, which the profile does not carry.
+
+  Slice 6 also consumes each decision at dispatch.
+
 ## Runtime Authority launches
 
 These were decided on 2026-10-04 for slice 6.
@@ -279,8 +329,10 @@ unadvertised until slice 6.
 4. **Threads decisions.** Evaluate the automation-authority profile in Rust:
    risk class, capability grant, denial and downgrade, the approval
    requirement, and degrade-to-proposal. Put the evaluator in
-   `coven-threads-core` and bump the pinned revision. Sign decisions with the
-   decision key, and run all 130 profile vectors.
+   `coven-threads-core` and bump the pinned revision. Its 44 evaluation
+   vectors run there. Add the `owner-principal` key. Then sign requests with
+   it and decisions with the decision key, verify each pair, and record it,
+   as set out under "Threads decisions" above.
 5. **Terminal observer.** The session executor records a durable observation
    before publication: exit, timeout or cancellation, and capabilities,
    effects and results as observed-complete, observed-partial or unknown,

@@ -58,6 +58,10 @@ pub mod stream_observation;
 // Wired into every session ending; it observes only Runtime Authority attempts,
 // which nothing dispatches until the trusted adapter (coven#857 slice 6).
 pub mod terminal_observer;
+// Threads decisions: the trusted adapter (coven#857 slice 6) is their only
+// caller, so nothing in production decides yet.
+#[allow(dead_code)]
+pub mod threads_decisions;
 pub mod transition_events;
 #[cfg(test)]
 mod transport_authority_tests;
