@@ -203,7 +203,7 @@
         "importedFrom": {
           "type": "string",
           "maxLength": 200,
-          "description": "Legacy source marker for imported definitions, for example codex.automation.toml."
+          "description": "Legacy source marker for imported definitions, for example codex-automation-toml for the #816 Codex import. The Codex importers currently record this marker only as payload.importedFrom on the definition's definition.imported event and leave provenance unset on the stored definition."
         }
       }
     },

@@ -282,7 +282,7 @@
       "properties": {
         "source": {
           "enum": ["codex-automation-toml"],
-          "description": "v1 supports the #816 non-destructive Codex import; imported definitions are created PAUSED (draft in v1 lifecycle terms) with provenance.importedFrom set."
+          "description": "v1 supports the #816 non-destructive Codex import. Imported definitions are created in the draft lifecycle state as v1-managed rows, and the source marker codex-automation-toml is recorded as payload.importedFrom on each definition's definition.imported event, not on provenance.importedFrom. The unversioned coven.automations.import action is a separate implementation that creates paused rows and takes no adoptionKey or dryRun."
         },
         "dryRun": {
           "type": "boolean",
