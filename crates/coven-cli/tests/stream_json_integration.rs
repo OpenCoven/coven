@@ -840,6 +840,353 @@ printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"ty
     );
 }
 
+/// #1268: a stream-capable harness that exits non-zero without a `result`
+/// frame (coven-code's one-shot `--output-format stream-json` path reports
+/// the failure on stderr) must not reach clients as `error: null`, and the
+/// session ledger must hold a terminal event that explains the failure.
+#[cfg(unix)]
+#[test]
+fn native_stream_failure_populates_error_and_records_exit_event() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home).expect("failed to create coven home");
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).expect("failed to create project root");
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin).expect("failed to create fake bin dir");
+    let fake_claude = fake_bin.join("claude");
+    fs::write(
+        &fake_claude,
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"text_delta","text":"partial answer","session_id":"native-claude-id"}'
+printf '%s\n' '{"type":"error","error":"provider returned 529 overloaded"}' >&2
+exit 1
+"#,
+    )
+    .expect("failed to write fake claude");
+    let mut permissions = fs::metadata(&fake_claude)
+        .expect("failed to stat fake claude")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_claude, permissions).expect("failed to chmod fake claude");
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .expect("test PATH should be joinable");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["run", "claude", "--stream-json", "--", "explain yourself"])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to spawn coven binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "harness exit code is relayed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("provider returned 529 overloaded"),
+        "harness stderr is still forwarded live: {stderr}"
+    );
+
+    let stdout = String::from_utf8(out.stdout).expect("stdout not utf-8");
+    let frames: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("Coven stdout must remain JSONL"))
+        .collect();
+    let result = frames.last().expect("result frame should be last");
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["subtype"], "error_during_execution");
+    assert_eq!(result["is_error"], true);
+    let error = result["error"]
+        .as_str()
+        .expect("a failed result frame carries error text, not null");
+    assert!(
+        error.starts_with("claude exited with code 1: "),
+        "error names the harness and exit code: {error}"
+    );
+    assert!(
+        error.contains("provider returned 529 overloaded"),
+        "error carries the stderr tail: {error}"
+    );
+
+    let session_id = frames[0]["session_id"]
+        .as_str()
+        .expect("system frame carries stable Coven id");
+    let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3"))
+        .expect("failed to open Coven session ledger");
+    let (status, exit_code): (String, Option<i32>) = conn
+        .query_row(
+            "SELECT status, exit_code FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("failed session should remain in the ledger");
+    assert_eq!(status, "failed");
+    assert_eq!(exit_code, Some(1));
+
+    let mut statement = conn
+        .prepare("SELECT kind, payload_json FROM events WHERE session_id = ?1 ORDER BY rowid")
+        .expect("events table is queryable");
+    let events: Vec<(String, String)> = statement
+        .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("events query runs")
+        .collect::<Result<_, _>>()
+        .expect("events rows decode");
+    assert_eq!(
+        events.len(),
+        1,
+        "the native passthrough records exactly one terminal event: {events:?}"
+    );
+    assert_eq!(events[0].0, "exit");
+    let payload: serde_json::Value =
+        serde_json::from_str(&events[0].1).expect("exit payload is JSON");
+    assert_eq!(payload["status"], "failed");
+    assert_eq!(payload["exitCode"], 1);
+    assert_eq!(
+        payload["error"], error,
+        "ledger and stream agree on the cause"
+    );
+}
+
+/// Exercise failed native runs with a generous hang guard and file-backed
+/// output, so a regression cannot fill the test parent's own capture pipes.
+#[cfg(unix)]
+fn native_failure_fixture(
+    script: &str,
+    privacy: Option<&str>,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    native_failure_fixture_with_stderr(script, privacy, false, false)
+}
+
+#[cfg(unix)]
+fn native_failure_fixture_with_stderr(
+    script: &str,
+    privacy: Option<&str>,
+    undrained: bool,
+    close_stdout: bool,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    if let Some(privacy) = privacy {
+        fs::write(home.join("privacy.toml"), privacy).unwrap();
+    }
+    let executable = bin.join("claude");
+    fs::write(&executable, format!("#!/bin/sh\n{script}\n")).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .unwrap();
+    let stdout_path = root.path().join("stdout");
+    let stderr_path = root.path().join("stderr");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["run", "claude", "--stream-json", "--", "fixture"])
+        .current_dir(root.path())
+        .env("COVEN_HOME", &home)
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(if close_stdout {
+            Stdio::piped()
+        } else {
+            fs::File::create(&stdout_path).unwrap().into()
+        })
+        .stderr(if undrained {
+            Stdio::piped()
+        } else {
+            fs::File::create(&stderr_path).unwrap().into()
+        })
+        .spawn()
+        .unwrap();
+    if close_stdout {
+        use std::io::BufRead;
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut init = String::new();
+        output.read_line(&mut init).unwrap();
+        fs::write(&stdout_path, init).unwrap();
+        drop(output);
+        // Release the fake harness only after the output consumer is gone.
+        fs::write(root.path().join("release-harness"), "ready").unwrap();
+    }
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        // Hang guard only; these fixtures do not assert a latency contract.
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("native failure fixture hung after {:?}", started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    let frames: Vec<serde_json::Value> = fs::read_to_string(stdout_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let result = frames.last().unwrap().clone();
+    let conn = rusqlite::Connection::open(home.join("coven.sqlite3")).unwrap();
+    let mut query = conn
+        .prepare("SELECT payload_json FROM events WHERE kind = 'exit'")
+        .unwrap();
+    let events = query
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect();
+    (result, events)
+}
+
+#[cfg(unix)]
+#[test]
+fn native_failure_regression_malformed_stream_persists_terminal_event() {
+    let (result, events) = native_failure_fixture("printf '%s\\n' 'not-json'\nexit 1", None);
+    assert_eq!(result["is_error"], true);
+    assert_eq!(
+        events.len(),
+        1,
+        "protocol failure must leave terminal evidence"
+    );
+    assert_eq!(events[0]["status"], "failed");
+    assert_eq!(events[0]["error"], result["error"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_failure_regression_custom_privacy_redacts_synthesized_error() {
+    let (result, events) = native_failure_fixture(
+        "printf '%s\\n' 'provider rejected fixture-private-value' >&2\nexit 1",
+        Some("extra_patterns = ['fixture-private-value']\n"),
+    );
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        !error.contains("fixture-private-value"),
+        "new error frame leaked configured private text"
+    );
+    assert!(error.contains("[REDACTED]"));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["error"], result["error"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_failure_regression_harness_error_is_bounded_utf8() {
+    let error = "é".repeat(5000);
+    let frame = serde_json::json!({"type":"result", "is_error":true, "error":error});
+    let (result, events) =
+        native_failure_fixture(&format!("printf '%s\\n' '{frame}'\nexit 1"), None);
+    assert!(
+        result["error"].as_str().unwrap().len() <= 4096,
+        "terminal diagnostic exceeds byte budget"
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["error"], result["error"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_failure_regression_undrained_stderr_does_not_wedge_supervisor() {
+    let (result, events) = native_failure_fixture_with_stderr(
+        "dd if=/dev/zero bs=1024 count=2048 >&2 2>/dev/null\nexit 1",
+        None,
+        true,
+        false,
+    );
+    assert_eq!(result["is_error"], true);
+    assert_eq!(events.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_failure_regression_closed_stdout_keeps_exit_event() {
+    let (_, events) = native_failure_fixture_with_stderr(
+        "while [ ! -f release-harness ]; do sleep 0.01; done\nexit 1",
+        None,
+        false,
+        true,
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "a disconnected consumer must not suppress persistence"
+    );
+    assert_eq!(events[0]["status"], "failed");
+    assert_eq!(events[0]["exitCode"], 1);
+    assert!(events[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("exited with code 1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_failure_regression_oversized_stderr_does_not_expose_secret_suffix() {
+    let private = format!("BEGIN{}PRIVATE_SUFFIX_END", "x".repeat(6000));
+    let (result, events) = native_failure_fixture(
+        &format!("printf '%s\\n' '{private}' >&2\nexit 1"),
+        Some("extra_patterns = ['BEGIN[^\\n]+END']\n"),
+    );
+    assert!(
+        !result["error"].as_str().unwrap().contains("PRIVATE_SUFFIX"),
+        "truncation removed redaction context"
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["error"], result["error"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_failure_regression_multiline_private_material_is_redacted_before_tail_selection() {
+    let diagnostic = format!(
+        "-----{} PRIVATE KEY-----\n{}PRIVATE_BODY_MARKER\n-----{} PRIVATE KEY-----",
+        "BEGIN",
+        "fixture-body-line\n".repeat(400),
+        "END",
+    );
+    let (result, events) =
+        native_failure_fixture(&format!("printf '%s\\n' '{diagnostic}' >&2\nexit 1"), None);
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        !error.contains("PRIVATE_BODY_MARKER") && !error.contains("fixture-body-line"),
+        "tail selection lost multiline redaction context"
+    );
+    assert!(error.contains("[REDACTED]"));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["error"], result["error"]);
+}
+
 #[cfg(unix)]
 #[test]
 fn command_construction_failure_marks_created_row_failed() {

@@ -149,6 +149,9 @@ enum PendingEvent {
     Exit {
         session_id: String,
         result: PtyRunResult,
+        /// Why the session failed, when the launcher knows (#1268). Bounded
+        /// by the launcher; absent from the payload when `None`.
+        error: Option<String>,
         created_at: String,
     },
 }
@@ -309,11 +312,23 @@ impl EventWriter {
     /// Insert the terminal event only after every prior accepted event has
     /// committed.  The caller receives database failures synchronously.
     pub fn record_exit(&self, session_id: &str, result: PtyRunResult) -> Result<()> {
-        let bytes = EVENT_OVERHEAD_BYTES;
+        self.record_exit_with_error(session_id, result, None)
+    }
+
+    /// `record_exit` with the failure text a client should see after the
+    /// fact, so a `failed` session's ledger explains itself (#1268).
+    pub fn record_exit_with_error(
+        &self,
+        session_id: &str,
+        result: PtyRunResult,
+        error: Option<String>,
+    ) -> Result<()> {
+        let bytes = EVENT_OVERHEAD_BYTES.saturating_add(error.as_ref().map_or(0, String::len));
         self.enqueue_critical(
             PendingEvent::Exit {
                 session_id: session_id.to_string(),
                 result,
+                error,
                 created_at: crate::api::current_timestamp(),
             },
             bytes,
@@ -734,10 +749,18 @@ fn commit_batch(
             PendingEvent::Exit {
                 session_id,
                 result,
+                error,
                 created_at,
             } => {
                 flush_output(&transaction, coven_home, &mut output, &mut committed)?;
-                record_exit(&transaction, coven_home, session_id, result, created_at)?;
+                record_exit(
+                    &transaction,
+                    coven_home,
+                    session_id,
+                    result,
+                    error.as_deref(),
+                    created_at,
+                )?;
                 committed += 1;
             }
         }
@@ -846,6 +869,7 @@ fn record_exit(
     coven_home: &std::path::Path,
     session_id: &str,
     result: &PtyRunResult,
+    error: Option<&str>,
     created_at: &str,
 ) -> Result<()> {
     if let Some(session) = store::get_session(conn, session_id)? {
@@ -887,14 +911,24 @@ fn record_exit(
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             kind: "exit".to_string(),
-            payload_json: serde_json::to_string(&json!({
-                "status": result.status,
-                "exitCode": result.exit_code,
-            }))
-            .context("failed to serialize exit event payload")?,
+            payload_json: serde_json::to_string(&exit_event_payload(result, error))
+                .context("failed to serialize exit event payload")?,
             created_at: created_at.to_string(),
         },
     )
+}
+
+/// `{status, exitCode}` plus `error` only when the launcher supplied one, so
+/// existing exit payloads stay byte-for-byte unchanged.
+fn exit_event_payload(result: &PtyRunResult, error: Option<&str>) -> serde_json::Value {
+    let mut payload = json!({
+        "status": result.status,
+        "exitCode": result.exit_code,
+    });
+    if let Some(error) = error {
+        payload["error"] = serde_json::Value::String(error.to_string());
+    }
+    payload
 }
 
 fn release_capacity(shared: &Arc<Shared>, events: usize, bytes: usize) {
@@ -1496,6 +1530,56 @@ mod tests {
     }
 
     #[test]
+    fn exit_event_payload_carries_optional_error_text() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("plain-exit"))?;
+        store::insert_session(&conn, &session("explained-exit"))?;
+        let writer = EventWriter::start(home.path().to_path_buf())?;
+
+        writer.record_exit(
+            "plain-exit",
+            PtyRunResult {
+                status: "failed",
+                exit_code: Some(1),
+            },
+        )?;
+        writer.record_exit_with_error(
+            "explained-exit",
+            PtyRunResult {
+                status: "failed",
+                exit_code: Some(1),
+            },
+            Some("coven-code exited with code 1: provider refused".to_string()),
+        )?;
+
+        let plain = store::list_events(&conn, "plain-exit")?;
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].kind, "exit");
+        let plain_payload: serde_json::Value = serde_json::from_str(&plain[0].payload_json)?;
+        assert_eq!(
+            plain_payload,
+            serde_json::json!({ "status": "failed", "exitCode": 1 }),
+            "an exit without an explanation keeps the existing payload shape"
+        );
+
+        let explained = store::list_events(&conn, "explained-exit")?;
+        assert_eq!(explained.len(), 1);
+        assert_eq!(explained[0].kind, "exit");
+        let explained_payload: serde_json::Value =
+            serde_json::from_str(&explained[0].payload_json)?;
+        assert_eq!(
+            explained_payload,
+            serde_json::json!({
+                "status": "failed",
+                "exitCode": 1,
+                "error": "coven-code exited with code 1: provider refused",
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn terminal_exit_rejects_nonterminal_status() -> Result<()> {
         let home = tempfile::tempdir()?;
         let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
@@ -1509,6 +1593,7 @@ mod tests {
                 status: "running",
                 exit_code: None,
             },
+            None,
             "2026-08-04T00:01:00Z",
         )
         .expect_err("terminal exit must reject a nonterminal status");
@@ -1960,6 +2045,7 @@ mod tests {
                 status: "completed",
                 exit_code: Some(0),
             },
+            None,
             "2026-09-03T12:30:00.000Z",
         )
         .unwrap();
@@ -1999,6 +2085,7 @@ mod tests {
                 status: "failed",
                 exit_code: Some(1),
             },
+            None,
             "2026-09-03T12:30:00.000Z",
         )
         .unwrap();
