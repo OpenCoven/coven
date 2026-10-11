@@ -249,7 +249,11 @@
         "lifecycleState": {
           "enum": ["draft", "paused", "active", "disabled", "invalid", "tombstoned"]
         },
-        "importedFrom": { "type": "string", "maxLength": 200 }
+        "importedFrom": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Legacy source marker set on definition.imported, for example codex-automation-toml for the #816 Codex import. This event payload is where the Codex importers record the marker; they do not set provenance.importedFrom on the stored definition."
+        }
       }
     },
     "transitionPayload": {
