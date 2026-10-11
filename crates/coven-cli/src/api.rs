@@ -11427,6 +11427,29 @@ fn decide_threads_proposal_inner(
             }),
         );
     }
+    // An unscheduled authority-lane proposal binds its approval to the stored
+    // writer label, and that label is the client-asserted
+    // `principalKeyFingerprint` string, not a verified signature. No supported
+    // intake stages this lane, so a new approval is refused outright. The
+    // proposal stays pending: the owner can still reject it, and retention
+    // expiry still applies. Recovery of an apply that already began is not
+    // affected.
+    if decision == "approve"
+        && applying_state.is_none()
+        && review_kind == PendingReviewKind::Authority
+        && scheduled.is_none()
+    {
+        claim.restore_pending(&document)?;
+        audit_reservation.finish()?;
+        return json_response(
+            409,
+            &json!({
+                "blocked": true,
+                "why": "legacy-authority-approval-unsupported",
+                "proposalId": proposal_id,
+            }),
+        );
+    }
     let decision_semantics = match proposal_decision_semantics(
         scheduled,
         decision,
