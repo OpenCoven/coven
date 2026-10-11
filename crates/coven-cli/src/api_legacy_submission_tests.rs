@@ -175,6 +175,92 @@ fn legacy_authority_intake_records_its_own_bound_submission() -> Result<()> {
 }
 
 #[test]
+fn legacy_authority_tier_one_approval_is_refused_even_with_the_principal_label() -> Result<()> {
+    // An unscheduled authority-lane proposal stores the client-asserted
+    // `principalKeyFingerprint` as its writer label. That label is not a
+    // signature, so it must never decide whether an approval may apply.
+    let temp = tempfile::tempdir()?;
+    let home = temp.path();
+    let workspace = seed_warded_familiar(home)?;
+    std::fs::create_dir_all(workspace.join("reviewed"))?;
+    std::fs::write(workspace.join("reviewed/skill.md"), LEGACY_BEFORE)?;
+    let config = ward::WardConfig::load(&workspace)?.context("Ward")?;
+    let conn = store::open_store(&store_path(home))?;
+    let edits = [ward::FileEdit::new(
+        "reviewed/skill.md",
+        LEGACY_AFTER.as_bytes().to_vec(),
+    )];
+    let targets = ["reviewed/skill.md".to_string()];
+    let authorization = ward::Authorization::signed_by("fpr-val");
+    let request = crate::threads_gate::GateRequest {
+        coven_home: home,
+        familiar_id: "sage",
+        workspace: &workspace,
+        config: &config,
+        edits: &edits,
+        gated_targets: &targets,
+        authorization: &authorization,
+    };
+    assert!(matches!(
+        crate::threads_gate::gate_protected_edits(&conn, &request)?.outcome,
+        crate::threads_gate::GateOutcome::Permitted
+    ));
+    std::fs::write(workspace.join("reviewed/skill.md"), "out of band")?;
+    let report = crate::threads_gate::gate_protected_edits(&conn, &request)?;
+    let crate::threads_gate::GateOutcome::Staged {
+        pending_path,
+        proposal_id,
+    } = report.outcome
+    else {
+        anyhow::bail!("expected authority staging, got {:?}", report.outcome);
+    };
+    let document = read_pending_proposal_document(&pending_path)?;
+    assert!(document.scheduled().is_none());
+    assert!(document.review_kind.is_none());
+    assert_eq!(document.pending().writer.as_str(), "principal:fpr-val");
+    // Staging needed a frayed thread. A later approved apply that leaves the
+    // surface at its current bytes advances the baseline and mends that fray,
+    // which is the only state in which the stored writer label is consulted.
+    crate::threads_gate::advance_surface_baseline_from_bytes(
+        &conn,
+        "sage",
+        &workspace,
+        "reviewed/skill.md",
+        b"out of band",
+    )?;
+
+    let response = decide_threads_proposal(home, &proposal_id, "approve", Some("{}"))?;
+    assert_eq!(
+        response.status, 409,
+        "a client-asserted writer label approved a legacy proposal: {}",
+        response.body
+    );
+    let body: Value = serde_json::from_str(&response.body)?;
+    assert_eq!(
+        body["why"], "legacy-authority-approval-unsupported",
+        "{}",
+        response.body
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+        "out of band"
+    );
+    assert!(proposal_terminal_event(&conn, &proposal_id)?.is_none());
+    assert!(load_proposal_apply_intent(&conn, &proposal_id)?.is_none());
+    assert!(pending_path.exists(), "refused approval must leave the proposal pending");
+
+    // The refusal leaves the owner a way out: rejection still terminalizes it.
+    let rejected = decide_threads_proposal(home, &proposal_id, "reject", Some("{}"))?;
+    assert_eq!(rejected.status, 200, "{}", rejected.body);
+    assert!(proposal_terminal_event(&conn, &proposal_id)?.is_some());
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+        "out of band"
+    );
+    Ok(())
+}
+
+#[test]
 fn legacy_submission_receipt_must_match_before_claiming() -> Result<()> {
     for mutation in [
         "DELETE FROM ward_audit WHERE proposal_id=?1",
