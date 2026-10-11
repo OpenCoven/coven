@@ -136,6 +136,15 @@ mod suite {
     /// Hang guard only: far above anything load can produce.
     const HANG_GUARD: Duration = Duration::from_secs(20);
 
+    // The real lease includes launch preparation. A 600 ms lease
+    // could expire before Running on a contended host (observed at 1.24 s).
+    // These two expiry tests must first launch their explicitly lingering
+    // worker, then prove the guardian fences it. No production budget changes.
+    const EXPIRY_TEST_LEASE_MS: u64 = 10_000;
+    // Discriminating bound near the midpoint between the 10 s lease and the
+    // worker's 120 s sleep; this still rejects a worker that exits on its own.
+    const EXPIRY_TERMINATION_BOUND: Duration = Duration::from_secs(60);
+
     struct Workspace {
         root: PathBuf,
     }
@@ -201,12 +210,31 @@ mod suite {
         let (driver, clock) = SeatbeltDriver::seal(ws.config(), worker).expect("seal");
         let binding = coven_restricted_runtime::Driver::binding(&driver);
         let mut ctl = Controller::new(driver, clock, binding);
+        let started = Instant::now();
         assert_eq!(ctl.start(lease_ms).unwrap().state, State::Preparing);
-        assert_eq!(ctl.advance().unwrap().state, State::Installing);
-        assert_eq!(ctl.advance().unwrap().state, State::RetainingLifetime);
-        assert_eq!(ctl.advance().unwrap().state, State::Revalidating);
-        let status = ctl.advance().unwrap();
-        assert_eq!(status.state, State::Running);
+        // The lease also bounds the launch handoff: a guardian that reads
+        // `spawn` after its deadline refuses the worker, which surfaces here
+        // as a backend error rather than at the lease assertion. Name the
+        // stage, the elapsed time and the lease so that failure is readable.
+        let stage = |ctl: &mut Ctl, expected: State| {
+            let status = ctl.advance().unwrap_or_else(|error| {
+                panic!(
+                    "advance toward {expected:?} failed with {error:?} after {:?} of a {lease_ms} ms lease",
+                    started.elapsed()
+                )
+            });
+            assert_eq!(
+                status.state,
+                expected,
+                "after {:?} of a {lease_ms} ms lease",
+                started.elapsed()
+            );
+            status
+        };
+        stage(&mut ctl, State::Installing);
+        stage(&mut ctl, State::RetainingLifetime);
+        stage(&mut ctl, State::Revalidating);
+        let status = stage(&mut ctl, State::Running);
         assert_eq!(status.execution, Execution::PossiblyStarted);
         (ctl, controller_stdio)
     }
@@ -284,7 +312,7 @@ mod suite {
     fn guardian_kills_the_group_when_the_lease_expires() {
         let ws = Workspace::create("expiry", true);
         let started = Instant::now();
-        let (mut ctl, mut stdio) = launch(&ws, 600);
+        let (mut ctl, mut stdio) = launch(&ws, EXPIRY_TEST_LEASE_MS);
         let report = read_all(&mut stdio.stdout);
         assert_line(&report, "inside-read:allowed");
         let status = await_termination(&mut ctl);
@@ -295,9 +323,10 @@ mod suite {
             "{status:?} after {elapsed:?}"
         );
         // Discriminating bound: a lingering worker sleeps 120s; only the
-        // guardian's autonomous SIGKILL at the 600ms lease can end it early.
+        // guardian's autonomous SIGKILL at lease expiry can end it early.
         assert!(
-            elapsed >= Duration::from_millis(600) && elapsed < Duration::from_secs(10),
+            elapsed >= Duration::from_millis(EXPIRY_TEST_LEASE_MS)
+                && elapsed < EXPIRY_TERMINATION_BOUND,
             "terminated after {elapsed:?}"
         );
         assert_eq!(
@@ -537,7 +566,7 @@ mod suite {
         // Lease expiry.
         let ws = Workspace::create_with("escape-lease", true, true);
         let started = Instant::now();
-        let (mut ctl, mut stdio) = launch(&ws, 600);
+        let (mut ctl, mut stdio) = launch(&ws, EXPIRY_TEST_LEASE_MS);
         let report = read_report(&mut stdio.stdout);
         assert_line(&report, "escape:allowed");
         let pid = worker_pid(&report);
@@ -545,7 +574,8 @@ mod suite {
         let elapsed = started.elapsed();
         assert_eq!(status.reason, Some(Error::Expired), "{status:?}");
         assert!(
-            elapsed >= Duration::from_millis(600) && elapsed < Duration::from_secs(10),
+            elapsed >= Duration::from_millis(EXPIRY_TEST_LEASE_MS)
+                && elapsed < EXPIRY_TERMINATION_BOUND,
             "terminated after {elapsed:?}"
         );
         assert!(

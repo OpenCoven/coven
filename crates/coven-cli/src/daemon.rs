@@ -9134,7 +9134,9 @@ mod tests {
                 let _ = exit_tx.send(result);
             }),
         };
-        let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+        let mut piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+        let (writing_tx, writing_rx) = std::sync::mpsc::channel();
+        piped.notify_prompt_write_started_for_test(writing_tx)?;
         let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
         let runtime = Arc::new(LiveSessionRuntime::default());
         let activation_runtime = Arc::clone(&runtime);
@@ -9149,32 +9151,38 @@ mod tests {
             });
             let _ = activation_tx.send(result);
         });
-        let registration_deadline = Instant::now() + Duration::from_secs(2);
-        while !runtime
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("blocked-prompt")
-        {
-            anyhow::ensure!(
-                Instant::now() < registration_deadline,
-                "piped prompt was not registered before its writer blocked"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        // Registration precedes prompt delivery inside `activate`, so the
+        // writer's entry event is the readiness signal; a registry poll on a
+        // clock was redundant and could only lose under load.
+        receive_prompt_delivery_phase(
+            &writing_rx,
+            "prompt writer entry before kill",
+            PROMPT_DELIVERY_HANG_GUARD,
+        )?;
+        anyhow::ensure!(
+            runtime
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key("blocked-prompt"),
+            "prompt delivery started before the piped session was registered"
+        );
 
         let started = Instant::now();
         SessionRuntime::kill_session(runtime.as_ref(), "blocked-prompt")?;
-        assert!(started.elapsed() < Duration::from_secs(2));
-        let activation = activation_rx.recv_timeout(Duration::from_secs(2))?;
+        let kill_elapsed = started.elapsed();
+        assert!(
+            kill_elapsed < Duration::from_secs(2),
+            "kill_session returned after {kill_elapsed:?}; the stop budget is two seconds"
+        );
+        let activation = activation_rx.recv_timeout(PROMPT_DELIVERY_HANG_GUARD)?;
         let error = activation.expect_err("cancellation must interrupt prompt delivery");
         let diagnostic = format!("{error:#}");
         assert!(
             diagnostic.contains("terminated") || diagnostic.contains("failed writing"),
             "{diagnostic}"
         );
-        let exit = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        let exit = exit_rx.recv_timeout(PROMPT_DELIVERY_HANG_GUARD)?;
         assert_eq!(exit.status, "failed", "{exit:?}");
         await_daemon_shutdown_descendant_exit(child_pid, "prompt cancellation")?;
         Ok(())
@@ -9419,28 +9427,29 @@ mod tests {
             let _ = response_tx.send(response);
         });
 
-        let session_id =
-            receive_prompt_launch_notification(&launched_rx, &response_rx, Duration::from_secs(2))?;
+        let session_id = receive_prompt_launch_notification(
+            &launched_rx,
+            &response_rx,
+            PROMPT_DELIVERY_HANG_GUARD,
+        )?;
         let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
-        let registration_deadline = Instant::now() + Duration::from_secs(2);
-        while !runtime
-            .inner
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(&session_id)
-        {
-            anyhow::ensure!(
-                Instant::now() < registration_deadline,
-                "API launch did not register before prompt delivery blocked"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // `activate` registers the session before it starts prompt delivery,
+        // so the writer's entry event already proves registration; polling
+        // the registry against a clock only added a race to lose.
         receive_prompt_delivery_phase(
             &writing_rx,
             "prompt writer entry before kill",
-            registration_deadline.saturating_duration_since(Instant::now()),
+            PROMPT_DELIVERY_HANG_GUARD,
         )?;
+        anyhow::ensure!(
+            runtime
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&session_id),
+            "prompt delivery for {session_id} started before the API launch registered it"
+        );
 
         let kill = crate::api::handle_request_with_runtime(
             "POST",
@@ -9454,7 +9463,7 @@ mod tests {
         let launch = receive_prompt_delivery_phase(
             &response_rx,
             "launch response after kill",
-            Duration::from_secs(2),
+            PROMPT_DELIVERY_HANG_GUARD,
         )?
         .context("API launch returned an error after concurrent kill")?;
         assert_eq!(launch.status, 500, "{}", launch.body);
@@ -9465,6 +9474,10 @@ mod tests {
         await_daemon_shutdown_descendant_exit(child_pid, "concurrent API cancellation")?;
         Ok(())
     }
+
+    // Setup and result delivery may wait for a contended CI scheduler. This
+    // hang guard is deliberately separate from the strict two-second kill budget.
+    const PROMPT_DELIVERY_HANG_GUARD: Duration = Duration::from_secs(30);
 
     fn receive_prompt_delivery_phase<T>(
         receiver: &std::sync::mpsc::Receiver<T>,
@@ -9626,20 +9639,29 @@ mod tests {
 
         let temp_dir = tempfile::tempdir()?;
         let pid_file = temp_dir.path().join("output-descendant.pid");
+        // With a marker, the fixture publishes the descendant pid only after
+        // the descendant has written to both inherited pipes, so waiting for
+        // the pid file waits for output readiness rather than for a clock.
+        let ready_marker = temp_dir.path().join("output-descendant.ready");
         let command = pty_runner::piped_prompt_probe_command(
             temp_dir.path(),
             "descendant-output",
             &pid_file.to_string_lossy(),
-            None,
+            Some(&ready_marker),
             Vec::new(),
         )?;
         let observed = Arc::new(AtomicUsize::new(0));
         let observer_count = Arc::clone(&observed);
+        let (output_tx, output_rx) = std::sync::mpsc::sync_channel(1);
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
         let observer = pty_runner::DetachedPtyObserver {
             on_output: Box::new(move |chunk| {
                 observer_count.fetch_add(chunk.len(), Ordering::AcqRel);
+                let _ = output_tx.try_send(());
             }),
-            on_exit: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
         };
         let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
         let descendant_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
@@ -9652,20 +9674,30 @@ mod tests {
             )
         })?;
 
-        let output_deadline = Instant::now() + Duration::from_secs(2);
-        while observed.load(Ordering::Acquire) == 0 {
-            anyhow::ensure!(
-                Instant::now() < output_deadline,
-                "output descendant did not emit its readiness output"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // The bytes were already in the pipes when the pid file appeared;
+        // this only waits for the parent-side drain thread to hand them to
+        // the observer. Hang guard, not a promptness claim.
+        receive_prompt_delivery_phase(
+            &output_rx,
+            "descendant output observer readiness",
+            PROMPT_DELIVERY_HANG_GUARD,
+        )?;
 
         let started = Instant::now();
         SessionRuntime::kill_session(&runtime, "output-descendant")?;
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let kill_elapsed = started.elapsed();
+        assert!(
+            kill_elapsed < Duration::from_secs(2),
+            "kill_session returned after {kill_elapsed:?}; the stop budget is two seconds"
+        );
         let count_at_return = observed.load(Ordering::Acquire);
-        std::thread::sleep(Duration::from_millis(100));
+        // on_exit follows joining both pipe drains, so no producer can append
+        // output after this receipt. A sleep cannot prove that final sequence.
+        receive_prompt_delivery_phase(
+            &exit_rx,
+            "pipe drains completed after kill",
+            PROMPT_DELIVERY_HANG_GUARD,
+        )?;
         assert_eq!(
             observed.load(Ordering::Acquire),
             count_at_return,
@@ -12814,9 +12846,15 @@ mod tests {
             temp_dir.path(),
             &AuthenticatedRecoveryController { recovered: None },
         );
+        let refusal = unavailable
+            .err()
+            .context("malformed identity without authenticated health must fail closed")?;
+        // The refusal must be the preserved parse error. An exhausted
+        // lifecycle deadline is also an error, and a bare `is_err` could not
+        // tell the two apart when this case failed on a loaded runner.
         assert!(
-            unavailable.is_err(),
-            "malformed identity without authenticated health must fail closed"
+            is_daemon_status_parse_error(&refusal),
+            "malformed identity must be refused for its parse error, got: {refusal:#}"
         );
         assert!(
             daemon_status_path(temp_dir.path()).exists(),
