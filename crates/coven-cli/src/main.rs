@@ -5208,6 +5208,7 @@ fn run_session(
     // construction; other non-stream harnesses take the captured PTY path so
     // stdout stays JSONL-only.
     if stream_harness_passthrough {
+        let privacy_config = privacy::load_config(&coven_home).unwrap_or_default();
         let stdout = io::stdout();
         let mut handle = stdout.lock();
         let stream_conversation_hint = if is_resume {
@@ -5235,19 +5236,31 @@ fn run_session(
             familiar_for_args,
             launch_options,
         );
-        let exit_code = command.and_then(|mut command| {
+        let stream_exit = command.and_then(|mut command| {
             apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
             pty_runner::stream_harness(
                 &command,
                 stream_json_input,
                 &selected_harness.id,
                 &record.id,
+                &privacy_config,
                 &mut handle,
             )
         });
         drop(handle);
-        let exit_code = match exit_code {
-            Ok(code) => code,
+        let persist_terminal = |status: &'static str, exit_code, failure| {
+            event_writer::EventWriter::start(coven_home.clone())
+                .and_then(|writer| {
+                    writer.record_exit_with_error(
+                        &record.id,
+                        pty_runner::PtyRunResult { status, exit_code },
+                        failure,
+                    )
+                })
+                .context("failed to persist terminal event after native stream run")
+        };
+        let stream_exit = match stream_exit {
+            Ok(exit) => exit,
             Err(error) => {
                 store::update_session_status(
                     &conn,
@@ -5256,21 +5269,41 @@ fn run_session(
                     None,
                     &current_timestamp(),
                 )?;
-                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                let failure =
+                    pty_runner::native_failure_text(&format!("{error:#}"), &privacy_config);
+                let persistence =
+                    persist_terminal(FAILED_SESSION_STATUS, None, Some(failure.clone()));
+                // The original protocol/runner error remains primary even if
+                // the consumer also closed stdout before the terminal frame.
+                let _ = emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
                     subtype: "error_during_execution".into(),
                     duration_ms: stream_started.elapsed().as_millis() as u64,
                     is_error: true,
                     num_turns: 1,
                     session_id: record.id.clone(),
                     harness_session_id: None,
-                    error: Some(format!("{error:#}")),
+                    error: Some(failure),
                     usage: None,
-                }))?;
+                }));
+                if let Err(persistence_error) = persistence {
+                    return Err(error.context(format!("{persistence_error:#}")));
+                }
                 return Err(error);
             }
         };
+        let exit_code = stream_exit.exit_code;
         let is_error = exit_code != 0;
         let status = if is_error { "failed" } else { "completed" };
+        // A non-zero exit without a harness `result` frame used to reach
+        // clients as `error: null` and leave the ledger empty (#1268). Carry
+        // the harness's own error text, or its exit code plus a bounded
+        // stderr tail, on both the result frame and the terminal event.
+        let failure = is_error.then(|| {
+            pty_runner::native_failure_text(
+                &stream_exit.failure_summary(&selected_harness.id),
+                &privacy_config,
+            )
+        });
         store::update_session_status(
             &conn,
             &record.id,
@@ -5278,7 +5311,10 @@ fn run_session(
             Some(exit_code),
             &current_timestamp(),
         )?;
-        emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+        // Persist independently of stdout delivery. A disconnected client
+        // must not erase terminal evidence from the session ledger.
+        let persistence = persist_terminal(status, Some(exit_code), failure.clone());
+        let emission = emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
             subtype: if is_error {
                 "error_during_execution".into()
             } else {
@@ -5289,9 +5325,11 @@ fn run_session(
             num_turns: 1,
             session_id: record.id.clone(),
             harness_session_id: None,
-            error: None,
+            error: failure.clone(),
             usage: None,
-        }))?;
+        }));
+        persistence?;
+        emission?;
         if archive {
             let archived_at = current_timestamp();
             store::archive_session(&conn, &record.id, &archived_at)?;

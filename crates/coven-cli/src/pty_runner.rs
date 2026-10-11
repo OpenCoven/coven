@@ -862,6 +862,14 @@ const CODEX_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CODEX_STDERR_TAIL_BYTES: usize = 8 * 1024;
 const NATIVE_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Upper bound on the harness stderr retained for a native stream's failure
+/// summary. Engine stderr can carry provider responses and other private
+/// detail, so only this trailing slice is ever relayed into the `result`
+/// frame and the session ledger; stderr itself is still forwarded live.
+const NATIVE_STDERR_TAIL_BYTES: usize = 4 * 1024;
+// Keep complete regex context before selecting the diagnostic tail. If this
+// budget is exceeded, omit stderr entirely instead of publishing a fragment.
+const NATIVE_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 
 // Supervised streams run in separate Unix sessions so Coven can clean up an
 // entire harness tree in one operation. That also means a TERM sent to Coven
@@ -3684,14 +3692,72 @@ pub fn run_piped_attached_captured(
 /// argv is built from the harness declaration (`stream_args`, continuity,
 /// model, sandbox, and identity handling); this runner only spawns it and
 /// normalizes each frame's top-level Coven session id before writing to `out`.
+/// Terminal evidence from a native stream-json harness run.
+///
+/// `exit_code` is the child's status; `harness_error` is the `error` (or
+/// Claude-shape `result`) text of the last failed `result` frame the harness
+/// emitted, if any; `stderr_tail` is the bounded trailing slice of its
+/// stderr. Together they let the caller explain a non-zero exit instead of
+/// relaying `error: null` (#1268).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeStreamExit {
+    pub exit_code: i32,
+    pub harness_error: Option<String>,
+    pub stderr_tail: String,
+}
+
+/// Redact before bounding: truncating raw text can remove the prefix that
+/// identifies a credential. Bound bytes at a UTF-8 boundary after redaction.
+pub fn native_failure_text(text: &str, config: &crate::privacy::PrivacyConfig) -> String {
+    truncate_native_diagnostic(crate::privacy::redact_text_with_config(text, config))
+}
+
+fn truncate_native_diagnostic(mut text: String) -> String {
+    if text.len() > NATIVE_STDERR_TAIL_BYTES {
+        let mut end = NATIVE_STDERR_TAIL_BYTES - "…".len();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
+impl NativeStreamExit {
+    /// One line a client can show for a failed run: the harness's own error
+    /// text when it reported one, otherwise the exit code with whatever the
+    /// harness last wrote to stderr (bounded by `NATIVE_STDERR_TAIL_BYTES`).
+    pub fn failure_summary(&self, harness_id: &str) -> String {
+        if let Some(error) = self
+            .harness_error
+            .as_deref()
+            .map(str::trim)
+            .filter(|error| !error.is_empty())
+        {
+            return truncate_native_diagnostic(error.to_string());
+        }
+        let stderr = self.stderr_tail.trim();
+        if stderr.is_empty() {
+            format!("{harness_id} exited with code {}", self.exit_code)
+        } else {
+            truncate_native_diagnostic(format!(
+                "{harness_id} exited with code {}: {stderr}",
+                self.exit_code
+            ))
+        }
+    }
+}
+
 pub fn stream_harness<W: Write>(
     command: &HarnessCommand,
     forward_stdin: bool,
     harness_id: &str,
     ledger_session_id: &str,
+    privacy: &crate::privacy::PrivacyConfig,
     out: &mut W,
-) -> Result<i32> {
-    stream_harness_with_program_and_env(
+) -> Result<NativeStreamExit> {
+    stream_harness_with_program_and_env_and_privacy(
         &command.program,
         &command.cwd,
         command.args.clone(),
@@ -3699,6 +3765,7 @@ pub fn stream_harness<W: Write>(
         forward_stdin,
         harness_id,
         ledger_session_id,
+        privacy,
         out,
     )
 }
@@ -3707,6 +3774,103 @@ enum NativeStreamMessage {
     Line(String),
     ReadError(String),
     Closed,
+    StderrClosed(String),
+    StderrForwarded,
+}
+
+// Use an owned OS descriptor instead of Stderr's process-wide mutex. A
+// blocked forwarding write must not prevent the CLI's final stderr flush.
+fn native_stderr_output() -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .ok()
+            .map(std::fs::File::from)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle;
+        io::stderr()
+            .as_handle()
+            .try_clone_to_owned()
+            .ok()
+            .map(std::fs::File::from)
+    }
+    #[cfg(not(any(unix, windows)))]
+    None
+}
+
+/// Capture complete stderr with bounded memory, then redact before selecting
+/// its tail. On overflow or read failure, omit stderr rather than publishing a
+/// fragment whose multiline credential delimiters may have been lost.
+/// Live forwarding has a separate bounded queue: a blocked parent's stderr
+/// must never stall child supervision or accumulate an unbounded backlog.
+fn spawn_native_stderr_reader(
+    stderr: std::process::ChildStderr,
+    sender: mpsc::Sender<NativeStreamMessage>,
+    privacy: crate::privacy::PrivacyConfig,
+) {
+    let (forward_sender, forward_receiver) = mpsc::sync_channel::<Vec<u8>>(8);
+    let forwarded = sender.clone();
+    let output = native_stderr_output();
+    thread::spawn(move || {
+        if let Some(mut output) = output {
+            for chunk in forward_receiver {
+                if output.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = forwarded.send(NativeStreamMessage::StderrForwarded);
+    });
+    thread::spawn(move || {
+        let mut reader = stderr;
+        let mut buffer = [0_u8; 1024];
+        let mut capture = Vec::new();
+        let mut omitted = false;
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    // Live stderr is best effort under backpressure; capture
+                    // continues even when the forwarding queue is full.
+                    let _ = forward_sender.try_send(buffer[..count].to_vec());
+                    if !omitted {
+                        if capture.len() + count <= NATIVE_STDERR_CAPTURE_BYTES {
+                            capture.extend_from_slice(&buffer[..count]);
+                        } else {
+                            capture.clear();
+                            omitted = true;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    capture.clear();
+                    omitted = true;
+                    break;
+                }
+            }
+        }
+        drop(forward_sender);
+        let tail = if omitted {
+            "[stderr diagnostic omitted: capture incomplete or over limit]".to_string()
+        } else {
+            let mut redacted = crate::privacy::redact_text_with_config(
+                &String::from_utf8_lossy(&capture),
+                &privacy,
+            );
+            let mut start = redacted.len().saturating_sub(NATIVE_STDERR_TAIL_BYTES);
+            while !redacted.is_char_boundary(start) {
+                start += 1;
+            }
+            redacted.split_off(start)
+        };
+        let _ = sender.send(NativeStreamMessage::StderrClosed(tail));
+    });
 }
 
 fn spawn_native_stdout_reader(
@@ -3792,11 +3956,35 @@ fn spawn_native_stdin_forwarder(child_stdin: std::process::ChildStdin, stopped: 
     });
 }
 
+/// The error text of a harness `result` frame that reports failure: the
+/// `error` string, or Claude's `result` string when `error` is absent.
+fn native_result_error(
+    object: &serde_json::Map<String, serde_json::Value>,
+    privacy: &crate::privacy::PrivacyConfig,
+) -> Option<String> {
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("result") {
+        return None;
+    }
+    if object.get("is_error").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    object
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| object.get("result").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| native_failure_text(text, privacy))
+}
+
 fn normalize_native_stream_line<W: Write>(
     line: &str,
     harness_id: &str,
     ledger_session_id: &str,
     out: &mut W,
+    harness_error: &mut Option<String>,
+    privacy: &crate::privacy::PrivacyConfig,
 ) -> Result<()> {
     if line.trim().is_empty() {
         return Ok(());
@@ -3806,6 +3994,9 @@ fn normalize_native_stream_line<W: Write>(
     let object = frame
         .as_object_mut()
         .with_context(|| format!("invalid JSON object from {harness_id} native stream"))?;
+    if let Some(error) = native_result_error(object, privacy) {
+        *harness_error = Some(error);
+    }
     if !object.contains_key("harness_session_id") {
         if let Some(native_session_id) = object
             .get("session_id")
@@ -3849,8 +4040,10 @@ fn stream_harness_with_program<W: Write>(
         ledger_session_id,
         out,
     )
+    .map(|exit| exit.exit_code)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn stream_harness_with_program_and_env<W: Write>(
     program: &str,
@@ -3861,7 +4054,32 @@ fn stream_harness_with_program_and_env<W: Write>(
     harness_id: &str,
     ledger_session_id: &str,
     out: &mut W,
-) -> Result<i32> {
+) -> Result<NativeStreamExit> {
+    stream_harness_with_program_and_env_and_privacy(
+        program,
+        cwd,
+        args,
+        env_overrides,
+        forward_stdin,
+        harness_id,
+        ledger_session_id,
+        &crate::privacy::PrivacyConfig::default(),
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_harness_with_program_and_env_and_privacy<W: Write>(
+    program: &str,
+    cwd: &Path,
+    args: Vec<String>,
+    env_overrides: &[(String, Option<String>)],
+    forward_stdin: bool,
+    harness_id: &str,
+    ledger_session_id: &str,
+    privacy: &crate::privacy::PrivacyConfig,
+    out: &mut W,
+) -> Result<NativeStreamExit> {
     let mut command = std::process::Command::new(program);
     command
         .args(&args)
@@ -3872,7 +4090,9 @@ fn stream_harness_with_program_and_env<W: Write>(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // Capture a bounded diagnostic while a separate worker forwards
+        // stderr without blocking the supervisor.
+        .stderr(Stdio::piped());
     for (name, value) in env_overrides {
         match value {
             Some(value) => {
@@ -3939,8 +4159,18 @@ fn stream_harness_with_program_and_env<W: Write>(
         None
     };
 
+    let child_stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("stderr requested but {harness_id} has no piped stderr");
+        }
+    };
+
     let (sender, receiver) = mpsc::channel();
-    spawn_native_stdout_reader(child_stdout, sender);
+    spawn_native_stdout_reader(child_stdout, sender.clone());
+    spawn_native_stderr_reader(child_stderr, sender, privacy.clone());
     if let Some(child_stdin) = child_stdin {
         spawn_native_stdin_forwarder(child_stdin, Arc::clone(&stdin_stopped));
     }
@@ -3961,6 +4191,10 @@ fn stream_harness_with_program_and_env<W: Write>(
     #[cfg(not(unix))]
     let mut status = None;
     let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut stderr_tail = String::new();
+    let mut stderr_forwarded = false;
+    let mut harness_error: Option<String> = None;
     let mut post_exit_deadline = None;
     let result = (|| -> Result<()> {
         if let Some(signal) = activation_signal {
@@ -4001,7 +4235,7 @@ fn stream_harness_with_program_and_env<W: Write>(
                 }
             }
 
-            if direct_child_exited && stdout_closed {
+            if direct_child_exited && stdout_closed && stderr_closed && stderr_forwarded {
                 break;
             }
             let timeout = post_exit_deadline
@@ -4014,22 +4248,36 @@ fn stream_harness_with_program_and_env<W: Write>(
             if direct_child_exited && timeout.is_zero() {
                 break;
             }
-            if stdout_closed {
+            if stdout_closed && stderr_closed && stderr_forwarded {
                 thread::sleep(timeout.min(CODEX_CHILD_POLL_INTERVAL));
                 continue;
             }
 
             match receiver.recv_timeout(timeout.min(CODEX_CHILD_POLL_INTERVAL)) {
                 Ok(NativeStreamMessage::Line(line)) => {
-                    normalize_native_stream_line(&line, harness_id, ledger_session_id, out)?;
+                    normalize_native_stream_line(
+                        &line,
+                        harness_id,
+                        ledger_session_id,
+                        out,
+                        &mut harness_error,
+                        privacy,
+                    )?;
                 }
                 Ok(NativeStreamMessage::ReadError(error)) => {
                     anyhow::bail!("reading {harness_id} stdout: {error}");
                 }
                 Ok(NativeStreamMessage::Closed) => stdout_closed = true,
+                Ok(NativeStreamMessage::StderrClosed(tail)) => {
+                    stderr_tail = tail;
+                    stderr_closed = true;
+                }
+                Ok(NativeStreamMessage::StderrForwarded) => stderr_forwarded = true,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     stdout_closed = true;
+                    stderr_closed = true;
+                    stderr_forwarded = true;
                 }
             }
         }
@@ -4055,7 +4303,11 @@ fn stream_harness_with_program_and_env<W: Write>(
         Some(status) => status,
         None => waited_status?,
     };
-    Ok(status.code().unwrap_or(1))
+    Ok(NativeStreamExit {
+        exit_code: status.code().unwrap_or(1),
+        harness_error,
+        stderr_tail,
+    })
 }
 
 #[cfg(test)]
@@ -8025,6 +8277,114 @@ exit 0
             "nested-unchanged"
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_stream_failure_summary_carries_exit_code_and_stderr_tail() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("fake-failing-stream");
+        // Mirrors coven-code's one-shot `--output-format stream-json` path:
+        // the engine reports the terminal failure on stderr as a JSON line
+        // and exits 1 without a `result` frame on stdout (#1268).
+        std::fs::write(
+            &fake_harness,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"text_delta","text":"partial","session_id":"native"}'
+printf '%s\n' 'noise before the failure' >&2
+printf '%s\n' '{"type":"error","error":"provider refused the request"}' >&2
+exit 1
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let mut out = Vec::new();
+        let exit = stream_harness_with_program_and_env(
+            fake_harness.to_str().unwrap(),
+            temp_dir.path(),
+            Vec::new(),
+            &[],
+            false,
+            "streamy",
+            "ledger-current",
+            &mut out,
+        )?;
+
+        assert_eq!(exit.exit_code, 1);
+        assert_eq!(exit.harness_error, None);
+        assert!(
+            exit.stderr_tail.contains("provider refused the request"),
+            "stderr tail should keep the engine's error line: {:?}",
+            exit.stderr_tail
+        );
+        let summary = exit.failure_summary("streamy");
+        assert!(
+            summary.starts_with("streamy exited with code 1: "),
+            "summary should name the harness and exit code: {summary}"
+        );
+        assert!(
+            summary.contains("provider refused the request"),
+            "summary should carry the stderr tail: {summary}"
+        );
+        let frame: serde_json::Value = serde_json::from_slice(&out)?;
+        assert_eq!(frame["type"], "text_delta");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_stream_failure_summary_prefers_harness_result_error() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("fake-result-error-stream");
+        std::fs::write(
+            &fake_harness,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"error":"rate limited by upstream","session_id":"native"}'
+printf '%s\n' 'stderr chatter' >&2
+exit 1
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let exit = stream_harness_with_program_and_env(
+            fake_harness.to_str().unwrap(),
+            temp_dir.path(),
+            Vec::new(),
+            &[],
+            false,
+            "streamy",
+            "ledger-current",
+            &mut Vec::new(),
+        )?;
+
+        assert_eq!(exit.exit_code, 1);
+        assert_eq!(
+            exit.harness_error.as_deref(),
+            Some("rate limited by upstream")
+        );
+        assert_eq!(exit.failure_summary("streamy"), "rate limited by upstream");
+        Ok(())
+    }
+
+    #[test]
+    fn native_stream_failure_summary_without_stderr_names_only_the_exit_code() {
+        let exit = NativeStreamExit {
+            exit_code: 3,
+            harness_error: None,
+            stderr_tail: "   \n".to_string(),
+        };
+        assert_eq!(
+            exit.failure_summary("coven-code"),
+            "coven-code exited with code 3"
+        );
     }
 
     #[cfg(unix)]
