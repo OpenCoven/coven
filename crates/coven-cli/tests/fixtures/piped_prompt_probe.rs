@@ -136,13 +136,24 @@ fn main() {
         }
         "descendant-output" => {
             let pid_file = required_arg("first");
-            let child = Command::new(env::current_exe().expect("current executable"))
-                .arg("output-child")
+            let ready_marker = optional_arg("second");
+            let mut command = Command::new(env::current_exe().expect("current executable"));
+            command.arg("output-child");
+            if let Some(marker) = ready_marker.as_ref() {
+                command.arg(marker);
+            }
+            let child = command
                 .stdin(Stdio::null())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .spawn()
                 .expect("spawn output descendant");
+            // With a marker, publish the pid only once the descendant has
+            // proven both inherited pipes carry output, so a test that waits
+            // for the pid file is waiting for readiness rather than for time.
+            if let Some(marker) = ready_marker.as_deref() {
+                wait_for_marker(marker);
+            }
             fs::write(pid_file, child.id().to_string()).expect("write descendant pid");
             // The descendant intentionally owns both inherited output pipes;
             // cancellation is complete only once its containing Job/process
@@ -210,13 +221,24 @@ fn main() {
             fs::write(pid_file, child.id().to_string()).expect("write descendant pid");
             thread::sleep(Duration::from_secs(120));
         }
-        "output-child" => loop {
-            io::stdout().write_all(b"stdout-tick\n").expect("stdout tick");
-            io::stdout().flush().expect("flush stdout tick");
-            io::stderr().write_all(b"stderr-tick\n").expect("stderr tick");
-            io::stderr().flush().expect("flush stderr tick");
-            thread::sleep(Duration::from_millis(5));
-        },
+        "output-child" => {
+            let ready_marker = optional_arg("first");
+            let mut announced = false;
+            loop {
+                io::stdout().write_all(b"stdout-tick\n").expect("stdout tick");
+                io::stdout().flush().expect("flush stdout tick");
+                io::stderr().write_all(b"stderr-tick\n").expect("stderr tick");
+                io::stderr().flush().expect("flush stderr tick");
+                if !announced {
+                    // Both inherited pipes now hold real bytes.
+                    if let Some(marker) = ready_marker.as_ref() {
+                        fs::write(marker, b"ready").expect("write readiness marker");
+                    }
+                    announced = true;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
         "output-child-short" => {
             let ready_marker = optional_arg("first");
             let deadline = std::time::Instant::now() + Duration::from_secs(2);

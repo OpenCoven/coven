@@ -1555,7 +1555,8 @@ impl SharedStrictChildProcessTree {
     }
 
     pub(crate) fn terminate_and_wait(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
         let termination = self.terminate_tree().err();
         let wait_state = wait_for_piped_child_reap(
             &self.child_wait_state,
@@ -1573,6 +1574,10 @@ impl SharedStrictChildProcessTree {
         #[cfg(not(unix))]
         let containment_quiescence: Option<anyhow::Error> = None;
         if let Some(error) = containment_quiescence {
+            let error = error.context(format!(
+                "process group did not quiesce {}",
+                self.quiescence_observation(started, timeout, wait_state)
+            ));
             return match termination {
                 Some(termination) => Err(error.context(format!(
                     "process-tree termination also reported an error: {termination}"
@@ -1589,21 +1594,65 @@ impl SharedStrictChildProcessTree {
                 Some(error) => anyhow::bail!(
                     "process-tree termination failed ({error}) and the direct child wait failed"
                 ),
-                None => anyhow::bail!(
-                    "the direct child wait failed after process-tree termination"
-                ),
+                None => {
+                    anyhow::bail!("the direct child wait failed after process-tree termination")
+                }
             },
-            (termination, _) => match termination {
-                Some(error) => anyhow::bail!(
-                    "process-tree termination failed ({error}) and the child did not become quiescent within {} ms",
-                    timeout.as_millis()
-                ),
-                None => anyhow::bail!(
-                    "the child did not become quiescent within {} ms after process-tree termination",
-                    timeout.as_millis()
-                ),
-            },
+            (termination, _) => {
+                let observation = self.quiescence_observation(started, timeout, wait_state);
+                match termination {
+                    Some(error) => anyhow::bail!(
+                        "process-tree termination failed ({error}) and the child did not become quiescent within {} ms ({observation})",
+                        timeout.as_millis()
+                    ),
+                    None => anyhow::bail!(
+                        "the child did not become quiescent within {} ms after process-tree termination ({observation})",
+                        timeout.as_millis()
+                    ),
+                }
+            }
         }
+    }
+
+    /// What the quiescence wait could see when it gave up: elapsed time
+    /// against its budget, the direct-child wait state, and on Unix whether
+    /// the contained process group still answers a signal-0 probe. Diagnostic
+    /// text only; it does not change which outcome `terminate_and_wait`
+    /// reports or how long it waits.
+    fn quiescence_observation(
+        &self,
+        started: Instant,
+        timeout: Duration,
+        wait_state: u8,
+    ) -> String {
+        let wait_state = match wait_state {
+            PIPED_CHILD_REAPED => "direct child reaped and output drains joined",
+            PIPED_CHILD_WAIT_FAILED => "direct child wait or output drain failed",
+            _ => "direct child wait still pending",
+        };
+        #[cfg(unix)]
+        let group = {
+            let pid = match self.process_tree.lock() {
+                Ok(process_tree) => process_tree.0.pid,
+                Err(poisoned) => poisoned.into_inner().0.pid,
+            };
+            // SAFETY: signal 0 only probes whether the group still has members.
+            if unsafe { libc::kill(-(pid as libc::pid_t), 0) } == 0 {
+                format!("; process group {pid} still has live members")
+            } else {
+                format!(
+                    "; process group {pid} probe: {}",
+                    io::Error::last_os_error()
+                )
+            }
+        };
+        #[cfg(not(unix))]
+        let group = String::new();
+        format!(
+            "after {} ms of a {} ms budget; {wait_state}{group}",
+            started.elapsed().as_millis(),
+            timeout.as_millis()
+        )
     }
 
     #[cfg(unix)]

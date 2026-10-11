@@ -4748,10 +4748,12 @@ fn kill_session(
             {
                 session_not_live_response(session_id)
             } else {
+                // `{:#}` keeps the cause chain: `Display` alone prints only the
+                // outermost context and drops which native wait actually failed.
                 api_error(
                     500,
                     "kill_failed",
-                    &error.to_string(),
+                    &format!("{error:#}"),
                     Some(json!({ "sessionId": session_id })),
                 )
             }
@@ -28411,7 +28413,8 @@ pub(crate) mod tests {
                 Ok(())
             }
             fn kill_session(&self, _: &str) -> Result<()> {
-                Err(anyhow::anyhow!("simulated kill_session failure"))
+                Err(anyhow::anyhow!("native wait exceeded stop budget"))
+                    .context("simulated kill_session failure")
             }
         }
         let runtime = FailingKill;
@@ -28429,6 +28432,16 @@ pub(crate) mod tests {
         assert!(
             response.body.contains("kill_failed"),
             "expected structured `kill_failed` code, got: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("simulated kill_session failure"),
+            "{}",
+            response.body
+        );
+        assert!(
+            response.body.contains("native wait exceeded stop budget"),
+            "{}",
             response.body
         );
         Ok(())
