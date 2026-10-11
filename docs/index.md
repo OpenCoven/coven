@@ -23,6 +23,7 @@ implementation:
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — crate ownership and authority boundaries.
 - [`SESSION-LIFECYCLE.md`](SESSION-LIFECYCLE.md) — normative session state machine.
 - [`HARNESS-ADAPTERS.md`](HARNESS-ADAPTERS.md) — adapter implementation contract.
+- [`HOME-LAYOUT.md`](HOME-LAYOUT.md) — `COVEN_HOME` ownership classes, naming, and retention contract.
 - [`development/`](development/) — maintainer source maps and verification loops.
 - [`design/`](design/), [`superpowers/`](superpowers/), and repository specs —
   implementation decisions, plans, and historical records.

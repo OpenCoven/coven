@@ -89,7 +89,7 @@ macOS-first system diagnostics and relief subcommand. Reports CPU, memory, disk,
 
 ## `COVEN_HOME`
 
-The local directory where Coven stores daemon/socket/database state when configured. Runtime state should not be committed to source control.
+The local directory where Coven stores daemon/socket/database state when configured. Runtime state should not be committed to source control. Path ownership, naming, and retention rules: [`HOME-LAYOUT.md`](HOME-LAYOUT.md).
 
 ## Daemon
 
