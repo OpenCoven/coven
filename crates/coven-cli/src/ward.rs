@@ -6904,6 +6904,80 @@ tier = 1
     }
 
     #[test]
+    fn validation_rejects_unknown_approval_tier_at_load() {
+        // A well-formed tier table under a name the daemon does not know must
+        // fail at load, even beside a valid tier, rather than being ignored.
+        let unknown_tier = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
+
+[approval_tiers.mystery_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#;
+        let error = WardConfig::from_toml_str(unknown_tier).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("approval_tiers contains unknown tier `mystery_review`"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_approval_tier_gate_drift_at_load() {
+        // Every tier must carry exactly its own gate. Pairing a tier with any
+        // other tier's gate is label drift, and it must fail at load.
+        let gates = [
+            ("auto", APPROVAL_GATE_AUTO),
+            ("familiar_review", APPROVAL_GATE_FAMILIAR_REVIEW),
+            ("human_review", APPROVAL_GATE_HUMAN_REVIEW),
+            ("human_required", APPROVAL_GATE_HUMAN_REQUIRED),
+        ];
+        for (tier_name, expected_gate) in gates {
+            for (_, wrong_gate) in gates.iter().filter(|(_, gate)| *gate != expected_gate) {
+                let drifted = format!(
+                    r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.{tier_name}]
+blocks = ["tool_defaults"]
+gate = "{wrong_gate}"
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
+"#
+                );
+                let error = WardConfig::from_toml_str(&drifted).unwrap_err();
+                assert!(
+                    error.to_string().contains(&format!(
+                        "approval_tiers.{tier_name}.gate must be `{expected_gate}`, found `{wrong_gate}`"
+                    )),
+                    "tier {tier_name} with gate {wrong_gate}: unexpected error: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn validation_rejects_mismatched_protected_surface() {
         let mut config = sample_config();
         config.protected_surface = vec!["SOUL.md".into()]; // missing IDENTITY.md, USER.md
