@@ -87,7 +87,11 @@ fn create_lists_the_familiar_and_refuses_a_second_identical_create() -> anyhow::
 
     let created = sandbox.coven(&["familiar", "create", "Astra", "--json"])?;
     assert!(created.status.success(), "{}", describe(&created));
-    let workspace = sandbox.coven_home.join("workspaces/familiars/astra");
+    let workspace = sandbox
+        .coven_home
+        .join("workspaces")
+        .join("familiars")
+        .join("astra");
     let workspace_text = workspace.to_str().unwrap();
     assert_eq!(
         stdout_json(&created),

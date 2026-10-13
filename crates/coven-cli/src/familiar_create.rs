@@ -640,7 +640,9 @@ mod tests {
 
         let workspace = std::path::absolute(home)
             .unwrap()
-            .join("workspaces/familiars/astra");
+            .join("workspaces")
+            .join("familiars")
+            .join("astra");
         assert_eq!(created.id, "astra");
         assert_eq!(created.display_name, "Astra");
         assert_eq!(created.workspace, workspace.to_str().unwrap());
@@ -898,7 +900,7 @@ mod tests {
     fn never_overwrites_existing_workspace_files() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let workspace = home.join("workspaces/familiars/astra");
+        let workspace = home.join("workspaces").join("familiars").join("astra");
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("SOUL.md"), "# My own soul\n").unwrap();
 
