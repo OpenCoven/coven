@@ -43,6 +43,7 @@ mod adoption_gate;
 mod automations;
 mod executor_node;
 mod familiar_cli;
+mod familiar_create;
 mod familiar_identity;
 // Familiar Contract binding issuer; no production caller until the trusted
 // Runtime Authority adapter (coven#857 slice 6).
@@ -731,10 +732,17 @@ enum Command {
         json: bool,
     },
     #[command(
-        about = "List the familiar roster from ~/.coven/familiars.toml",
-        alias = "familiar"
+        about = "List the familiar roster from ~/.coven/familiars.toml, or create a familiar",
+        alias = "familiar",
+        args_conflicts_with_subcommands = true
     )]
+    #[command(after_help = "Examples:
+  coven familiars                 list the roster
+  coven familiars sage            show sage's declared Ward surface
+  coven familiar create Astra     add Astra to the roster and create its workspace")]
     Familiars {
+        #[command(subcommand)]
+        command: Option<familiar_create::FamiliarsCommand>,
         #[arg(help = "Familiar id: show its declared Ward surface (tiers) instead of the roster")]
         id: Option<String>,
         #[arg(long, help = "Print familiars as JSON (machine-readable)")]
@@ -1655,6 +1663,13 @@ fn main() -> Result<()> {
         if error.downcast_ref::<SetupIncomplete>().is_some() {
             std::process::exit(1);
         }
+        // `--json` commands that already printed their error as JSON.
+        if error
+            .downcast_ref::<familiar_create::ReportedAsJson>()
+            .is_some()
+        {
+            std::process::exit(1);
+        }
         if let Some(reset_error) = error.downcast_ref::<reset::ResetError>() {
             eprintln!("Error: {reset_error}");
             std::process::exit(reset_error.exit_code());
@@ -1793,7 +1808,15 @@ fn run_cli(cli: Cli) -> Result<()> {
             None => tui::sessions::run_command(all, manage, plain, json),
         },
         Some(Command::Status { json }) => observe::run_status(json),
-        Some(Command::Familiars { id, json }) => observe::run_familiars(id.as_deref(), json),
+        Some(Command::Familiars {
+            command: Some(command),
+            ..
+        }) => familiar_create::run(command),
+        Some(Command::Familiars {
+            command: None,
+            id,
+            json,
+        }) => observe::run_familiars(id.as_deref(), json),
         Some(Command::EvalLoop { command }) => run_eval_loop_command(command),
         Some(Command::Skills { json }) => observe::run_skills(json),
         Some(Command::Device { command }) => match command {
@@ -3489,7 +3512,7 @@ fn print_familiars_section(
         println!("\nFamiliars:");
         print_doctor_line(format!("  none configured ({})", manifest.display()));
         println!(
-            "  Declare [[familiar]] entries there, then run with \
+            "  Create one with `coven familiar create <name>`, then run with \
              `coven run <harness> --familiar <id> \"...\"`."
         );
         return;
@@ -6125,6 +6148,7 @@ mod tests {
         assert!(matches!(
             Cli::parse_from(["coven", "familiars"]).command,
             Some(Command::Familiars {
+                command: None,
                 id: None,
                 json: false
             })
@@ -6132,6 +6156,7 @@ mod tests {
         assert!(matches!(
             Cli::parse_from(["coven", "familiars", "nova", "--json"]).command,
             Some(Command::Familiars {
+                command: None,
                 id: Some(_),
                 json: true
             })
@@ -7999,6 +8024,64 @@ mod tests {
             Cli::parse_from(["coven", "familiar", "sage"]).command,
             Some(Command::Familiars { id: Some(_), .. })
         ));
+    }
+
+    #[test]
+    fn cli_parses_familiar_create() {
+        for parent in ["familiar", "familiars"] {
+            let Some(Command::Familiars {
+                command: Some(create),
+                id: None,
+                json: false,
+            }) = Cli::parse_from([
+                "coven",
+                parent,
+                "create",
+                "Night Owl",
+                "--id",
+                "owl",
+                "--emoji",
+                "🦉",
+                "--role",
+                "Research",
+                "--description",
+                "Reads late.",
+                "--json",
+            ])
+            .command
+            else {
+                panic!("expected `coven {parent} create` to parse as the create subcommand");
+            };
+            assert_eq!(
+                create,
+                familiar_create::FamiliarsCommand::Create {
+                    display_name: "Night Owl".into(),
+                    id: Some("owl".into()),
+                    emoji: Some("🦉".into()),
+                    role: Some("Research".into()),
+                    description: Some("Reads late.".into()),
+                    json: true,
+                }
+            );
+        }
+        assert!(matches!(
+            Cli::parse_from(["coven", "familiar", "create", "Astra"]).command,
+            Some(Command::Familiars {
+                command: Some(familiar_create::FamiliarsCommand::Create {
+                    id: None,
+                    emoji: None,
+                    role: None,
+                    description: None,
+                    json: false,
+                    ..
+                }),
+                ..
+            })
+        ));
+        // The display name is required, and the roster's own arguments do
+        // not combine with the subcommand.
+        assert!(Cli::try_parse_from(["coven", "familiar", "create"]).is_err());
+        assert!(Cli::try_parse_from(["coven", "familiars", "--json", "create", "Astra"]).is_err());
     }
 
     #[test]
