@@ -3692,14 +3692,37 @@ fn run_piped_attached_observed_with_writers(
     })
 }
 
+/// Which child streams `run_piped_attached_captured` forwards (#1289).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsCapture {
+    /// Codex writes its labeled transcript, final answer included, to stderr
+    /// and repeats a plain answer on stdout. Forward stderr only.
+    StderrTranscript,
+    /// Other harnesses answer on stdout and report failures on stderr.
+    StdoutAndStderr,
+}
+
+#[cfg(windows)]
+impl WindowsCapture {
+    pub fn for_harness(harness_id: &str) -> Self {
+        if harness_id == "codex" {
+            Self::StderrTranscript
+        } else {
+            Self::StdoutAndStderr
+        }
+    }
+}
+
 /// Run a one-shot Windows harness through ordinary pipes while keeping stdout
-/// available for Coven's stream-JSON protocol. Codex writes its labeled
-/// transcript to stderr, so capture that stream and let the caller wrap it in
-/// JSON `output` events; discard Codex's duplicate plain stdout answer.
+/// available for Coven's stream-JSON protocol. The captured streams are handed
+/// to `on_output` so the caller can wrap them in JSON `output` events; `capture`
+/// decides whether the harness's own stdout is among them.
 #[cfg(windows)]
 pub fn run_piped_attached_captured(
     command: &HarnessCommand,
-    mut on_output: Box<dyn FnMut(Vec<u8>) + Send + 'static>,
+    capture: WindowsCapture,
+    on_output: Box<dyn FnMut(Vec<u8>) + Send + 'static>,
 ) -> Result<PtyRunResult> {
     let mut child_command = std::process::Command::new(&command.program);
     child_command
@@ -3710,7 +3733,10 @@ pub fn run_piped_attached_captured(
         } else {
             Stdio::inherit()
         })
-        .stdout(Stdio::null())
+        .stdout(match capture {
+            WindowsCapture::StderrTranscript => Stdio::null(),
+            WindowsCapture::StdoutAndStderr => Stdio::piped(),
+        })
         .stderr(Stdio::piped());
     command.apply_environment(&mut child_command);
     let mut child = child_command.spawn().with_context(|| {
@@ -3719,13 +3745,27 @@ pub fn run_piped_attached_captured(
             command.program()
         )
     })?;
-    write_stdin_prompt(&mut child, command.stdin_prompt.as_deref())?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .context("captured piped harness did not expose stderr")?;
-    drain_detached_output(&mut stderr, Some(&mut on_output));
-    let status = child.wait().context("failed waiting for piped harness")?;
+    let stdout = child.stdout.take();
+
+    // Drain each pipe on its own thread, started before the prompt is
+    // written, so neither a full stdout nor a full stderr can stall the
+    // child while the other is being read.
+    let on_output = Arc::new(Mutex::new(on_output));
+    let stderr_drain = spawn_captured_drain(stderr, Arc::clone(&on_output));
+    let stdout_drain = stdout.map(|stdout| spawn_captured_drain(stdout, on_output));
+    let status = write_stdin_prompt(&mut child, command.stdin_prompt.as_deref())
+        .and_then(|()| child.wait().context("failed waiting for piped harness"));
+    let stderr_joined = stderr_drain.join();
+    let stdout_joined = stdout_drain.map(thread::JoinHandle::join);
+    let status = status?;
+    stderr_joined.map_err(|_| anyhow::anyhow!("stderr capture thread panicked"))?;
+    if let Some(Err(_)) = stdout_joined {
+        anyhow::bail!("stdout capture thread panicked");
+    }
     Ok(PtyRunResult {
         status: if status.success() {
             "completed"
@@ -3733,6 +3773,26 @@ pub fn run_piped_attached_captured(
             "failed"
         },
         exit_code: status.code(),
+    })
+}
+
+#[cfg(windows)]
+type CapturedOutput = Box<dyn FnMut(Vec<u8>) + Send + 'static>;
+
+/// Forward one captured pipe to the shared observer. Each drain keeps its own
+/// UTF-8 reassembly state, so chunks from the two pipes never split a codepoint.
+#[cfg(windows)]
+fn spawn_captured_drain(
+    mut reader: impl Read + Send + 'static,
+    on_output: Arc<Mutex<CapturedOutput>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut forward: CapturedOutput = Box::new(move |chunk| {
+            if let Ok(mut on_output) = on_output.lock() {
+                on_output(chunk);
+            }
+        });
+        drain_detached_output(&mut reader, Some(&mut forward));
     })
 }
 
@@ -10440,6 +10500,7 @@ exit 0
 
         let result = run_piped_attached_captured(
             &command,
+            WindowsCapture::StderrTranscript,
             Box::new(move |chunk| {
                 callback_output.lock().unwrap().extend_from_slice(&chunk);
             }),
@@ -10448,6 +10509,62 @@ exit 0
         assert_eq!(result.status, "completed");
         assert_eq!(result.exit_code, Some(0));
         assert!(String::from_utf8(captured.lock().unwrap().clone())?.contains("hello from stdin"));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captured_piped_forwards_stdout_for_every_harness_but_codex() -> anyhow::Result<()> {
+        assert_eq!(
+            WindowsCapture::for_harness("codex"),
+            WindowsCapture::StderrTranscript
+        );
+        for harness in ["coven-code", "claude", "copilot"] {
+            assert_eq!(
+                WindowsCapture::for_harness(harness),
+                WindowsCapture::StdoutAndStderr,
+                "{harness}"
+            );
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let batch = temp_dir.path().join("fake-harness.cmd");
+        std::fs::write(
+            &batch,
+            "@echo off\r\necho answer on stdout\r\n>&2 echo error on stderr\r\nexit /b 3\r\n",
+        )?;
+        for (capture, expects_stdout) in [
+            (WindowsCapture::StdoutAndStderr, true),
+            (WindowsCapture::StderrTranscript, false),
+        ] {
+            let command = HarnessCommand {
+                program: batch.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: temp_dir.path().to_path_buf(),
+                stdin_prompt: None,
+                env_overrides: Vec::new(),
+            };
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let callback_output = captured.clone();
+
+            let result = run_piped_attached_captured(
+                &command,
+                capture,
+                Box::new(move |chunk| {
+                    callback_output.lock().unwrap().extend_from_slice(&chunk);
+                }),
+            )?;
+
+            let text = String::from_utf8(captured.lock().unwrap().clone())?;
+            assert_eq!(result.status, "failed", "{capture:?}: {text:?}");
+            assert_eq!(result.exit_code, Some(3), "{capture:?}: {text:?}");
+            assert!(text.contains("error on stderr"), "{capture:?}: {text:?}");
+            assert_eq!(
+                text.contains("answer on stdout"),
+                expects_stdout,
+                "{capture:?}: {text:?}"
+            );
+        }
         Ok(())
     }
 

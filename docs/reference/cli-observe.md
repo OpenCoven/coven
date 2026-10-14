@@ -34,6 +34,10 @@ table.
 | `coven sessions events <id>` | Recorded events (redacted) | `GET /api/v1/sessions/:id/events` |
 | `coven sessions log <id>` | Log lines | `GET /api/v1/sessions/:id/log` |
 
+`coven familiar create` is the one write command under `coven familiars`. It
+adds a familiar to the roster; see
+[`cli-familiar-create.md`](cli-familiar-create.md).
+
 ## Color
 
 On a color-capable terminal the human views carry the Coven brand palette:
@@ -200,7 +204,7 @@ fresh install can navigate the ecosystem without reading source:
 ```text
 $ coven familiars
 No familiars configured.
-Add [[familiar]] entries to ~/.coven/familiars.toml to build your roster.
+Create one with `coven familiar create <name>`, or add [[familiar]] entries to ~/.coven/familiars.toml.
 ```
 
 ## In the interactive surfaces
