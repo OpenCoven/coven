@@ -370,7 +370,10 @@ jobs:
     needs: changes
     if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}
     runs-on: macos-26
-    timeout-minutes: 20
+    # The workspace plus the Threads journeys now finish at about 20 minutes on
+    # macos-26, so a 20-minute limit cancelled the job after its last suite
+    # passed and failed the PR gate on every main push from f772b513 to 84066d2b.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
