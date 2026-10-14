@@ -1408,7 +1408,8 @@ fn failure_artifacts_retain_failed_restart_cli_output() -> Result<()> {
     let artifacts = tempfile::tempdir()?;
     let mut evidence = EvidenceContext::new("restart-failure-retention");
     evidence.artifact_dir = artifacts.path().to_path_buf();
-    evidence.foreground_daemon = false;
+    // Setup readiness is independent of the CLI restart diagnostics under test.
+    evidence.foreground_daemon = true;
     let mut fixture = ThreadsFixture::start(&evidence)?;
     fixture.stop_daemon()?;
     fs::write(
@@ -1417,7 +1418,7 @@ fn failure_artifacts_retain_failed_restart_cli_output() -> Result<()> {
     )?;
 
     let error = fixture
-        .restart_daemon()
+        .restart_daemon_via_cli()
         .expect_err("restart with an invalid store must fail");
     fixture.write_run_provenance(Some(&error))?;
     let manifest: Value =
@@ -2631,8 +2632,8 @@ impl ThreadsFixture {
     }
 
     fn restart_daemon(&mut self) -> Result<()> {
-        let pid_before = self.current_daemon_pid();
         if self.foreground_daemon {
+            let pid_before = self.current_daemon_pid();
             self.stop_daemon()?;
             self.start_daemon()?;
             anyhow::ensure!(
@@ -2641,6 +2642,11 @@ impl ThreadsFixture {
             );
             return Ok(());
         }
+        self.restart_daemon_via_cli()
+    }
+
+    fn restart_daemon_via_cli(&mut self) -> Result<()> {
+        let pid_before = self.current_daemon_pid();
         self.stopped = false;
         let output = self.daemon_command(&["daemon", "restart"])?;
         let pid_after = daemon_pid(&self.coven_home).ok();
