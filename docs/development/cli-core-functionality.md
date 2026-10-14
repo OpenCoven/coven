@@ -34,6 +34,7 @@ Do not call the CLI healthy merely because `--help` renders. A healthy core path
 | Launch work | `coven run <harness> <prompt>` | `session_launch.rs`, `harness.rs`, `pty_runner.rs`, `store.rs` | Validate project root and cwd in Rust, construct argv safely, then record session/events. |
 | Inspect and manage history | `coven sessions`, `coven attach`, `coven archive`, `coven summon`, `coven sacrifice`, `coven kill` | `store.rs`, `daemon.rs`, `tui/` | Archive is reversible; sacrifice and other destructive actions keep explicit confirmation. |
 | Read runtime state | `coven status`, `coven familiars`, `coven skills`, `coven memory`, `coven research`, `coven calls`, `coven hub`, `coven scheduler`, `coven travel` | `observe.rs`, `hub.rs`, `control_plane.rs` | Read surfaces do not silently become write paths. |
+| Create a familiar | `coven familiar create <name>` | `familiar_create.rs`, `cockpit_sources.rs` | Appends to `familiars.toml` under a lock and never rewrites existing roster bytes or workspace files. |
 | Coordinate parallel work | `coven wt`, `coven claim`, `coven hooks` | `parallel_protocol.rs` | Claims are shared through git's common directory and remain TTL-bounded. |
 | Repair or diagnose a machine | `coven patch`, `coven pc`, `coven logs`, `coven vacuum` | `patch.rs`, `pc.rs`, `store.rs` | Keep inspection separate from explicit write/repair confirmation. |
 

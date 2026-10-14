@@ -507,7 +507,7 @@ fn render_familiars(p: theme::Palette, body: &Value) -> String {
     let familiars = body.as_array().cloned().unwrap_or_default();
     if familiars.is_empty() {
         return "No familiars configured.\n\
-                Add [[familiar]] entries to ~/.coven/familiars.toml to build your roster.\n"
+                Create one with `coven familiar create <name>`, or add [[familiar]] entries to ~/.coven/familiars.toml.\n"
             .to_string();
     }
     let rows: Vec<Vec<String>> = familiars
@@ -2124,6 +2124,7 @@ mod tests {
     fn render_familiars_empty_state_teaches_setup() {
         let out = render_familiars(plain(), &json!([]));
         assert!(out.contains("No familiars configured."));
+        assert!(out.contains("coven familiar create <name>"));
         assert!(out.contains("familiars.toml"));
     }
 
@@ -3016,7 +3017,7 @@ sage   Sage   researcher  active   —       reads everything
 @@@END@@@
 ### familiars_empty
 No familiars configured.
-Add [[familiar]] entries to ~/.coven/familiars.toml to build your roster.
+Create one with `coven familiar create <name>`, or add [[familiar]] entries to ~/.coven/familiars.toml.
 @@@END@@@
 ### familiar_ward
 Familiar sage — Ward surface
