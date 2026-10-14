@@ -5594,6 +5594,7 @@ fn run_session(
         let output_session_id = record.id.clone();
         pty_runner::run_piped_attached_captured(
             &command,
+            pty_runner::WindowsCapture::for_harness(&selected_harness.id),
             Box::new(move |chunk| {
                 let _ =
                     emit_stream_event(&stream_json::Event::Output(stream_json::HarnessOutput {
