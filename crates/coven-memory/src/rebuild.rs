@@ -22,6 +22,14 @@ pub fn rebuild_index(
     output: &Path,
     mut embed: impl FnMut(Vec<String>) -> Result<Vec<Vec<f32>>>,
 ) -> Result<usize> {
+    // A bare relative filename has an empty parent, which the privacy
+    // helper cannot canonicalize. Resolve it before reserving the output.
+    let output = if output.is_absolute() {
+        output.to_owned()
+    } else {
+        std::env::current_dir()?.join(output)
+    };
+    let output = output.as_path();
     fs_security::ensure_private_parent(output)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

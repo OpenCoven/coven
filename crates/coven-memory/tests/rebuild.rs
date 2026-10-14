@@ -11,13 +11,14 @@ fn rebuild_empty_store_does_not_load_legacy_index_or_download_a_model() {
     std::fs::write(&legacy, original).unwrap();
     let rebuilt = root.join("rebuilt.tvim");
     let output = Command::new(env!("CARGO_BIN_EXE_coven-memory"))
+        .current_dir(&root)
         .arg("--db")
         .arg(&db_path)
         .arg("--index")
         .arg(&legacy)
         .arg("rebuild")
         .arg("--output")
-        .arg(&rebuilt)
+        .arg("rebuilt.tvim")
         .output()
         .unwrap();
     assert!(
