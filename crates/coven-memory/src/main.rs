@@ -15,6 +15,7 @@ use coven_memory::{
     embed::Embedder,
     index::VecIndex,
     ingest::{ingest_dir, ingest_file},
+    rebuild::rebuild_index,
 };
 
 #[derive(Parser)]
@@ -56,6 +57,12 @@ enum Cmd {
     },
     /// Show index stats
     Status,
+    /// Re-embed persisted chunks into a NEW index, preserving the old index and DB
+    Rebuild {
+        /// New destination; existing files are refused. Use --index with this file afterward
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -65,6 +72,22 @@ fn main() -> Result<()> {
     let db_path = cli.db.unwrap_or_else(default_db_path);
 
     let db = MetaDb::open(&db_path)?;
+    if let Cmd::Rebuild { output } = &cli.command {
+        // Rebuilding must work even when the old index format cannot be loaded.
+        let mut embedder = None;
+        let count = rebuild_index(&db, output, |texts| {
+            if embedder.is_none() {
+                eprintln!("⟳  Initialising embedder (downloads model on first run)…");
+                embedder = Some(Embedder::new()?);
+            }
+            embedder
+                .as_mut()
+                .expect("embedder is initialized")
+                .embed_batch(&texts.iter().map(String::as_str).collect::<Vec<_>>())
+        })?;
+        println!("✓  Rebuilt {count} vectors in {}. Use --index with this file; the old index is preserved.", output.display());
+        return Ok(());
+    }
     let mut index = VecIndex::open(&index_path)?;
 
     match cli.command {
@@ -144,6 +167,7 @@ fn main() -> Result<()> {
             println!("  Indexed:  {indexed} vectors in turbovec");
             println!("────────────────────────────────────────────────────");
         }
+        Cmd::Rebuild { .. } => unreachable!("rebuild is handled before loading the old index"),
     }
 
     Ok(())

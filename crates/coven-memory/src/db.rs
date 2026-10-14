@@ -158,6 +158,16 @@ impl MetaDb {
         Ok(ids)
     }
 
+    /// All persisted document ids, for rebuilding an index from stored chunks.
+    pub fn all_ids(&self) -> Result<Vec<u64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM docs ORDER BY id")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .map(|id| id.map(|id| id as u64))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Total doc count
     pub fn count(&self) -> Result<u64> {
         let n: i64 = self

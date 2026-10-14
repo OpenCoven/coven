@@ -11,6 +11,7 @@ mod fs_security;
 pub mod index;
 pub mod ingest;
 pub mod promotion;
+pub mod rebuild;
 
 use std::path::PathBuf;
 
