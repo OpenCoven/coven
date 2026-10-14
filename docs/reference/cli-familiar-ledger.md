@@ -36,6 +36,8 @@ Every command accepts `--json` to print the ledger's response.
 ## Requirements
 
 - The familiar must appear exactly once in `~/.coven/familiars.toml`.
+  [`coven familiar create`](cli-familiar-create.md) adds one with both
+  declaration files below.
 - Its workspace must contain `IDENTITY.md` and `SOUL.md` as UTF-8 text. A
   `ward.toml`, when present, must parse.
 - The command runs as the owner. Over the daemon API the same actions are
