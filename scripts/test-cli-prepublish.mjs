@@ -61,6 +61,10 @@ export const TEMP_PROJECT_CLEANUP_OPTIONS = Object.freeze({
   retryDelay: 100
 });
 const CARGO_GATE_TIMEOUT_MS = 20 * 60_000;
+// This aggregate suite launches real npm packaging fixtures. Windows CI has
+// completed all assertions in 114 seconds, before process startup/cleanup.
+// Keep its hang guard well above that duration without widening npm deadlines.
+const GUARDRAILS_TIMEOUT_MS = 10 * 60_000;
 
 const PLATFORM_TARGETS = {
   macos: { packageName: '@opencoven/cli-macos', binaryName: 'coven' },
@@ -138,7 +142,7 @@ step('onboarding, PR readiness, and publish guardrails', () => {
     'scripts/publish-npm-test.mjs',
     'scripts/test-cli-prepublish-test.mjs',
     'scripts/user-journey-e2e-test.mjs'
-  ]);
+  ], { timeoutMs: GUARDRAILS_TIMEOUT_MS });
 });
 
 if (withCargoGates) {
