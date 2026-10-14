@@ -1718,11 +1718,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
         crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
-        let handle =
+        let mut handle =
             start_automations_scheduler(home, Arc::new(crate::api::NoopSessionRuntime)).unwrap();
 
         assert!(wake_automations_scheduler(home));
-        handle.shutdown().unwrap();
+        // This is a completion guard for the test, not the daemon's shutdown
+        // contract. The production shutdown path may detach on its deadline;
+        // unregistering can only be asserted after the worker actually joins.
+        handle
+            .shutdown_and_join_until(Instant::now() + Duration::from_secs(60))
+            .unwrap();
         assert!(!wake_automations_scheduler(home));
     }
 }
