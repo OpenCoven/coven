@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-const FAMILIARS_CONFIG_FILE: &str = "familiars.toml";
+pub(crate) const FAMILIARS_CONFIG_FILE: &str = "familiars.toml";
 const SKILLS_DIR: &str = "skills";
 const MEMORY_DIR: &str = "memory";
 const RESEARCH_TSV: &str = "research/results.tsv";
@@ -206,9 +206,15 @@ pub(crate) fn read_familiar_entries(coven_home: &Path) -> Result<Vec<FamiliarEnt
     };
     let raw = std::str::from_utf8(&bytes)
         .with_context(|| format!("failed to decode {}", path.display()))?;
-    let parsed: FamiliarsFile =
-        toml::from_str(raw).with_context(|| format!("failed to parse {}", path.display()))?;
-    Ok(parsed.familiar)
+    parse_familiar_entries(raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// Parses roster text exactly as [`read_familiar_entries`] does, so a writer
+/// can check a roster before and after changing it.
+pub(crate) fn parse_familiar_entries(
+    raw: &str,
+) -> std::result::Result<Vec<FamiliarEntry>, toml::de::Error> {
+    toml::from_str::<FamiliarsFile>(raw).map(|parsed| parsed.familiar)
 }
 
 fn expand_workspace(workspace: String) -> PathBuf {
