@@ -15,11 +15,7 @@ yanked = "deny"
 # (`turbovec -> faer`, plus fastembed/tokenizers). RUSTSEC-2024-0436 marks it
 # unmaintained, not vulnerable, and reports no safe upgrade. Keep this scoped
 # here until turbovec/faer/tokenizers move off paste or we replace that stack.
-#
-# `unsafe-libyaml` reaches coven-cli only through `serde_yaml_ng`.
-# RUSTSEC-2024-0449 marks it unmaintained, not vulnerable. Keep this scoped
-# here until YAML parsing moves to a maintained parser (#1297).
-ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2024-0449"]
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 # Explicit allow-list for licenses currently present in the resolved workspace
