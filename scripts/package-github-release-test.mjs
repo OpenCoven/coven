@@ -45,7 +45,7 @@ const CI_RUN_ATTEMPT = 1;
 const PR_GATE_JOB_ID = '101569906999';
 const CHECKOUT_ACTION_SHA = ['3d3c42e5aac5ba805825da76', '410c181273ba90b1'].join('');
 const SETUP_NODE_ACTION_SHA = ['949feb2413d6458794dcd24', '91c4babbbce0c15c1'].join('');
-const DOWNLOAD_ARTIFACT_ACTION_SHA = ['3e5f45b2cfb9172054b4087a', '40e8e0b5a5461e7c'].join('');
+const DOWNLOAD_ARTIFACT_ACTION_SHA = ['9000827ccba6bdab643e8b6', 'fd33ac0654aef8333'].join('');
 const RELEASE_PACKAGES = [
   '@opencoven/cli',
   '@opencoven/cli-linux-x64',

@@ -418,7 +418,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         )
         self.assertIn("cancel-in-progress: false", RELEASE_GITHUB_TEXT)
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", RELEASE_GITHUB_TEXT)
-        self.assertIn("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", RELEASE_GITHUB_TEXT)
+        self.assertIn("actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333", RELEASE_GITHUB_TEXT)
         self.assertIn("github.event.workflow_run.run_attempt || inputs.source_run_attempt", RELEASE_GITHUB_TEXT)
         self.assertIn('--source-run-attempt "$SOURCE_RUN_ATTEMPT"', RELEASE_GITHUB_TEXT)
         self.assertIn("verify-source-run-attempt", RELEASE_GITHUB_TEXT)
