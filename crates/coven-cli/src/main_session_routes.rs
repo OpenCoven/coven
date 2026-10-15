@@ -79,7 +79,7 @@ impl Drop for ScopeGate {
 }
 
 impl ScopeGate {
-    pub(crate) fn acquire(coven_home: &Path, scope_key: &str) -> Result<Self> {
+    fn open(coven_home: &Path, scope_key: &str) -> Result<fs::File> {
         crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?;
         let directory = coven_home.join(SCOPE_LOCK_DIR);
         fs::create_dir_all(&directory).with_context(|| {
@@ -94,9 +94,25 @@ impl ScopeGate {
             .collect::<String>();
         let path = directory.join(format!("{digest}.lock"));
         let file = crate::state_lock::open_lock_file(&path)?;
+        Ok(file)
+    }
+
+    pub(crate) fn acquire(coven_home: &Path, scope_key: &str) -> Result<Self> {
+        let file = Self::open(coven_home, scope_key)?;
         file.lock_exclusive()
-            .with_context(|| format!("failed to acquire main-session lock {}", path.display()))?;
+            .context("failed to acquire main-session lock")?;
         Ok(Self { file })
+    }
+
+    /// Streaming must never wait behind a harness launch or hold this lock
+    /// while writing to a client. Retry on the next stream tick instead.
+    pub(crate) fn try_acquire(coven_home: &Path, scope_key: &str) -> Result<Option<Self>> {
+        let file = Self::open(coven_home, scope_key)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if crate::state_lock::is_lock_contended(&error) => Ok(None),
+            Err(error) => Err(error).context("failed to acquire main-session stream lock"),
+        }
     }
 }
 

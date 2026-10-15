@@ -5292,7 +5292,10 @@ impl Write for LimitedJsonWriter {
     }
 }
 
-fn serialize_event_with_limit(event: &store::EventRecord, limit: usize) -> Result<Option<String>> {
+pub(crate) fn serialize_event_with_limit(
+    event: &store::EventRecord,
+    limit: usize,
+) -> Result<Option<String>> {
     let mut writer = LimitedJsonWriter::new(limit);
     if let Err(error) = serde_json::to_writer(&mut writer, event) {
         if writer.exceeded {

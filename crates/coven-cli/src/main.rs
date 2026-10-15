@@ -59,6 +59,7 @@ pub mod harness_contract;
 mod help;
 mod hub;
 mod main_session;
+mod main_session_events;
 mod main_session_notices;
 mod main_session_routes;
 mod main_session_start;
