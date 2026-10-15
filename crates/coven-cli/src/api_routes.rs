@@ -22,8 +22,10 @@
 //! - the query string is split off the raw path before classification and is
 //!   never part of the classified route.
 //!
-//! New routes belong in the `crate::api` dispatch behind this gate — never in
-//! a helper that skips it. Route/version policy changes belong here;
+//! New JSON routes belong in the `crate::api` dispatch behind this gate. The
+//! daemon dispatches streaming main-session events only after this same route
+//! normalization and the ordinary chat-context admission gate. Never add a
+//! transport helper that skips those gates. Route/version policy changes belong here;
 //! validation, persistence, and response mapping stay in their own seams (see
 //! `docs/authority-module-inventory.md`).
 

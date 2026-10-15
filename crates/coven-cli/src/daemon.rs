@@ -4850,15 +4850,25 @@ fn serve_accepted_tcp_connection(
         .set_write_timeout(Some(TCP_IO_TIMEOUT))
         .context("failed to set TCP write timeout")?;
     let read = stream.try_clone().context("failed to clone TCP stream")?;
-    handle_http_stream(
+    let configure_stream = || {
+        stream
+            .set_write_timeout(Some(crate::main_session_events::WRITE_TIMEOUT))
+            .context("failed to bound SSE writes")
+    };
+    handle_http_stream_with_lifecycle(
         read,
-        stream,
+        &stream,
         coven_home,
         status,
         runtime,
         Some(MAX_TCP_BODY_BYTES),
-        HostGuard::Loopback { allowed_hosts },
+        HttpStreamPolicy {
+            host_guard: HostGuard::Loopback { allowed_hosts },
+            lifecycle: LifecycleControl::Disabled,
+            configure_stream: Some(&configure_stream),
+        },
     )
+    .map(|_| ())
 }
 
 #[cfg(unix)]
@@ -5283,8 +5293,13 @@ extern "C" fn handle_termination_signal(sig: libc::c_int) {
 }
 
 #[cfg(unix)]
-fn daemon_termination_requested() -> bool {
+pub(crate) fn daemon_termination_requested() -> bool {
     DAEMON_TERMINATION_REQUESTED.load(Ordering::Acquire)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn daemon_termination_requested() -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -5780,7 +5795,9 @@ pub fn serve_forever(
         let tcp_status = status.clone();
         let tcp_runtime = Arc::clone(&runtime);
         let tcp_allowed_hosts: Vec<String> = allowed_hosts.to_vec();
-        let active_tcp_connection = Arc::new(Mutex::new(None::<TcpStream>));
+        let active_tcp_connection = Arc::new(Mutex::new(
+            std::collections::HashMap::<u64, TcpStream>::new(),
+        ));
         let active_tcp_for_thread = Arc::clone(&active_tcp_connection);
         // TCP accept errors are logged and the loop continues — misbehaving
         // network clients should not bring down the daemon. The Unix loop
@@ -5790,6 +5807,7 @@ pub fn serve_forever(
             std::thread::Builder::new()
                 .name("coven-tcp-api".into())
                 .spawn(move || {
+                    let mut connection_id = 0_u64;
                     while !daemon_termination_requested() {
                         let stream = match tcp_listener.accept() {
                             Ok((stream, _)) => stream,
@@ -5817,32 +5835,46 @@ pub fn serve_forever(
                                 continue;
                             }
                         };
-                        match active_tcp_for_thread.lock() {
-                            Ok(mut active) => *active = Some(cancellation),
-                            Err(poisoned) => *poisoned.into_inner() = Some(cancellation),
+                        let id = connection_id;
+                        connection_id = connection_id.wrapping_add(1);
+                        {
+                            let mut active = active_tcp_for_thread
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            if active.len() >= 64 {
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                continue;
+                            }
+                            active.insert(id, cancellation);
                         }
-                        let result = serve_accepted_tcp_connection(
-                            stream,
-                            &tcp_home,
-                            Some(tcp_status.clone()),
-                            tcp_runtime.as_ref(),
-                            &tcp_allowed_hosts,
-                        );
-                        match active_tcp_for_thread.lock() {
-                            Ok(mut active) => {
-                                active.take();
-                            }
-                            Err(poisoned) => {
-                                poisoned.into_inner().take();
-                            }
-                        }
-                        if let Err(error) = result {
-                            // A client hanging up mid-response is expected under SSE +
-                            // polling load; don't log or throttle that path.
-                            if !is_client_disconnect(&error) {
-                                eprintln!("coven daemon: TCP connection error: {error:#}");
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
+                        let home = tcp_home.clone();
+                        let status = tcp_status.clone();
+                        let runtime = Arc::clone(&tcp_runtime);
+                        let hosts = tcp_allowed_hosts.clone();
+                        let active = Arc::clone(&active_tcp_for_thread);
+                        let spawned = std::thread::Builder::new()
+                            .name("coven-tcp-request".into())
+                            .spawn(move || {
+                                let result = serve_accepted_tcp_connection(
+                                    stream,
+                                    &home,
+                                    Some(status),
+                                    runtime.as_ref(),
+                                    &hosts,
+                                );
+                                active.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+                                if let Err(error) = result {
+                                    if !is_client_disconnect(&error) {
+                                        eprintln!("coven daemon: TCP connection error: {error:#}");
+                                    }
+                                }
+                            });
+                        if let Err(error) = spawned {
+                            active_tcp_for_thread
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&id);
+                            eprintln!("coven daemon: failed to spawn TCP handler: {error:#}");
                         }
                     }
                 })
@@ -5863,8 +5895,8 @@ pub fn serve_forever(
     // `Arc<LiveSessionRuntime>`, so request handling is already concurrency-safe
     // (TCP + Unix have always run at the same time).
     //
-    // In-flight handlers are capped; past the cap we serve inline so a flood
-    // applies backpressure instead of spawning unbounded threads. Per-connection
+    // In-flight handlers are capped; excess connections are closed so a flood
+    // cannot spawn unbounded threads or pin the accept loop with a stream. Per-connection
     // errors stay isolated (logged, loop continues) so one malformed request
     // can't bring the daemon down or orphan the socket.
     const MAX_INFLIGHT: usize = 64;
@@ -5897,20 +5929,9 @@ pub fn serve_forever(
         let conn_status = Some(status.clone());
 
         if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
-            // Backpressure: at capacity, serve this one on the accept thread.
-            match serve_accepted_connection(stream, coven_home, conn_status, runtime.as_ref()) {
-                Ok(Some(stream)) => retain_shutdown_connection(&shutdown_connections, stream),
-                Ok(None) => {}
-                Err(error) => {
-                    if !is_client_disconnect(&error) {
-                        eprintln!("coven daemon: unix connection error: {error:#}");
-                        append_daemon_recovery_log(
-                            coven_home,
-                            &format!("unix connection error: {error:#}"),
-                        );
-                    }
-                }
-            }
+            // Never run a long-lived stream on the accept thread at capacity.
+            // Close this request so the client can retry; worker count stays bounded.
+            drop(stream);
             continue;
         }
 
@@ -5969,6 +5990,9 @@ pub fn serve_forever(
         .context("failed to terminate live sessions during daemon shutdown");
     let scheduler_shutdown = automations_scheduler.finish_shutdown(scheduler_shutdown_deadline);
     let tcp_shutdown = if let Some(tcp_thread) = tcp_thread {
+        if let Some(active) = active_tcp_connection.as_ref() {
+            cancel_active_tcp_connection(active);
+        }
         let deadline = Instant::now() + Duration::from_millis(250);
         while !tcp_thread.is_finished() && Instant::now() < deadline {
             if let Some(active) = active_tcp_connection.as_ref() {
@@ -5992,6 +6016,11 @@ pub fn serve_forever(
     } else {
         Ok(())
     };
+    if let Some(active) = active_tcp_connection.as_ref() {
+        // Also close workers registered between the first cancellation and
+        // the accept loop observing termination.
+        cancel_active_tcp_connection(active);
+    }
     let shutdown_result = scheduler_shutdown.and(runtime_shutdown).and(tcp_shutdown);
     drop(unix_listener);
     drop(mobile_gateway);
@@ -6014,12 +6043,9 @@ fn retain_shutdown_connection(connections: &Mutex<Vec<UnixStream>>, stream: Unix
 }
 
 #[cfg(unix)]
-fn cancel_active_tcp_connection(active: &Mutex<Option<TcpStream>>) {
-    let stream = match active.lock() {
-        Ok(mut active) => active.take(),
-        Err(poisoned) => poisoned.into_inner().take(),
-    };
-    if let Some(stream) = stream {
+fn cancel_active_tcp_connection(active: &Mutex<std::collections::HashMap<u64, TcpStream>>) {
+    let mut active = active.lock().unwrap_or_else(|p| p.into_inner());
+    for (_, stream) in active.drain() {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -6046,12 +6072,14 @@ enum LifecycleControl {
 enum EarlyDispatch {
     LifecycleShutdown,
     LocalControl,
+    MainSessionEvents,
 }
 
 #[derive(Clone, Copy)]
 struct HttpStreamPolicy<'a> {
     host_guard: HostGuard<'a>,
     lifecycle: LifecycleControl,
+    configure_stream: Option<&'a dyn Fn() -> Result<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6060,6 +6088,7 @@ enum HttpStreamOutcome {
     HoldForShutdown,
 }
 
+#[cfg(test)]
 fn handle_http_stream<R, W>(
     read: R,
     write: W,
@@ -6083,6 +6112,7 @@ where
         HttpStreamPolicy {
             host_guard: guard,
             lifecycle: LifecycleControl::Disabled,
+            configure_stream: None,
         },
     )
     .map(|_| ())
@@ -6105,6 +6135,7 @@ where
     let HttpStreamPolicy {
         host_guard: guard,
         lifecycle,
+        configure_stream,
     } = policy;
     let mut reader = BufReader::new(read);
     let request_line = read_http_request_line(&mut reader)?;
@@ -6203,6 +6234,8 @@ where
         && crate::mobile_memory::gateway::claims_local_control(path)
     {
         Some(EarlyDispatch::LocalControl)
+    } else if crate::main_session_events::claims(method, path) {
+        Some(EarlyDispatch::MainSessionEvents)
     } else {
         None
     };
@@ -6229,6 +6262,18 @@ where
     };
     let (response, hold_for_shutdown) = if let Some(rejection) = intent_rejection {
         (rejection, false)
+    } else if matches!(early_dispatch, Some(EarlyDispatch::MainSessionEvents)) {
+        let response = crate::main_session_events::handle(
+            coven_home,
+            crate::api_routes::split_path_query(path).1,
+            headers.last_event_id.as_deref(),
+            &mut write,
+            configure_stream,
+        )?;
+        if let Some(response) = response {
+            write_api_response(&mut write, &response)?;
+        }
+        return Ok(HttpStreamOutcome::Complete);
     } else if matches!(early_dispatch, Some(EarlyDispatch::LifecycleShutdown)) {
         lifecycle_shutdown_response(status.as_ref(), body.as_deref())?
     } else {
@@ -6602,6 +6647,11 @@ fn serve_accepted_connection(
     let read = stream.try_clone().context("failed to clone Unix stream")?;
     // Apply a body cap even on local Unix sockets: a buggy or hostile local
     // process should not be able to OOM the daemon with a huge payload.
+    let configure_stream = || {
+        stream
+            .set_write_timeout(Some(crate::main_session_events::WRITE_TIMEOUT))
+            .context("failed to bound SSE writes")
+    };
     let outcome = handle_http_stream_with_lifecycle(
         read,
         &stream,
@@ -6612,6 +6662,7 @@ fn serve_accepted_connection(
         HttpStreamPolicy {
             host_guard: HostGuard::Disabled,
             lifecycle: LifecycleControl::OwnerLocal,
+            configure_stream: Some(&configure_stream),
         },
     )?;
     Ok((outcome == HttpStreamOutcome::HoldForShutdown).then_some(stream))
@@ -6651,6 +6702,7 @@ struct ParsedHeaders {
     host: Option<String>,
     origin: Option<String>,
     if_none_match: Option<String>,
+    last_event_id: Option<String>,
 }
 
 fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
@@ -6659,6 +6711,7 @@ fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
         host: None,
         origin: None,
         if_none_match: None,
+        last_event_id: None,
     };
     let mut header = String::new();
     loop {
@@ -6678,6 +6731,15 @@ fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
                 headers.host = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("origin") {
                 headers.origin = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("last-event-id") {
+                // Repeated cursors are ambiguous; retain a bounded invalid
+                // sentinel so the SSE route returns a structured 400.
+                headers.last_event_id =
+                    Some(if headers.last_event_id.is_some() || value.len() > 19 {
+                        "invalid".to_owned()
+                    } else {
+                        value.to_owned()
+                    });
             } else if name.eq_ignore_ascii_case("if-none-match") {
                 // Repeated field lines form one comma-separated list (RFC 9110 §5.3).
                 headers.if_none_match = Some(match headers.if_none_match.take() {
@@ -6921,23 +6983,7 @@ fn serve_forever_with_lifetime_job_installer(
         let conn_status = status.clone();
         let conn_runtime = Arc::clone(&runtime);
         if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
-            // Backpressure at capacity by serving on the accept thread rather
-            // than allowing stalled clients to create unbounded OS threads.
-            let _ = stream.set_recv_timeout(Some(SOCKET_IO_TIMEOUT));
-            let _ = stream.set_send_timeout(Some(SOCKET_IO_TIMEOUT));
-            if let Err(error) = handle_http_stream(
-                &stream,
-                &stream,
-                &conn_home,
-                Some(conn_status),
-                conn_runtime.as_ref(),
-                Some(MAX_SOCKET_BODY_BYTES),
-                HostGuard::Disabled,
-            ) {
-                if !is_client_disconnect(&error) {
-                    eprintln!("coven daemon: pipe connection error: {error:#}");
-                }
-            }
+            drop(stream);
             continue;
         }
 
@@ -6946,18 +6992,11 @@ fn serve_forever_with_lifetime_job_installer(
         let spawn_result = std::thread::Builder::new()
             .name("coven-windows-api".into())
             .spawn(move || {
-                // Bound each transaction and isolate it so a stalled client
-                // cannot block accept or starve Cave's polling requests.
-                let _ = stream.set_recv_timeout(Some(SOCKET_IO_TIMEOUT));
-                let _ = stream.set_send_timeout(Some(SOCKET_IO_TIMEOUT));
-                if let Err(error) = handle_http_stream(
-                    &stream,
+                if let Err(error) = serve_named_pipe_connection(
                     &stream,
                     &conn_home,
                     Some(conn_status),
                     conn_runtime.as_ref(),
-                    Some(MAX_SOCKET_BODY_BYTES),
-                    HostGuard::Disabled,
                 ) {
                     if !is_client_disconnect(&error) {
                         eprintln!("coven daemon: pipe connection error: {error:#}");
@@ -6971,6 +7010,48 @@ fn serve_forever_with_lifetime_job_installer(
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn serve_named_pipe_connection(
+    stream: &interprocess::local_socket::Stream,
+    home: &Path,
+    status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
+) -> Result<HttpStreamOutcome> {
+    use interprocess::local_socket::traits::Stream as _;
+    let _ = stream.set_recv_timeout(Some(SOCKET_IO_TIMEOUT));
+    let _ = stream.set_send_timeout(Some(SOCKET_IO_TIMEOUT));
+    let streaming = std::cell::Cell::new(false);
+    let configure = || {
+        // Windows named pipes do not support I/O timeouts. Nonblocking writes
+        // let the SSE frame deadline own slow-reader disconnection instead.
+        stream
+            .set_nonblocking(true)
+            .context("failed to bound SSE pipe writes")?;
+        streaming.set(true);
+        Ok(())
+    };
+    let result = handle_http_stream_with_lifecycle(
+        stream,
+        stream,
+        home,
+        status,
+        runtime,
+        Some(MAX_SOCKET_BODY_BYTES),
+        HttpStreamPolicy {
+            host_guard: HostGuard::Disabled,
+            lifecycle: LifecycleControl::Disabled,
+            configure_stream: Some(&configure),
+        },
+    );
+    if streaming.get() {
+        // A stalled SSE reader must not migrate to interprocess's background
+        // flush/limbo pool when the connection is dropped.
+        let interprocess::local_socket::Stream::NamedPipe(pipe) = stream;
+        pipe.inner().assume_flushed();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -8056,6 +8137,7 @@ mod tests {
             HttpStreamPolicy {
                 host_guard: HostGuard::Disabled,
                 lifecycle: LifecycleControl::OwnerLocal,
+                configure_stream: None,
             },
         )?;
 
@@ -8103,6 +8185,7 @@ mod tests {
             HttpStreamPolicy {
                 host_guard: HostGuard::Disabled,
                 lifecycle: LifecycleControl::OwnerLocal,
+                configure_stream: None,
             },
         )?;
 
@@ -11204,6 +11287,7 @@ mod tests {
                     HttpStreamPolicy {
                         host_guard: HostGuard::Disabled,
                         lifecycle: LifecycleControl::OwnerLocal,
+                        configure_stream: None,
                     },
                 )
                 .expect("handle ok");
@@ -11224,6 +11308,113 @@ mod tests {
                     "{label} {path} created a pairing: {response}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn main_session_events_preserves_transport_and_context_admission() {
+        use crate::api::NoopSessionRuntime;
+        let home = tempfile::tempdir().unwrap();
+        ensure_private_coven_home(home.path()).unwrap();
+        for (method, path, headers, body, status, code) in [
+            (
+                "GET",
+                "/api/v1/main-session/events",
+                "Host: evil.example\r\n",
+                "",
+                403,
+                "",
+            ),
+            (
+                "GET",
+                "/api/v1/main-session/events",
+                "Host: localhost\r\nOrigin: https://evil.example\r\n",
+                "",
+                403,
+                "",
+            ),
+            (
+                "GET",
+                "/api/v9/main-session/events",
+                "Host: localhost\r\n",
+                "",
+                404,
+                "invalid_request",
+            ),
+            (
+                "POST",
+                "/api/v1/main-session/events",
+                "Host: localhost\r\n",
+                "",
+                404,
+                "not_found",
+            ),
+            (
+                "GET",
+                "/api/v1/main-session/events",
+                "Host: localhost\r\nLast-Event-ID: -1\r\n",
+                "",
+                400,
+                "invalid_request",
+            ),
+            (
+                "GET",
+                "/api/v1/main-session/events",
+                "Host: localhost\r\nLast-Event-ID: 1\r\nLast-Event-ID: 2\r\n",
+                "",
+                400,
+                "invalid_request",
+            ),
+            (
+                "GET",
+                "/api/v1/main-session/events",
+                "Host: localhost\r\n",
+                r#"{"contextAdmission":null}"#,
+                404,
+                "main_session_not_found",
+            ),
+            (
+                "GET",
+                "/api/v1/main-session/events",
+                "Host: localhost\r\n",
+                "",
+                404,
+                "main_session_not_found",
+            ),
+            (
+                "POST",
+                "/api/v1/main-session/events",
+                "Host: localhost\r\n",
+                r#"{"contextAdmission":null}"#,
+                403,
+                "chat_context_forbidden",
+            ),
+        ] {
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut out = Vec::new();
+            handle_http_stream(
+                request.as_bytes(),
+                &mut out,
+                home.path(),
+                None,
+                &NoopSessionRuntime,
+                None,
+                HostGuard::Loopback { allowed_hosts: &[] },
+            )
+            .unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{method} {path}: {text}"
+            );
+            assert!(text.contains(code), "{text}");
+            assert!(
+                !text.contains("text/event-stream"),
+                "admission must precede stream headers"
+            );
         }
     }
 

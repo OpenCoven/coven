@@ -1,6 +1,7 @@
 ---
 title: "Coven local API contract (coven.daemon.v1)"
 summary: "The versioned coven.daemon.v1 contract under /api/v1: health negotiation, capability discovery, error envelopes, and additive compatibility rules."
+source_adjacent_reason: "Defines the daemon wire contract alongside its Rust route and transport implementations."
 read_when:
   - Pinning a client to the daemon contract
   - Checking stable API shapes and error envelopes
@@ -947,6 +948,60 @@ first launch, after a reset or rollover, or once the row was deleted).
 `hasHistory` is whether any session row has ever carried the current
 conversation id, which is what the next turn uses to pick `init` or `resume`.
 `404 main_session_not_found` before the first turn.
+
+### `GET /api/v1/main-session/events`
+
+Streams the current main conversation as UTF-8 `text/event-stream`. Optional
+`scope` has the same meaning and validation as `GET /main-session`. This route
+uses the same owner-local IPC permissions, TCP Host/Origin guard and trusted
+proxy boundary as the other session read routes. It does not add public access,
+a bearer-token bypass, or a mobile-gateway route. It uses the shared route/version
+and context-admission gates with their existing read-request semantics.
+
+Each default `message` event carries the existing event record JSON (including
+`seq`, `id`, `session_id`, `kind`, `payload_json`, `created_at`):
+
+```text
+id: 314
+data: {"seq":314,"id":"event-id","session_id":"session-id","kind":"output","payload_json":"{...}","created_at":"..."}
+
+```
+
+Connect without a cursor to replay retained events for the current conversation.
+Reconnect with `Last-Event-ID: 314` to receive only events with `seq > 314`, in
+ascending sequence order, including subsequent hosting sessions in that same
+conversation. Sequence numbers are global SQLite event cursors; unrelated
+sessions can leave numeric gaps. Persist the ID only after consuming its complete
+SSE frame. Legacy event payloads receive the same read-time privacy redaction as
+the JSON events endpoint. An idle stream sends `: heartbeat` comments every 25
+seconds; comments do not advance the cursor.
+
+Reset or rollover deliberately replaces the conversation. The stream sends
+`event: main_session.changed` with `data: {}` and an empty `id:` field (clearing
+the EventSource reconnect cursor), then replays the replacement conversation.
+Clients clear their displayed conversation on this event. An old retained cursor
+from another conversation receives the same transition on reconnect. Output from
+the discarded conversation is no longer part of the main-session feed. Ordinary
+turn/resume rebindings within the same conversation do not reset the cursor.
+
+The daemon admits at most 16 simultaneous SSE streams, leaving ordinary request
+capacity available. It loads one event at a time, checks stored size before
+loading payloads, and limits both loaded fields and encoded event JSON to 1 MiB.
+No producer queue, transaction or scope lock waits on a network write. Each frame
+has a five-second write deadline; a blocking socket write may overshoot by at
+most one five-second write timeout. Windows pipes use nonblocking writes. Slow
+readers are disconnected and can replay from their last fully consumed ID.
+Streams use `Cache-Control: no-store` and request disabled proxy buffering.
+
+Before streaming: `404 main_session_not_found` for an unknown scope,
+`400 invalid_request` for a malformed, repeated or nonpositive `Last-Event-ID`,
+`409 event_cursor_unavailable` for a cursor no longer retained (refresh history
+before subscribing without a cursor), and `503 stream_capacity` when full.
+An oversized next event emits `event: error` with code
+`event_response_too_large` and its `seq`, then closes without advancing the ID;
+the client must surface the error rather than silently skip that event.
+Retention/deletion can remove history; SSE does not extend the store's retention
+policy or promise replay of deleted events.
 
 ### `POST /api/v1/main-session/turn`
 

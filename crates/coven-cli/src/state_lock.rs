@@ -217,8 +217,8 @@ mod tests {
             (
                 "main-session scope",
                 include_str!("main_session_routes.rs"),
-                "    pub(crate) fn acquire(",
-                "\n        Ok(Self { file })",
+                "    fn open(",
+                "\n    pub(crate) fn acquire(",
             ),
         ] {
             let source = source
