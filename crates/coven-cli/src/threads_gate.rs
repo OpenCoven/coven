@@ -1290,7 +1290,7 @@ fn stage_pending_proposal(
     probes: &[crate::ward_probes::SurfaceProbeReport],
 ) -> Result<PathBuf> {
     let pending_dir = coven_home.join("pending");
-    std::fs::create_dir_all(&pending_dir)
+    crate::durable_fs::create_dir_all(&pending_dir)
         .with_context(|| format!("creating {}", pending_dir.display()))?;
     let path = pending_dir.join(pending.file_name());
     let body = {
@@ -1566,7 +1566,7 @@ fn stage_scheduled_coherence_proposal(
 
     checkpoint(Phase::ProbesReady);
     let pending_dir = coven_home.join("pending");
-    std::fs::create_dir_all(&pending_dir)
+    crate::durable_fs::create_dir_all(&pending_dir)
         .with_context(|| format!("creating {}", pending_dir.display()))?;
     let path = pending_dir.join(scheduled.pending().file_name());
     let body = {
@@ -1599,9 +1599,11 @@ fn stage_scheduled_coherence_proposal(
         &body,
     )?;
     checkpoint(Phase::SubmissionBindingBegin);
-    submission
-        .audit_reservation
-        .replace_purpose(&recovery.purpose()?)?;
+    crate::store::durable_transaction(submission.audit_reservation.connection(), || {
+        submission
+            .audit_reservation
+            .replace_purpose(&recovery.purpose()?)
+    })?;
     submission.audit_reservation.preserve_if_unfinished();
     checkpoint(Phase::SubmissionBindingReady);
     checkpoint(Phase::StageBegin);
@@ -1674,7 +1676,8 @@ pub(crate) fn append_scheduled_submission_audit(
         identity_evidence,
         auto_regression_evidence,
     ))?;
-    conn.execute(
+    crate::store::durable_transaction(conn, || {
+        conn.execute(
         "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
             tier, decision, approver, diff_hash, files_touched, channel,
@@ -1694,7 +1697,8 @@ pub(crate) fn append_scheduled_submission_audit(
         ],
     )
     .context("appending scheduled proposal submission audit")?;
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]

@@ -10297,6 +10297,7 @@ fn decide_threads_proposal_inner(
     )?;
     let decision_now = crate::threads_clock::now(coven_home)?;
     if let Some(terminal) = proposal_terminal_event(&conn, proposal_id)? {
+        store::durable_barrier(&conn)?;
         release_terminal_proposal_reservations(&conn, proposal_uuid)?;
         let matches_request = matches!(
             (decision, terminal.event_type.as_str()),
@@ -11526,6 +11527,7 @@ fn decide_threads_proposal_inner(
         }
     }
     if let Some(terminal) = proposal_terminal_event(&conn, proposal_id)? {
+        store::durable_barrier(&conn)?;
         let matches_request = matches!(
             (decision, terminal.event_type.as_str()),
             ("approve", "proposal_approved")
@@ -12204,6 +12206,12 @@ fn decide_threads_proposal_inner(
             audit_reservation.preserve()?;
             return Err(error);
         }
+        // Old intents and retries must cross the same evidence/file barriers as
+        // a fresh approval before recovery can change any protected target.
+        claim.preserve();
+        audit_reservation.preserve_if_unfinished();
+        store::durable_barrier(&conn)?;
+        crate::proposal_store::sync_existing(&claim.path)?;
         let (report, apply_cleanup_error) = {
             let mut final_authority_check = || {
                 ensure_proposal_final_authority_unchanged(
@@ -16027,8 +16035,9 @@ fn append_proposal_apply_intent(
     let detail = serde_json::to_string(state).context("serializing proposal apply intent")?;
     let files_touched = serde_json::to_string(files_touched)?;
     let now = now.format(&time::format_description::well_known::Rfc3339)?;
-    conn.execute(
-        "INSERT INTO ward_audit (
+    store::durable_transaction(conn, || {
+        conn.execute(
+            "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
             tier, decision, approver, diff_hash, detail, files_touched,
             channel, thread_id, submitted_at, decided_at
@@ -16036,19 +16045,20 @@ fn append_proposal_apply_intent(
             'validation_verdict', ?1, ?2, NULL, ?3, NULL,
             'proposal-apply-intent', ?4, NULL, ?5, ?6, ?7, NULL, ?8, ?8
          )",
-        rusqlite::params![
-            proposal_id,
-            familiar_id,
-            state.weave_hash,
-            approver.map(coven_threads_core::WriterId::as_str),
-            detail,
-            files_touched,
-            format!("{channel:?}").to_lowercase(),
-            now,
-        ],
-    )
-    .context("appending proposal apply intent")?;
-    Ok(())
+            rusqlite::params![
+                proposal_id,
+                familiar_id,
+                state.weave_hash,
+                approver.map(coven_threads_core::WriterId::as_str),
+                detail,
+                files_touched,
+                format!("{channel:?}").to_lowercase(),
+                now,
+            ],
+        )
+        .context("appending proposal apply intent")?;
+        Ok(())
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -16785,9 +16795,7 @@ fn finalize_approved_proposal(
     conn: &rusqlite::Connection,
     finalization: ApprovedProposalFinalization<'_>,
 ) -> Result<()> {
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .context("starting proposal approval transaction")?;
-    let result = (|| -> Result<()> {
+    store::durable_transaction(conn, || {
         crate::threads_gate::append_apply_audit_records_at(
             conn,
             Some(finalization.proposal_id),
@@ -16828,13 +16836,8 @@ fn finalize_approved_proposal(
             finalization.probe_summary,
             finalization.decided_at,
         )?;
-        conn.execute_batch("COMMIT")
-            .context("committing proposal approval transaction")
-    })();
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
-    }
-    result
+        Ok(())
+    })
 }
 
 fn append_proposal_decision_audit(
@@ -16908,27 +16911,34 @@ fn append_proposal_decision_audit_with_probe_summary(
         _ => None,
     };
     let now = now.format(&time::format_description::well_known::Rfc3339)?;
-    conn.execute(
-        "INSERT INTO ward_audit (
+    let write = || {
+        conn.execute(
+            "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
             tier, decision, approver, diff_hash, detail, files_touched,
             channel, thread_id, submitted_at, decided_at
         ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, ?6, NULL, ?7, ?8, ?9, NULL, ?10, ?10)",
-        rusqlite::params![
-            audit.event_type.tag(),
-            audit.proposal_id,
-            audit.familiar_id,
-            audit.weave_hash,
-            audit.decision,
-            audit.approver.map(|w| w.as_str().to_string()),
-            detail,
-            files_touched,
-            format!("{:?}", audit.channel).to_lowercase(),
-            now,
-        ],
-    )
-    .context("appending proposal decision to ward_audit")?;
-    Ok(())
+            rusqlite::params![
+                audit.event_type.tag(),
+                audit.proposal_id,
+                audit.familiar_id,
+                audit.weave_hash,
+                audit.decision,
+                audit.approver.map(|w| w.as_str().to_string()),
+                detail,
+                files_touched,
+                format!("{:?}", audit.channel).to_lowercase(),
+                now,
+            ],
+        )
+        .context("appending proposal decision to ward_audit")?;
+        Ok(())
+    };
+    if terminal {
+        store::durable_transaction(conn, write)
+    } else {
+        write()
+    }
 }
 
 /// Serialize one Ward per-edit outcome for the `/familiars/{id}/edits` response.
@@ -17379,6 +17389,10 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod power_loss_cases {
+        use super::*;
+        include!("api_power_loss_tests.rs");
+    }
     mod identity_route_cases {
         use super::*;
         include!("api_identity_route_tests.rs");

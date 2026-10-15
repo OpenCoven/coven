@@ -2154,8 +2154,10 @@ pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
         // cannot fail.
         check_owned_by_current_user(coven_home, metadata.uid(), unsafe { libc::geteuid() })?;
     }
-    std::fs::create_dir_all(coven_home)
-        .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
+    if !coven_home.is_dir() {
+        crate::durable_fs::create_dir_all(coven_home)
+            .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
+    }
     std::fs::set_permissions(coven_home, std::fs::Permissions::from_mode(0o700)).with_context(
         || {
             format!(
@@ -2178,8 +2180,10 @@ pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
             );
         }
     }
-    std::fs::create_dir_all(coven_home)
-        .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
+    if !coven_home.is_dir() {
+        crate::durable_fs::create_dir_all(coven_home)
+            .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
+    }
     #[cfg(windows)]
     set_windows_owner_only_directory_security(coven_home)?;
     Ok(())

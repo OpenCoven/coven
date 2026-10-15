@@ -70,6 +70,9 @@ pub(super) fn save_for_project(
     project_root: &Path,
     conversations: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    if !coven_home.is_dir() {
+        crate::durable_fs::create_dir_all(coven_home).map_err(std::io::Error::other)?;
+    }
     let dir = conversations_dir(coven_home);
     std::fs::create_dir_all(&dir)?;
     let stored = StoredConversations {

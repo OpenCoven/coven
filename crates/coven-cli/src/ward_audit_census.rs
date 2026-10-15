@@ -418,6 +418,12 @@ fn observe_artifacts(home: &Path) -> Result<(BTreeMap<Uuid, Artifacts>, usize)> 
             );
             let name = entry.file_name();
             if !quarantine
+                && name == crate::durable_fs::PUBLICATION_DIRECTORY
+                && entry.file_type()?.is_dir()
+            {
+                continue;
+            }
+            if !quarantine
                 && matches!(
                     name.to_str(),
                     Some("quarantine" | ".quota.lock" | ".scheduler-cursor")
@@ -853,6 +859,57 @@ mod tests {
         assert!(snapshot.windows[0].terminal_rows.is_empty());
         tx.commit()?;
         assert_eq!(load(home.path(), 100)?.windows[0].terminal_rows.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_publication_registry_is_bookkeeping_only_when_a_real_directory() -> Result<()> {
+        let (home, conn) = store()?;
+        let id = Uuid::new_v4().to_string();
+        append(
+            &conn,
+            &id,
+            "proposal_window_opened",
+            Some(&opening()?),
+            "sage",
+        )?;
+        let pending = home.path().join("pending");
+        fs::create_dir(&pending)?;
+        let proposal = pending.join(format!("{id}.json"));
+        fs::write(&proposal, "unverified proposal")?;
+        crate::proposal_store::quarantine(home.path(), &proposal, "fixture")?
+            .context("proposal was quarantined")?;
+        let registry = pending.join(".coven-directory-publications");
+        assert!(fs::symlink_metadata(&registry)?.is_dir());
+        assert_eq!(fs::read_dir(&registry)?.count(), 0);
+        let report = load(home.path(), 100)?;
+        assert_eq!(report.unattributed_artifact_entries, 0);
+        assert!(matches!(
+            report.windows[0].classification,
+            Classification::QuarantinedOpening
+        ));
+        assert_eq!(report.windows[0].artifacts.quarantine, 1);
+
+        let marker = registry.join("quarantine");
+        fs::write(&marker, "")?;
+        assert_eq!(load(home.path(), 100)?.unattributed_artifact_entries, 0);
+        fs::remove_file(&marker)?;
+        let quarantined_registry = pending
+            .join("quarantine")
+            .join(".coven-directory-publications");
+        fs::create_dir(&quarantined_registry)?;
+        assert_eq!(load(home.path(), 100)?.unattributed_artifact_entries, 1);
+        fs::remove_dir(&quarantined_registry)?;
+
+        fs::remove_dir(&registry)?;
+        fs::write(&registry, "not a registry directory")?;
+        assert_eq!(load(home.path(), 100)?.unattributed_artifact_entries, 1);
+        #[cfg(unix)]
+        {
+            fs::remove_file(&registry)?;
+            std::os::unix::fs::symlink(home.path(), &registry)?;
+            assert_eq!(load(home.path(), 100)?.unattributed_artifact_entries, 1);
+        }
         Ok(())
     }
 
