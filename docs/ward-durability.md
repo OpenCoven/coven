@@ -36,6 +36,8 @@ marked publications before creating descendants. Existing unmarked ancestors
 are the trusted initialization boundary; they need no write access to their own
 parents. Marker basenames use filesystem comparison rules, and Windows verifies
 that the registry has the same case-sensitivity setting as its parent.
+The census treats a real registry directory in `pending` as bookkeeping;
+files or symlinks under that name remain unattributed artifacts.
 
 ## SQLite policy
 

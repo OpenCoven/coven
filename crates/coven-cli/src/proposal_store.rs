@@ -677,7 +677,24 @@ mod tests {
         publish_new(temp.path(), &admitted, b"valid")?;
 
         assert!(admitted.exists());
-        assert_eq!(fs::read_dir(&pending)?.count(), 3);
+        let mut entries = fs::read_dir(&pending)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort();
+        let mut expected = vec![
+            std::ffi::OsString::from(".quota.lock"),
+            std::ffi::OsString::from(".coven-directory-publications"),
+            std::ffi::OsString::from("quarantine"),
+            admitted.file_name().unwrap().to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(entries, expected);
+        // The registry remains, but successful publication leaves no pending
+        // marker. Neither it nor quarantined hostile names consume quota.
+        assert_eq!(
+            fs::read_dir(pending.join(".coven-directory-publications"))?.count(),
+            0
+        );
         assert_eq!(
             fs::read_dir(pending.join("quarantine"))?.count(),
             MAX_PENDING_PROPOSALS

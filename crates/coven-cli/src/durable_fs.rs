@@ -312,7 +312,7 @@ fn ensure_matching_case_rules(
     Ok(())
 }
 
-const PUBLICATION_DIRECTORY: &str = ".coven-directory-publications";
+pub(crate) const PUBLICATION_DIRECTORY: &str = ".coven-directory-publications";
 
 fn publication_marker(path: &Path) -> Option<std::path::PathBuf> {
     let name = path.file_name()?;
