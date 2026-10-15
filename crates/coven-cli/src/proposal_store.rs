@@ -84,7 +84,7 @@ struct ProposalStoreLock {
 
 impl ProposalStoreLock {
     fn acquire(pending_dir: &Path) -> Result<Self> {
-        fs::create_dir_all(pending_dir)
+        crate::durable_fs::create_dir_all(pending_dir)
             .with_context(|| format!("creating {}", pending_dir.display()))?;
         let process = process_lock()
             .lock()
@@ -162,12 +162,13 @@ fn quarantine_locked(pending_dir: &Path, path: &Path, reason: &str) -> Result<Op
         .file_name()
         .context("pending proposal quarantine source has no filename")?;
     let quarantine_dir = pending_dir.join("quarantine");
-    fs::create_dir_all(&quarantine_dir)
+    crate::durable_fs::create_dir_all(&quarantine_dir)
         .with_context(|| format!("creating {}", quarantine_dir.display()))?;
     let destination_name = file_name.to_str().map_or_else(
         || format!("non-utf8.{reason}.{}", Uuid::new_v4()),
         |file_name| format!("{file_name}.{reason}.{}", Uuid::new_v4()),
     );
+    crate::durable_fs::sync_parent(&quarantine_dir)?;
     let destination = quarantine_dir.join(destination_name);
     fs::rename(path, &destination).with_context(|| {
         format!(
@@ -176,6 +177,8 @@ fn quarantine_locked(pending_dir: &Path, path: &Path, reason: &str) -> Result<Op
             destination.display()
         )
     })?;
+    crate::durable_fs::sync_parent(&destination)?;
+    crate::durable_fs::sync_parent(path)?;
     Ok(Some(destination))
 }
 
@@ -315,7 +318,8 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
         file.sync_all()
             .with_context(|| format!("syncing pending proposal stage {}", staged.display()))?;
         fs::rename(&staged, path)
-            .with_context(|| format!("committing pending proposal {}", path.display()))
+            .with_context(|| format!("committing pending proposal {}", path.display()))?;
+        crate::durable_fs::sync_parent(path)
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&staged);
@@ -393,7 +397,8 @@ pub(crate) fn rename_existing(source: &Path, destination: &Path) -> Result<()> {
             source.display(),
             destination.display()
         )
-    })
+    })?;
+    crate::durable_fs::sync_parent(destination)
 }
 
 pub(crate) fn remove_existing(path: &Path) -> Result<()> {
@@ -401,7 +406,35 @@ pub(crate) fn remove_existing(path: &Path) -> Result<()> {
         .parent()
         .context("pending proposal path has no parent")?;
     let _guard = ProposalStoreLock::acquire(pending_dir)?;
-    fs::remove_file(path).with_context(|| format!("removing pending proposal {}", path.display()))
+    fs::remove_file(path)
+        .with_context(|| format!("removing pending proposal {}", path.display()))?;
+    crate::durable_fs::sync_parent(path)
+}
+
+/// Re-establish the claim barrier before recovering an older applying state.
+pub(crate) fn sync_existing(path: &Path) -> Result<()> {
+    let parent = path.parent().context("proposal claim has no parent")?;
+    let _guard = ProposalStoreLock::acquire(parent)?;
+    let directory = crate::durable_fs::open_directory(parent)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "proposal claim is not a regular file"
+    );
+    crate::durable_fs::sync_file(&file)?;
+    crate::durable_fs::sync_directory(&directory)
 }
 
 #[cfg(test)]
@@ -415,6 +448,17 @@ mod tests {
     fn pending_path(home: &Path) -> PathBuf {
         home.join("pending")
             .join(format!("{}-{}.json", Uuid::new_v4(), Uuid::new_v4()))
+    }
+
+    #[test]
+    fn failed_publication_barrier_leaves_recoverable_file_and_returns_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("proposal.json");
+        crate::durable_fs::fail_next_directory_sync();
+        assert!(write_atomic(&path, b"durable contents").is_err());
+        assert_eq!(fs::read(&path)?, b"durable contents");
+        sync_existing(&path)?;
+        Ok(())
     }
 
     #[test]

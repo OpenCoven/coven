@@ -226,8 +226,10 @@ pub(crate) fn create(coven_home: &Path, request: &CreateRequest) -> Result<Creat
     };
     validate_id(&id)?;
 
-    fs::create_dir_all(coven_home)
-        .with_context(|| format!("failed to create COVEN_HOME {}", coven_home.display()))?;
+    if !coven_home.is_dir() {
+        crate::durable_fs::create_dir_all(coven_home)
+            .with_context(|| format!("failed to create COVEN_HOME {}", coven_home.display()))?;
+    }
     let home = std::path::absolute(coven_home)
         .with_context(|| format!("failed to resolve COVEN_HOME {}", coven_home.display()))?;
     let workspace = home.join("workspaces").join("familiars").join(&id);
@@ -423,7 +425,7 @@ fn seed_workspace(
     workspace: &Path,
     entry: &RosterEntry<'_>,
 ) -> Result<Vec<&'static str>, CreateError> {
-    fs::create_dir_all(workspace)
+    crate::durable_fs::create_dir_all(workspace)
         .with_context(|| format!("failed to create workspace {}", workspace.display()))?;
     let mut kept = Vec::new();
     for (name, contents) in [

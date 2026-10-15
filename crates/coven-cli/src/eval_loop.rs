@@ -185,7 +185,9 @@ impl Drop for MutationLock {
 
 pub(crate) fn mutation_lock(workspace: &Path) -> Result<MutationLock> {
     let dir = workspace.join(EVAL_LOOP_DIR);
-    fs::create_dir_all(&dir)?;
+    if !dir.is_dir() {
+        crate::durable_fs::create_dir_all(&dir)?;
+    }
     let file = crate::state_lock::open_lock_file(&dir.join("mutation.lock"))?;
     fs2::FileExt::lock_exclusive(&file).context("failed to lock eval-loop mutation")?;
     Ok(MutationLock(file))

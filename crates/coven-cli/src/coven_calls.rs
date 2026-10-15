@@ -196,8 +196,10 @@ fn load_file(path: &Path) -> Result<CovenCallsFile> {
 fn save_file(path: &Path, file: &CovenCallsFile) -> Result<()> {
     // Ensure parent directory exists.
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create dir {}", parent.display()))?;
+        if !parent.is_dir() {
+            crate::durable_fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create dir {}", parent.display()))?;
+        }
     }
 
     // Atomic write: tmp in same dir → rename.

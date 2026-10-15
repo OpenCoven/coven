@@ -21,7 +21,9 @@ use crate::{
     privacy::{self, PrivacyConfig},
 };
 
+mod durability;
 mod schema;
+pub(crate) use durability::{barrier as durable_barrier, transaction as durable_transaction};
 
 // Keep these public paths stable for callers while schema owns the defaults.
 #[allow(unused_imports)]
@@ -443,8 +445,12 @@ pub struct EventsQueryOptions {
 }
 
 pub fn ensure_private_store_directory(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("failed to create store directory {}", path.display()))?;
+    if !path.is_dir() {
+        crate::durable_fs::create_dir_all(path)
+            .with_context(|| format!("failed to create store directory {}", path.display()))?;
+    }
+    // Existing homes keep NORMAL-mode opens cheap. Authority commits separately
+    // sync the home's publication in its parent, including interrupted mkdirs.
     harden_store_directory(path)
 }
 

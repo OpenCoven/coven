@@ -47,6 +47,7 @@ mod familiar_create;
 mod familiar_identity;
 // Familiar Contract binding issuer; no production caller until the trusted
 // Runtime Authority adapter (coven#857 slice 6).
+mod durable_fs;
 #[allow(dead_code)]
 mod familiar_issuer;
 mod familiar_ledger;
@@ -72,6 +73,8 @@ mod parallel_protocol;
 mod patch;
 mod paths;
 mod pc;
+#[cfg(test)]
+mod power_loss_tests;
 mod privacy;
 mod project;
 mod prompt_refs;
@@ -3662,6 +3665,9 @@ fn run_adapter_install(adapter: &str) -> Result<()> {
         )
     })?;
     let coven_home = coven_home_dir()?;
+    if !coven_home.is_dir() {
+        durable_fs::create_dir_all(&coven_home)?;
+    }
     let adapter_dir = harness::trusted_adapter_dir(&coven_home);
     let manifest_path = harness::trusted_adapter_manifest_path(&coven_home, adapter);
 

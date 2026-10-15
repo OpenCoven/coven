@@ -2609,7 +2609,9 @@ impl App {
             return;
         };
         let export_dir = coven_home.join("exports");
-        if std::fs::create_dir_all(&export_dir).is_err() {
+        if (!coven_home.is_dir() && crate::durable_fs::create_dir_all(&coven_home).is_err())
+            || std::fs::create_dir_all(&export_dir).is_err()
+        {
             self.push_system_message("Failed to create export directory.");
             return;
         }

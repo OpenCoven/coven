@@ -604,6 +604,9 @@ pub(super) fn configure_initializing_connection(conn: &Connection) -> Result<()>
 /// milliseconds per write transaction and pushed ordinary requests past the
 /// client's response budget (#1051).
 ///
+/// Authority transactions temporarily use FULL; fullfsync ensures their WAL
+/// commits and all checkpoints request the macOS device barrier as well.
+///
 /// `temp_store = MEMORY` keeps the per-connection TEMP trigger and table that
 /// `install_ward_audit_capacity_trigger` rebuilds on every open out of a
 /// temp file; the default writes them under the OS temp directory on first
@@ -612,6 +615,7 @@ const WRITABLE_CONNECTION_PRAGMAS: &str = "PRAGMA busy_timeout = 5000;
      PRAGMA foreign_keys = ON;
      PRAGMA recursive_triggers = ON;
      PRAGMA synchronous = NORMAL;
+     PRAGMA fullfsync = ON;
      PRAGMA temp_store = MEMORY;";
 
 fn enable_wal_with_retry(conn: &Connection) -> Result<()> {

@@ -2556,6 +2556,10 @@ fn open_expected_ward_config(
     Ok(ExpectedControlFile { path, observed })
 }
 
+fn sync_anchored_directory(directory: &Dir) -> Result<()> {
+    crate::durable_fs::sync_directory(&directory.try_clone()?.into_std_file())
+}
+
 struct AnchoredParent {
     dir: Arc<Dir>,
     absolute: PathBuf,
@@ -3460,6 +3464,8 @@ fn write_atomically_if_unchanged(
                 "approved target unexpectedly disappeared before batch finalization",
                 &changed,
             )?;
+            crate::durable_fs::sync_file(identity)?;
+            sync_anchored_directory(&write.path.parent)?;
             if write.already_applied {
                 continue;
             }
@@ -3616,6 +3622,12 @@ fn rollback_conditional_writes(
         } else {
             rollback_created_write(write)
         };
+        let rollback = rollback.and_then(|()| {
+            if let Some(before) = write.observed.as_ref() {
+                crate::durable_fs::sync_file(&before.file)?;
+            }
+            sync_anchored_directory(&write.path.parent)
+        });
         if let Err(error) = rollback {
             errors.push(format!("{}: {error:#}", write.decision.target));
         }
@@ -5879,9 +5891,13 @@ fn prepare_staging_parent(home: &AnchoredHome, parent: &Path) -> Result<Anchored
                 );
             }
         }
-        directory = open_child_dir_nofollow(&directory, part)
+        let child = open_child_dir_nofollow(&directory, part)
             .with_context(|| format!("opening staging parent {}", verified.display()))?;
+        sync_anchored_directory(&child)?;
+        sync_anchored_directory(&directory)?;
+        directory = child;
     }
+    sync_anchored_directory(&directory)?;
     Ok(AnchoredParent {
         dir: Arc::new(directory),
         absolute: verified,

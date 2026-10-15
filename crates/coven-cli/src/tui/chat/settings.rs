@@ -75,7 +75,9 @@ pub(super) fn load_from(coven_home: &Path) -> ChatSettings {
 /// underlying io error so callers can surface a system message — but they
 /// must not treat it as a fatal failure (the in-memory mode is still active).
 pub(super) fn save_to(coven_home: &Path, settings: &ChatSettings) -> std::io::Result<()> {
-    std::fs::create_dir_all(coven_home)?;
+    if !coven_home.is_dir() {
+        crate::durable_fs::create_dir_all(coven_home).map_err(std::io::Error::other)?;
+    }
     let body = serde_json::to_vec_pretty(settings)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     let path = settings_path(coven_home);

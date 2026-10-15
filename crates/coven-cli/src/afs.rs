@@ -469,6 +469,9 @@ impl AfsStore {
 
         let commit = git_head(&project_root);
         let fingerprint = base_fingerprint(&project_root, commit.as_deref());
+        if !self.root.is_dir() {
+            crate::durable_fs::create_dir_all(&self.root).map_err(AfsError::from)?;
+        }
         std::fs::create_dir_all(self.bases_dir())
             .and_then(|_| std::fs::create_dir_all(self.sessions_dir()))
             .context("failed to create the AFS store layout")
