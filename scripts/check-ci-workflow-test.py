@@ -10,7 +10,7 @@ RELEASE_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'wo
 RELEASE_GITHUB_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'release-github.yml'
 RELEASE_STRESS_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'release-stress.yml'
 CACHE_SHA = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
-SETUP_NODE_SHA = "820762786026740c76f36085b0efc47a31fe5020"
+SETUP_NODE_SHA = "949feb2413d6458794dcd2491c4babbbce0c15c1"
 CI_TEXT = CI_WORKFLOW.read_text(encoding='utf-8')
 RELEASE_TEXT = RELEASE_WORKFLOW.read_text(encoding='utf-8')
 RELEASE_GITHUB_TEXT = RELEASE_GITHUB_WORKFLOW.read_text(encoding='utf-8')

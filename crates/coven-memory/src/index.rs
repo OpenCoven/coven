@@ -13,6 +13,14 @@ pub struct VecIndex {
 }
 
 impl VecIndex {
+    pub(crate) fn fresh(path: &Path) -> Result<Self> {
+        Ok(Self {
+            inner: IdMapIndex::new(DIM, BIT_WIDTH)
+                .map_err(|e| anyhow::anyhow!("creating index: {e:?}"))?,
+            path: path.to_owned(),
+        })
+    }
+
     /// Load from disk if it exists, otherwise create a fresh index
     pub fn open(path: &Path) -> Result<Self> {
         fs_security::ensure_private_parent(path)?;
@@ -56,7 +64,10 @@ impl VecIndex {
         k: usize,
         allowlist: &[u64],
     ) -> Result<(Vec<f32>, Vec<u64>)> {
-        let (scores, ids) = self.inner.search_with_allowlist(query, k, Some(allowlist));
+        let (scores, ids) = self
+            .inner
+            .search_with_allowlist(query, k, Some(allowlist))
+            .map_err(|error| anyhow::anyhow!("searching turbovec with allowlist: {error:?}"))?;
         Ok((scores, ids))
     }
 
@@ -87,6 +98,21 @@ impl VecIndex {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn filtered_search_reports_invalid_allowlist_instead_of_panicking() {
+        let root =
+            std::env::temp_dir().join(format!("coven-filtered-search-{}", uuid::Uuid::new_v4()));
+        let mut index = VecIndex::open(&root.join("index.tvim")).unwrap();
+        let vector = vec![1.0; DIM];
+        index.add(&[42], std::slice::from_ref(&vector)).unwrap();
+
+        let (_, ids) = index.search_filtered(&vector, 1, &[42]).unwrap();
+        assert_eq!(ids, vec![42]);
+        let error = index.search_filtered(&vector, 1, &[99]).unwrap_err();
+        assert!(error.to_string().contains("UnknownId(99)"), "{error:#}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn opening_an_existing_permissive_index_tightens_it() {
