@@ -56,7 +56,9 @@ page cache survives it, and graceful connection close may checkpoint the WAL.
 
 On Unix, checked Rust file/directory `sync_all` calls use `fsync`, or
 `F_FULLFSYNC` on macOS. Ward keeps the target directory and file identities
-open across replacement and sync. The private proposal store retains its
+open across replacement and sync. Directory barriers reopen `.` relative to the
+retained handle with read access because Linux `O_PATH` handles cannot be synced.
+The private proposal store retains its
 existing assumption that its trusted home/parent path is not concurrently
 replaced by another process; target containment still uses anchored handles.
 

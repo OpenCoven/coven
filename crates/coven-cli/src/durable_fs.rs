@@ -10,9 +10,28 @@ pub(crate) fn open_directory(path: &Path) -> Result<File> {
 
 #[cfg(unix)]
 fn sync_directory_native(directory: &File) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // cap-std uses O_PATH on Linux and several other Unix targets. Those
+    // descriptors support relative lookup but reject fsync with EBADF. Open
+    // the retained directory itself, never its possibly replaced pathname.
+    // SAFETY: the borrowed descriptor and NUL-terminated relative name remain
+    // valid throughout openat. No mode argument is needed without O_CREAT.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("reopening retained directory for durability");
+    }
+    // SAFETY: successful openat returned one newly owned descriptor.
+    let readable = unsafe { File::from_raw_fd(descriptor) };
     // Rust uses F_FULLFSYNC on macOS, fsync elsewhere. Never ignore unsupported
     // barriers: a rename alone does not prove power-loss durability.
-    directory.sync_all().context("syncing durable directory")
+    readable.sync_all().context("syncing durable directory")
 }
 
 #[cfg(windows)]
