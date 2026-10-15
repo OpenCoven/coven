@@ -470,8 +470,15 @@ fn parse_markdown_front_matter(proposed: &[u8]) -> Result<()> {
         let candidate = candidate.strip_suffix('\r').unwrap_or(candidate);
         if candidate == "---" {
             let metadata = &after_open[..offset];
-            serde_yaml_ng::from_str::<serde_yaml_ng::Value>(metadata)
-                .context("invalid YAML front matter")?;
+            // Validate YAML without retaining values or restricting keys to strings.
+            // Preserve the previous parser's acceptance of merge keys as ordinary
+            // keys and non-finite scalars; duplicate keys still fail closed.
+            let options = serde_saphyr::options! {
+                merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+                non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::PassThrough,
+            };
+            serde_saphyr::from_str_with_options::<serde::de::IgnoredAny>(metadata, options)
+                .map_err(|_| anyhow::anyhow!("invalid YAML front matter"))?;
             return Ok(());
         }
         offset += line.len();
@@ -972,6 +979,63 @@ format = "markdown-front-matter"
 
         assert_eq!(reports[0].status, ProbeStatus::Failed);
         assert_eq!(reports[0].results[0].status, ProbeStatus::Failed);
+    }
+
+    #[test]
+    fn markdown_front_matter_preserves_yaml_syntax_support() {
+        for metadata in [
+            "",
+            "# comment only\n",
+            "name: sage\nroles: [reader, writer]\n",
+            "sage\n",
+            "- reader\n- writer\n",
+            "? [one, two]\n: value\n",
+            "name: !custom sage\nroles: !custom [reader, writer]\n",
+            "values: [.nan, .inf, -.inf]\n",
+            "<<: ordinary\n",
+            "name: &name sage\nalias: *name\n",
+            "defaults: &defaults {name: sage}\nprofile: {<<: *defaults, name: nova}\n",
+            "description: |\n  First line\n  Second line\n",
+            "name: \"Sage 🌿\"\nenabled: true\nmissing: null\n",
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let proposed =
+                    format!("---\n{metadata}---\n# Body\ninvalid: [\n").replace('\n', newline);
+                let (status, _, detail) =
+                    run_parse(Some(ProbeFormat::MarkdownFrontMatter), proposed.as_bytes());
+                assert_eq!(status, ProbeStatus::Passed, "{metadata:?}: {detail}");
+                assert_eq!(detail, json!({ "format": "markdown-front-matter" }));
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_front_matter_rejects_invalid_yaml_without_exposing_contents() {
+        for metadata in [
+            "name: [\n",
+            "name: first\nname: second\n",
+            "profile: {name: first, name: second}\n",
+            "0xB: first\n11: second\n",
+            "? [one, two]\n: first\n? [one, two]\n: second\n",
+            "name: *missing\n",
+            "loop: &loop [*loop]\n",
+            "value: !!int nope\n",
+            "value: !!bool nope\n",
+            "name: sage\n...\nname: nova\n",
+            "name: \0\n",
+        ] {
+            let proposed = format!("---\n{metadata}---\n# Body\n");
+            let (status, _, detail) =
+                run_parse(Some(ProbeFormat::MarkdownFrontMatter), proposed.as_bytes());
+            assert_eq!(status, ProbeStatus::Failed, "{metadata:?}: {detail}");
+            assert_eq!(
+                detail,
+                json!({
+                    "format": "markdown-front-matter",
+                    "error": "invalid YAML front matter",
+                })
+            );
+        }
     }
 
     #[test]
