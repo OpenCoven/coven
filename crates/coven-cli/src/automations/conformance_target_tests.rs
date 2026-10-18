@@ -1223,9 +1223,9 @@ fn command_envelope_outcomes_suite_fails_when_the_router_disagrees() {
         |vectors| {
             vectors["cases"][1]["steps"][0]["expect"] = json!({ "outcome": "committed" });
         },
-        // The retry, which this producer does not implement, would have to be
-        // adopted; the refused delivery variant would have to leave no adoption.
-        |vectors| vectors["cases"][1]["steps"][0]["expect"]["writes"] = json!("adoption"),
+        // The retained NOT_FOUND retry refusal would have to leave no adoption;
+        // the refused delivery variant would also have to leave no adoption.
+        |vectors| vectors["cases"][1]["steps"][0]["expect"]["writes"] = json!("nothing"),
         |vectors| vectors["cases"][1]["steps"][2]["expect"]["writes"] = json!("nothing"),
         // The stale revise would have to be refused for a different reason.
         |vectors| {

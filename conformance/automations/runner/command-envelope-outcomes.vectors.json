@@ -272,8 +272,8 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "CAPABILITY_UNSUPPORTED",
-            "writes": "nothing"
+            "errorCode": "NOT_FOUND",
+            "writes": "adoption"
           }
         },
         {

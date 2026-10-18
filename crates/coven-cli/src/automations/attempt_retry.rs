@@ -573,6 +573,68 @@ mod tests {
                 "note": "the disk was full" })
     }
 
+    #[test]
+    fn envelope_retry_replays_the_original_result_after_reopening() {
+        let validator = super::super::command_envelope::tests::response_validator();
+        let fixture = held();
+        let flat = request(&fixture, "adopt:retry:envelope", 1, "failed");
+        let mut payload = flat.as_object().unwrap().clone();
+        payload.remove("action");
+        payload.remove("adoptionKey");
+        let envelope = json!({
+            "action": "coven.automations.command.v1",
+            "envelope": {
+                "schemaVersion": "coven.automations.v1", "command": "attempt.retry.v1",
+                "adoptionKey": flat["adoptionKey"],
+                "origin": { "principal": { "principalId": "principal:owner" }, "channel": "sdk" },
+                "intent": { "statement": "Retry the failed attempt." }, "payload": payload
+            }
+        });
+        let (status, first) = crate::control_plane::route_action(
+            envelope.clone(),
+            &fixture.conn,
+            &NoopSessionRuntime,
+        );
+        assert_eq!(status, 200, "{first:?}");
+        let first = first.result.unwrap();
+        assert!(validator.is_valid(&first), "{first}");
+        assert_eq!(first["outcome"], "committed");
+        assert_eq!(first["result"]["attemptNumber"], 2);
+        let path = fixture._temp.path().join("store.sqlite");
+        drop(fixture.conn);
+        let conn = crate::store::open_store(&path).unwrap();
+        let (_, replay) =
+            crate::control_plane::route_action(envelope.clone(), &conn, &NoopSessionRuntime);
+        let replay = replay.result.unwrap();
+        assert!(validator.is_valid(&replay), "{replay}");
+        assert_eq!(replay["outcome"], "replayed");
+        assert_eq!(replay["result"], first["result"]);
+        assert!(replay["replay"]["firstCommittedAt"].is_string());
+        let mut changed = envelope.clone();
+        changed["envelope"]["payload"]["note"] = json!("different request");
+        let (_, conflict) = crate::control_plane::route_action(changed, &conn, &NoopSessionRuntime);
+        assert_eq!(conflict.error.unwrap()["code"], "ADOPTION_REPLAY_MISMATCH");
+        let RetryExecution::Success { payload, replayed } =
+            execute_attempt_retry(&conn, flat, Utc::now()).unwrap()
+        else {
+            panic!("flat replay was refused");
+        };
+        assert!(replayed);
+        assert_eq!(payload, first["result"]);
+        // Simulate corrupt restored storage, which the normal append-only API
+        // cannot create. This trigger is removed only in the disposable fixture.
+        conn.execute_batch("DROP TRIGGER automation_command_adoptions_immutable_columns")
+            .unwrap();
+        conn.execute(
+            "UPDATE automation_command_adoptions SET adopted_at = ?1 WHERE adoption_key = ?2",
+            ["2026-10-18T09:00:00+00:00", "adopt:retry:envelope"],
+        )
+        .unwrap();
+        let (_, corrupt) = crate::control_plane::route_action(envelope, &conn, &NoopSessionRuntime);
+        assert_eq!(corrupt.error.unwrap()["code"], "INTERNAL");
+        assert!(corrupt.event.is_none());
+    }
+
     fn refused(fixture: &Fixture, body: Value, at: DateTime<Utc>) -> ErrorCode {
         match execute_attempt_retry(&fixture.conn, body, at).unwrap() {
             RetryExecution::Rejected(error) => error.code(),
