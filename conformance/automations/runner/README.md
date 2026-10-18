@@ -262,7 +262,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eleven structural suites, fourteen
+The native Coven target currently implements eleven structural suites, fifteen
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -471,3 +471,37 @@ definition/adoption/event, reopens the store and requires stable replay without
 additional writes. Synthetic payloads and database snapshots remain internal.
 Unsupported fixture conditions and malformed vectors fail with static errors.
 This remains `audit_only`; it supplies no production release eligibility.
+
+## Command process-crash audit boundary
+
+`command-process-crash-recovery` uses three abrupt process-termination cases
+and an uninterrupted commit control. Each worker is the exact audited binary,
+creates a new private child directory under parent-owned scratch, initializes
+a disposable file-backed store, and verifies a preexisting paused definition.
+No worker input can select an existing database. No providers or runtimes launch.
+
+Fixture-only TEMP triggers call a local SQLite callback after the definition,
+event or adoption INSERT. The callback announces the boundary and parks. The
+parent verifies the WAL header, frame salts and rolling checksums, and
+requires complete frames with zero commit markers before abruptly killing and
+reaping the child. The disposable connection uses a one-page cache and cache
+spill after a verified truncating checkpoint. Production cache/durability
+settings do not change. SQL abort and panic unwinding are not crash evidence.
+
+Raw reopen checks integrity and complete snapshots before production schema
+initialization. Definitions, rich revisions, owner principal/grants, adoptions,
+reservations, events and stream heads must retain the baseline without partial
+writes. Retrying the same command/key must add one definition/adoption/event
+and its stream head, with a correlated event reference. Reopen/replay must
+preserve the full response and first commit time without additional writes.
+
+Worker handshakes, private snapshots and synthetic prompts remain internal.
+Exported observations contain fixed boundary/outcome classes, counts and
+preservation booleans. Child input/output and waits are bounded; error cleanup
+kills/reaps the child before removing scratch. The runner's two-minute fixture
+hang guard is not a measured recovery SLO. Native-target tests run on Windows;
+standalone Windows runner containment remains unsupported.
+
+This adds `audit_only` command transaction crash coverage. It does not cover
+external dispatch crashes, physical disk exhaustion, permission/I/O/corruption,
+complete profiles, production authority, or release eligibility.

@@ -126,6 +126,7 @@ fn capability_advertises_the_native_structural_suites() {
                         "command-transaction-rollback",
                         "legacy-import-source-preservation",
                         "command-storage-capacity-recovery",
+                        "command-process-crash-recovery",
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
                         OVERLAP_FORBID_CLAIMING_SUITE,

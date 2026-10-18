@@ -1192,6 +1192,8 @@ enum AutomationsCommand {
 
 #[derive(Subcommand, Debug)]
 enum AutomationsConformanceCommand {
+    #[command(hide = true, name = "command-crash-worker")]
+    CommandCrashWorker,
     #[command(about = "Print the native conformance suites supported by this binary")]
     Capability,
     #[command(about = "Evaluate one conformance suite request from standard input")]
@@ -4134,6 +4136,13 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
             json,
         } => automations::lease_cli::run(automation_id.as_deref(), limit, cursor.as_deref(), json),
         AutomationsCommand::Conformance { command } => match command {
+            AutomationsConformanceCommand::CommandCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::command_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
             AutomationsConformanceCommand::Capability => {
                 println!(
                     "{}",

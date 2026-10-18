@@ -20,6 +20,7 @@
     { "profile": "scheduler_reliability", "suiteId": "command-transaction-rollback", "vectorFile": "command-transaction-rollback.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "legacy-import-source-preservation", "vectorFile": "legacy-import-source-preservation.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "command-storage-capacity-recovery", "vectorFile": "command-storage-capacity-recovery.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "command-process-crash-recovery", "vectorFile": "command-process-crash-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "misfire-latest-planning", "vectorFile": "misfire-latest-planning.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "occurrence-lease-recovery", "vectorFile": "occurrence-lease-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "overlap-forbid-claiming", "vectorFile": "overlap-forbid-claiming.vectors.json" },
