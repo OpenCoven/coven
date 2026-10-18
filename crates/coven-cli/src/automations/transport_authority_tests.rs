@@ -359,7 +359,7 @@ fn prompt_and_log_reads_require_owner_ipc() -> Result<()> {
 }
 
 #[test]
-fn retry_and_recovery_envelopes_are_refused_before_tcp_store_access() -> Result<()> {
+fn run_control_envelopes_are_refused_before_tcp_store_access() -> Result<()> {
     for (command, payload) in [
         (
             "attempt.retry.v1",
@@ -369,6 +369,11 @@ fn retry_and_recovery_envelopes_are_refused_before_tcp_store_access() -> Result<
             "occurrence.recover.v1",
             json!({"occurrenceId": "occurrence-1", "evidenceDetermination": "failed_deterministic"}),
         ),
+        (
+            "occurrence.cancel.v1",
+            json!({"occurrenceId": "occurrence-1"}),
+        ),
+        ("attempt.cancel.v1", json!({"attemptId": "attempt-1"})),
     ] {
         for route in ["/actions", "/api/v1/actions"] {
             let temp = tempfile::tempdir()?;

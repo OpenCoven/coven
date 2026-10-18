@@ -11,8 +11,8 @@
 //!
 //! Only the envelope's supported subset is translated. A command or field the
 //! producer cannot honour is refused with `CAPABILITY_UNSUPPORTED` rather than
-//! dropped. Run-now and cancellation need replay-contract reconciliation;
-//! `run.cancel.v1` also lacks the attempt and runtime correlation the
+//! dropped. Run-now needs replay-contract reconciliation;
+//! `run.cancel.v1` lacks the attempt and runtime correlation the
 //! producer's cancellation requires.
 
 use serde_json::{json, Map, Value};
@@ -92,9 +92,12 @@ pub(crate) fn route(
 
     if matches!(
         command,
-        CommandName::AttemptRetry | CommandName::OccurrenceRecover
+        CommandName::AttemptRetry
+            | CommandName::OccurrenceRecover
+            | CommandName::OccurrenceCancel
+            | CommandName::AttemptCancel
     ) {
-        return stable_run_control(conn, envelope, command, &command_name);
+        return stable_run_control(conn, runtime, envelope, command, &command_name);
     }
 
     let (status, inner) = match command {
@@ -192,11 +195,12 @@ pub(crate) fn route(
     )
 }
 
-/// These executors retain the original committed payload, unlike run-now's
-/// live projection and cancellation's evolving stop outcome. Reuse their
-/// transaction, fences and authority refusals; only adapt the response wire.
+/// Reuse the executors' transactions, fences and authority decisions. For
+/// delegated cancellation, only the inner terminal adoption is a committed
+/// result; the outer adoption records a request that may still be pending.
 fn stable_run_control(
     conn: &rusqlite::Connection,
+    runtime: &dyn crate::api::SessionRuntime,
     envelope: &Value,
     command: CommandName,
     command_name: &str,
@@ -213,7 +217,7 @@ fn stable_run_control(
             super::attempt_retry::execute_attempt_retry(conn, body, chrono::Utc::now()).map(
                 |answer| match answer {
                     super::attempt_retry::RetryExecution::Success { payload, replayed } => {
-                        Ok((payload, replayed))
+                        Ok((payload, replayed, None))
                     }
                     super::attempt_retry::RetryExecution::Rejected(error) => Err(error),
                 },
@@ -224,20 +228,59 @@ fn stable_run_control(
             super::recovery::execute_occurrence_recovery(conn, body, chrono::Utc::now()).map(
                 |answer| match answer {
                     super::recovery::RecoveryExecution::Success { payload, replayed } => {
-                        Ok((payload, replayed))
+                        Ok((payload, replayed, None))
                     }
                     super::recovery::RecoveryExecution::Rejected(error) => Err(error),
                 },
             ),
             "automations.occurrence.recovery",
         ),
+        CommandName::OccurrenceCancel | CommandName::AttemptCancel => {
+            let (answer, kind) = if command == CommandName::OccurrenceCancel {
+                (
+                    super::cancel_commands::execute_occurrence_cancel(
+                        conn,
+                        runtime,
+                        body,
+                        chrono::Utc::now(),
+                    ),
+                    "automations.occurrence.cancellation",
+                )
+            } else {
+                (
+                    super::cancel_commands::execute_attempt_cancel(
+                        conn,
+                        runtime,
+                        body,
+                        chrono::Utc::now(),
+                    ),
+                    "automations.attempt.cancellation",
+                )
+            };
+            (
+                answer.map(|answer| match answer {
+                    super::cancel_commands::CancelExecution::Success {
+                        payload, terminal, ..
+                    } => Ok((payload, terminal.replayed, Some(terminal))),
+                    super::cancel_commands::CancelExecution::Rejected(error) => Err(error),
+                }),
+                kind,
+            )
+        }
         _ => unreachable!("only stable-result run controls use this adapter"),
     };
-    let (payload, replayed) = match execution {
+    let (payload, replayed, terminal) = match execution {
         Ok(Ok(success)) => success,
         Ok(Err(error)) => return reject(error),
         Err(error) => return reject(automation_error(ErrorCode::Internal, error)),
     };
+    // A committed outer delegation is not a terminal cancellation result.
+    // Validate the identified terminal adoption even on its first response.
+    if let Some(terminal) = &terminal {
+        if let Err(error) = validate_cancellation_adoption(conn, terminal, &payload, envelope) {
+            return reject(automation_error(ErrorCode::Internal, error));
+        }
+    }
     let mut response = json!({
         "schemaVersion": SCHEMA_VERSION, "command": command_name,
         "adoptionKey": key, "outcome": if replayed { "replayed" } else { "committed" },
@@ -247,7 +290,15 @@ fn stable_run_control(
         let first_committed_at = conn.query_row(
             "SELECT adopted_at FROM automation_command_adoptions
              WHERE adoption_key = ?1 AND command = ?2 AND outcome = 'committed'",
-            rusqlite::params![key.as_str(), command_name],
+            rusqlite::params![
+                terminal
+                    .as_ref()
+                    .map(|adoption| adoption.key.as_str())
+                    .or(key.as_str()),
+                terminal
+                    .as_ref()
+                    .map_or(command_name, |adoption| adoption.command)
+            ],
             |row| row.get::<_, String>(0),
         );
         let first_committed_at = match first_committed_at {
@@ -289,6 +340,52 @@ fn stable_run_control(
             }),
         },
     )
+}
+
+fn validate_cancellation_adoption(
+    conn: &rusqlite::Connection,
+    terminal: &super::cancel_commands::TerminalAdoption,
+    payload: &Value,
+    envelope: &Value,
+) -> Result<(), String> {
+    let (stored, at): (String, String) = conn
+        .query_row(
+            "SELECT response_json, adopted_at FROM automation_command_adoptions
+         WHERE adoption_key = ?1 AND command = ?2 AND outcome = 'committed'",
+            rusqlite::params![terminal.key, terminal.command],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("missing terminal cancellation adoption: {error}"))?;
+    if super::contract::types::Timestamp::new(at.clone()).is_err()
+        || chrono::DateTime::parse_from_rfc3339(&at).is_err()
+    {
+        return Err("terminal cancellation adoption has an invalid timestamp".to_owned());
+    }
+    let stored: Value = serde_json::from_str(&stored)
+        .map_err(|error| format!("invalid terminal cancellation adoption: {error}"))?;
+    let mut retained = stored["result"].clone();
+    if stored["outcome"] != "committed"
+        || !retained.is_object()
+        || !matches!(
+            retained["status"].as_str(),
+            Some("cancelled" | "recovery_required")
+        )
+    {
+        return Err("terminal cancellation adoption has no valid result".to_owned());
+    }
+    let field = if envelope["command"] == "occurrence.cancel.v1" {
+        "occurrenceId"
+    } else {
+        "attemptId"
+    };
+    let target = &envelope["payload"][field];
+    if terminal.command == "run.cancel.v1" && field == "occurrenceId" {
+        retained[field] = target.clone();
+    }
+    if retained.get(field) != Some(target) || retained != *payload {
+        return Err("terminal cancellation result does not match its immutable target".to_owned());
+    }
+    Ok(())
 }
 
 /// A rejected spec response around the adapter's error. The spec requires a

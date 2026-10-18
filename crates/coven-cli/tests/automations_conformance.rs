@@ -745,8 +745,8 @@ fn native_target_evaluates_checked_in_command_envelope_vectors() -> anyhow::Resu
     let response: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(response["suiteId"], "command-envelope-outcomes");
     assert_eq!(response["status"], "passed");
-    assert_eq!(response["evidence"]["executedCases"], 5);
-    assert_eq!(response["evidence"]["passedCases"], 5);
+    assert_eq!(response["evidence"]["executedCases"], 6);
+    assert_eq!(response["evidence"]["passedCases"], 6);
     assert!(!coven_home.exists());
     Ok(())
 }

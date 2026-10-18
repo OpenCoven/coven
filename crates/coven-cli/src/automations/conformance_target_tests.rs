@@ -1213,13 +1213,13 @@ fn command_envelope_outcomes_suite_executes_the_checked_in_vectors() {
     let response = evaluate(&request_for("command-envelope-outcomes", vectors)).unwrap();
 
     assert_eq!(response.status, TargetSuiteStatus::Passed);
-    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 5);
-    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 5);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 6);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 6);
 }
 
 #[test]
 fn command_envelope_outcomes_suite_fails_when_the_router_disagrees() {
-    let wrong_expectations: [fn(&mut Value); 7] = [
+    let wrong_expectations: [fn(&mut Value); 10] = [
         // The refused retry would have to commit.
         |vectors| {
             vectors["cases"][1]["steps"][0]["expect"] = json!({ "outcome": "committed" });
@@ -1246,6 +1246,12 @@ fn command_envelope_outcomes_suite_fails_when_the_router_disagrees() {
             vectors["cases"][4]["steps"][2]["expect"] =
                 json!({ "outcome": "committed", "revision": 1 });
         },
+        // A missing cancellation target still retains its refusal adoption.
+        |vectors| vectors["cases"][5]["steps"][0]["expect"]["writes"] = json!("nothing"),
+        // Repeating that request must not create a second adoption.
+        |vectors| vectors["cases"][5]["steps"][1]["expect"]["writes"] = json!("adoption"),
+        // The same key cannot silently switch to another cancellation target.
+        |vectors| vectors["cases"][5]["steps"][2]["expect"]["errorCode"] = json!("NOT_FOUND"),
     ];
 
     for mutate in wrong_expectations {

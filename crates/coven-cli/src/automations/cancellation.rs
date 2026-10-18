@@ -401,6 +401,8 @@ fn reconcile_cancellation_adoption_ledger(conn: &Connection) -> anyhow::Result<(
 pub struct CancellationSuccess {
     pub payload: Value,
     pub replayed: bool,
+    /// True only when loading an already committed terminal adoption.
+    pub terminal_replayed: bool,
 }
 
 struct CancellationLifecycle {
@@ -518,6 +520,7 @@ fn recover_settled_result(
         finalize_success(conn, reservation, "recovery_required", &payload, now)?;
         return Ok(Some(CancellationExecution::Success(CancellationSuccess {
             payload,
+            terminal_replayed: false,
             replayed: true,
         })));
     }
@@ -560,6 +563,7 @@ fn recover_settled_result(
             finalize_success(conn, reservation, "recovery_required", &payload, now)?;
             return Ok(Some(CancellationExecution::Success(CancellationSuccess {
                 payload,
+                terminal_replayed: false,
                 replayed: true,
             })));
         }
@@ -573,6 +577,7 @@ fn recover_settled_result(
             finalize_success(conn, reservation, "recovery_required", &payload, now)?;
             return Ok(Some(CancellationExecution::Success(CancellationSuccess {
                 payload,
+                terminal_replayed: false,
                 replayed: true,
             })));
         }
@@ -605,6 +610,7 @@ fn recover_settled_result(
         finalize_success(conn, reservation, "cancelled", &payload, now)?;
         return Ok(Some(CancellationExecution::Success(CancellationSuccess {
             payload,
+            terminal_replayed: false,
             replayed: true,
         })));
     }
@@ -955,6 +961,7 @@ fn execute_reserved_cancellation(
         finalize_success(conn, &reservation, "recovery_required", &payload, now)?;
         return Ok(CancellationExecution::Success(CancellationSuccess {
             payload,
+            terminal_replayed: false,
             replayed: true,
         }));
     }
@@ -1004,6 +1011,7 @@ fn execute_reserved_cancellation(
             finalize_success(conn, &reservation, "recovery_required", &payload, now)?;
             return Ok(CancellationExecution::Success(CancellationSuccess {
                 payload,
+                terminal_replayed: false,
                 replayed: true,
             }));
         }
@@ -1060,6 +1068,7 @@ fn execute_reserved_cancellation(
                     finalize_success(conn, &reservation, "recovery_required", &payload, now)?;
                     Ok(CancellationExecution::Success(CancellationSuccess {
                         payload,
+                        terminal_replayed: false,
                         replayed,
                     }))
                 }
@@ -1074,6 +1083,7 @@ fn execute_reserved_cancellation(
                     finalize_success(conn, &reservation, "cancelled", &payload, now)?;
                     Ok(CancellationExecution::Success(CancellationSuccess {
                         payload,
+                        terminal_replayed: false,
                         replayed,
                     }))
                 }
@@ -1102,6 +1112,7 @@ fn execute_reserved_cancellation(
             finalize_success(conn, &reservation, "recovery_required", &payload, now)?;
             Ok(CancellationExecution::Success(CancellationSuccess {
                 payload,
+                terminal_replayed: false,
                 replayed,
             }))
         }
@@ -1682,6 +1693,7 @@ fn load_adopted_response(
             })?;
             Ok(Some(CancellationExecution::Success(CancellationSuccess {
                 payload,
+                terminal_replayed: true,
                 replayed: true,
             })))
         }
