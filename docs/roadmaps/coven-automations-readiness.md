@@ -43,7 +43,7 @@ and terminal-recovery conformance additions in this change:
 | --- | --- | --- |
 | Definitions and scheduling | Durable revisions, adopted requests, UTC/IANA schedules, DST, latest-only misfire, occurrence fences, overlap refusal | Executable rich-definition and versioned command parity, complete lifecycle publication (#1054) |
 | Scheduler recovery | Persisted retry/backoff, quarantine, stop-fence cancellation/timeout arbitration, leadership fencing, startup and definition-change wake | Complete crash-boundary matrix, storage fault injection, measured load/retention limits (#858) |
-| Portable audit | Eleven structural and ten scheduler-reliability suites in the native target; versioned vectors and independent audit-result runner | Full authority, continuity, privacy, interoperability, and release-eligibility evidence (#858) |
+| Portable audit | Eleven structural and eleven scheduler-reliability suites in the native target; versioned vectors and independent audit-result runner | Full authority, continuity, privacy, interoperability, and release-eligibility evidence (#858) |
 | Authority | Exact dispatch-binding validation/persistence seam and bounded runtime projection | Trusted production Familiar/Threads/principal/approval/runtime adapters (#857) |
 | Receipts | Immutable base receipt and authority sidecar commitment, atomic run link/event, verified reopen, owner-local base read | Launched-session authenticated observation producer, accepting verifier, evidence consumption and terminal receipt construction (#857) |
 | No-launch evidence | Dispatcher-controlled refusal of an authority-unaware runtime can commit a truthful no-launch receipt through the explicit authority seam | This is not proof of a launched runtime's effects, and the production authority adapter remains unavailable |
@@ -186,3 +186,14 @@ This is audit-only evidence for command-adoption lock refusal and recovery.
 It does not certify process crashes, disk-full, I/O errors, corruption,
 permission loss, runtime dispatch, or release eligibility. The zero busy wait
 belongs only to the fixture connection; production deadlines are unchanged.
+
+## Command transaction rollback audit
+
+The `command-transaction-rollback` suite adds independent transaction-abort
+coverage for rich definition creation at event insertion and final command
+adoption insertion. It verifies all five affected record sets are empty both
+immediately and after reopening, repeats the fault after reopening, then proves
+same-key retry and durable replay once the trigger is removed. A mandatory
+no-fault control proves the fixture can commit. This is audit-only evidence;
+process-kill, filesystem I/O/corruption/disk-full, external dispatch boundaries,
+authority certification and release eligibility remain unproven.
