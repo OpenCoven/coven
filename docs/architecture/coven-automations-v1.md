@@ -356,18 +356,20 @@ This producer does not implement the whole catalog. `automations/command_matrix.
 
 #### Command envelope over the control-action wire
 
-`coven.automations.command.v1` carries a spec `commandEnvelope` on the control-action wire as `{ "action": "coven.automations.command.v1", "envelope": { ... } }`. The envelope is validated as a typed `CommandRequest` (schema version, command name, adoption key, `expectedRevision` exactly where required, origin, intent and the command's payload), translated onto the producer's existing adapter for that command, and answered with a spec `commandResponse` in `result`. That response is validated in tests against `command-envelope.schema.json#/$defs/commandResponse`. Commits, replays, rejections and events all come from the same adapter as the flat action. An adoption key therefore replays identically on either wire, and a rejection is `outcome: "rejected"` with the typed error, never an accepted wrapper around a failure.
+`coven.automations.command.v1` carries a spec `commandEnvelope` on the control-action wire as `{ "action": "coven.automations.command.v1", "envelope": { ... } }`. The envelope is validated as a typed `CommandRequest` (schema version, command name, adoption key, `expectedRevision` exactly where required, origin, intent and the command's payload), translated onto the producer's existing adapter for that command, and answered with a spec `commandResponse` in `result`. That response is validated in tests against `command-envelope.schema.json#/$defs/commandResponse`. Commits, replays, rejections and events all come from the same adapter as the flat action. Except for run-now and run cancellation, compatible request bodies replay identically on either wire. Run-now envelopes retain the immutable first dispatch result, while the flat API projects current state; their adoption digests are separate. Run cancellation also has separate request identities: the envelope resolves a run ID into a retained attempt/session binding, while the flat action requires explicit correlation. Reusing a run-now or run-cancel adoption key across its envelope and flat request shapes is `ADOPTION_REPLAY_MISMATCH`. A rejection is `outcome: "rejected"` with the typed error, never an accepted wrapper around a failure.
 
 The envelope translates:
 
 - the adopted mutations `definition.create.v1` and `.revise.v1` with rich bodies (below), `definition.activate.v1`, `.pause.v1`, `.disable.v1`, `.tombstone.v1` and `legacy.import.v1`;
+- run controls `occurrence.runNow.v1`, `attempt.retry.v1`, `occurrence.recover.v1`, `occurrence.cancel.v1`, `attempt.cancel.v1` and `run.cancel.v1`, through the existing Rust executors;
 - the queries `definition.list.v1`, `definition.get.v1`, `definition.health.v1`, `run.history.v1`, `events.read.v1` and `events.subscribe.v1`. Queries answer `outcome: "committed"` on every request; their adoption key is echoed but not stored.
 
 The envelope refuses with `CAPABILITY_UNSUPPORTED`, before any write:
 
-- `run.cancel.v1`, whose payload lacks the attempt and runtime correlation the producer's cancellation requires;
 - the matrix's unimplemented commands;
 - any payload field the adapter does not implement: list `limit`, `cursor` or a `lifecycleState` other than `all`; get `revision`; tombstone `reason`.
+
+Cancellation remains a request until acknowledged or reconciled. A pending stop returns a typed refusal; its first terminal result is `committed`, and subsequent replay retains that result and its persisted timestamp. The run-cancel envelope binds its exact run, attempt and session transactionally before stopping work. Replay never resolves a later attempt, including after recovery. Invalid retained terminal evidence fails closed. Existing Runtime Authority requirements and refusals remain enforced.
 
 A malformed envelope is `VALIDATION_FAILED` and is not adopted. `origin.channel` and `origin.correlationId` are recorded on the committed event; like every caller-supplied identity field they grant nothing. The action is owner-local IPC only, as the transport gate denies every automation action not on its TCP read list.
 

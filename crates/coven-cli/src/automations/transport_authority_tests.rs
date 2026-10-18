@@ -376,6 +376,7 @@ fn run_control_envelopes_are_refused_before_tcp_store_access() -> Result<()> {
             json!({"occurrenceId": "occurrence-1"}),
         ),
         ("attempt.cancel.v1", json!({"attemptId": "attempt-1"})),
+        ("run.cancel.v1", json!({"runId": "run-1"})),
     ] {
         for route in ["/actions", "/api/v1/actions"] {
             let temp = tempfile::tempdir()?;
