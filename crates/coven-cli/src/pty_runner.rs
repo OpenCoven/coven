@@ -4607,6 +4607,8 @@ struct PipedPromptDelivery {
     outcome: Arc<PipedPromptOutcome>,
     #[cfg(test)]
     write_started: Option<mpsc::Sender<()>>,
+    #[cfg(test)]
+    timeout_selected: Arc<AtomicBool>,
 }
 
 struct PipedPromptOutcome {
@@ -4659,6 +4661,17 @@ impl PipedSession {
             .context("prompt-write notification requires an initial stdin prompt")?
             .write_started = Some(sender);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn prompt_timeout_selection(&self) -> Arc<AtomicBool> {
+        Arc::clone(
+            &self
+                .prompt_delivery
+                .as_ref()
+                .expect("initial prompt")
+                .timeout_selected,
+        )
     }
 
     pub(crate) fn cancellation_handle(&self) -> SharedStrictChildProcessTree {
@@ -4726,6 +4739,8 @@ impl PipedPromptDelivery {
             process_tree,
             #[cfg(test)]
             self.write_started.take(),
+            #[cfg(test)]
+            Arc::clone(&self.timeout_selected),
         );
         outcome.finish(result.is_ok());
         result
@@ -4747,6 +4762,7 @@ fn deliver_piped_prompt(
     timeout: Duration,
     process_tree: &SharedStrictChildProcessTree,
     #[cfg(test)] write_started: Option<mpsc::Sender<()>>,
+    #[cfg(test)] timeout_selected: Arc<AtomicBool>,
 ) -> Result<()> {
     if process_tree.is_terminated() {
         return Err(cleanup_piped_launch_failure(
@@ -4793,6 +4809,8 @@ fn deliver_piped_prompt(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            #[cfg(test)]
+            timeout_selected.store(true, Ordering::Release);
             drop(writer);
             return Err(cleanup_piped_launch_failure(
                 anyhow::anyhow!(
@@ -5022,6 +5040,8 @@ pub(crate) fn spawn_piped_with_status_observer(
                     outcome: Arc::clone(&prompt_outcome),
                     #[cfg(test)]
                     write_started: None,
+                    #[cfg(test)]
+                    timeout_selected: Arc::new(AtomicBool::new(false)),
                 }),
             )
         } else {
@@ -6388,6 +6408,21 @@ mod tests {
     }
 
     #[test]
+    fn definitive_piped_cleanup_preserves_prompt_timeout() {
+        let error = piped_launch_cleanup_error(
+            anyhow::anyhow!("timed out while writing harness prompt to stdin"),
+            Ok(()),
+        );
+        assert!(error
+            .downcast_ref::<PipedLaunchCleanupRetainedError>()
+            .is_none());
+        assert_eq!(
+            error.to_string(),
+            "timed out while writing harness prompt to stdin"
+        );
+    }
+
+    #[test]
     fn failed_piped_cleanup_has_typed_privacy_safe_disposition() {
         let primary = anyhow::anyhow!("private primary prompt failure");
         let cleanup = Err(anyhow::anyhow!("private cleanup failure"));
@@ -6944,6 +6979,77 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn piped_prompt_timeout_retains_ownership_until_output_observer_releases() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("gated-never-read.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "never-read",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let mut first_output = true;
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(move |_| {
+                if first_output {
+                    first_output = false;
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                }
+            }),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let mut cleanup;
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let timeout_selected = session.prompt_timeout_selection();
+        let tree = session.cancellation_handle();
+        cleanup = GatedPipedTestCleanup {
+            tree: tree.clone(),
+            release: Some(release_tx),
+            home: Some(temp_dir),
+            complete: false,
+        };
+        // Readiness proves the observer is held before prompt delivery begins.
+        // This is a fixture hang guard, not a production response deadline.
+        entered_rx.recv_timeout(Duration::from_secs(60))?;
+        let child_pid = await_piped_descendant_pid(&pid_file)?;
+        let error = match session
+            .activate_with_prompt_timeout(Duration::from_millis(100), |_input, process_tree| {
+                Ok(process_tree)
+            }) {
+            Ok(_) => anyhow::bail!("never-reading child accepted the prompt"),
+            Err(error) => error,
+        };
+        assert!(
+            timeout_selected.load(Ordering::Acquire),
+            "prompt deadline was not selected"
+        );
+        assert!(
+            error
+                .downcast_ref::<PipedLaunchCleanupRetainedError>()
+                .is_some(),
+            "gated output cleanup lost retained ownership: {error:#}"
+        );
+        assert!(tree.wait_for_quiescence(Duration::ZERO).is_err());
+        cleanup.release_and_join()?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(60))?;
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert!(
+            wait_for_piped_process_exit(child_pid, Duration::from_secs(2)),
+            "released observer left child {child_pid} running"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn piped_prompt_timeout_terminates_and_reaps_a_child_that_never_reads() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let pid_file = temp_dir.path().join("never-read.pid");
@@ -6962,7 +7068,16 @@ mod tests {
             }),
         };
 
+        let mut cleanup;
         let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let timeout_selected = session.prompt_timeout_selection();
+        let tree = session.cancellation_handle();
+        cleanup = GatedPipedTestCleanup {
+            tree,
+            release: None,
+            home: Some(temp_dir),
+            complete: false,
+        };
         let child_pid = await_piped_descendant_pid(&pid_file)?;
         let started = Instant::now();
         let error = match session
@@ -6978,8 +7093,24 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "blocked prompt timeout took {elapsed:?}"
         );
-        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
-        let result = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        // Cleanup may conservatively retain ownership when its fixed budget
+        // expires. Prove timeout selection independently of that private result,
+        // then join the owned fixture before claiming eventual containment.
+        assert!(
+            timeout_selected.load(Ordering::Acquire),
+            "prompt deadline was not selected"
+        );
+        assert!(
+            error
+                .downcast_ref::<PipedLaunchCleanupRetainedError>()
+                .is_some()
+                || format!("{error:#}").contains("timed out"),
+            "{error:#}"
+        );
+        cleanup.release_and_join()?;
+        // Callback completion has already been joined, so this cannot depend
+        // on scheduling within a short receive timeout.
+        let result = exit_rx.try_recv()?;
         assert_eq!(result.status, "failed", "{result:?}");
         assert!(
             wait_for_piped_process_exit(child_pid, Duration::from_secs(2)),
