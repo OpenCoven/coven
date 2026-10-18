@@ -579,8 +579,10 @@ fn claim_in(
     let refuse = |code, message: String| Ok(Err(typed_error(code, message)));
     let row: Option<(String, Option<String>, String)> = conn
         .query_row(
+            // A mission's internal definition is not a routine.
             "SELECT definition_json, tombstoned_at, lifecycle_state
-             FROM automation_definitions WHERE id = ?1",
+             FROM automation_definitions WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM automation_missions WHERE automation_id = ?1)",
             [&request.automation_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )

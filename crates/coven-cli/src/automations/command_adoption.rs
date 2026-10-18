@@ -1867,9 +1867,12 @@ fn current_definition_state(
 ) -> Result<Option<DefinitionState>> {
     let state = conn
         .query_row(
+            // A mission's internal definition is not a routine: no definition
+            // command may revise, activate or tombstone it.
             "SELECT revision, tombstoned_at IS NOT NULL, authority_version, lifecycle_state
              FROM automation_definitions
-             WHERE id = ?1",
+             WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM automation_missions WHERE automation_id = ?1)",
             [automation_id],
             |row| {
                 Ok((

@@ -97,8 +97,9 @@ pub(crate) fn route(
             | CommandName::OccurrenceRecover
             | CommandName::OccurrenceCancel
             | CommandName::AttemptCancel
+            | CommandName::MissionSubmit
     ) {
-        return stable_run_control(conn, runtime, envelope, command, &command_name);
+        return stable_run_control(conn, runtime, envelope, command, &command_name, authority);
     }
 
     let (status, inner) = match command {
@@ -205,6 +206,7 @@ fn stable_run_control(
     envelope: &Value,
     command: CommandName,
     command_name: &str,
+    authority: super::owner_grants::CommandAuthority,
 ) -> (u16, ControlActionResponse) {
     let key = &envelope["adoptionKey"];
     let reject = |error| rejected_response(command_name, key, typed_rejection(ACTION, error));
@@ -279,6 +281,17 @@ fn stable_run_control(
                 kind,
             )
         }
+        CommandName::MissionSubmit => (
+            super::missions::execute_mission_submit(conn, authority, body, chrono::Utc::now()).map(
+                |answer| match answer {
+                    super::missions::MissionExecution::Success { payload, replayed } => {
+                        Ok((payload, replayed, None))
+                    }
+                    super::missions::MissionExecution::Rejected(error) => Err(error),
+                },
+            ),
+            "automations.mission.submit",
+        ),
         _ => unreachable!("only stable-result run controls use this adapter"),
     };
     let (payload, replayed, terminal) = match execution {
@@ -523,6 +536,9 @@ fn flat_request(
         CommandName::DefinitionHealth => {
             flat.insert("id".into(), payload["automationId"].clone());
         }
+        CommandName::MissionGet => {
+            flat.insert("missionId".into(), payload["missionId"].clone());
+        }
         CommandName::RunHistory | CommandName::EventsRead | CommandName::EventsSubscribe => {
             // Field names and bounds match the flat actions.
             flat.extend(payload);
@@ -561,6 +577,12 @@ pub(crate) mod tests {
     /// Validates against the published `commandResponse` definition, resolving
     /// every sibling v1 schema offline.
     pub(crate) fn response_validator() -> jsonschema::Validator {
+        spec_validator("commandResponse")
+    }
+
+    /// Validates against one `$defs` entry of `command-envelope.schema.json`,
+    /// resolving every sibling v1 schema offline.
+    pub(crate) fn spec_validator(definition: &str) -> jsonschema::Validator {
         let mut registry = jsonschema::Registry::new();
         let mut command_schema_id = String::new();
         for entry in std::fs::read_dir(SPEC_DIR).unwrap() {
@@ -580,7 +602,7 @@ pub(crate) mod tests {
         jsonschema::draft202012::options()
             .with_registry(&registry)
             .offline()
-            .build(&json!({ "$ref": format!("{command_schema_id}#/$defs/commandResponse") }))
+            .build(&json!({ "$ref": format!("{command_schema_id}#/$defs/{definition}") }))
             .unwrap()
     }
 

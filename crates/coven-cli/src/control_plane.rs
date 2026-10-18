@@ -135,6 +135,8 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.run.cancel.v1",
                     "coven.automations.occurrence.recover.v1",
                     "coven.automations.occurrence.runNow.v1",
+                    "coven.automations.mission.submit.v1",
+                    "coven.automations.mission.get.v1",
                     "coven.automations.occurrence.cancel.v1",
                     "coven.automations.attempt.cancel.v1",
                     "coven.automations.attempt.retry.v1",
@@ -230,6 +232,7 @@ pub(crate) fn automation_transport_rejection(
         "coven.automations.events.read.v1" | "coven.automations.events.subscribe.v1" => {
             "Automation event reads require owner-local IPC."
         }
+        crate::automations::missions::GET_ACTION => "Mission reads require owner-local IPC.",
         _ if OWNER_AUTOMATION_READS.contains(&action) => {
             "Automation reads that return prompts or run logs require owner-local IPC."
         }
@@ -843,6 +846,54 @@ pub(crate) fn route_action_at(
                     },
                 ),
                 Ok(crate::automations::run_now::RunNowExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
+            }
+        }
+        crate::automations::missions::SUBMIT_ACTION | crate::automations::missions::GET_ACTION => {
+            let executed = if action == crate::automations::missions::SUBMIT_ACTION {
+                crate::automations::missions::execute_mission_submit(
+                    conn,
+                    authority,
+                    payload.clone(),
+                    chrono::Utc::now(),
+                )
+            } else {
+                crate::automations::missions::execute_mission_get(conn, authority, &payload)
+            };
+            match executed {
+                Ok(crate::automations::missions::MissionExecution::Success {
+                    payload: result,
+                    replayed,
+                }) => (
+                    200,
+                    ControlActionResponse {
+                        ok: true,
+                        accepted: true,
+                        action: action.to_string(),
+                        status: ActionStatus::Completed,
+                        reason: replayed.then(|| "replayed previously adopted mission".to_string()),
+                        error: None,
+                        result: Some(result.clone()),
+                        event: (action == crate::automations::missions::SUBMIT_ACTION).then(|| {
+                            ControlEvent {
+                                kind: "automations.mission.submit",
+                                action: action.to_string(),
+                                origin,
+                                intent_id,
+                                payload: result,
+                            }
+                        }),
+                    },
+                ),
+                Ok(crate::automations::missions::MissionExecution::Rejected(error)) => {
                     typed_rejection(action, error)
                 }
                 Err(error) => typed_rejection(

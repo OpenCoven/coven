@@ -41,6 +41,39 @@ pub const AUTOMATION_DEFINITIONS_SCHEMA_SQL: &str = "
         recorded_at TEXT NOT NULL,
         PRIMARY KEY (automation_id, revision)
     );
+
+    -- A mission's internal definition (see `missions`). The row marks the
+    -- definition as not a routine, and records the one-run owner grant.
+    CREATE TABLE IF NOT EXISTS automation_missions (
+        mission_id TEXT PRIMARY KEY NOT NULL,
+        automation_id TEXT NOT NULL UNIQUE,
+        occurrence_id TEXT NOT NULL UNIQUE,
+        adoption_key TEXT NOT NULL UNIQUE,
+        request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+        authority TEXT NOT NULL CHECK (authority = 'owner_local'),
+        principal_id TEXT NOT NULL,
+        familiar_root_id TEXT NOT NULL,
+        familiar_revision_id TEXT NOT NULL,
+        envelope_id TEXT NOT NULL,
+        envelope_descriptor_digest TEXT NOT NULL CHECK (length(envelope_descriptor_digest) = 64),
+        project_cwd TEXT NOT NULL,
+        statement TEXT NOT NULL,
+        timeout_minutes INTEGER NOT NULL CHECK (timeout_minutes BETWEEN 1 AND 60),
+        submitted_at TEXT NOT NULL,
+        valid_until TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_automation_missions_scope
+        ON automation_missions (familiar_root_id, project_cwd);
+    CREATE TRIGGER IF NOT EXISTS automation_missions_immutable
+    BEFORE UPDATE ON automation_missions
+    BEGIN
+        SELECT RAISE(ABORT, 'automation missions are immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS automation_missions_retained
+    BEFORE DELETE ON automation_missions
+    BEGIN
+        SELECT RAISE(ABORT, 'automation missions are never deleted');
+    END;
 ";
 
 pub const AUTOMATION_TIMEZONE_MIGRATIONS_SCHEMA_SQL: &str = "
@@ -167,6 +200,8 @@ pub(crate) fn monotonic_definition_timestamp(
     Ok(latest)
 }
 
+/// Routines only: a mission's internal definition is not a routine, so no
+/// list or get returns it (see `missions`).
 pub fn list_definitions(conn: &Connection) -> Result<Vec<RoutineRecord>> {
     list_definitions_with_tombstones(conn, false)
 }
@@ -179,12 +214,18 @@ pub fn list_definitions_with_tombstones(
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
                 tombstoned_at, updated_at
          FROM automation_definitions
+         WHERE NOT EXISTS (
+             SELECT 1 FROM automation_missions WHERE automation_id = automation_definitions.id
+         )
          ORDER BY name ASC, id ASC"
     } else {
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
                 tombstoned_at, updated_at
          FROM automation_definitions
          WHERE tombstoned_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM automation_missions WHERE automation_id = automation_definitions.id
+           )
          ORDER BY name ASC, id ASC"
     };
     let mut statement = conn
@@ -214,12 +255,14 @@ pub fn get_definition_with_tombstone(
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
                 tombstoned_at, updated_at
          FROM automation_definitions
-         WHERE id = ?1"
+         WHERE id = ?1
+           AND NOT EXISTS (SELECT 1 FROM automation_missions WHERE automation_id = ?1)"
     } else {
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
                 tombstoned_at, updated_at
          FROM automation_definitions
-         WHERE id = ?1 AND tombstoned_at IS NULL"
+         WHERE id = ?1 AND tombstoned_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM automation_missions WHERE automation_id = ?1)"
     };
     let mut statement = conn
         .prepare(query)
