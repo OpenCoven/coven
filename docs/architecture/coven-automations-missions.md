@@ -34,7 +34,7 @@ This document defines only what the layer adds.
 
 | # | Question | Proposal |
 | --- | --- | --- |
-| 1 | What can the first mission do? | **M0 is a read-only diagnosis report** on the `r0-read.1` envelope, the only one that launches. Running tests waits for an exec envelope with enforced confinement (M1, under #857). chat#155 says "diagnosis/test". This narrows it to diagnosis until M1. |
+| 1 | What can the first mission do? | **Decided (Val, 2026-10-18): M0 is a read-only diagnosis report** on the `r0-read.1` envelope, the only one that launches. Running tests waits for an exec envelope with enforced confinement (M1, under #857). This narrows chat#155's "diagnosis/test" to diagnosis until M1. |
 | 2 | Is a mission a new resource? | **No.** `mission.submit` atomically creates a hidden one-shot definition, adopts the owner grant for it, and claims its single manual occurrence. The mission id and the occurrence id are derived from the same adoption key. The definition is never listed, scheduled or revised. |
 | 3 | Who authorizes a mission? | The **owner-local principal** (Decision 1 of the runtime-authority doc), over the owner-only socket or pipe. Submitting is the one-run owner grant, as `occurrence.runNow.v1` on an authority routine already is (decided 2026-10-05). TCP callers are refused before the store opens. |
 | 4 | Approvals? | **Reserved, not produced.** M0 launches only R0. An approval would unlock nothing until a writable envelope exists, the same reasoning slice 7 used. `needs_approval` is in the state set so clients render it once it exists. |
@@ -275,11 +275,9 @@ a clock and a transport, a command sequence produces exact responses and
 
 ## Open questions
 
-1. M0's diagnosis-only scope (Decision 1): accept it, or make the exec envelope
-   the critical path?
-2. Should `mission.submit` also accept an existing active routine, as a "run this
+1. Should `mission.submit` also accept an existing active routine, as a "run this
    routine as a mission", or only the hidden one-shot definition?
-3. Report retention: keep the owner-only artifact for the session-log period, or
+2. Report retention: keep the owner-only artifact for the session-log period, or
    set a mission-specific `RetentionClass`?
-4. Should the M0 concurrency limit be per familiar root and project (proposed),
+3. Should the M0 concurrency limit be per familiar root and project (proposed),
    per familiar, or global?
