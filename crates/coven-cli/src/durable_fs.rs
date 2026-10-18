@@ -1,4 +1,5 @@
 //! Checked namespace barriers for Ward targets, proposal claims and audit files.
+use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
 use anyhow::{Context, Result};
 use std::{fs::File, path::Path};
 
@@ -11,6 +12,7 @@ pub(crate) fn open_directory(path: &Path) -> Result<File> {
 #[cfg(unix)]
 fn sync_directory_native(directory: &File) -> Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
+    checkpoint(Phase::DirectoryNativeReopenBegin);
     // cap-std uses O_PATH on Linux and several other Unix targets. Those
     // descriptors support relative lookup but reject fsync with EBADF. Open
     // the retained directory itself, never its possibly replaced pathname.
@@ -29,9 +31,13 @@ fn sync_directory_native(directory: &File) -> Result<()> {
     }
     // SAFETY: successful openat returned one newly owned descriptor.
     let readable = unsafe { File::from_raw_fd(descriptor) };
+    checkpoint(Phase::DirectoryNativeReopenReady);
     // Rust uses F_FULLFSYNC on macOS, fsync elsewhere. Never ignore unsupported
     // barriers: a rename alone does not prove power-loss durability.
-    readable.sync_all().context("syncing durable directory")
+    checkpoint(Phase::DirectoryNativeFlushBegin);
+    readable.sync_all().context("syncing durable directory")?;
+    checkpoint(Phase::DirectoryNativeFlushReady);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -55,6 +61,7 @@ fn sync_directory_native(directory: &File) -> Result<()> {
         },
     };
     let mut filesystem = [0_u16; 32];
+    checkpoint(Phase::DirectoryNativeVolumeBegin);
     // MS-FSA 2.1.5.7 and product behavior note 80 guarantee directory structure
     // persistence only on NTFS; other filesystems may return a successful no-op.
     // SAFETY: the retained directory and output buffer are live for the call.
@@ -74,6 +81,7 @@ fn sync_directory_native(directory: &File) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("querying durable directory filesystem");
     }
+    checkpoint(Phase::DirectoryNativeVolumeReady);
     let length = filesystem
         .iter()
         .position(|ch| *ch == 0)
@@ -94,6 +102,7 @@ fn sync_directory_native(directory: &File) -> Result<()> {
     };
     let mut status = IO_STATUS_BLOCK::default();
     let mut handle = std::ptr::null_mut();
+    checkpoint(Phase::DirectoryNativeReopenBegin);
     // SAFETY: all pointers refer to live, correctly sized native structures;
     // successful creation gives this function ownership of exactly one handle.
     let result = unsafe {
@@ -121,16 +130,28 @@ fn sync_directory_native(directory: &File) -> Result<()> {
         ))
         .context("reopening retained directory for durability");
     }
+    checkpoint(Phase::DirectoryNativeReopenReady);
+    checkpoint(Phase::DirectoryNativeFlushBegin);
     // SAFETY: handle was acquired above, is exclusively owned here, and is
     // closed exactly once even when flushing fails. Preserve the first error.
     let flushed = unsafe { FlushFileBuffers(handle) };
     let flush_error = (flushed == 0).then(std::io::Error::last_os_error);
+    if flushed != 0 {
+        checkpoint(Phase::DirectoryNativeFlushReady);
+    }
+    checkpoint(Phase::DirectoryNativeCloseBegin);
+    // SAFETY: this remains the single close of the owned native handle.
     let closed = unsafe { CloseHandle(handle) };
+    // Capture the native error before diagnostics can change GetLastError.
+    let close_error = (closed == 0).then(std::io::Error::last_os_error);
+    if closed != 0 {
+        checkpoint(Phase::DirectoryNativeCloseReady);
+    }
     if let Some(error) = flush_error {
         return Err(error).context("syncing durable NTFS directory");
     }
-    if closed == 0 {
-        return Err(std::io::Error::last_os_error()).context("closing durability directory handle");
+    if let Some(error) = close_error {
+        return Err(error).context("closing durability directory handle");
     }
     Ok(())
 }

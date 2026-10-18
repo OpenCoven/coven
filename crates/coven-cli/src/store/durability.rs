@@ -1,4 +1,5 @@
 //! Durable authority transactions without changing session/event commit policy.
+use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, TransactionBehavior};
 
@@ -6,6 +7,7 @@ use rusqlite::{Connection, TransactionBehavior};
 /// outer caller owns its commit/barrier; a NORMAL transaction cannot be upgraded
 /// after BEGIN. On every exit, ordinary writes regain their original mode.
 pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T>) -> Result<T> {
+    checkpoint(Phase::DurableModeBegin);
     let synchronous: i64 = conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
     let fullfsync: bool = conn.pragma_query_value(None, "fullfsync", |row| row.get(0))?;
     if !conn.is_autocommit() {
@@ -13,6 +15,7 @@ pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T
             synchronous >= 2 && fullfsync,
             "authority write requires a durable outer transaction"
         );
+        checkpoint(Phase::DurableModeReady);
         return write();
     }
     let restore = RestoreMode {
@@ -22,8 +25,10 @@ pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T
     };
     conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA fullfsync = ON;")
         .context("enabling durable authority commits")?;
+    checkpoint(Phase::DurableModeReady);
     // Retain the directory before committing. SQLite's Unix directory sync is
     // best effort; ours is checked (and uses F_FULLFSYNC on macOS).
+    checkpoint(Phase::DurableDirectoryOpenBegin);
     let directory = conn
         .path()
         .filter(|path| !path.is_empty())
@@ -31,6 +36,8 @@ pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T
         .and_then(std::path::Path::parent)
         .map(crate::durable_fs::open_directory)
         .transpose()?;
+    checkpoint(Phase::DurableDirectoryOpenReady);
+    checkpoint(Phase::DurableParentOpenBegin);
     let home_parent = conn
         .path()
         .filter(|path| !path.is_empty())
@@ -39,20 +46,36 @@ pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T
         .and_then(std::path::Path::parent)
         .map(crate::durable_fs::open_directory)
         .transpose()?;
+    checkpoint(Phase::DurableParentOpenReady);
     let result = (|| {
+        checkpoint(Phase::DurableTransactionBegin);
         let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        checkpoint(Phase::DurableTransactionReady);
+        checkpoint(Phase::DurableWriteBegin);
         let value = write()?;
+        checkpoint(Phase::DurableWriteReady);
+        checkpoint(Phase::DurableCommitBegin);
         tx.commit()
             .context("committing durable authority evidence")?;
+        checkpoint(Phase::DurableCommitReady);
         if let Some(directory) = directory.as_ref() {
+            checkpoint(Phase::DurableDirectorySyncBegin);
             crate::durable_fs::sync_directory(directory)?;
+            checkpoint(Phase::DurableDirectorySyncReady);
         }
         if let Some(home_parent) = home_parent.as_ref() {
+            checkpoint(Phase::DurableParentSyncBegin);
             crate::durable_fs::sync_directory(home_parent)?;
+            checkpoint(Phase::DurableParentSyncReady);
         }
         Ok(value)
     })();
-    restore.restore().context("restoring store commit policy")?;
+    checkpoint(Phase::DurableRestoreBegin);
+    let restored = restore.restore().context("restoring store commit policy");
+    // Include the guard's existing fallback restoration in the observed phase.
+    drop(restore);
+    restored?;
+    checkpoint(Phase::DurableRestoreReady);
     result
 }
 
