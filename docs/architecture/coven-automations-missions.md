@@ -9,10 +9,10 @@ source_adjacent_reason: "Defines the producer contract that OpenCoven/chat#155 a
 
 # Automations missions
 
-Status: **contract shape approved by Val on 2026-10-18. `mission.submit.v1` and
-`mission.get.v1` are implemented; under M0 no mission launches yet (see
-*Implementation notes*). `mission.cancel.v1`, mission events, the no-launch
-receipt and the conformance vectors are not implemented.** Written for #1313,
+Status: **contract shape approved by Val on 2026-10-18. `mission.submit.v1`,
+`mission.get.v1` and `mission.cancel.v1` are implemented; under M0 no mission
+launches yet (see *Implementation notes*). The conformance vectors are not
+implemented.** Written for #1313,
 which replaces OpenCoven/coven-agents#261. Consumers: OpenCoven/chat#155 (native
 submit/observe/cancel) and the SDK client. Builds on
 [coven-automations-v1.md](coven-automations-v1.md) and
@@ -110,10 +110,18 @@ interface MissionCancelResult {
   current `MissionView`.
 - **`mission.cancel.v1`** maps onto `occurrence.cancel.v1` before dispatch and
   `run.cancel.v1` after it, with the existing stop-fence arbitration. Replaying
-  the same adoption key returns the same cancellation.
+  the same adoption key returns the same cancellation. The inner
+  `occurrence.cancel.v1` runs under a key derived from the mission cancel's
+  (`mc:` and 40 hex of its SHA-256). That key is the `cancellationId`, and the
+  view reads the cancellation back from its adoption. A mission that has
+  already settled answers `ILLEGAL_TRANSITION`, with the settled view in
+  `details.mission`. Under M0, every mission has settled before a cancel can
+  arrive.
 - **Events**: clients use `events.read.v1` / `events.subscribe.v1` on the
-  mission's occurrence stream. Every event that changes the projected state also
-  carries `missionId` and the new `mission.state`.
+  mission's occurrence stream. Every event on it carries `automationId` equal to
+  the `missionId`, because a mission's internal definition has the mission's id.
+  Events do not carry the mission state. Each one raises the view's `revision`,
+  and the client reads the state with `mission.get`.
 
 ## Mission view and states
 
@@ -247,7 +255,7 @@ a clock and a transport, a command sequence produces exact responses and
 | M-03 | duplicate submission | (a) same key, same body; (b) same key, changed body; (c) a new key with the same body | (a) `replayed`. (b) `ADOPTION_REPLAY_MISMATCH` (409), `conflictOutcome: committed`. (c) a second mission; under M0's limit, `CONCURRENCY_LIMIT` while the first is active. |
 | M-04 | stale familiar revision | (a) the submitted revision is not the current active one; (b) it is superseded between submit and dispatch | (a) `REVISION_CONFLICT` with the current revision in `details`, nothing created. (b) `revoked` / `familiar_revision_stale`, no launch. |
 | M-05 | rejected capability/runtime | The envelope id is unknown, or its descriptor digest differs from the advertised one | `CAPABILITY_UNSUPPORTED` naming the envelope, nothing created |
-| M-06 | authority unavailable | Runtime Authority is not constructed, or the trusted state is unreadable at dispatch | `unavailable` with `authority_unavailable`, no launch, and a no-launch receipt |
+| M-06 | authority unavailable | Runtime Authority is not constructed, or the trusted state is unreadable at dispatch | `unavailable` with `authority_unavailable`, and no launch. A refusal at dispatch also writes a no-launch receipt; M0 refuses before dispatch, so it has none (see *Implementation notes*). |
 | M-07 | cancellation racing completion | A cancel arrives after the harness's conclusive success but before settlement | `completed`; the cancellation outcome is `lost_to_completion` |
 | M-08 | cancel before launch | A cancel arrives while `queued` | `cancelled`, no session, and a cancellation receipt |
 | M-09 | idempotent cancel | The same cancel key twice, then a new key after the mission is terminal | The same receipt twice; the new key gets `ILLEGAL_TRANSITION` with the terminal view |
@@ -308,7 +316,13 @@ what.
   committed, the mission's occurrence settles failed with a reason the view
   projects to `unavailable` / `authority_unavailable` (vector M-06). The submit
   answers with the state at commit (`queued`); `mission.get` reports the
-  settlement. The no-launch receipt is not written yet.
+  settlement.
+- **No receipt in M0.** A receipt binds a run and an attempt: the receipts
+  table, `automation-receipt.schema.json` and the commit checks all require
+  both. An M0 mission is refused before either exists, so it has no receipt.
+  The settled occurrence, its transition event and the mission row are the
+  record that nothing launched. Once missions dispatch, a refusal at dispatch
+  writes the runner's existing no-launch receipt.
 - **Validation order.** `validUntil` (in the future, at most 15 minutes ahead),
   then the envelope (`r0-read.1` and its descriptor digest), then the project
   directory (exists, canonical, not inside `COVEN_HOME`), then the familiar
@@ -317,9 +331,11 @@ what.
   Every refusal is adopted under its key, as for `runNow`. The request digest
   covers `{command, payload}`, so the flat action and the command envelope are
   the same request, and `origin` / `intentId` never change it.
-- **Events.** Event payloads are closed schemas. `missionId` and the projected
-  state are added as optional fields of the transition payload, a minor-profile
-  change while the profile is `proposed`.
+- **Events need no schema change.** Event payloads are closed schemas. The
+  mission id already reaches every event as its `automationId`, and the state
+  comes from `mission.get`, so the transition payload is unchanged. The SDK's
+  `watch` already works this way: it yields a fresh view whenever `revision`
+  rises.
 
 ## Also decided (2026-10-18)
 

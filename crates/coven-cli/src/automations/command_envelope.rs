@@ -98,6 +98,7 @@ pub(crate) fn route(
             | CommandName::OccurrenceCancel
             | CommandName::AttemptCancel
             | CommandName::MissionSubmit
+            | CommandName::MissionCancel
     ) {
         return stable_run_control(conn, runtime, envelope, command, &command_name, authority);
     }
@@ -291,6 +292,22 @@ fn stable_run_control(
                 },
             ),
             "automations.mission.submit",
+        ),
+        CommandName::MissionCancel => (
+            super::missions::execute_mission_cancel(
+                conn,
+                runtime,
+                authority,
+                body,
+                chrono::Utc::now(),
+            )
+            .map(|answer| match answer {
+                super::missions::MissionExecution::Success { payload, replayed } => {
+                    Ok((payload, replayed, None))
+                }
+                super::missions::MissionExecution::Rejected(error) => Err(error),
+            }),
+            "automations.mission.cancel",
         ),
         _ => unreachable!("only stable-result run controls use this adapter"),
     };
