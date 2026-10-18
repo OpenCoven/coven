@@ -125,7 +125,12 @@ fn output_auto_submission_records_bounded_request_phases() -> Result<()> {
                 for (field, prefix) in [(fields[0], "request="), (fields[2], "elapsed_us="), (fields[3], "prior_observer_us=")] {
                     field.strip_prefix(prefix).context("numeric diagnostic field")?.parse::<u128>()?;
                 }
-                phases.push(fields[1].strip_prefix("phase=").context("diagnostic phase")?);
+                let phase = fields[1].strip_prefix("phase=").context("diagnostic phase")?;
+                // Durable operation ordering has its own refusal regression below.
+                // Retain the complete admission/finalization sequence here.
+                if !phase.starts_with("durable-") && !phase.starts_with("directory-native-") {
+                    phases.push(phase);
+                }
             }
             for phase in [
                 "request-begin", "body-read", "intake", "lock-wait", "lock-acquired",
@@ -151,6 +156,79 @@ fn output_auto_submission_records_bounded_request_phases() -> Result<()> {
                 phases.remove(0);
             }
             anyhow::ensure!(phases.iter().all(|phase| ["response-ready", "request-end"].contains(phase)));
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn output_auto_protected_refusal_records_durable_audit_phases() -> Result<()> {
+    run_clocked_journey(
+        "output-auto-refusal-durability",
+        |home, workspace| {
+            seed_output_auto(home, workspace, false)?;
+            let path = workspace.join("ward.toml");
+            let mut config: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+            config["protected_surface"]
+                .as_array_mut()
+                .context("protected surfaces")?
+                .push(toml::Value::String("OUTPUT-FORMAT.JSON".into()));
+            config["surface"]
+                .as_array_mut()
+                .context("surfaces")?
+                .push(toml::from_str("path='OUTPUT-FORMAT.JSON'\ntier=0\n")?);
+            fs::write(path, toml::to_string(&config)?)?;
+            Ok(())
+        },
+        |fixture, _| {
+            let response = post_format(fixture, FORMAT_AFTER)?;
+            anyhow::ensure!(response.status == 403, "protected refusal: {response:?}");
+            anyhow::ensure!(
+                fs::read_to_string(fixture.workspace.join(FORMAT_PATH))? == FORMAT_BEFORE
+            );
+            let count: i64 = fixture.store()?.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE decision = 'protected-target-not-proposable'",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(count == 1, "refusal must retain exactly one audit row");
+            let log = fs::read_to_string(fixture.coven_home.join("daemon-recovery.log"))?;
+            let phases: Vec<_> = log.lines()
+                .filter_map(|line| line.split_once(" phase=").map(|(_, tail)| tail.split_whitespace().next().unwrap()))
+                .filter(|phase| phase.starts_with("durable-"))
+                .collect();
+            anyhow::ensure!(
+                phases == [
+                    "durable-mode-begin", "durable-mode-ready",
+                    "durable-directory-open-begin", "durable-directory-open-ready",
+                    "durable-parent-open-begin", "durable-parent-open-ready",
+                    "durable-transaction-begin", "durable-transaction-ready",
+                    "durable-write-begin", "durable-write-ready",
+                    "durable-commit-begin", "durable-commit-ready",
+                    "durable-directory-sync-begin", "durable-directory-sync-ready",
+                    "durable-parent-sync-begin", "durable-parent-sync-ready",
+                    "durable-restore-begin", "durable-restore-ready",
+                ],
+                "refusal must distinguish each durable native operation: {phases:?}"
+            );
+            let native: Vec<_> = log.lines()
+                .filter_map(|line| line.split_once(" phase=").map(|(_, tail)| tail.split_whitespace().next().unwrap()))
+                .filter(|phase| phase.starts_with("directory-native-"))
+                .collect();
+            let expected = if cfg!(windows) {
+                vec![
+                    "directory-native-volume-begin", "directory-native-volume-ready",
+                    "directory-native-reopen-begin", "directory-native-reopen-ready",
+                    "directory-native-flush-begin", "directory-native-flush-ready",
+                    "directory-native-close-begin", "directory-native-close-ready",
+                ]
+            } else {
+                vec![
+                    "directory-native-reopen-begin", "directory-native-reopen-ready",
+                    "directory-native-flush-begin", "directory-native-flush-ready",
+                ]
+            };
+            anyhow::ensure!(native == expected.repeat(2), "database and home-parent native barriers: {native:?}");
             Ok(())
         },
     )
