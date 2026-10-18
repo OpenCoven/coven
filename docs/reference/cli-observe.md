@@ -38,6 +38,36 @@ table.
 adds a familiar to the roster; see
 [`cli-familiar-create.md`](cli-familiar-create.md).
 
+## Automations inspection
+
+These commands require a compatible running daemon on owner-local IPC:
+
+```sh
+coven automations status --json
+coven automations occurrence <occurrence-id> --json
+coven automations run <run-id> --json
+coven automations attempts <run-id> --json
+```
+
+They issue existing read control actions through the identity-bound Rust daemon
+client. They do not start the daemon, initialize local state, repair records,
+or dispatch work. If the daemon is unavailable, check `coven daemon status`.
+A missing occurrence or run exits unsuccessfully; it is not an empty healthy
+result.
+
+Output uses `schemaVersion: "coven.automations.inspection.v1"` and a
+`scheduler`, `occurrence`, `run`, or `runId`/`attempts` field. Both display modes
+use the same privacy-minimized projection; omitting `--json` adds a heading.
+Raw logs, adoption keys and free-form failure reasons are omitted. Structured
+states, fences, retry classifications and nullable settlement times remain
+visible. An occurrence's `runsTruncated` marker must be respected: the returned
+run list is bounded and does not prove complete history.
+
+Scheduler status reports persisted authority, last-pass and queue observations.
+An assigned authority or a previous successful pass is not a current liveness
+or overall health guarantee. Comprehensive `doctor`/`explain`, principal-scoped
+reads and the remaining operator surface are still tracked by #858.
+
 ## Color
 
 On a color-capable terminal the human views carry the Coven brand palette:
