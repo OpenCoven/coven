@@ -29,11 +29,17 @@ use super::runs::{
 };
 
 mod command_envelope_outcomes;
+mod command_process_crash_recovery;
 mod command_storage_capacity_recovery;
 mod command_storage_lock_recovery;
 mod command_transaction_rollback;
 mod legacy_import_source_preservation;
 mod runtime_authority_terminal_recovery;
+
+/// Execute the disposable hidden process-crash conformance worker.
+pub fn command_crash_worker(request: &Value) -> Result<(), &'static str> {
+    command_process_crash_recovery::worker(request)
+}
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
 const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-request.v1";
@@ -97,6 +103,7 @@ pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutabi
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
 pub const COMMAND_TRANSACTION_ROLLBACK_SUITE: &str = "command-transaction-rollback";
 pub const COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE: &str = "command-storage-capacity-recovery";
+pub const COMMAND_PROCESS_CRASH_RECOVERY_SUITE: &str = "command-process-crash-recovery";
 pub const COMMAND_STORAGE_LOCK_RECOVERY_SUITE: &str = "command-storage-lock-recovery";
 pub const COMMAND_ENVELOPE_OUTCOMES_SUITE: &str = "command-envelope-outcomes";
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
@@ -1565,6 +1572,7 @@ pub fn capability() -> TargetCapability {
                     COMMAND_TRANSACTION_ROLLBACK_SUITE,
                     LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE,
                     COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE,
+                    COMMAND_PROCESS_CRASH_RECOVERY_SUITE,
                     MISFIRE_LATEST_PLANNING_SUITE,
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
                     OVERLAP_FORBID_CLAIMING_SUITE,
@@ -1633,6 +1641,14 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         (SCHEDULER_RELIABILITY_PROFILE, COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE) => {
             let (passed, observations) =
                 command_storage_capacity_recovery::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, COMMAND_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = command_process_crash_recovery::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);
