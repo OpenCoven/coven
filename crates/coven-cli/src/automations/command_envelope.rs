@@ -6,14 +6,13 @@
 //! [`CommandRequest`], translated onto the producer's existing flat adapter for
 //! that command, and answered with a spec `commandResponse` in `result`.
 //! Nothing here executes on its own: every commit, replay, rejection and event
-//! comes from the same adapter the flat action uses, so an adoption key
-//! replays identically on either wire.
+//! comes from the existing Rust executors. Run cancellation binds the
+//! envelope's run ID to an immutable attempt/session before delegation;
+//! the flat cancellation action still requires that explicit correlation.
 //!
 //! Only the envelope's supported subset is translated. A command or field the
 //! producer cannot honour is refused with `CAPABILITY_UNSUPPORTED` rather than
-//! dropped. Run-now needs replay-contract reconciliation;
-//! `run.cancel.v1` lacks the attempt and runtime correlation the
-//! producer's cancellation requires.
+//! dropped. Run-now still needs replay-contract reconciliation.
 
 use serde_json::{json, Map, Value};
 
@@ -96,6 +95,7 @@ pub(crate) fn route(
             | CommandName::OccurrenceRecover
             | CommandName::OccurrenceCancel
             | CommandName::AttemptCancel
+            | CommandName::RunCancel
     ) {
         return stable_run_control(conn, runtime, envelope, command, &command_name);
     }
@@ -235,7 +235,7 @@ fn stable_run_control(
             ),
             "automations.occurrence.recovery",
         ),
-        CommandName::OccurrenceCancel | CommandName::AttemptCancel => {
+        CommandName::OccurrenceCancel | CommandName::AttemptCancel | CommandName::RunCancel => {
             let (answer, kind) = if command == CommandName::OccurrenceCancel {
                 (
                     super::cancel_commands::execute_occurrence_cancel(
@@ -245,6 +245,16 @@ fn stable_run_control(
                         chrono::Utc::now(),
                     ),
                     "automations.occurrence.cancellation",
+                )
+            } else if command == CommandName::RunCancel {
+                (
+                    super::cancel_commands::execute_run_cancel_envelope(
+                        conn,
+                        runtime,
+                        body,
+                        chrono::Utc::now(),
+                    ),
+                    "automations.run.cancellation",
                 )
             } else {
                 (
@@ -373,7 +383,9 @@ fn validate_cancellation_adoption(
     {
         return Err("terminal cancellation adoption has no valid result".to_owned());
     }
-    let field = if envelope["command"] == "occurrence.cancel.v1" {
+    let field = if envelope["command"] == "run.cancel.v1" {
+        "runId"
+    } else if envelope["command"] == "occurrence.cancel.v1" {
         "occurrenceId"
     } else {
         "attemptId"
@@ -507,12 +519,6 @@ fn flat_request(
         }
         CommandName::DefinitionCreate | CommandName::DefinitionRevise => {
             return Err(format!("`{command}` has no flat translation."));
-        }
-        CommandName::RunCancel => {
-            return Err(format!(
-                "`{command}` over the envelope lacks the attempt and runtime correlation this \
-                 producer's cancellation requires. Use `coven.automations.run.cancel.v1`."
-            ));
         }
         _ => {
             return Err(
@@ -758,12 +764,6 @@ pub(crate) mod tests {
         let refused = [
             golden_create,
             golden_revise,
-            envelope(
-                "run.cancel.v1",
-                "adopt:envelope:cancel",
-                None,
-                json!({ "runId": "run-1" }),
-            ),
             envelope(
                 "definition.list.v1",
                 "adopt:envelope:list",

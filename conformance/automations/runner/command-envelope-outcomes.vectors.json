@@ -298,8 +298,8 @@
           },
           "expect": {
             "outcome": "rejected",
-            "errorCode": "CAPABILITY_UNSUPPORTED",
-            "writes": "nothing"
+            "errorCode": "NOT_FOUND",
+            "writes": "adoption"
           }
         },
         {
@@ -2320,6 +2320,84 @@
             },
             "payload": {
               "attemptId": "different-target"
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "ADOPTION_REPLAY_MISMATCH",
+            "writes": "nothing"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "run.cancel.v1",
+            "adoptionKey": "adopt:envelope-outcomes:run.cancel.v1",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise cancellation refusal adoption and replay."
+            },
+            "payload": {
+              "runId": "missing-target"
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "NOT_FOUND",
+            "writes": "adoption"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "run.cancel.v1",
+            "adoptionKey": "adopt:envelope-outcomes:run.cancel.v1",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise cancellation refusal adoption and replay."
+            },
+            "payload": {
+              "runId": "missing-target"
+            }
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "NOT_FOUND",
+            "writes": "nothing"
+          }
+        },
+        {
+          "kind": "send",
+          "envelope": {
+            "schemaVersion": "coven.automations.v1",
+            "command": "run.cancel.v1",
+            "adoptionKey": "adopt:envelope-outcomes:run.cancel.v1",
+            "origin": {
+              "principal": {
+                "principalId": "principal:conformance"
+              },
+              "channel": "sdk",
+              "correlationId": "corr-command-envelope-outcomes"
+            },
+            "intent": {
+              "statement": "Exercise cancellation refusal adoption and replay."
+            },
+            "payload": {
+              "runId": "different-target"
             }
           },
           "expect": {
