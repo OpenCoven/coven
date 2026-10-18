@@ -4727,7 +4727,7 @@ mod tests {
 
     #[test]
     fn discovers_native_allowlist_for_exact_registered_familiar_in_stable_order() -> Result<()> {
-        let temp = trusted_tempdir()?;
+        let mut temp = trusted_tempdir()?;
         let sage = temp.path().join("sage-workspace");
         let cody = temp.path().join("cody-workspace");
         write_registered_familiars(temp.path(), &[("sage", &sage), ("cody", &cody)])?;
@@ -4736,7 +4736,7 @@ mod tests {
         write_file(&sage.join("MEMORY.md"), b"root")?;
         write_file(&sage.join("memory/nested/a-first.md"), b"a")?;
         write_file(&cody.join("MEMORY.md"), b"wrong familiar")?;
-        add_excluded_traps(&sage, true)?;
+        add_excluded_traps(&mut temp, &sage, true)?;
 
         let first = discover_sources(
             temp.path(),
@@ -4780,7 +4780,7 @@ mod tests {
 
     #[test]
     fn discovers_openclaw_allowlist_into_explicit_registered_familiar() -> Result<()> {
-        let temp = trusted_tempdir()?;
+        let mut temp = trusted_tempdir()?;
         let sage = temp.path().join("native-sage");
         let openclaw = temp.path().join("explicit-openclaw");
         write_registered_familiars(temp.path(), &[("sage", &sage)])?;
@@ -4789,7 +4789,7 @@ mod tests {
         write_file(&openclaw.join("DREAMS.md"), b"dreams")?;
         write_file(&openclaw.join("MEMORY.md"), b"memory")?;
         write_file(&openclaw.join("memory/nested/a.md"), b"a")?;
-        add_excluded_traps(&openclaw, false)?;
+        add_excluded_traps(&mut temp, &openclaw, false)?;
 
         let discovered = discover_sources(
             temp.path(),
@@ -5451,9 +5451,7 @@ mod tests {
     #[test]
     fn plans_treat_symlink_nonregular_and_case_colliding_targets_as_conflicts() -> Result<()> {
         use std::os::unix::fs::symlink;
-        use std::os::unix::net::UnixListener;
-
-        let temp = trusted_tempdir()?;
+        let mut temp = trusted_tempdir()?;
         let workspace = temp.path().join("workspace");
         write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
         fs::create_dir_all(temp.path().join("memory/sage"))?;
@@ -5462,7 +5460,8 @@ mod tests {
             temp.path().join("outside.md"),
             temp.path().join("memory/sage/memory-link.md"),
         )?;
-        let socket = UnixListener::bind(temp.path().join("memory/sage/memory-socket.md"))?;
+        let socket_path = temp.path().join("memory/sage/memory-socket.md");
+        create_socket_fixture(&mut temp, &socket_path)?;
         write_file(&temp.path().join("memory/sage/Notes-Case.md"), b"same")?;
         let sources = vec![
             DiscoveredSource {
@@ -5485,7 +5484,6 @@ mod tests {
             MemoryImportSourceKind::Native,
             &sources,
         )?;
-        drop(socket);
 
         assert_eq!(plan.status, ImportPlanStatus::Conflict);
         assert_eq!(plan.conflict_count, 3);
@@ -8801,6 +8799,148 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn socket_fixture_child() -> Result<()> {
+        let Some(name) = std::env::var_os("COVEN_MEMORY_SOCKET_FIXTURE_CHILD") else {
+            return Ok(());
+        };
+        let name = Path::new(&name);
+        anyhow::ensure!(
+            name.components().count() == 1
+                && matches!(
+                    name.components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+                && name.as_os_str().len() < 80,
+            "socket fixture requires one short filename"
+        );
+        let listener = std::os::unix::net::UnixListener::bind(name)?;
+        drop(listener);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn create_socket_fixture(home: &mut tempfile::TempDir, path: &Path) -> Result<()> {
+        use anyhow::Context;
+        use std::os::unix::fs::FileTypeExt;
+        use std::process::{Child, Command};
+        use std::time::{Duration, Instant};
+
+        // Own the child on every exit path, including poll errors and unwinding.
+        // No descendants are started by the exact helper test.
+        struct OwnedChild<'a> {
+            child: Child,
+            reaped: bool,
+            home: &'a mut tempfile::TempDir,
+            stdout: tempfile::NamedTempFile,
+            stderr: tempfile::NamedTempFile,
+        }
+        impl OwnedChild<'_> {
+            fn reap(&mut self) -> io::Result<()> {
+                if !self.reaped {
+                    let _ = self.child.kill();
+                    self.child.wait()?;
+                    self.reaped = true;
+                }
+                Ok(())
+            }
+        }
+        impl Drop for OwnedChild<'_> {
+            fn drop(&mut self) {
+                if let Err(error) = self.reap() {
+                    // Do not remove a live child's cwd or its diagnostic evidence.
+                    self.home.disable_cleanup(true);
+                    self.stdout.disable_cleanup(true);
+                    self.stderr.disable_cleanup(true);
+                    eprintln!(
+                        "socket fixture child reap failed; owned home/logs retained: {error}"
+                    );
+                }
+            }
+        }
+
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => anyhow::bail!("socket fixture destination already exists"),
+        }
+        let parent = path.parent().context("socket fixture requires a parent")?;
+        let name = path
+            .file_name()
+            .context("socket fixture requires a filename")?;
+        anyhow::ensure!(name.len() < 80, "socket fixture filename is too long");
+        let stdout = tempfile::NamedTempFile::new()?;
+        let stderr = tempfile::NamedTempFile::new()?;
+        let child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "memory_import::tests::socket_fixture_child",
+                "--nocapture",
+            ])
+            // Only the child changes cwd. Absolute checkout paths can exceed
+            // sockaddr_un capacity even though filesystem lookup succeeds.
+            .current_dir(parent)
+            .env("COVEN_MEMORY_SOCKET_FIXTURE_CHILD", name)
+            .stdout(stdout.reopen()?)
+            .stderr(stderr.reopen()?)
+            .spawn()?;
+        let mut owned = OwnedChild {
+            child,
+            reaped: false,
+            home,
+            stdout,
+            stderr,
+        };
+        let started = Instant::now();
+        // Fixture hang guard, far above process startup; no production deadline.
+        let status = loop {
+            match owned.child.try_wait() {
+                Ok(Some(status)) => {
+                    owned.reaped = true;
+                    break Ok(status);
+                }
+                Err(error) => break Err(error),
+                Ok(None) if started.elapsed() >= Duration::from_secs(60) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("socket fixture child hung after {:?}", started.elapsed()),
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let cleanup = owned.reap(); // Confirm termination before fixture cleanup.
+        anyhow::ensure!(
+            status.as_ref().is_ok_and(|status| status.success()) && cleanup.is_ok(),
+            "socket fixture child failed: {status:?}; cleanup: {cleanup:?}\nstdout: {}\nstderr: {}",
+            fs::read_to_string(owned.stdout.path())?,
+            fs::read_to_string(owned.stderr.path())?
+        );
+        anyhow::ensure!(
+            fs::symlink_metadata(path)?.file_type().is_socket(),
+            "socket fixture child did not create an actual socket"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_socket_fixture_supports_long_trusted_paths() -> Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+
+        let mut temp = trusted_tempdir()?;
+        let root = temp.path().join("long-owned-fixture-path-".repeat(8));
+        fs::create_dir_all(&root)?;
+        let cwd = std::env::current_dir()?;
+        add_excluded_traps(&mut temp, &root, true)?;
+        assert_eq!(std::env::current_dir()?, cwd);
+        let socket = root.join("memory/special.md");
+        assert!(socket.as_os_str().len() > 128);
+        assert!(fs::symlink_metadata(socket)?.file_type().is_socket());
+        Ok(())
+    }
+
     fn trusted_tempdir() -> Result<tempfile::TempDir> {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let worktree = manifest_dir
@@ -8844,7 +8984,7 @@ workspace = {workspace}
         Ok(())
     }
 
-    fn add_excluded_traps(root: &Path, native: bool) -> Result<()> {
+    fn add_excluded_traps(_home: &mut tempfile::TempDir, root: &Path, native: bool) -> Result<()> {
         for root_file in ["AGENTS.md", "USER.md", "SOUL.md", "TOOLS.md"] {
             let path = root.join(root_file);
             write_file(&path, format!("sentinel root {root_file}").as_bytes())?;
@@ -8883,7 +9023,6 @@ workspace = {workspace}
         {
             use std::ffi::OsString;
             use std::os::unix::ffi::OsStringExt;
-            use std::os::unix::net::UnixListener;
 
             let non_utf8 = OsString::from_vec(b"non-utf8-\xff.md".to_vec());
             if let Err(error) = write_file(&root.join("memory").join(non_utf8), b"bad name") {
@@ -8895,9 +9034,7 @@ workspace = {workspace}
                     return Err(error);
                 }
             }
-            let socket_path = root.join("memory/special.md");
-            let listener = UnixListener::bind(&socket_path)?;
-            drop(listener);
+            create_socket_fixture(_home, &root.join("memory/special.md"))?;
         }
         Ok(())
     }
