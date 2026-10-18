@@ -2591,8 +2591,10 @@ value is `400 invalid_request` and changes nothing) is posted once into the
 instance main session as a notice with `source_kind` `hub` and `source_id` the
 job id. Under the main-session scope gate, the terminal state, the notice, and
 the job's `delivered` record with its `noticeId` commit in one transaction.
-If the notice cannot be posted, the job still completes and its delivery is
-recorded `failed` with a `reason`. A job delivers at most once: a repeated
+If the notice cannot be posted, or posting would evict an undelivered notice
+(the scope already holds 20 pending), the job still completes and its delivery
+is recorded `failed` with a `reason`. A job id outside `[A-Za-z0-9._:-]`
+cannot name a notice, so its summary is recorded `failed` the same way. A job delivers at most once: a repeated
 completion keeps the first summary and notice. The job body from this route
 and from `GET /api/v1/hub/jobs/:jobId` carries `resultSummary` and `delivery`
 (both `null` until a completion supplies a summary), in the same shape as an
