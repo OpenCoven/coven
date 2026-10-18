@@ -1516,8 +1516,338 @@ mod tests {
         assert_eq!(session_count, 0);
     }
 
+    // The plain/base-v1 mock runtime exercises durable scheduler recovery across a
+    // real process exit. It does not certify native process-tree containment.
+
+    struct RecoveryGateClock {
+        now: DateTime<Utc>,
+        ready: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl AutomationClock for RecoveryGateClock {
+        fn now_utc(&self) -> DateTime<Utc> {
+            self.now
+        }
+
+        fn monotonic_now(&self) -> MonotonicInstant {
+            MonotonicInstant::ZERO
+        }
+
+        fn sleep_until_or_wake(
+            &self,
+            _deadline: MonotonicInstant,
+            wake: &AutomationWakeSignal,
+            _observed_generation: u64,
+        ) -> WakeReason {
+            // Startup completed before this call. Do not hold the wake mutex:
+            // shutdown must remain able to request cancellation while we are gated.
+            self.ready.send(()).expect("report completed startup pass");
+            self.release
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("release scheduler gate");
+            assert!(wake.is_shutdown(), "release only after requesting shutdown");
+            WakeReason::Shutdown
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecoveryRow {
+        // occurrence, run, attempt, session, scheduler generation, attempt number, occurrence fence
+        identity: (String, String, String, String, i64, i64, i64),
+        // occurrence, run, attempt, session
+        states: [String; 4],
+        reason: Option<String>,
+        settled_at: Option<String>,
+    }
+
+    fn recovery_rows(conn: &rusqlite::Connection) -> Vec<RecoveryRow> {
+        let mut statement = conn
+            .prepare(
+                "SELECT o.id, r.id, a.id, s.id, o.scheduler_generation, a.attempt_number,
+                    o.state, r.status, a.state, s.status, a.state_reason, a.settled_at, o.attempt
+             FROM automation_occurrences o
+             JOIN automation_runs r ON r.occurrence_id = o.id
+             JOIN automation_attempts a ON a.run_id = r.id AND a.occurrence_id = o.id
+                 AND a.occurrence_fence_generation = o.attempt
+             JOIN sessions s ON s.id = r.session_id AND s.id = a.session_id
+             ORDER BY o.automation_id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok(RecoveryRow {
+                    identity: (
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(12)?,
+                    ),
+                    states: [row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?],
+                    reason: row.get(10)?,
+                    settled_at: row.get(11)?,
+                })
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let counts: [i64; 4] = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM automation_occurrences),
+                    (SELECT COUNT(*) FROM automation_runs),
+                    (SELECT COUNT(*) FROM automation_attempts),
+                    (SELECT COUNT(*) FROM sessions)",
+                [],
+                |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?]),
+            )
+            .unwrap();
+        assert_eq!(
+            counts, [3; 4],
+            "no missing or duplicate lifecycle identities"
+        );
+        assert_eq!(rows.len(), 3, "every identity must remain fully correlated");
+        rows
+    }
+
+    fn assert_unreconciled_running(rows: &[RecoveryRow]) {
+        for row in rows {
+            assert_eq!(
+                row.states,
+                ["running", "running", "started", "running"],
+                "{row:?}"
+            );
+            assert_eq!(row.reason, None, "the shutdown tail must not have run");
+            assert_eq!(row.settled_at, None);
+            assert_eq!(row.identity.5, 1);
+        }
+    }
+
+    fn recovery_gate(now: DateTime<Utc>) -> (Arc<RecoveryGateClock>, Receiver<()>, SyncSender<()>) {
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        (
+            Arc::new(RecoveryGateClock {
+                now,
+                ready: ready_tx,
+                release: Mutex::new(release_rx),
+            }),
+            ready_rx,
+            release_tx,
+        )
+    }
+
     #[test]
-    fn bounded_shutdown_drain_marks_every_active_attempt_for_restart_reconciliation() {
+    fn detached_scheduler_process_exit_preserves_attempts_for_startup_recovery() {
+        const CHILD_HOME: &str = "COVEN_TEST_DETACHED_SCHEDULER_HOME";
+        const TEST_NAME: &str = "automations::daemon_tick::tests::detached_scheduler_process_exit_preserves_attempts_for_startup_recovery";
+        // Completion guard only. No production deadline or test parallelism change.
+        const HANG_GUARD: Duration = Duration::from_secs(60);
+        let launched_at = Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap();
+        let restarted_at = launched_at + chrono::Duration::seconds(1);
+
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let home = PathBuf::from(home);
+            crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+            let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+            for id in ["detached-one", "detached-two", "detached-three"] {
+                insert_definition(&conn, &definition(id)).unwrap();
+                set_created_at(&conn, id, "2026-08-31T08:00:00.000Z");
+            }
+            let (started_tx, started_rx) = sync_channel(3);
+            let (clock, ready, _release) = recovery_gate(launched_at);
+            let handle = start_automations_scheduler_with_clock(
+                &home,
+                Arc::new(NotifyingRunningRuntime {
+                    started: started_tx,
+                }),
+                clock,
+            )
+            .unwrap();
+            ready
+                .recv_timeout(HANG_GUARD)
+                .expect("first startup pass must finish");
+            let sessions: BTreeSet<_> = (0..3).map(|_| started_rx.try_recv().unwrap()).collect();
+            assert_eq!(sessions.len(), 3);
+            handle.request_shutdown();
+            handle.finish_shutdown(Instant::now()).unwrap();
+            let rows = recovery_rows(&conn);
+            assert_unreconciled_running(&rows);
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.identity.3.clone())
+                    .collect::<BTreeSet<_>>(),
+                sessions
+            );
+            let error =
+                super::super::leadership::SchedulerLeadership::acquire(&home, &conn, restarted_at)
+                    .err()
+                    .expect("detachment must retain the live worker's exclusive leadership");
+            assert!(
+                error
+                    .to_string()
+                    .contains("automations scheduler leadership is already held"),
+                "{error:#}"
+            );
+            // Exit while the worker is still gated. In particular, do not drop the
+            // release sender and permit the old shutdown tail to contaminate proof.
+            std::process::exit(0);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        struct OwnedHelper(std::process::Child);
+        impl Drop for OwnedHelper {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let stdout_path = home.join("detached-helper.stdout");
+        let stderr_path = home.join("detached-helper.stderr");
+        let helper_started = Instant::now();
+        let mut child = OwnedHelper(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_HOME, home)
+                .stdout(std::fs::File::create(&stdout_path).unwrap())
+                .stderr(std::fs::File::create(&stderr_path).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        // Outer hang guard includes process startup and the child's own guard.
+        // File-backed logs avoid a full pipe preventing the child from exiting.
+        let deadline = helper_started + HANG_GUARD + HANG_GUARD;
+        let result = loop {
+            match child.0.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Err(error) => break Err(error),
+                Ok(None) if Instant::now() >= deadline => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "detached helper exceeded hang guard after {:?}",
+                            helper_started.elapsed()
+                        ),
+                    ))
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        drop(child); // Kill and reap before inspecting logs or asserting failure.
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        assert!(
+            result.as_ref().is_ok_and(|status| status.success()),
+            "child failed: {result:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(stderr.contains("detaching for process exit"));
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let before = recovery_rows(&conn);
+        assert_unreconciled_running(&before);
+        let previous_authority: (String, i64) = conn
+            .query_row(
+                "SELECT owner_id, generation FROM automation_scheduler_authority WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        for row in &before {
+            assert_eq!(row.identity.4, previous_authority.1);
+            assert!(row.identity.6 >= 1);
+        }
+        let restarted_iso = restarted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert_eq!(
+            crate::store::mark_running_sessions_orphaned(&conn, &restarted_iso).unwrap(),
+            3
+        );
+
+        let (started_tx, started_rx) = sync_channel(4);
+        let (clock, ready, release) = recovery_gate(restarted_at);
+        let mut handle = start_automations_scheduler_with_clock(
+            home,
+            Arc::new(NotifyingRunningRuntime {
+                started: started_tx,
+            }),
+            clock,
+        )
+        .unwrap();
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ready
+                .recv_timeout(HANG_GUARD)
+                .expect("successor startup must finish");
+            // Snapshot BEFORE this successor's own shutdown can mark recovery_required.
+            let recovered = recovery_rows(&conn);
+            assert!(
+                matches!(
+                    started_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "restart must not dispatch a duplicate of an already executed attempt"
+            );
+            let authority: (String, i64) = conn
+                .query_row(
+                    "SELECT owner_id, generation FROM automation_scheduler_authority WHERE id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_ne!(authority.0, previous_authority.0);
+            assert!(authority.1 > previous_authority.1);
+            for (old, row) in before.iter().zip(&recovered) {
+                assert_eq!(row.identity, old.identity);
+                assert_eq!(
+                    row.states,
+                    ["running", "running", "failed", "killed"],
+                    "{row:?}"
+                );
+                assert_eq!(
+                    row.reason.as_deref(),
+                    Some("session killed; held for an operator retry until the run's deadline")
+                );
+                assert_eq!(row.settled_at.as_deref(), Some(restarted_iso.as_str()));
+            }
+        }));
+        // Also clean up on assertion failure, preserving the original failure.
+        handle.request_shutdown();
+        let _ = release.send(());
+        let cleanup = handle.shutdown_and_join_until(Instant::now() + HANG_GUARD);
+        if let Err(error) = cleanup {
+            // A live worker can still write: retain its home instead of deleting it.
+            let retained = temp.keep();
+            eprintln!(
+                "successor cleanup failed; retained {}: {error:#}",
+                retained.display()
+            );
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+            panic!("successor did not join: {error:#}");
+        }
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+        for (old, row) in before.iter().zip(recovery_rows(&conn)) {
+            assert_eq!(row.identity, old.identity);
+            assert_eq!(
+                row.states,
+                ["recovery_required", "running", "failed", "killed"]
+            );
+            assert_eq!(
+                row.reason.as_deref(),
+                Some("session killed; held for an operator retry until the run's deadline")
+            );
+            assert_eq!(row.settled_at.as_deref(), Some(restarted_iso.as_str()));
+        }
+    }
+
+    #[test]
+    fn completed_scheduler_shutdown_marks_every_active_attempt_for_restart_reconciliation() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
         crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
@@ -1534,7 +1864,7 @@ mod tests {
         drop(conn);
 
         let (started_tx, started_rx) = sync_channel(automation_ids.len());
-        let handle = start_automations_scheduler(
+        let mut handle = start_automations_scheduler(
             home,
             Arc::new(NotifyingRunningRuntime {
                 started: started_tx,
@@ -1552,8 +1882,12 @@ mod tests {
             .collect();
         assert_eq!(started_sessions.len(), automation_ids.len());
 
-        handle.request_shutdown();
-        handle.shutdown().unwrap();
+        // This test asserts the completed worker's durable tail. Production
+        // shutdown may detach on its deadline; the process-exit regression
+        // separately proves restart recovery without that tail's marker.
+        handle
+            .shutdown_and_join_until(Instant::now() + Duration::from_secs(60))
+            .unwrap();
 
         let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
         let lifecycle: Vec<(String, String, String, Option<String>, String, String)> = conn
@@ -1587,7 +1921,7 @@ mod tests {
         assert_eq!(
             lifecycle.len(),
             automation_ids.len(),
-            "the bounded drain must record every active attempt for restart reconciliation"
+            "completed shutdown must record every active attempt for restart reconciliation"
         );
         for (automation_id, occurrence_state, attempt_state, reason, run_state, session_state) in
             lifecycle
