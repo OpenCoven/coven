@@ -11,9 +11,9 @@
 //!
 //! Only the envelope's supported subset is translated. A command or field the
 //! producer cannot honour is refused with `CAPABILITY_UNSUPPORTED` rather than
-//! dropped: `definition.create.v1` and `.revise.v1` carry rich definition
-//! bodies the executor cannot run yet, and `run.cancel.v1` lacks the attempt
-//! and runtime correlation the producer's cancellation requires.
+//! dropped. Run-now and cancellation need replay-contract reconciliation;
+//! `run.cancel.v1` also lacks the attempt and runtime correlation the
+//! producer's cancellation requires.
 
 use serde_json::{json, Map, Value};
 
@@ -22,7 +22,7 @@ use super::contract::error::ErrorCode;
 use super::contract::types::{CommandName, CommandRequest};
 use crate::control_plane::{
     automation_command_result, automation_error, route_action_at, typed_rejection,
-    validation_rejection, ActionStatus, ControlActionResponse,
+    validation_rejection, ActionStatus, ControlActionResponse, ControlEvent,
 };
 
 pub const ACTION: &str = "coven.automations.command.v1";
@@ -89,6 +89,13 @@ pub(crate) fn route(
             typed_rejection(ACTION, automation_error(code, message)),
         )
     };
+
+    if matches!(
+        command,
+        CommandName::AttemptRetry | CommandName::OccurrenceRecover
+    ) {
+        return stable_run_control(conn, envelope, command, &command_name);
+    }
 
     let (status, inner) = match command {
         // Rich definition bodies have no flat action: they go straight to
@@ -181,6 +188,105 @@ pub(crate) fn route(
             error: None,
             result: Some(response),
             event: inner.event,
+        },
+    )
+}
+
+/// These executors retain the original committed payload, unlike run-now's
+/// live projection and cancellation's evolving stop outcome. Reuse their
+/// transaction, fences and authority refusals; only adapt the response wire.
+fn stable_run_control(
+    conn: &rusqlite::Connection,
+    envelope: &Value,
+    command: CommandName,
+    command_name: &str,
+) -> (u16, ControlActionResponse) {
+    let key = &envelope["adoptionKey"];
+    let reject = |error| rejected_response(command_name, key, typed_rejection(ACTION, error));
+    let mut body = envelope["payload"].clone();
+    body["action"] = json!(format!("coven.automations.{command_name}"));
+    body["adoptionKey"] = key.clone();
+    // Origin and intent are caller-asserted metadata, not execution authority.
+    // The strict flat request structs deliberately do not accept those fields.
+    let (execution, event_kind) = match command {
+        CommandName::AttemptRetry => (
+            super::attempt_retry::execute_attempt_retry(conn, body, chrono::Utc::now()).map(
+                |answer| match answer {
+                    super::attempt_retry::RetryExecution::Success { payload, replayed } => {
+                        Ok((payload, replayed))
+                    }
+                    super::attempt_retry::RetryExecution::Rejected(error) => Err(error),
+                },
+            ),
+            "automations.attempt.retry",
+        ),
+        CommandName::OccurrenceRecover => (
+            super::recovery::execute_occurrence_recovery(conn, body, chrono::Utc::now()).map(
+                |answer| match answer {
+                    super::recovery::RecoveryExecution::Success { payload, replayed } => {
+                        Ok((payload, replayed))
+                    }
+                    super::recovery::RecoveryExecution::Rejected(error) => Err(error),
+                },
+            ),
+            "automations.occurrence.recovery",
+        ),
+        _ => unreachable!("only stable-result run controls use this adapter"),
+    };
+    let (payload, replayed) = match execution {
+        Ok(Ok(success)) => success,
+        Ok(Err(error)) => return reject(error),
+        Err(error) => return reject(automation_error(ErrorCode::Internal, error)),
+    };
+    let mut response = json!({
+        "schemaVersion": SCHEMA_VERSION, "command": command_name,
+        "adoptionKey": key, "outcome": if replayed { "replayed" } else { "committed" },
+        "result": payload,
+    });
+    if replayed {
+        let first_committed_at = conn.query_row(
+            "SELECT adopted_at FROM automation_command_adoptions
+             WHERE adoption_key = ?1 AND command = ?2 AND outcome = 'committed'",
+            rusqlite::params![key.as_str(), command_name],
+            |row| row.get::<_, String>(0),
+        );
+        let first_committed_at = match first_committed_at {
+            Ok(at)
+                if super::contract::types::Timestamp::new(at.clone()).is_ok()
+                    && chrono::DateTime::parse_from_rfc3339(&at).is_ok() =>
+            {
+                at
+            }
+            _ => {
+                return reject(automation_error(
+                    ErrorCode::Internal,
+                    "run-control replay has no valid persisted adoption timestamp",
+                ))
+            }
+        };
+        response["replay"] = json!({ "firstCommittedAt": first_committed_at });
+    }
+    (
+        200,
+        ControlActionResponse {
+            ok: true,
+            accepted: true,
+            action: ACTION.to_owned(),
+            status: ActionStatus::Completed,
+            reason: None,
+            error: None,
+            result: Some(response),
+            event: Some(ControlEvent {
+                kind: event_kind,
+                action: format!("coven.automations.{command_name}"),
+                origin: envelope["origin"]["channel"]
+                    .as_str()
+                    .map(ToOwned::to_owned),
+                intent_id: envelope["origin"]["correlationId"]
+                    .as_str()
+                    .map(ToOwned::to_owned),
+                payload,
+            }),
         },
     )
 }
@@ -324,7 +430,7 @@ fn flat_request(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::api::NoopSessionRuntime;
 
@@ -335,7 +441,7 @@ mod tests {
 
     /// Validates against the published `commandResponse` definition, resolving
     /// every sibling v1 schema offline.
-    fn response_validator() -> jsonschema::Validator {
+    pub(crate) fn response_validator() -> jsonschema::Validator {
         let mut registry = jsonschema::Registry::new();
         let mut command_schema_id = String::new();
         for entry in std::fs::read_dir(SPEC_DIR).unwrap() {
@@ -560,12 +666,6 @@ mod tests {
                 "adopt:envelope:cancel",
                 None,
                 json!({ "runId": "run-1" }),
-            ),
-            envelope(
-                "attempt.retry.v1",
-                "adopt:envelope:retry",
-                None,
-                json!({ "runId": "run-1", "priorAttemptNumber": 1, "priorDisposition": "failed" }),
             ),
             envelope(
                 "definition.list.v1",

@@ -357,3 +357,31 @@ fn prompt_and_log_reads_require_owner_ipc() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn retry_and_recovery_envelopes_are_refused_before_tcp_store_access() -> Result<()> {
+    for (command, payload) in [
+        (
+            "attempt.retry.v1",
+            json!({"runId": "run-1", "priorAttemptNumber": 1, "priorDisposition": "failed"}),
+        ),
+        (
+            "occurrence.recover.v1",
+            json!({"occurrenceId": "occurrence-1", "evidenceDetermination": "failed_deterministic"}),
+        ),
+    ] {
+        for route in ["/actions", "/api/v1/actions"] {
+            let temp = tempfile::tempdir()?;
+            let body = json!({"action": "coven.automations.command.v1", "envelope": {
+                "schemaVersion": "coven.automations.v1", "command": command,
+                "adoptionKey": "adopt:tcp:run-control",
+                "origin": {"principal": {"principalId": "principal:owner"}, "channel": "sdk"},
+                "intent": {"statement": "Caller labels cannot authorize a mutation."}, "payload": payload
+            }});
+            let response = request(temp.path(), route, &body, RequestAuthority::Tcp)?;
+            assert_authority_refusal(&response, "coven.automations.command.v1")?;
+            assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
+        }
+    }
+    Ok(())
+}

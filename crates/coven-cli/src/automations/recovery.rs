@@ -517,6 +517,10 @@ mod tests {
     /// A store with routine `notes` whose first occurrence ran, lost its stop
     /// confirmation, and whose session the daemon has since lost.
     fn recovering() -> (tempfile::TempDir, Connection, String) {
+        recovering_at(now())
+    }
+
+    fn recovering_at(at: DateTime<Utc>) -> (tempfile::TempDir, Connection, String) {
         let (temp, conn) = store();
         let routine = RoutineDefinition::from_json(&json!({
             "schemaVersion": 1, "id": "notes", "name": "Notes", "status": "ACTIVE",
@@ -526,14 +530,11 @@ mod tests {
         }))
         .unwrap();
         insert_definition(&conn, &routine).unwrap();
-        assert!(
-            insert_claimed_occurrence(&conn, OCCURRENCE, "notes", "daemon", 60, now()).unwrap()
-        );
+        assert!(insert_claimed_occurrence(&conn, OCCURRENCE, "notes", "daemon", 60, at).unwrap());
         let report =
-            dispatch_claimed_occurrences_with_clock(&conn, &NoopSessionRuntime, now(), now)
-                .unwrap();
+            dispatch_claimed_occurrences_with_clock(&conn, &NoopSessionRuntime, at, || at).unwrap();
         let run_id = report.dispatched[0].clone();
-        mark_unconfirmed_stop_for_recovery(&conn, &run_id, "timeout stop was not confirmed", now())
+        mark_unconfirmed_stop_for_recovery(&conn, &run_id, "timeout stop was not confirmed", at)
             .unwrap();
         conn.execute(
             "UPDATE sessions SET status = 'orphaned'
@@ -550,6 +551,59 @@ mod tests {
             "evidenceDetermination": determination,
             "statement": "The report job is idempotent; the timeout was a slow disk."
         })
+    }
+
+    #[test]
+    fn envelope_recovery_replays_the_original_determination() {
+        let validator = super::super::command_envelope::tests::response_validator();
+        for (determination, expected_status) in [
+            ("failed_deterministic", "failed"),
+            ("retry_with_new_attempt", "planned"),
+        ] {
+            let (temp, conn, _) = recovering_at(Utc::now());
+            let flat = request("adopt:recover:envelope", determination);
+            let mut payload = flat.as_object().unwrap().clone();
+            payload.remove("action");
+            payload.remove("adoptionKey");
+            let envelope = json!({
+                "action": "coven.automations.command.v1",
+                "envelope": {
+                    "schemaVersion": "coven.automations.v1", "command": "occurrence.recover.v1",
+                    "adoptionKey": flat["adoptionKey"],
+                    "origin": { "principal": { "principalId": "principal:owner" }, "channel": "sdk" },
+                    "intent": { "statement": "Record the operator determination." }, "payload": payload
+                }
+            });
+            let (status, first) =
+                crate::control_plane::route_action(envelope.clone(), &conn, &NoopSessionRuntime);
+            assert_eq!(status, 200, "{first:?}");
+            let first = first.result.unwrap();
+            assert!(validator.is_valid(&first), "{first}");
+            assert_eq!(first["outcome"], "committed");
+            assert_eq!(first["result"]["status"], expected_status);
+            let path = temp.path().join("store.sqlite");
+            drop(conn);
+            let conn = crate::store::open_store(&path).unwrap();
+            let (_, replay) =
+                crate::control_plane::route_action(envelope.clone(), &conn, &NoopSessionRuntime);
+            let replay = replay.result.unwrap();
+            assert!(validator.is_valid(&replay), "{replay}");
+            assert_eq!(replay["outcome"], "replayed");
+            assert_eq!(replay["result"], first["result"]);
+            assert!(replay["replay"]["firstCommittedAt"].is_string());
+            let mut changed = envelope;
+            changed["envelope"]["payload"]["statement"] = json!("different determination");
+            let (_, conflict) =
+                crate::control_plane::route_action(changed, &conn, &NoopSessionRuntime);
+            assert_eq!(conflict.error.unwrap()["code"], "ADOPTION_REPLAY_MISMATCH");
+            let RecoveryExecution::Success { payload, replayed } =
+                execute_occurrence_recovery(&conn, flat, Utc::now()).unwrap()
+            else {
+                panic!("flat recovery replay was refused");
+            };
+            assert!(replayed);
+            assert_eq!(payload, first["result"]);
+        }
     }
 
     fn refused(conn: &Connection, body: Value, at: DateTime<Utc>) -> ErrorCode {
@@ -768,5 +822,30 @@ mod tests {
             ),
             ErrorCode::AuthorityRequired
         );
+        for (command, payload) in [
+            (
+                "occurrence.recover.v1",
+                json!({"occurrenceId": OCCURRENCE, "evidenceDetermination": "failed_deterministic"}),
+            ),
+            (
+                "attempt.retry.v1",
+                json!({"runId": "run.notes-1", "priorAttemptNumber": 1, "priorDisposition": "failed"}),
+            ),
+        ] {
+            let (_, response) = crate::control_plane::route_action(
+                json!({
+                    "action": "coven.automations.command.v1",
+                    "envelope": {
+                        "schemaVersion": "coven.automations.v1", "command": command,
+                        "adoptionKey": format!("adopt:envelope:authority:{command}"),
+                        "origin": {"principal": {"principalId": "principal:owner"}, "channel": "sdk"},
+                        "intent": {"statement": "Cannot override Runtime Authority."}, "payload": payload
+                    }
+                }),
+                &conn,
+                &NoopSessionRuntime,
+            );
+            assert_eq!(response.error.unwrap()["code"], "AUTHORITY_REQUIRED");
+        }
     }
 }
