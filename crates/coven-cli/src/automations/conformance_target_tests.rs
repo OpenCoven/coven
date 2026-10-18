@@ -122,6 +122,7 @@ fn capability_advertises_the_native_structural_suites() {
                         CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                         "cancellation-timeout-arbitration",
                         "command-storage-lock-recovery",
+                        "command-transaction-rollback",
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
                         OVERLAP_FORBID_CLAIMING_SUITE,
@@ -1983,6 +1984,88 @@ fn storage_lock_suite_rejects_malformed_vectors() {
     for request in invalid {
         assert_eq!(
             evaluate(&request).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+const COMMAND_TRANSACTION_ROLLBACK_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/command-transaction-rollback.vectors.json"
+);
+
+#[test]
+fn transaction_rollback_suite_executes_checked_in_faults_and_control() {
+    let vector = serde_json::from_str(COMMAND_TRANSACTION_ROLLBACK_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "command-transaction-rollback",
+        vector,
+    ))
+    .unwrap();
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+}
+
+#[test]
+fn transaction_rollback_suite_rejects_weakened_invariants() {
+    for index in 0..3 {
+        for (field, value) in [
+            ("initialRows", json!(7)),
+            ("finalRows", json!(0)),
+            ("replayPreserved", json!(false)),
+        ] {
+            let mut vector: Value =
+                serde_json::from_str(COMMAND_TRANSACTION_ROLLBACK_VECTORS).unwrap();
+            vector["cases"][index]["expected"][field] = value;
+            assert_eq!(
+                evaluate(&request_for_profile(
+                    "scheduler_reliability",
+                    "command-transaction-rollback",
+                    vector
+                ))
+                .unwrap_err(),
+                "conformance vector is invalid"
+            );
+        }
+    }
+}
+
+#[test]
+fn transaction_rollback_suite_requires_both_faults_and_control() {
+    for index in 0..3 {
+        let mut vector: Value = serde_json::from_str(COMMAND_TRANSACTION_ROLLBACK_VECTORS).unwrap();
+        vector["cases"].as_array_mut().unwrap().remove(index);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                "command-transaction-rollback",
+                vector
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn transaction_rollback_suite_rejects_invalid_inputs_before_execution() {
+    let mutations: [fn(&mut Value); 6] = [
+        |vector| vector["cases"][1]["fault"] = json!("event_insert"),
+        |vector| vector["cases"][1]["caseId"] = vector["cases"][0]["caseId"].clone(),
+        |vector| vector["cases"][0]["unexpected"] = json!("PRIVATE-ROLLBACK-MARKER"),
+        |vector| vector["cases"][0]["definition"]["integrity"]["value"] = json!("0".repeat(64)),
+        |vector| vector["cases"][0]["adoptionKey"] = json!(""),
+        |vector| vector["cases"][0]["fault"] = json!("PRIVATE-ROLLBACK-MARKER"),
+    ];
+    for mutate in mutations {
+        let mut vector: Value = serde_json::from_str(COMMAND_TRANSACTION_ROLLBACK_VECTORS).unwrap();
+        mutate(&mut vector);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                "command-transaction-rollback",
+                vector
+            ))
+            .unwrap_err(),
             "conformance vector is invalid"
         );
     }
