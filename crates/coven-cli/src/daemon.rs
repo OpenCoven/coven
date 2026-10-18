@@ -9157,17 +9157,67 @@ mod tests {
         };
         let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
         let descendant_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
+        struct ObservedKiller {
+            inner: Box<dyn RuntimeKiller>,
+            observations: Arc<Mutex<Vec<String>>>,
+        }
+        impl RuntimeKiller for ObservedKiller {
+            fn kill(&mut self) -> Result<()> {
+                self.inner.kill()
+            }
+
+            fn signal_shutdown(&mut self) -> Result<()> {
+                let started = Instant::now();
+                let result = self.inner.signal_shutdown();
+                self.observations.lock().unwrap().push(format!(
+                    "signal: elapsed_us={}, result={result:?}",
+                    started.elapsed().as_micros()
+                ));
+                result
+            }
+
+            fn wait_for_shutdown_quiescence(&mut self, timeout: Duration) -> Result<()> {
+                let started = Instant::now();
+                let result = self.inner.wait_for_shutdown_quiescence(timeout);
+                self.observations.lock().unwrap().push(format!(
+                    "quiescence: budget_us={}, elapsed_us={}, result={result:?}",
+                    timeout.as_micros(),
+                    started.elapsed().as_micros()
+                ));
+                result
+            }
+
+            fn process_group(&self) -> Option<u32> {
+                self.inner.process_group()
+            }
+        }
+        let observations = Arc::new(Mutex::new(Vec::new()));
         let runtime = LiveSessionRuntime::default();
         piped.activate(|input, process_tree| {
-            runtime.register("piped".to_string(), input, Box::new(process_tree))
+            runtime.register(
+                "piped".to_string(),
+                input,
+                Box::new(ObservedKiller {
+                    inner: Box::new(process_tree),
+                    observations: Arc::clone(&observations),
+                }),
+            )
         })?;
 
         drop(runtime);
-        let result = exit_rx
-            .try_recv()
-            .context("runtime drop returned before the piped exit callback completed")?;
+        // Capture the immediate callback assertion before observing descendants.
+        // Even on failure, retain whether native containment actually completed.
+        let callback_result = exit_rx.try_recv();
+        let descendant_result =
+            await_daemon_shutdown_descendant_exit(descendant_pid, "runtime drop");
+        let result = callback_result.with_context(|| {
+                format!(
+                    "runtime drop returned before the piped exit callback completed; shutdown observations: {:?}; descendant result: {descendant_result:?}",
+                    observations.lock().unwrap()
+                )
+            })?;
         assert_eq!(result.status, "failed", "{result:?}");
-        await_daemon_shutdown_descendant_exit(descendant_pid, "runtime drop")?;
+        descendant_result?;
         Ok(())
     }
 
