@@ -274,12 +274,71 @@ pub(crate) fn checkpoint(phase: Phase) {
     ACTIVE.with(|active| {
         if let Some(state) = active.borrow_mut().as_mut() {
             let home = state.home.clone();
-            state.append_with(phase, std::time::Instant::now, |line| {
-                crate::daemon::append_daemon_recovery_log(&home, line);
-            });
+            state.append_with(
+                phase,
+                std::time::Instant::now,
+                sample_native_clock,
+                |line| {
+                    crate::daemon::append_daemon_recovery_log(&home, line);
+                },
+            );
         }
     });
     let _ = phase;
+}
+
+#[cfg(feature = "threads-test-clock")]
+struct NativeClock {
+    process_id: u32,
+    thread_id: u32,
+    counter: Option<(i64, i64)>,
+}
+
+#[cfg(all(feature = "threads-test-clock", any(windows, test)))]
+fn cached_native_frequency(
+    cache: &std::sync::OnceLock<i64>,
+    query: impl FnOnce() -> Option<i64>,
+) -> Option<i64> {
+    if let Some(value) = cache.get() {
+        return Some(*value);
+    }
+    let value = query()?;
+    if value <= 0 {
+        return None;
+    }
+    let _ = cache.set(value);
+    cache.get().copied()
+}
+
+#[cfg(all(feature = "threads-test-clock", windows))]
+fn sample_native_clock() -> Option<NativeClock> {
+    use windows_sys::Win32::System::{
+        Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+        Threading::GetCurrentThreadId,
+    };
+    static FREQUENCY: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let frequency = cached_native_frequency(&FREQUENCY, || {
+        let mut value = 0;
+        // SAFETY: value is writable storage for the synchronous output parameter.
+        (unsafe { QueryPerformanceFrequency(&mut value) } != 0).then_some(value)
+    });
+    let counter = frequency.and_then(|frequency| {
+        let mut value = 0;
+        // SAFETY: value is writable storage for the synchronous output parameter.
+        (unsafe { QueryPerformanceCounter(&mut value) } != 0 && value >= 0)
+            .then_some((value, frequency))
+    });
+    Some(NativeClock {
+        process_id: std::process::id(),
+        // SAFETY: this argument-free query reads the calling thread's numeric ID.
+        thread_id: unsafe { GetCurrentThreadId() },
+        counter,
+    })
+}
+
+#[cfg(all(feature = "threads-test-clock", not(windows)))]
+fn sample_native_clock() -> Option<NativeClock> {
+    None
 }
 
 #[cfg(feature = "threads-test-clock")]
@@ -288,16 +347,32 @@ impl State {
         &mut self,
         phase: Phase,
         mut now: impl FnMut() -> std::time::Instant,
+        sample: impl FnOnce() -> Option<NativeClock>,
         write: impl FnOnce(&str),
     ) {
         let observed = now();
-        write(&format!(
+        let native = sample();
+        let mut line = format!(
             "threads_request_checkpoint request={} phase={} elapsed_us={} prior_observer_us={}",
             self.request,
             phase.label(),
             observed.saturating_duration_since(self.started).as_micros(),
             self.observer.as_micros(),
-        ));
+        );
+        if let Some(native) = native {
+            use std::fmt::Write as _;
+            let _ = write!(
+                line,
+                " native_pid={} native_tid={}",
+                native.process_id, native.thread_id
+            );
+            if let Some((counter, frequency)) = native.counter {
+                let _ = write!(line, " native_qpc={counter} native_qpc_hz={frequency}");
+            } else {
+                line.push_str(" native_clock=unavailable");
+            }
+        }
+        write(&line);
         // Match startup diagnostics: an emitted line does not prove its own
         // append returned. Later lines expose prior observer cost separately.
         self.observer += now().saturating_duration_since(observed);
@@ -534,6 +609,7 @@ mod tests {
             state.append_with(
                 phase,
                 || times.next().unwrap(),
+                || None,
                 |line| lines.push(line.to_owned()),
             );
         }
@@ -542,5 +618,115 @@ mod tests {
             "threads_request_checkpoint request=7 phase=stage-ready elapsed_us=54000 prior_observer_us=50000",
         ]);
         assert_eq!(state.observer, Duration::from_millis(56));
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn request_diagnostics_native_samples_remain_inside_observer_accounting() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        for (counter, suffix) in [
+            (
+                Some((17, 19)),
+                " native_pid=11 native_tid=13 native_qpc=17 native_qpc_hz=19",
+            ),
+            (
+                None,
+                " native_pid=11 native_tid=13 native_clock=unavailable",
+            ),
+        ] {
+            let start = Instant::now();
+            let clock_ms = Cell::new(1);
+            let sampled = Cell::new(false);
+            let mut state = State {
+                home: "synthetic-private-path".into(),
+                request: 7,
+                started: start,
+                observer: Duration::ZERO,
+            };
+            state.append_with(
+                Phase::StageBegin,
+                || start + Duration::from_millis(clock_ms.get()),
+                || {
+                    assert_eq!(clock_ms.get(), 1);
+                    sampled.set(true);
+                    clock_ms.set(31);
+                    Some(NativeClock { process_id: 11, thread_id: 13, counter })
+                },
+                |line| {
+                    assert!(sampled.get());
+                    assert_eq!(clock_ms.get(), 31);
+                    assert_eq!(line, format!("threads_request_checkpoint request=7 phase=stage-begin elapsed_us=1000 prior_observer_us=0{suffix}"));
+                    assert!(!line.contains("synthetic-private"));
+                    clock_ms.set(51);
+                },
+            );
+            assert_eq!(state.observer, Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(all(feature = "threads-test-clock", windows))]
+    #[test]
+    fn request_diagnostics_windows_checkpoints_match_native_clock_and_thread() {
+        use windows_sys::Win32::System::{
+            Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+            Threading::GetCurrentThreadId,
+        };
+        let home = fixture_home();
+        let mut frequency = 0;
+        // SAFETY: frequency is writable storage for the synchronous output.
+        assert_ne!(unsafe { QueryPerformanceFrequency(&mut frequency) }, 0);
+        assert!(frequency > 0);
+        // SAFETY: this argument-free query reads the current thread's numeric ID.
+        let thread_id = unsafe { GetCurrentThreadId() };
+        let mut before = 0;
+        // SAFETY: before is writable storage for the synchronous output.
+        assert_ne!(unsafe { QueryPerformanceCounter(&mut before) }, 0);
+        let trace = begin(home.path(), "POST", "/api/v1/familiars/sage/edits");
+        checkpoint(Phase::Intake);
+        drop(trace);
+        let mut after = 0;
+        // SAFETY: after is writable storage for the synchronous output.
+        assert_ne!(unsafe { QueryPerformanceCounter(&mut after) }, 0);
+        let log = std::fs::read_to_string(home.path().join("daemon-recovery.log")).unwrap();
+        let records: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("threads_request_checkpoint "))
+            .collect();
+        assert_eq!(records.len(), 3, "activated checkpoints missing: {log}");
+        for record in records {
+            let number = |prefix: &str| -> i64 {
+                record
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix(prefix))
+                    .unwrap_or_else(|| panic!("missing {prefix}: {record}"))
+                    .parse()
+                    .unwrap()
+            };
+            assert_eq!(number("native_pid="), i64::from(std::process::id()));
+            assert_eq!(number("native_tid="), i64::from(thread_id));
+            assert_eq!(number("native_qpc_hz="), frequency);
+            let counter = number("native_qpc=");
+            assert!(
+                counter >= before && counter <= after,
+                "native sample {counter} outside observed counter interval {before}..={after}"
+            );
+        }
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn request_diagnostics_frequency_cache_retries_failures_and_caches_only_valid_values() {
+        let cache = std::sync::OnceLock::new();
+        assert_eq!(cached_native_frequency(&cache, || None), None);
+        assert_eq!(cached_native_frequency(&cache, || Some(0)), None);
+        assert_eq!(cached_native_frequency(&cache, || Some(-1)), None);
+        assert!(cache.get().is_none());
+        assert_eq!(cached_native_frequency(&cache, || Some(19)), Some(19));
+        assert_eq!(
+            cached_native_frequency(&cache, || panic!("valid frequency was queried twice")),
+            Some(19)
+        );
     }
 }
