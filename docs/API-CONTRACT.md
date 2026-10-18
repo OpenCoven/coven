@@ -1147,9 +1147,10 @@ The prelude is explicit, untrusted framing. Each notice is wrapped as
 
 under a fixed header that says the notices came from daemon components, not
 the user. Notice bodies are sanitized before rendering: control characters
-other than newline and tab are dropped, and any body line that imitates the
-framing is escaped, so a notice can neither close its own block early nor open
-another. The user's text follows the prelude verbatim. A notice is never
+other than newline and tab are dropped, Unicode line and paragraph separators
+count as line breaks, and any body line that imitates the framing is escaped,
+so a notice can neither close its own block early nor open another. A source
+id, which is rendered into the framing line, is limited to `[A-Za-z0-9._:-]`. The user's text follows the prelude verbatim. A notice is never
 presented as user or system text.
 
 Pending notices are capped at 20 per scope: a 21st pending notice drops the
@@ -1175,8 +1176,12 @@ delivery bar written in `crates/coven-cli/src/automations/definition.rs`
   `noticeId` in one transaction, under the scope gate. A replay converges on
   that one notice. When Home's stream process is idle the notice arrives as
   its own turn; otherwise the next turn carries it.
-- A result that cannot be delivered records `failed` with a `reason`.
-  Delivered and failed records are immutable.
+- A result never evicts another undelivered notice: while the scope already
+  holds 20 pending notices the run stays `pending`, and it posts once a turn
+  drains the inbox.
+- A result that cannot be delivered records `failed` with a `reason`, and a
+  run whose result cannot be read fails alone without holding back later
+  runs. Delivered and failed records are immutable.
 
 The notice body names the routine, run, outcome, any receipt id, the failure
 reason for an unsuccessful run, and at most the last 4 KiB of the run's clean

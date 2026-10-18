@@ -289,8 +289,8 @@ impl DeliveryCriterion {
             }
             Self::ExactlyOnce => {
                 "One store transaction writes the delivered artifact and records `delivered` with \
-                 that artifact's id; a replay after a crash at any point converges on exactly one \
-                 artifact."
+                 that artifact's id, without evicting any other undelivered artifact; a replay \
+                 after a crash at any point converges on exactly one artifact."
             }
             Self::ExplicitFailure => {
                 "A delivery that cannot be made records `failed` with a reason, instead of \
@@ -334,6 +334,10 @@ pub const CERTIFIED_OUTPUT_TARGETS: &[DeliveryCertification] = &[DeliveryCertifi
             "a_rolled_back_settlement_leaves_no_obligation",
         ),
         (
+            DeliveryCriterion::CommittedWithSettlement,
+            "only_record_run_finish_writes_a_terminal_run_status",
+        ),
+        (
             DeliveryCriterion::ExactlyOnce,
             "a_replayed_delivery_converges_on_one_notice",
         ),
@@ -342,8 +346,16 @@ pub const CERTIFIED_OUTPUT_TARGETS: &[DeliveryCertification] = &[DeliveryCertifi
             "a_failed_discharge_rolls_back_the_notice_with_the_record",
         ),
         (
+            DeliveryCriterion::ExactlyOnce,
+            "a_full_inbox_defers_results_instead_of_evicting_notices",
+        ),
+        (
             DeliveryCriterion::ExplicitFailure,
             "an_undeliverable_result_records_failed_with_a_reason",
+        ),
+        (
+            DeliveryCriterion::ExplicitFailure,
+            "a_run_whose_result_cannot_be_read_fails_alone",
         ),
         (
             DeliveryCriterion::Attributed,

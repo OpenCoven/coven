@@ -43,7 +43,11 @@ const DELIVERY_BATCH: i64 = 32;
 /// Output carried in a result notice. A prelude may hold twenty notices, so a
 /// result is the tail of the run's output, not its transcript.
 const RESULT_EXCERPT_MAX_BYTES: usize = 4 * 1024;
+/// A failure reason carried in a result notice, so a runaway reason cannot
+/// push the notice past the inbox's body limit.
+const REASON_MAX_BYTES: usize = 1024;
 const GATE_UNAVAILABLE_REASON: &str = "the main-session inbox lock could not be opened";
+const RESULT_UNREADABLE_REASON: &str = "the run's recorded output could not be read";
 
 #[cfg(test)]
 type NoticeInsertHook = Box<dyn FnOnce() -> Result<()>>;
@@ -60,7 +64,8 @@ pub struct DeliveryReport {
     pub delivered: Vec<String>,
     /// Runs recorded `failed`, with the recorded reason.
     pub failed: Vec<(String, String)>,
-    /// Runs left `pending` because a main-session turn held the scope gate.
+    /// Runs left `pending`: a main-session turn held the scope gate, or the
+    /// inbox was full and posting would have evicted an undelivered notice.
     pub deferred: Vec<String>,
     /// Detail for the daemon recovery log. Notices are durable either way.
     pub warnings: Vec<String>,
@@ -73,6 +78,33 @@ fn iso(instant: DateTime<Utc>) -> String {
 /// The inbox scope a certified target delivers to.
 fn target_scope(target: &str) -> Option<&'static str> {
     (target == OutputTargetKind::MainSession.as_str()).then_some(INSTANCE_MAIN_SCOPE_KEY)
+}
+
+/// SQLite contention is retried on the next tick. Any other error about one
+/// run is that run's own failure and must not hold back the runs after it.
+fn is_transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
+}
+
+/// What one discharge attempt did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Discharge {
+    /// The notice and the `delivered` record committed together.
+    Delivered(String),
+    /// The scope already holds the most pending notices it keeps; posting
+    /// would evict one that no turn has carried yet. The run stays pending.
+    InboxFull,
+    /// Another pass settled the obligation first.
+    AlreadySettled,
 }
 
 /// Discharges pending delivery obligations, oldest first. With a runtime,
@@ -99,6 +131,7 @@ pub fn deliver_pending_results(
         .context("failed to read pending deliveries")?;
     let mut report = DeliveryReport::default();
     let mut scopes: Vec<&'static str> = Vec::new();
+    let mut full: Vec<&'static str> = Vec::new();
     for run_id in pending {
         let Some(run) = get_run(conn, &run_id)? else {
             continue;
@@ -116,7 +149,21 @@ pub fn deliver_pending_results(
             )?;
             continue;
         };
-        let text = result_notice_text(conn, &run)?;
+        if full.contains(&scope_key) {
+            report.deferred.push(run_id);
+            continue;
+        }
+        let text = match result_notice_text(conn, &run) {
+            Ok(text) => text,
+            Err(error) if is_transient(&error) => return Err(error),
+            Err(error) => {
+                report.warnings.push(format!(
+                    "automation run `{run_id}` result could not be composed: {error:#}"
+                ));
+                fail(conn, &mut report, &run_id, RESULT_UNREADABLE_REASON, now)?;
+                continue;
+            }
+        };
         let notice = NewNotice {
             scope_key,
             source_kind: NOTICE_SOURCE_KIND,
@@ -143,11 +190,18 @@ pub fn deliver_pending_results(
                 continue;
             }
         };
-        if discharge(conn, &run_id, &notice, now)?.is_some() {
-            report.delivered.push(run_id);
-            if !scopes.contains(&scope_key) {
-                scopes.push(scope_key);
+        match discharge(conn, &run_id, &notice, now)? {
+            Discharge::Delivered(_) => {
+                report.delivered.push(run_id);
+                if !scopes.contains(&scope_key) {
+                    scopes.push(scope_key);
+                }
             }
+            Discharge::InboxFull => {
+                report.deferred.push(run_id);
+                full.push(scope_key);
+            }
+            Discharge::AlreadySettled => {}
         }
     }
     if let Some(runtime) = runtime {
@@ -184,14 +238,19 @@ pub(crate) fn delivery_value(conn: &Connection, delivery: &RunDelivery) -> Resul
 }
 
 /// One transaction: the notice and the run's `delivered` record commit
-/// together or not at all. `None` when the obligation was already settled.
-/// The caller holds the scope gate, which `insert_notice` requires.
+/// together or not at all, and only while the inbox has room, so posting
+/// never evicts a notice no turn has carried. The caller holds the scope
+/// gate, which `insert_notice` requires.
 fn discharge(
     conn: &Connection,
     run_id: &str,
     notice: &NewNotice<'_>,
     now: DateTime<Utc>,
-) -> Result<Option<String>> {
+) -> Result<Discharge> {
+    anyhow::ensure!(
+        conn.is_autocommit(),
+        "automation delivery needs a connection outside any transaction"
+    );
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("failed to begin automation delivery")?;
     let pending: bool = transaction
@@ -204,7 +263,12 @@ fn discharge(
         )
         .context("failed to recheck the delivery obligation")?;
     if !pending {
-        return Ok(None);
+        return Ok(Discharge::AlreadySettled);
+    }
+    if main_session_notices::pending_count(&transaction, notice.scope_key)?
+        >= main_session_notices::MAX_PENDING_NOTICES_PER_SCOPE
+    {
+        return Ok(Discharge::InboxFull);
     }
     let stored = main_session_notices::insert_notice(&transaction, notice, &iso(now))?;
     #[cfg(test)]
@@ -230,7 +294,7 @@ fn discharge(
     transaction
         .commit()
         .context("failed to commit automation delivery")?;
-    Ok(Some(stored.id))
+    Ok(Discharge::Delivered(stored.id))
 }
 
 /// Records `failed` with a reason, unless the obligation settled first.
@@ -316,7 +380,7 @@ fn result_notice_text(conn: &Connection, run: &RunRecord) -> Result<String> {
     }
     if run.status != "succeeded" {
         if let Some(reason) = failure_reason(conn, run)? {
-            text.push_str(&format!("\nReason: {reason}"));
+            text.push_str(&format!("\nReason: {}", bounded(&reason, REASON_MAX_BYTES)));
         }
     }
     let Some(session_id) = &run.session_id else {
@@ -369,6 +433,18 @@ fn failure_reason(conn: &Connection, run: &RunRecord) -> Result<Option<String>> 
         .optional()
         .context("failed to read the run's occurrence reason")?
         .flatten())
+}
+
+/// `text` cut to at most `max` bytes on a character boundary, marked when cut.
+fn bounded(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// The visible tail of `output`, at most [`RESULT_EXCERPT_MAX_BYTES`], and
@@ -606,9 +682,19 @@ mod tests {
         update_definition(&f.conn, &routine("unpinned", main_session()))
             .unwrap()
             .unwrap();
+        // Started with a target; the routine is deleted before it ends.
+        insert_definition(&f.conn, &routine("deleted", main_session())).unwrap();
+        start(&f.conn, "deleted", "run-deleted");
+        f.conn
+            .execute(
+                "UPDATE automation_definitions SET tombstoned_at = ?1 WHERE id = 'deleted'",
+                [iso(at(30))],
+            )
+            .unwrap();
 
         assert!(finish(&f.conn, "run-pinned", "succeeded"));
         assert!(finish(&f.conn, "run-unpinned", "succeeded"));
+        assert!(finish(&f.conn, "run-deleted", "succeeded"));
         let pinned = run(&f.conn, "run-pinned").delivery.unwrap();
         assert_eq!(
             (pinned.target.as_str(), pinned.state.as_str()),
@@ -617,8 +703,12 @@ mod tests {
         assert_eq!(run(&f.conn, "run-unpinned").delivery, None);
 
         let report = deliver_pending_results(&f.home, &f.conn, None, at(61)).unwrap();
-        assert_eq!(report.delivered, vec!["run-pinned".to_owned()]);
+        assert_eq!(
+            report.delivered,
+            vec!["run-deleted".to_owned(), "run-pinned".to_owned()]
+        );
         assert_eq!(notices_for(&f.conn, "run-pinned").len(), 1);
+        assert_eq!(notices_for(&f.conn, "run-deleted").len(), 1);
         assert!(notices_for(&f.conn, "run-unpinned").is_empty());
     }
 
@@ -660,23 +750,34 @@ mod tests {
         assert_eq!(record.delivery.unwrap().state, "pending");
     }
 
-    /// The source before its first inline `#[cfg(test)]` module.
-    fn production_source(source: &str) -> &str {
-        let mut search = 0;
-        while let Some(found) = source[search..].find("#[cfg(test)]\n") {
-            let attribute = search + found;
-            let next = &source[attribute + "#[cfg(test)]\n".len()..];
-            let line = next.lines().next().unwrap_or_default().trim();
-            let inline_module = line.ends_with('{')
+    /// The source with every inline `#[cfg(test)]` module body removed.
+    /// rustfmt closes a module with a brace at the module's own indent.
+    fn production_source(source: &str) -> String {
+        const ATTRIBUTE: &str = "#[cfg(test)]\n";
+        let mut production = String::with_capacity(source.len());
+        let mut rest = source;
+        while let Some(found) = rest.find(ATTRIBUTE) {
+            let after = &rest[found + ATTRIBUTE.len()..];
+            let line = after.lines().next().unwrap_or_default();
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let item = line.trim();
+            let inline_module = item.ends_with('{')
                 && ["mod ", "pub mod ", "pub(crate) mod "]
                     .iter()
-                    .any(|prefix| line.starts_with(prefix));
-            if inline_module {
-                return &source[..attribute];
+                    .any(|prefix| item.starts_with(prefix));
+            if !inline_module {
+                production.push_str(&rest[..found + ATTRIBUTE.len()]);
+                rest = after;
+                continue;
             }
-            search = attribute + 1;
+            production.push_str(&rest[..found]);
+            let close = format!("\n{indent}}}\n");
+            rest = after
+                .find(&close)
+                .map_or("", |end| &after[end + close.len()..]);
         }
-        source
+        production.push_str(rest);
+        production
     }
 
     /// The SQL string literal that starts at the head of `text`.
@@ -790,7 +891,10 @@ mod tests {
             context_key: None,
         };
         let _gate = ScopeGate::acquire(&f.home, INSTANCE_MAIN_SCOPE_KEY).unwrap();
-        assert_eq!(discharge(&f.conn, "run-1", &notice, at(63)).unwrap(), None);
+        assert_eq!(
+            discharge(&f.conn, "run-1", &notice, at(63)).unwrap(),
+            Discharge::AlreadySettled
+        );
 
         let notices = notices_for(&f.conn, "run-1");
         assert_eq!(notices.len(), 1);
@@ -949,6 +1053,103 @@ mod tests {
         receipted.receipt_id = Some("receipt.nightly-1".to_owned());
         let text = result_notice_text(&f.conn, &receipted).unwrap();
         assert!(text.contains("\nReceipt: receipt.nightly-1\n"), "{text}");
+    }
+
+    #[test]
+    fn a_full_inbox_defers_results_instead_of_evicting_notices() {
+        let f = fixture();
+        insert_definition(&f.conn, &routine("nightly", main_session())).unwrap();
+        let mut waiting = Vec::new();
+        {
+            let mut conn = store::open_store(&crate::api::store_path(&f.home)).unwrap();
+            for index in 0..main_session_notices::MAX_PENDING_NOTICES_PER_SCOPE {
+                let id = format!("handoff-{index}");
+                let notice = NewNotice {
+                    scope_key: INSTANCE_MAIN_SCOPE_KEY,
+                    source_kind: "handoff",
+                    source_id: Some(&id),
+                    text: "acknowledged",
+                    context_key: None,
+                };
+                waiting.push(
+                    main_session_notices::enqueue_notice(&mut conn, &notice, &iso(at(1)))
+                        .unwrap()
+                        .id,
+                );
+            }
+        }
+        for run_id in ["run-1", "run-2"] {
+            start(&f.conn, "nightly", run_id);
+            assert!(finish(&f.conn, run_id, "succeeded"));
+        }
+
+        let report = deliver_pending_results(&f.home, &f.conn, None, at(61)).unwrap();
+        assert!(report.delivered.is_empty(), "{report:?}");
+        assert_eq!(
+            report.deferred,
+            vec!["run-1".to_owned(), "run-2".to_owned()]
+        );
+        for run_id in ["run-1", "run-2"] {
+            assert_eq!(run(&f.conn, run_id).delivery.unwrap().state, "pending");
+            assert!(notices_for(&f.conn, run_id).is_empty());
+        }
+        let pending: Vec<String> =
+            main_session_notices::pending_notices(&f.conn, INSTANCE_MAIN_SCOPE_KEY)
+                .unwrap()
+                .into_iter()
+                .map(|notice| notice.id)
+                .collect();
+        assert_eq!(pending, waiting, "no undelivered notice was evicted");
+
+        // A turn drains the inbox; the waiting results then post.
+        main_session_notices::mark_delivered(&f.conn, &waiting, "home-session", &iso(at(62)))
+            .unwrap();
+        let report = deliver_pending_results(&f.home, &f.conn, None, at(63)).unwrap();
+        assert_eq!(
+            report.delivered,
+            vec!["run-1".to_owned(), "run-2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_run_whose_result_cannot_be_read_fails_alone() {
+        let f = fixture();
+        let corrupt = routine("corrupt", main_session());
+        let nightly = routine("nightly", main_session());
+        insert_definition(&f.conn, &corrupt).unwrap();
+        insert_definition(&f.conn, &nightly).unwrap();
+        let (broken, finished_at) = launched_run(&f, &corrupt, "", "completed", Some(0));
+        let session_id = run(&f.conn, &broken).session_id.unwrap();
+        store::insert_event(
+            &f.conn,
+            &EventRecord {
+                seq: 0,
+                id: "event-broken".to_owned(),
+                session_id,
+                kind: "output".to_owned(),
+                payload_json: json!({ "data": 7 }).to_string(),
+                created_at: iso(finished_at),
+            },
+        )
+        .unwrap();
+        let (healthy, finished_at) = launched_run(&f, &nightly, "fine", "completed", Some(0));
+        settle_finished_runs(&f.conn, finished_at).unwrap();
+
+        let report = deliver_pending_results(&f.home, &f.conn, None, finished_at).unwrap();
+        assert_eq!(
+            report.failed,
+            vec![(broken.clone(), RESULT_UNREADABLE_REASON.to_owned())]
+        );
+        assert_eq!(report.delivered, vec![healthy]);
+        assert_eq!(run(&f.conn, &broken).delivery.unwrap().state, "failed");
+
+        // A runaway failure reason is trimmed rather than failing the notice.
+        let reason = "é".repeat(REASON_MAX_BYTES);
+        assert_eq!(
+            bounded(&reason, REASON_MAX_BYTES).len(),
+            REASON_MAX_BYTES + "…".len()
+        );
+        assert_eq!(bounded("short", REASON_MAX_BYTES), "short");
     }
 
     #[derive(Default)]
