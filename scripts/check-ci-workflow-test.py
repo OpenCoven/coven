@@ -54,6 +54,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         for job_name in [
             'rust-lint-linux',
             'rust-test-linux',
+            'threads-test-linux',
             'rust-test-windows',
             'threads-test-windows',
             'rust-test-macos',
@@ -257,7 +258,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
 
     def test_all_platforms_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
         command = THREADS_FEATURE_COMMAND
-        for job in ("rust-test-linux", "threads-test-windows", "rust-test-macos"):
+        for job in ("threads-test-linux", "threads-test-windows", "rust-test-macos"):
             self.assertIn(command, ci_job_block(job))
         harness = CI_WORKFLOW.parents[2] / "crates/coven-cli/tests/threads_e2e.rs"
         self.assertNotIn("#![cfg(unix)]", harness.read_text(encoding="utf-8"))
@@ -364,6 +365,40 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("if-no-files-found: error", upload)
         self.assertIn("retention-days: 14", windows)
 
+    def test_linux_build_profiles_have_separate_required_job_budgets(self) -> None:
+        workspace = ci_job_block("rust-test-linux")
+        # Keep the existing native audit and complete workspace coverage.
+        self.assertIn("cargo test --workspace --locked", workspace)
+        self.assertIn("node conformance/automations/runner/audit.mjs", workspace)
+        self.assertNotIn("--features threads-test-clock", workspace)
+        threads = ci_job_block("threads-test-linux")
+        self.assertNotIn("cargo test --workspace", threads)
+        self.assertIn(THREADS_FEATURE_COMMAND, threads)
+        self.assertIn(
+            "cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_",
+            threads,
+        )
+        for name, job in (("rust-test-linux", workspace), ("threads-test-linux", threads)):
+            with self.subTest(job=name):
+                self.assertIn("runs-on: ubuntu-latest", job)
+                self.assertIn("\n    timeout-minutes: 20\n", job)
+                self.assertIn("needs: changes", job)
+                self.assertIn("if: ${{ needs.changes.outputs.rust == 'true' }}", job)
+                self.assertIn("dtolnay/rust-toolchain@stable", job)
+                self.assertIn("bash scripts/install-native-link-dependencies.sh", job)
+                self.assertIn('CARGO_TARGET_DIR=${{ runner.temp }}/coven-target', job)
+                self.assertNotIn("continue-on-error:", job)
+                self.assertNotIn("--test-threads", job)
+                self.assertIn(f"\n      - {name}\n", ci_job_block("pr-gate"))
+        # Separate keys prevent the two profiles racing to save one cache.
+        self.assertIn("${{ runner.os }}-rust-threads-", threads)
+        self.assertIn("${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}", threads)
+        restore = threads.split("          restore-keys: |\n", 1)[1].split("      - name:", 1)[0]
+        self.assertEqual(restore.strip().splitlines(), [
+            "${{ runner.os }}-rust-threads-",
+            "            ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}",
+        ])
+
     def test_windows_build_profiles_run_in_separate_required_jobs(self) -> None:
         workspace = ci_job_block("rust-test-windows")
         windows = ci_job_block("threads-test-windows")
@@ -389,7 +424,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
                 workflow_text,
             )
 
-        expected_invocations = 7 + 3 + 1
+        expected_invocations = 8 + 3 + 1
         actual_invocations = (
             CI_TEXT.count("bash scripts/install-native-link-dependencies.sh")
             + RELEASE_TEXT.count("bash scripts/install-native-link-dependencies.sh")

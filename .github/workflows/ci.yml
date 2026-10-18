@@ -286,6 +286,35 @@ jobs:
           retention-days: 14
           if-no-files-found: error
       - run: cargo test --workspace --locked
+
+  # Workspace/audit and Threads retain independent bounded budgets. Their
+  # combined runtime can exhaust one job before the real-daemon tests finish.
+  threads-test-linux:
+    name: Threads tests (Linux)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Keep build outputs outside the source
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/coven-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6.0.0
+        with:
+          node-version: 24
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/coven-target
+          key: ${{ runner.os }}-rust-threads-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-threads-
+            ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+      - name: Install native link dependencies
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Exercise isolated Threads clock feature
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
       - name: Exercise real-daemon Threads journeys
@@ -777,6 +806,7 @@ jobs:
       - automations-authority-profile-bundle
       - rust-lint-linux
       - rust-test-linux
+      - threads-test-linux
       - rust-test-windows
       - threads-test-windows
       - rust-test-macos
