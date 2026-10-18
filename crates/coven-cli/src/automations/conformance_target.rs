@@ -29,6 +29,7 @@ use super::runs::{
 };
 
 mod command_envelope_outcomes;
+mod command_storage_lock_recovery;
 mod runtime_authority_terminal_recovery;
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -91,6 +92,7 @@ pub const CALENDAR_SCHEDULE_RESOLUTION_SUITE: &str = "calendar-schedule-resoluti
 pub const CANCELLATION_TIMEOUT_ARBITRATION_SUITE: &str = "cancellation-timeout-arbitration";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
+pub const COMMAND_STORAGE_LOCK_RECOVERY_SUITE: &str = "command-storage-lock-recovery";
 pub const COMMAND_ENVELOPE_OUTCOMES_SUITE: &str = "command-envelope-outcomes";
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
@@ -1553,6 +1555,7 @@ pub fn capability() -> TargetCapability {
                 suites: vec![
                     CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                     CANCELLATION_TIMEOUT_ARBITRATION_SUITE,
+                    COMMAND_STORAGE_LOCK_RECOVERY_SUITE,
                     MISFIRE_LATEST_PLANNING_SUITE,
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
                     OVERLAP_FORBID_CLAIMING_SUITE,
@@ -1617,6 +1620,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, CANCELLATION_TIMEOUT_ARBITRATION_SUITE) => {
             evaluate_cancellation_timeout_arbitration(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, COMMAND_STORAGE_LOCK_RECOVERY_SUITE) => {
+            command_storage_lock_recovery::evaluate(&request.vector)?
         }
         (SCHEDULER_RELIABILITY_PROFILE, MISFIRE_LATEST_PLANNING_SUITE) => {
             evaluate_misfire_latest_planning(&request.vector)?

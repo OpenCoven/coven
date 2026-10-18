@@ -259,7 +259,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eleven structural suites, nine
+The native Coven target currently implements eleven structural suites, ten
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -382,3 +382,17 @@ Rust verifier. The native target rejects evaluation requests larger than one
 MiB before JSON parsing.
 Each target operation has a two-second deadline followed by process-tree
 termination; output is capped at one MiB.
+
+## Command storage-lock audit boundary
+
+The `command-storage-lock-recovery` suite uses two connections to a disposable
+file-backed SQLite store. A held write lock must produce `SQLITE_BUSY` without
+writing a definition, adoption or event. Releasing that lock permits the same
+command/key to commit; closing and reopening the store must preserve one copy
+and the original replay result, event reference and commit timestamp. An
+unlocked control exercises the same command without contention.
+
+This is audit-only evidence for command-adoption lock refusal and recovery.
+It does not certify process crashes, disk-full, I/O errors, corruption,
+permission loss, runtime dispatch, or release eligibility. The zero busy wait
+belongs only to the fixture connection; production deadlines are unchanged.
