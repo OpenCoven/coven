@@ -787,6 +787,103 @@ fn scheduler_leadership_fencing_suite_requires_scheduler_profile() {
     );
 }
 
+// Run environment-sensitive error paths in a child so no parallel test sees
+// the deliberately invalid temporary directory configuration.
+#[test]
+fn startup_reconciliation_trace_failure_child() {
+    if std::env::var("COVEN_STARTUP_TRACE_CHILD").as_deref() != Ok("temp-home") {
+        return;
+    }
+    let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
+    let result = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "startup-reconciliation-wake",
+        vectors,
+    ));
+    assert_eq!(result.unwrap_err(), "conformance suite execution failed");
+    println!("startup trace child confirmed the existing execution error");
+}
+
+#[test]
+fn startup_reconciliation_trace_identifies_temp_home_failure_without_private_path() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct OwnedChild {
+        child: std::process::Child,
+        home: Option<tempfile::TempDir>,
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            if self.child.wait().is_err() {
+                if let Some(home) = self.home.take() {
+                    let _ = home.keep();
+                }
+                eprintln!("conformance diagnostic child cleanup incomplete; owned home retained");
+            }
+        }
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix("coven-conformance-error-child-")
+        .tempdir()
+        .unwrap();
+    let invalid_root = temp.path().join("private-conformance-path");
+    std::fs::write(&invalid_root, b"not a directory").unwrap();
+    let stdout = temp.path().join("child.stdout");
+    let stderr = temp.path().join("child.stderr");
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "automations::conformance_target_tests::startup_reconciliation_trace_failure_child",
+            "--nocapture",
+        ])
+        .env("COVEN_STARTUP_TRACE_CHILD", "temp-home")
+        .env("TMPDIR", &invalid_root)
+        .env("TMP", &invalid_root)
+        .env("TEMP", &invalid_root)
+        .stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()))
+        .spawn()
+        .unwrap();
+    // This guard also kills/reaps on polling errors or assertion unwinding.
+    let mut owned = OwnedChild {
+        child,
+        home: Some(temp),
+    };
+    // This guard catches a wedged owned test process; it asserts no runtime
+    // promptness or production lifecycle deadline.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = owned.child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            panic!("startup trace child exceeded its 60-second hang guard");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let output = format!(
+        "{}{}",
+        std::fs::read_to_string(stdout).unwrap(),
+        std::fs::read_to_string(stderr).unwrap()
+    );
+    assert!(status.success(), "child failed: {output}");
+    assert!(
+        output.contains("startup trace child confirmed the existing execution error"),
+        "child did not exercise the intended failure: {output}"
+    );
+    assert!(
+        output.contains("phase=temp-home outcome=error"),
+        "missing owning-operation diagnostic: {output}"
+    );
+    assert!(
+        !output.contains("private-conformance-path"),
+        "diagnostic leaked the private path"
+    );
+}
+
 #[test]
 fn startup_reconciliation_wake_suite_executes_the_checked_in_vectors() {
     let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
