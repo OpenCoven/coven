@@ -417,7 +417,10 @@ export type CommandName =
   | "definition.health.v1"
   | "events.read.v1"
   | "events.subscribe.v1"
-  | "legacy.import.v1";
+  | "legacy.import.v1"
+  | "mission.submit.v1"
+  | "mission.get.v1"
+  | "mission.cancel.v1";
 
 export interface CommandOrigin {
   principal: PrincipalRef;
@@ -475,6 +478,120 @@ export interface CommandPayloadByCommand {
     checkpoint?: string;
   };
   "legacy.import.v1": { source: "codex-automation-toml"; dryRun?: boolean };
+  "mission.submit.v1": MissionSubmitPayload;
+  "mission.get.v1": { missionId: MissionId };
+  "mission.cancel.v1": { missionId: MissionId; reason?: string };
+}
+
+// ---------------------------------------------------------------------------
+// Missions: one owner-submitted, one-shot invocation of an exact familiar
+// revision on one project, over one manual occurrence (#1313).
+// ---------------------------------------------------------------------------
+
+/** "mission-" + the first 32 hex digits of sha256(adoptionKey) of the submit. */
+export type MissionId = string;
+
+export interface FamiliarRevisionRef {
+  /** familiar:<32 hex> */
+  rootId: string;
+  /** familiar-revision:<32 hex>:<position> */
+  revisionId: string;
+}
+
+export interface MissionEnvelopeRef {
+  /** A runtime envelope the daemon advertises and enforces, such as "r0-read.1". */
+  id: string;
+  descriptorDigest: Digest;
+}
+
+export interface MissionSubmitPayload {
+  familiar: FamiliarRevisionRef;
+  envelope: MissionEnvelopeRef;
+  /** Absolute directory; the daemon canonicalizes it and refuses one inside COVEN_HOME. */
+  project: { cwd: string };
+  /** statement: 1-200 characters. prompt: at most 32 KiB of UTF-8, never echoed back. */
+  task: { statement: string; prompt: string };
+  /** 1-60 minutes. */
+  limits: { timeoutMinutes: number };
+  /** Dispatch must begin before this instant, at most 15 minutes after the request. */
+  validUntil: Timestamp;
+}
+
+export type MissionState =
+  | "queued"
+  | "running"
+  | "needs_approval"
+  | "cancelling"
+  | "reconciling"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "rejected"
+  | "revoked"
+  | "unavailable";
+
+export type MissionReason =
+  | "timeout"
+  | "harness_failed"
+  | "familiar_revision_stale"
+  | "familiar_revision_revoked"
+  | "grant_revoked"
+  | "envelope_unsupported"
+  | "expired_before_dispatch"
+  | "authority_unavailable"
+  | "runtime_unavailable"
+  | "ambiguous_execution";
+
+export interface MissionResult {
+  outcome: "completed" | "failed" | "cancelled" | "rejected" | "revoked" | "unavailable";
+  settledAt: Timestamp;
+  resultDigest?: Digest;
+  artifacts: Array<{
+    kind: "report";
+    ref: string;
+    mediaType: "text/markdown";
+    bytes: number;
+    digest: Digest;
+  }>;
+  /** Reported by the harness's result event, never estimated. */
+  usage: null | {
+    source: "harness_result_event";
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    costUsd?: number;
+  };
+  observation: "complete" | "partial" | "unknown";
+}
+
+export interface MissionView {
+  missionId: MissionId;
+  occurrenceId: string;
+  /** Increases on every state change and stops at the terminal state. */
+  revision: number;
+  state: MissionState;
+  terminal: boolean;
+  reason?: MissionReason;
+  principal: PrincipalRef;
+  familiar: FamiliarRevisionRef;
+  envelope: MissionEnvelopeRef;
+  project: { cwd: string };
+  task: { statement: string };
+  submittedAt: Timestamp;
+  validUntil: Timestamp;
+  attempts: Array<{
+    attemptId: string;
+    attemptNumber: number;
+    state: AttemptState;
+    failureClass?: string;
+  }>;
+  cancellation?: {
+    cancellationId: string;
+    requestedAt: Timestamp;
+    outcome: "cancelled" | "pending" | "lost_to_completion" | "recovery_required";
+  };
+  result?: MissionResult;
 }
 
 export interface StreamRef {

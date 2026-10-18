@@ -5,7 +5,8 @@
     "Machine-readable compatibility matrix for coven.automations.v1.",
     "changeClass defines what a future change to any field or variant is, and what a v1 consumer/producer must do when it meets it.",
     "Consumers and producers must refuse incompatible profiles explicitly with SCHEMA_VERSION_UNSUPPORTED; they never approximate or degrade silently.",
-    "This profile is still proposed. The UTC/IANA timezone correction and operator-retry hold transitions are pre-stabilization contract revisions: older source-bound bundles remain immutable historical artifacts, and consumers must pin the exact bundle they validated."
+    "This profile is still proposed. The UTC/IANA timezone correction and operator-retry hold transitions are pre-stabilization contract revisions: older source-bound bundles remain immutable historical artifacts, and consumers must pin the exact bundle they validated.",
+    "The mission commands (mission.submit.v1, mission.get.v1, mission.cancel.v1, #1313) are a pre-stabilization additive-variant revision: a reader that does not implement them refuses them with CAPABILITY_UNSUPPORTED. They add no error code; the frozen vocabulary covers every mission refusal."
   ],
   "changeClasses": [
     {

@@ -350,6 +350,9 @@ This producer does not implement the whole catalog. `automations/command_matrix.
 | `events.read.v1` | implemented | `coven.automations.events.read.v1` |
 | `events.subscribe.v1` | implemented | `coven.automations.events.subscribe.v1` |
 | `legacy.import.v1` | implemented | `coven.automations.legacy.import.v1` |
+| `mission.submit.v1` | unsupported | none |
+| `mission.get.v1` | unsupported | none |
+| `mission.cancel.v1` | unsupported | none |
 
 #### Command envelope over the control-action wire
 
