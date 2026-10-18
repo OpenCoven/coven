@@ -309,6 +309,22 @@ pub(crate) fn notice_by_id(conn: &Connection, id: &str) -> Result<Option<NoticeR
     .context("failed to read notice")
 }
 
+/// What became of a notice, for the producer that posted it: `pending`
+/// until a main-session turn carries it, `delivered` once one has, and
+/// `dropped` once a same-key notice replaced it or the pending cap evicted
+/// it unread.
+pub(crate) fn notice_fate(conn: &Connection, id: &str) -> Result<serde_json::Value> {
+    Ok(match notice_by_id(conn, id)? {
+        Some(notice) => json!({
+            "state": if notice.delivered_at.is_some() { "delivered" } else { "pending" },
+            "scopeKey": notice.scope_key,
+            "deliveredAt": notice.delivered_at,
+            "deliveredSessionId": notice.delivered_session_id,
+        }),
+        None => json!({ "state": "dropped" }),
+    })
+}
+
 /// Records that `ids` reached `session_id`. Already-delivered ids are left
 /// alone, so a late second call cannot re-stamp a notice. Returns how many
 /// notices were newly marked.

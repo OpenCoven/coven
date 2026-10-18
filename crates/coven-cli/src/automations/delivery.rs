@@ -213,8 +213,7 @@ pub fn deliver_pending_results(
 }
 
 /// The run API's view of a delivery record. A delivered record also reports
-/// its notice: still `pending` in the inbox, `delivered` into a main-session
-/// turn, or `dropped` once the pending cap evicted it unread.
+/// its notice's fate (`main_session_notices::notice_fate`).
 pub(crate) fn delivery_value(conn: &Connection, delivery: &RunDelivery) -> Result<Value> {
     let mut value = json!({
         "target": { "kind": delivery.target },
@@ -224,15 +223,7 @@ pub(crate) fn delivery_value(conn: &Connection, delivery: &RunDelivery) -> Resul
         "recordedAt": delivery.recorded_at,
     });
     if let Some(notice_id) = &delivery.notice_id {
-        value["notice"] = match main_session_notices::notice_by_id(conn, notice_id)? {
-            Some(notice) => json!({
-                "state": if notice.delivered_at.is_some() { "delivered" } else { "pending" },
-                "scopeKey": notice.scope_key,
-                "deliveredAt": notice.delivered_at,
-                "deliveredSessionId": notice.delivered_session_id,
-            }),
-            None => json!({ "state": "dropped" }),
-        };
+        value["notice"] = main_session_notices::notice_fate(conn, notice_id)?;
     }
     Ok(value)
 }
@@ -494,7 +485,7 @@ fn strip_escape_sequences(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
 
@@ -1152,11 +1143,13 @@ mod tests {
         assert_eq!(bounded("short", REASON_MAX_BYTES), "short");
     }
 
+    /// A runtime that hosts Home as a stream session and records every turn
+    /// sent to it. `busy` stands in for a turn still generating.
     #[derive(Default)]
-    struct HomeRuntime {
+    pub(crate) struct HomeRuntime {
         launches: RefCell<Vec<SessionLaunch>>,
-        inputs: RefCell<Vec<String>>,
-        busy: Cell<bool>,
+        pub(crate) inputs: RefCell<Vec<String>>,
+        pub(crate) busy: Cell<bool>,
     }
 
     impl SessionRuntime for HomeRuntime {
