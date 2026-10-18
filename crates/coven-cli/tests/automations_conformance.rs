@@ -153,6 +153,7 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "command-storage-readonly-recovery",
                         "command-transaction-rollback",
                         "legacy-import-source-preservation",
+                        "command-storage-capacity-recovery",
                         "misfire-latest-planning",
                         "occurrence-lease-recovery",
                         "overlap-forbid-claiming",
@@ -1366,5 +1367,81 @@ fn native_target_imports_legacy_sources_through_real_daemon() -> anyhow::Result<
         "Error: conformance vector is invalid\n"
     );
     assert!(!home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_storage_capacity_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/command-storage-capacity-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "command-storage-capacity-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "command-storage-capacity-recovery");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 2);
+    assert_eq!(response["evidence"]["passedCases"], 2);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("capacity observations");
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0]["faultSource"], "sqlite_max_page_count");
+    assert_eq!(observations[0]["sqliteErrorCode"], 13);
+    assert_eq!(observations[0]["initialAddedDefinitions"], 0);
+    assert_eq!(observations[1]["initialAddedDefinitions"], 1);
+    for observation in observations {
+        assert_eq!(observation["baselinePreserved"], true);
+        assert_eq!(observation["finalAddedDefinitions"], 1);
+        assert_eq!(observation["replayPreserved"], true);
+        assert_eq!(observation["replayWritesUnchanged"], true);
+    }
+    for (field, value) in [
+        ("promptBytes", json!(131073)),
+        ("fault", json!("physical_disk_full")),
+        ("unexpected", json!("private-invalid-value")),
+    ] {
+        let mut malformed = request.clone();
+        malformed["vector"]["cases"][0][field] = value;
+        let rejected = run_target(&coven_home, "evaluate", Some(&malformed))?;
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(error.contains("conformance vector is invalid"));
+        assert!(!error.contains("private-invalid-value"));
+    }
+    let mut wrong_expectation = request.clone();
+    wrong_expectation["vector"]["cases"][0]["expected"]["initialOutcome"] = json!("committed");
+    let rejected = run_target(&coven_home, "evaluate", Some(&wrong_expectation))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(!coven_home.exists());
     Ok(())
 }

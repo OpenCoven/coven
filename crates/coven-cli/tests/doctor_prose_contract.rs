@@ -147,3 +147,41 @@ description = "Exercises terminal-control escaping."
     assert!(prose.contains(r"Research\u{9b}er"), "{prose:?}");
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn doctor_names_a_coven_home_too_long_for_its_socket() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let project = temp.path().join("project");
+    // Longer than any platform's Unix socket limit once `/coven.sock` is added.
+    let coven_home = temp.path().join("h".repeat(120));
+    fs::create_dir_all(project.join(".git"))?;
+    fs::create_dir_all(&coven_home)?;
+    fs::create_dir_all(temp.path().join("user-home"))?;
+
+    let prose =
+        isolated_doctor_command(temp.path(), &project, &coven_home, &["doctor"]).output()?;
+    assert_blocking_exit(&prose);
+    let prose_text = String::from_utf8(prose.stdout)?;
+    assert!(
+        prose_text.contains("[!!] Not running, and its socket path is")
+            && prose_text.contains("— set COVEN_HOME to a shorter directory"),
+        "{prose_text}"
+    );
+    assert!(
+        !prose_text.contains("[--] Not running — run: coven daemon start"),
+        "{prose_text}"
+    );
+
+    let json_output =
+        isolated_doctor_command(temp.path(), &project, &coven_home, &["doctor", "--json"])
+            .output()?;
+    assert_blocking_exit(&json_output);
+    let json: Value = serde_json::from_slice(&json_output.stdout)?;
+    assert_eq!(check_status(&json, "daemon"), Some("fail"));
+    assert_eq!(
+        check_hint(&json, "daemon"),
+        Some("set COVEN_HOME to a shorter directory")
+    );
+    Ok(())
+}

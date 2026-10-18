@@ -2810,8 +2810,22 @@ struct DoctorEngineReport {
 impl DoctorReport {
     /// A blocking problem exists exactly when one of these holds; prose exit
     /// codes and the JSON `ok` field both derive from this list.
+    /// `(length, limit)` when no daemon runs and none could: the home's
+    /// socket path is too long to bind (coven#1345).
+    fn daemon_socket_overflow(&self) -> Option<(usize, usize)> {
+        if self.daemon.is_some() {
+            return None;
+        }
+        let home = self
+            .home
+            .canonicalize()
+            .unwrap_or_else(|_| self.home.clone());
+        daemon::socket_path_overflow(&home)
+    }
+
     fn healthy(&self) -> bool {
-        let daemon_ok = !matches!(self.daemon, Some(daemon::DaemonStatusState::Stale(_)));
+        let daemon_ok = !matches!(self.daemon, Some(daemon::DaemonStatusState::Stale(_)))
+            && self.daemon_socket_overflow().is_none();
         let repos_ok = self.repos.iter().all(|repo| repo.ok);
         let harness_ok = self.harnesses.iter().any(|harness| harness.available);
         let engine_ok = match &self.engine {
@@ -3008,7 +3022,12 @@ fn print_doctor_prose(report: &DoctorReport) {
                 status.pid, status.socket
             ));
         }
-        None => println!("  [--] Not running — run: coven daemon start"),
+        None => match report.daemon_socket_overflow() {
+            Some((length, limit)) => println!(
+                "  [!!] Not running, and its socket path is {length} bytes; Unix sockets here allow at most {limit} — set COVEN_HOME to a shorter directory"
+            ),
+            None => println!("  [--] Not running — run: coven daemon start"),
+        },
     }
 
     if !report.repos.is_empty() {
@@ -3323,11 +3342,22 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             ),
             Some("run: coven daemon restart".to_string()),
         ),
-        None => DoctorCheck::warn(
-            "daemon",
-            "not running",
-            Some("run: coven daemon start".to_string()),
-        ),
+        // A home whose socket cannot be bound would fail `daemon start` too,
+        // so name that instead of suggesting it (coven#1345).
+        None => match report.daemon_socket_overflow() {
+            Some((length, limit)) => DoctorCheck::fail(
+                "daemon",
+                format!(
+                    "not running, and its socket path is {length} bytes; Unix sockets here allow at most {limit}"
+                ),
+                Some("set COVEN_HOME to a shorter directory".to_string()),
+            ),
+            None => DoctorCheck::warn(
+                "daemon",
+                "not running",
+                Some("run: coven daemon start".to_string()),
+            ),
+        },
     });
 
     for repo in &report.repos {
@@ -9471,6 +9501,35 @@ mod tests {
 
     /// The JSON `ok` field is derived from check statuses while the exit code
     /// derives from `healthy()`; they must agree for every failure mode.
+    #[test]
+    fn doctor_names_a_socket_path_too_long_to_bind() {
+        let mut stopped = make_doctor_report();
+        stopped.daemon = None;
+        let check = |report: &DoctorReport| {
+            doctor_checks(report)
+                .into_iter()
+                .find(|check| check.id == "daemon")
+                .unwrap()
+        };
+        let plain = check(&stopped);
+        assert_eq!(plain.status, "warn");
+        assert_eq!(plain.hint.as_deref(), Some("run: coven daemon start"));
+
+        stopped.home = PathBuf::from(format!("/tmp/{}", "h".repeat(200)));
+        let long = check(&stopped);
+        if cfg!(unix) {
+            assert_eq!(long.status, "fail");
+            assert!(long.message.starts_with("not running, and its socket path is 216 bytes; Unix sockets here allow at most "), "{}", long.message);
+            assert_eq!(
+                long.hint.as_deref(),
+                Some("set COVEN_HOME to a shorter directory")
+            );
+            assert!(!stopped.healthy());
+        } else {
+            assert_eq!(long.status, "warn");
+        }
+    }
+
     #[test]
     fn doctor_checks_fail_statuses_match_healthy() {
         let healthy = make_doctor_report();
