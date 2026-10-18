@@ -9,7 +9,10 @@ source_adjacent_reason: "Defines the producer contract that OpenCoven/chat#155 a
 
 # Automations missions
 
-Status: **contract shape approved by Val on 2026-10-18; not implemented**. Written for #1313,
+Status: **contract shape approved by Val on 2026-10-18. `mission.submit.v1` and
+`mission.get.v1` are implemented; under M0 no mission launches yet (see
+*Implementation notes*). `mission.cancel.v1`, mission events, the no-launch
+receipt and the conformance vectors are not implemented.** Written for #1313,
 which replaces OpenCoven/coven-agents#261. Consumers: OpenCoven/chat#155 (native
 submit/observe/cancel) and the SDK client. Builds on
 [coven-automations-v1.md](coven-automations-v1.md) and
@@ -289,16 +292,31 @@ what.
 
 - **The internal definition must never be scheduled.** Every v1 definition
   needs an `rrule`, and the planner schedules every active row, while `runNow`
-  requires an active one. A mission therefore gets its own claim path: the
-  definition is stored with a mission marker the planner skips, and is never
-  active in the scheduling sense.
-- **The owner grant needs a migration.** `automation_owner_grants` allows only
-  create, activate and revise commands by CHECK constraint, so `mission.submit`
-  is added to it, with release-upgrade fixture coverage.
+  requires an active one. A mission therefore gets its own claim path: its
+  definition is stored `DISABLED`, so the planner, activation and `runNow` pass
+  it by, and it carries no marker column. Its `automation_missions` row is what
+  marks it: definition list and get, every definition command and `runNow`
+  treat a definition with a mission row as absent (`NOT_FOUND`).
+- **The owner grant is the mission row.** `automation_owner_grants` allows only
+  create, activate and revise commands by CHECK constraint. Rather than widen
+  that table with a migration, the immutable `automation_missions` row records
+  the grant's evidence: the owner-local principal, the adoption key, the request
+  digest and `submittedAt`. Triggers refuse any update or delete of it.
 - **No launch until Runtime Authority exists.** Production dispatch is still the
   base v1 path, which launches with ambient authority. M0 refuses to launch any
-  mission until the R0 envelope is enforced (#857), and settles it
-  `unavailable` with a no-launch receipt (vector M-06).
+  mission until the R0 envelope is enforced (#857). Once the submit has
+  committed, the mission's occurrence settles failed with a reason the view
+  projects to `unavailable` / `authority_unavailable` (vector M-06). The submit
+  answers with the state at commit (`queued`); `mission.get` reports the
+  settlement. The no-launch receipt is not written yet.
+- **Validation order.** `validUntil` (in the future, at most 15 minutes ahead),
+  then the envelope (`r0-read.1` and its descriptor digest), then the project
+  directory (exists, canonical, not inside `COVEN_HOME`), then the familiar
+  (unknown root `NOT_FOUND`; a revision that is not the root's active head
+  `REVISION_CONFLICT` with `details.currentRevisionId`), then concurrency.
+  Every refusal is adopted under its key, as for `runNow`. The request digest
+  covers `{command, payload}`, so the flat action and the command envelope are
+  the same request, and `origin` / `intentId` never change it.
 - **Events.** Event payloads are closed schemas. `missionId` and the projected
   state are added as optional fields of the transition payload, a minor-profile
   change while the profile is `proposed`.
