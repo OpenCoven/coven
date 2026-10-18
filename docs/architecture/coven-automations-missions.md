@@ -1,6 +1,6 @@
 ---
 title: "Automations missions"
-summary: "Draft contract for submitting, observing and cancelling one bounded familiar mission over coven.automations.v1."
+summary: "Approved contract (not implemented) for submitting, observing and cancelling one bounded familiar mission over coven.automations.v1."
 read_when:
   - Designing or reviewing the mission commands for issue 1313
   - Building a client (SDK, CLI, Chat) that submits or observes a mission
@@ -9,7 +9,7 @@ source_adjacent_reason: "Defines the producer contract that OpenCoven/chat#155 a
 
 # Automations missions
 
-Status: **draft for review, not implemented**. Written 2026-10-18 for #1313,
+Status: **contract shape approved by Val on 2026-10-18; not implemented**. Written for #1313,
 which replaces OpenCoven/coven-agents#261. Consumers: OpenCoven/chat#155 (native
 submit/observe/cancel) and the SDK client. Builds on
 [coven-automations-v1.md](coven-automations-v1.md) and
@@ -30,11 +30,13 @@ one manual occurrence of `coven.automations.v1`, which already has:
 
 This document defines only what the layer adds.
 
-## Decisions for review
+## Decisions
+
+All decided by Val on 2026-10-18.
 
 | # | Question | Proposal |
 | --- | --- | --- |
-| 1 | What can the first mission do? | **Decided (Val, 2026-10-18): M0 is a read-only diagnosis report** on the `r0-read.1` envelope, the only one that launches. Running tests waits for an exec envelope with enforced confinement (M1, under #857). This narrows chat#155's "diagnosis/test" to diagnosis until M1. |
+| 1 | What can the first mission do? | **M0 is a read-only diagnosis report** on the `r0-read.1` envelope, the only one that launches. Running tests waits for an exec envelope with enforced confinement (M1, under #857). This narrows chat#155's "diagnosis/test" to diagnosis until M1. |
 | 2 | Is a mission a new resource? | **No.** `mission.submit` atomically creates a hidden one-shot definition, adopts the owner grant for it, and claims its single manual occurrence. The mission id and the occurrence id are derived from the same adoption key. The definition is never listed, scheduled or revised. |
 | 3 | Who authorizes a mission? | The **owner-local principal** (Decision 1 of the runtime-authority doc), over the owner-only socket or pipe. Submitting is the one-run owner grant, as `occurrence.runNow.v1` on an authority routine already is (decided 2026-10-05). TCP callers are refused before the store opens. |
 | 4 | Approvals? | **Reserved, not produced.** M0 launches only R0. An approval would unlock nothing until a writable envelope exists, the same reasoning slice 7 used. `needs_approval` is in the state set so clients render it once it exists. |
@@ -273,11 +275,12 @@ a clock and a transport, a command sequence produces exact responses and
 - Scheduling. A mission never recurs; a routine stays the thing for that.
 - Billing and Daytona lifecycle (coven-agents).
 
-## Open questions
+## Also decided (2026-10-18)
 
-1. Should `mission.submit` also accept an existing active routine, as a "run this
-   routine as a mission", or only the hidden one-shot definition?
-2. Report retention: keep the owner-only artifact for the session-log period, or
-   set a mission-specific `RetentionClass`?
-3. Should the M0 concurrency limit be per familiar root and project (proposed),
-   per familiar, or global?
+1. **One-shot only.** `mission.submit` creates its own hidden definition and
+   never accepts an existing routine. Running a routine stays `occurrence.runNow`.
+2. **Report retention follows session logs.** The owner-only report artifact is
+   kept for the period the daemon already applies to session logs; there is no
+   mission-specific `RetentionClass`.
+3. **Concurrency per familiar root and project.** M0 allows one active mission per
+   familiar root in each project (fail-closed rule 8).
