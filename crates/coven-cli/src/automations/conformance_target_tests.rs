@@ -123,6 +123,7 @@ fn capability_advertises_the_native_structural_suites() {
                         "cancellation-timeout-arbitration",
                         "command-storage-lock-recovery",
                         "command-transaction-rollback",
+                        "legacy-import-source-preservation",
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
                         OVERLAP_FORBID_CLAIMING_SUITE,
