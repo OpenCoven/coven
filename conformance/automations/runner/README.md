@@ -259,7 +259,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eleven structural suites, ten
+The native Coven target currently implements eleven structural suites, eleven
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -397,3 +397,19 @@ This is audit-only evidence for command-adoption lock refusal and recovery.
 It does not certify process crashes, disk-full, I/O errors, corruption,
 permission loss, runtime dispatch, or release eligibility. The zero busy wait
 belongs only to the fixture connection; production deadlines are unchanged.
+
+The `command-storage-readonly-recovery` suite creates a private disposable store,
+seeds unrelated definition/adoption/event and authority records, then closes it.
+A fresh `SQLITE_OPEN_READ_ONLY` connection must refuse the production definition
+command with actual `SQLITE_READONLY`. The complete persisted projections must
+remain unchanged and the transaction must close. A fresh writable connection
+then retries the same key once; a second reopen must replay the exact result,
+event reference, revision, and first commit timestamp without further writes.
+A writable control exercises the same command without the refusal. Machine
+readable observations are included in the suite evidence.
+
+This is audit-only evidence for SQLite read-only mode. It does not prove OS
+permission loss, full-disk or I/O recovery, corruption tolerance, runtime
+execution, complete conformance profiles, or release eligibility. The fixture
+never opens an existing user store, launches a provider, or changes production
+connection permissions.
