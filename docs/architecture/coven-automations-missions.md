@@ -276,6 +276,31 @@ a clock and a transport, a command sequence produces exact responses and
 | SDK | A `CovenMissionsClient` with `submit`, `get`, `cancel` and `watch`, the projection types, and the client-side vectors (M-01, M-02, M-11, M-14). Designed in the SDK's companion design doc. |
 | Chat | chat#155 builds typed native commands on the CLI or SDK surface. It stores the mission's adoption key and id, which needs the storage design its `SECURITY.md` calls for. |
 
+### CLI output and exit status
+
+The `coven missions` commands are hidden from `coven --help`, like `coven automations`,
+because they are machine-facing. Each prints one JSON object per line on stdout:
+
+- **`submit --json <path|->`** wraps the payload in a `mission.submit.v1` envelope. The
+  envelope records the task statement as its intent and `cli` as its channel.
+  `--adoption-key` sets the idempotency key; without it, a UUID is generated. The command
+  prints the daemon's command response, `committed`, `replayed` or `rejected`, unchanged.
+- **`cancel <id>`** does the same for `mission.cancel.v1`, with an optional `--reason`.
+- **`get <id>`** prints the `MissionView`.
+- **`watch <id>`** prints each view whose `revision` increased, waiting `--interval-ms`
+  (default 1000) between reads, and returns after the first terminal view. A failed read
+  ends the watch; running it again resumes from the current view.
+
+Without `--json`, `get`, `cancel` and `watch` print one summary line instead.
+
+| Exit status | Meaning |
+| --- | --- |
+| 0 | `committed`, `replayed`, or a view was read |
+| 1 | The daemon refused the command (its response is printed), or nothing was sent: a bad payload, no running daemon, or a failed connection |
+| 3 | The request may have been applied and no answer proved it. The command prints `{"outcome":"unknown","command":…,"adoptionKey":…,"missionId":…}`; send it again with the same `--adoption-key` to learn the outcome |
+
+The CLI never resends on its own and never decides a mission's state.
+
 ## Milestones
 
 | Milestone | Delivers | Needs first |

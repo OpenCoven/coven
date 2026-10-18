@@ -66,6 +66,7 @@ mod main_session_start;
 mod maintenance_gate;
 mod memory_dashboard;
 mod memory_import;
+mod missions_cli;
 pub mod mobile_memory;
 mod observe;
 mod openclaw_repo;
@@ -818,6 +819,14 @@ Exit codes: 0 ok · 3 refused (JSON {refused, detail}) · 1 error")]
     Automations {
         #[command(subcommand)]
         command: AutomationsCommand,
+    },
+    #[command(
+        hide = true,
+        about = "Submit, read, watch and cancel one familiar mission on the running daemon"
+    )]
+    Missions {
+        #[command(subcommand)]
+        command: missions_cli::MissionsCommand,
     },
     #[command(about = "Inspect travel-mode handoff state (read-only)")]
     Travel {
@@ -1703,6 +1712,10 @@ fn main() -> Result<()> {
         {
             std::process::exit(1);
         }
+        // Mission commands print their result as JSON before choosing a status.
+        if let Some(exit) = error.downcast_ref::<missions_cli::MissionsExit>() {
+            std::process::exit(exit.0);
+        }
         if let Some(reset_error) = error.downcast_ref::<reset::ResetError>() {
             eprintln!("Error: {reset_error}");
             std::process::exit(reset_error.exit_code());
@@ -1943,6 +1956,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             SchedulerCommand::Loop { loop_id, json } => observe::run_scheduler_loop(&loop_id, json),
         },
         Some(Command::Automations { command }) => run_automations_command(command),
+        Some(Command::Missions { command }) => missions_cli::run(command),
         Some(Command::Travel { command }) => match command {
             TravelCommand::State {
                 client,
