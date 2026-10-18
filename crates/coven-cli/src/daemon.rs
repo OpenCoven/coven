@@ -4047,9 +4047,9 @@ fn recover_authenticated_status_for_stop(
             "could not authenticate the recovered Coven daemon identity; refusing to stop or start"
         );
     };
-    deadline.remaining("publishing recovered Coven daemon status")?;
+    deadline.remaining("publishing recovered Coven daemon status (before write)")?;
     write_status(coven_home, &status)?;
-    deadline.remaining("publishing recovered Coven daemon status")?;
+    deadline.remaining("publishing recovered Coven daemon status (after write)")?;
     Ok(Some(status))
 }
 
@@ -4137,9 +4137,9 @@ fn recover_missing_status_from_default_socket(
 
     if let Some(running) = controller.authenticated_running_status(coven_home, &status, deadline)? {
         deadline.remaining("verifying recovered Coven daemon health")?;
-        deadline.remaining("publishing recovered Coven daemon status")?;
+        deadline.remaining("publishing recovered Coven daemon status (before write)")?;
         write_status(coven_home, &running)?;
-        deadline.remaining("publishing recovered Coven daemon status")?;
+        deadline.remaining("publishing recovered Coven daemon status (after write)")?;
         return Ok(Some(DaemonStatusState::Running(running)));
     }
 
@@ -4326,9 +4326,9 @@ fn recover_corrupt_status_for_status_command(
     };
     if let Some(status) = recovered {
         deadline.remaining("verifying recovered Coven daemon health")?;
-        deadline.remaining("publishing recovered Coven daemon status")?;
+        deadline.remaining("publishing recovered Coven daemon status (before write)")?;
         write_status(coven_home, &status)?;
-        deadline.remaining("publishing recovered Coven daemon status")?;
+        deadline.remaining("publishing recovered Coven daemon status (after write)")?;
         return Ok(Some(DaemonStatusState::Running(status)));
     }
     if let Some(error) = unresolved_error {
