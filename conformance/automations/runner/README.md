@@ -188,6 +188,7 @@ The checked-in
 [`cancellation-timeout-arbitration.vectors.json`](cancellation-timeout-arbitration.vectors.json),
 [`command-adoption-idempotency.vectors.json`](command-adoption-idempotency.vectors.json),
 [`command-envelope-outcomes.vectors.json`](command-envelope-outcomes.vectors.json),
+[`command-transaction-rollback.vectors.json`](command-transaction-rollback.vectors.json),
 [`definition-lifecycle-transitions.vectors.json`](definition-lifecycle-transitions.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
@@ -259,7 +260,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eleven structural suites, eleven
+The native Coven target currently implements eleven structural suites, twelve
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -413,3 +414,20 @@ permission loss, full-disk or I/O recovery, corruption tolerance, runtime
 execution, complete conformance profiles, or release eligibility. The fixture
 never opens an existing user store, launches a provider, or changes production
 connection permissions.
+### Command transaction rollback audit
+
+`command-transaction-rollback` exercises the real definition-command transaction
+with rich v1 draft definitions in disposable file-backed stores. Mandatory cases
+inject SQLite trigger aborts at event insertion and final adoption insertion,
+plus an uninjected control. Each abort must leave zero definition, rich revision,
+event, stream-head and adoption rows, including after reopening and repeating the
+same request while the fault remains installed. Removing the trigger permits the
+same adoption key to commit; another reopen must replay the original result,
+revision, event reference and first-commit timestamp with exactly one durable
+record of each kind. The stored event must match the returned stream and sequence.
+
+These are deterministic transaction-abort probes. They do not prove process-kill
+recovery, disk-full, filesystem I/O/corruption, runtime authority, or release
+eligibility. The fixtures remain draft and launch no runtime. Invalid definitions,
+missing/duplicate fault cases, and weakened expected invariants are refused with
+static errors before executing any case.

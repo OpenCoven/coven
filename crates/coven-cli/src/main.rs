@@ -66,6 +66,7 @@ mod main_session_start;
 mod maintenance_gate;
 mod memory_dashboard;
 mod memory_import;
+mod missions_cli;
 pub mod mobile_memory;
 mod observe;
 mod openclaw_repo;
@@ -819,6 +820,14 @@ Exit codes: 0 ok · 3 refused (JSON {refused, detail}) · 1 error")]
         #[command(subcommand)]
         command: AutomationsCommand,
     },
+    #[command(
+        hide = true,
+        about = "Submit, read, watch and cancel one familiar mission on the running daemon"
+    )]
+    Missions {
+        #[command(subcommand)]
+        command: missions_cli::MissionsCommand,
+    },
     #[command(about = "Inspect travel-mode handoff state (read-only)")]
     Travel {
         #[command(subcommand)]
@@ -1138,6 +1147,31 @@ enum SchedulerCommand {
 
 #[derive(Subcommand, Debug)]
 enum AutomationsCommand {
+    #[command(
+        about = "Inspect scheduler leadership, last pass, and queue through the local daemon"
+    )]
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one occurrence and its bounded run history")]
+    Occurrence {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one run without raw logs or private failure text")]
+    Run {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one run's attempts, fences, and retry classifications")]
+    Attempts {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Expose the native conformance target protocol")]
     Conformance {
         #[command(subcommand)]
@@ -1603,6 +1637,10 @@ fn main() -> Result<()> {
         &cli.command,
         Some(Command::Automations {
             command: AutomationsCommand::Conformance { .. }
+                | AutomationsCommand::Status { .. }
+                | AutomationsCommand::Occurrence { .. }
+                | AutomationsCommand::Run { .. }
+                | AutomationsCommand::Attempts { .. }
         })
     ) || matches!(
         &cli.command,
@@ -1673,6 +1711,10 @@ fn main() -> Result<()> {
             .is_some()
         {
             std::process::exit(1);
+        }
+        // Mission commands print their result as JSON before choosing a status.
+        if let Some(exit) = error.downcast_ref::<missions_cli::MissionsExit>() {
+            std::process::exit(exit.0);
         }
         if let Some(reset_error) = error.downcast_ref::<reset::ResetError>() {
             eprintln!("Error: {reset_error}");
@@ -1914,6 +1956,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             SchedulerCommand::Loop { loop_id, json } => observe::run_scheduler_loop(&loop_id, json),
         },
         Some(Command::Automations { command }) => run_automations_command(command),
+        Some(Command::Missions { command }) => missions_cli::run(command),
         Some(Command::Travel { command }) => match command {
             TravelCommand::State {
                 client,
@@ -4036,7 +4079,12 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
 }
 
 fn run_automations_command(command: AutomationsCommand) -> Result<()> {
+    use automations::operator_cli::{run, View};
     match command {
+        AutomationsCommand::Status { json } => run(View::Status, json),
+        AutomationsCommand::Occurrence { id, json } => run(View::Occurrence(&id), json),
+        AutomationsCommand::Run { id, json } => run(View::Run(&id), json),
+        AutomationsCommand::Attempts { run_id, json } => run(View::Attempts(&run_id), json),
         AutomationsCommand::Conformance { command } => match command {
             AutomationsConformanceCommand::Capability => {
                 println!(

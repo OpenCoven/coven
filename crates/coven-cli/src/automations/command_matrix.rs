@@ -18,8 +18,10 @@ pub enum CommandSupport {
     // the category stays for a command whose legacy action outlives it.
     #[allow(dead_code)]
     CompatibilityOnly { legacy_action: &'static str },
-    /// Refused; nothing in this producer performs it yet. `mission.cancel.v1`
-    /// (#1313) is in the contract ahead of its implementation.
+    /// Refused; nothing in this producer performs it yet. No command is
+    /// unsupported since `mission.cancel.v1` landed; the category stays for a
+    /// command added to the contract ahead of its implementation.
+    #[allow(dead_code)]
     Unsupported,
 }
 
@@ -55,7 +57,7 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
     entry("legacy.import.v1", Implemented),
     entry("mission.submit.v1", Implemented),
     entry("mission.get.v1", Implemented),
-    entry("mission.cancel.v1", Unsupported),
+    entry("mission.cancel.v1", Implemented),
 ];
 
 /// Versioned read actions this producer adds outside the command enum. They
@@ -171,7 +173,7 @@ mod tests {
                 entry.command
             );
         }
-        assert!(refused_command("coven.automations.mission.cancel.v1").is_some());
+        assert!(refused_command("coven.automations.mission.cancel.v1").is_none());
         assert!(refused_command("coven.automations.definition.revise.v1").is_none());
         assert!(refused_command("coven.automations.update").is_none());
         assert!(refused_command("attempt.retry.v1").is_none());

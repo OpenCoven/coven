@@ -1726,7 +1726,11 @@ fn session_harness_can_acquire_maintenance_against_its_own_writer() -> anyhow::R
     let generation = acquired["owner"]["generation"]
         .as_str()
         .context("participant owner generation")?;
-    fs::write(&participant_generation, format!("{generation}\n"))?;
+    // The fake harness uses this path's existence as its readiness signal.
+    // Publish only after writing, so it cannot read an empty generation.
+    let pending_generation = participant_generation.with_extension("pending");
+    fs::write(&pending_generation, format!("{generation}\n"))?;
+    fs::rename(&pending_generation, &participant_generation)?;
 
     let participant_output = participant_thread
         .join()
