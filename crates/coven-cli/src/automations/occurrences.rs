@@ -42,6 +42,14 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_automation_occurrences_history
         ON automation_occurrences(automation_id, (substr(scheduled_for, 1, 19) || '.' || substr(rtrim(substr(scheduled_for, 21), 'Z') || '000000000', 1, 9) || 'Z') DESC, id DESC);
 
+    -- Lease inspection pages only current metadata, without scanning history.
+    CREATE INDEX IF NOT EXISTS idx_automation_occurrences_leases
+        ON automation_occurrences(id)
+        WHERE lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_automation_occurrences_leases_by_automation
+        ON automation_occurrences(automation_id, id)
+        WHERE lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL;
+
     CREATE INDEX IF NOT EXISTS idx_automation_occurrences_state
         ON automation_occurrences(state, lease_expires_at);
 

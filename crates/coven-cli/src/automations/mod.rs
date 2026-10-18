@@ -33,8 +33,11 @@ pub mod health;
 pub mod import_legacy;
 pub mod inspection;
 pub mod leadership;
+pub(crate) mod lease_cli;
+pub(crate) mod leases;
 pub mod missions;
 pub mod occurrences;
+pub(crate) mod operator_cli;
 // Owner grants: production records them; the trusted adapter (coven#857 slice 6)
 // is their only reader, so the resolver has no production caller yet.
 #[allow(dead_code)]

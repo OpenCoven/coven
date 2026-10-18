@@ -435,6 +435,27 @@ fi
 }
 
 #[test]
+fn daemon_start_names_a_coven_home_too_long_for_its_socket() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    // Longer than any platform's Unix socket limit once `/coven.sock` is added.
+    let coven_home = temp.path().canonicalize()?.join("h".repeat(120));
+    fs::create_dir(&coven_home)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let output = run_coven(&coven_bin(), &coven_home, &path, &["daemon", "start"])?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("but Unix sockets on this platform allow at most")
+            && stderr.contains("set COVEN_HOME to a shorter directory"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("timed out waiting"), "{stderr}");
+    // The pre-flight refusal, not the startup-health timeout: no daemon ran.
+    assert!(!coven_home.join("daemon.json").exists());
+    Ok(())
+}
+
+#[test]
 fn managed_daemon_identity_matches_health_across_restart_and_stop() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -1726,7 +1747,11 @@ fn session_harness_can_acquire_maintenance_against_its_own_writer() -> anyhow::R
     let generation = acquired["owner"]["generation"]
         .as_str()
         .context("participant owner generation")?;
-    fs::write(&participant_generation, format!("{generation}\n"))?;
+    // The fake harness uses this path's existence as its readiness signal.
+    // Publish only after writing, so it cannot read an empty generation.
+    let pending_generation = participant_generation.with_extension("pending");
+    fs::write(&pending_generation, format!("{generation}\n"))?;
+    fs::rename(&pending_generation, &participant_generation)?;
 
     let participant_output = participant_thread
         .join()

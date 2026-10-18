@@ -398,6 +398,9 @@ fn result_notice_text(conn: &Connection, run: &RunRecord) -> Result<String> {
     Ok(text)
 }
 
+/// Why an unsuccessful run ended. The occurrence carries the final reason;
+/// the last attempt's reason is added when it differs, as it does for a run
+/// held for an operator retry that then reached its deadline.
 fn failure_reason(conn: &Connection, run: &RunRecord) -> Result<Option<String>> {
     let attempt: Option<String> = conn
         .query_row(
@@ -409,21 +412,25 @@ fn failure_reason(conn: &Connection, run: &RunRecord) -> Result<Option<String>> 
         .optional()
         .context("failed to read the run's attempt reason")?
         .flatten();
-    if attempt.is_some() {
-        return Ok(attempt);
-    }
-    let Some(occurrence_id) = &run.occurrence_id else {
-        return Ok(None);
+    let occurrence: Option<String> = match &run.occurrence_id {
+        Some(occurrence_id) => conn
+            .query_row(
+                "SELECT failure_reason FROM automation_occurrences WHERE id = ?1",
+                [occurrence_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read the run's occurrence reason")?
+            .flatten(),
+        None => None,
     };
-    Ok(conn
-        .query_row(
-            "SELECT failure_reason FROM automation_occurrences WHERE id = ?1",
-            [occurrence_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("failed to read the run's occurrence reason")?
-        .flatten())
+    Ok(match (occurrence, attempt) {
+        (Some(occurrence), Some(attempt)) if occurrence != attempt => {
+            Some(format!("{occurrence}. Last attempt: {attempt}"))
+        }
+        (Some(occurrence), _) => Some(occurrence),
+        (None, attempt) => attempt,
+    })
 }
 
 /// `text` cut to at most `max` bytes on a character boundary, marked when cut.
@@ -1141,6 +1148,33 @@ pub(crate) mod tests {
             REASON_MAX_BYTES + "…".len()
         );
         assert_eq!(bounded("short", REASON_MAX_BYTES), "short");
+    }
+
+    #[test]
+    fn an_expired_retry_hold_reports_its_final_reason() {
+        let f = fixture();
+        let nightly = routine("nightly", main_session());
+        insert_definition(&f.conn, &nightly).unwrap();
+        let (run_id, finished_at) = launched_run(&f, &nightly, "boom", "failed", Some(1));
+        // A plain failure before the deadline holds the run for a retry...
+        settle_finished_runs(&f.conn, finished_at).unwrap();
+        assert_eq!(run(&f.conn, &run_id).status, "running");
+        assert_eq!(run(&f.conn, &run_id).delivery, None);
+        // ...and settles failed once the deadline passes with none opened.
+        let after_deadline = finished_at + chrono::Duration::minutes(31);
+        settle_finished_runs(&f.conn, after_deadline).unwrap();
+        assert_eq!(run(&f.conn, &run_id).status, "failed");
+
+        deliver_pending_results(&f.home, &f.conn, None, after_deadline).unwrap();
+        let notice = &notices_for(&f.conn, &run_id)[0];
+        assert!(
+            notice.text.contains(
+                "\nReason: no operator retry was opened before the run's deadline. \
+                 Last attempt: session failed (exit code 1)"
+            ),
+            "{}",
+            notice.text
+        );
     }
 
     /// A runtime that hosts Home as a stream session and records every turn
