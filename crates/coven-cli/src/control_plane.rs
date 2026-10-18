@@ -697,6 +697,7 @@ pub(crate) fn route_action_at(
                 Ok(crate::automations::cancel_commands::CancelExecution::Success {
                     payload: result,
                     replayed,
+                    ..
                 }) => (
                     200,
                     ControlActionResponse {
@@ -739,6 +740,7 @@ pub(crate) fn route_action_at(
                 Ok(crate::automations::cancel_commands::CancelExecution::Success {
                     payload: result,
                     replayed,
+                    ..
                 }) => (
                     200,
                     ControlActionResponse {
