@@ -262,7 +262,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eleven structural suites, twelve
+The native Coven target currently implements eleven structural suites, thirteen
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -438,3 +438,21 @@ platform containment, complete profiles or release eligibility. The daemon
 receives an isolated home and no provider environment. The runner uses a short
 owned scratch path on macOS for Unix sockets and a separate fixture hang guard;
 production startup and maintenance deadlines are unchanged.
+
+## Command SQLite capacity audit boundary
+
+The `command-storage-capacity-recovery` suite initializes a disposable file-backed
+store, seeds an unrelated definition, then caps SQLite `max_page_count` at the
+current page count. A bounded synthetic 128 KiB prompt forces page growth through
+the production definition-command API. The fault case requires actual
+`rusqlite::ErrorCode::DiskFull` (`SQLITE_FULL`); the other case is unconstrained.
+The fault source is `sqlite_max_page_count`. This does not cover physical disk
+exhaustion, permission loss, I/O errors or corruption. No runtime is launched.
+
+Private snapshots compare every row in definitions, rich revisions, owner
+principal/grants, command adoptions/reservations and events after failure. The
+fixture lifts its quota, retries the same command/key, checks one added
+definition/adoption/event, reopens the store and requires stable replay without
+additional writes. Synthetic payloads and database snapshots remain internal.
+Unsupported fixture conditions and malformed vectors fail with static errors.
+This remains `audit_only`; it supplies no production release eligibility.

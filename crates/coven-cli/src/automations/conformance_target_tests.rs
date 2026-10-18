@@ -124,6 +124,7 @@ fn capability_advertises_the_native_structural_suites() {
                         "command-storage-lock-recovery",
                         "command-transaction-rollback",
                         "legacy-import-source-preservation",
+                        "command-storage-capacity-recovery",
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
                         OVERLAP_FORBID_CLAIMING_SUITE,
@@ -2075,5 +2076,66 @@ fn transaction_rollback_suite_rejects_invalid_inputs_before_execution() {
             .unwrap_err(),
             "conformance vector is invalid"
         );
+    }
+}
+
+fn storage_capacity_request() -> Value {
+    request_for_profile(
+        "scheduler_reliability",
+        "command-storage-capacity-recovery",
+        serde_json::from_str(include_str!(
+            "../../../../conformance/automations/runner/command-storage-capacity-recovery.vectors.json"
+        ))
+        .unwrap(),
+    )
+}
+
+#[test]
+fn storage_capacity_suite_executes_real_quota_and_unbounded_control() {
+    let response = evaluate(&storage_capacity_request()).unwrap();
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+}
+
+#[test]
+fn storage_capacity_suite_rejects_missing_control_and_duplicate_cases() {
+    let mut missing = storage_capacity_request();
+    missing["vector"]["cases"].as_array_mut().unwrap().pop();
+    assert_eq!(
+        evaluate(&missing).unwrap_err(),
+        "conformance vector is invalid"
+    );
+    let mut duplicate = storage_capacity_request();
+    duplicate["vector"]["cases"][1] = duplicate["vector"]["cases"][0].clone();
+    assert_eq!(
+        evaluate(&duplicate).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn storage_capacity_suite_rejects_weakened_invariant_expectations() {
+    for case_index in 0..2 {
+        for (field, wrong) in [
+            ("initialRows", json!(3)),
+            ("finalRows", json!(2)),
+            ("replayPreserved", json!(false)),
+            ("baselinePreserved", json!(false)),
+            (
+                "initialOutcome",
+                json!(if case_index == 0 {
+                    "committed"
+                } else {
+                    "disk_full"
+                }),
+            ),
+        ] {
+            let mut request = storage_capacity_request();
+            request["vector"]["cases"][case_index]["expected"][field] = wrong;
+            assert_eq!(
+                evaluate(&request).unwrap_err(),
+                "conformance vector is invalid",
+                "case {case_index}: {field}"
+            );
+        }
     }
 }
