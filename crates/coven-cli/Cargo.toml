@@ -94,7 +94,7 @@ p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 qrcode = { version = "0.14", default-features = false }
 # Event replay uses SQLite 3.43+'s metadata-only octet_length() path before
 # loading payloads. Keep SQLite bundled so the locked library version provides it.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 serde_jcs = "0.2"

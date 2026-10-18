@@ -1,0 +1,109 @@
+{
+  "schemaVersion": "coven.automations.command-process-crash-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "command-crash-after-definition",
+      "boundary": "after_definition",
+      "adoptionKey": "adopt:process-crash:0001",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "promptBytes": 131072,
+      "expected": {
+        "initialOutcome": "terminated",
+        "baselinePreserved": true,
+        "integrityOk": true,
+        "finalRows": 1,
+        "replayPreserved": true
+      }
+    },
+    {
+      "caseId": "command-crash-after-event",
+      "boundary": "after_event",
+      "adoptionKey": "adopt:process-crash:0001",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "promptBytes": 131072,
+      "expected": {
+        "initialOutcome": "terminated",
+        "baselinePreserved": true,
+        "integrityOk": true,
+        "finalRows": 1,
+        "replayPreserved": true
+      }
+    },
+    {
+      "caseId": "command-crash-after-adoption",
+      "boundary": "after_adoption",
+      "adoptionKey": "adopt:process-crash:0001",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "promptBytes": 131072,
+      "expected": {
+        "initialOutcome": "terminated",
+        "baselinePreserved": true,
+        "integrityOk": true,
+        "finalRows": 1,
+        "replayPreserved": true
+      }
+    },
+    {
+      "caseId": "command-crash-none",
+      "boundary": "none",
+      "adoptionKey": "adopt:process-crash:0001",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "promptBytes": 131072,
+      "expected": {
+        "initialOutcome": "committed",
+        "baselinePreserved": true,
+        "integrityOk": true,
+        "finalRows": 1,
+        "replayPreserved": true
+      }
+    }
+  ]
+}
