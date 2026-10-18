@@ -2648,9 +2648,14 @@ static OPTIONAL_DIAGNOSTIC_DELAY_MILLIS: std::sync::atomic::AtomicU64 =
 fn optional_diagnostic_test_delay() {
     #[cfg(test)]
     {
+        // Poll rather than sleep once, so a test's reset ends the injected
+        // delay instead of leaving a detached worker asleep past its test.
         let delay = OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.load(std::sync::atomic::Ordering::SeqCst);
-        if delay != 0 {
-            std::thread::sleep(Duration::from_millis(delay));
+        let until = Instant::now() + Duration::from_millis(delay);
+        while Instant::now() < until
+            && OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.load(std::sync::atomic::Ordering::SeqCst) != 0
+        {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -7612,9 +7617,14 @@ mod tests {
         };
         write_status(temp_dir.path(), &status)?;
         let started = std::sync::Arc::new(std::sync::Mutex::new(0));
-        OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.store(500, std::sync::atomic::Ordering::SeqCst);
+        // The restart deadline is a budget handed to the code under test, so
+        // it must leave the mandatory work (stop, start, recording the startup
+        // budget) room under load: at 100ms that work alone could exhaust it
+        // and fail the restart before this test's question was asked
+        // (coven#1333). The injected delay stays well past the deadline.
+        OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.store(5_000, std::sync::atomic::Ordering::SeqCst);
         let _delay_guard = DiagnosticDelayGuard;
-        let deadline = LifecycleDeadline::after(Duration::from_millis(100))?;
+        let deadline = LifecycleDeadline::after(Duration::from_secs(1))?;
         let started_at = Instant::now();
 
         let restarted = restart_background_server_with_controllers_until(
@@ -7636,13 +7646,13 @@ mod tests {
         )?;
 
         assert!(restarted.0);
-        // The injected diagnostic delay is 500ms and the restart deadline is
-        // 100ms, so any bound strictly between them proves the scan did not
-        // block. 250ms sat close to the fast path; 400ms keeps the same signal
-        // with more room for jitter.
+        // A discriminating threshold: restart returns by its 1s deadline when
+        // the optional scan does not block, and not before 5s when it does.
+        // The bound sits near the midpoint so jitter cannot cross it.
+        let elapsed = started_at.elapsed();
         assert!(
-            started_at.elapsed() < Duration::from_millis(400),
-            "optional diagnostic scan delayed restart completion"
+            elapsed < Duration::from_secs(3),
+            "optional diagnostic scan delayed restart completion: {elapsed:?}"
         );
         Ok(())
     }
