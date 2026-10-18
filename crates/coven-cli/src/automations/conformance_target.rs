@@ -29,6 +29,7 @@ use super::runs::{
 };
 
 mod command_envelope_outcomes;
+mod command_storage_capacity_recovery;
 mod command_storage_lock_recovery;
 mod command_transaction_rollback;
 mod legacy_import_source_preservation;
@@ -95,6 +96,7 @@ pub const CANCELLATION_TIMEOUT_ARBITRATION_SUITE: &str = "cancellation-timeout-a
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
 pub const COMMAND_TRANSACTION_ROLLBACK_SUITE: &str = "command-transaction-rollback";
+pub const COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE: &str = "command-storage-capacity-recovery";
 pub const COMMAND_STORAGE_LOCK_RECOVERY_SUITE: &str = "command-storage-lock-recovery";
 pub const COMMAND_ENVELOPE_OUTCOMES_SUITE: &str = "command-envelope-outcomes";
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
@@ -1562,6 +1564,7 @@ pub fn capability() -> TargetCapability {
                     COMMAND_STORAGE_LOCK_RECOVERY_SUITE,
                     COMMAND_TRANSACTION_ROLLBACK_SUITE,
                     LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE,
+                    COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE,
                     MISFIRE_LATEST_PLANNING_SUITE,
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
                     OVERLAP_FORBID_CLAIMING_SUITE,
@@ -1626,6 +1629,15 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, CANCELLATION_TIMEOUT_ARBITRATION_SUITE) => {
             evaluate_cancellation_timeout_arbitration(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                command_storage_capacity_recovery::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
         }
         (SCHEDULER_RELIABILITY_PROFILE, COMMAND_STORAGE_LOCK_RECOVERY_SUITE) => {
             command_storage_lock_recovery::evaluate(&request.vector)?
