@@ -2468,7 +2468,9 @@ mod tests {
     fn stored_output_target_definition_is_not_planned() {
         let (_temp, conn) = temp_store();
         let mut routine = definition("legacy-output", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
-        routine.output_target = Some("result.md".to_string());
+        routine.output_target = Some(crate::automations::definition::OutputTarget::Uncertified(
+            serde_json::json!("result.md"),
+        ));
         insert_definition(&conn, &routine).unwrap();
 
         let report = tick_planning(&conn, real_now()).unwrap();
@@ -2483,7 +2485,9 @@ mod tests {
         let (_temp, conn) = temp_store();
         let valid = definition("valid", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
         let mut invalid = definition("invalid", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
-        invalid.output_target = Some("result.md".to_string());
+        invalid.output_target = Some(crate::automations::definition::OutputTarget::Uncertified(
+            serde_json::json!("result.md"),
+        ));
         insert_definition(&conn, &valid).unwrap();
         insert_definition(&conn, &invalid).unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 8, 28, 8, 0, 0).unwrap();

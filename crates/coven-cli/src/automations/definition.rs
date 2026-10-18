@@ -248,6 +248,169 @@ impl RoutineAuthority {
     }
 }
 
+/// One requirement of the atomic delivery bar (coven#1179). `outputTarget`
+/// may name a target only after that target has a proving test for every
+/// criterion, recorded in [`CERTIFIED_OUTPUT_TARGETS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryCriterion {
+    Pinned,
+    CommittedWithSettlement,
+    ExactlyOnce,
+    ExplicitFailure,
+    Attributed,
+    Observable,
+}
+
+impl DeliveryCriterion {
+    pub const ALL: [Self; 6] = [
+        Self::Pinned,
+        Self::CommittedWithSettlement,
+        Self::ExactlyOnce,
+        Self::ExplicitFailure,
+        Self::Attributed,
+        Self::Observable,
+    ];
+
+    /// The requirement as written. This text is the certification bar: the
+    /// certification test reads it and the API contract cites it, so only
+    /// non-test builds see it unused.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn requirement(self) -> &'static str {
+        match self {
+            Self::Pinned => {
+                "Delivery reads its target from the run's pinned definition revision, never the \
+                 live definition, so revising or deleting a routine cannot redirect or drop a \
+                 settled run's result."
+            }
+            Self::CommittedWithSettlement => {
+                "The run's terminal status and its delivery obligation commit in one store \
+                 transaction, on every terminal path, so no crash leaves a finished run that \
+                 asked for delivery without a recorded obligation."
+            }
+            Self::ExactlyOnce => {
+                "One store transaction writes the delivered artifact and records `delivered` with \
+                 that artifact's id; a replay after a crash at any point converges on exactly one \
+                 artifact."
+            }
+            Self::ExplicitFailure => {
+                "A delivery that cannot be made records `failed` with a reason, instead of \
+                 retrying forever or disappearing."
+            }
+            Self::Attributed => {
+                "The artifact names the run (and its receipt, when one exists) as its source, \
+                 and its text is framed as untrusted runtime output, never as a user or system \
+                 instruction."
+            }
+            Self::Observable => {
+                "The delivery state, including the artifact id or failure reason, is readable \
+                 from `automation_runs` through the run API."
+            }
+        }
+    }
+}
+
+/// A target that has cleared the atomic delivery bar, with the test that
+/// proves each criterion. Proof names are test functions in
+/// `automations/delivery.rs`; a unit test checks that every one exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryCertification {
+    pub kind: OutputTargetKind,
+    pub proofs: &'static [(DeliveryCriterion, &'static str)],
+}
+
+pub const CERTIFIED_OUTPUT_TARGETS: &[DeliveryCertification] = &[DeliveryCertification {
+    kind: OutputTargetKind::MainSession,
+    proofs: &[
+        (
+            DeliveryCriterion::Pinned,
+            "delivery_follows_the_pinned_definition_not_a_later_revision",
+        ),
+        (
+            DeliveryCriterion::CommittedWithSettlement,
+            "every_terminal_path_records_the_obligation_with_the_run_status",
+        ),
+        (
+            DeliveryCriterion::CommittedWithSettlement,
+            "a_rolled_back_settlement_leaves_no_obligation",
+        ),
+        (
+            DeliveryCriterion::ExactlyOnce,
+            "a_replayed_delivery_converges_on_one_notice",
+        ),
+        (
+            DeliveryCriterion::ExactlyOnce,
+            "a_failed_discharge_rolls_back_the_notice_with_the_record",
+        ),
+        (
+            DeliveryCriterion::ExplicitFailure,
+            "an_undeliverable_result_records_failed_with_a_reason",
+        ),
+        (
+            DeliveryCriterion::Attributed,
+            "the_notice_names_the_run_and_receipt_and_is_framed_as_untrusted",
+        ),
+        (
+            DeliveryCriterion::Observable,
+            "the_result_reaches_the_next_main_session_turn_and_the_run_says_so",
+        ),
+    ],
+}];
+
+/// Kinds of certified output target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputTargetKind {
+    /// The instance main session's notice inbox (coven#1178).
+    MainSession,
+}
+
+impl OutputTargetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MainSession => "main-session",
+        }
+    }
+
+    /// Certified means listed with a proof for every criterion of the bar,
+    /// so a target with a missing proof is refused rather than half-trusted.
+    pub fn is_certified(self) -> bool {
+        CERTIFIED_OUTPUT_TARGETS.iter().any(|certification| {
+            certification.kind == self
+                && DeliveryCriterion::ALL.iter().all(|criterion| {
+                    certification
+                        .proofs
+                        .iter()
+                        .any(|(proved, _)| proved == criterion)
+                })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CertifiedOutputTarget {
+    pub kind: OutputTargetKind,
+}
+
+/// Where a settled run's result is delivered. A value that is not a
+/// certified target, including the legacy file-path string, is kept verbatim
+/// so validation can refuse it rather than fail to parse it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OutputTarget {
+    Certified(CertifiedOutputTarget),
+    Uncertified(Value),
+}
+
+impl OutputTarget {
+    pub fn certified(&self) -> Option<CertifiedOutputTarget> {
+        match self {
+            Self::Certified(target) => Some(*target),
+            Self::Uncertified(_) => None,
+        }
+    }
+}
+
 /// A validated routine definition. Serialized to `definition_json` in the
 /// store with camelCase keys, mirroring the control-plane wire style.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,10 +435,10 @@ pub struct RoutineDefinition {
     pub familiar_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Reserved output delivery field. Validation refuses it until delivery
-    /// has a pinned definition revision and crash-recoverable commit protocol.
+    /// Where each settled run's result is delivered. Validation accepts only
+    /// targets in [`CERTIFIED_OUTPUT_TARGETS`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_target: Option<String>,
+    pub output_target: Option<OutputTarget>,
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -406,10 +569,17 @@ impl RoutineDefinition {
                 return Err("familiarId must be 1..=64 characters".to_string());
             }
         }
-        if self.output_target.is_some() {
-            return Err(
-                "outputTarget is not supported until atomic delivery is certified".to_string(),
-            );
+        if let Some(target) = &self.output_target {
+            let certified = target
+                .certified()
+                .is_some_and(|target| target.kind.is_certified());
+            // The refused value is not echoed: it may carry a private path.
+            if !certified {
+                return Err(
+                    "outputTarget is not supported until atomic delivery is certified; the only certified target is {\"kind\":\"main-session\"}"
+                        .to_string(),
+                );
+            }
         }
         if let Some(authority) = &self.authority {
             authority.validate()?;
@@ -622,13 +792,76 @@ mod tests {
 
     #[test]
     fn rejects_output_target_until_atomic_delivery_is_certified() {
+        for target in [
+            json!("result.md"),
+            json!({"kind": "file", "path": "~/private/notes.md"}),
+            json!({"kind": "main-session", "scope": "familiar:cody:main"}),
+            json!({"kind": "Main-Session"}),
+            json!({"private": "value"}),
+            json!(7),
+        ] {
+            let mut value = valid_definition();
+            value["outputTarget"] = target.clone();
+            let error = RoutineDefinition::from_json(&value).unwrap_err();
+            assert!(
+                error.contains("outputTarget is not supported"),
+                "{target}: {error}"
+            );
+            assert!(
+                !error.contains("private"),
+                "the refused value is not echoed: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_the_certified_main_session_target() {
         let mut value = valid_definition();
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("outputTarget".to_string(), json!("result.md"));
-        let error = RoutineDefinition::from_json(&value).unwrap_err();
-        assert!(error.contains("outputTarget is not supported"), "{error}");
+        value["outputTarget"] = json!({"kind": "main-session"});
+        let definition = RoutineDefinition::from_json(&value).unwrap();
+        assert_eq!(
+            definition.output_target,
+            Some(OutputTarget::Certified(CertifiedOutputTarget {
+                kind: OutputTargetKind::MainSession
+            }))
+        );
+        assert_eq!(
+            serde_json::to_value(&definition).unwrap()["outputTarget"],
+            json!({"kind": "main-session"})
+        );
+        // An explicit null is no target, so stored legacy JSON keeps parsing.
+        value["outputTarget"] = Value::Null;
+        assert_eq!(
+            RoutineDefinition::from_json(&value).unwrap().output_target,
+            None
+        );
+    }
+
+    /// The bar is enforced, not just written: every certified target names a
+    /// proof for every criterion, and every named proof is a real test.
+    #[test]
+    fn every_certified_target_proves_every_delivery_criterion() {
+        let proofs = include_str!("delivery.rs");
+        assert!(!CERTIFIED_OUTPUT_TARGETS.is_empty());
+        for certification in CERTIFIED_OUTPUT_TARGETS {
+            for criterion in DeliveryCriterion::ALL {
+                assert!(!criterion.requirement().is_empty());
+                assert!(
+                    certification
+                        .proofs
+                        .iter()
+                        .any(|(proved, _)| *proved == criterion),
+                    "{:?} has no proof for {criterion:?}",
+                    certification.kind
+                );
+            }
+            for (criterion, test) in certification.proofs {
+                assert!(
+                    proofs.contains(&format!("#[test]\n    fn {test}()")),
+                    "{criterion:?} names `{test}`, which is not a test in delivery.rs"
+                );
+            }
+        }
     }
 
     #[test]

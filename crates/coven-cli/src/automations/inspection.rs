@@ -48,6 +48,7 @@ pub struct RunInspection {
     pub started_at: String,
     pub timeout_at: Option<String>,
     pub finished_at: Option<String>,
+    pub delivery: Option<super::runs::RunDelivery>,
     pub attempts: Vec<AttemptInspection>,
 }
 
@@ -370,7 +371,9 @@ fn run_columns() -> String {
         "id, automation_id, automation_revision,
          {digest} AS definition_digest, occurrence_id,
          authority_profile, receipt_id, session_id, familiar_id, runtime, status,
-         exit_code, log_json, output_commit, started_at, timeout_at, finished_at",
+         exit_code, log_json, output_commit, started_at, timeout_at, finished_at,
+         delivery_target, delivery_state, delivery_notice_id, delivery_reason,
+         delivery_recorded_at",
         digest = super::rich_definition::published_digest_sql("automation_runs"),
     )
 }
@@ -424,6 +427,7 @@ fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunInspectio
         started_at: row.get(14)?,
         timeout_at: row.get(15)?,
         finished_at: row.get(16)?,
+        delivery: super::runs::run_delivery_from_row(row, 17)?,
         attempts: Vec::new(),
     })
 }

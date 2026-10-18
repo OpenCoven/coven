@@ -551,6 +551,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::automations::runs::AUTOMATION_RUNS_SCHEMA_SQL)
         .context("failed to initialize automation_runs schema")?;
     crate::automations::runs::ensure_timeout_column(conn)?;
+    crate::automations::runs::ensure_delivery_columns(conn)?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_ATTEMPTS_SCHEMA_SQL)
         .context("failed to initialize automation attempts and retry state schema")?;
     crate::automations::runs::ensure_authority_columns(conn)?;

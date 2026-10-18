@@ -431,6 +431,26 @@ fn reconcile_automation_runs(
         crate::daemon::append_daemon_recovery_log(coven_home, &failure);
     }
     super::runner::settle_finished_runs(conn, now).map_err(anyhow::Error::msg)?;
+    // Settlement committed each run's delivery obligation with its terminal
+    // status; discharge them into the main-session inbox (coven#1179). An
+    // error leaves the obligations pending for the next tick.
+    match super::delivery::deliver_pending_results(coven_home, conn, Some(runtime), now) {
+        Ok(delivery) => {
+            for (run_id, reason) in &delivery.failed {
+                crate::daemon::append_daemon_recovery_log(
+                    coven_home,
+                    &format!("automation run `{run_id}` result was not delivered: {reason}"),
+                );
+            }
+            for warning in &delivery.warnings {
+                crate::daemon::append_daemon_recovery_log(coven_home, warning);
+            }
+        }
+        Err(error) => crate::daemon::append_daemon_recovery_log(
+            coven_home,
+            &format!("automation result delivery deferred: {error:#}"),
+        ),
+    }
     super::runner::cleanup_terminal_containment_receipts(coven_home, conn)
         .map_err(anyhow::Error::msg)?;
     Ok(())

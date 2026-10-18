@@ -1919,23 +1919,21 @@ fn automation_occurrence_get_payload(
     conn: &rusqlite::Connection,
     id: &str,
 ) -> Result<Value, String> {
-    crate::automations::inspection::inspect_occurrence(conn, id)
-        .map(|inspection| {
-            let Some(inspection) = inspection else {
-                return json!({ "occurrence": null });
-            };
-            let mut occurrence = automation_occurrence_value(inspection.occurrence);
-            occurrence["runsTruncated"] = json!(inspection.runs_truncated);
-            occurrence["runs"] = Value::Array(
-                inspection
-                    .runs
-                    .into_iter()
-                    .map(automation_run_value)
-                    .collect(),
-            );
-            json!({ "occurrence": occurrence })
-        })
-        .map_err(|error| format!("{error:#}"))
+    let inspection = crate::automations::inspection::inspect_occurrence(conn, id)
+        .map_err(|error| format!("{error:#}"))?;
+    let Some(inspection) = inspection else {
+        return Ok(json!({ "occurrence": null }));
+    };
+    let mut occurrence = automation_occurrence_value(inspection.occurrence);
+    occurrence["runsTruncated"] = json!(inspection.runs_truncated);
+    occurrence["runs"] = Value::Array(
+        inspection
+            .runs
+            .into_iter()
+            .map(|run| automation_run_value(conn, run))
+            .collect::<Result<_, _>>()?,
+    );
+    Ok(json!({ "occurrence": occurrence }))
 }
 
 fn automation_occurrence_history_payload(
@@ -1969,12 +1967,29 @@ fn automation_occurrence_history_payload(
 }
 
 fn automation_run_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
-    crate::automations::inspection::inspect_run(conn, id)
-        .map(|run| json!({ "run": run.map(automation_run_value) }))
+    let run = crate::automations::inspection::inspect_run(conn, id)
+        .map_err(|error| format!("{error:#}"))?
+        .map(|run| automation_run_value(conn, run))
+        .transpose()?;
+    Ok(json!({ "run": run }))
+}
+
+/// The optional `delivery` member of a run projection (coven#1179).
+fn run_delivery_value(
+    conn: &rusqlite::Connection,
+    delivery: Option<&crate::automations::runs::RunDelivery>,
+) -> Result<Option<Value>, String> {
+    delivery
+        .map(|delivery| crate::automations::delivery::delivery_value(conn, delivery))
+        .transpose()
         .map_err(|error| format!("{error:#}"))
 }
 
-fn automation_run_value(run: crate::automations::inspection::RunInspection) -> Value {
+fn automation_run_value(
+    conn: &rusqlite::Connection,
+    run: crate::automations::inspection::RunInspection,
+) -> Result<Value, String> {
+    let delivery = run_delivery_value(conn, run.delivery.as_ref())?;
     let attempts = run
         .attempts
         .into_iter()
@@ -2000,7 +2015,7 @@ fn automation_run_value(run: crate::automations::inspection::RunInspection) -> V
             })
         })
         .collect::<Vec<_>>();
-    json!({
+    let mut value = json!({
         "id": run.id,
         "automationId": run.automation_id,
         "automationRevision": run.automation_revision,
@@ -2019,7 +2034,11 @@ fn automation_run_value(run: crate::automations::inspection::RunInspection) -> V
         "timeoutAt": run.timeout_at,
         "finishedAt": run.finished_at,
         "attempts": attempts,
-    })
+    });
+    if let Some(delivery) = delivery {
+        value["delivery"] = delivery;
+    }
+    Ok(value)
 }
 
 fn automation_occurrence_value(record: crate::automations::inspection::OccurrenceRecord) -> Value {
@@ -2126,6 +2145,7 @@ fn run_value(
     record: &crate::automations::runs::RunRecord,
     attempts: Vec<Value>,
     cancellation: Option<Value>,
+    delivery: Option<Value>,
 ) -> Value {
     let mut run = json!({
         "id": record.id,
@@ -2145,6 +2165,9 @@ fn run_value(
     });
     if let Some(cancellation) = cancellation {
         run["cancellation"] = cancellation;
+    }
+    if let Some(delivery) = delivery {
+        run["delivery"] = delivery;
     }
     run
 }
@@ -2207,7 +2230,9 @@ fn automation_run_history_result(
             let cancellation =
                 crate::automations::cancellation::cancellation_for_run(&transaction, &record.id)
                     .map_err(anyhow::Error::msg)?;
-            runs.push(run_value(record, attempts, cancellation));
+            let delivery = run_delivery_value(&transaction, record.delivery.as_ref())
+                .map_err(anyhow::Error::msg)?;
+            runs.push(run_value(record, attempts, cancellation, delivery));
         }
         transaction.commit()?;
         let mut cursor = json!({ "hasMore": page.next.is_some() });
@@ -2264,7 +2289,8 @@ fn automation_runs_payload(
                     .into_iter()
                     .map(|attempt| attempt_value(&attempt))
                     .collect::<Vec<_>>();
-                let run = run_value(record, attempts, cancellation);
+                let delivery = run_delivery_value(conn, record.delivery.as_ref())?;
+                let run = run_value(record, attempts, cancellation, delivery);
                 runs.push(run);
             }
             Ok(json!({ "runs": runs }))

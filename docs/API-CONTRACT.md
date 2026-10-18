@@ -1158,6 +1158,56 @@ the same key, so a source that reports repeatedly on one subject leaves only
 its latest word. Delivered notices are kept as history and are never
 replaced or capped away. Notice bodies are limited to 16 KiB.
 
+#### Automation results
+
+A routine whose definition carries `"outputTarget": {"kind": "main-session"}`
+delivers each settled run's result into the instance main scope
+(`instance:main`). It is the first target certified against the atomic
+delivery bar written in `crates/coven-cli/src/automations/definition.rs`
+(`DeliveryCriterion`), and every criterion names its proving test:
+
+- The target is read from the run's pinned definition revision, so a later
+  revision or a deleted routine cannot redirect or drop a settled result.
+- Settlement records the obligation (`delivery.state` `pending`) in the same
+  transaction as the run's terminal status, on every terminal path.
+- The automation scheduler then inserts one notice (`source_kind`
+  `automation`, `source_id` the run id) and records `delivered` with its
+  `noticeId` in one transaction, under the scope gate. A replay converges on
+  that one notice. When Home's stream process is idle the notice arrives as
+  its own turn; otherwise the next turn carries it.
+- A result that cannot be delivered records `failed` with a `reason`.
+  Delivered and failed records are immutable.
+
+The notice body names the routine, run, outcome, any receipt id, the failure
+reason for an unsuccessful run, and at most the last 4 KiB of the run's clean
+(unredacted) output. Runs of every terminal status deliver. Every other
+`outputTarget` value, including the reserved file-path string, is still
+refused, and no per-familiar or other-principal scope is a target until runs
+bind principal authority (#857).
+
+Run reads (`coven.automations.runs`, `coven.automations.run.history.v1`,
+`coven.automations.run.get.v1` and `coven.automations.occurrence.get.v1`)
+carry an additive `delivery` member on runs that asked for one:
+
+```json
+"delivery": {
+  "target": { "kind": "main-session" },
+  "state": "delivered",
+  "noticeId": "4f9c…",
+  "reason": null,
+  "recordedAt": "2026-10-18T09:00:05.000Z",
+  "notice": {
+    "state": "delivered",
+    "scopeKey": "instance:main",
+    "deliveredAt": "2026-10-18T09:12:40.000Z",
+    "deliveredSessionId": "session-…"
+  }
+}
+```
+
+`notice.state` is `pending` until a main-session turn carries the notice,
+`delivered` once one has, and `dropped` if the pending cap evicted it unread.
+
 ## Psyche execution binding contract (`v1`)
 
 Coven binds a session at launch to an immutable, opaque

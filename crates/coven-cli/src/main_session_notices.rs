@@ -136,7 +136,7 @@ fn validate_label(field: &str, value: &str) -> Result<()> {
 }
 
 impl NewNotice<'_> {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         main_session::validate_scope_key(self.scope_key)?;
         if self.source_kind.is_empty()
             || !self
@@ -187,10 +187,26 @@ pub fn enqueue_notice(
     notice: &NewNotice<'_>,
     now: &str,
 ) -> Result<NoticeRecord> {
-    notice.validate()?;
     let transaction = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to begin notice enqueue")?;
+    let record = insert_notice(&transaction, notice, now)?;
+    transaction.commit()?;
+    Ok(record)
+}
+
+/// [`enqueue_notice`] inside a transaction the caller owns, so a producer can
+/// commit the notice together with its own record of having posted it. The
+/// caller must hold the scope's [`ScopeGate`] for the reason
+/// [`post_notice`] gives: replacement and capping delete pending notices.
+///
+/// [`ScopeGate`]: crate::main_session_routes::ScopeGate
+pub(crate) fn insert_notice(
+    transaction: &Connection,
+    notice: &NewNotice<'_>,
+    now: &str,
+) -> Result<NoticeRecord> {
+    notice.validate()?;
     if let Some(context_key) = notice.context_key {
         transaction
             .execute(
@@ -240,7 +256,6 @@ pub fn enqueue_notice(
         .optional()
         .context("failed to read stored notice")?
         .context("the stored notice was capped away immediately")?;
-    transaction.commit()?;
     Ok(record)
 }
 
@@ -258,6 +273,18 @@ pub fn pending_notices(conn: &Connection, scope_key: &str) -> Result<Vec<NoticeR
         .context("failed to read pending notices")?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to read pending notices")
+}
+
+/// One notice, pending or delivered. `None` once a same-key notice replaced
+/// it or the pending cap dropped it.
+pub(crate) fn notice_by_id(conn: &Connection, id: &str) -> Result<Option<NoticeRecord>> {
+    conn.query_row(
+        &format!("SELECT {NOTICE_COLUMNS} FROM session_notices WHERE id = ?1"),
+        [id],
+        record_from_row,
+    )
+    .optional()
+    .context("failed to read notice")
 }
 
 /// Records that `ids` reached `session_id`. Already-delivered ids are left
@@ -377,42 +404,57 @@ pub fn post_notice(
         let mut conn = store::open_store(&path)?;
         enqueue_notice(&mut conn, notice, &crate::api::current_timestamp())?
     };
-    let conn = store::open_store(&path)?;
-    let queued = |conn: &Connection, stored: NoticeRecord| -> Result<NoticeOutcome> {
-        let pending = pending_notices(conn, notice.scope_key)?.len();
-        Ok(NoticeOutcome::Queued {
+    match deliver_pending_if_idle(coven_home, runtime, notice.scope_key)? {
+        Some((session_id, delivered)) => Ok(NoticeOutcome::Delivered {
             notice: stored,
-            pending,
-        })
-    };
-    let Some(record) = main_session::get_main_session(&conn, notice.scope_key)? else {
-        return queued(&conn, stored);
+            session_id,
+            delivered,
+        }),
+        None => {
+            let conn = store::open_store(&path)?;
+            let pending = pending_notices(&conn, notice.scope_key)?.len();
+            Ok(NoticeOutcome::Queued {
+                notice: stored,
+                pending,
+            })
+        }
+    }
+}
+
+/// Delivers every pending notice for the scope as its own turn when the
+/// bound stream process is idle, returning the session and how many notices
+/// were marked. `None` leaves them for the next turn. The caller must hold
+/// the scope's gate, so the snapshot cannot lose a notice before its receipt.
+pub(crate) fn deliver_pending_if_idle(
+    coven_home: &Path,
+    runtime: &dyn SessionRuntime,
+    scope_key: &str,
+) -> Result<Option<(String, usize)>> {
+    let conn = store::open_store(&crate::api::store_path(coven_home))?;
+    let Some(record) = main_session::get_main_session(&conn, scope_key)? else {
+        return Ok(None);
     };
     let Some(session_id) = record.current_session_id.as_deref() else {
-        return queued(&conn, stored);
+        return Ok(None);
     };
     let Some(session) = store::get_session(&conn, session_id)? else {
-        return queued(&conn, stored);
+        return Ok(None);
     };
     if session.status != "running" || !runtime.live_session_is_idle(&session.id)? {
-        return queued(&conn, stored);
+        return Ok(None);
     }
-    let pending = pending_notices(&conn, notice.scope_key)?;
+    let pending = pending_notices(&conn, scope_key)?;
     let Some(prelude) = render_prelude(&pending) else {
-        return queued(&conn, stored);
+        return Ok(None);
     };
     let body = json!({ "data": prelude }).to_string();
     let response = crate::api::record_input(coven_home, &session.id, Some(&body), runtime)?;
     if response.status != 202 {
-        return queued(&conn, stored);
+        return Ok(None);
     }
     let ids: Vec<String> = pending.into_iter().map(|notice| notice.id).collect();
     let delivered = mark_delivered(&conn, &ids, &session.id, &crate::api::current_timestamp())?;
-    Ok(NoticeOutcome::Delivered {
-        notice: stored,
-        session_id: session.id,
-        delivered,
-    })
+    Ok(Some((session.id, delivered)))
 }
 
 #[cfg(test)]
