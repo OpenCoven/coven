@@ -9063,7 +9063,9 @@ mod tests {
     fn stored_output_target_definition_is_not_loaded_for_dispatch() {
         let (_temp, conn) = temp_store();
         let mut routine = definition("legacy-output");
-        routine.output_target = Some("result.md".to_string());
+        routine.output_target = Some(crate::automations::definition::OutputTarget::Uncertified(
+            serde_json::json!("result.md"),
+        ));
         insert_definition(&conn, &routine).unwrap();
 
         let error = load_definition_for_run(&conn, &routine.id).unwrap_err();
@@ -9075,7 +9077,9 @@ mod tests {
     fn invalid_claimed_definition_does_not_block_valid_dispatch() {
         let (_temp, conn) = temp_store();
         let mut invalid = definition("invalid");
-        invalid.output_target = Some("result.md".to_string());
+        invalid.output_target = Some(crate::automations::definition::OutputTarget::Uncertified(
+            serde_json::json!("result.md"),
+        ));
         let valid = definition("valid");
         insert_definition(&conn, &invalid).unwrap();
         insert_definition(&conn, &valid).unwrap();
