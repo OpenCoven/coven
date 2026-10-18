@@ -176,6 +176,76 @@ service and harness admission tests, then the restored adapter/receipts, then
 exact-release SDK/Cave/Psyche canaries. Threads #82/#84 review and final merged
 pins remain prerequisites for production adapter integration.
 
+## Scope interpretation and opened-resource review contract
+
+This section is a review proposal. It adds no accepted grant vocabulary and
+provides no executed containment evidence. Threads #84 at
+`7ccae83f3449694eba6d21832f5afa2336931fbf` is pending review; Coven's merged
+pin remains `78e47c9d2430582128679fd4a54f9966f2f4f976`. Reconcile this contract
+with the final reviewed dependency before integrating the production adapter.
+
+### Preserve authenticated bytes
+
+The inspected filesystem scope has five fields: `kind`, `root`, `path`,
+`access`, and `recursive`. The pending validator uses a temporary backslash
+to slash replacement for breadth checks. It does not rewrite the signed scope.
+Keep the authenticated JSON and its digests unchanged. Derive a separate
+internal enforcement representation only after upstream validation, using
+identical lexical interpretation for grant paths and request paths.
+
+Refuse unsupported encodings before opening a resource. Include backslashes,
+repeated separators, dot components, drive-relative paths, embedded NUL,
+platform aliases, and case/Unicode aliases in the review vectors. A spelling
+accepted by shape validation does not establish containment or permission.
+Do not reinterpret a backslash as a literal filename on one platform while
+another treats it as a separator.
+
+### Separate capability, access, resource, and operation
+
+`analysis.read` alone does not supply a filesystem scope. Missing applicable
+read scope refuses every file operation; `access: write` does not imply read.
+`recursive` does not establish resource type or authorize listing/search.
+Determine type from the safely opened object, never its extension or a trailing
+separator. Do not add private fields to the closed upstream scope object.
+
+| Grant and opened resource | Proposed operation disposition |
+| --- | --- |
+| Applicable read scope, nonrecursive regular file | Bounded read of that exact opened file after all containment checks |
+| Same grant, parent or sibling request | Refuse, including parent listing and metadata disclosure |
+| Directory or recursive scope without reviewed operation mapping | Refuse; no inferred traversal, listing, or search |
+| Missing scope, write-only scope, or unknown kind | Refuse before disclosure |
+| Symlink, multiply linked file, special file, or mount crossing | Refuse under the initial profile |
+
+An exact-file slice is only an implementation increment. It cannot complete
+the required service: reviewed directory traversal, listing, and search remain
+mandatory. Before implementing those operations, the upstream review must map
+scope fields to each operation, its depth, accessible entries, protected
+exclusions, and continuation semantics. Keep unsupported operations closed
+until that mapping is reviewed; do not advertise partial service as complete.
+
+### Review the actual open and disclosure order
+
+Bind each root to a daemon-held resource identity and the validated grant.
+Requests cannot select or reopen a root. Define what a retained root means
+when its directory is renamed or replaced. Compare the opened resource to
+that binding, including protected-resource aliases. A device identifier alone
+is not proof that every mount crossing was excluded.
+
+For each supported platform, review the actual traversal/open primitive and
+its guarantees under concurrent rename, symlink replacement, mount changes,
+and file-to-directory replacement. Require a deterministic race test and
+an explicit unsupported disposition where a guarantee cannot be established.
+A normalized string, canonical path, or successful metadata precheck cannot
+substitute for the opened-object proof.
+
+Buffer the complete bounded response, then revalidate and commit its exact
+payload digest through the same authority/fence serialization point as
+revocation and cancellation. Test both orders: revocation first withholds the
+payload; response commitment first authorizes only those committed bytes.
+Apply this rule to listing/search metadata and continuation responses too.
+Retry, recovery, and restart require a fresh private channel and authorization;
+a retained cursor or old channel cannot recreate authority.
+
 ## Required acceptance evidence
 
 | Case | Required observation |
