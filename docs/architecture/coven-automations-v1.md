@@ -352,7 +352,7 @@ This producer does not implement the whole catalog. `automations/command_matrix.
 | `legacy.import.v1` | implemented | `coven.automations.legacy.import.v1` |
 | `mission.submit.v1` | implemented | `coven.automations.mission.submit.v1` |
 | `mission.get.v1` | implemented | `coven.automations.mission.get.v1` |
-| `mission.cancel.v1` | unsupported | none |
+| `mission.cancel.v1` | implemented | `coven.automations.mission.cancel.v1` |
 
 #### Command envelope over the control-action wire
 

@@ -25,16 +25,25 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
+use super::cancel_commands::{
+    execute_occurrence_cancel, CancelExecution, OCCURRENCE_CANCEL_ACTION,
+};
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{AdoptionConflictOutcome, ErrorAdoption, ErrorCode, ErrorEnvelope};
-use super::contract::types::{AdoptionKey, MissionId, MissionSubmitPayload};
+use super::contract::types::{AdoptionKey, MissionCancelPayload, MissionId, MissionSubmitPayload};
 use super::occurrences::{insert_claimed_occurrence, settle_occurrence};
 use super::owner_grants::CommandAuthority;
 use super::runtime_envelope::CLAUDE_R0_READ;
+use crate::api::SessionRuntime;
 
 pub const SUBMIT_ACTION: &str = "coven.automations.mission.submit.v1";
 pub const GET_ACTION: &str = "coven.automations.mission.get.v1";
+pub const CANCEL_ACTION: &str = "coven.automations.mission.cancel.v1";
 const SUBMIT_COMMAND: &str = "mission.submit.v1";
+const CANCEL_COMMAND: &str = "mission.cancel.v1";
+/// Prefix of the `occurrence.cancel.v1` key a mission cancel derives. The view
+/// reads the mission's cancellation back from that adoption.
+const CANCELLATION_KEY_PREFIX: &str = "mc:";
 /// Dispatch must begin before `validUntil`, at most this long after the request.
 const MAX_VALIDITY_MINUTES: i64 = 15;
 /// The failure reason that marks a mission refused for want of Runtime
@@ -66,34 +75,13 @@ pub fn execute_mission_submit(
     body: Value,
     now: DateTime<Utc>,
 ) -> Result<MissionExecution, String> {
-    if authority != CommandAuthority::OwnerLocal {
-        return Ok(MissionExecution::Rejected(typed_error(
-            ErrorCode::AuthorityRequired,
-            "missions are owner-local: submit over the daemon's owner socket",
-        )));
-    }
-    let Some(adoption_key) = body
-        .get("adoptionKey")
-        .and_then(Value::as_str)
-        .filter(|key| AdoptionKey::new((*key).to_owned()).is_ok())
-        .map(ToOwned::to_owned)
-    else {
-        return Ok(MissionExecution::Rejected(typed_error(
-            ErrorCode::ValidationFailed,
-            "adoptionKey is required and must be a valid adoption key",
-        )));
+    let (adoption_key, payload, digest) = match owner_request(authority, &body, SUBMIT_COMMAND)? {
+        Ok(request) => request,
+        Err(refusal) => return Ok(refusal),
     };
-    let payload = flat_payload(&body);
-    // The digest covers the command and its payload, not the wire form, so a
-    // flat request and an envelope with the same payload are the same request.
-    let digest = sha256_hex(
-        &canonicalize(&json!({ "command": SUBMIT_COMMAND, "payload": payload }))
-            .map_err(|error| format!("failed to canonicalize mission.submit: {error:#}"))?,
-    );
-
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin mission.submit: {error}"))?;
-    if let Some(answer) = adopted(&transaction, &adoption_key, &digest)? {
+    if let Some(answer) = adopted(&transaction, SUBMIT_COMMAND, &adoption_key, &digest)? {
         transaction
             .commit()
             .map_err(|error| format!("failed to close mission.submit replay: {error}"))?;
@@ -106,27 +94,15 @@ pub fn execute_mission_submit(
             format!("invalid mission.submit.v1 payload: {error}"),
         )),
     };
-    let stored = match &decided {
-        Ok(result) => json!({ "outcome": "committed", "result": result }),
-        Err(error) => json!({ "outcome": "rejected", "error": error }),
-    };
-    transaction
-        .execute(
-            "INSERT INTO automation_command_adoptions (
-                adoption_key, command, automation_id, request_digest, outcome,
-                revision, response_json, adopted_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
-            params![
-                adoption_key,
-                SUBMIT_COMMAND,
-                mission_id_for(&adoption_key),
-                digest,
-                stored["outcome"].as_str(),
-                stored.to_string(),
-                iso(now)
-            ],
-        )
-        .map_err(|error| format!("failed to adopt mission.submit: {error}"))?;
+    adopt(
+        &transaction,
+        SUBMIT_COMMAND,
+        &adoption_key,
+        &mission_id_for(&adoption_key),
+        &digest,
+        &decided,
+        now,
+    )?;
     transaction
         .commit()
         .map_err(|error| format!("failed to commit mission.submit: {error}"))?;
@@ -151,6 +127,128 @@ pub fn execute_mission_submit(
         payload: result,
         replayed: false,
     })
+}
+
+/// Executes one `mission.cancel.v1` request at `now`. Before dispatch it is
+/// `occurrence.cancel.v1` on the mission's occurrence; after dispatch that
+/// command hands it to `run.cancel.v1` and its stop fence. The inner command
+/// runs under a key derived from this one, so a replay after a crash between
+/// the two adoptions repeats the same cancellation instead of starting another.
+pub fn execute_mission_cancel(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    authority: CommandAuthority,
+    body: Value,
+    now: DateTime<Utc>,
+) -> Result<MissionExecution, String> {
+    let (adoption_key, payload, digest) = match owner_request(authority, &body, CANCEL_COMMAND)? {
+        Ok(request) => request,
+        Err(refusal) => return Ok(refusal),
+    };
+    if let Some(answer) = adopted(conn, CANCEL_COMMAND, &adoption_key, &digest)? {
+        return Ok(answer);
+    }
+    let (mission_id, decided) = match serde_json::from_value::<MissionCancelPayload>(payload) {
+        Ok(request) => (
+            request.mission_id.as_str().to_owned(),
+            cancel(conn, runtime, &adoption_key, &request, now)?,
+        ),
+        Err(error) => (
+            String::new(),
+            Err(typed_error(
+                ErrorCode::ValidationFailed,
+                format!("invalid mission.cancel.v1 payload: {error}"),
+            )),
+        ),
+    };
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to begin mission.cancel: {error}"))?;
+    // The same key may have been adopted while the cancellation ran.
+    if let Some(answer) = adopted(&transaction, CANCEL_COMMAND, &adoption_key, &digest)? {
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to close mission.cancel replay: {error}"))?;
+        return Ok(answer);
+    }
+    adopt(
+        &transaction,
+        CANCEL_COMMAND,
+        &adoption_key,
+        &mission_id,
+        &digest,
+        &decided,
+        now,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit mission.cancel: {error}"))?;
+    Ok(match decided {
+        Ok(payload) => MissionExecution::Success {
+            payload,
+            replayed: false,
+        },
+        Err(error) => MissionExecution::Rejected(error),
+    })
+}
+
+/// Cancels the mission's occurrence, or says why it cannot be.
+fn cancel(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    adoption_key: &str,
+    request: &MissionCancelPayload,
+    now: DateTime<Utc>,
+) -> Result<Result<Value, ErrorEnvelope>, String> {
+    let mission_id = request.mission_id.as_str();
+    let Some(view) = mission_view(conn, mission_id)? else {
+        return Ok(Err(typed_error(
+            ErrorCode::NotFound,
+            format!("no mission `{mission_id}`"),
+        )));
+    };
+    if view["terminal"] == json!(true) {
+        return Ok(Err(nothing_to_cancel(view)));
+    }
+    let cancellation_id = format!(
+        "{CANCELLATION_KEY_PREFIX}{}",
+        &sha256_hex(adoption_key.as_bytes())[..40]
+    );
+    let mut inner = json!({
+        "action": OCCURRENCE_CANCEL_ACTION,
+        "adoptionKey": cancellation_id,
+        "occurrenceId": view["occurrenceId"],
+    });
+    if let Some(reason) = &request.reason {
+        inner["reason"] = json!(reason.as_str());
+    }
+    if let CancelExecution::Rejected(error) = execute_occurrence_cancel(conn, runtime, inner, now)?
+    {
+        // The mission may have settled since it was read.
+        return Ok(Err(
+            match mission_view(conn, mission_id)?.filter(|view| view["terminal"] == json!(true)) {
+                Some(view) => nothing_to_cancel(view),
+                None => error,
+            },
+        ));
+    }
+    let view = mission_view(conn, mission_id)?.ok_or("the cancelled mission is not readable")?;
+    Ok(Ok(json!({
+        "cancellation": view["cancellation"].clone(),
+        "mission": view,
+    })))
+}
+
+/// `ILLEGAL_TRANSITION` for a mission that has already settled, with the view
+/// it settled in.
+fn nothing_to_cancel(view: Value) -> ErrorEnvelope {
+    typed_error(
+        ErrorCode::IllegalTransition,
+        format!(
+            "the mission is `{}`, with nothing left to cancel",
+            view["state"].as_str().unwrap_or("settled")
+        ),
+    )
+    .with_details(BTreeMap::from([("mission".to_owned(), view)]))
 }
 
 /// Executes one `mission.get.v1` read: the mission's current view.
@@ -199,6 +297,74 @@ pub fn execute_mission_get(
     }
 }
 
+/// The owner's request: its adoption key, its payload and the digest that
+/// adoption compares. Any other caller, or a missing key, is refused before
+/// anything is read or adopted.
+fn owner_request(
+    authority: CommandAuthority,
+    body: &Value,
+    command: &str,
+) -> Result<Result<(String, Value, String), MissionExecution>, String> {
+    if authority != CommandAuthority::OwnerLocal {
+        return Ok(Err(MissionExecution::Rejected(typed_error(
+            ErrorCode::AuthorityRequired,
+            "missions are owner-local: send mission commands over the daemon's owner socket",
+        ))));
+    }
+    let Some(adoption_key) = body
+        .get("adoptionKey")
+        .and_then(Value::as_str)
+        .filter(|key| AdoptionKey::new((*key).to_owned()).is_ok())
+        .map(ToOwned::to_owned)
+    else {
+        return Ok(Err(MissionExecution::Rejected(typed_error(
+            ErrorCode::ValidationFailed,
+            "adoptionKey is required and must be a valid adoption key",
+        ))));
+    };
+    let payload = flat_payload(body);
+    // The digest covers the command and its payload, not the wire form, so a
+    // flat request and an envelope with the same payload are the same request.
+    let digest = sha256_hex(
+        &canonicalize(&json!({ "command": command, "payload": payload }))
+            .map_err(|error| format!("failed to canonicalize {command}: {error:#}"))?,
+    );
+    Ok(Ok((adoption_key, payload, digest)))
+}
+
+/// Records the command's answer under its adoption key.
+fn adopt(
+    conn: &Connection,
+    command: &str,
+    adoption_key: &str,
+    mission_id: &str,
+    digest: &str,
+    decided: &Result<Value, ErrorEnvelope>,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let stored = match decided {
+        Ok(result) => json!({ "outcome": "committed", "result": result }),
+        Err(error) => json!({ "outcome": "rejected", "error": error }),
+    };
+    conn.execute(
+        "INSERT INTO automation_command_adoptions (
+            adoption_key, command, automation_id, request_digest, outcome,
+            revision, response_json, adopted_at
+         ) VALUES (?1, ?2, NULLIF(?3, ''), ?4, ?5, NULL, ?6, ?7)",
+        params![
+            adoption_key,
+            command,
+            mission_id,
+            digest,
+            stored["outcome"].as_str(),
+            stored.to_string(),
+            iso(now)
+        ],
+    )
+    .map_err(|error| format!("failed to adopt {command}: {error}"))?;
+    Ok(())
+}
+
 /// The keys a flat request carries for routing and correlation, not as
 /// payload.
 const ROUTING_KEYS: [&str; 4] = ["action", "adoptionKey", "origin", "intentId"];
@@ -215,6 +381,7 @@ fn flat_payload(body: &Value) -> Value {
 /// A replay, a mismatch, or `None` when the key is new.
 fn adopted(
     conn: &Connection,
+    command_name: &str,
     adoption_key: &str,
     digest: &str,
 ) -> Result<Option<MissionExecution>, String> {
@@ -244,7 +411,7 @@ fn adopted(
             used_elsewhere.then(|| MissionExecution::Rejected(replay_mismatch(adoption_key, None)))
         );
     };
-    if command != SUBMIT_COMMAND || stored_digest != digest {
+    if command != command_name || stored_digest != digest {
         let conflict = match outcome.as_str() {
             "committed" => Some(AdoptionConflictOutcome::Committed),
             "rejected" => Some(AdoptionConflictOutcome::Rejected),
@@ -258,7 +425,8 @@ fn adopted(
     let response: Value = serde_json::from_str(&response_json)
         .map_err(|error| format!("stored mission response is invalid: {error}"))?;
     Ok(Some(match outcome.as_str() {
-        // The first commit's result, unchanged: a replay never launches again.
+        // The first commit's result, unchanged: a replay never launches or
+        // cancels again.
         "committed" => MissionExecution::Success {
             payload: response["result"].clone(),
             replayed: true,
@@ -522,6 +690,17 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
         return Ok(None);
     };
     let (state, reason) = project(&occurrence_state, failure_reason.as_deref());
+    let cancellation = cancellation(conn, mission_id, &occurrence_state)?;
+    // A stop the owner asked for that has not landed yet.
+    let state = if state == "running"
+        && cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation["outcome"] == "pending")
+    {
+        "cancelling"
+    } else {
+        state
+    };
     let terminal = matches!(
         state,
         "completed" | "failed" | "cancelled" | "rejected" | "revoked" | "unavailable"
@@ -586,6 +765,9 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
     if let Some(reason) = reason {
         view["reason"] = json!(reason);
     }
+    if let Some(cancellation) = cancellation {
+        view["cancellation"] = cancellation;
+    }
     if terminal {
         view["result"] = json!({
             "outcome": state,
@@ -597,6 +779,42 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
         });
     }
     Ok(Some(view))
+}
+
+/// The cancellation `mission.cancel` asked for, if any: the first committed
+/// `occurrence.cancel.v1` adoption under a key it derived. Its outcome follows
+/// the occurrence as it stands now.
+fn cancellation(
+    conn: &Connection,
+    mission_id: &str,
+    occurrence_state: &str,
+) -> Result<Option<Value>, String> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT adoption_key, adopted_at FROM automation_command_adoptions
+             WHERE command = 'occurrence.cancel.v1' AND automation_id = ?1
+               AND outcome = 'committed'
+               AND substr(adoption_key, 1, length(?2)) = ?2
+             ORDER BY adopted_at, adoption_key
+             LIMIT 1",
+            params![mission_id, CANCELLATION_KEY_PREFIX],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read the mission's cancellation: {error}"))?;
+    Ok(row.map(|(cancellation_id, requested_at)| {
+        let outcome = match occurrence_state {
+            "cancelled" => "cancelled",
+            "recovery_required" => "recovery_required",
+            "succeeded" | "failed" | "timed_out" | "skipped" | "superseded" => "lost_to_completion",
+            _ => "pending",
+        };
+        json!({
+            "cancellationId": cancellation_id,
+            "requestedAt": requested_at,
+            "outcome": outcome,
+        })
+    }))
 }
 
 /// The mission state for an occurrence state, by the contract's projection.
@@ -773,6 +991,10 @@ mod tests {
         .0
     }
 
+    fn view_of(fixture: &Fixture, mission_id: &str) -> Value {
+        view(fixture, mission_id)
+    }
+
     fn assert_mission_view(view: &Value) {
         let validator = spec_validator("missionView");
         let errors: Vec<String> = validator
@@ -780,6 +1002,39 @@ mod tests {
             .map(|error| error.to_string())
             .collect();
         assert!(errors.is_empty(), "{errors:?}\n{view:#}");
+    }
+
+    /// Records a mission and leaves it queued, as a daemon that can dispatch
+    /// would. M0 settles every submitted mission at once, so this is the only
+    /// way to reach a mission before dispatch. Returns its id.
+    fn hold(fixture: &Fixture, key: &str) -> String {
+        let request: MissionSubmitPayload =
+            serde_json::from_value(payload(fixture, now())).unwrap();
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &fixture.home.conn,
+            TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        claim_in(&transaction, key, &"a".repeat(64), &request, now())
+            .unwrap()
+            .unwrap();
+        transaction.commit().unwrap();
+        mission_id_for(key)
+    }
+
+    fn cancel(fixture: &Fixture, authority: CommandAuthority, body: Value) -> MissionExecution {
+        execute_mission_cancel(
+            &fixture.home.conn,
+            &NoopSessionRuntime,
+            authority,
+            body,
+            now() + Duration::seconds(5),
+        )
+        .unwrap()
+    }
+
+    fn cancel_body(key: &str, mission_id: &str) -> Value {
+        json!({ "action": CANCEL_ACTION, "adoptionKey": key, "missionId": mission_id })
     }
 
     fn count(fixture: &Fixture, table: &str) -> i64 {
@@ -973,19 +1228,7 @@ mod tests {
     #[test]
     fn a_second_mission_waits_for_the_first_in_the_same_project() {
         let fixture = fixture();
-        // Hold one mission queued, as a dispatching daemon would.
-        let held = "adopt:mission:held";
-        let request: MissionSubmitPayload =
-            serde_json::from_value(payload(&fixture, now())).unwrap();
-        let transaction = rusqlite::Transaction::new_unchecked(
-            &fixture.home.conn,
-            TransactionBehavior::Immediate,
-        )
-        .unwrap();
-        claim_in(&transaction, held, &"a".repeat(64), &request, now())
-            .unwrap()
-            .unwrap();
-        transaction.commit().unwrap();
+        hold(&fixture, "adopt:mission:held");
 
         let key = "adopt:mission:second";
         let error = refused(submit(&fixture, flat(key, payload(&fixture, now()))));
@@ -1103,6 +1346,130 @@ mod tests {
     }
 
     #[test]
+    fn cancel_stops_a_queued_mission_once() {
+        let fixture = fixture();
+        let mission_id = hold(&fixture, "adopt:mission:to-cancel");
+        let key = "adopt:mission-cancel:first";
+        let mut body = cancel_body(key, &mission_id);
+        body["reason"] = json!("Not needed after all.");
+        let (answer, replayed) =
+            committed(cancel(&fixture, CommandAuthority::OwnerLocal, body.clone()));
+        assert!(!replayed);
+        let view = &answer["mission"];
+        assert_mission_view(view);
+        assert_eq!(
+            (
+                view["state"].as_str(),
+                view["terminal"].as_bool(),
+                view["result"]["outcome"].as_str(),
+                answer["cancellation"]["outcome"].as_str(),
+            ),
+            (
+                Some("cancelled"),
+                Some(true),
+                Some("cancelled"),
+                Some("cancelled")
+            )
+        );
+        assert_eq!(answer["cancellation"], view["cancellation"]);
+        let cancellation_id = answer["cancellation"]["cancellationId"].as_str().unwrap();
+        assert!(cancellation_id.starts_with(CANCELLATION_KEY_PREFIX));
+        // The view keeps the cancellation.
+        assert_eq!(
+            view_of(&fixture, &mission_id)["cancellation"],
+            answer["cancellation"]
+        );
+
+        // The same key is the same cancellation; a new one finds nothing left.
+        let (replay, replayed) = committed(cancel(&fixture, CommandAuthority::OwnerLocal, body));
+        assert!(replayed);
+        assert_eq!(replay, answer);
+        let error = refused(cancel(
+            &fixture,
+            CommandAuthority::OwnerLocal,
+            cancel_body("adopt:mission-cancel:second", &mission_id),
+        ));
+        assert_eq!(error["code"], "ILLEGAL_TRANSITION");
+        assert_eq!(error["details"]["mission"]["state"], "cancelled");
+        for table in ["automation_runs", "automation_attempts", "sessions"] {
+            assert_eq!(count(&fixture, table), 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn cancel_refuses_a_settled_mission_with_its_view() {
+        let fixture = fixture();
+        // M0: the submitted mission settles unavailable at once.
+        let submitted = "adopt:mission:settled";
+        committed(submit(&fixture, flat(submitted, payload(&fixture, now()))));
+        let mission_id = mission_id_for(submitted);
+
+        let key = "adopt:mission-cancel:late";
+        let error = refused(cancel(
+            &fixture,
+            CommandAuthority::OwnerLocal,
+            cancel_body(key, &mission_id),
+        ));
+        assert_eq!(error["code"], "ILLEGAL_TRANSITION");
+        assert_mission_view(&error["details"]["mission"]);
+        assert_eq!(error["details"]["mission"]["state"], "unavailable");
+        // The refusal is adopted: the key answers the same way again, and
+        // cannot be reused for another request.
+        assert_eq!(
+            refused(cancel(
+                &fixture,
+                CommandAuthority::OwnerLocal,
+                cancel_body(key, &mission_id)
+            )),
+            error
+        );
+        let mut changed = cancel_body(key, &mission_id);
+        changed["reason"] = json!("Changed my mind.");
+        let mismatch = refused(cancel(&fixture, CommandAuthority::OwnerLocal, changed));
+        assert_eq!(
+            (
+                mismatch["code"].as_str(),
+                mismatch["adoption"]["conflictOutcome"].as_str()
+            ),
+            (Some("ADOPTION_REPLAY_MISMATCH"), Some("rejected"))
+        );
+
+        let cases = [
+            (
+                CommandAuthority::OwnerLocal,
+                cancel_body(
+                    "adopt:mission-cancel:unknown",
+                    &mission_id_for("adopt:none"),
+                ),
+                "NOT_FOUND",
+            ),
+            (
+                CommandAuthority::OwnerLocal,
+                json!({
+                    "action": CANCEL_ACTION,
+                    "adoptionKey": "adopt:mission-cancel:long",
+                    "missionId": mission_id,
+                    "reason": "x".repeat(501),
+                }),
+                "VALIDATION_FAILED",
+            ),
+            (
+                CommandAuthority::Unauthenticated,
+                cancel_body("adopt:mission-cancel:remote", &mission_id),
+                "AUTHORITY_REQUIRED",
+            ),
+        ];
+        for (authority, body, code) in cases {
+            assert_eq!(
+                refused(cancel(&fixture, authority, body.clone()))["code"],
+                code,
+                "{body}"
+            );
+        }
+        assert_eq!(count(&fixture, "automation_runs"), 0);
+    }
+
+    #[test]
     fn both_wires_submit_replay_and_read_the_same_mission() {
         let fixture = fixture();
         let conn = &fixture.home.conn;
@@ -1167,5 +1534,27 @@ mod tests {
         assert!(validator.is_valid(&read), "{read:#}");
         assert_eq!(read["result"]["state"], "unavailable");
         assert_mission_view(&read["result"]);
+
+        // A cancel over the envelope answers like the flat action: M0's
+        // mission has settled, so there is nothing left to cancel.
+        let mut cancel = envelope("mission.cancel.v1", json!({ "missionId": mission_id }));
+        cancel["envelope"]["adoptionKey"] = json!("adopt:mission-cancel:wire");
+        let (status, response) = crate::control_plane::route_action_at(
+            cancel,
+            conn,
+            &NoopSessionRuntime,
+            &iso(requested_at),
+            CommandAuthority::OwnerLocal,
+        );
+        assert_eq!(status, 422, "{response:?}");
+        let refused = response.result.unwrap();
+        assert!(validator.is_valid(&refused), "{refused:#}");
+        assert_eq!(
+            (
+                refused["outcome"].as_str(),
+                refused["error"]["code"].as_str()
+            ),
+            (Some("rejected"), Some("ILLEGAL_TRANSITION"))
+        );
     }
 }

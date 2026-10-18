@@ -137,6 +137,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.occurrence.runNow.v1",
                     "coven.automations.mission.submit.v1",
                     "coven.automations.mission.get.v1",
+                    "coven.automations.mission.cancel.v1",
                     "coven.automations.occurrence.cancel.v1",
                     "coven.automations.attempt.cancel.v1",
                     "coven.automations.attempt.retry.v1",
@@ -857,16 +858,33 @@ pub(crate) fn route_action_at(
                 ),
             }
         }
-        crate::automations::missions::SUBMIT_ACTION | crate::automations::missions::GET_ACTION => {
-            let executed = if action == crate::automations::missions::SUBMIT_ACTION {
-                crate::automations::missions::execute_mission_submit(
-                    conn,
-                    authority,
-                    payload.clone(),
-                    chrono::Utc::now(),
-                )
-            } else {
-                crate::automations::missions::execute_mission_get(conn, authority, &payload)
+        crate::automations::missions::SUBMIT_ACTION
+        | crate::automations::missions::GET_ACTION
+        | crate::automations::missions::CANCEL_ACTION => {
+            let (executed, event_kind) = match action {
+                crate::automations::missions::SUBMIT_ACTION => (
+                    crate::automations::missions::execute_mission_submit(
+                        conn,
+                        authority,
+                        payload.clone(),
+                        chrono::Utc::now(),
+                    ),
+                    Some("automations.mission.submit"),
+                ),
+                crate::automations::missions::CANCEL_ACTION => (
+                    crate::automations::missions::execute_mission_cancel(
+                        conn,
+                        runtime,
+                        authority,
+                        payload.clone(),
+                        chrono::Utc::now(),
+                    ),
+                    Some("automations.mission.cancel"),
+                ),
+                _ => (
+                    crate::automations::missions::execute_mission_get(conn, authority, &payload),
+                    None,
+                ),
             };
             match executed {
                 Ok(crate::automations::missions::MissionExecution::Success {
@@ -882,14 +900,12 @@ pub(crate) fn route_action_at(
                         reason: replayed.then(|| "replayed previously adopted mission".to_string()),
                         error: None,
                         result: Some(result.clone()),
-                        event: (action == crate::automations::missions::SUBMIT_ACTION).then(|| {
-                            ControlEvent {
-                                kind: "automations.mission.submit",
-                                action: action.to_string(),
-                                origin,
-                                intent_id,
-                                payload: result,
-                            }
+                        event: event_kind.map(|kind| ControlEvent {
+                            kind,
+                            action: action.to_string(),
+                            origin,
+                            intent_id,
+                            payload: result,
                         }),
                     },
                 ),
