@@ -87,7 +87,7 @@ interface MissionSubmitResult {
 
 interface MissionGetPayload { missionId: string }
 
-interface MissionCancelPayload { missionId: string; reason?: string }   // reason ≤ 200 chars
+interface MissionCancelPayload { missionId: string; reason?: string }   // reason ≤ 500 chars, as for other cancels
 
 interface MissionCancelResult {
   cancellation: {
@@ -221,9 +221,13 @@ writable envelope exists.
    timeout, report size, and one active mission per familiar root per project in
    M0 (`CONCURRENCY_LIMIT`).
 
-New error codes: `FAMILIAR_REVISION_STALE`, `MISSION_EXPIRED`,
-`ENVELOPE_UNSUPPORTED`. Every other refusal reuses the existing `ErrorCode`
-set.
+No new error codes: the v1 vocabulary is frozen, and it already covers every
+mission refusal. A familiar revision that is not the current active one is
+`REVISION_CONFLICT`, with the current revision in `details`. An envelope the
+daemon does not advertise and enforce is `CAPABILITY_UNSUPPORTED`. A
+`validUntil` already past at submit is `VALIDATION_FAILED`. Expiry after
+submit is not an error: the mission settles `rejected` with reason
+`expired_before_dispatch`.
 
 ## Vectors
 
@@ -238,8 +242,8 @@ a clock and a transport, a command sequence produces exact responses and
 | M-01 | disconnected before submit | The submit never reaches the daemon; the client asks `mission.get` for the id derived from its key | `NOT_FOUND`. The client may submit with the same key. |
 | M-02 | disconnect after submit, before acknowledgement | Commit succeeds, the response is lost, and the client replays the same key and body | `replayed`, the same `missionId` and occurrence, exactly one launch |
 | M-03 | duplicate submission | (a) same key, same body; (b) same key, changed body; (c) a new key with the same body | (a) `replayed`. (b) `ADOPTION_REPLAY_MISMATCH` (409), `conflictOutcome: committed`. (c) a second mission; under M0's limit, `CONCURRENCY_LIMIT` while the first is active. |
-| M-04 | stale familiar revision | (a) the submitted revision is not the current active one; (b) it is superseded between submit and dispatch | (a) `FAMILIAR_REVISION_STALE`, nothing created. (b) `revoked` / `familiar_revision_stale`, no launch. |
-| M-05 | rejected capability/runtime | The envelope id is unknown, or its descriptor digest differs from the advertised one | `ENVELOPE_UNSUPPORTED`, nothing created |
+| M-04 | stale familiar revision | (a) the submitted revision is not the current active one; (b) it is superseded between submit and dispatch | (a) `REVISION_CONFLICT` with the current revision in `details`, nothing created. (b) `revoked` / `familiar_revision_stale`, no launch. |
+| M-05 | rejected capability/runtime | The envelope id is unknown, or its descriptor digest differs from the advertised one | `CAPABILITY_UNSUPPORTED` naming the envelope, nothing created |
 | M-06 | authority unavailable | Runtime Authority is not constructed, or the trusted state is unreadable at dispatch | `unavailable` with `authority_unavailable`, no launch, and a no-launch receipt |
 | M-07 | cancellation racing completion | A cancel arrives after the harness's conclusive success but before settlement | `completed`; the cancellation outcome is `lost_to_completion` |
 | M-08 | cancel before launch | A cancel arrives while `queued` | `cancelled`, no session, and a cancellation receipt |

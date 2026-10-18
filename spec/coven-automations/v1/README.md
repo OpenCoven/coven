@@ -16,7 +16,7 @@ Cave, the SDK, Psyche adapters, runtimes, and future implementations consume the
 | `automation-run.schema.json` | `AutomationRun`: exact familiar/principal/authority/runtime binding, attempts, terminal disposition, delivery, receipt reference. |
 | `automation-attempt.schema.json` | `AutomationAttempt`: adoption key, dispatch fence, worker correlation, retry classification, cursors, ambiguous disposition. |
 | `automation-receipt.schema.json` | `AutomationReceipt`: immutable versioned receipt with digests, side-effect class, integrity/authentication, privacy/retention. |
-| `command-envelope.schema.json` | Every command (create, revise, activate, pause, disable, tombstone, run now, cancel, retry/recover, list/get/history/health, events read/subscribe, legacy import) + response envelope with adoption-key semantics. |
+| `command-envelope.schema.json` | Every command (create, revise, activate, pause, disable, tombstone, run now, cancel, retry/recover, list/get/history/health, events read/subscribe, legacy import, mission submit/get/cancel) + response envelope with adoption-key semantics, and the mission view a mission command returns. |
 | `error-envelope.schema.json` | Typed error codes and the frozen HTTP/control-action status mapping. |
 | `event-envelope.schema.json` | Changefeed envelope: streams, gapless sequences, event ids, causation, compaction snapshots. |
 | `conformance-result.schema.json` | Portable conformance-result envelope with a separately signed statement, exact source/protocol/runner binding, audit-only versus release-eligibility scope, per-profile suite results, freshness, and optional P-256 authentication. |
