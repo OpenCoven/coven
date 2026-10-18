@@ -1213,6 +1213,13 @@ carry an additive `delivery` member on runs that asked for one:
 `notice.state` is `pending` until a main-session turn carries the notice,
 `delivered` once one has, and `dropped` if the pending cap evicted it unread.
 
+#### Hub job results
+
+`POST /api/v1/hub/jobs/:jobId/complete` with a `resultSummary` posts the
+summary into the same scope, at most once per job, and records the delivery on
+the job (see the hub routes below). The notice body names the job, its outcome
+and its node, followed by the summary as the executor wrote it.
+
 ## Psyche execution binding contract (`v1`)
 
 Coven binds a session at launch to an immutable, opaque
@@ -2578,6 +2585,18 @@ If no registered node qualifies, the call returns `409 no_available_node` and th
 ### `POST /api/v1/hub/jobs/:jobId/complete`
 
 Marks a job terminal (`{ "state": "completed" | "failed" | "cancelled" }`, defaulting to `completed`), removes it from its executor subqueue, and refreshes the node's queue pressure. Terminal jobs cannot be reassigned (`409 job_not_assignable`).
+
+An optional `resultSummary` (at most 8 KiB after trimming; an empty or longer
+value is `400 invalid_request` and changes nothing) is posted once into the
+instance main session as a notice with `source_kind` `hub` and `source_id` the
+job id. Under the main-session scope gate, the terminal state, the notice, and
+the job's `delivered` record with its `noticeId` commit in one transaction.
+If the notice cannot be posted, the job still completes and its delivery is
+recorded `failed` with a `reason`. A job delivers at most once: a repeated
+completion keeps the first summary and notice. The job body from this route
+and from `GET /api/v1/hub/jobs/:jobId` carries `resultSummary` and `delivery`
+(both `null` until a completion supplies a summary), in the same shape as an
+automation run's `delivery`, including the notice's fate.
 
 ### `GET /api/v1/hub/routing`
 

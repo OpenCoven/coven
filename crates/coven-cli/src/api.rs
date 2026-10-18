@@ -1352,7 +1352,7 @@ fn handle_request_with_runtime_authority_and_automation_time(
                 .trim_start_matches("/hub/jobs/")
                 .trim_end_matches("/complete");
             hub_mutation_response(coven_home, || {
-                crate::hub::complete_job(coven_home, job_id, body)
+                crate::hub::complete_job(coven_home, job_id, body, runtime)
             })
         }
         ("GET", path) if path.starts_with("/hub/jobs/") => {

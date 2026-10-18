@@ -17,15 +17,19 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    api::{api_error, current_timestamp, json_response, parse_body, ApiResponse},
-    executor_node, store,
+    api::{api_error, current_timestamp, json_response, parse_body, ApiResponse, SessionRuntime},
+    executor_node,
+    main_session::INSTANCE_MAIN_SCOPE_KEY,
+    main_session_notices::{self, NewNotice},
+    main_session_routes::ScopeGate,
+    store,
 };
 
 /// Store-meta key shared with travel profile generation so the hub identity
@@ -39,6 +43,12 @@ const JOB_STATE_QUEUED: &str = "queued";
 const JOB_STATE_ASSIGNED: &str = "assigned";
 const JOB_STATE_HELD: &str = "held";
 const TERMINAL_JOB_STATES: [&str; 3] = ["completed", "failed", "cancelled"];
+/// Largest `resultSummary` a completion may carry. Its notice adds a short
+/// header and must stay inside the main-session inbox's body limit.
+const MAX_RESULT_SUMMARY_BYTES: usize = 8 * 1024;
+/// The inbox source kind of a notice a hub job's completion posted.
+const RESULT_NOTICE_SOURCE_KIND: &str = "hub";
+const INBOX_UNAVAILABLE_REASON: &str = "the main-session inbox lock could not be opened";
 
 #[derive(Clone)]
 struct VersionedStatusSnapshot {
@@ -103,6 +113,58 @@ fn node_response(node: &store::NodeRecord) -> Value {
         "registeredAt": node.registered_at,
         "updatedAt": node.updated_at,
     })
+}
+
+/// Adds a job's result summary and the delivery record of its main-session
+/// notice (coven#1179) to a job body. Both are `null` until a completion
+/// carries a `resultSummary`.
+fn add_job_result(conn: &Connection, body: &mut Value) -> Result<()> {
+    #[derive(Default)]
+    struct JobResult {
+        summary: Option<String>,
+        state: Option<String>,
+        notice_id: Option<String>,
+        reason: Option<String>,
+        recorded_at: Option<String>,
+    }
+    let job_id = body["jobId"].as_str().unwrap_or_default().to_owned();
+    let result = conn
+        .query_row(
+            "SELECT result_summary, delivery_state, delivery_notice_id, delivery_reason,
+                    delivery_recorded_at
+             FROM hub_jobs WHERE job_id = ?1",
+            [&job_id],
+            |row| {
+                Ok(JobResult {
+                    summary: row.get(0)?,
+                    state: row.get(1)?,
+                    notice_id: row.get(2)?,
+                    reason: row.get(3)?,
+                    recorded_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to read hub job result")?
+        .unwrap_or_default();
+    body["resultSummary"] = json!(result.summary);
+    body["delivery"] = match result.state {
+        None => Value::Null,
+        Some(state) => {
+            let mut delivery = json!({
+                "target": { "kind": "main-session" },
+                "state": state,
+                "noticeId": result.notice_id,
+                "reason": result.reason,
+                "recordedAt": result.recorded_at,
+            });
+            if let Some(notice_id) = &result.notice_id {
+                delivery["notice"] = main_session_notices::notice_fate(conn, notice_id)?;
+            }
+            delivery
+        }
+    };
+    Ok(())
 }
 
 fn job_response(job: &store::HubJobRecord) -> Value {
@@ -1093,6 +1155,7 @@ pub fn get_job(coven_home: &Path, job_id: &str) -> Result<ApiResponse> {
             let route = store::get_route(&conn, job_id)?;
             let mut body = job_response(&job);
             body["route"] = route.as_ref().map(route_response).unwrap_or(Value::Null);
+            add_job_result(&conn, &mut body)?;
             json_response(200, &body)
         }
         None => api_error(
@@ -1275,9 +1338,17 @@ pub fn assign_job(coven_home: &Path, job_id: &str, body: Option<&str>) -> Result
 struct CompleteJobRequest {
     #[serde(default)]
     state: Option<String>,
+    /// What the job produced, posted once into the main session.
+    #[serde(default)]
+    result_summary: Option<String>,
 }
 
-pub fn complete_job(coven_home: &Path, job_id: &str, body: Option<&str>) -> Result<ApiResponse> {
+pub fn complete_job(
+    coven_home: &Path,
+    job_id: &str,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
     let payload = match parse_body(body) {
         Ok(payload) => payload,
         Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
@@ -1295,7 +1366,27 @@ pub fn complete_job(coven_home: &Path, job_id: &str, body: Option<&str>) -> Resu
             Some(json!({ "state": state })),
         );
     }
-    let conn = store::open_store(&store_path(coven_home))?;
+    let summary = match request.result_summary.as_deref().map(str::trim) {
+        None => None,
+        Some("") => {
+            return api_error(
+                400,
+                "invalid_request",
+                "resultSummary must not be empty.",
+                None,
+            )
+        }
+        Some(summary) if summary.len() > MAX_RESULT_SUMMARY_BYTES => {
+            return api_error(
+                400,
+                "invalid_request",
+                &format!("resultSummary must be at most {MAX_RESULT_SUMMARY_BYTES} bytes."),
+                None,
+            )
+        }
+        Some(summary) => Some(summary),
+    };
+    let mut conn = store::open_store(&store_path(coven_home))?;
     let Some(job) = store::get_hub_job(&conn, job_id)? else {
         return api_error(
             404,
@@ -1306,12 +1397,146 @@ pub fn complete_job(coven_home: &Path, job_id: &str, body: Option<&str>) -> Resu
     };
     let now = current_timestamp();
     let assigned_node_id = job.assigned_node_id.clone();
-    store::update_hub_job_state(&conn, job_id, &state, assigned_node_id.as_deref(), &now)?;
+    match summary {
+        Some(summary) => {
+            complete_with_result(coven_home, &mut conn, runtime, &job, &state, summary, &now)?
+        }
+        None => {
+            store::update_hub_job_state(&conn, job_id, &state, assigned_node_id.as_deref(), &now)?
+        }
+    }
     if let Some(node_id) = assigned_node_id {
         sync_executor_queue(&conn, &node_id, &now)?;
     }
     let job = store::get_hub_job(&conn, job_id)?.context("job disappeared during completion")?;
-    json_response(200, &job_response(&job))
+    let mut body = job_response(&job);
+    add_job_result(&conn, &mut body)?;
+    json_response(200, &body)
+}
+
+/// Completes a job and posts its result summary into the main session, at
+/// most once per job (coven#1179). Under the main-session scope gate, one
+/// transaction records the terminal state, inserts the notice (source = the
+/// job id) and records `delivered` with the notice id. If the notice cannot
+/// be posted the job still completes, and its record says why.
+fn complete_with_result(
+    coven_home: &Path,
+    conn: &mut Connection,
+    runtime: &dyn SessionRuntime,
+    job: &store::HubJobRecord,
+    state: &str,
+    summary: &str,
+    now: &str,
+) -> Result<()> {
+    let job_id = job.job_id.as_str();
+    let text = result_notice_text(job, state, summary);
+    let notice = NewNotice {
+        scope_key: INSTANCE_MAIN_SCOPE_KEY,
+        source_kind: RESULT_NOTICE_SOURCE_KIND,
+        source_id: Some(job_id),
+        text: &text,
+        context_key: None,
+    };
+    let gate = match notice.validate() {
+        Ok(()) => ScopeGate::acquire(coven_home, INSTANCE_MAIN_SCOPE_KEY).map_err(|error| {
+            crate::daemon::append_daemon_recovery_log(
+                coven_home,
+                &format!("hub job `{job_id}` result was not delivered: {error:#}"),
+            );
+            INBOX_UNAVAILABLE_REASON.to_owned()
+        }),
+        Err(error) => Err(format!("the result notice is invalid: {error:#}")),
+    };
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to begin hub job completion")?;
+    store::update_hub_job_state(
+        &transaction,
+        job_id,
+        state,
+        job.assigned_node_id.as_deref(),
+        now,
+    )?;
+    let undelivered: bool = transaction
+        .query_row(
+            "SELECT delivery_state IS NULL FROM hub_jobs WHERE job_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .context("failed to read hub job delivery")?;
+    let delivered = match (&gate, undelivered) {
+        (_, false) => false,
+        (Ok(_), true) => {
+            let stored = main_session_notices::insert_notice(&transaction, &notice, now)?;
+            let recorded = transaction
+                .execute(
+                    "UPDATE hub_jobs
+                     SET result_summary = ?2,
+                         delivery_state = 'delivered',
+                         delivery_notice_id = ?3,
+                         delivery_recorded_at = ?4
+                     WHERE job_id = ?1 AND delivery_state IS NULL",
+                    params![job_id, summary, stored.id, now],
+                )
+                .context("failed to record the hub job's delivered notice")?;
+            anyhow::ensure!(
+                recorded == 1,
+                "hub job `{job_id}` delivery changed during completion"
+            );
+            true
+        }
+        (Err(reason), true) => {
+            transaction
+                .execute(
+                    "UPDATE hub_jobs
+                     SET result_summary = ?2,
+                         delivery_state = 'failed',
+                         delivery_reason = ?3,
+                         delivery_recorded_at = ?4
+                     WHERE job_id = ?1 AND delivery_state IS NULL",
+                    params![job_id, summary, reason, now],
+                )
+                .context("failed to record the hub job's failed delivery")?;
+            false
+        }
+    };
+    transaction
+        .commit()
+        .context("failed to commit hub job completion")?;
+    // An idle Home sees the result as its own turn; otherwise the durable
+    // notice rides the next turn.
+    if delivered {
+        if let Err(error) = main_session_notices::deliver_pending_if_idle(
+            coven_home,
+            runtime,
+            INSTANCE_MAIN_SCOPE_KEY,
+        ) {
+            crate::daemon::append_daemon_recovery_log(
+                coven_home,
+                &format!("hub job `{job_id}` result notice stays queued: {error:#}"),
+            );
+        }
+    }
+    drop(gate);
+    Ok(())
+}
+
+/// The notice body for a completed hub job. The summary is the executor's
+/// own words and stays inside the untrusted runtime-notice framing.
+fn result_notice_text(job: &store::HubJobRecord, state: &str, summary: &str) -> String {
+    let outcome = match state {
+        "cancelled" => "was cancelled",
+        state => state,
+    };
+    let node = job
+        .assigned_node_id
+        .as_deref()
+        .map(|node_id| format!(" on node {node_id}"))
+        .unwrap_or_default();
+    format!(
+        "Hub job {} {outcome}{node}.\nSummary:\n{summary}",
+        job.job_id
+    )
 }
 
 pub fn list_routing_table(coven_home: &Path) -> Result<ApiResponse> {
@@ -2571,6 +2796,233 @@ exit 2
         assert_eq!(body["hubJobSynced"], false);
         let (_, jobs) = get(&temp, "/api/v1/hub/jobs")?;
         assert_eq!(jobs["jobs"].as_array().unwrap().len(), 0);
+        Ok(())
+    }
+
+    fn assigned_job(temp: &tempfile::TempDir, job_id: &str) -> anyhow::Result<()> {
+        register_gpu_node(temp, "node_gpu")?;
+        let (status, _) = post(
+            temp,
+            "/api/v1/hub/jobs",
+            &format!(r#"{{"jobId":"{job_id}","requiredCapabilities":["gpu"]}}"#),
+        )?;
+        assert_eq!(status, 201);
+        let (status, _) = post(temp, &format!("/api/v1/hub/jobs/{job_id}/assign"), "{}")?;
+        assert_eq!(status, 200);
+        Ok(())
+    }
+
+    fn hub_notices(temp: &tempfile::TempDir) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = crate::store::open_store(&super::store_path(temp.path()))?;
+        let mut statement = conn.prepare(
+            "SELECT id, text FROM session_notices WHERE source_kind = 'hub' ORDER BY rowid",
+        )?;
+        let notices = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(notices)
+    }
+
+    #[test]
+    fn a_result_summary_reaches_the_next_main_session_turn_once() -> anyhow::Result<()> {
+        use crate::api::handle_request_with_runtime;
+        use crate::automations::delivery::tests::HomeRuntime;
+
+        let temp = tempfile::tempdir()?;
+        std::fs::write(
+            temp.path().join("familiars.toml"),
+            "[[familiar]]\nid = \"nova\"\ndisplay_name = \"Nova\"\nrole = \"Lead\"\n\
+             description = \"Fronts Home.\"\n",
+        )?;
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?.to_string_lossy().into_owned();
+        let runtime = HomeRuntime::default();
+        let call = |method: &str, route: &str, body: Option<serde_json::Value>| {
+            let body = body.map(|body| body.to_string());
+            let response = handle_request_with_runtime(
+                method,
+                route,
+                temp.path(),
+                None,
+                body.as_deref(),
+                &runtime,
+            )
+            .unwrap();
+            (
+                response.status,
+                serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+            )
+        };
+        let (status, body) = call(
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(serde_json::json!({ "prompt": "good morning", "projectRoot": root })),
+        );
+        assert_eq!(status, 201, "{body}");
+        let home_session = body["session"]["id"].as_str().unwrap().to_owned();
+
+        // Home is mid-turn when the job returns: its result waits.
+        runtime.busy.set(true);
+        assigned_job(&temp, "job_train")?;
+        let (status, job) = call(
+            "POST",
+            "/api/v1/hub/jobs/job_train/complete",
+            Some(serde_json::json!({
+                "state": "completed",
+                "resultSummary": "  Trained 3 epochs; validation loss 0.12.  "
+            })),
+        );
+        assert_eq!(status, 200, "{job}");
+        assert_eq!(job["state"], "completed");
+        assert_eq!(
+            job["resultSummary"],
+            "Trained 3 epochs; validation loss 0.12."
+        );
+        assert_eq!(job["delivery"]["target"]["kind"], "main-session");
+        assert_eq!(job["delivery"]["state"], "delivered");
+        assert_eq!(job["delivery"]["notice"]["state"], "pending");
+        let notice_id = job["delivery"]["noticeId"].as_str().unwrap().to_owned();
+        assert!(runtime.inputs.borrow().is_empty());
+
+        // Completing again neither posts a second notice nor rewrites the first.
+        let (status, again) = call(
+            "POST",
+            "/api/v1/hub/jobs/job_train/complete",
+            Some(serde_json::json!({ "state": "completed", "resultSummary": "a retry" })),
+        );
+        assert_eq!(status, 200, "{again}");
+        assert_eq!(again["delivery"]["noticeId"], notice_id.as_str());
+        assert_eq!(again["resultSummary"], job["resultSummary"]);
+        let notices = hub_notices(&temp)?;
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].0, notice_id);
+        assert_eq!(
+            notices[0].1,
+            "Hub job job_train completed on node node_gpu.\nSummary:\nTrained 3 epochs; validation loss 0.12."
+        );
+
+        // The next turn carries the summary ahead of the user's words.
+        runtime.busy.set(false);
+        let (status, body) = call(
+            "POST",
+            "/api/v1/main-session/turn",
+            Some(serde_json::json!({ "prompt": "any news?" })),
+        );
+        assert_eq!(status, 202, "{body}");
+        let prompt = runtime.inputs.borrow().last().unwrap().clone();
+        assert!(prompt.contains(" hub:job_train]\n"), "{prompt}");
+        assert!(
+            prompt.contains("\n  Trained 3 epochs; validation loss 0.12.\n"),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("\n\nany news?"), "{prompt}");
+
+        let (status, job) = call("GET", "/api/v1/hub/jobs/job_train", None);
+        assert_eq!(status, 200, "{job}");
+        assert_eq!(job["delivery"]["notice"]["state"], "delivered");
+        assert_eq!(
+            job["delivery"]["notice"]["deliveredSessionId"],
+            home_session
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_summary_that_cannot_be_posted_still_completes_and_records_why() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        assigned_job(&temp, "job_locked")?;
+        // The inbox lock directory cannot be created where a file stands.
+        std::fs::write(temp.path().join("main-session-locks"), "not a directory")?;
+        let (status, job) = post(
+            &temp,
+            "/api/v1/hub/jobs/job_locked/complete",
+            r#"{"state":"failed","resultSummary":"out of memory"}"#,
+        )?;
+        assert_eq!(status, 200, "{job}");
+        assert_eq!(job["state"], "failed");
+        assert_eq!(job["resultSummary"], "out of memory");
+        assert_eq!(job["delivery"]["state"], "failed");
+        assert_eq!(job["delivery"]["reason"], super::INBOX_UNAVAILABLE_REASON);
+        assert_eq!(job["delivery"]["noticeId"], serde_json::Value::Null);
+        assert!(hub_notices(&temp)?.is_empty());
+
+        // Failed is final, even once the inbox is reachable again.
+        std::fs::remove_file(temp.path().join("main-session-locks"))?;
+        let (_, job) = post(
+            &temp,
+            "/api/v1/hub/jobs/job_locked/complete",
+            r#"{"state":"failed","resultSummary":"out of memory"}"#,
+        )?;
+        assert_eq!(job["delivery"]["state"], "failed");
+        assert!(hub_notices(&temp)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_delivery_record_rolls_back_the_completion_and_its_notice() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        assigned_job(&temp, "job_atomic")?;
+        let conn = crate::store::open_store(&super::store_path(temp.path()))?;
+        conn.execute_batch(
+            "CREATE TRIGGER inject_delivery_failure
+             BEFORE UPDATE OF delivery_notice_id ON hub_jobs
+             BEGIN SELECT RAISE(ABORT, 'injected delivery failure'); END;",
+        )?;
+        let body = r#"{"state":"completed","resultSummary":"done"}"#;
+        let error = handle_request_with_body(
+            "POST",
+            "/api/v1/hub/jobs/job_atomic/complete",
+            temp.path(),
+            None,
+            Some(body),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected delivery failure"),
+            "{error:#}"
+        );
+        let (_, job) = get(&temp, "/api/v1/hub/jobs/job_atomic")?;
+        assert_eq!(job["state"], "assigned", "the completion rolled back too");
+        assert_eq!(job["delivery"], serde_json::Value::Null);
+        assert!(hub_notices(&temp)?.is_empty());
+
+        conn.execute_batch("DROP TRIGGER inject_delivery_failure")?;
+        let (status, job) = post(&temp, "/api/v1/hub/jobs/job_atomic/complete", body)?;
+        assert_eq!(status, 200, "{job}");
+        assert_eq!(job["delivery"]["state"], "delivered");
+        assert_eq!(hub_notices(&temp)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_result_summary_is_validated_before_the_job_changes() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        assigned_job(&temp, "job_checked")?;
+        let oversized = "x".repeat(super::MAX_RESULT_SUMMARY_BYTES + 1);
+        for summary in [serde_json::json!("   "), serde_json::json!(oversized)] {
+            let body = serde_json::json!({ "state": "completed", "resultSummary": summary });
+            let (status, error) = post(
+                &temp,
+                "/api/v1/hub/jobs/job_checked/complete",
+                &body.to_string(),
+            )?;
+            assert_eq!(status, 400, "{error}");
+            assert_eq!(error["error"]["code"], "invalid_request");
+        }
+        let (_, job) = get(&temp, "/api/v1/hub/jobs/job_checked")?;
+        assert_eq!(job["state"], "assigned");
+        assert!(hub_notices(&temp)?.is_empty());
+
+        // Without a summary, completion is unchanged and posts nothing.
+        let (status, job) = post(
+            &temp,
+            "/api/v1/hub/jobs/job_checked/complete",
+            r#"{"state":"completed"}"#,
+        )?;
+        assert_eq!(status, 200, "{job}");
+        assert_eq!(job["resultSummary"], serde_json::Value::Null);
+        assert_eq!(job["delivery"], serde_json::Value::Null);
+        assert!(hub_notices(&temp)?.is_empty());
         Ok(())
     }
 }
