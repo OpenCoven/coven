@@ -43,7 +43,7 @@ and terminal-recovery conformance additions in this change:
 | --- | --- | --- |
 | Definitions and scheduling | Durable revisions, adopted requests, UTC/IANA schedules, DST, latest-only misfire, occurrence fences, overlap refusal | Executable rich-definition and versioned command parity, complete lifecycle publication (#1054) |
 | Scheduler recovery | Persisted retry/backoff, quarantine, stop-fence cancellation/timeout arbitration, leadership fencing, startup and definition-change wake | Complete crash-boundary matrix, storage fault injection, measured load/retention limits (#858) |
-| Portable audit | Eleven structural and nine scheduler-reliability suites in the native target; versioned vectors and independent audit-result runner | Full authority, continuity, privacy, interoperability, and release-eligibility evidence (#858) |
+| Portable audit | Eleven structural and ten scheduler-reliability suites in the native target; versioned vectors and independent audit-result runner | Full authority, continuity, privacy, interoperability, and release-eligibility evidence (#858) |
 | Authority | Exact dispatch-binding validation/persistence seam and bounded runtime projection | Trusted production Familiar/Threads/principal/approval/runtime adapters (#857) |
 | Receipts | Immutable base receipt and authority sidecar commitment, atomic run link/event, verified reopen, owner-local base read | Launched-session authenticated observation producer, accepting verifier, evidence consumption and terminal receipt construction (#857) |
 | No-launch evidence | Dispatcher-controlled refusal of an authority-unaware runtime can commit a truthful no-launch receipt through the explicit authority seam | This is not proof of a launched runtime's effects, and the production authority adapter remains unavailable |
@@ -172,3 +172,17 @@ readiness report. #1222 establishes GitHub-only work tracking. Refresh current
 issue and immutable delivery evidence before the final #854 rollup, including
 #1054 and OpenCoven/coven-runtimes#48. The source findings above retain their
 original review date and do not claim acceptance of later, unmerged work.
+
+## Command storage-lock audit boundary
+
+The `command-storage-lock-recovery` suite uses two connections to a disposable
+file-backed SQLite store. A held write lock must produce `SQLITE_BUSY` without
+writing a definition, adoption or event. Releasing that lock permits the same
+command/key to commit; closing and reopening the store must preserve one copy
+and the original replay result, event reference and commit timestamp. An
+unlocked control exercises the same command without contention.
+
+This is audit-only evidence for command-adoption lock refusal and recovery.
+It does not certify process crashes, disk-full, I/O errors, corruption,
+permission loss, runtime dispatch, or release eligibility. The zero busy wait
+belongs only to the fixture connection; production deadlines are unchanged.

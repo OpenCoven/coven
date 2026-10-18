@@ -121,6 +121,7 @@ fn capability_advertises_the_native_structural_suites() {
                     "suites": [
                         CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                         "cancellation-timeout-arbitration",
+                        "command-storage-lock-recovery",
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
                         OVERLAP_FORBID_CLAIMING_SUITE,
@@ -1902,4 +1903,87 @@ fn evaluator_rejects_malformed_vectors_with_a_static_error() {
         .unwrap_err(),
         "conformance vector is invalid"
     );
+}
+
+fn storage_lock_request() -> Value {
+    request_for_profile(
+        "scheduler_reliability",
+        "command-storage-lock-recovery",
+        serde_json::from_str(include_str!(
+            "../../../../conformance/automations/runner/command-storage-lock-recovery.vectors.json"
+        ))
+        .unwrap(),
+    )
+}
+
+#[test]
+fn storage_lock_suite_executes_real_lock_and_unlocked_control() {
+    let response = evaluate(&storage_lock_request()).unwrap();
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+}
+
+#[test]
+fn storage_lock_suite_rejects_missing_control_and_duplicate_cases() {
+    let mut missing = storage_lock_request();
+    missing["vector"]["cases"].as_array_mut().unwrap().pop();
+    assert_eq!(
+        evaluate(&missing).unwrap_err(),
+        "conformance vector is invalid"
+    );
+    let mut duplicate = storage_lock_request();
+    duplicate["vector"]["cases"][1] = duplicate["vector"]["cases"][0].clone();
+    assert_eq!(
+        evaluate(&duplicate).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn storage_lock_suite_rejects_weakened_invariant_expectations() {
+    for case_index in 0..2 {
+        for (field, wrong) in [
+            ("initialRows", json!(3)),
+            ("finalRows", json!(2)),
+            ("replayPreserved", json!(false)),
+            (
+                "initialOutcome",
+                json!(if case_index == 0 { "committed" } else { "busy" }),
+            ),
+        ] {
+            let mut request = storage_lock_request();
+            request["vector"]["cases"][case_index]["expected"][field] = wrong;
+            assert_eq!(
+                evaluate(&request).unwrap_err(),
+                "conformance vector is invalid",
+                "case {case_index}: {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn storage_lock_suite_rejects_malformed_vectors() {
+    let original = storage_lock_request();
+    let mut invalid = Vec::new();
+    let mut request = original.clone();
+    request["vector"]["schemaVersion"] = json!("unknown");
+    invalid.push(request);
+    let mut request = original.clone();
+    request["vector"]["cases"][0]["unexpected"] = json!(true);
+    invalid.push(request);
+    let mut request = original.clone();
+    request["vector"]["cases"][0]["adoptionKey"] = json!("");
+    invalid.push(request);
+    let mut request = original.clone();
+    request["vector"]["cases"][0]["definition"] = json!({});
+    invalid.push(request);
+    let mut request = original;
+    request["vector"]["cases"][0]["expected"]["initialOutcome"] = json!("any_error");
+    invalid.push(request);
+    for request in invalid {
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
 }
