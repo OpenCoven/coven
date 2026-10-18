@@ -1,3 +1,7 @@
+---
+source_adjacent_reason: "Records the runtime authority trust decisions alongside the Rust envelope and binding implementation."
+---
+
 # Coven Automations Runtime Authority: trust decisions
 
 Status: maintainer decisions recorded 2026-10-03; slices 1–3 and 5
@@ -163,6 +167,17 @@ What it does not protect against:
 - **Multiple or remote principals.** One local owner is the only principal.
   Per-principal signing keys or an external identity provider are later
   decisions.
+
+## Scoped-read direction selected on 2026-10-18
+
+Val selected a Coven-owned scoped Rust read service for the filesystem
+containment boundary. The [scoped-read design proposal](coven-automations-scoped-read-service.md)
+prepares a replacement for the native-read/no-MCP envelope below: only the
+Coven-owned service would be admitted, with exact grant enforcement in Rust.
+This is a direction for review, not a delivered adapter or a certification.
+The existing envelope text remains historical/current implementation context;
+production authority dispatch stays fail-closed until the replacement and its
+upstream gates are proven.
 
 ## How each decision fills the execution binding
 
