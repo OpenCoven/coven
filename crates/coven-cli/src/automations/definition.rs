@@ -841,7 +841,8 @@ mod tests {
     /// proof for every criterion, and every named proof is a real test.
     #[test]
     fn every_certified_target_proves_every_delivery_criterion() {
-        let proofs = include_str!("delivery.rs");
+        // A Windows checkout may carry CRLF line endings.
+        let proofs = include_str!("delivery.rs").replace("\r\n", "\n");
         assert!(!CERTIFIED_OUTPUT_TARGETS.is_empty());
         for certification in CERTIFIED_OUTPUT_TARGETS {
             for criterion in DeliveryCriterion::ALL {

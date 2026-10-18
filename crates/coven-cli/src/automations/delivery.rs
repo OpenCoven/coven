@@ -712,7 +712,10 @@ mod tests {
                 {
                     continue;
                 }
-                let source = std::fs::read_to_string(&path).unwrap();
+                // A Windows checkout may carry CRLF line endings.
+                let source = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("\r\n", "\n");
                 let production = production_source(&source);
                 for (offset, _) in production.match_indices("UPDATE automation_runs") {
                     let literal = sql_literal(&production[offset..]);
