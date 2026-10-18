@@ -39,7 +39,7 @@ Downloaded base protocol asset:
   manifest file sizes/hashes and byte equality with the exact producer commit.
   Release `SHA256SUMS` covers native archives only, not this protocol bundle.
 
-SDK main `d19fdbe3912c012b3730932d5a03eff10ba3d32d` still locks producer
+The pre-repin SDK snapshot `d19fdbe3912c012b3730932d5a03eff10ba3d32d` locked producer
 `c93a8a936f9b7f1bd070a1cbb608d38d4e13c92a` (v0.4.7), content
 `ef266d16d76d7380f5cd2b30a110b2e84f1310b154b262e0ade9aa6bf60b3445`.
 Six files differ at the selected release: `README.md`,
@@ -48,7 +48,8 @@ Six files differ at the selected release: `README.md`,
 `state-machines.json`. Re-pin through the SDK artifact verifier, including
 producer workflow/job/archive provenance; do not replace only the digest or
 substitute release asset metadata for the lock's CI artifact fields.
-**Consumer re-pinning and release behavior execution remain outstanding.**
+SDK #348 delivered this re-pinning, as recorded below. Complete SDK/Cave
+run-control acceptance remains outstanding.
 
 ## Consumer boundaries
 
@@ -59,16 +60,16 @@ phase on #857/#858. Do not expose these public methods just to satisfy a test.
 A proposed base-only test transport must retain the public API gate and be
 reviewed as such before it can count as SDK consumer evidence.
 
-Cave main `47b0cd43de11864b1189683c0b0a024318ecf3eb`,
+The earlier Cave snapshot `47b0cd43de11864b1189683c0b0a024318ecf3eb`,
 `scripts/coven-automations-release-canary.ts`, drives unversioned
 create/update/delete/get/list/runs and versioned event subscriptions. Keep this
 compatibility canary. It is not v1 command-envelope mutation coverage.
 
-Cave's release fixture at that commit already pins v0.4.10. Its existing
-lifecycle-controls continuation (OpenCoven/coven-cave#5217, comment `6246083218`)
-owns the release refresh, canonical reads and revision-aware controls on
-`feat/issue-5217-lifecycle-controls`. Preserve that ownership and incorporate
-its delivered evidence; do not create a competing Cave implementation.
+Cave's release fixture at that commit already pins v0.4.10. The earlier
+lifecycle-controls ownership record (OpenCoven/coven-cave#5217, comment `6246083218`)
+covered the release refresh, canonical reads and revision-aware controls on
+`feat/issue-5217-lifecycle-controls`. The newer delivered evidence is recorded below. Preserve owner coordination
+and do not create a competing Cave implementation.
 GitHub issue/PR discovery establishes this same-work match; private execution
 liveness was not inspected. Run controls remain outside that continuation's
 scope and gated on #857/#858/SDK #80.
@@ -82,10 +83,11 @@ release evidence appears in the checkpoint below.
 ## Behavioral matrix
 
 This is the required acceptance matrix, not a claim of shipped consumer coverage.
-The current envelope router refuses all six run-control commands below with
-`CAPABILITY_UNSUPPORTED`. Their positive cases describe flat versioned actions;
-public envelope support and consumer delivery remain gaps. Verify that each
-envelope refusal leaves execution state unchanged.
+The selected v0.4.10 release refuses all six run-control commands below over
+the envelope with `CAPABILITY_UNSUPPORTED`. Its positive cases describe flat
+versioned actions. Newer source support is recorded separately below; it does
+not change the released artifact or establish published consumer coverage.
+Verify that each released envelope refusal leaves execution state unchanged.
 
 Use isolated daemon homes and disposable projects. Collect IDs from actual
 responses, never seed lifecycle state by editing SQLite. Capture requests,
@@ -174,8 +176,10 @@ keep it open while any original acceptance item is missing or unverified.
 ## Active delivery checkpoint (2026-10-18)
 
 SDK PR #348, source `d6a75fe41b09977f0ee890e3d05c7080abcb863a`, now aligns the protocol
-lock, CI reproduction and npm daemon fixture to v0.4.10. This is unmerged work,
-not a statement about SDK main. Live provenance verification passed for CI
+lock, CI reproduction and npm daemon fixture to v0.4.10. It merged as
+`785f2a69cf0e8b621a69a4757a0866896b98f497` in
+OpenCoven/sdk#348.
+Live provenance verification passed for CI
 artifact `11868030042`, producer run `38505518198`, job `115662069315`;
 the CI-contained bundle is byte-identical to the GitHub release bundle above.
 Npm verified registry signatures and attestations for both installed packages.
@@ -194,7 +198,8 @@ corrected fixture keeps the response half-open and waits for request receipt
 before interruption; its 35 focused tests pass. All 3,160 coverage tests and
 thresholds then passed, as did typecheck, stress properties and lint. Packed
 package, contract and release-configuration checks passed. Independent review
-found no remaining findings. Exact-head CI and protected delivery are pending.
+found no remaining findings. SDK #348 is merged; its existing daemon scenario
+still does not execute run-control commands.
 
 The SDK artifact canary also passed manifest integrity, receipt-definition
 fixture binding, typechecking, duplicate delivery, out-of-order refusal and
@@ -206,3 +211,40 @@ its digest rejection was expected, and the corrected tarball invocation passed.
 The first reproduction invocation omitted required SOURCE_COMMIT and failed;
 the corrected invocation supplied the exact release commit. Neither failure
 was suppressed or treated as producer behavior evidence.
+
+## Source delivery and consumer checkpoint
+
+Keep these source changes separate from the selected published v0.4.10 daemon:
+
+| Surface | Delivery evidence | Remaining proof |
+| --- | --- | --- |
+| Retry/recovery envelopes | Coven #1312 merged as `0207d4a21bf5939959b203e87c409b5f1b209f12` | Authority-bearing behavior and exact published consumer execution |
+| Occurrence/attempt cancellation envelopes | Coven #1316 merged as `60ed9cf2d55bdc1b4b7ca9c9b7bf43c546d893d7` | Exact published consumer execution and authority acceptance |
+| Run cancellation envelope | [Coven #1323](https://github.com/OpenCoven/coven/pull/1323), head `40aa89d9930f31ca357a760c00d5eb205c449884`, remains draft | Readiness, protected delivery, published consumer execution |
+| Run-now envelope | [Coven #1335](https://github.com/OpenCoven/coven/pull/1335), head `ed57eecd42d04ec6389f6d4b031deac89725645c` | Exact-head CI, protected delivery, published consumer execution |
+
+#1335 retains immutable dispatch results and typed refusals, validates original
+attempt/session correlation, and refuses ambiguous replay without relaunching.
+Its local workspace, lint, Policy guard, and 22-suite native audit passed. The
+audit scope is `audit_only`; it does not prove production authority or released
+SDK/Cave behavior. #1323 and #1335 overlap in the router and portable vectors.
+Land sequentially, then rebase and reverify the second PR.
+
+Cave PR OpenCoven/coven-cave#6077 merged as
+`e7a5cc602a07dc996f4a5263a9386c1c3729a358` from head
+`5d37fbbaf840a30d5420e1a3bec246160f8478ba`. Its
+owner-recorded canary (Cave #5217, comment `6250720884`)
+against v0.4.10 reports two daemon starts, ten mutations, three history pages,
+four lifecycle commands, typed revision conflicts, run-now failure reporting,
+one occurrence/attempt, six feed events, and restart/resume checks. This is
+released flat compatibility evidence, not run-control envelope or Runtime
+Authority coverage. Cave #5217's owner has continued overview occurrence-state
+work on `feat/issue-5217-row-occurrences`; preserve that active lane.
+
+The scoped Rust read service design from Coven #1308 remains a review proposal.
+Run-now still dispatches with `AutomationAuthorityMode::BaseV1`; owner grants
+currently cover definition create/activate/revise, not an adopted manual run.
+Manual authorization, trusted adapter integration, exact grants, approval and
+revocation handling, verified receipts, Threads #82/#84 human review and merged
+pins, and #858 certification remain required. Do not close #1054 from the base
+command count, audit results, or flat compatibility canaries alone.

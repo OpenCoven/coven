@@ -6,13 +6,15 @@
 //! [`CommandRequest`], translated onto the producer's existing flat adapter for
 //! that command, and answered with a spec `commandResponse` in `result`.
 //! Nothing here executes on its own: every commit, replay, rejection and event
-//! comes from the existing Rust executors. Run cancellation binds the
-//! envelope's run ID to an immutable attempt/session before delegation;
-//! the flat cancellation action still requires that explicit correlation.
+//! comes from the owning Rust adapter. Run-now envelopes retain immutable
+//! dispatch results; the flat run-now API preserves its live projection.
+//! Their adoption digests are distinct to prevent cross-wire replay.
+//! Run cancellation binds the envelope's run ID to an immutable attempt/session
+//! before delegation; the flat API requires that explicit correlation.
 //!
 //! Only the envelope's supported subset is translated. A command or field the
 //! producer cannot honour is refused with `CAPABILITY_UNSUPPORTED` rather than
-//! dropped. Run-now still needs replay-contract reconciliation.
+//! dropped.
 
 use serde_json::{json, Map, Value};
 
@@ -91,7 +93,8 @@ pub(crate) fn route(
 
     if matches!(
         command,
-        CommandName::AttemptRetry
+        CommandName::OccurrenceRunNow
+            | CommandName::AttemptRetry
             | CommandName::OccurrenceRecover
             | CommandName::OccurrenceCancel
             | CommandName::AttemptCancel
@@ -213,6 +216,17 @@ fn stable_run_control(
     // Origin and intent are caller-asserted metadata, not execution authority.
     // The strict flat request structs deliberately do not accept those fields.
     let (execution, event_kind) = match command {
+        CommandName::OccurrenceRunNow => (
+            super::run_now::execute_run_now_envelope(conn, runtime, body, chrono::Utc::now()).map(
+                |answer| match answer {
+                    super::run_now::RunNowExecution::Success { payload, replayed } => {
+                        Ok((payload, replayed, None))
+                    }
+                    super::run_now::RunNowExecution::Rejected(error) => Err(error),
+                },
+            ),
+            "automations.occurrence.runNow",
+        ),
         CommandName::AttemptRetry => (
             super::attempt_retry::execute_attempt_retry(conn, body, chrono::Utc::now()).map(
                 |answer| match answer {
@@ -301,13 +315,23 @@ fn stable_run_control(
             "SELECT adopted_at FROM automation_command_adoptions
              WHERE adoption_key = ?1 AND command = ?2 AND outcome = 'committed'",
             rusqlite::params![
-                terminal
-                    .as_ref()
-                    .map(|adoption| adoption.key.as_str())
-                    .or(key.as_str()),
-                terminal
-                    .as_ref()
-                    .map_or(command_name, |adoption| adoption.command)
+                if command == CommandName::OccurrenceRunNow {
+                    Some(super::run_now::result_adoption_key(
+                        key.as_str().unwrap_or_default(),
+                    ))
+                } else {
+                    terminal
+                        .as_ref()
+                        .map(|adoption| adoption.key.clone())
+                        .or_else(|| key.as_str().map(ToOwned::to_owned))
+                },
+                if command == CommandName::OccurrenceRunNow {
+                    super::run_now::RESULT_COMMAND
+                } else {
+                    terminal
+                        .as_ref()
+                        .map_or(command_name, |adoption| adoption.command)
+                }
             ],
             |row| row.get::<_, String>(0),
         );

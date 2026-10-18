@@ -74,6 +74,9 @@
         { "if": { "properties": { "command": { "const": "events.read.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/eventsRead" } } } },
         { "if": { "properties": { "command": { "const": "events.subscribe.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/eventsSubscribe" } } } },
         { "if": { "properties": { "command": { "const": "legacy.import.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/legacyImport" } } } },
+        { "if": { "properties": { "command": { "const": "mission.submit.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/missionSubmit" } } } },
+        { "if": { "properties": { "command": { "const": "mission.get.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/missionGet" } } } },
+        { "if": { "properties": { "command": { "const": "mission.cancel.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/missionCancel" } } } },
         { "if": { "properties": { "command": { "enum": ["definition.revise.v1", "definition.activate.v1", "definition.pause.v1", "definition.disable.v1", "definition.tombstone.v1"] } } }, "then": { "required": ["expectedRevision"] }, "else": { "not": { "required": ["expectedRevision"] } } }
       ]
     },
@@ -96,7 +99,10 @@
         "definition.health.v1",
         "events.read.v1",
         "events.subscribe.v1",
-        "legacy.import.v1"
+        "legacy.import.v1",
+        "mission.submit.v1",
+        "mission.get.v1",
+        "mission.cancel.v1"
       ]
     },
     "definitionCreate": {
@@ -289,6 +295,187 @@
           "default": false,
           "description": "Report what would import, skip, and fail without writing."
         }
+      }
+    },
+    "missionId": {
+      "type": "string",
+      "pattern": "^mission-[0-9a-f]{32}$",
+      "description": "mission- followed by the first 32 hex digits of sha256(adoptionKey) of the submit that created it. Clients can derive it before the response arrives."
+    },
+    "familiarRevisionRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rootId", "revisionId"],
+      "properties": {
+        "rootId": { "type": "string", "pattern": "^familiar:[0-9a-f]{32}$" },
+        "revisionId": { "type": "string", "pattern": "^familiar-revision:[0-9a-f]{32}:(0|[1-9][0-9]{0,8})$" }
+      }
+    },
+    "missionEnvelopeRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "descriptorDigest"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", "description": "A runtime envelope the daemon advertises and enforces, such as r0-read.1." },
+        "descriptorDigest": { "$ref": "common.schema.json#/$defs/digest" }
+      }
+    },
+    "missionSubmit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["familiar", "envelope", "project", "task", "limits", "validUntil"],
+      "description": "One one-shot mission. The principal comes from the transport, never from this payload. A familiar revision that is not the root's current active revision is REVISION_CONFLICT; an envelope the daemon does not advertise and enforce is CAPABILITY_UNSUPPORTED; a validUntil already past is VALIDATION_FAILED.",
+      "properties": {
+        "familiar": { "$ref": "#/$defs/familiarRevisionRef" },
+        "envelope": { "$ref": "#/$defs/missionEnvelopeRef" },
+        "project": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cwd"],
+          "properties": {
+            "cwd": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(/|[A-Za-z]:[\\\\/])", "description": "Absolute directory. The daemon canonicalizes it and refuses one inside COVEN_HOME." }
+          }
+        },
+        "task": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["statement", "prompt"],
+          "properties": {
+            "statement": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "prompt": { "type": "string", "minLength": 1, "maxLength": 32768, "description": "At most 32 KiB of UTF-8; the daemon checks the byte length. Never echoed back in a mission view." }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["timeoutMinutes"],
+          "properties": {
+            "timeoutMinutes": { "type": "integer", "minimum": 1, "maximum": 60 }
+          }
+        },
+        "validUntil": { "$ref": "common.schema.json#/$defs/timestamp", "description": "Dispatch must begin before this instant, at most 15 minutes after the request. A mission still queued then settles rejected with reason expired_before_dispatch." }
+      }
+    },
+    "missionGet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["missionId"],
+      "properties": {
+        "missionId": { "$ref": "#/$defs/missionId" }
+      }
+    },
+    "missionCancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["missionId"],
+      "properties": {
+        "missionId": { "$ref": "#/$defs/missionId" },
+        "reason": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "missionState": {
+      "enum": ["queued", "running", "needs_approval", "cancelling", "reconciling", "completed", "failed", "cancelled", "rejected", "revoked", "unavailable"],
+      "description": "The daemon's projection of the mission's occurrence, run, attempt and cancellation records. needs_approval is reserved and not produced while only read envelopes launch. submitted and acknowledged are client states and never appear here."
+    },
+    "missionReason": {
+      "enum": ["timeout", "harness_failed", "familiar_revision_stale", "familiar_revision_revoked", "grant_revoked", "envelope_unsupported", "expired_before_dispatch", "authority_unavailable", "runtime_unavailable", "ambiguous_execution"]
+    },
+    "missionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "settledAt", "artifacts", "usage", "observation"],
+      "properties": {
+        "outcome": { "enum": ["completed", "failed", "cancelled", "rejected", "revoked", "unavailable"] },
+        "settledAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "resultDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "artifacts": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "ref", "mediaType", "bytes", "digest"],
+            "properties": {
+              "kind": { "enum": ["report"] },
+              "ref": { "type": "string", "minLength": 1, "maxLength": 200 },
+              "mediaType": { "const": "text/markdown" },
+              "bytes": { "type": "integer", "minimum": 0, "maximum": 262144 },
+              "digest": { "$ref": "common.schema.json#/$defs/digest" }
+            }
+          }
+        },
+        "usage": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source"],
+              "properties": {
+                "source": { "const": "harness_result_event" },
+                "inputTokens": { "type": "integer", "minimum": 0 },
+                "outputTokens": { "type": "integer", "minimum": 0 },
+                "cacheReadTokens": { "type": "integer", "minimum": 0 },
+                "cacheWriteTokens": { "type": "integer", "minimum": 0 },
+                "costUsd": { "type": "number", "minimum": 0 }
+              }
+            }
+          ],
+          "description": "Reported by the harness's result event, never estimated; null when the harness reports none."
+        },
+        "observation": { "enum": ["complete", "partial", "unknown"] }
+      }
+    },
+    "missionView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["missionId", "occurrenceId", "revision", "state", "terminal", "principal", "familiar", "envelope", "project", "task", "submittedAt", "validUntil", "attempts"],
+      "description": "Result of mission.submit.v1 (as mission), mission.get.v1 and mission.cancel.v1 (as mission). The prompt is never echoed.",
+      "properties": {
+        "missionId": { "$ref": "#/$defs/missionId" },
+        "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+        "revision": { "type": "integer", "minimum": 1, "description": "Increases on every state change and stops at the terminal state." },
+        "state": { "$ref": "#/$defs/missionState" },
+        "terminal": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/missionReason" },
+        "principal": { "$ref": "common.schema.json#/$defs/principalRef" },
+        "familiar": { "$ref": "#/$defs/familiarRevisionRef" },
+        "envelope": { "$ref": "#/$defs/missionEnvelopeRef" },
+        "project": { "$ref": "#/$defs/missionSubmit/properties/project" },
+        "task": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["statement"],
+          "properties": { "statement": { "type": "string", "minLength": 1, "maxLength": 200 } }
+        },
+        "submittedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "validUntil": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "attempts": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["attemptId", "attemptNumber", "state"],
+            "properties": {
+              "attemptId": { "$ref": "common.schema.json#/$defs/attemptId" },
+              "attemptNumber": { "type": "integer", "minimum": 1, "maximum": 10 },
+              "state": { "enum": ["adopted", "dispatching", "started", "observing", "succeeded", "failed", "cancelled", "timed_out", "ambiguous"] },
+              "failureClass": { "type": "string", "minLength": 1, "maxLength": 64 }
+            }
+          }
+        },
+        "cancellation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cancellationId", "requestedAt", "outcome"],
+          "properties": {
+            "cancellationId": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "requestedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+            "outcome": { "enum": ["cancelled", "pending", "lost_to_completion", "recovery_required"] }
+          }
+        },
+        "result": { "$ref": "#/$defs/missionResult" }
       }
     },
     "streamRef": {

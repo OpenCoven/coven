@@ -408,6 +408,94 @@ mod tests {
         }));
     }
 
+    fn mission_command(command: &str, payload: Value) -> Value {
+        let mut envelope = fixture("command.create.golden");
+        envelope["command"] = json!(command);
+        envelope["payload"] = payload;
+        envelope
+    }
+
+    fn mission_submit_payload() -> Value {
+        json!({
+            "familiar": {
+                "rootId": format!("familiar:{}", "a".repeat(32)),
+                "revisionId": format!("familiar-revision:{}:2", "a".repeat(32))
+            },
+            "envelope": {
+                "id": "r0-read.1",
+                "descriptorDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "b".repeat(64)
+                }
+            },
+            "project": {"cwd": "/srv/project"},
+            "task": {"statement": "Diagnose the failing build.", "prompt": "Why does CI fail?"},
+            "limits": {"timeoutMinutes": 30},
+            "validUntil": "2026-10-18T12:15:00.000Z"
+        })
+    }
+
+    #[test]
+    fn mission_commands_round_trip_and_hold_their_bounds() {
+        let mission_id = format!("mission-{}", "c".repeat(32));
+        assert_round_trip::<CommandRequest>(mission_command(
+            "mission.submit.v1",
+            mission_submit_payload(),
+        ));
+        assert_round_trip::<CommandRequest>(mission_command(
+            "mission.get.v1",
+            json!({ "missionId": mission_id }),
+        ));
+        assert_round_trip::<CommandRequest>(mission_command(
+            "mission.cancel.v1",
+            json!({ "missionId": mission_id, "reason": "No longer needed." }),
+        ));
+        let mut windows = mission_submit_payload();
+        windows["project"]["cwd"] = json!("C:\\work\\project");
+        assert_round_trip::<CommandRequest>(mission_command("mission.submit.v1", windows));
+
+        let refused = |pointer: &str, value: Value| {
+            let mut payload = mission_submit_payload();
+            *payload.pointer_mut(pointer).unwrap() = value;
+            serde_json::from_value::<CommandRequest>(mission_command("mission.submit.v1", payload))
+                .is_err()
+        };
+        assert!(refused("/familiar/rootId", json!("familiar:short")));
+        assert!(refused(
+            "/familiar/rootId",
+            json!(format!("familiar:{}", "A".repeat(32)))
+        ));
+        assert!(refused(
+            "/familiar/revisionId",
+            json!(format!("familiar-revision:{}:01", "a".repeat(32)))
+        ));
+        assert!(refused("/envelope/id", json!(".hidden")));
+        assert!(refused("/project/cwd", json!("relative/dir")));
+        assert!(refused("/task/statement", json!("")));
+        assert!(refused("/task/prompt", json!("é".repeat(16_385))));
+        assert!(refused("/limits/timeoutMinutes", json!(61)));
+        assert!(refused("/limits/timeoutMinutes", json!(0)));
+        assert!(refused("/validUntil", json!("tomorrow")));
+
+        let mut principal = mission_submit_payload();
+        principal["principal"] = json!({"principalId": "someone"});
+        assert!(serde_json::from_value::<CommandRequest>(mission_command(
+            "mission.submit.v1",
+            principal
+        ))
+        .is_err());
+        assert!(serde_json::from_value::<CommandRequest>(mission_command(
+            "mission.get.v1",
+            json!({ "missionId": "mission:abc" })
+        ))
+        .is_err());
+        let mut with_revision =
+            mission_command("mission.get.v1", json!({ "missionId": mission_id }));
+        with_revision["expectedRevision"] = json!(1);
+        assert!(serde_json::from_value::<CommandRequest>(with_revision).is_err());
+    }
+
     #[test]
     fn command_payloads_and_expected_revisions_are_command_correlated() {
         let mut wrong_payload = fixture("command.create.golden");

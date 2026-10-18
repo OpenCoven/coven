@@ -164,7 +164,7 @@ fn store_home(conn: &Connection) -> Option<PathBuf> {
 
 /// The session's recorded output in order, and whether it differs from what
 /// the harness emitted, because some was dropped under pressure or redacted.
-fn session_output(conn: &Connection, session_id: &str) -> Result<(String, bool)> {
+pub(crate) fn session_output(conn: &Connection, session_id: &str) -> Result<(String, bool)> {
     let mut statement = conn
         .prepare(
             "SELECT kind, payload_json, redaction_status FROM events

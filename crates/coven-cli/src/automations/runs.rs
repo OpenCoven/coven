@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use super::definition::OutputTarget;
+
 pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_runs (
         id TEXT PRIMARY KEY NOT NULL,
@@ -32,6 +34,13 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         started_at TEXT NOT NULL,
         timeout_at TEXT,
         finished_at TEXT,
+        delivery_target TEXT,
+        delivery_state TEXT CHECK (
+            delivery_state IS NULL OR delivery_state IN ('pending', 'delivered', 'failed')
+        ),
+        delivery_notice_id TEXT,
+        delivery_reason TEXT,
+        delivery_recorded_at TEXT,
         FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE SET NULL
     );
 
@@ -160,6 +169,19 @@ pub struct RunRecord {
     pub started_at: String,
     pub timeout_at: Option<String>,
     pub finished_at: Option<String>,
+    pub delivery: Option<RunDelivery>,
+}
+
+/// A run's output delivery record (coven#1179). `pending` is the obligation
+/// settlement commits with the terminal status; `delivered` names the
+/// artifact (a main-session notice); `failed` says why there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunDelivery {
+    pub target: String,
+    pub state: String,
+    pub notice_id: Option<String>,
+    pub reason: Option<String>,
+    pub recorded_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +362,17 @@ pub fn record_run_finish(
             }
         })
         .filter(|log| !log.is_empty());
+    // The delivery obligation rides in the same guarded UPDATE as the
+    // terminal status, so every terminal path records it atomically.
+    let obligation = pinned_delivery_obligation(conn, run_id)?;
+    let (delivery_target, delivery_state, delivery_reason) = match &obligation {
+        Some(obligation) => (
+            Some(obligation.target.as_str()),
+            Some(obligation.state),
+            obligation.reason,
+        ),
+        None => (None, None, None),
+    };
     let changed = conn
         .execute(
             "UPDATE automation_runs
@@ -348,7 +381,11 @@ pub fn record_run_finish(
                  session_id = ?4,
                  log_json = ?5,
                  output_commit = ?6,
-                 finished_at = ?7
+                 finished_at = ?7,
+                 delivery_target = ?8,
+                 delivery_state = ?9,
+                 delivery_reason = ?10,
+                 delivery_recorded_at = CASE WHEN ?9 IS NULL THEN NULL ELSE ?7 END
              WHERE id = ?1 AND status = 'running'",
             params![
                 run_id,
@@ -357,17 +394,93 @@ pub fn record_run_finish(
                 session_id,
                 bounded_log,
                 output_commit,
-                iso(now)
+                iso(now),
+                delivery_target,
+                delivery_state,
+                delivery_reason
             ],
         )
         .context("failed to record run finish")?;
     Ok(changed > 0)
 }
 
+struct DeliveryObligation {
+    target: String,
+    state: &'static str,
+    reason: Option<&'static str>,
+}
+
+/// The delivery the run's pinned definition asks for. Only the revision the
+/// run started under counts (the `Pinned` criterion): a later revision or a
+/// deleted routine cannot redirect or drop it. A pinned target that is not
+/// certified is recorded `failed` rather than silently ignored.
+fn pinned_delivery_obligation(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<DeliveryObligation>> {
+    let definition_json: Option<String> = conn
+        .query_row(
+            "SELECT definition_json FROM automation_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read the run's pinned definition")?
+        .flatten();
+    let Some(definition) = definition_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(target) = definition
+        .get("outputTarget")
+        .filter(|target| !target.is_null())
+    else {
+        return Ok(None);
+    };
+    let certified = serde_json::from_value::<OutputTarget>(target.clone())
+        .ok()
+        .and_then(|target| target.certified())
+        .filter(|target| target.kind.is_certified());
+    Ok(Some(match certified {
+        Some(target) => DeliveryObligation {
+            target: target.kind.as_str().to_owned(),
+            state: "pending",
+            reason: None,
+        },
+        None => DeliveryObligation {
+            target: "uncertified".to_owned(),
+            state: "failed",
+            reason: Some("the pinned outputTarget is not a certified delivery target"),
+        },
+    }))
+}
+
 const RUN_COLUMNS: &str =
     "id, automation_id, automation_revision, definition_digest, occurrence_id,
      receipt_id, session_id, familiar_id, runtime, status, exit_code, log_json,
-     output_commit, started_at, timeout_at, finished_at";
+     output_commit, started_at, timeout_at, finished_at, delivery_target,
+     delivery_state, delivery_notice_id, delivery_reason, delivery_recorded_at";
+
+/// Reads the delivery columns starting at `first`, in `RUN_COLUMNS` order.
+pub(crate) fn run_delivery_from_row(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+) -> rusqlite::Result<Option<RunDelivery>> {
+    let target: Option<String> = row.get(first)?;
+    let state: Option<String> = row.get(first + 1)?;
+    let (Some(target), Some(state)) = (target, state) else {
+        return Ok(None);
+    };
+    Ok(Some(RunDelivery {
+        target,
+        state,
+        notice_id: row.get(first + 2)?,
+        reason: row.get(first + 3)?,
+        recorded_at: row.get(first + 4)?,
+    }))
+}
 
 fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     Ok(RunRecord {
@@ -393,7 +506,18 @@ fn run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         started_at: row.get(13)?,
         timeout_at: row.get(14)?,
         finished_at: row.get(15)?,
+        delivery: run_delivery_from_row(row, 16)?,
     })
+}
+
+pub(crate) fn get_run(conn: &Connection, run_id: &str) -> Result<Option<RunRecord>> {
+    conn.query_row(
+        &format!("SELECT {RUN_COLUMNS} FROM automation_runs WHERE id = ?1"),
+        [run_id],
+        run_record_from_row,
+    )
+    .optional()
+    .context("failed to read run")
 }
 
 pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<Vec<RunRecord>> {
@@ -640,6 +764,54 @@ pub fn ensure_timeout_column(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN definition_json TEXT")
             .context("failed to add automation_runs.definition_json")?;
     }
+    Ok(())
+}
+
+/// Adds the output delivery record (coven#1179) to stores created before it.
+/// A settled record (`delivered` or `failed`) is immutable, so a replayed
+/// discharge can neither re-point a run at a second notice nor erase one.
+pub fn ensure_delivery_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(automation_runs)")
+        .context("failed to inspect automation_runs delivery columns")?
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query automation_runs delivery columns")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read automation_runs delivery columns")?;
+    for (column, definition) in [
+        ("delivery_target", "delivery_target TEXT"),
+        (
+            "delivery_state",
+            "delivery_state TEXT CHECK (
+                delivery_state IS NULL OR delivery_state IN ('pending', 'delivered', 'failed')
+            )",
+        ),
+        ("delivery_notice_id", "delivery_notice_id TEXT"),
+        ("delivery_reason", "delivery_reason TEXT"),
+        ("delivery_recorded_at", "delivery_recorded_at TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE automation_runs ADD COLUMN {definition}"
+            ))
+            .with_context(|| format!("failed to add automation_runs.{column}"))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_automation_runs_delivery_pending
+             ON automation_runs(finished_at, id)
+             WHERE delivery_state = 'pending';
+
+         CREATE TRIGGER IF NOT EXISTS automation_run_delivery_settled_immutable
+         BEFORE UPDATE OF delivery_target, delivery_state, delivery_notice_id,
+                          delivery_reason, delivery_recorded_at
+         ON automation_runs
+         WHEN OLD.delivery_state IN ('delivered', 'failed')
+         BEGIN
+             SELECT RAISE(ABORT, 'settled automation run delivery is immutable');
+         END;",
+    )
+    .context("failed to install automation run delivery guards")?;
     Ok(())
 }
 

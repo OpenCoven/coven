@@ -361,6 +361,7 @@ fn prompt_and_log_reads_require_owner_ipc() -> Result<()> {
 #[test]
 fn run_control_envelopes_are_refused_before_tcp_store_access() -> Result<()> {
     for (command, payload) in [
+        ("occurrence.runNow.v1", json!({"automationId": "notes"})),
         (
             "attempt.retry.v1",
             json!({"runId": "run-1", "priorAttemptNumber": 1, "priorDisposition": "failed"}),

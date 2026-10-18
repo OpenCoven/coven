@@ -1,6 +1,6 @@
 //! Executable status of every `coven.automations.v1` command (coven#1054).
 //!
-//! The command envelope names nineteen versioned commands. This producer
+//! The command envelope names twenty-two versioned commands. This producer
 //! dispatches some of them as `coven.automations.<command>` control actions,
 //! covers some only through an unversioned legacy action that takes no caller
 //! adoption key or expected revision, and implements the rest not at all. A versioned
@@ -18,10 +18,8 @@ pub enum CommandSupport {
     // the category stays for a command whose legacy action outlives it.
     #[allow(dead_code)]
     CompatibilityOnly { legacy_action: &'static str },
-    /// Refused; nothing in this producer performs it.
-    // Every v1 command is implemented since `attempt.retry.v1` landed; the
-    // category stays for a command a later contract revision adds.
-    #[allow(dead_code)]
+    /// Refused; nothing in this producer performs it yet. The mission
+    /// commands (#1313) are in the contract ahead of their implementation.
     Unsupported,
 }
 
@@ -55,6 +53,9 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
     entry("events.read.v1", Implemented),
     entry("events.subscribe.v1", Implemented),
     entry("legacy.import.v1", Implemented),
+    entry("mission.submit.v1", Unsupported),
+    entry("mission.get.v1", Unsupported),
+    entry("mission.cancel.v1", Unsupported),
 ];
 
 /// Versioned read actions this producer adds outside the command enum. They
@@ -162,14 +163,15 @@ mod tests {
 
     #[test]
     fn refuses_only_versioned_names_that_are_not_implemented() {
-        // Every v1 command is implemented, so no versioned name is refused.
         for entry in COMMAND_MATRIX {
-            assert!(
-                refused_command(&action_name(entry.command)).is_none(),
+            assert_eq!(
+                refused_command(&action_name(entry.command)).is_some(),
+                entry.support != Implemented,
                 "{}",
                 entry.command
             );
         }
+        assert!(refused_command("coven.automations.mission.submit.v1").is_some());
         assert!(refused_command("coven.automations.definition.revise.v1").is_none());
         assert!(refused_command("coven.automations.update").is_none());
         assert!(refused_command("attempt.retry.v1").is_none());

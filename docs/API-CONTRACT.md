@@ -1147,9 +1147,10 @@ The prelude is explicit, untrusted framing. Each notice is wrapped as
 
 under a fixed header that says the notices came from daemon components, not
 the user. Notice bodies are sanitized before rendering: control characters
-other than newline and tab are dropped, and any body line that imitates the
-framing is escaped, so a notice can neither close its own block early nor open
-another. The user's text follows the prelude verbatim. A notice is never
+other than newline and tab are dropped, Unicode line and paragraph separators
+count as line breaks, and any body line that imitates the framing is escaped,
+so a notice can neither close its own block early nor open another. A source
+id, which is rendered into the framing line, is limited to `[A-Za-z0-9._:-]`. The user's text follows the prelude verbatim. A notice is never
 presented as user or system text.
 
 Pending notices are capped at 20 per scope: a 21st pending notice drops the
@@ -1157,6 +1158,67 @@ oldest. A notice posted with a `context_key` replaces any pending notice with
 the same key, so a source that reports repeatedly on one subject leaves only
 its latest word. Delivered notices are kept as history and are never
 replaced or capped away. Notice bodies are limited to 16 KiB.
+
+#### Automation results
+
+A routine whose definition carries `"outputTarget": {"kind": "main-session"}`
+delivers each settled run's result into the instance main scope
+(`instance:main`). It is the first target certified against the atomic
+delivery bar written in `crates/coven-cli/src/automations/definition.rs`
+(`DeliveryCriterion`), and every criterion names its proving test:
+
+- The target is read from the run's pinned definition revision, so a later
+  revision or a deleted routine cannot redirect or drop a settled result.
+- Settlement records the obligation (`delivery.state` `pending`) in the same
+  transaction as the run's terminal status, on every terminal path.
+- The automation scheduler then inserts one notice (`source_kind`
+  `automation`, `source_id` the run id) and records `delivered` with its
+  `noticeId` in one transaction, under the scope gate. A replay converges on
+  that one notice. When Home's stream process is idle the notice arrives as
+  its own turn; otherwise the next turn carries it.
+- A result never evicts another undelivered notice: while the scope already
+  holds 20 pending notices the run stays `pending`, and it posts once a turn
+  drains the inbox.
+- A result that cannot be delivered records `failed` with a `reason`, and a
+  run whose result cannot be read fails alone without holding back later
+  runs. Delivered and failed records are immutable.
+
+The notice body names the routine, run, outcome, any receipt id, the failure
+reason for an unsuccessful run, and at most the last 4 KiB of the run's clean
+(unredacted) output. Runs of every terminal status deliver. Every other
+`outputTarget` value, including the reserved file-path string, is still
+refused, and no per-familiar or other-principal scope is a target until runs
+bind principal authority (#857).
+
+Run reads (`coven.automations.runs`, `coven.automations.run.history.v1`,
+`coven.automations.run.get.v1` and `coven.automations.occurrence.get.v1`)
+carry an additive `delivery` member on runs that asked for one:
+
+```json
+"delivery": {
+  "target": { "kind": "main-session" },
+  "state": "delivered",
+  "noticeId": "4f9c…",
+  "reason": null,
+  "recordedAt": "2026-10-18T09:00:05.000Z",
+  "notice": {
+    "state": "delivered",
+    "scopeKey": "instance:main",
+    "deliveredAt": "2026-10-18T09:12:40.000Z",
+    "deliveredSessionId": "session-…"
+  }
+}
+```
+
+`notice.state` is `pending` until a main-session turn carries the notice,
+`delivered` once one has, and `dropped` if the pending cap evicted it unread.
+
+#### Hub job results
+
+`POST /api/v1/hub/jobs/:jobId/complete` with a `resultSummary` posts the
+summary into the same scope, at most once per job, and records the delivery on
+the job (see the hub routes below). The notice body names the job, its outcome
+and its node, followed by the summary as the executor wrote it.
 
 ## Psyche execution binding contract (`v1`)
 
@@ -2523,6 +2585,20 @@ If no registered node qualifies, the call returns `409 no_available_node` and th
 ### `POST /api/v1/hub/jobs/:jobId/complete`
 
 Marks a job terminal (`{ "state": "completed" | "failed" | "cancelled" }`, defaulting to `completed`), removes it from its executor subqueue, and refreshes the node's queue pressure. Terminal jobs cannot be reassigned (`409 job_not_assignable`).
+
+An optional `resultSummary` (at most 8 KiB after trimming; an empty or longer
+value is `400 invalid_request` and changes nothing) is posted once into the
+instance main session as a notice with `source_kind` `hub` and `source_id` the
+job id. Under the main-session scope gate, the terminal state, the notice, and
+the job's `delivered` record with its `noticeId` commit in one transaction.
+If the notice cannot be posted, or posting would evict an undelivered notice
+(the scope already holds 20 pending), the job still completes and its delivery
+is recorded `failed` with a `reason`. A job id outside `[A-Za-z0-9._:-]`
+cannot name a notice, so its summary is recorded `failed` the same way. A job delivers at most once: a repeated
+completion keeps the first summary and notice. The job body from this route
+and from `GET /api/v1/hub/jobs/:jobId` carries `resultSummary` and `delivery`
+(both `null` until a completion supplies a summary), in the same shape as an
+automation run's `delivery`, including the notice's fate.
 
 ### `GET /api/v1/hub/routing`
 

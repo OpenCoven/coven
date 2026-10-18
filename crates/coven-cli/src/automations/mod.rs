@@ -20,6 +20,7 @@ mod conformance_target_tests;
 pub mod contract;
 pub mod daemon_tick;
 pub mod definition;
+pub mod delivery;
 pub mod diagnostics;
 // Role keys for the daemon's Runtime Authority signers; no production caller
 // until the trusted adapter lands (coven#857).

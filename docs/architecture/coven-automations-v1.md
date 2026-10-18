@@ -350,20 +350,22 @@ This producer does not implement the whole catalog. `automations/command_matrix.
 | `events.read.v1` | implemented | `coven.automations.events.read.v1` |
 | `events.subscribe.v1` | implemented | `coven.automations.events.subscribe.v1` |
 | `legacy.import.v1` | implemented | `coven.automations.legacy.import.v1` |
+| `mission.submit.v1` | unsupported | none |
+| `mission.get.v1` | unsupported | none |
+| `mission.cancel.v1` | unsupported | none |
 
 #### Command envelope over the control-action wire
 
-`coven.automations.command.v1` carries a spec `commandEnvelope` on the control-action wire as `{ "action": "coven.automations.command.v1", "envelope": { ... } }`. The envelope is validated as a typed `CommandRequest` (schema version, command name, adoption key, `expectedRevision` exactly where required, origin, intent and the command's payload), translated onto the producer's existing adapter for that command, and answered with a spec `commandResponse` in `result`. That response is validated in tests against `command-envelope.schema.json#/$defs/commandResponse`. Commits, replays, rejections and events all come from the same adapter as the flat action. Except for run cancellation, compatible request bodies replay identically on either wire. Run cancellation has separate request identities: the envelope resolves a run ID into a retained attempt/session binding, while the flat action requires explicit correlation. Reusing its adoption key across those request shapes is `ADOPTION_REPLAY_MISMATCH`. A rejection is `outcome: "rejected"` with the typed error, never an accepted wrapper around a failure.
+`coven.automations.command.v1` carries a spec `commandEnvelope` on the control-action wire as `{ "action": "coven.automations.command.v1", "envelope": { ... } }`. The envelope is validated as a typed `CommandRequest` (schema version, command name, adoption key, `expectedRevision` exactly where required, origin, intent and the command's payload), translated onto the producer's existing adapter for that command, and answered with a spec `commandResponse` in `result`. That response is validated in tests against `command-envelope.schema.json#/$defs/commandResponse`. Commits, replays, rejections and events all come from the same adapter as the flat action. Except for run-now and run cancellation, compatible request bodies replay identically on either wire. Run-now envelopes retain the immutable first dispatch result, while the flat API projects current state; their adoption digests are separate. Run cancellation also has separate request identities: the envelope resolves a run ID into a retained attempt/session binding, while the flat action requires explicit correlation. Reusing a run-now or run-cancel adoption key across its envelope and flat request shapes is `ADOPTION_REPLAY_MISMATCH`. A rejection is `outcome: "rejected"` with the typed error, never an accepted wrapper around a failure.
 
 The envelope translates:
 
 - the adopted mutations `definition.create.v1` and `.revise.v1` with rich bodies (below), `definition.activate.v1`, `.pause.v1`, `.disable.v1`, `.tombstone.v1` and `legacy.import.v1`;
-- run controls `attempt.retry.v1`, `occurrence.recover.v1`, `occurrence.cancel.v1`, `attempt.cancel.v1` and `run.cancel.v1`, through the existing Rust executors;
+- run controls `occurrence.runNow.v1`, `attempt.retry.v1`, `occurrence.recover.v1`, `occurrence.cancel.v1`, `attempt.cancel.v1` and `run.cancel.v1`, through the existing Rust executors;
 - the queries `definition.list.v1`, `definition.get.v1`, `definition.health.v1`, `run.history.v1`, `events.read.v1` and `events.subscribe.v1`. Queries answer `outcome: "committed"` on every request; their adoption key is echoed but not stored.
 
 The envelope refuses with `CAPABILITY_UNSUPPORTED`, before any write:
 
-- `occurrence.runNow.v1`, pending reconciliation of its pre-launch adoption and post-dispatch result;
 - the matrix's unimplemented commands;
 - any payload field the adapter does not implement: list `limit`, `cursor` or a `lifecycleState` other than `all`; get `revision`; tombstone `reason`.
 
@@ -461,7 +463,8 @@ Deterministic failure injection certifies the currently implemented durability b
 | Runtime dispatch request and session creation | `durable_launch_failure_rolls_back_session_run_and_attempt` proves failed attempt persistence leaves no orphan session, run, or attempt and terminalizes the manual occurrence with the exact refusal. |
 | First runtime ownership publication | Retained/publication-error and terminal-before-publication tests preserve nonterminal ambiguity or reconcile durable terminal session evidence without replay. |
 | Runtime terminal observation and run settlement | `terminal_settlement_failure_rolls_back_and_retries_from_session_evidence` proves occurrence, attempt, and run settlement is atomic and repeatable from the unchanged terminal session record. |
-| Delivery temp write and rename/commit | Not executable in v1: durable definitions still reject `outputTarget` until atomic delivery is certified. No release may claim these boundaries while that capability remains refused. |
+| Main-session result delivery | The flat `outputTarget: {"kind": "main-session"}` is the first target certified against the atomic delivery bar in `definition.rs` (`DeliveryCriterion`, #1179). `every_terminal_path_records_the_obligation_with_the_run_status` and `a_rolled_back_settlement_leaves_no_obligation` prove the obligation commits with the terminal status; `a_failed_discharge_rolls_back_the_notice_with_the_record` and `a_replayed_delivery_converges_on_one_notice` prove the notice and its `delivered` record commit together exactly once. |
+| Delivery temp write and rename/commit | Not executable in v1: file-path targets, flat or `policies.delivery`, remain refused until a file target clears the same bar. No release may claim these boundaries while that capability remains refused. |
 | Receipt commit | The receipt component proves atomic immutable commit, replay convergence, exact terminal correlation, and rollback on event failure. Production terminal receipt wiring remains tracked by #857 and is not implied by component tests. |
 | Event/changefeed publication | Gapless sequence, duplicate-id refusal, definition mutation rollback, and receipt rollback tests prove event publication cannot commit apart from its owning domain mutation. |
 

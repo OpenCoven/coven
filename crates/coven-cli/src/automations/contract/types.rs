@@ -393,6 +393,67 @@ fn matches_error_message(value: &str) -> bool {
     has_character_length(value, 1, 1_000)
 }
 
+fn matches_mission_id(value: &str) -> bool {
+    matches_prefixed_hex(value, "mission-")
+}
+
+fn matches_familiar_root_id(value: &str) -> bool {
+    matches_prefixed_hex(value, "familiar:")
+}
+
+fn matches_familiar_revision_id(value: &str) -> bool {
+    let Some((root, position)) = value
+        .strip_prefix("familiar-revision:")
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    is_lower_hex(root, 32)
+        && (position == "0"
+            || (!position.is_empty()
+                && position.len() <= 9
+                && !position.starts_with('0')
+                && position.bytes().all(|byte| byte.is_ascii_digit())))
+}
+
+fn matches_envelope_id(value: &str) -> bool {
+    matches_identifier(value, 64)
+}
+
+fn matches_mission_statement(value: &str) -> bool {
+    has_character_length(value, 1, 200)
+}
+
+/// At most 32 KiB of UTF-8. The schema's maxLength counts characters; the
+/// daemon holds the byte length.
+fn matches_mission_prompt(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 32_768
+}
+
+/// An absolute directory, POSIX or Windows. The daemon canonicalizes it.
+fn matches_mission_directory(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.chars().count() <= 1_024
+        && (bytes.first() == Some(&b'/')
+            || (bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/')))
+}
+
+fn matches_prefixed_hex(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|hex| is_lower_hex(hex, 32))
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 validated_string!(Timestamp, matches_timestamp);
 validated_string!(AutomationId, matches_automation_id);
 validated_string!(OccurrenceId, matches_entity_id);
@@ -449,6 +510,13 @@ validated_string!(Checkpoint, matches_checkpoint);
 validated_string!(TransitionState, matches_transition_state);
 validated_string!(TransitionReason, matches_transition_reason);
 validated_string!(ErrorMessage, matches_error_message);
+validated_string!(MissionId, matches_mission_id);
+validated_string!(FamiliarRootId, matches_familiar_root_id);
+validated_string!(FamiliarRevisionId, matches_familiar_revision_id);
+validated_string!(EnvelopeId, matches_envelope_id);
+validated_string!(MissionStatement, matches_mission_statement);
+validated_string!(MissionPrompt, matches_mission_prompt);
+validated_string!(MissionDirectory, matches_mission_directory);
 
 macro_rules! validated_integer {
     ($name:ident, $minimum:expr, $maximum:expr) => {
@@ -495,6 +563,7 @@ validated_integer!(SafeInteger, 0, 9_007_199_254_740_991);
 validated_integer!(TimeoutMinutes, 1, 44_640);
 validated_integer!(MaximumAttempts, 1, 10);
 validated_integer!(BackoffSeconds, 1, 86_400);
+validated_integer!(MissionTimeoutMinutes, 1, 60);
 validated_integer!(LeaseMinutes, 1, 1_440);
 validated_integer!(RunAttemptCount, 1, 100);
 validated_integer!(CommandListLimit, 1, 100);
@@ -2334,6 +2403,12 @@ pub enum CommandName {
     EventsSubscribe,
     #[serde(rename = "legacy.import.v1")]
     LegacyImport,
+    #[serde(rename = "mission.submit.v1")]
+    MissionSubmit,
+    #[serde(rename = "mission.get.v1")]
+    MissionGet,
+    #[serde(rename = "mission.cancel.v1")]
+    MissionCancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2466,6 +2541,9 @@ pub enum CommandPayload {
     EventsRead(EventsReadPayload),
     EventsSubscribe(EventsSubscribePayload),
     LegacyImport(LegacyImportPayload),
+    MissionSubmit(MissionSubmitPayload),
+    MissionGet(MissionGetPayload),
+    MissionCancel(MissionCancelPayload),
 }
 
 impl CommandPayload {
@@ -2512,6 +2590,9 @@ impl CommandPayload {
                 Ok(Self::EventsSubscribe(serde_json::from_value(value)?))
             }
             CommandName::LegacyImport => Ok(Self::LegacyImport(serde_json::from_value(value)?)),
+            CommandName::MissionSubmit => Ok(Self::MissionSubmit(serde_json::from_value(value)?)),
+            CommandName::MissionGet => Ok(Self::MissionGet(serde_json::from_value(value)?)),
+            CommandName::MissionCancel => Ok(Self::MissionCancel(serde_json::from_value(value)?)),
         }
     }
 
@@ -2537,6 +2618,9 @@ impl CommandPayload {
             Self::EventsRead(_) => CommandName::EventsRead,
             Self::EventsSubscribe(_) => CommandName::EventsSubscribe,
             Self::LegacyImport(_) => CommandName::LegacyImport,
+            Self::MissionSubmit(_) => CommandName::MissionSubmit,
+            Self::MissionGet(_) => CommandName::MissionGet,
+            Self::MissionCancel(_) => CommandName::MissionCancel,
         }
     }
 
@@ -2795,6 +2879,70 @@ pub struct LegacyImportPayload {
         skip_serializing_if = "Option::is_none"
     )]
     pub dry_run: Option<bool>,
+}
+
+/// One owner-submitted, one-shot mission (#1313). The principal comes from the
+/// transport, never from this payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionSubmitPayload {
+    pub familiar: FamiliarRevisionRef,
+    pub envelope: MissionEnvelopeRef,
+    pub project: MissionProject,
+    pub task: MissionTask,
+    pub limits: MissionLimits,
+    pub valid_until: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FamiliarRevisionRef {
+    pub root_id: FamiliarRootId,
+    pub revision_id: FamiliarRevisionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionEnvelopeRef {
+    pub id: EnvelopeId,
+    pub descriptor_digest: DigestValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionProject {
+    pub cwd: MissionDirectory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionTask {
+    pub statement: MissionStatement,
+    pub prompt: MissionPrompt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionLimits {
+    pub timeout_minutes: MissionTimeoutMinutes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionGetPayload {
+    pub mission_id: MissionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionCancelPayload {
+    pub mission_id: MissionId,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reason: Option<CommandReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

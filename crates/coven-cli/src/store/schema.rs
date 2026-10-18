@@ -445,7 +445,14 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             loop_id TEXT,
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            result_summary TEXT,
+            delivery_state TEXT CHECK (
+                delivery_state IS NULL OR delivery_state IN ('delivered', 'failed')
+            ),
+            delivery_notice_id TEXT,
+            delivery_reason TEXT,
+            delivery_recorded_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_hub_jobs_state
@@ -524,6 +531,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     ensure_request_adoption_indexes_and_triggers(conn)?;
     migrate_historical_request_adoptions(conn)?;
     ensure_node_registry_dispatch_columns(conn)?;
+    ensure_hub_job_result_columns(conn)?;
     ensure_session_external_columns(conn)?;
     conn.execute_batch(crate::main_session::MAIN_SESSIONS_SCHEMA_SQL)
         .context("failed to initialize main_sessions schema")?;
@@ -551,6 +559,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::automations::runs::AUTOMATION_RUNS_SCHEMA_SQL)
         .context("failed to initialize automation_runs schema")?;
     crate::automations::runs::ensure_timeout_column(conn)?;
+    crate::automations::runs::ensure_delivery_columns(conn)?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_ATTEMPTS_SCHEMA_SQL)
         .context("failed to initialize automation attempts and retry state schema")?;
     crate::automations::runs::ensure_authority_columns(conn)?;
@@ -1326,6 +1335,50 @@ pub(super) fn migrate_historical_request_adoptions(conn: &Connection) -> Result<
 
 /// Stores created at the initial node_registry schema (#266) predate the
 /// hub-outbound dispatch columns (#267); add them idempotently.
+/// A hub job's result summary and the delivery record of its main-session
+/// notice (coven#1179). A settled delivery is immutable, so a repeated
+/// completion can neither post a second notice nor erase the first.
+fn ensure_hub_job_result_columns(conn: &Connection) -> Result<()> {
+    for (column, sql) in [
+        (
+            "result_summary",
+            "ALTER TABLE hub_jobs ADD COLUMN result_summary TEXT",
+        ),
+        (
+            "delivery_state",
+            "ALTER TABLE hub_jobs ADD COLUMN delivery_state TEXT CHECK (
+                 delivery_state IS NULL OR delivery_state IN ('delivered', 'failed')
+             )",
+        ),
+        (
+            "delivery_notice_id",
+            "ALTER TABLE hub_jobs ADD COLUMN delivery_notice_id TEXT",
+        ),
+        (
+            "delivery_reason",
+            "ALTER TABLE hub_jobs ADD COLUMN delivery_reason TEXT",
+        ),
+        (
+            "delivery_recorded_at",
+            "ALTER TABLE hub_jobs ADD COLUMN delivery_recorded_at TEXT",
+        ),
+    ] {
+        ensure_column(conn, "hub_jobs", column, sql)?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS hub_job_delivery_settled_immutable
+         BEFORE UPDATE OF result_summary, delivery_state, delivery_notice_id,
+                          delivery_reason, delivery_recorded_at
+         ON hub_jobs
+         WHEN OLD.delivery_state IS NOT NULL
+         BEGIN
+             SELECT RAISE(ABORT, 'settled hub job delivery is immutable');
+         END;",
+    )
+    .context("failed to install hub job delivery guard")?;
+    Ok(())
+}
+
 fn ensure_node_registry_dispatch_columns(conn: &Connection) -> Result<()> {
     ensure_column(
         conn,
