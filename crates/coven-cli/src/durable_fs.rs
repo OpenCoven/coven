@@ -236,10 +236,20 @@ pub(crate) fn create_dir_all(path: &Path) -> Result<()> {
         use cap_std::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NONBLOCK);
     }
-    let publication = registry
-        .open_with(name, &options)
-        .context("opening directory publication marker")?
-        .into_std();
+    // On macOS, concurrent creation or unlink of this basename can make even
+    // O_CREAT return ENOENT. Retry through the retained registry with the same
+    // no-follow options; disappearance never proves publication succeeded.
+    // Bound the attempts so persistent namespace churn still fails closed.
+    let mut retries = 15;
+    let publication = loop {
+        match registry.open_with(name, &options) {
+            Ok(file) => break file.into_std(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && retries > 0 => {
+                retries -= 1;
+            }
+            Err(error) => return Err(error).context("opening directory publication marker"),
+        }
+    };
     let metadata = publication.metadata()?;
     anyhow::ensure!(
         metadata.is_file() && !metadata.file_type().is_symlink(),
@@ -349,6 +359,52 @@ pub(crate) fn fail_next_directory_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_directory_publication_succeeds_for_every_creator() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for round in 0..32 {
+            let directory = temp.path().join(format!("shared-{round}"));
+            let barrier = std::sync::Barrier::new(8);
+            let results = std::thread::scope(|scope| {
+                let creators: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            create_dir_all(&directory)
+                        })
+                    })
+                    .collect();
+                creators
+                    .into_iter()
+                    .map(|creator| creator.join().expect("directory creator panicked"))
+                    .collect::<Vec<_>>()
+            });
+            for result in results {
+                result.with_context(|| format!("concurrent publication round {round}"))?;
+            }
+            assert!(directory.is_dir());
+            assert!(!publication_marker(&directory).unwrap().exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_marker_symlink_is_refused_without_touching_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("new");
+        let marker = publication_marker(&directory).unwrap();
+        std::fs::create_dir(marker.parent().unwrap())?;
+        let target = temp.path().join("unrelated");
+        std::fs::write(&target, b"unchanged")?;
+        std::os::unix::fs::symlink(&target, &marker)?;
+        assert!(create_dir_all(&directory).is_err());
+        assert!(!directory.exists());
+        assert_eq!(std::fs::read(&target)?, b"unchanged");
+        assert!(marker.symlink_metadata()?.file_type().is_symlink());
+        Ok(())
+    }
 
     #[test]
     fn directory_barrier_retains_identity_after_path_replacement() -> Result<()> {
