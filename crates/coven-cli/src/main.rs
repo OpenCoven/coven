@@ -1163,6 +1163,17 @@ enum AutomationsCommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Inspect occurrence lease metadata through the owner-local daemon")]
+    Leases {
+        #[arg(long)]
+        automation_id: Option<String>,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
+        limit: u8,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Expose the native conformance target protocol")]
     Conformance {
         #[command(subcommand)]
@@ -1628,6 +1639,7 @@ fn main() -> Result<()> {
         &cli.command,
         Some(Command::Automations {
             command: AutomationsCommand::Conformance { .. }
+                | AutomationsCommand::Leases { .. }
                 | AutomationsCommand::Status { .. }
                 | AutomationsCommand::Occurrence { .. }
                 | AutomationsCommand::Run { .. }
@@ -4071,6 +4083,12 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
         AutomationsCommand::Occurrence { id, json } => run(View::Occurrence(&id), json),
         AutomationsCommand::Run { id, json } => run(View::Run(&id), json),
         AutomationsCommand::Attempts { run_id, json } => run(View::Attempts(&run_id), json),
+        AutomationsCommand::Leases {
+            automation_id,
+            limit,
+            cursor,
+            json,
+        } => automations::lease_cli::run(automation_id.as_deref(), limit, cursor.as_deref(), json),
         AutomationsCommand::Conformance { command } => match command {
             AutomationsConformanceCommand::Capability => {
                 println!(

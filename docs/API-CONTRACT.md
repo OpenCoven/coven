@@ -540,6 +540,7 @@ Automation reads that expose sensitive content are owner-local too:
 - run reads, which return `logJson`: `.runs`, `.run.history.v1`, `.run.get.v1` and
   `.occurrence.get.v1`;
 - receipt reads;
+- `.occurrence.leases.v1`, which returns minimized owner references and lease diagnostics;
 - `.events.read.v1` and `.events.subscribe.v1`, because each event page issues a
   stored resume checkpoint.
 
