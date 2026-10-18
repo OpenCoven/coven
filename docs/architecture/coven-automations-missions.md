@@ -37,7 +37,7 @@ All decided by Val on 2026-10-18.
 | # | Question | Proposal |
 | --- | --- | --- |
 | 1 | What can the first mission do? | **M0 is a read-only diagnosis report** on the `r0-read.1` envelope, the only one that launches. Running tests waits for an exec envelope with enforced confinement (M1, under #857). This narrows chat#155's "diagnosis/test" to diagnosis until M1. |
-| 2 | Is a mission a new resource? | **No.** `mission.submit` atomically creates a hidden one-shot definition, adopts the owner grant for it, and claims its single manual occurrence. The mission id and the occurrence id are derived from the same adoption key. The definition is never listed, scheduled or revised. |
+| 2 | Is a mission a new resource? | **No.** `mission.submit` atomically records an internal one-shot definition, adopts the owner grant for it, and claims its single manual occurrence. The mission id and the occurrence id are derived from the same adoption key. The definition is never listed, scheduled or revised (see *Implementation notes*). |
 | 3 | Who authorizes a mission? | The **owner-local principal** (Decision 1 of the runtime-authority doc), over the owner-only socket or pipe. Submitting is the one-run owner grant, as `occurrence.runNow.v1` on an authority routine already is (decided 2026-10-05). TCP callers are refused before the store opens. |
 | 4 | Approvals? | **Reserved, not produced.** M0 launches only R0. An approval would unlock nothing until a writable envelope exists, the same reasoning slice 7 used. `needs_approval` is in the state set so clients render it once it exists. |
 | 5 | Where does usage come from? | The session's stream-json **result event**, recorded on the attempt when it settles and summed on the mission. Usage is reported, never estimated. A harness that reports none yields `usage: null`. |
@@ -61,9 +61,11 @@ Changing any field under the same adoption key is `ADOPTION_REPLAY_MISMATCH`.
 ## Commands
 
 The commands join `CommandName` in `coven.automations.v1`. Each also gets a flat
-`coven.missions.*.v1` action on `POST /api/v1/actions`, matching the existing
-automations actions. Both go through the same command envelope, adoption and
-error handling.
+`coven.automations.mission.*.v1` action on `POST /api/v1/actions`, matching the
+existing automations actions. The `coven.automations.` prefix is what puts them
+behind the owner-only transport gate (`automation_transport_rejection`) and in
+the command matrix. Both forms go through the same command envelope, adoption
+and error handling.
 
 ```ts
 type MissionCommandName = "mission.submit.v1" | "mission.get.v1" | "mission.cancel.v1";
@@ -78,7 +80,7 @@ interface MissionSubmitPayload {
 }
 
 interface MissionSubmitResult {
-  missionId: string;      // "mission:" + first 32 hex of sha256(adoptionKey)
+  missionId: string;      // "mission-" + first 32 hex of sha256(adoptionKey); no ":" (id pattern)
   occurrenceId: string;   // the manual occurrence the mission projects
   mission: MissionView;   // state at commit, "queued" on first commit
 }
@@ -97,7 +99,7 @@ interface MissionCancelResult {
 }
 ```
 
-- **`mission.submit.v1`** commits these in one store transaction: the hidden
+- **`mission.submit.v1`** commits these in one store transaction: the internal
   definition, the owner grant, the claimed manual occurrence, and the adoption
   record. Launch happens after commit, as for runNow. A replay returns the first
   commit's result with `outcome: "replayed"` and never launches again.
@@ -226,7 +228,8 @@ set.
 ## Vectors
 
 Each negative case in chat#155 maps to at least one vector. Vectors live under
-`conformance/automations/missions/` in the existing vector format: given a store,
+`conformance/automations/runner/` as `mission-*.vectors.json` suites, registered
+in `inventory.json` like every other suite, in the existing format: given a store,
 a clock and a transport, a command sequence produces exact responses and
 `MissionView` states. In the table, "the key" means the mission's adoption key.
 
@@ -253,8 +256,8 @@ a clock and a transport, a command sequence produces exact responses and
 
 | Surface | M0 shape |
 | --- | --- |
-| Daemon | `mission.*.v1` in the command envelope, plus flat `coven.missions.*.v1` actions. Owner-local only. |
-| CLI | `coven missions submit --json -` reads the payload on stdin and prints the response. Also `coven missions get <id> --json`, `coven missions cancel <id> --json`, and `coven missions watch <id> --json`, which streams `MissionView` lines until terminal. Chat can call these without moving its pinned `coven-client`. |
+| Daemon | `mission.*.v1` in the command envelope, plus flat `coven.automations.mission.*.v1` actions. Owner-local only. |
+| CLI | `coven missions submit --json -` reads the payload on stdin and prints the response. It calls the running daemon over its owner socket, never the in-process action path, whose no-op runtime would record a launch that never happened. Also `coven missions get <id> --json`, `coven missions cancel <id> --json`, and `coven missions watch <id> --json`, which streams `MissionView` lines until terminal. Chat can call these without moving its pinned `coven-client`. |
 | SDK | A `CovenMissionsClient` with `submit`, `get`, `cancel` and `watch`, the projection types, and the client-side vectors (M-01, M-02, M-11, M-14). Designed in the SDK's companion design doc. |
 | Chat | chat#155 builds typed native commands on the CLI or SDK surface. It stores the mission's adoption key and id, which needs the storage design its `SECURITY.md` calls for. |
 
@@ -275,9 +278,30 @@ a clock and a transport, a command sequence produces exact responses and
 - Scheduling. A mission never recurs; a routine stays the thing for that.
 - Billing and Daytona lifecycle (coven-agents).
 
+## Implementation notes
+
+Found while mapping the code on `origin/main` `753f553f`; they change how, not
+what.
+
+- **The internal definition must never be scheduled.** Every v1 definition
+  needs an `rrule`, and the planner schedules every active row, while `runNow`
+  requires an active one. A mission therefore gets its own claim path: the
+  definition is stored with a mission marker the planner skips, and is never
+  active in the scheduling sense.
+- **The owner grant needs a migration.** `automation_owner_grants` allows only
+  create, activate and revise commands by CHECK constraint, so `mission.submit`
+  is added to it, with release-upgrade fixture coverage.
+- **No launch until Runtime Authority exists.** Production dispatch is still the
+  base v1 path, which launches with ambient authority. M0 refuses to launch any
+  mission until the R0 envelope is enforced (#857), and settles it
+  `unavailable` with a no-launch receipt (vector M-06).
+- **Events.** Event payloads are closed schemas. `missionId` and the projected
+  state are added as optional fields of the transition payload, a minor-profile
+  change while the profile is `proposed`.
+
 ## Also decided (2026-10-18)
 
-1. **One-shot only.** `mission.submit` creates its own hidden definition and
+1. **One-shot only.** `mission.submit` creates its own internal definition and
    never accepts an existing routine. Running a routine stays `occurrence.runNow`.
 2. **Report retention follows session logs.** The owner-only report artifact is
    kept for the period the daemon already applies to session logs; there is no
