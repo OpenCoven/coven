@@ -33,6 +33,8 @@ pub mod health;
 pub mod import_legacy;
 pub mod inspection;
 pub mod leadership;
+pub(crate) mod lease_cli;
+pub(crate) mod leases;
 pub mod missions;
 pub mod occurrences;
 pub(crate) mod operator_cli;
