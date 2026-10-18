@@ -1,0 +1,504 @@
+name: Windows reliability experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Diagnostic stage
+        type: choice
+        default: samples
+        options: [samples, metadata-preflight]
+  # Temporary metadata-only admission on the owning draft PR.
+  # A head push or label removal cannot start another experiment.
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-reliability-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  threads:
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'samples'
+    name: Windows Threads sample ${{ matrix.sample }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      # Every predeclared sample survives failures in the other samples.
+      # Separate runners prevent survivors of a timeout contaminating a retry.
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3]
+    env:
+      EXPERIMENT_NAME: windows-reliability-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.sample }}
+      EXPERIMENT_SAMPLE: ${{ matrix.sample }}
+      EXPERIMENT_WORKFLOW_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Prepare isolated evidence directory
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP $env:EXPERIMENT_NAME
+          if (Test-Path $root) { throw 'Evidence directory already exists' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          "EXPERIMENT_ROOT=$root" >> $env:GITHUB_ENV
+          "COVEN_THREADS_E2E_ARTIFACT_ROOT=$(Join-Path $root 'fixtures')" >> $env:GITHUB_ENV
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
+        with:
+          # PR samples exercise the event's merge candidate, not the older head.
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-05-20
+      - name: Bind experiment to checked-out source
+        id: source
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $head = git rev-parse HEAD
+          $headCode = $LASTEXITCODE
+          $parentText = git show -s --format=%P HEAD
+          $parentsCode = $LASTEXITCODE
+          $parents = @($parentText -split ' ')
+          $shallow = git rev-parse --is-shallow-repository
+          $shallowCode = $LASTEXITCODE
+          $main = git rev-parse --verify 'refs/remotes/origin/main^{commit}'
+          $mainCode = $LASTEXITCODE
+          $event = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+          $activation = @{ event = $env:GITHUB_EVENT_NAME; action = $event.action }
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            $activation.pullRequest = $event.pull_request.number
+            $activation.label = $event.label.name
+            $activation.head = $event.pull_request.head.sha
+            $activation.base = $event.pull_request.base.sha
+            $activation.baseRepository = $event.pull_request.base.repo.full_name
+            $activation.baseRef = $event.pull_request.base.ref
+            $activation.headRepository = $event.pull_request.head.repo.full_name
+            $activation.headRef = $event.pull_request.head.ref
+          }
+          @{
+            source = $head; eventSha = $env:GITHUB_SHA; sourceParents = $parents
+            activation = $activation; capturedMain = $main; shallow = $shallow
+            fetchDepth = 0; headExit = $headCode; parentsExit = $parentsCode
+            shallowExit = $shallowCode; mainExit = $mainCode
+          } | ConvertTo-Json -Depth 5 | Set-Content "$env:EXPERIMENT_ROOT/source-check.json"
+          if ($headCode -ne 0 -or $parentsCode -ne 0) { throw 'Cannot identify source and parents' }
+          if ($head -ne $env:GITHUB_SHA) { throw 'Checkout does not match the triggering source' }
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            if ($activation.baseRepository -ne 'OpenCoven/coven' -or $activation.baseRef -ne 'main') {
+              throw 'Activating PR does not target the expected repository and main branch'
+            }
+            if ($activation.base -notmatch '^[0-9a-f]{40}$' -or $activation.head -notmatch '^[0-9a-f]{40}$') {
+              throw 'Activating PR has invalid commit identities'
+            }
+            if ($parents.Count -ne 2 -or $parents[1] -ne $activation.head) {
+              throw 'Merge candidate does not contain the activating PR head'
+            }
+            if ($shallowCode -ne 0 -or $shallow -ne 'false' -or $mainCode -ne 0) {
+              throw 'Complete main ancestry is required for source proof'
+            }
+            git merge-base --is-ancestor $activation.base $parents[0]
+            $payloadAncestorCode = $LASTEXITCODE
+            git merge-base --is-ancestor $parents[0] $main
+            $mainAncestorCode = $LASTEXITCODE
+            @{
+              payloadBase = $activation.base; actualBase = $parents[0]; capturedMain = $main
+              payloadAncestorExit = $payloadAncestorCode; mainAncestorExit = $mainAncestorCode
+            } | ConvertTo-Json | Set-Content "$env:EXPERIMENT_ROOT/source-ancestry.json"
+            if ($payloadAncestorCode -gt 1 -or $mainAncestorCode -gt 1) {
+              throw 'Git could not verify merge candidate ancestry'
+            }
+            if ($payloadAncestorCode -ne 0 -or $mainAncestorCode -ne 0) {
+              throw 'Merge candidate base is outside the activating main lineage'
+            }
+          }
+          $dirty = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect source' }
+          $receipt = @{
+            source = $head; sourceStatus = $dirty; eventSha = $env:GITHUB_SHA
+            sourceParents = $parents; activation = $activation
+            workflowSha = $env:GITHUB_WORKFLOW_SHA
+            workflowRef = $env:EXPERIMENT_WORKFLOW_REF
+            run = $env:GITHUB_RUN_ID; attempt = $env:GITHUB_RUN_ATTEMPT
+            sample = $env:EXPERIMENT_SAMPLE; platform = $env:RUNNER_OS
+            logicalProcessors = [Environment]::ProcessorCount
+            rustTestThreads = $env:RUST_TEST_THREADS
+            lockSha256 = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash
+            workflowSha256 = (Get-FileHash .github/workflows/windows-reliability.yml -Algorithm SHA256).Hash
+            command = @('cargo', 'test', '--locked', '-p', 'coven-cli', '--test', 'threads_e2e', '--features', 'threads-test-clock', '--test', 'threads_identity_invariants', '--test', 'threads_protected_intake', '--test', 'threads_terminal_recovery', '--no-fail-fast')
+            limits = 'Three isolated hosted runners; default within-suite parallelism. Synthetic principals; dependency provenance is in fixture manifests. Passing samples do not establish a causal repair or provider certification.'
+          }
+          $receipt | ConvertTo-Json -Depth 5 | Set-Content "$env:EXPERIMENT_ROOT/source.json"
+          if (Test-Path Env:RUST_TEST_THREADS) { throw 'Parallelism override is not supported' }
+          if ($dirty.Count -ne 0) { throw 'Source checkout is dirty' }
+          if (-not (Select-String -Path crates/coven-cli/src/threads_request_diagnostics.rs -SimpleMatch '"durable-commit-begin"' -Quiet)) {
+            throw 'This experiment requires the durable-operation diagnostics from PR #1320'
+          }
+          rustc -vV | Set-Content "$env:EXPERIMENT_ROOT/rustc.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify Rust toolchain' }
+          cargo --version | Set-Content "$env:EXPERIMENT_ROOT/cargo.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify Cargo' }
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - name: Warm the exact feature and target selection
+        id: warm
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $source = Get-Content "$env:EXPERIMENT_ROOT/source.json" -Raw | ConvertFrom-Json
+          $arguments = @($source.command | Select-Object -Skip 1) + @('--no-run')
+          @{ startedAt = [DateTime]::UtcNow.ToString('o'); command = @('cargo') + $arguments } |
+            ConvertTo-Json -Depth 5 | Set-Content "$env:EXPERIMENT_ROOT/warm-start.json"
+          & cargo @arguments 2>&1 | Tee-Object -FilePath "$env:EXPERIMENT_ROOT/warm.log"
+          $code = $LASTEXITCODE
+          @{ finishedAt = [DateTime]::UtcNow.ToString('o'); exitCode = $code } |
+            ConvertTo-Json | Set-Content "$env:EXPERIMENT_ROOT/warm-result.json"
+          exit $code
+      - name: Observe the supported parallel Threads suite
+        id: exercise
+        # The observed four-target command took 381 seconds after compilation.
+        # This outer experiment guard changes no test or production deadline.
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $source = Get-Content "$env:EXPERIMENT_ROOT/source.json" -Raw | ConvertFrom-Json
+          $arguments = @($source.command | Select-Object -Skip 1)
+          @{ startedAt = [DateTime]::UtcNow.ToString('o'); command = $source.command } |
+            ConvertTo-Json -Depth 5 | Set-Content "$env:EXPERIMENT_ROOT/test-start.json"
+          & cargo @arguments 2>&1 | Tee-Object -FilePath "$env:EXPERIMENT_ROOT/test.log"
+          $code = $LASTEXITCODE
+          @{ finishedAt = [DateTime]::UtcNow.ToString('o'); exitCode = $code } |
+            ConvertTo-Json | Set-Content "$env:EXPERIMENT_ROOT/test-result.json"
+          exit $code
+      - name: Retain completion and evidence gaps
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          WARM_OUTCOME: ${{ steps.warm.outcome }}
+          TEST_OUTCOME: ${{ steps.exercise.outcome }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:EXPERIMENT_ROOT | Out-Null
+          $head = git rev-parse HEAD
+          $headCode = $LASTEXITCODE
+          $dirty = @(git status --porcelain --untracked-files=all)
+          $statusCode = $LASTEXITCODE
+          $manifests = @(Get-ChildItem $env:COVEN_THREADS_E2E_ARTIFACT_ROOT -Filter manifest.json -Recurse -ErrorAction SilentlyContinue)
+          $floors = @($manifests | Where-Object { $_.Directory.Name -like 'output-auto-floors-*' })
+          @{
+            sourceOutcome = $env:SOURCE_OUTCOME; warmOutcome = $env:WARM_OUTCOME
+            testOutcome = $env:TEST_OUTCOME; finalSource = $head; finalSourceStatus = $dirty
+            manifestCount = $manifests.Count; floorsManifestCount = $floors.Count
+            testReturned = (Test-Path "$env:EXPERIMENT_ROOT/test-result.json")
+            limits = 'A missing result or manifest is incomplete evidence, including after timeout. Each sample has its own hosted runner; no later sample reuses its process tree. No descendant-cleanup certification is claimed.'
+          } | ConvertTo-Json -Depth 5 | Set-Content "$env:EXPERIMENT_ROOT/completion.json"
+          if ($env:SOURCE_OUTCOME -eq 'success') {
+            $source = Get-Content "$env:EXPERIMENT_ROOT/source.json" -Raw | ConvertFrom-Json
+            if ($headCode -ne 0 -or $statusCode -ne 0 -or $head -ne $source.source -or $dirty.Count -ne 0) {
+              throw 'Executed source changed or cannot be verified'
+            }
+          }
+          if ($env:TEST_OUTCOME -eq 'success' -and $floors.Count -ne 1) {
+            throw 'Successful command did not retain the expected protected-refusal fixture'
+          }
+          if ($env:TEST_OUTCOME -eq 'success') {
+            foreach ($manifest in $manifests) {
+              $fixture = Get-Content $manifest.FullName -Raw | ConvertFrom-Json
+              if ($fixture.coven_commit -ne $head -or $fixture.coven_dirty -ne $false -or $fixture.platform -ne 'windows' -or $fixture.result -ne 'passed') {
+                throw 'Fixture source or result contradicts the successful command'
+              }
+            }
+          }
+      - name: Upload every sample including partial failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: windows-reliability-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.sample }}
+          path: ${{ runner.temp }}/${{ env.EXPERIMENT_NAME }}
+          retention-days: 14
+          if-no-files-found: error
+
+  metadata-preflight:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.stage == 'metadata-preflight') ||
+      (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+       github.event.label.name == 'ci:windows-reliability-preflight' &&
+       github.repository == 'OpenCoven/coven' && github.event.pull_request.number == 1326 &&
+       github.event.pull_request.base.repo.full_name == github.repository &&
+       github.event.pull_request.base.ref == 'main' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.head.ref == 'test/1227-windows-reliability-experiment')
+    name: Windows read-only metadata preflight
+    runs-on: windows-latest
+    # Outer diagnostic hang guard, not a production deadline or cleanup proof.
+    timeout-minutes: 10
+    env:
+      METADATA_WORKFLOW_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Prepare isolated public evidence directory
+        id: prepare
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "windows-reliability-metadata-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path $root) { throw 'Evidence directory already exists' }
+          $public = Join-Path $root 'public'
+          New-Item -ItemType Directory -Path $public | Out-Null
+          "EXPERIMENT_ROOT=$public" >> $env:GITHUB_ENV
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Bind metadata preflight to checked-out source
+        id: source
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $head = git rev-parse HEAD
+          $headCode = $LASTEXITCODE
+          $parentText = git show -s --format=%P HEAD
+          $parentsCode = $LASTEXITCODE
+          $parents = @($parentText -split ' ')
+          $shallow = git rev-parse --is-shallow-repository
+          $shallowCode = $LASTEXITCODE
+          $main = git rev-parse --verify 'refs/remotes/origin/main^{commit}'
+          $mainCode = $LASTEXITCODE
+          $event = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+          $activation = @{ event = $env:GITHUB_EVENT_NAME; action = $event.action }
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            $activation.pullRequest = $event.pull_request.number
+            $activation.label = $event.label.name
+            $activation.head = $event.pull_request.head.sha
+            $activation.base = $event.pull_request.base.sha
+            $activation.baseRepository = $event.pull_request.base.repo.full_name
+            $activation.baseRef = $event.pull_request.base.ref
+            $activation.headRepository = $event.pull_request.head.repo.full_name
+            $activation.headRef = $event.pull_request.head.ref
+          }
+          @{
+            source = $head; eventSha = $env:GITHUB_SHA; sourceParents = $parents
+            activation = $activation; capturedMain = $main; shallow = $shallow
+            fetchDepth = 0; headExit = $headCode; parentsExit = $parentsCode
+            shallowExit = $shallowCode; mainExit = $mainCode
+          } | ConvertTo-Json -Depth 5 | Set-Content "$env:EXPERIMENT_ROOT/source-check.json"
+          if ($headCode -ne 0 -or $parentsCode -ne 0) { throw 'Cannot identify source and parents' }
+          if ($head -ne $env:GITHUB_SHA) { throw 'Checkout does not match the triggering source' }
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            if ($activation.baseRepository -ne 'OpenCoven/coven' -or $activation.baseRef -ne 'main') {
+              throw 'Activating PR does not target the expected repository and main branch'
+            }
+            if ($activation.base -notmatch '^[0-9a-f]{40}$' -or $activation.head -notmatch '^[0-9a-f]{40}$') {
+              throw 'Activating PR has invalid commit identities'
+            }
+            if ($parents.Count -ne 2 -or $parents[1] -ne $activation.head) {
+              throw 'Merge candidate does not contain the activating PR head'
+            }
+            if ($shallowCode -ne 0 -or $shallow -ne 'false' -or $mainCode -ne 0) {
+              throw 'Complete main ancestry is required for source proof'
+            }
+            git merge-base --is-ancestor $activation.base $parents[0]
+            $payloadAncestorCode = $LASTEXITCODE
+            git merge-base --is-ancestor $parents[0] $main
+            $mainAncestorCode = $LASTEXITCODE
+            @{
+              payloadBase = $activation.base; actualBase = $parents[0]; capturedMain = $main
+              payloadAncestorExit = $payloadAncestorCode; mainAncestorExit = $mainAncestorCode
+            } | ConvertTo-Json | Set-Content "$env:EXPERIMENT_ROOT/source-ancestry.json"
+            if ($payloadAncestorCode -gt 1 -or $mainAncestorCode -gt 1) {
+              throw 'Git could not verify merge candidate ancestry'
+            }
+            if ($payloadAncestorCode -ne 0 -or $mainAncestorCode -ne 0) {
+              throw 'Merge candidate base is outside the activating main lineage'
+            }
+          }
+          $dirty = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect source' }
+          $pythonJson = python -c 'import hashlib,json,pathlib,sys; print(json.dumps({"version":list(sys.version_info[:3]),"implementation":sys.implementation.name,"sha256":hashlib.sha256(pathlib.Path(sys.executable).read_bytes()).hexdigest()}))'
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify Python interpreter' }
+          $pythonIdentity = $pythonJson | ConvertFrom-Json
+          if ($pythonIdentity.implementation -ne 'cpython' -or $pythonIdentity.version[0] -ne 3 -or $pythonIdentity.version[1] -lt 12) { throw 'Unsupported publisher interpreter' }
+          $bindingFiles = @(
+            '.github/workflows/windows-reliability.yml'
+            'scripts/windows-reliability/preflight-core.ps1'
+            'scripts/windows-reliability/preflight-tests.ps1'
+            'scripts/windows-reliability/provider-schema-tests.ps1'
+            'scripts/windows-reliability/provider-schema.ps1'
+            'scripts/windows-reliability/public_receipt.py'
+            'scripts/windows-reliability/public_receipt_tests.py'
+            'scripts/windows-reliability/query-cleanup-tests.ps1'
+            'scripts/windows-reliability/query-executor-tests.ps1'
+            'scripts/windows-reliability/query-executor.ps1'
+            'scripts/windows-reliability/query-helper-tests.ps1'
+            'scripts/windows-reliability/query-helper.ps1'
+            'scripts/windows-reliability/query-inherited-pipe-test.ps1'
+            'scripts/windows-reliability/query-plan-tests.ps1'
+            'scripts/windows-reliability/query-plan.ps1'
+            'scripts/windows-reliability/query-stream-disposal-controlled-test.ps1'
+            'scripts/windows-reliability/query-summary-tests.ps1'
+            'scripts/windows-reliability/query-summary.ps1'
+            'scripts/windows-reliability/query-test-handles.ps1'
+            'scripts/windows-reliability/receipt-writer-tests.ps1'
+            'scripts/windows-reliability/receipt-writer.ps1'
+            'scripts/windows-reliability/run-preflight.ps1'
+            'scripts/windows-reliability/signer-rdn-tests.ps1'
+            'scripts/windows-reliability/source-stability-tests.ps1'
+            'scripts/windows-reliability/source-stability.ps1'
+            'scripts/windows-reliability/tool-admission-tests.ps1'
+            'scripts/windows-reliability/tool-discovery-tests.ps1'
+            'scripts/windows-reliability/tool-discovery.ps1'
+            'scripts/windows-reliability/tool-identity-tests.ps1'
+            'scripts/windows-reliability/tool-identity.ps1'
+          )
+          $sourceFiles = @($bindingFiles | ForEach-Object {
+            @{ file = $_; sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256 -ErrorAction Stop).Hash }
+          })
+          @{
+            stage = 'metadata-preflight'; source = $head; eventSha = $env:GITHUB_SHA
+            workflowSha = $env:GITHUB_WORKFLOW_SHA; workflowRef = $env:METADATA_WORKFLOW_REF
+            sourceFiles = $sourceFiles
+            sourceParents = $parents; activation = $activation; capturedMain = $main
+            run = $env:GITHUB_RUN_ID; attempt = $env:GITHUB_RUN_ATTEMPT
+            dirtyCount = $dirty.Count; python = $pythonIdentity
+            powershell = @($PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor, $PSVersionTable.PSVersion.Patch)
+            osVersion = @([Environment]::OSVersion.Version.Major, [Environment]::OSVersion.Version.Minor, [Environment]::OSVersion.Version.Build, [Environment]::OSVersion.Version.Revision)
+            lockSha256 = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash
+            workflowSha256 = (Get-FileHash .github/workflows/windows-reliability.yml -Algorithm SHA256).Hash
+            publisherSha256 = (Get-FileHash scripts/windows-reliability/public_receipt.py -Algorithm SHA256).Hash
+            captureAttempted = $false
+          } | ConvertTo-Json -Depth 6 | Set-Content "$env:EXPERIMENT_ROOT/source.json"
+          if ($dirty.Count -ne 0) { throw 'Source checkout is dirty' }
+          $baselineHash = (Get-FileHash -LiteralPath "$env:EXPERIMENT_ROOT/source.json" -Algorithm SHA256).Hash
+          "METADATA_BASELINE_SHA256=$baselineHash" >> $env:GITHUB_ENV
+      - name: Verify bounded query and publication helpers
+        id: tests
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $root = Join-Path $pwd 'scripts/windows-reliability'
+          $node = (Get-Command node -CommandType Application -ErrorAction Stop).Source
+          foreach ($name in @('query-helper-tests.ps1','query-cleanup-tests.ps1','query-inherited-pipe-test.ps1','query-stream-disposal-controlled-test.ps1')) {
+            & pwsh -NoProfile -File (Join-Path $root $name) -Helper (Join-Path $root 'query-helper.ps1') -Node $node
+            if ($LASTEXITCODE -ne 0) { throw "Bounded helper test failed: $name" }
+          }
+          foreach ($name in @('query-plan','query-summary','query-executor','tool-identity','tool-admission','tool-discovery','signer-rdn','provider-schema','preflight','receipt-writer','source-stability')) {
+            & pwsh -NoProfile -File (Join-Path $root "$name-tests.ps1")
+            if ($LASTEXITCODE -ne 0) { throw "Metadata helper test failed: $name" }
+          }
+          python scripts/windows-reliability/public_receipt_tests.py
+          if ($LASTEXITCODE -ne 0) { throw 'Public receipt tests failed' }
+      - name: Run bounded read-only metadata queries
+        id: metadata
+        continue-on-error: true
+        timeout-minutes: 4
+        shell: pwsh
+        run: ./scripts/windows-reliability/run-preflight.ps1
+      - name: Recheck checkout and execution source before publication
+        id: binding
+        if: always() && steps.source.outcome == 'success'
+        shell: pwsh
+        run: |
+          $baselineValid = $false; $headMatches = $false; $workflowMatches = $false
+          $dirtyCount = -1; $mismatchCount = 0; $fileCount = 0; $headCode = -1; $statusCode = -1
+          try {
+            $baselinePath = Join-Path $env:EXPERIMENT_ROOT 'source.json'
+            $baselineHash = (Get-FileHash -LiteralPath $baselinePath -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($baselineHash -ne $env:METADATA_BASELINE_SHA256) { throw 'Baseline changed' }
+            $baseline = Get-Content -LiteralPath $baselinePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $baselineValid = $true
+            $actualHead = git rev-parse HEAD 2>$null
+            $headCode = $LASTEXITCODE
+            $dirty = @(git status --porcelain --untracked-files=all 2>$null)
+            $statusCode = $LASTEXITCODE; $dirtyCount = $dirty.Count
+            $headMatches = ($headCode -eq 0 -and $actualHead -eq $baseline.source -and $actualHead -eq $env:GITHUB_SHA)
+            $workflowMatches = ($baseline.workflowSha -eq $env:GITHUB_WORKFLOW_SHA -and $baseline.workflowRef -eq $env:METADATA_WORKFLOW_REF)
+            foreach ($file in $baseline.sourceFiles) {
+              $fileCount++
+              try {
+                $hash = (Get-FileHash -LiteralPath $file.file -Algorithm SHA256 -ErrorAction Stop).Hash
+                if ($hash -ne $file.sha256) { $mismatchCount++ }
+              } catch { $mismatchCount++ }
+            }
+          } catch { $baselineValid = $false }
+          $bound = ($baselineValid -and $headMatches -and $workflowMatches -and $statusCode -eq 0 -and $dirtyCount -eq 0 -and $fileCount -gt 0 -and $mismatchCount -eq 0)
+          @{
+            sourceBound = $bound; baselineValid = $baselineValid; headMatches = $headMatches
+            workflowMatches = $workflowMatches; headExit = $headCode; statusExit = $statusCode
+            dirtyCount = $dirtyCount; checkedFiles = $fileCount; mismatchCount = $mismatchCount
+          } | ConvertTo-Json | Set-Content "$env:EXPERIMENT_ROOT/binding.json"
+          if (-not $bound) { throw 'Metadata source binding failed before publication' }
+      - name: Validate and publish only the public receipt
+        id: publication
+        if: always() && steps.binding.outcome == 'success' && steps.metadata.outputs.public-receipt != ''
+        env:
+          PUBLIC_SOURCE_RECEIPT: ${{ steps.metadata.outputs.public-receipt }}
+        shell: pwsh
+        run: |
+          $result = python scripts/windows-reliability/public_receipt.py "$env:PUBLIC_SOURCE_RECEIPT" "$env:RUNNER_TEMP" "$env:EXPERIMENT_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw 'Public receipt publication failed' }
+          $result | Set-Content "$env:EXPERIMENT_ROOT/publication.json"
+      - name: Record separate stage outcomes
+        if: always() && steps.prepare.outcome == 'success'
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          BINDING_OUTCOME: ${{ steps.binding.outcome }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+          QUERY_OUTCOME: ${{ steps.metadata.outcome }}
+          PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
+        shell: pwsh
+        run: |
+          @{
+            source = $env:SOURCE_OUTCOME; tests = $env:TEST_OUTCOME
+            binding = $env:BINDING_OUTCOME; sourceBound = ($env:BINDING_OUTCOME -eq 'success')
+            queryStep = $env:QUERY_OUTCOME; publication = $env:PUBLICATION_OUTCOME
+            publicReceiptPublished = ($env:PUBLICATION_OUTCOME -eq 'success')
+            metadataComplete = $false; captureAttempted = $false
+          } | ConvertTo-Json | Set-Content "$env:EXPERIMENT_ROOT/outcome.json"
+      - name: Retain explicit public source and outcome evidence
+        if: always() && steps.prepare.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: windows-reliability-metadata-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EXPERIMENT_ROOT }}/source-check.json
+            ${{ env.EXPERIMENT_ROOT }}/source-ancestry.json
+            ${{ env.EXPERIMENT_ROOT }}/source.json
+            ${{ env.EXPERIMENT_ROOT }}/binding.json
+            ${{ env.EXPERIMENT_ROOT }}/outcome.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain successfully published public metadata only
+        if: always() && steps.publication.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: windows-reliability-metadata-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.EXPERIMENT_ROOT }}/publication.json
+            ${{ env.EXPERIMENT_ROOT }}/receipt.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Require completed queries and successful publication
+        if: always() && steps.prepare.outcome == 'success'
+        env:
+          BINDING_OUTCOME: ${{ steps.binding.outcome }}
+          QUERY_OUTCOME: ${{ steps.metadata.outcome }}
+          PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
+        shell: pwsh
+        run: |
+          if ($env:BINDING_OUTCOME -ne 'success' -or $env:QUERY_OUTCOME -ne 'success' -or $env:PUBLICATION_OUTCOME -ne 'success') {
+            throw 'Metadata execution or public receipt publication is incomplete'
+          }
