@@ -1,0 +1,81 @@
+{
+  "schemaVersion": "coven.automations.legacy-import-source-preservation-vectors.v1",
+  "cases": [
+    {
+      "caseId": "legacy-inactive-source-preserving-import",
+      "route": "legacy",
+      "sources": [
+        {
+          "name": "a-valid",
+          "contents": "id = \"imported\"\nname = \"Import fixture\"\nstatus = \"ACTIVE\"\nrrule = \"FREQ=DAILY;BYHOUR=9\"\nprompt = \"synthetic import sentinel\"\n"
+        },
+        {
+          "name": "b-duplicate",
+          "contents": "id = \"imported\"\nname = \"Import fixture\"\nstatus = \"ACTIVE\"\nrrule = \"FREQ=DAILY;BYHOUR=9\"\nprompt = \"synthetic import sentinel\"\n"
+        },
+        {
+          "name": "c-existing",
+          "contents": "id = \"existing\"\nname = \"Import fixture\"\nstatus = \"ACTIVE\"\nrrule = \"FREQ=DAILY;BYHOUR=9\"\nprompt = \"synthetic import sentinel\"\n"
+        },
+        {
+          "name": "d-unsupported",
+          "contents": "id = \"unsupported\"\nname = \"Import fixture\"\nstatus = \"ACTIVE\"\nrrule = \"FREQ=HOURLY\"\nprompt = \"synthetic import sentinel\"\n"
+        }
+      ],
+      "expected": {
+        "imported": [
+          "imported"
+        ],
+        "skipped": 1,
+        "failures": 2,
+        "definitionStatus": "PAUSED",
+        "lifecycleState": "paused",
+        "sourcePreserved": true,
+        "preexistingPreserved": true,
+        "replayPreserved": true,
+        "restartPreserved": true,
+        "occurrences": 0,
+        "runs": 0,
+        "attempts": 0
+      }
+    },
+    {
+      "caseId": "v1-inactive-source-preserving-import",
+      "route": "v1",
+      "sources": [
+        {
+          "name": "a-valid",
+          "contents": "id = \"imported\"\nname = \"Import fixture\"\nstatus = \"ACTIVE\"\nrrule = \"FREQ=DAILY;BYHOUR=9\"\nprompt = \"synthetic import sentinel\"\n"
+        },
+        {
+          "name": "b-duplicate",
+          "contents": "id = \"imported\"\nname = \"Import fixture\"\nstatus = \"ACTIVE\"\nrrule = \"FREQ=DAILY;BYHOUR=9\"\nprompt = \"synthetic import sentinel\"\n"
+        },
+        {
+          "name": "c-existing",
+          "contents": "id = \"existing\"\nname = \"Import fixture\"\nstatus = \"ACTIVE\"\nrrule = \"FREQ=DAILY;BYHOUR=9\"\nprompt = \"synthetic import sentinel\"\n"
+        },
+        {
+          "name": "d-unsupported",
+          "contents": "id = \"unsupported\"\nname = \"Import fixture\"\nstatus = \"ACTIVE\"\nrrule = \"FREQ=HOURLY\"\nprompt = \"synthetic import sentinel\"\n"
+        }
+      ],
+      "expected": {
+        "imported": [
+          "imported"
+        ],
+        "skipped": 3,
+        "failures": 0,
+        "definitionStatus": "PAUSED",
+        "lifecycleState": "draft",
+        "sourcePreserved": true,
+        "preexistingPreserved": true,
+        "replayPreserved": true,
+        "restartPreserved": true,
+        "occurrences": 0,
+        "runs": 0,
+        "attempts": 0
+      }
+    }
+  ]
+}

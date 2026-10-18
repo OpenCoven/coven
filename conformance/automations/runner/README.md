@@ -187,6 +187,7 @@ The checked-in
 [`calendar-schedule-resolution.vectors.json`](calendar-schedule-resolution.vectors.json),
 [`cancellation-timeout-arbitration.vectors.json`](cancellation-timeout-arbitration.vectors.json),
 [`command-adoption-idempotency.vectors.json`](command-adoption-idempotency.vectors.json),
+[`legacy-import-source-preservation.vectors.json`](legacy-import-source-preservation.vectors.json),
 [`command-envelope-outcomes.vectors.json`](command-envelope-outcomes.vectors.json),
 [`command-transaction-rollback.vectors.json`](command-transaction-rollback.vectors.json),
 [`definition-lifecycle-transitions.vectors.json`](definition-lifecycle-transitions.vectors.json),
@@ -237,6 +238,7 @@ The runner invokes the target directly without a shell.
       "suites": [
         "calendar-schedule-resolution",
         "cancellation-timeout-arbitration",
+        "legacy-import-source-preservation",
         "misfire-latest-planning",
         "occurrence-lease-recovery",
         "overlap-forbid-claiming",
@@ -260,7 +262,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eleven structural suites, twelve
+The native Coven target currently implements eleven structural suites, thirteen
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -431,3 +433,23 @@ recovery, disk-full, filesystem I/O/corruption, runtime authority, or release
 eligibility. The fixtures remain draft and launch no runtime. Invalid definitions,
 missing/duplicate fault cases, and weakened expected invariants are refused with
 static errors before executing any case.
+
+## Legacy import audit boundary
+
+The `legacy-import-source-preservation` suite calls existing import actions
+through an identity-bound owner-local daemon in a disposable home. Its two
+routes distinguish legacy `PAUSED`/`paused` records from v1 `PAUSED`/`draft`
+records. Source definitions request ACTIVE status; import must keep them inactive.
+The fixture compares source bytes and inventory, preserves a preexisting
+definition, exercises duplicate IDs and unsupported schedules, and checks v1
+dry run and adoption replay. It compares persisted records across daemon restart
+and requires zero occurrences, runs and attempts. Case observations expose only
+fixed state/outcome classifications, counts, preservation booleans and case IDs;
+they are retained for both passing and failed expectations.
+
+This adds audit-only evidence toward golden scenario 20. It does not certify
+runtime launch, principal-scoped disclosure, broad crash boundaries, all
+platform containment, complete profiles or release eligibility. The daemon
+receives an isolated home and no provider environment. The runner uses a short
+owned scratch path on macOS for Unix sockets and a separate fixture hang guard;
+production startup and maintenance deadlines are unchanged.

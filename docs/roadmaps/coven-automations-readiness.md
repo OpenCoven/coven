@@ -43,7 +43,7 @@ and terminal-recovery conformance additions in this change:
 | --- | --- | --- |
 | Definitions and scheduling | Durable revisions, adopted requests, UTC/IANA schedules, DST, latest-only misfire, occurrence fences, overlap refusal | Executable rich-definition and versioned command parity, complete lifecycle publication (#1054) |
 | Scheduler recovery | Persisted retry/backoff, quarantine, stop-fence cancellation/timeout arbitration, leadership fencing, startup and definition-change wake | Complete crash-boundary matrix, storage fault injection, measured load/retention limits (#858) |
-| Portable audit | Eleven structural and eleven scheduler-reliability suites in the native target; versioned vectors and independent audit-result runner | Full authority, continuity, privacy, interoperability, and release-eligibility evidence (#858) |
+| Portable audit | Eleven structural and twelve scheduler-reliability suites in the native target; versioned vectors and independent audit-result runner | Full authority, continuity, privacy, interoperability, and release-eligibility evidence (#858) |
 | Authority | Exact dispatch-binding validation/persistence seam and bounded runtime projection | Trusted production Familiar/Threads/principal/approval/runtime adapters (#857) |
 | Receipts | Immutable base receipt and authority sidecar commitment, atomic run link/event, verified reopen, owner-local base read | Launched-session authenticated observation producer, accepting verifier, evidence consumption and terminal receipt construction (#857) |
 | No-launch evidence | Dispatcher-controlled refusal of an authority-unaware runtime can commit a truthful no-launch receipt through the explicit authority seam | This is not proof of a launched runtime's effects, and the production authority adapter remains unavailable |
@@ -197,3 +197,21 @@ same-key retry and durable replay once the trigger is removed. A mandatory
 no-fault control proves the fixture can commit. This is audit-only evidence;
 process-kill, filesystem I/O/corruption/disk-full, external dispatch boundaries,
 authority certification and release eligibility remain unproven.
+
+## Legacy import audit boundary
+
+The `legacy-import-source-preservation` suite calls existing import actions
+through an identity-bound owner-local daemon in a disposable home. Its two
+routes distinguish legacy `PAUSED`/`paused` records from v1 `PAUSED`/`draft`
+records. Source definitions request ACTIVE status; import must keep them inactive.
+The fixture compares source bytes and inventory, preserves a preexisting
+definition, exercises duplicate IDs and unsupported schedules, and checks v1
+dry run and adoption replay. It compares persisted records across daemon restart
+and requires zero occurrences, runs and attempts.
+
+This adds audit-only evidence toward golden scenario 20. It does not certify
+runtime launch, principal-scoped disclosure, broad crash boundaries, all
+platform containment, complete profiles or release eligibility. The daemon
+receives an isolated home and no provider environment. The runner uses a short
+owned scratch path on macOS for Unix sockets and a separate fixture hang guard;
+production startup and maintenance deadlines are unchanged.

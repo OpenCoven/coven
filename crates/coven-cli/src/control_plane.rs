@@ -154,6 +154,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.health.v1",
                     "coven.automations.scheduler.status.v1",
                     "coven.automations.occurrence.list.v1",
+                    crate::automations::leases::ACTION,
                     "coven.automations.occurrence.get.v1",
                     "coven.automations.run.get.v1",
                     "coven.automations.occurrence.history.v1",
@@ -190,6 +191,7 @@ const TCP_AUTOMATION_READS: &[&str] = &[
 /// runs carry `logJson`, receipts carry authority evidence, and event pages
 /// issue a stored checkpoint.
 const OWNER_AUTOMATION_READS: &[&str] = &[
+    crate::automations::leases::ACTION,
     "coven.automations.list",
     "coven.automations.get",
     "coven.automations.definition.list.v1",
@@ -234,6 +236,9 @@ pub(crate) fn automation_transport_rejection(
             "Automation event reads require owner-local IPC."
         }
         crate::automations::missions::GET_ACTION => "Mission reads require owner-local IPC.",
+        crate::automations::leases::ACTION => {
+            "Automation lease inspection requires owner-local IPC."
+        }
         _ if OWNER_AUTOMATION_READS.contains(&action) => {
             "Automation reads that return prompts or run logs require owner-local IPC."
         }
@@ -1080,6 +1085,43 @@ pub(crate) fn route_action_at(
             intent_id,
             automation_scheduler_status_payload(conn, chrono::Utc::now()),
         ),
+        crate::automations::leases::ACTION => {
+            use crate::automations::contract::error::ErrorCode;
+            match crate::automations::leases::read(conn, &payload, recorded_at) {
+                Ok(page) => match serde_json::to_value(page) {
+                    Ok(page) => (
+                        200,
+                        ControlActionResponse {
+                            ok: true,
+                            accepted: true,
+                            action: action.to_owned(),
+                            status: ActionStatus::Completed,
+                            reason: None,
+                            error: None,
+                            result: Some(page),
+                            event: None,
+                        },
+                    ),
+                    Err(_) => typed_rejection(
+                        action,
+                        automation_error(
+                            ErrorCode::Internal,
+                            "Automation lease inspection failed.",
+                        ),
+                    ),
+                },
+                Err(crate::automations::leases::ReadError::Invalid(reason)) => {
+                    validation_rejection(action, reason.to_owned())
+                }
+                Err(crate::automations::leases::ReadError::Store) => typed_rejection(
+                    action,
+                    automation_error(
+                        ErrorCode::Internal,
+                        "Automation lease metadata could not be inspected.",
+                    ),
+                ),
+            }
+        }
         "coven.automations.occurrence.list.v1" => {
             let view = required_occurrence_view(&payload, action);
             let limit = optional_inspection_limit(&payload, action);
@@ -3365,6 +3407,141 @@ mod tests {
             rusqlite::params![id, automation_id, scheduled_for, state],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn occurrence_leases_read_pages_before_limit_without_writes_or_private_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for id in ["lease-target", "lease-other"] {
+            filter_fixture_definition(&conn, id);
+        }
+        let now = chrono::Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap();
+        for index in 0..112 {
+            let scheduled = now + chrono::Duration::seconds(index);
+            for (prefix, automation, offset, leased) in [
+                ("lease", "lease-target", 0, true),
+                ("000-unleased", "lease-target", -86400, false),
+                ("001-other", "lease-other", -172800, true),
+            ] {
+                let id = format!("{prefix}-{index:03}");
+                filter_fixture_occurrence(
+                    &conn,
+                    &id,
+                    automation,
+                    &(scheduled + chrono::Duration::seconds(offset))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    if index % 2 == 0 { "claimed" } else { "running" },
+                );
+                if leased {
+                    conn.execute(
+                        "UPDATE automation_occurrences SET lease_owner = ?1,
+                         lease_expires_at = ?2, scheduler_generation = 7,
+                         failure_reason = ?3 WHERE id = ?4",
+                        rusqlite::params![
+                            "private-owner-marker",
+                            if index % 2 == 0 {
+                                "2026-09-01T08:00:00.000Z"
+                            } else {
+                                "2026-09-02T09:00:00.000Z"
+                            },
+                            "private-reason-marker",
+                            id,
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let before = store_snapshot(&conn);
+        let changes = conn.total_changes();
+        conn.pragma_update(None, "query_only", true).unwrap();
+        let mut cursor = Value::Null;
+        let mut ids = Vec::new();
+        for expected_count in [100, 12] {
+            let mut request = json!({
+                "action":"coven.automations.occurrence.leases.v1",
+                "automationId":"lease-target", "limit":100,
+            });
+            if !cursor.is_null() {
+                request["cursor"] = cursor;
+            }
+            let (status, response) = route_action_at(
+                request,
+                &conn,
+                &crate::api::NoopSessionRuntime,
+                "2026-09-01T09:00:00.000Z",
+                CommandAuthority::OwnerLocal,
+            );
+            assert_eq!(status, 200, "lease read must be supported");
+            assert!(response.ok);
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains("private-owner-marker"));
+            assert!(!encoded.contains("private-reason-marker"));
+            assert!(
+                response.event.is_none(),
+                "a lease read is not a lifecycle change"
+            );
+            let payload = response.result.as_ref().unwrap();
+            assert_eq!(payload["schemaVersion"], "coven.automations.leases.v1");
+            assert_eq!(payload["observedAt"], "2026-09-01T09:00:00.000Z");
+            let leases = payload["leases"].as_array().unwrap();
+            assert_eq!(leases.len(), expected_count);
+            for lease in leases {
+                assert_eq!(lease["automationId"], "lease-target");
+                assert_eq!(lease["schedulerGeneration"], 7);
+                assert_eq!(lease["ownerPresent"], true);
+                ids.push(lease["occurrenceId"].as_str().unwrap().to_owned());
+            }
+            if ids.len() == 100 {
+                assert_eq!(leases[0]["expiry"], "expired");
+                assert_eq!(leases[1]["expiry"], "active");
+            }
+            cursor = payload["cursor"]["next"].clone();
+            assert_eq!(payload["cursor"]["hasMore"], expected_count == 100);
+            assert_eq!(cursor.is_null(), expected_count == 12);
+        }
+        assert_eq!(
+            ids,
+            (0..112)
+                .map(|index| format!("lease-{index:03}"))
+                .collect::<Vec<_>>()
+        );
+        let mut all_ids = Vec::new();
+        for expected_count in [100, 100, 24] {
+            let mut request =
+                json!({"action":"coven.automations.occurrence.leases.v1", "limit":100});
+            if !cursor.is_null() {
+                request["cursor"] = cursor;
+            }
+            let (status, response) = route_action_at(
+                request,
+                &conn,
+                &crate::api::NoopSessionRuntime,
+                "2026-09-01T09:00:00.000Z",
+                CommandAuthority::OwnerLocal,
+            );
+            assert_eq!(status, 200);
+            let payload = response.result.unwrap();
+            let leases = payload["leases"].as_array().unwrap();
+            assert_eq!(leases.len(), expected_count);
+            all_ids.extend(
+                leases
+                    .iter()
+                    .map(|lease| lease["occurrenceId"].as_str().unwrap().to_owned()),
+            );
+            cursor = payload["cursor"]["next"].clone();
+            assert_eq!(cursor.is_null(), expected_count == 24);
+        }
+        let expected = ["001-other", "lease"]
+            .into_iter()
+            .flat_map(|prefix| (0..112).map(move |index| format!("{prefix}-{index:03}")))
+            .collect::<Vec<_>>();
+        assert_eq!(all_ids, expected);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(store_snapshot(&conn), before);
     }
 
     #[test]

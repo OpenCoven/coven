@@ -32,6 +32,7 @@ mod command_envelope_outcomes;
 mod command_storage_lock_recovery;
 mod command_storage_readonly_recovery;
 mod command_transaction_rollback;
+mod legacy_import_source_preservation;
 mod runtime_authority_terminal_recovery;
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -101,6 +102,7 @@ pub const COMMAND_ENVELOPE_OUTCOMES_SUITE: &str = "command-envelope-outcomes";
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
+pub const LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE: &str = "legacy-import-source-preservation";
 pub const MISFIRE_LATEST_PLANNING_SUITE: &str = "misfire-latest-planning";
 pub const OCCURRENCE_LEASE_RECOVERY_SUITE: &str = "occurrence-lease-recovery";
 pub const OVERLAP_FORBID_CLAIMING_SUITE: &str = "overlap-forbid-claiming";
@@ -1562,6 +1564,7 @@ pub fn capability() -> TargetCapability {
                     COMMAND_STORAGE_LOCK_RECOVERY_SUITE,
                     COMMAND_STORAGE_READONLY_RECOVERY_SUITE,
                     COMMAND_TRANSACTION_ROLLBACK_SUITE,
+                    LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE,
                     MISFIRE_LATEST_PLANNING_SUITE,
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
                     OVERLAP_FORBID_CLAIMING_SUITE,
@@ -1641,6 +1644,13 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, COMMAND_TRANSACTION_ROLLBACK_SUITE) => {
             command_transaction_rollback::evaluate(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE) => {
+            let (passed, observations) =
+                legacy_import_source_preservation::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            result.evidence.get_or_insert_with(|| json!({}))["caseObservations"] = observations;
+            return Ok(result);
         }
         (SCHEDULER_RELIABILITY_PROFILE, MISFIRE_LATEST_PLANNING_SUITE) => {
             evaluate_misfire_latest_planning(&request.vector)?
