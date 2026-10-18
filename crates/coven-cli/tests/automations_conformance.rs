@@ -151,6 +151,7 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "cancellation-timeout-arbitration",
                         "command-storage-lock-recovery",
                         "command-transaction-rollback",
+                        "legacy-import-source-preservation",
                         "misfire-latest-planning",
                         "occurrence-lease-recovery",
                         "overlap-forbid-claiming",
@@ -1222,5 +1223,92 @@ fn native_target_evaluates_checked_in_transaction_rollback_vectors() -> anyhow::
     assert_eq!(response["evidence"]["executedCases"], 3);
     assert_eq!(response["evidence"]["passedCases"], 3);
     assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_imports_legacy_sources_through_real_daemon() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let temp = tempfile::tempdir_in("/tmp")?;
+    #[cfg(not(unix))]
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("must-not-be-created");
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/legacy-import-source-preservation.vectors.json"
+    ))?;
+    let mut request = json!({
+        "schemaVersion":"coven.automations.conformance-suite-request.v1",
+        "profile":"scheduler_reliability", "suiteId":"legacy-import-source-preservation",
+        "protocolArtifact":{}, "subjectArtifact":{}, "vector":vector
+    });
+    let output = run_target(&home, "evaluate", Some(&request))?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 2);
+    assert_eq!(response["evidence"]["passedCases"], 2);
+    let observations = response["evidence"]["caseObservations"].as_array().unwrap();
+    assert_eq!(observations.len(), 2);
+    for (index, lifecycle, outcome) in
+        [(0, "paused", "legacy_completed"), (1, "draft", "committed")]
+    {
+        let observed = &observations[index];
+        assert_eq!(observed["definitionStatus"], "PAUSED");
+        assert_eq!(observed["lifecycleState"], lifecycle);
+        assert_eq!(observed["commandOutcome"], outcome);
+        for field in [
+            "sourcePreserved",
+            "preexistingPreserved",
+            "replayPreserved",
+            "restartPreserved",
+            "passed",
+        ] {
+            assert_eq!(observed[field], true, "{field}: {observed}");
+        }
+        for table in [
+            "automation_occurrences",
+            "automation_runs",
+            "automation_attempts",
+        ] {
+            assert_eq!(observed["workCounts"][table], 0);
+        }
+    }
+    assert_eq!(observations[0]["dryRunPreserved"], Value::Null);
+    assert_eq!(observations[1]["dryRunPreserved"], true);
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains("synthetic sentinel"));
+    assert!(!text.contains("synthetic import sentinel"));
+    assert!(!text.contains(temp.path().to_string_lossy().as_ref()));
+    assert!(!home.exists());
+
+    request["vector"]["cases"][0]["expected"]["skipped"] = json!(0);
+    let output = run_target(&home, "evaluate", Some(&request))?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["status"], "failed");
+    assert_eq!(
+        response["evidence"]["caseObservations"][0]["skippedCount"],
+        1
+    );
+    assert_eq!(response["evidence"]["caseObservations"][0]["passed"], false);
+    assert!(!home.exists());
+
+    request["vector"]["cases"][0]["expected"]["sourcePreserved"] = json!(false);
+    let output = run_target(&home, "evaluate", Some(&request))?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "Error: conformance vector is invalid\n"
+    );
+    assert!(!home.exists());
     Ok(())
 }

@@ -33,6 +33,9 @@ const STARTUP_WAKE_TARGET_TIMEOUT_MS = 20_000;
 // The two race cases can consume three 5-second synchronization guards; keep
 // additional time for fixture setup, SQLite settlement, and process cleanup.
 const CANCELLATION_ARBITRATION_TARGET_TIMEOUT_MS = 20_000;
+// Real-daemon import cases include startup and restart readiness guards.
+// This is a fixture hang guard, not a production latency budget.
+const LEGACY_IMPORT_TARGET_TIMEOUT_MS = 600_000;
 const TARGET_KILL_GRACE_MS = 100;
 const TARGET_OUTPUT_LIMIT = 1024 * 1024;
 const MAX_JCS_DEPTH = 128;
@@ -394,7 +397,8 @@ function parseTargetJson(execution) {
 
 async function invokeTarget(subject, operation, input) {
   const directory = mkdtempSync(
-    join(tmpdir(), "coven-conformance-subject-"),
+    // macOS default TMPDIR paths leave too little room for a Unix socket.
+    join(process.platform === "darwin" ? "/tmp" : tmpdir(), "coven-conformance-subject-"),
   );
   const target = join(directory, subject.name);
   writeFileSync(target, subject.bytes, { mode: subject.mode });
@@ -408,6 +412,8 @@ async function invokeTarget(subject, operation, input) {
         : operation === "evaluate" &&
             input?.suiteId === "cancellation-timeout-arbitration"
           ? CANCELLATION_ARBITRATION_TARGET_TIMEOUT_MS
+        : operation === "evaluate" && input?.suiteId === "legacy-import-source-preservation"
+          ? LEGACY_IMPORT_TARGET_TIMEOUT_MS
         : DEFAULT_TARGET_HANG_GUARD_MS;
     return await new Promise((resolve) => {
       const child = spawn(
