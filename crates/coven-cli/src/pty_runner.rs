@@ -1510,6 +1510,8 @@ pub(crate) struct SharedStrictChildProcessTree {
     guardian: Arc<Mutex<ProcessSupervisorGuardian>>,
     child_wait_state: Arc<AtomicU8>,
     exit_callback_complete: Arc<AtomicBool>,
+    #[cfg(test)]
+    wait_phase: Arc<AtomicU8>,
 }
 
 impl SharedStrictChildProcessTree {
@@ -1525,6 +1527,8 @@ impl SharedStrictChildProcessTree {
             guardian: Arc::new(Mutex::new(guardian)),
             child_wait_state,
             exit_callback_complete,
+            #[cfg(test)]
+            wait_phase: Arc::new(AtomicU8::new(PipedWaitPhase::NotStarted as u8)),
         }
     }
 
@@ -1538,6 +1542,8 @@ impl SharedStrictChildProcessTree {
             process_tree: Arc::new(Mutex::new(process_tree)),
             child_wait_state,
             exit_callback_complete,
+            #[cfg(test)]
+            wait_phase: Arc::new(AtomicU8::new(PipedWaitPhase::NotStarted as u8)),
         }
     }
 
@@ -1648,8 +1654,15 @@ impl SharedStrictChildProcessTree {
         };
         #[cfg(not(unix))]
         let group = String::new();
+        #[cfg(test)]
+        let phase = format!(
+            "; wait_phase={}",
+            PipedWaitPhase::label(self.wait_phase.load(Ordering::Acquire))
+        );
+        #[cfg(not(test))]
+        let phase = "";
         format!(
-            "after {} ms of a {} ms budget; {wait_state}{group}",
+            "after {} ms of a {} ms budget; {wait_state}{group}{phase}",
             started.elapsed().as_millis(),
             timeout.as_millis()
         )
@@ -1682,13 +1695,22 @@ impl SharedStrictChildProcessTree {
     pub(crate) fn wait_for_quiescence(&self, timeout: Duration) -> Result<()> {
         match wait_for_piped_child_reap(&self.child_wait_state, timeout) {
             PIPED_CHILD_REAPED => Ok(()),
-            PIPED_CHILD_WAIT_FAILED => {
-                anyhow::bail!("the direct child wait or output drain failed")
+            state => {
+                #[cfg(test)]
+                let phase = format!(
+                    "; wait_phase={}",
+                    PipedWaitPhase::label(self.wait_phase.load(Ordering::Acquire))
+                );
+                #[cfg(not(test))]
+                let phase = "";
+                if state == PIPED_CHILD_WAIT_FAILED {
+                    anyhow::bail!("the direct child wait or output drain failed{phase}");
+                }
+                anyhow::bail!(
+                    "the child did not become quiescent within {} ms{phase}",
+                    timeout.as_millis()
+                )
             }
-            _ => anyhow::bail!(
-                "the child did not become quiescent within {} ms",
-                timeout.as_millis()
-            ),
         }
     }
 
@@ -1696,6 +1718,14 @@ impl SharedStrictChildProcessTree {
         let deadline = Instant::now() + timeout;
         self.wait_for_quiescence(timeout)?;
         while !self.exit_callback_complete.load(Ordering::Acquire) {
+            #[cfg(test)]
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the piped child exit callback did not complete within {} ms; wait_phase={}",
+                timeout.as_millis(),
+                PipedWaitPhase::label(self.wait_phase.load(Ordering::Acquire))
+            );
+            #[cfg(not(test))]
             anyhow::ensure!(
                 Instant::now() < deadline,
                 "the piped child exit callback did not complete within {} ms",
@@ -4517,6 +4547,46 @@ const PIPED_CHILD_WAIT_PENDING: u8 = 0;
 const PIPED_CHILD_REAPED: u8 = 1;
 const PIPED_CHILD_WAIT_FAILED: u8 = 2;
 
+#[cfg(test)]
+#[repr(u8)]
+enum PipedWaitPhase {
+    NotStarted,
+    ChildExitWait,
+    TreeTermination,
+    GuardianFinish,
+    StdoutDrainJoin,
+    StderrDrainJoin,
+    ChildReap,
+    GroupQuiescence,
+    ContainmentReceipt,
+    PublishQuiescence,
+    PromptOutcome,
+    ExitCallback,
+    PublishCallbackCompletion,
+}
+
+#[cfg(test)]
+impl PipedWaitPhase {
+    fn label(value: u8) -> &'static str {
+        match value {
+            x if x == Self::NotStarted as u8 => "wait-thread-not-entered",
+            x if x == Self::ChildExitWait as u8 => "child-exit-wait",
+            x if x == Self::TreeTermination as u8 => "tree-termination",
+            x if x == Self::GuardianFinish as u8 => "guardian-finish",
+            x if x == Self::StdoutDrainJoin as u8 => "stdout-drain-join",
+            x if x == Self::StderrDrainJoin as u8 => "stderr-drain-join",
+            x if x == Self::ChildReap as u8 => "child-reap",
+            x if x == Self::GroupQuiescence as u8 => "group-quiescence",
+            x if x == Self::ContainmentReceipt as u8 => "containment-receipt",
+            x if x == Self::PublishQuiescence as u8 => "publish-quiescence",
+            x if x == Self::PromptOutcome as u8 => "prompt-outcome",
+            x if x == Self::ExitCallback as u8 => "exit-callback",
+            x if x == Self::PublishCallbackCompletion as u8 => "publish-callback-completion",
+            _ => "unknown",
+        }
+    }
+}
+
 /// Privacy-safe disposition for a piped launch whose cleanup did not prove
 /// child-process quiescence. Callers may preserve killable runtime ownership
 /// without exposing either the prompt-delivery or cleanup failure.
@@ -5047,6 +5117,8 @@ pub(crate) fn spawn_piped_with_status_observer(
         Arc::clone(&exit_callback_complete),
     );
     let wait_process_tree = Arc::downgrade(&process_tree.process_tree);
+    #[cfg(test)]
+    let wait_phase = Arc::clone(&process_tree.wait_phase);
     #[cfg(unix)]
     let wait_guardian = Arc::downgrade(&process_tree.guardian);
     let stdout_callback = Arc::clone(&on_output_shared);
@@ -5070,7 +5142,11 @@ pub(crate) fn spawn_piped_with_status_observer(
         // stderr open forever; waiting for EOF first would never reach tree
         // cleanup. WNOWAIT (or the stable Windows process handle) reserves the
         // root identity until its entire containment unit is terminated.
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::ChildExitWait as u8, Ordering::Release);
         let pre_reap_wait_failed = wait_for_child_exit_without_reaping(&child).is_err();
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::TreeTermination as u8, Ordering::Release);
         let containment_cleanup_failed =
             wait_process_tree
                 .upgrade()
@@ -5081,6 +5157,8 @@ pub(crate) fn spawn_piped_with_status_observer(
         // Close and reap the independent Unix guardian while the direct child
         // remains WNOWAIT-reserved. Its final group signal can therefore never
         // target a recycled numeric PGID.
+        #[cfg(all(test, unix))]
+        wait_phase.store(PipedWaitPhase::GuardianFinish as u8, Ordering::Release);
         #[cfg(unix)]
         if let Some(guardian) = wait_guardian.upgrade() {
             match guardian.lock() {
@@ -5091,8 +5169,14 @@ pub(crate) fn spawn_piped_with_status_observer(
         // Tree termination closes every inherited output pipe. Join both
         // drains before publishing quiescence so no observer callback can run
         // after `/kill` or shutdown reports completion.
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::StdoutDrainJoin as u8, Ordering::Release);
         let stdout_drain_failed = stdout_thread.join().is_err();
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::StderrDrainJoin as u8, Ordering::Release);
         let stderr_drain_failed = stderr_thread.join().is_err();
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::ChildReap as u8, Ordering::Release);
         let (mut result, mut state) = match child.wait() {
             Ok(status) => (
                 PtyRunResult {
@@ -5113,12 +5197,16 @@ pub(crate) fn spawn_piped_with_status_observer(
                 PIPED_CHILD_WAIT_FAILED,
             ),
         };
+        #[cfg(all(test, unix))]
+        wait_phase.store(PipedWaitPhase::GroupQuiescence as u8, Ordering::Release);
         #[cfg(unix)]
         let process_group_quiescence_failed = state == PIPED_CHILD_REAPED
             && wait_for_unix_process_group_exit(process_group_pid, PIPED_PROMPT_REAP_TIMEOUT)
                 .is_err();
         #[cfg(not(unix))]
         let process_group_quiescence_failed = false;
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::ContainmentReceipt as u8, Ordering::Release);
         if state == PIPED_CHILD_REAPED && !process_group_quiescence_failed {
             if let Some(path) = wait_containment_receipt_path.as_deref() {
                 if write_containment_receipt(path, CONTAINMENT_QUIESCENT_RECEIPT).is_err() {
@@ -5138,6 +5226,8 @@ pub(crate) fn spawn_piped_with_status_observer(
         {
             state = PIPED_CHILD_WAIT_FAILED;
         }
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::PublishQuiescence as u8, Ordering::Release);
         wait_state.store(state, Ordering::Release);
         // Prompt-delivery cleanup may itself wait for the reaped/quiescent
         // state above, so publish that barrier first. Do not publish on_exit,
@@ -5145,10 +5235,19 @@ pub(crate) fn spawn_piped_with_status_observer(
         // after closing stdin while the required prompt write fails with
         // EPIPE. In that race the launch and durable exit event must both be
         // failed, never completed.
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::PromptOutcome as u8, Ordering::Release);
         if !prompt_outcome.wait() {
             result.status = "failed";
         }
+        #[cfg(test)]
+        wait_phase.store(PipedWaitPhase::ExitCallback as u8, Ordering::Release);
         on_exit(result);
+        #[cfg(test)]
+        wait_phase.store(
+            PipedWaitPhase::PublishCallbackCompletion as u8,
+            Ordering::Release,
+        );
         callback_complete.store(true, Ordering::Release);
     });
 
@@ -6360,6 +6459,107 @@ mod tests {
             "definitive cleanup left child {child_pid} running"
         );
         release_tx.send(())?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    struct GatedPipedTestCleanup {
+        tree: SharedStrictChildProcessTree,
+        release: Option<mpsc::Sender<()>>,
+        home: Option<tempfile::TempDir>,
+        complete: bool,
+    }
+
+    #[cfg(any(unix, windows))]
+    impl GatedPipedTestCleanup {
+        fn release_and_join(&mut self) -> anyhow::Result<()> {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            let termination = self.tree.terminate_tree();
+            // An owned-fixture cleanup hang guard, not a runtime deadline.
+            let completion = self
+                .tree
+                .wait_for_shutdown_quiescence(Duration::from_secs(60));
+            self.complete = completion.is_ok();
+            termination?;
+            completion
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    impl Drop for GatedPipedTestCleanup {
+        fn drop(&mut self) {
+            if !self.complete {
+                let _ = self.release_and_join();
+            }
+            if !self.complete {
+                // Never remove the executable/home while a worker may still
+                // reference it. Keep the original assertion/error as primary.
+                if let Some(home) = self.home.take() {
+                    let _ = home.keep();
+                }
+                eprintln!("piped diagnostic fixture cleanup incomplete; owned home retained");
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_shutdown_diagnostic_identifies_a_gated_exit_callback() -> anyhow::Result<()> {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("coven-piped-callback-phase-")
+            .tempdir()?;
+        let pid_file = temp_dir.path().join("gated-exit-callback.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "close-stdin",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = entered_tx.send(result);
+                let _ = release_rx.recv();
+            }),
+        };
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let tree = session.process_tree.clone();
+        let mut cleanup = GatedPipedTestCleanup {
+            tree: tree.clone(),
+            release: Some(release_tx),
+            home: Some(temp_dir),
+            complete: false,
+        };
+        let launch_error = match session.activate(|_input, process_tree| Ok(process_tree)) {
+            Ok(_) => anyhow::bail!("closed stdin unexpectedly accepted the launch prompt"),
+            Err(error) => error,
+        };
+        // A hang guard for a controlled child callback, not a promptness claim.
+        let exit = entered_rx.recv_timeout(Duration::from_secs(60))?;
+        assert_eq!(exit.status, "failed", "{exit:?}");
+        assert!(
+            launch_error
+                .downcast_ref::<PipedLaunchCleanupRetainedError>()
+                .is_none(),
+            "the direct child must already be quiescent: {launch_error:#}"
+        );
+        // The callback is provably unfinished; an expired budget alone would
+        // not distinguish that state from a worker which already completed.
+        let observed = tree
+            .wait_for_shutdown_quiescence(Duration::ZERO)
+            .expect_err("the callback is held by the explicit gate");
+        let diagnostic = format!("{observed:#}");
+        let completion = cleanup.release_and_join();
+        assert!(
+            diagnostic.contains("wait_phase=exit-callback"),
+            "missing actual worker phase: {diagnostic}"
+        );
+        completion?;
         Ok(())
     }
 
