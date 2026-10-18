@@ -133,6 +133,11 @@ shortcut around steps 2 through 6.
 No unattended real-repository, release, deployment, merge, or publication
 automation is enabled by this work.
 
+The [command acceptance matrix](coven-automations-command-acceptance.md)
+reconciles the 19-command base surface, selected release artifacts, consumer
+behavioral cases and remaining #857/#858 gates. Its dated evidence distinguishes
+unmerged verification work from delivered consumer support.
+
 ## Upstream and consumer evidence
 
 Reviewed GitHub main branches and open PRs on 2026-09-14:
