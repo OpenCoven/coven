@@ -103,9 +103,12 @@ fn real_daemon_lease_pages_are_minimized_read_only_and_owner_local() -> Result<(
     let mut conn = Connection::open(home.join("coven.sqlite3"))?;
     conn.busy_timeout(Duration::from_secs(10))?;
     let transaction = conn.transaction()?;
+    // Transport readiness does not wait for scheduler startup reconciliation.
+    // Keep every synthetic row terminal: planned distractors are real work
+    // that a concurrent startup/periodic pass may legitimately retire.
     for index in 0..112 {
         for (prefix, automation, state, owner, expiry) in [
-            ("000-unleased", "target", "planned", None, None),
+            ("000-unleased", "target", "cancelled", None, None),
             (
                 "001-other",
                 "other",
@@ -184,10 +187,14 @@ fn real_daemon_lease_pages_are_minimized_read_only_and_owner_local() -> Result<(
         assert!(response.starts_with("HTTP/1.1 403"));
         assert!(response.contains("AUTHORITY_REQUIRED"));
     }
-    assert_eq!(
-        snapshot(&conn)?,
-        before,
-        "lease reads changed durable lifecycle state"
-    );
+    let after = snapshot(&conn)?;
+    for (index, (before, after)) in before.iter().zip(&after).enumerate() {
+        assert!(
+            before == after,
+            "lease reads changed lifecycle table {index}: {} before rows, {} after rows",
+            before.len(),
+            after.len()
+        );
+    }
     Ok(())
 }
