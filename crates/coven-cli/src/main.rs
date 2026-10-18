@@ -1138,6 +1138,31 @@ enum SchedulerCommand {
 
 #[derive(Subcommand, Debug)]
 enum AutomationsCommand {
+    #[command(
+        about = "Inspect scheduler leadership, last pass, and queue through the local daemon"
+    )]
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one occurrence and its bounded run history")]
+    Occurrence {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one run without raw logs or private failure text")]
+    Run {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one run's attempts, fences, and retry classifications")]
+    Attempts {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Expose the native conformance target protocol")]
     Conformance {
         #[command(subcommand)]
@@ -1603,6 +1628,10 @@ fn main() -> Result<()> {
         &cli.command,
         Some(Command::Automations {
             command: AutomationsCommand::Conformance { .. }
+                | AutomationsCommand::Status { .. }
+                | AutomationsCommand::Occurrence { .. }
+                | AutomationsCommand::Run { .. }
+                | AutomationsCommand::Attempts { .. }
         })
     ) || matches!(
         &cli.command,
@@ -4036,7 +4065,12 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
 }
 
 fn run_automations_command(command: AutomationsCommand) -> Result<()> {
+    use automations::operator_cli::{run, View};
     match command {
+        AutomationsCommand::Status { json } => run(View::Status, json),
+        AutomationsCommand::Occurrence { id, json } => run(View::Occurrence(&id), json),
+        AutomationsCommand::Run { id, json } => run(View::Run(&id), json),
+        AutomationsCommand::Attempts { run_id, json } => run(View::Attempts(&run_id), json),
         AutomationsCommand::Conformance { command } => match command {
             AutomationsConformanceCommand::Capability => {
                 println!(
