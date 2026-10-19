@@ -1,9 +1,12 @@
 //! Native lease acquisition and independent acknowledgement/loss observation.
-use crate::Failure;
+use crate::{
+    pipe::{byte_pipe, CancellablePipe},
+    Failure,
+};
 
 use std::{
     fs::File,
-    io::{self, Read},
+    io::Read,
     mem::{size_of, zeroed},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::null_mut,
@@ -15,38 +18,12 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{
-        DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_IO_INCOMPLETE,
-        ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    },
-    Storage::FileSystem::ReadFile,
+    Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
-        Pipes::{GetNamedPipeInfo, PIPE_SERVER_END},
-        Threading::{
-            CreateEventW, GetCurrentProcess, GetStartupInfoW, WaitForSingleObject, STARTUPINFOW,
-        },
-        IO::{CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED},
+        Threading::{GetCurrentProcess, GetStartupInfoW, WaitForSingleObject, STARTUPINFOW},
+        IO::CancelSynchronousIo,
     },
 };
-
-fn byte_pipe(file: &File) -> Result<(), Failure> {
-    let mut flags = 0;
-    // SAFETY: The file owns a live handle; optional outputs are null, flags is writable.
-    if unsafe {
-        GetNamedPipeInfo(
-            file.as_raw_handle(),
-            &mut flags,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-        )
-    } == 0
-        || flags & !PIPE_SERVER_END != 0
-    {
-        return Err(Failure::InvalidLaunch);
-    }
-    Ok(())
-}
 
 fn duplicate_pipe(raw: HANDLE) -> Result<File, Failure> {
     let mut duplicate = null_mut();
@@ -74,7 +51,7 @@ fn duplicate_pipe(raw: HANDLE) -> Result<File, Failure> {
 
 /// Acquire only the private four-pipe libuv contract. Does not own/close CRT originals.
 /// Actual supported Node/libuv versions must be exercised on native Windows.
-pub fn inherited_pipe() -> Result<File, Failure> {
+fn startup_pipes() -> Result<[u64; 4], Failure> {
     // SAFETY: STARTUPINFOW is a plain Win32 output record with null pointers initially.
     let mut startup: STARTUPINFOW = unsafe { zeroed() };
     // SAFETY: Win32 writes the local output record and returns this process's startup data.
@@ -86,8 +63,23 @@ pub fn inherited_pipe() -> Result<File, Failure> {
     // SAFETY: GetStartupInfoW returns OS-owned process startup storage of cbReserved2
     // bytes. Its exact bounded length is checked above and it remains live here.
     let bytes = unsafe { std::slice::from_raw_parts(startup.lpReserved2, expected) };
-    let raw = super::decode_node_lease(bytes, size_of::<HANDLE>())?;
-    duplicate_pipe(raw as usize as HANDLE)
+    super::decode_node_pipes(bytes, size_of::<HANDLE>())
+}
+
+/// Duplicate and validate all four byte-pipe descriptors. Partial acquisition
+/// releases owned duplicates; original CRT handles remain untouched.
+pub fn inherited_pipes() -> Result<[File; 4], Failure> {
+    let [input, output, error, control] = startup_pipes()?;
+    Ok([
+        duplicate_pipe(input as usize as HANDLE)?,
+        duplicate_pipe(output as usize as HANDLE)?,
+        duplicate_pipe(error as usize as HANDLE)?,
+        duplicate_pipe(control as usize as HANDLE)?,
+    ])
+}
+
+pub fn inherited_pipe() -> Result<File, Failure> {
+    duplicate_pipe(startup_pipes()?[3] as usize as HANDLE)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,85 +87,7 @@ pub enum LeaseStatus {
     AwaitingAck,
     Acknowledged,
     Failed,
-}
-
-struct CancellablePipe {
-    file: File,
-    stopping: Arc<AtomicBool>,
-}
-impl Read for CancellablePipe {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        // read_exact retries Interrupted. Checking before each retry makes cancellation
-        // terminal rather than accidentally starting another blocking native read.
-        if self.stopping.load(Ordering::Acquire) {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        }
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        let count = u32::try_from(buffer.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
-        // SAFETY: Create an unnamed, noninheritable manual-reset event with no initial signal.
-        let raw_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        if raw_event.is_null() {
-            return Err(io::ErrorKind::Other.into());
-        }
-        // SAFETY: A successful event creation returned an independently owned handle.
-        let event = unsafe { OwnedHandle::from_raw_handle(raw_event) };
-        // SAFETY: Zero initializes the Win32 operation record, including byte offsets.
-        let mut operation: OVERLAPPED = unsafe { zeroed() };
-        operation.hEvent = event.as_raw_handle();
-        // SAFETY: The file, buffer, event and unique operation record remain live
-        // until completion, including after cancellation. For synchronous pipes this
-        // call blocks; for overlapped pipes the event/result loop owns pending I/O.
-        let completed = unsafe {
-            ReadFile(
-                self.file.as_raw_handle(),
-                buffer.as_mut_ptr(),
-                count,
-                null_mut(),
-                std::ptr::addr_of_mut!(operation),
-            )
-        };
-        // SAFETY: Read the calling thread's last error immediately after ReadFile.
-        if completed == 0 && unsafe { GetLastError() } != ERROR_IO_PENDING {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        }
-        loop {
-            let mut transferred = 0;
-            // SAFETY: This is the same live handle and outstanding operation. A
-            // false/non-INCOMPLETE result is a terminal I/O completion error.
-            if unsafe {
-                GetOverlappedResult(
-                    self.file.as_raw_handle(),
-                    std::ptr::addr_of!(operation),
-                    &mut transferred,
-                    0,
-                )
-            } != 0
-            {
-                if self.stopping.load(Ordering::Acquire) || transferred > count {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
-                return Ok(transferred as usize);
-            }
-            // SAFETY: Read the calling thread's last error immediately after the query.
-            if unsafe { GetLastError() } != ERROR_IO_INCOMPLETE {
-                return Err(io::ErrorKind::BrokenPipe.into());
-            }
-            if self.stopping.load(Ordering::Acquire) {
-                // SAFETY: Cancel exactly this operation; cancellation is only a
-                // request. Do not drop its storage until completion is observed.
-                unsafe { CancelIoEx(self.file.as_raw_handle(), std::ptr::addr_of!(operation)) };
-            }
-            // SAFETY: The event is privately owned for this outstanding operation.
-            let waited = unsafe { WaitForSingleObject(event.as_raw_handle(), 10) };
-            if waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT {
-                // Retain all I/O storage even on an unexpected wait failure. The
-                // coordinator's bounded stop may detach this worker and exit safely.
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
+    Stopped,
 }
 
 pub struct LeaseWatch {
@@ -191,26 +105,31 @@ impl LeaseWatch {
         {
             return Err(Failure::InvalidLaunch);
         }
-        byte_pipe(&file)?;
         let state = Arc::new(AtomicU8::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_state = state.clone();
-        let mut reader = CancellablePipe {
-            file,
-            stopping: stopping.clone(),
-        };
+        let mut reader = CancellablePipe::new(file, stopping.clone())?;
         let worker = thread::Builder::new()
             .name("coven-audit-lease".into())
             .spawn(move || {
                 if crate::protocol::read_ack(&mut reader, &nonce).is_ok()
                     && !reader.stopping.load(Ordering::Acquire)
                 {
-                    worker_state.store(1, Ordering::Release);
+                    if worker_state
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        return;
+                    }
                     // Any data, EOF or error after ACK is lease failure. This reader has
                     // no target-body/output responsibilities that could block observation.
                     let _ = reader.read(&mut [0]);
                 }
-                worker_state.store(2, Ordering::Release);
+                // Failure observation and requested stop have distinct atomic
+                // states. Intentional cancellation cannot erase a latched loss.
+                let _ = worker_state.try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    (state < 2).then_some(2)
+                });
             })
             .map_err(|_| Failure::InvalidLaunch)?;
         Ok(Self {
@@ -224,20 +143,34 @@ impl LeaseWatch {
         match self.state.load(Ordering::Acquire) {
             0 => LeaseStatus::AwaitingAck,
             1 => LeaseStatus::Acknowledged,
-            _ => LeaseStatus::Failed,
+            2 => LeaseStatus::Failed,
+            _ => LeaseStatus::Stopped,
         }
     }
 
     /// Explicit stop must be checked by the native coordinator after job cleanup.
     /// A failed stop detaches a still-owned worker; the helper process must then exit.
-    pub fn stop(mut self) -> Result<(), Failure> {
-        self.stop_inner()
+    pub fn stop(self) -> Result<(), Failure> {
+        self.stop_observed().map(|_| ())
+    }
+
+    /// Preserve independently observed controller failure through explicit stop.
+    /// The state transition linearizes requested cancellation without relabeling
+    /// an already-latched loss as a clean stop.
+    pub fn stop_observed(mut self) -> Result<LeaseStatus, Failure> {
+        self.stop_inner()?;
+        Ok(self.status())
     }
 
     fn stop_inner(&mut self) -> Result<(), Failure> {
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
+        let _ = self
+            .state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state < 2).then_some(3)
+            });
         self.stopping.store(true, Ordering::Release);
         let started = Instant::now();
         loop {
@@ -277,7 +210,7 @@ mod tests {
         time::{Duration, Instant},
     };
     use windows_sys::Win32::{
-        Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT},
+        Foundation::{GetHandleInformation, GetLastError, HANDLE_FLAG_INHERIT},
         System::Pipes::CreatePipe,
     };
 
@@ -418,12 +351,12 @@ mod tests {
                     write.write_all(b"x").unwrap();
                     wait_status(&watch, LeaseStatus::Failed);
                     // Keep the writer open so EOF cannot make this data case pass.
-                    watch.stop().unwrap();
+                    assert_eq!(watch.stop_observed().unwrap(), LeaseStatus::Failed);
                     drop(write);
                 } else {
                     drop(write);
                     wait_status(&watch, LeaseStatus::Failed);
-                    watch.stop().unwrap();
+                    assert_eq!(watch.stop_observed().unwrap(), LeaseStatus::Failed);
                 }
             }
         }
@@ -451,7 +384,7 @@ mod tests {
                 // where stop wins before worker startup. No data/EOF can end it.
                 wait_pending_read(&watch);
                 // Keep the writer open: cancellation must stop without needing EOF.
-                watch.stop().unwrap();
+                assert_eq!(watch.stop_observed().unwrap(), LeaseStatus::Stopped);
                 drop(write);
             }
         }

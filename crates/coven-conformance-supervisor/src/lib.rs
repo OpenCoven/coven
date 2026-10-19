@@ -20,9 +20,20 @@ impl std::fmt::Display for Failure {
 impl std::error::Error for Failure {}
 
 pub mod command;
+pub mod control;
 pub mod image;
 pub mod lease;
 pub mod protocol;
+pub mod transfer;
 
 #[cfg(windows)]
 pub mod job;
+
+#[cfg(windows)]
+mod pipe;
+
+#[cfg(any(windows, test))]
+pub mod worker;
+
+#[cfg(windows)]
+pub mod coordinator;
