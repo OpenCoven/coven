@@ -71,6 +71,7 @@ token, or a ruleset in `evaluate` mode all fail.
 | `branch.merge_queue` | Merges go through the merge queue, which tests each group against current `main`. |
 | `branch.non_fast_forward` | No force pushes to `main`. |
 | `branch.deletion` | `main` cannot be deleted. |
+| `branch.required-checks-verified` | Every check `main` requires, in any ruleset or classic protection, is one the release verifies on the exact commit. |
 | `branch.classic-protection` | Classic protection is absent or has `enforce_admins` enabled. |
 | `tags.update` | Release tags (`v*`, `coven-client-v*`) cannot be moved. |
 | `tags.deletion` | Release tags cannot be deleted. |
@@ -101,6 +102,7 @@ asserts this table's pass/fail column against that fixture.
 | `branch.merge_queue` | Ruleset `merge-queue-main` (#23575627), no bypass actors. | Pass |
 | `branch.non_fast_forward` | Only classic protection blocks force pushes, and it exempts administrators. | Fail |
 | `branch.deletion` | Only classic protection blocks deletion, and it exempts administrators. | Fail |
+| `branch.required-checks-verified` | `PR gate` is the only required check, and the release verifies it. | Pass |
 | `branch.classic-protection` | `enforce_admins=false`; the branch summary reports `enforcement_level: non_admins`. | Fail |
 | `tags.update` | No tag ruleset exists. | Fail |
 | `tags.deletion` | No tag ruleset exists. | Fail |
@@ -123,11 +125,22 @@ node scripts/release-governance.mjs check \
   --output governance-evaluation.json
 ```
 
-It reads with `RELEASE_GOVERNANCE_READ_TOKEN`, then `GH_TOKEN`, then
+The command reads with `RELEASE_GOVERNANCE_READ_TOKEN`, then `GH_TOKEN`, then
 `GITHUB_TOKEN`, then `gh auth token`. The snapshot records which source it
 used, never the value. It exits non-zero when any control fails, after writing
 both files. `evaluate --snapshot FILE --output FILE` re-evaluates a stored
 snapshot without network access.
+
+The **Release governance check** workflow (`.github/workflows/release-governance.yml`)
+runs the same check every Monday and on demand, reading with
+`RELEASE_GOVERNANCE_READ_TOKEN` only. It catches drift between releases (a
+break-glass change left in place, an edited ruleset, an expired credential)
+before a release does, and retains the snapshot and evaluation as an artifact.
+Dispatch it after changing protection or rotating the credential:
+
+```sh
+gh workflow run release-governance.yml --repo OpenCoven/coven
+```
 
 ## Apply the policy
 

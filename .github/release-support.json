@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "kind": "coven.release-support",
+  "supportedReleaseLine": "0.4",
+  "packages": {
+    "@opencoven/cli": { "state": "supported" },
+    "@opencoven/cli-linux-x64": { "state": "supported" },
+    "@opencoven/cli-macos": { "state": "supported" },
+    "@opencoven/cli-macos-x64": { "state": "supported" },
+    "@opencoven/cli-windows": { "state": "supported" }
+  }
+}

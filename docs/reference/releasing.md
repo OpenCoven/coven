@@ -193,11 +193,17 @@ three.
 
 The tag must be **annotated and cryptographically signed**. Lightweight tags (`git tag vX.Y.Z`) are refused by the workflow.
 
+The annotation is the release record: it becomes the GitHub Release body,
+which is Coven's per-version changelog. Its subject line must be exactly
+`Coven vX.Y.Z`, and it must carry release notes below that line, including
+known risks and migration steps when they matter. A tag with only a title is
+refused before anything is published.
+
 ```sh
 git fetch origin main
 git checkout main
 git pull --ff-only
-git tag -s v0.0.17 -m "Coven v0.0.17"
+git tag -s v0.0.17 -F release-notes.md   # first line: Coven v0.0.17, then a blank line and the notes
 git push origin v0.0.17
 ```
 
@@ -218,8 +224,31 @@ That single push is the entire release. The workflow takes over from there.
    `coven-release-source-acceptance-vX.Y.Z` JSON artifact.
 4. **Build platform binaries** — matrix builds the release binary for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`, then uploads each as an artifact.
 5. **npm publish dry-run** — repacks the wrapper and native packages at the tag version and runs `npm publish --dry-run` for each. This is the same code path as the real publish minus the registry write, so a failure here means the real publish would also fail.
-6. **npm publish** — authenticates via GitHub Actions OIDC (`permissions: id-token: write`), then runs `npm publish --provenance --access public` for the four native packages and the wrapper. Each published tarball gets a provenance attestation linking it to this exact workflow run and commit SHA, visible on each package's npm page.
-7. **Automations contract bundles** — starting with `v0.4.4`, rebuilds both
+6. **Authorize publication** — immediately before the first registry write,
+   in the publish job itself, `scripts/authorize-release-publication.mjs`
+   decides again from fresh reads, because the build matrix takes long enough
+   for the preflight to go stale. It refuses unless every control passes:
+   - the tag re-verifies, signer pins at the current `main` tip included, and
+     still names the tag object and commit the builds started from;
+   - the exact-source `CI` run still passed `PR gate`;
+   - live protection satisfies [release governance](release-governance.md)
+     under the policy at the tagged commit and on `main`, read with
+     `RELEASE_GOVERNANCE_READ_TOKEN`;
+   - the version is on the [supported release line](#support-state) and every
+     package is a supported surface;
+   - no package already has the version, and it is newer than every package's
+     current `latest`;
+   - the source manifests still carry their `0.0.0` placeholders;
+   - every native binary embeds the tagged commit and version, and the Linux
+     binary reports `coven vX.Y.Z`;
+   - the annotation is titled `Coven vX.Y.Z` and has notes.
+
+   The `coven-release-publication-authorization-vX.Y.Z` artifact records
+   every control and its evidence, refused or not. The publish job holds the
+   `coven-release-channel` concurrency group, so two tags never publish at
+   once.
+7. **npm publish** — authenticates via GitHub Actions OIDC (`permissions: id-token: write`), then runs `npm publish --provenance --access public` for the four native packages and the wrapper. Each published tarball gets a provenance attestation linking it to this exact workflow run and commit SHA, visible on each package's npm page.
+8. **Automations contract bundles** — starting with `v0.4.4`, rebuilds both
    `spec/coven-automations/v1/` and the separately advertised
    `spec/coven-automations/authority/v1/` companion profile from the exact
    tagged commit into deterministic source-bound bundles. Each embedded
@@ -231,9 +260,10 @@ That single push is the entire release. The workflow takes over from there.
 ### Exact-source checkpoint boundary
 
 The source-acceptance artifact records the preflight observation before release
-builds. It is not a final publication receipt: it contains no registry outcome,
-artifact digests, channel reconciliation, or repository-protection snapshot.
-The workflow does not repeat the CI lookup immediately before registry writes.
+builds. The publication authorization repeats that lookup, with the tag,
+protection, support and registry checks, immediately before registry writes.
+Neither is the final publication receipt: they contain no registry outcome or
+channel reconciliation.
 
 The required source check is currently the versioned `PR gate` name in
 `scripts/package-github-release.mjs`; the verifier does not discover repository
@@ -250,6 +280,22 @@ a durable final receipt with publication and artifact outcomes. Passing this
 source preflight does not establish those controls or authorize a release.
 [Release governance](release-governance.md) defines the branch, tag, and
 repository policy, and the check that compares live protection against it.
+
+### Support state
+
+`.github/release-support.json` decides what may be published. It names the
+supported release line and gives every npm package a state: `supported`,
+`support-disabled`, or `security-blocked`, the last two with a reason and an
+issue link. `scripts/publish-npm.mjs` and the publication authorization both
+refuse a package that is not `supported`, whatever the package-set metadata
+in the script lists. A blocked surface comes back only by changing this file
+in a reviewed pull request.
+
+Coven has no long-term support before 1.0, so a release must be on the
+supported line: a patch to an older minor line is refused. To open a new
+line, change `supportedReleaseLine` and the supported release family in
+`SECURITY.md` in the same pull request. A test keeps the two in step. Then
+tag the first release of the new line.
 
 ### Postflight
 
