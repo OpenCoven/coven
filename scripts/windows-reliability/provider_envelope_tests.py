@@ -47,6 +47,68 @@ def envelope():
             'source':source(),'host':host(),'query':query,'collector':wire['collector']},encoded
 
 
+class SourceRootTests(unittest.TestCase):
+    def fixture(self,tree):
+        tree.mkdir(parents=True)
+        expected=source()
+        for item in expected['files']:
+            path=tree/receipt.SOURCE_PATHS[item['id']];path.parent.mkdir(parents=True,exist_ok=True)
+            data=PHASE_SOURCE if item['id']=='phase-validator' else b'controlled source'
+            path.write_bytes(data);item['sha256']=hashlib.sha256(data).hexdigest()
+        self.assertEqual(receipt.capture_source_tree(tree,expected),PHASE_SOURCE)
+        return expected
+
+    def alias(self,path,target):
+        if os.name=='nt':
+            # A junction needs no developer-mode symlink privilege. Paths are
+            # environment data, never interpolated into PowerShell source.
+            import base64
+            script="$ErrorActionPreference='Stop';New-Item -ItemType Junction -Path $env:COVEN_TEST_ALIAS -Target $env:COVEN_TEST_TARGET | Out-Null"
+            result=subprocess.run(['pwsh','-NoProfile','-EncodedCommand',base64.b64encode(script.encode('utf-16le')).decode('ascii')],
+                env={**os.environ,'COVEN_TEST_ALIAS':str(path),'COVEN_TEST_TARGET':str(target)},capture_output=True,timeout=30)
+            self.assertEqual(result.returncode,0,'Owned junction fixture setup failed')
+            self.assertTrue(path.is_junction(),'Owned junction fixture was not a junction')
+        else:
+            path.symlink_to(target,target_is_directory=True)
+            self.assertTrue(path.is_symlink())
+
+    def remove_alias(self,path):
+        if os.name=='nt':path.rmdir()
+        else:path.unlink()
+
+    def test_selected_root_alias_is_rejected_with_complete_identical_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder).resolve();tree=root/'checkout';expected=self.fixture(tree)
+            alias=root/'selected';self.alias(alias,tree)
+            try:
+                with patch.object(receipt,'_read_stable_regular',wraps=receipt._read_stable_regular) as read:
+                    with self.assertRaises(ValueError):receipt.capture_source_tree(alias,expected)
+                    read.assert_not_called()
+            finally:self.remove_alias(alias)
+            self.assertEqual(receipt.capture_source_tree(tree,expected),PHASE_SOURCE)
+
+    def test_selected_plain_root_identity_is_rechecked_after_ancestor_retarget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder).resolve();tree=root/'first'/'checkout';expected=self.fixture(tree)
+            second=root/'second';shutil.copytree(tree.parent,second)
+            self.assertEqual(receipt.capture_source_tree(second/'checkout',expected),PHASE_SOURCE)
+            alias=root/'parent';self.alias(alias,tree.parent);selected=alias/'checkout'
+            self.assertEqual(receipt.capture_source_tree(selected,expected),PHASE_SOURCE)
+            original=receipt._read_stable_regular;count=0
+            def retarget_after_last_read(path,limit):
+                nonlocal count
+                data=original(path,limit);count+=1
+                if count==len(expected['files']):
+                    self.remove_alias(alias);self.alias(alias,second)
+                return data
+            try:
+                with patch.object(receipt,'_read_stable_regular',side_effect=retarget_after_last_read):
+                    with self.assertRaises(ValueError):receipt.capture_source_tree(selected,expected)
+                self.assertEqual(count,len(expected['files']))
+            finally:self.remove_alias(alias)
+            self.assertEqual(receipt.capture_source_tree(tree,expected),PHASE_SOURCE)
+
+
 class EnvelopeTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell parent packet boundary required')
     def test_actual_parent_typed_identity_packet_matches_strict_decoder(self):
