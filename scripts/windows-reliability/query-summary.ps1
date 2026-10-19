@@ -1,9 +1,6 @@
 # Only fixed identifiers, numeric accounting, booleans and digests cross this boundary.
-function ConvertTo-CovenQuerySummary {
-    param(
-        [Parameter(Mandatory)][ValidateSet('xperf-start-help','xperf-providers-help','xperf-loggers','xperf-providers','xperf-profint','xperf-processing-help','xperf-dumper-help','xperf-tracestats-help','xperf-cswitch-help','kernel-file-schema','kernel-file-schema-no-messages','token-groups','token-privileges')][string]$Id,
-        [Parameter(Mandatory)]$Result
-    )
+function ConvertTo-CovenQueryObservation {
+    param([Parameter(Mandatory)]$Result)
     # Copy only the closed numeric observation surface, never the private object.
     $phases = [ordered]@{ unit='stopwatch-elapsed-ticks'; frequency=$null }
     $names = @('StartCallEnteredTicks','StartCallReturnedTicks','StdinCloseEnteredTicks','StdinCloseReturnedTicks',
@@ -30,7 +27,6 @@ function ConvertTo-CovenQuerySummary {
         [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Text))).ToLowerInvariant()
     }
     [pscustomobject][ordered]@{
-        id = $Id
         started = [bool]$Result.Started
         timedOut = [bool]$Result.TimedOut
         outputLimited = [bool]$Result.OutputLimited
@@ -48,6 +44,24 @@ function ConvertTo-CovenQuerySummary {
         stdoutSha256 = & $digest ([string]$Result.Stdout)
         stderrSha256 = & $digest ([string]$Result.Stderr)
     }
+}
+
+function ConvertTo-CovenQuerySummary {
+    param(
+        [Parameter(Mandatory)][ValidateSet('xperf-start-help','xperf-providers-help','xperf-loggers','xperf-providers','xperf-profint','xperf-processing-help','xperf-dumper-help','xperf-tracestats-help','xperf-cswitch-help','kernel-file-schema','kernel-file-schema-no-messages','token-groups','token-privileges')][string]$Id,
+        [Parameter(Mandatory)]$Result
+    )
+    $observation=ConvertTo-CovenQueryObservation -Result $Result
+    $summary=[ordered]@{id=$Id}
+    foreach ($property in $observation.PSObject.Properties) { $summary[$property.Name]=$property.Value }
+    [pscustomobject]$summary
+}
+function ConvertTo-CovenProviderQuerySummary {
+    param([Parameter(Mandatory)]$Result)
+    $observation=ConvertTo-CovenQueryObservation -Result $Result
+    $summary=[ordered]@{kind='kernel-file-metadata';stdoutDigestScope='decoded-text-utf8'}
+    foreach ($property in $observation.PSObject.Properties) { $summary[$property.Name]=$property.Value }
+    [pscustomobject]$summary
 }
 
 # A fixture observation is distinct from an executed metadata query. Projection

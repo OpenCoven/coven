@@ -7,7 +7,7 @@ on:
         description: Diagnostic stage
         type: choice
         default: samples
-        options: [samples, metadata-preflight]
+        options: [samples, metadata-preflight, provider-schema]
   # Temporary metadata-only admission on the owning draft PR.
   # A head push or label removal cannot start another experiment.
   pull_request:
@@ -512,3 +512,185 @@ jobs:
           if ($env:BINDING_OUTCOME -ne 'success' -or $env:QUERY_OUTCOME -ne 'success' -or $env:PUBLICATION_OUTCOME -ne 'success') {
             throw 'Metadata execution or public receipt publication is incomplete'
           }
+
+  provider-schema:
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'provider-schema'
+    name: Windows read-only Kernel-File metadata
+    runs-on: windows-latest
+    # Diagnostic build/collection hang guard, not a production response deadline.
+    timeout-minutes: 10
+    steps:
+      - name: Prepare exclusive source and public evidence directories
+        id: prepare
+        shell: pwsh
+        run: |
+          $temp = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetTempPath())
+          $root = Join-Path $temp "windows-reliability-provider-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $root) { throw 'Provider evidence directory already exists' }
+          [IO.Directory]::CreateDirectory((Join-Path $root 'public')) | Out-Null
+          "PROVIDER_ROOT=$root" >> $env:GITHUB_ENV
+          "PROVIDER_TEMP_ROOT=$temp" >> $env:GITHUB_ENV
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Bind manual activation and complete checkout source
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$false
+          $head=git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -cnotmatch '^[0-9a-f]{40}$') { throw 'Provider checkout identity unavailable' }
+          $parents=@((git show -s --format=%P HEAD) -split ' ')
+          if ($LASTEXITCODE -ne 0 -or @($parents | Where-Object { $_ -cnotmatch '^[0-9a-f]{40}$' }).Count -ne 0) { throw 'Provider parent identity unavailable' }
+          $main=git rev-parse --verify 'refs/remotes/origin/main^{commit}'
+          if ($LASTEXITCODE -ne 0 -or $main -cnotmatch '^[0-9a-f]{40}$') { throw 'Provider main identity unavailable' }
+          $shallow=git rev-parse --is-shallow-repository
+          if ($LASTEXITCODE -ne 0) { throw 'Provider ancestry unavailable' }
+          $dirty=@(git status --porcelain=v1 --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw 'Provider checkout state unavailable' }
+          git merge-base --is-ancestor $main $head
+          $ancestor=$LASTEXITCODE
+          $expectedWorkflow="$env:GITHUB_REPOSITORY/.github/workflows/windows-reliability.yml@$env:GITHUB_REF"
+          $activationMatches=$env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and $env:GITHUB_REF.StartsWith('refs/heads/') -and $head -ceq $env:GITHUB_SHA -and $env:GITHUB_WORKFLOW_SHA -ceq $head -and $env:GITHUB_WORKFLOW_REF -ceq $expectedWorkflow
+          @{stage='provider-schema';source=$head;parents=$parents;capturedMain=$main;mainAncestorExit=$ancestor;shallow=$shallow;dirtyCount=$dirty.Count;event=$env:GITHUB_EVENT_NAME;eventSha=$env:GITHUB_SHA;workflowSha=$env:GITHUB_WORKFLOW_SHA;workflowRef=$env:GITHUB_WORKFLOW_REF;ref=$env:GITHUB_REF;activationMatches=$activationMatches;run=$env:GITHUB_RUN_ID;attempt=$env:GITHUB_RUN_ATTEMPT;captureAttempted=$false;metadataComplete=$false} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $env:PROVIDER_ROOT 'source-check.json')
+          if (-not $activationMatches -or $dirty.Count -ne 0 -or $shallow -cne 'false' -or $ancestor -ne 0) { throw 'Provider manual/source/ancestry binding failed' }
+          # Execute the same bounded private bytes that the closed inventory later names.
+          # A path reread after dot-sourcing would not identify the executed script block.
+          $binderPath=Join-Path $pwd 'scripts/windows-reliability/provider-binding.ps1'
+          $binderStream=[IO.File]::Open($binderPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+          try {
+              $binderBuffer=[byte[]]::new(262145)
+              $binderUsed=0
+              while ($binderUsed -lt $binderBuffer.Length) {
+                  $count=$binderStream.Read($binderBuffer,$binderUsed,$binderBuffer.Length-$binderUsed)
+                  if ($count -eq 0) { break }
+                  $binderUsed+=$count
+              }
+              if ($binderUsed -eq 0 -or $binderUsed -gt 262144) { throw 'source' }
+              $binderBytes=$binderBuffer[0..($binderUsed-1)]
+          } finally { $binderStream.Dispose() }
+          $binderHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$binderBytes)).ToLowerInvariant()
+          . ([scriptblock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$binderBytes)))
+          $capture=Get-CovenProviderSourceCapture -Directory ([string]$pwd) -Commit $head
+          $binder=@($capture.Files | Where-Object { $_.Id -ceq 'binding' })[0]
+          if ($binder.Sha256 -cne $binderHash) { throw 'Provider executed binder does not match captured source' }
+          $source=@{commit=$head;beforeAfterMatch=$true;files=@($capture.Files | Sort-Object -CaseSensitive Id | ForEach-Object { @{id=$_.Id;sha256=$_.Sha256} })}
+          $text=$source | ConvertTo-Json -Depth 6 -Compress
+          [IO.File]::WriteAllText((Join-Path $env:PROVIDER_ROOT 'source.json'),$text,[Text.UTF8Encoding]::new($false))
+          "PROVIDER_SOURCE_SHA256=$((Get-FileHash -LiteralPath (Join-Path $env:PROVIDER_ROOT 'source.json') -Algorithm SHA256).Hash)" >> $env:GITHUB_ENV
+      - name: Verify controlled metadata, binding, encoding and publication boundaries
+        id: controls
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$false
+          $hostExecutable=[Environment]::ProcessPath
+          foreach ($name in @('provider-template-tests.ps1','provider-metadata-tests.ps1','provider-adapter-tests.ps1','provider-public-tests.ps1','provider-binding-tests.ps1')) {
+            & $hostExecutable -NoProfile -File (Join-Path 'scripts/windows-reliability' $name)
+            if ($LASTEXITCODE -ne 0) { throw 'Provider controlled PowerShell verification failed' }
+          }
+          foreach ($name in @('provider_schema_receipt_tests.py','provider_envelope_tests.py')) {
+            python -B (Join-Path 'scripts/windows-reliability' $name)
+            if ($LASTEXITCODE -ne 0) { throw 'Provider controlled Python verification failed' }
+          }
+      - name: Collect and independently publish bounded read-only provider metadata
+        id: provider
+        if: steps.source.outcome == 'success' && steps.controls.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          & ([Environment]::ProcessPath) -NoLogo -NoProfile -NonInteractive -File scripts/windows-reliability/run-provider-schema.ps1 -Directory ([string]$pwd) -Commit $env:GITHUB_SHA -OutputDirectory (Join-Path $env:PROVIDER_ROOT 'public') -TemporaryRoot $env:PROVIDER_TEMP_ROOT
+          exit $LASTEXITCODE
+      - name: Independently recheck source before artifact admission
+        id: binding
+        if: always() && steps.source.outcome == 'success'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$false
+          $sourcePath=Join-Path $env:PROVIDER_ROOT 'source.json'
+          $sourceMatches=(Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash -ceq $env:PROVIDER_SOURCE_SHA256
+          $source=Get-Content -LiteralPath $sourcePath -Raw | ConvertFrom-Json
+          $head=git rev-parse HEAD
+          $headMatches=$LASTEXITCODE -eq 0 -and $head -ceq $env:GITHUB_SHA -and $head -ceq $source.commit
+          $dirty=@(git status --porcelain=v1 --untracked-files=all)
+          $clean=$LASTEXITCODE -eq 0 -and $dirty.Count -eq 0
+          # Execute the same bounded private bytes that the closed inventory later names.
+          # A path reread after dot-sourcing would not identify the executed script block.
+          $binderPath=Join-Path $pwd 'scripts/windows-reliability/provider-binding.ps1'
+          $binderStream=[IO.File]::Open($binderPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+          try {
+              $binderBuffer=[byte[]]::new(262145)
+              $binderUsed=0
+              while ($binderUsed -lt $binderBuffer.Length) {
+                  $count=$binderStream.Read($binderBuffer,$binderUsed,$binderBuffer.Length-$binderUsed)
+                  if ($count -eq 0) { break }
+                  $binderUsed+=$count
+              }
+              if ($binderUsed -eq 0 -or $binderUsed -gt 262144) { throw 'source' }
+              $binderBytes=$binderBuffer[0..($binderUsed-1)]
+          } finally { $binderStream.Dispose() }
+          $binderHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$binderBytes)).ToLowerInvariant()
+          . ([scriptblock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$binderBytes)))
+          $capture=Get-CovenProviderSourceCapture -Directory ([string]$pwd) -Commit $head
+          $current=@($capture.Files | Sort-Object -CaseSensitive Id)
+          $sameFiles=$current.Count -eq $source.files.Count
+          for ($i=0;$i -lt $current.Count -and $sameFiles;$i++) {
+            $sameFiles=$current[$i].Id -ceq $source.files[$i].id -and $current[$i].Sha256 -ceq $source.files[$i].sha256
+          }
+          $binder=@($capture.Files | Where-Object { $_.Id -ceq 'binding' })[0]
+          $bound=$sourceMatches -and $headMatches -and $clean -and $binder.Sha256 -ceq $binderHash -and $sameFiles
+          @{sourceBound=$bound;sourceSnapshotMatches=$sourceMatches;headMatches=$headMatches;clean=$clean;checkedFiles=$capture.Files.Count;captureAttempted=$false;metadataComplete=$false} | ConvertTo-Json | Set-Content (Join-Path $env:PROVIDER_ROOT 'binding.json')
+          if (-not $bound) { throw 'Provider source changed before artifact admission' }
+      - name: Record separate source, controls, execution and binding outcomes
+        if: always() && steps.prepare.outcome == 'success'
+        shell: pwsh
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          CONTROL_OUTCOME: ${{ steps.controls.outcome }}
+          PROVIDER_OUTCOME: ${{ steps.provider.outcome }}
+          BINDING_OUTCOME: ${{ steps.binding.outcome }}
+          EXECUTION_JSON: ${{ steps.provider.outputs.execution }}
+          PUBLIC_RECEIPT: ${{ steps.provider.outputs.public-receipt }}
+        run: |
+          $execution=$null
+          if (-not [string]::IsNullOrEmpty($env:EXECUTION_JSON)) { $execution=$env:EXECUTION_JSON | ConvertFrom-Json }
+          @{source=$env:SOURCE_OUTCOME;controls=$env:CONTROL_OUTCOME;provider=$env:PROVIDER_OUTCOME;binding=$env:BINDING_OUTCOME;execution=$execution;publicReceiptAdmitted=($env:BINDING_OUTCOME -ceq 'success' -and -not [string]::IsNullOrEmpty($env:PUBLIC_RECEIPT));captureAttempted=$false;metadataComplete=$false} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $env:PROVIDER_ROOT 'outcome.json')
+      - name: Retain explicit provider source and outcome evidence
+        if: always() && steps.prepare.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-reliability-provider-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.PROVIDER_ROOT }}/source-check.json
+            ${{ env.PROVIDER_ROOT }}/source.json
+            ${{ env.PROVIDER_ROOT }}/binding.json
+            ${{ env.PROVIDER_ROOT }}/outcome.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain independently validated public provider receipt only
+        if: always() && steps.binding.outcome == 'success' && steps.provider.outputs.public-receipt != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-reliability-provider-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PROVIDER_ROOT }}/public/receipt.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Require complete collection and protected publication
+        if: always() && steps.prepare.outcome == 'success'
+        shell: pwsh
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          CONTROL_OUTCOME: ${{ steps.controls.outcome }}
+          PROVIDER_OUTCOME: ${{ steps.provider.outcome }}
+          BINDING_OUTCOME: ${{ steps.binding.outcome }}
+          PUBLIC_RECEIPT: ${{ steps.provider.outputs.public-receipt }}
+        run: |
+          if ($env:SOURCE_OUTCOME -cne 'success' -or $env:CONTROL_OUTCOME -cne 'success' -or $env:PROVIDER_OUTCOME -cne 'success' -or $env:BINDING_OUTCOME -cne 'success' -or [string]::IsNullOrEmpty($env:PUBLIC_RECEIPT)) { throw 'Provider collection/publication remains incomplete' }
