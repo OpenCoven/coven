@@ -67,6 +67,9 @@ fn run_pairing_control(
             }
             Err(error) => panic!("accept pairing control: {error}"),
         };
+        // macOS accepted sockets inherit the listener's nonblocking mode.
+        // Request reads need blocking I/O with the bounded timeout below.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
