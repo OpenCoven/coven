@@ -177,6 +177,34 @@ class CheckCiWorkflowTests(unittest.TestCase):
             CI_TEXT,
         )
 
+    def test_intel_onboarding_has_scoped_outer_build_capacity(self) -> None:
+        job = ci_job_block('npm-onboarding-main')
+        timeout = re.search(r'^    timeout-minutes: (.+)$', job, re.MULTILINE).group(1)
+        rows = re.findall(r'^          - os: ([^\n]+)\n((?:            [^\n]+\n)+)', job, re.MULTILINE)
+        targets = {}
+        for runner, properties in rows:
+            row = dict(re.findall(r'^            ([a-z-]+): ([^\n]+)$', properties, re.MULTILINE))
+            if timeout.isdecimal():
+                budget = int(timeout)
+            else:
+                self.assertEqual(timeout, '${{ matrix.job-timeout }}')
+                budget = int(row['job-timeout'])
+            target = row['npm-target']
+            self.assertNotIn(target, targets)
+            targets[target] = (runner, row['rust-target'], budget)
+        self.assertEqual(targets, {
+            'macos': ('macos-26', 'aarch64-apple-darwin', 20),
+            'macos-x64': ('macos-15-intel', 'x86_64-apple-darwin', 30),
+            'linux-x64': ('ubuntu-latest', 'x86_64-unknown-linux-gnu', 20),
+            'windows': ('windows-latest', 'x86_64-pc-windows-msvc', 20),
+        })
+        self.assertIn("if: ${{ github.event_name == 'push' }}", job)
+        self.assertIn('fail-fast: false', job)
+        self.assertIn('cargo build --release --package coven-cli --target ${{ matrix.rust-target }}', job)
+        self.assertIn('cargo build --release -p coven-afs --features mount --bins --target ${{ matrix.rust-target }}', job)
+        self.assertIn('node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan', job)
+        self.assertNotIn('continue-on-error:', job)
+
     def test_ci_subscribes_to_merge_group_events(self) -> None:
         # A merge queue raises merge_group events. Without this trigger no
         # workflow starts for a queue entry, PR gate never reports, and every
