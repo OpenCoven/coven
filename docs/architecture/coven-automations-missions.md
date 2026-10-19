@@ -11,8 +11,8 @@ source_adjacent_reason: "Defines the producer contract that OpenCoven/chat#155 a
 
 Status: **contract shape approved by Val on 2026-10-18. `mission.submit.v1`,
 `mission.get.v1` and `mission.cancel.v1` are implemented; under M0 no mission
-launches yet (see *Implementation notes*). The conformance vectors are not
-implemented.** Written for #1313,
+launches yet (see *Implementation notes*). The `mission-commands` conformance
+suite covers the vectors M0 can reach.** Written for #1313,
 which replaces OpenCoven/coven-agents#261. Consumers: OpenCoven/chat#155 (native
 submit/observe/cancel) and the SDK client. Builds on
 [coven-automations-v1.md](coven-automations-v1.md) and
@@ -247,6 +247,13 @@ Each negative case in chat#155 maps to at least one vector. Vectors live under
 in `inventory.json` like every other suite, in the existing format: given a store,
 a clock and a transport, a command sequence produces exact responses and
 `MissionView` states. In the table, "the key" means the mission's adoption key.
+
+The `mission-commands` suite holds the vectors M0 can reach: M-01 to M-06,
+M-09, M-11 (a) and M-15. M-03 (c) commits a second mission, because M0's first
+has already settled. M-07, M-08, M-10, M-12, M-13 and M-14 need a mission that
+launches, or one still queued, and wait for Runtime Authority (#857); unit
+tests hold M-08 with a mission kept queued. M-11 (b) is a client vector, and
+M-16 is held by the transport authority tests.
 
 | # | chat#155 case | Given / when | Then |
 | --- | --- | --- | --- |

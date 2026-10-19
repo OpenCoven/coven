@@ -1,0 +1,846 @@
+{
+  "schemaVersion": "coven.automations.mission-commands-vectors.v1",
+  "cases": [
+    {
+      "caseId": "m01-a-lost-submit-leaves-nothing-and-the-key-still-works",
+      "steps": [
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m01",
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "NOT_FOUND",
+            "writes": "nothing"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m01",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m02-a-lost-acknowledgement-replays-the-same-mission",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m02",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m02",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "replayed",
+            "replays": 0
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m03-a-reused-key-mismatches-and-a-new-key-is-a-new-mission",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m03-first",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m03-first",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the closed issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "ADOPTION_REPLAY_MISMATCH",
+            "conflictOutcome": "committed",
+            "writes": "nothing"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m03-second",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m04-a-stale-familiar-revision-names-the-current-one",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m04",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{staleRevisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "REVISION_CONFLICT",
+            "details": {
+              "currentRevisionId": "{{revisionId}}"
+            },
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m04",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{staleRevisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "REVISION_CONFLICT",
+            "replays": 0,
+            "writes": "nothing"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m05-an-envelope-the-daemon-does-not-enforce-is-refused",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m05-id",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r1-write.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "details": {
+              "supportedEnvelopes": [
+                {
+                  "id": "r0-read.1",
+                  "descriptorDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                  }
+                }
+              ]
+            },
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m05-digest",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "0000000000000000000000000000000000000000000000000000000000000000"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "writes": "adoption"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m06-without-runtime-authority-nothing-launches",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m06",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m06",
+          "expect": {
+            "outcome": "committed",
+            "state": "unavailable",
+            "reason": "authority_unavailable"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m09-a-settled-mission-has-nothing-left-to-cancel",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m09",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "mission.cancel.v1",
+          "adoptionKey": "adopt:mission-cancel:m09",
+          "missionOf": "adopt:mission:m09",
+          "payload": {
+            "reason": "Not needed after all."
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "ILLEGAL_TRANSITION",
+            "state": "unavailable",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.cancel.v1",
+          "adoptionKey": "adopt:mission-cancel:m09",
+          "missionOf": "adopt:mission:m09",
+          "payload": {
+            "reason": "Not needed after all."
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "ILLEGAL_TRANSITION",
+            "replays": 1,
+            "writes": "nothing"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m11-another-caller-learns-nothing-and-changes-nothing",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m11",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "caller": "other",
+          "missionOf": "adopt:mission:m11",
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "NOT_FOUND",
+            "writes": "nothing"
+          }
+        },
+        {
+          "command": "mission.cancel.v1",
+          "caller": "other",
+          "adoptionKey": "adopt:mission-cancel:m11",
+          "missionOf": "adopt:mission:m11",
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "AUTHORITY_REQUIRED",
+            "writes": "nothing"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "caller": "other",
+          "adoptionKey": "adopt:mission:m11-other",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "AUTHORITY_REQUIRED",
+            "writes": "nothing"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m15-the-daemon-enforces-every-bound",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m15-prompt",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "{{bytes:32769}}"
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m15-timeout",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 61
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m15-far",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:30m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m15-past",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:-1m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "the-project-and-the-familiar-must-exist",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:inside-home",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{insideHome}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:missing-project",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{missingProject}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:unknown-root",
+          "payload": {
+            "familiar": {
+              "rootId": "familiar:00000000000000000000000000000000",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "NOT_FOUND",
+            "writes": "adoption"
+          }
+        }
+      ]
+    }
+  ]
+}

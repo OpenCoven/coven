@@ -35,6 +35,7 @@ mod command_storage_lock_recovery;
 mod command_storage_readonly_recovery;
 mod command_transaction_rollback;
 mod legacy_import_source_preservation;
+mod mission_commands;
 mod runtime_authority_terminal_recovery;
 #[cfg(test)]
 mod startup_wake_trace;
@@ -117,6 +118,7 @@ pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE: &str = "legacy-import-source-preservation";
 pub const MISFIRE_LATEST_PLANNING_SUITE: &str = "misfire-latest-planning";
+pub const MISSION_COMMANDS_SUITE: &str = "mission-commands";
 pub const OCCURRENCE_LEASE_RECOVERY_SUITE: &str = "occurrence-lease-recovery";
 pub const OVERLAP_FORBID_CLAIMING_SUITE: &str = "overlap-forbid-claiming";
 pub const RETRY_BACKOFF_TIMING_SUITE: &str = "retry-backoff-timing";
@@ -1563,6 +1565,7 @@ pub fn capability() -> TargetCapability {
                     DEFINITION_LIFECYCLE_TRANSITIONS_SUITE,
                     DEFINITION_VALIDATION_SUITE,
                     EVENT_REDUCER_DETERMINISM_SUITE,
+                    MISSION_COMMANDS_SUITE,
                     OCCURRENCE_FENCE_UNIQUENESS_SUITE,
                     RECEIPT_INTEGRITY_VALIDATION_SUITE,
                     RRULE_VOCABULARY_SUITE,
@@ -1628,6 +1631,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (STRUCTURAL_PROFILE, EVENT_REDUCER_DETERMINISM_SUITE) => {
             evaluate_event_reducer_determinism(&request.vector)?
+        }
+        (STRUCTURAL_PROFILE, MISSION_COMMANDS_SUITE) => {
+            mission_commands::evaluate(&request.vector)?
         }
         (STRUCTURAL_PROFILE, OCCURRENCE_FENCE_UNIQUENESS_SUITE) => {
             evaluate_occurrence_fence_uniqueness(&request.vector)?

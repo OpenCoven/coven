@@ -194,6 +194,7 @@ The checked-in
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
 [`misfire-latest-planning.vectors.json`](misfire-latest-planning.vectors.json),
+[`mission-commands.vectors.json`](mission-commands.vectors.json),
 [`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
 [`occurrence-lease-recovery.vectors.json`](occurrence-lease-recovery.vectors.json),
 [`overlap-forbid-claiming.vectors.json`](overlap-forbid-claiming.vectors.json),
@@ -227,6 +228,7 @@ The runner invokes the target directly without a shell.
         "definition-lifecycle-transitions",
         "definition-validation",
         "event-reducer-determinism",
+        "mission-commands",
         "occurrence-fence-uniqueness",
         "receipt-integrity-validation",
         "rrule-vocabulary",
@@ -238,6 +240,8 @@ The runner invokes the target directly without a shell.
       "suites": [
         "calendar-schedule-resolution",
         "cancellation-timeout-arbitration",
+        "command-storage-lock-recovery",
+        "command-transaction-rollback",
         "legacy-import-source-preservation",
         "misfire-latest-planning",
         "occurrence-lease-recovery",
@@ -296,6 +300,16 @@ normalized JCS digest matches and rejecting a tampered definition.
 `event-reducer-determinism` replays a portable event stream through the native
 Rust reducer both canonically and with an exact duplicate delivery, requiring
 the same normalized final state and expected digest.
+`mission-commands` sends `mission.submit.v1`, `mission.get.v1` and
+`mission.cancel.v1` to a store holding one familiar whose first revision has
+been superseded, on a clock that advances a minute per step. It covers the
+vectors M0 can reach (M-01 to M-06, M-09, M-11 and M-15 in
+`docs/architecture/coven-automations-missions.md`): a replayed submit, a reused
+key, a stale revision, an unenforced envelope, the no-launch settlement, a
+cancel after it, another caller, and every bound. It checks what each refusal
+leaves behind, as `command-envelope-outcomes` does. Values that exist only at
+run time, such as the familiar's ids and `validUntil`, are whole-string tokens
+such as `{{revisionId}}` and `{{start:10m}}`.
 `calendar-schedule-resolution` executes fixed UTC and IANA-timezone cases
 through the production scheduler. It covers same-day and multi-hour daily
 schedules, weekly weekday selection, winter and summer offsets, skipped DST

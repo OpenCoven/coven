@@ -60,8 +60,8 @@ use crate::control_plane::{
 /// Every ledger action starts with this prefix; all of them need owner-local
 /// IPC.
 pub(crate) const ACTION_PREFIX: &str = "coven.familiars.ledger.";
-const REGISTER: &str = "coven.familiars.ledger.register.v1";
-const ADOPT: &str = "coven.familiars.ledger.adopt.v1";
+pub(crate) const REGISTER: &str = "coven.familiars.ledger.register.v1";
+pub(crate) const ADOPT: &str = "coven.familiars.ledger.adopt.v1";
 const RETIRE: &str = "coven.familiars.ledger.retire.v1";
 const REVOKE: &str = "coven.familiars.ledger.revoke.v1";
 const RESTORE: &str = "coven.familiars.ledger.restore.v1";

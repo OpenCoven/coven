@@ -9,6 +9,7 @@
     { "profile": "structural", "suiteId": "definition-lifecycle-transitions", "vectorFile": "definition-lifecycle-transitions.vectors.json" },
     { "profile": "structural", "suiteId": "definition-validation", "vectorFile": "definition-validation.vectors.json" },
     { "profile": "structural", "suiteId": "event-reducer-determinism", "vectorFile": "event-reducer-determinism.vectors.json" },
+    { "profile": "structural", "suiteId": "mission-commands", "vectorFile": "mission-commands.vectors.json" },
     { "profile": "structural", "suiteId": "occurrence-fence-uniqueness", "vectorFile": "occurrence-fence-uniqueness.vectors.json" },
     { "profile": "structural", "suiteId": "receipt-integrity-validation", "vectorFile": "receipt-integrity-validation.vectors.json" },
     { "profile": "structural", "suiteId": "rrule-vocabulary", "vectorFile": "rrule-vocabulary.vectors.json" },
