@@ -28,6 +28,8 @@ pub(crate) const RESERVED_CRITICAL_BYTES: usize = 128 * 1024;
 const EVENT_OVERHEAD_BYTES: usize = 512;
 const MAX_BATCH_EVENTS: usize = 64;
 const COALESCE_WINDOW: Duration = Duration::from_millis(12);
+/// Output held per session while its input boundary is reserved (#1396).
+const MAX_DEFERRED_BYTES: usize = 64 * 1024;
 const SQLITE_LOCK_COMMIT_ATTEMPTS: usize = 4;
 const SQLITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 
@@ -70,6 +72,22 @@ struct Queue {
     failed: Option<String>,
     truncations: HashMap<String, OutputTruncation>,
     closing_sessions: HashSet<String>,
+    deferred: HashMap<String, Deferral>,
+}
+
+/// Output that arrived while a session's input boundary was reserved. A
+/// stream harness answers its stdin within milliseconds, often before the
+/// input commits, so that output is held in arrival order and admitted right
+/// behind the input when the reservation settles (#1396). It is bounded per
+/// session and held outside queue capacity, so it can never stall the commit
+/// it waits on.
+#[derive(Default)]
+struct Deferral {
+    items: Vec<QueuedEvent>,
+    bytes: usize,
+    /// Set by the first chunk that cannot be held. Later chunks drop into the
+    /// same episode, so held output never runs ahead of its marker.
+    dropping: bool,
 }
 
 struct OutputTruncation {
@@ -103,7 +121,12 @@ impl EventBoundaryReservation {
         let result = self
             .writer
             .enqueue_closed_critical(event, self.bytes, marker);
-        self.writer.release_boundary(&self.session_id);
+        let mut queue = self.writer.lock_queue();
+        queue.closing_sessions.remove(&self.session_id);
+        self.writer
+            .settle_deferred(&mut queue, &self.session_id, None);
+        self.writer.shared.available.notify_all();
+        drop(queue);
         self.active = false;
         result
     }
@@ -119,10 +142,10 @@ impl EventBoundaryReservation {
             return;
         }
         let mut queue = self.writer.lock_queue();
-        if let Some(detached) = self.detached.take() {
-            restore_truncation(&mut queue, &self.session_id, detached);
-        }
         queue.closing_sessions.remove(&self.session_id);
+        let detached = self.detached.take();
+        self.writer
+            .settle_deferred(&mut queue, &self.session_id, detached);
         self.writer.shared.available.notify_all();
         self.event.take();
         drop(queue);
@@ -191,6 +214,7 @@ impl EventWriter {
                 failed: None,
                 truncations: HashMap::new(),
                 closing_sessions: HashSet::new(),
+                deferred: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes,
@@ -292,6 +316,9 @@ impl EventWriter {
             }
             if queue.closing_sessions.insert(session_id.to_string()) {
                 let detached = queue.truncations.remove(session_id);
+                queue
+                    .deferred
+                    .insert(session_id.to_string(), Deferral::default());
                 return Ok(EventBoundaryReservation {
                     writer: self.clone(),
                     session_id: session_id.to_string(),
@@ -348,19 +375,47 @@ impl EventWriter {
         if let Some(error) = &queue.failed {
             return Err(anyhow!(error.clone()));
         }
+        let queued_bytes = queue.queued_bytes;
+        let output_capacity = self.shared.output_capacity_bytes;
+        if let Some(deferral) = queue.deferred.get_mut(event.session_id()) {
+            // Hold only what would be admitted if released now, so `true`
+            // still means accepted. A queue that fills before the release
+            // drops the chunk there, into the health counters and a marker.
+            let held = deferral.bytes.saturating_add(bytes);
+            if !deferral.dropping
+                && held <= MAX_DEFERRED_BYTES
+                && queued_bytes.saturating_add(held) <= output_capacity
+            {
+                deferral.bytes += bytes;
+                deferral.items.push(QueuedEvent {
+                    event,
+                    bytes,
+                    completion: None,
+                });
+                return Ok(true);
+            }
+            deferral.dropping = true;
+        }
+        self.admit_output(&mut queue, event, bytes)
+    }
+
+    /// Queues one output chunk behind any pending truncation marker, or drops
+    /// it into the session's episode when the session is closing or the
+    /// queue is full.
+    fn admit_output(&self, queue: &mut Queue, event: PendingEvent, bytes: usize) -> Result<bool> {
         let (session_id, dropped_bytes, created_at) = match &event {
             PendingEvent::Output {
                 session_id,
                 data,
                 created_at,
             } => (session_id, data.len(), created_at),
-            _ => unreachable!("enqueue_output only accepts output events"),
+            _ => unreachable!("admit_output only accepts output events"),
         };
         if queue.closing_sessions.contains(session_id)
             || bytes > self.shared.output_capacity_bytes
             || queue.queued_bytes.saturating_add(bytes) > self.shared.output_capacity_bytes
         {
-            record_output_drop(&mut queue, session_id, dropped_bytes, created_at);
+            record_output_drop(queue, session_id, dropped_bytes, created_at);
             let mut health = self.lock_health();
             health.state = "pressured".to_string();
             health.dropped_output_events = health.dropped_output_events.saturating_add(1);
@@ -369,7 +424,7 @@ impl EventWriter {
                 .saturating_add(dropped_bytes as u64);
             return Ok(false);
         }
-        let marker = take_truncation_marker(&mut queue, session_id);
+        let marker = take_truncation_marker(queue, session_id);
         let marker_bytes = marker.as_ref().map_or(0, |item| item.bytes);
         anyhow::ensure!(
             queue
@@ -394,6 +449,44 @@ impl EventWriter {
         });
         self.shared.available.notify_one();
         Ok(true)
+    }
+
+    /// Admits the output a reservation held, once its session boundary is
+    /// released. `before` is a cancelled reservation's detached episode: it
+    /// is marked ahead of the held output, and drops seen during the
+    /// reservation, which all came after the held output, stay pending behind
+    /// it. With nothing held, `before` merges into that pending episode, so a
+    /// rejected input leaves one contiguous episode as it always did.
+    fn settle_deferred(
+        &self,
+        queue: &mut Queue,
+        session_id: &str,
+        before: Option<OutputTruncation>,
+    ) {
+        let held = queue
+            .deferred
+            .remove(session_id)
+            .map(|deferral| deferral.items)
+            .unwrap_or_default();
+        if held.is_empty() {
+            if let Some(before) = before {
+                restore_truncation(queue, session_id, before);
+            }
+            return;
+        }
+        let during = queue.truncations.remove(session_id);
+        if let Some(before) = before {
+            queue.truncations.insert(session_id.to_string(), before);
+        }
+        for item in held {
+            // A failed writer fails every producer; the held chunk goes with it.
+            if queue.failed.is_some() || self.admit_output(queue, item.event, item.bytes).is_err() {
+                break;
+            }
+        }
+        if let Some(during) = during {
+            merge_later_truncation(queue, session_id, during);
+        }
     }
 
     fn enqueue_critical(&self, event: PendingEvent, bytes: usize) -> Result<()> {
@@ -835,6 +928,21 @@ fn take_truncation_marker(queue: &mut Queue, session_id: &str) -> Option<QueuedE
         .map(|truncation| truncation_marker(session_id, truncation))
 }
 
+/// Adds an episode that began after the session's pending one, keeping the
+/// earlier start.
+fn merge_later_truncation(queue: &mut Queue, session_id: &str, later: OutputTruncation) {
+    match queue.truncations.entry(session_id.to_string()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(later);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let current = entry.get_mut();
+            current.dropped_events = current.dropped_events.saturating_add(later.dropped_events);
+            current.dropped_bytes = current.dropped_bytes.saturating_add(later.dropped_bytes);
+        }
+    }
+}
+
 fn restore_truncation(queue: &mut Queue, session_id: &str, detached: OutputTruncation) {
     match queue.truncations.entry(session_id.to_string()) {
         std::collections::hash_map::Entry::Vacant(entry) => {
@@ -964,6 +1072,7 @@ fn fail_writer(shared: &Arc<Shared>, message: String) -> Vec<QueuedEvent> {
     queue.failed = Some(message.clone());
     queue.truncations.clear();
     queue.closing_sessions.clear();
+    queue.deferred.clear();
     queue.queued_events = 0;
     queue.queued_bytes = 0;
     let pending = queue.items.drain(..).collect();
@@ -1141,6 +1250,7 @@ mod tests {
                 failed: None,
                 truncations: HashMap::new(),
                 closing_sessions: HashSet::new(),
+                deferred: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -1176,6 +1286,7 @@ mod tests {
                 failed: None,
                 truncations: HashMap::new(),
                 closing_sessions: HashSet::new(),
+                deferred: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -1244,6 +1355,7 @@ mod tests {
                     },
                 )]),
                 closing_sessions: HashSet::new(),
+                deferred: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: capacity,
@@ -1433,6 +1545,114 @@ mod tests {
             ["output_truncated", "output", "exit"],
         );
         assert_truncation(&events[0], 2, 5120)?;
+        Ok(())
+    }
+
+    fn output_text(events: &[store::EventRecord]) -> String {
+        events
+            .iter()
+            .filter(|event| event.kind == "output")
+            .map(|event| {
+                serde_json::from_str::<serde_json::Value>(&event.payload_json).unwrap()["data"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn kinds(events: &[store::EventRecord]) -> Vec<&str> {
+        events.iter().map(|event| event.kind.as_str()).collect()
+    }
+
+    fn exit(writer: &EventWriter) -> Result<()> {
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )
+    }
+
+    #[test]
+    fn output_answering_an_uncommitted_input_lands_after_it() -> Result<()> {
+        // A stream harness answers stdin within milliseconds, before the input
+        // commits; with room in the queue that answer must not be dropped.
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start(home.path().to_path_buf())?;
+
+        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "hi\n" }), None)?;
+        assert!(writer.record_output("s-1", "system/init ".to_string())?);
+        assert!(writer.record_output("s-1", "answer ".to_string())?);
+        reservation.commit()?;
+        assert!(writer.record_output("s-1", "later".to_string())?);
+        exit(&writer)?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(kinds(&events)[0], "input");
+        assert!(!kinds(&events).contains(&"output_truncated"));
+        assert_eq!(output_text(&events), "system/init answer later");
+        assert_eq!(writer.health().dropped_output_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn output_held_by_a_rejected_input_follows_the_earlier_episode() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 4096,
+        )?;
+
+        assert!(!writer.record_output("s-1", "a".repeat(5000))?);
+        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }), None)?;
+        assert!(writer.record_output("s-1", "held".to_string())?);
+        reservation.cancel();
+        assert!(writer.record_output("s-1", "after".to_string())?);
+        exit(&writer)?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(kinds(&events)[0], "output_truncated");
+        assert_truncation(&events[0], 1, 5000)?;
+        assert_eq!(&kinds(&events)[1..], ["output", "exit"]);
+        assert_eq!(output_text(&events), "heldafter");
+        Ok(())
+    }
+
+    #[test]
+    fn held_output_is_bounded_and_drops_after_it_stay_behind_it() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start(home.path().to_path_buf())?;
+
+        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "go\n" }), None)?;
+        assert!(writer.record_output("s-1", "first".to_string())?);
+        let flood = "x".repeat(MAX_DEFERRED_BYTES);
+        assert!(
+            !writer.record_output("s-1", flood)?,
+            "beyond the hold bound"
+        );
+        assert!(
+            !writer.record_output("s-1", "small".to_string())?,
+            "after a drop, nothing is held ahead of its marker"
+        );
+        reservation.commit()?;
+        assert!(writer.record_output("s-1", "recovered".to_string())?);
+        exit(&writer)?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            kinds(&events),
+            ["input", "output", "output_truncated", "output", "exit"]
+        );
+        assert_truncation(&events[2], 2, (MAX_DEFERRED_BYTES + "small".len()) as u64)?;
+        assert_eq!(output_text(&events), "firstrecovered");
         Ok(())
     }
 
@@ -1980,6 +2200,7 @@ mod tests {
                 failed: None,
                 truncations: HashMap::new(),
                 closing_sessions: HashSet::new(),
+                deferred: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -19,8 +20,9 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
         *,
         fail_command: str | None = None,
         packages: list[str] | None = None,
+        mktemp_default_dir: pathlib.Path | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], list[str]]:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix="coven installer ") as directory:
             tempdir = pathlib.Path(directory)
             bin_dir = tempdir / "bin"
             bin_dir.mkdir()
@@ -66,6 +68,30 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_sudo.chmod(0o755)
+            if mktemp_default_dir is not None:
+                # Model platforms whose default temporary root takes precedence
+                # over TMPDIR. Every generated directory still belongs to this test.
+                real_mktemp = shutil.which("mktemp")
+                self.assertIsNotNone(real_mktemp)
+                fake_mktemp = bin_dir / "mktemp"
+                fake_mktemp.write_text(
+                    textwrap.dedent(
+                        """\
+                        #!/usr/bin/env python3
+                        import os
+                        import sys
+                        import tempfile
+
+                        if sys.argv[1:] == ["-d"]:
+                            print(tempfile.mkdtemp(dir=os.environ["COVEN_FAKE_MKTEMP_DEFAULT"]))
+                        else:
+                            executable = os.environ["COVEN_REAL_MKTEMP"]
+                            os.execv(executable, [executable, *sys.argv[1:]])
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                fake_mktemp.chmod(0o755)
             env = os.environ.copy()
             env.update(
                 {
@@ -78,6 +104,9 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
             )
             if fail_command is not None:
                 env["COVEN_FAKE_FAIL_COMMAND"] = fail_command
+            if mktemp_default_dir is not None:
+                env["COVEN_FAKE_MKTEMP_DEFAULT"] = str(mktemp_default_dir)
+                env["COVEN_REAL_MKTEMP"] = str(real_mktemp)
             completed = subprocess.run(
                 ["bash", str(SCRIPT), *(packages or [])],
                 check=False,
@@ -128,6 +157,22 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+    def test_temporary_root_is_explicit_when_platform_default_ignores_tmpdir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="coven installer ") as directory:
+            root = pathlib.Path(directory)
+            apt_etc_dir = root / "apt"
+            default_dir = root / "platform default"
+            default_dir.mkdir()
+            self.write_deb822_ubuntu_source(apt_etc_dir)
+
+            completed, calls, _sources = self.run_installer(
+                apt_etc_dir, mktemp_default_dir=default_dir
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(list(default_dir.iterdir()), [])
 
     def test_update_and_install_are_scoped_to_ubuntu_sources_and_temp_lists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

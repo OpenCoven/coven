@@ -11046,6 +11046,73 @@ mod tests {
     }
 
     #[test]
+    fn output_answering_live_input_before_it_commits_is_stored_after_it() {
+        // A stream harness answers stdin before the daemon has committed the
+        // input event (#1396). This stdin records the answer from inside the
+        // write, the moment a real harness's reply can land.
+        struct AnsweringStdin(crate::event_writer::EventWriter);
+        impl Write for AnsweringStdin {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .record_output("answering", "{\"type\":\"system\"}\n".to_string())
+                    .map_err(std::io::Error::other)?;
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME)).unwrap();
+        crate::store::insert_session(&conn, &session_record("answering")).unwrap();
+        let runtime = LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf());
+        let writer = runtime.event_writer.clone().expect("writer-backed runtime");
+        runtime
+            .register(
+                "answering".to_string(),
+                Box::new(AnsweringStdin(writer)),
+                Box::new(RecordingKiller::default()),
+            )
+            .unwrap();
+
+        let payload = serde_json::json!({ "data": "hello" });
+        let mut action = || {
+            SessionRuntime::send_input(&runtime, "answering", &payload)
+                .map_err(crate::api::SessionEventBoundaryError::Runtime)
+        };
+        SessionRuntime::with_session_event_boundary(
+            &runtime,
+            "answering",
+            "input",
+            &payload,
+            None,
+            &mut action,
+        )
+        .expect("writer-backed runtime handles input boundaries")
+        .expect("input is accepted");
+
+        // Hang guard only: the writer commits the released answer
+        // asynchronously. The event kinds are the discriminating assertion.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let events = loop {
+            let events = crate::store::list_events(&conn, "answering").unwrap();
+            if events.len() >= 2 || std::time::Instant::now() >= deadline {
+                break events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["input", "output"]
+        );
+    }
+
+    #[test]
     fn kill_session_succeeds_even_while_send_input_is_blocked_on_a_hung_child() {
         use std::sync::{Arc, Condvar, Mutex as StdMutex};
         use std::thread;
