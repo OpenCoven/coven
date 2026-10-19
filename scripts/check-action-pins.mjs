@@ -12,9 +12,13 @@
 //                  every job that runs node installs it that way.
 //   verify-remote  online: each locked SHA is still what its tag names, or
 //                  is contained in its branch.
+//   update         rewrites .github/actions-lock.json from the workflows
+//                  after verifying every changed pin against GitHub, so an
+//                  action bump (Dependabot's included) is one reviewed
+//                  command rather than a hand-edited lock.
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -258,14 +262,117 @@ export function verifyRemoteLock(lock, ghApi = ghApiJson) {
   return findings;
 }
 
+/// The lock the workflows imply: one pin per action repository, named by its
+/// `# ref` comment. A ref the lock already tracks as a branch stays a branch;
+/// anything new is a tag, which is what version comments name.
+export function proposeLock({ lock, files }) {
+  const pins = new Map();
+  const problems = [];
+  for (const file of files) {
+    file.text.replace(/\r\n/g, '\n').split('\n').forEach((line, index) => {
+      const match = USES_LINE.exec(line);
+      if (!match || line.trimStart().startsWith('#')) {
+        return;
+      }
+      const [, target, comment] = match;
+      const remote = REMOTE_USES.exec(target);
+      if (!remote || target.startsWith('./') || target.startsWith('docker://')) {
+        return;
+      }
+      const [, name, , sha] = remote;
+      const where = `${file.path}:${index + 1}`;
+      if (!/^[0-9a-f]{40}$/.test(sha) || !comment) {
+        problems.push(`${where}: pin ${name} to a full commit SHA with a "# <ref>" comment before updating the lock.`);
+        return;
+      }
+      const pin = pins.get(name);
+      if (pin && (pin.sha !== sha || pin.ref !== comment)) {
+        problems.push(`${where}: ${name}@${sha} # ${comment} disagrees with ${pin.where} (${pin.sha} # ${pin.ref}); use one pin per action.`);
+        return;
+      }
+      pins.set(name, pin ?? { sha, ref: comment, where });
+    });
+  }
+  const actions = {};
+  // Code-point order: locale-independent, and the order the lock already uses.
+  for (const name of [...pins.keys()].sort()) {
+    const { sha, ref } = pins.get(name);
+    const previous = lock.actions?.[name];
+    const refKind = previous && previous.ref === ref ? previous.refKind : 'tag';
+    actions[name] = { sha, ref, refKind };
+  }
+  const changed = Object.entries(actions)
+    .filter(([name, entry]) => {
+      const previous = lock.actions?.[name];
+      return !previous || previous.sha !== entry.sha || previous.ref !== entry.ref || previous.refKind !== entry.refKind;
+    })
+    .map(([name]) => name);
+  const removed = Object.keys(lock.actions ?? {}).filter((name) => !(name in actions));
+  return { lock: { schemaVersion: 1, kind: 'coven.actions-lock', actions }, changed, removed, problems };
+}
+
+/// The lock file's own layout: one entry per line, so a bump is a one-line diff.
+export function renderLock(lock) {
+  const entries = Object.entries(lock.actions).map(
+    ([name, entry]) => `    ${JSON.stringify(name)}: { "sha": ${JSON.stringify(entry.sha)}, "ref": ${JSON.stringify(entry.ref)}, "refKind": ${JSON.stringify(entry.refKind)} }`
+  );
+  return ['{', '  "schemaVersion": 1,', '  "kind": "coven.actions-lock",', '  "actions": {', entries.join(',\n'), '  }', '}', ''].join('\n');
+}
+
+/// Proposes the lock, verifies only what changed against GitHub, and writes
+/// nothing unless every changed pin is what its tag or branch says it is.
+export function updateLock(inputs, { ghApi = ghApiJson, write = (text) => writeFileSync(path.join(repoRoot, LOCK_PATH), text) } = {}) {
+  const proposal = proposeLock(inputs);
+  if (proposal.problems.length > 0) {
+    return { findings: proposal.problems, proposal };
+  }
+  const changedLock = {
+    actions: Object.fromEntries(proposal.changed.map((name) => [name, proposal.lock.actions[name]]))
+  };
+  const findings = verifyRemoteLock(changedLock, ghApi);
+  if (findings.length > 0) {
+    return { findings, proposal };
+  }
+  const updated = { ...inputs, lock: proposal.lock };
+  const remaining = checkActionPins(updated);
+  if (remaining.length > 0) {
+    return { findings: remaining, proposal };
+  }
+  if (proposal.changed.length > 0 || proposal.removed.length > 0) {
+    write(renderLock(proposal.lock));
+  }
+  return { findings: [], proposal };
+}
+
 if (isMainModule()) {
   const command = process.argv[2] ?? 'check';
   const inputs = readRepositoryInputs();
+  if (command === 'update') {
+    const { findings, proposal } = updateLock(inputs);
+    for (const finding of findings) {
+      console.error(finding);
+    }
+    if (findings.length > 0) {
+      console.error(`${LOCK_PATH} was not changed.`);
+      process.exit(1);
+    }
+    for (const name of proposal.changed) {
+      const entry = proposal.lock.actions[name];
+      console.log(`locked ${name}@${entry.sha} (${entry.refKind} ${entry.ref}), verified against GitHub`);
+    }
+    for (const name of proposal.removed) {
+      console.log(`removed ${name}, which no workflow uses`);
+    }
+    if (proposal.changed.length === 0 && proposal.removed.length === 0) {
+      console.log(`${LOCK_PATH} already matches the workflows.`);
+    }
+    process.exit(0);
+  }
   const findings = command === 'verify-remote'
     ? verifyRemoteLock(inputs.lock)
     : command === 'check'
       ? checkActionPins(inputs)
-      : [`Unknown command ${JSON.stringify(command)}; use check or verify-remote.`];
+      : [`Unknown command ${JSON.stringify(command)}; use check, verify-remote, or update.`];
   for (const finding of findings) {
     console.error(finding);
   }

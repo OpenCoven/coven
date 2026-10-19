@@ -116,9 +116,12 @@ repository:
 `node scripts/check-action-pins.mjs check` enforces all three offline and runs
 in `Policy guard`. `node scripts/check-action-pins.mjs verify-remote` asks
 GitHub whether each locked SHA is still what its tag names, or is still
-contained in its branch. Run it when updating a pin. To bump an action, resolve
-the new tag to its commit, update the lock entry and every `uses:` line
-together, then run both commands.
+contained in its branch. To bump an action, or to land a Dependabot bump (whose
+pull request fails `Policy guard` until the lock agrees), put the new SHA and
+its `# <tag>` comment on every `uses:` line for that action, then run
+`node scripts/check-action-pins.mjs update`. It verifies each changed pin
+against GitHub and rewrites `.github/actions-lock.json`, or changes nothing
+and says why. Commit the lock with the workflows.
 
 ## Cut a release
 
