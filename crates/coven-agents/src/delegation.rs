@@ -659,7 +659,15 @@ pub struct DelegationDigests {
 
 /// A delegation whose spec has been proven against its parent's grant and
 /// bound to a fresh child invocation identity. Consumed by exactly one run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It is deliberately not `Clone`: a copy would let the same proof, and the
+/// same child invocation id, run twice. Prepare again to get a new child.
+///
+/// ```compile_fail
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<coven_agents::PreparedDelegation>();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct PreparedDelegation {
     invocation: InvocationContext,
     source: AgentRef,
