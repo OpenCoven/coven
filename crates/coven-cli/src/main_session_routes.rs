@@ -50,7 +50,7 @@ use crate::{
         self, MainSessionRecord, MainSessionSettings, RotatedMainSession, StaleIdRotation,
         DEFAULT_MAIN_SESSION_FAMILIAR_ID, DEFAULT_MAIN_SESSION_HARNESS, INSTANCE_MAIN_SCOPE_KEY,
     },
-    main_session_notices,
+    main_session_notices, main_session_transcript,
     request_authority::RequestAuthority,
     store,
 };
@@ -261,12 +261,14 @@ pub(crate) fn get_main_session(coven_home: &Path, query: Option<&str>) -> Result
     };
     let session = current_session(&conn, &record)?;
     let history = has_history(&conn, &record)?;
+    let transcript = main_session_transcript::measure(&conn, &record)?;
     json_response(
         200,
         &json!({
             "mainSession": record,
             "currentSession": session,
             "hasHistory": history,
+            "transcript": transcript,
         }),
     )
 }
@@ -1291,6 +1293,59 @@ description = "Builds and debugs."
         assert_eq!(
             *h.runtime.inputs.borrow(),
             vec![(session_id, "and again".to_string())]
+        );
+    }
+
+    #[test]
+    fn get_measures_the_current_conversation_transcript() {
+        let h = home();
+        let first = first_turn(&h);
+        let session_id = first["session"]["id"].as_str().unwrap().to_string();
+        let (_, get) = call(&h, "GET", "/api/v1/main-session", None);
+        assert_eq!(
+            get["transcript"],
+            json!({ "events": 0, "bytes": 0, "context": null })
+        );
+
+        // Claude's stream-json reports each model call's usage; the result
+        // frame names the model's window.
+        let usage = json!({"type": "assistant", "parent_tool_use_id": null, "message": {
+            "model": "claude-opus-5-5",
+            "usage": {"input_tokens": 3, "cache_read_input_tokens": 40_000,
+                "cache_creation_input_tokens": 2_000, "output_tokens": 9}}});
+        let result = json!({"type": "result", "modelUsage": {"claude-opus-5-5": {"contextWindow": 200_000}}});
+        let payload = json!({ "data": format!("{usage}\n{result}\n") }).to_string();
+        let conn = store::open_store(&store_path(&h.home)).unwrap();
+        store::insert_event(
+            &conn,
+            &store::EventRecord {
+                seq: 0,
+                id: Uuid::new_v4().to_string(),
+                session_id,
+                kind: "output".to_string(),
+                payload_json: payload.clone(),
+                created_at: current_timestamp(),
+            },
+        )
+        .unwrap();
+
+        let (status, get) = call(&h, "GET", "/api/v1/main-session", None);
+        assert_eq!(status, 200, "{get}");
+        let transcript = &get["transcript"];
+        assert_eq!(transcript["events"], 1);
+        assert_eq!(transcript["bytes"], payload.len());
+        assert_eq!(transcript["context"]["tokens"], 42_003);
+        assert_eq!(transcript["context"]["window"], 200_000);
+        assert_eq!(transcript["context"]["model"], "claude-opus-5-5");
+        assert!(transcript["context"]["eventSeq"].is_i64());
+
+        // A reset starts a conversation with nothing to measure.
+        let (status, _) = call(&h, "POST", "/api/v1/main-session/reset", None);
+        assert_eq!(status, 200);
+        let (_, get) = call(&h, "GET", "/api/v1/main-session", None);
+        assert_eq!(
+            get["transcript"],
+            json!({ "events": 0, "bytes": 0, "context": null })
         );
     }
 
