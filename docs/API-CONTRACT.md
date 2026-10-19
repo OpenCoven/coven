@@ -1231,9 +1231,10 @@ The daemon compacts a Claude main session before Claude's own automatic point
   above it.
 - **How.** The daemon sends `/compact` with fixed summary headings (Decisions,
   Open TODOs, Constraints, Pending user asks, Exact identifiers) as an `input`
-  event on the host session, and asks for the durable facts worth keeping
-  beyond the conversation between `<durable-facts>` and `</durable-facts>`
-  lines. Claude compacts natively, with no rotation: the conversation id and
+  event on the host session, and asks for the durable facts the
+  conversation's own messages established, worth keeping beyond it, between
+  `<durable-facts>` and `</durable-facts>` lines. Restatements of system
+  prompts or instruction files such as `CLAUDE.md` are excluded. Claude compacts natively, with no rotation: the conversation id and
   its feed continue.
 - **Evidence.** The first `result` after the request ends it. A
   `compact_boundary` before that result settles it `compacted` and records a

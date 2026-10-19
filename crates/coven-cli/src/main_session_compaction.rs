@@ -118,10 +118,11 @@ pub const COMPACT_INSTRUCTIONS: &str = "Coven is compacting Home, the long-runni
      conversation. Write the summary under exactly these headings, in this order: Decisions, \
      Open TODOs, Constraints, Pending user asks, Exact identifiers. Under Exact identifiers, copy \
      verbatim every id, path, URL, name, number and codeword the conversation still depends on. \
-     Finally, list the durable facts worth keeping beyond this conversation (decisions, \
-     preferences, commitments and exact identifiers), one per line starting with \"- \", between \
-     a line reading <durable-facts> and a line reading </durable-facts>. Write \"- none\" between \
-     them if there are none.";
+     Finally, list the durable facts this conversation's own messages established that are worth \
+     keeping beyond it (decisions, preferences, commitments and exact identifiers), one per line \
+     starting with \"- \", between a line reading <durable-facts> and a line reading \
+     </durable-facts>. Leave out anything that only restates a system prompt or an instruction \
+     file such as CLAUDE.md or AGENTS.md. Write \"- none\" between them if there are none.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
