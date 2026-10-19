@@ -48,8 +48,20 @@ function Get-CovenProviderSourceHash {
     param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
 }
+function Assert-CovenProviderSourceRoot {
+    param([string]$Directory)
+    $root=[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Directory))
+    $attributes=[IO.File]::GetAttributes($root)
+    if (($attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Provider source root is not a plain directory' }
+    $item=Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (-not [string]::IsNullOrEmpty($item.LinkType)) { throw 'Provider source root link is not admitted' }
+    $root
+}
 function Assert-CovenProviderSourcePath {
     param([string]$Directory,[string]$Relative)
+    # Both callers admit the selected root at entry and recheck it at the end.
+    # This loop retains every existing descendant and file check.
     $path=$Directory
     foreach ($part in $Relative.Split('/')) {
         $path=Join-Path $path $part
@@ -65,7 +77,7 @@ function Get-CovenProviderSourceCapture {
     param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][string]$Commit)
     try {
         if ($Commit -cnotmatch '^[0-9a-f]{40}$') { throw 'commit' }
-        $root=[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Directory))
+        $root=Assert-CovenProviderSourceRoot -Directory $Directory
         $inventory=Get-CovenProviderSourceInventory
         $files=[Collections.Generic.List[object]]::new()
         [long]$total=0
@@ -76,6 +88,7 @@ function Get-CovenProviderSourceCapture {
             if ($total -gt 2097152) { throw 'total' }
             $files.Add([pscustomobject]@{Id=$id;Path=$path;Bytes=$bytes;Sha256=(Get-CovenProviderSourceHash -Bytes $bytes)})
         }
+        [void](Assert-CovenProviderSourceRoot -Directory $root)
         [pscustomobject]@{Directory=$root;Commit=$Commit;Files=$files}
     } catch { throw 'Provider source capture failed' }
 }
@@ -84,6 +97,8 @@ function Test-CovenProviderSourceCapture {
     try {
         $inventory=Get-CovenProviderSourceInventory
         if ($Capture.Commit -isnot [string] -or $Capture.Commit -cnotmatch '^[0-9a-f]{40}$' -or $Capture.Files.Count -ne $inventory.Count) { return $false }
+        $root=Assert-CovenProviderSourceRoot -Directory $Capture.Directory
+        if ($root -cne $Capture.Directory) { return $false }
         $expectedIds=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($id in $inventory.Keys) { $expectedIds.Add([string]$id) | Out-Null }
         $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -97,6 +112,7 @@ function Test-CovenProviderSourceCapture {
             if ((Get-CovenProviderSourceHash -Bytes $file.Bytes) -cne $file.Sha256) { return $false }
             if ((Get-CovenProviderSourceHash -Bytes (Read-CovenProviderSourceBytes -Path $path)) -cne $file.Sha256) { return $false }
         }
+        [void](Assert-CovenProviderSourceRoot -Directory $root)
         return $seen.SetEquals($expectedIds)
     } catch { return $false }
 }
