@@ -38,6 +38,11 @@ variant identifiers directly. Rich definition objects remain negotiation hints
 only in this slice: they must satisfy their v1 required and conditional fields,
 and are never persisted as accepted `AutomationDefinition` values.
 
+The `coven.automations` entry also lists `missionEnvelopes`: each runtime
+envelope a mission may name, as `{ "id", "descriptorDigest" }`, with the digest
+the submit check enforces. A client reads it before submitting, or runs
+`coven missions envelopes --json`. Other entries omit this field.
+
 To refresh it, `POST /api/v1/actions` with action id `coven.capabilities.refresh`.
 
 ## Harness capability aggregate

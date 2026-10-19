@@ -54,7 +54,7 @@ Changing any field under the same adoption key is `ADOPTION_REPLAY_MISMATCH`.
 | --- | --- | --- |
 | `principal` | The owner-local principal, `principal:coven-local-owner:<hex>` | At submit, from the transport. Never from the body. |
 | `familiar.rootId`, `familiar.revisionId` | The exact revision the client showed the user | At submit **and** at dispatch: the revision must be the ledger's current active revision of that root |
-| `envelope` | `{ id: "r0-read.1", descriptorDigest }` | At submit: the daemon must advertise and enforce it |
+| `envelope` | `{ id: "r0-read.1", descriptorDigest }` | At submit: the daemon must advertise and enforce it. It advertises the list as `missionEnvelopes` on the `coven.automations` entry of `GET /api/v1/capabilities` (`coven missions envelopes --json`). |
 | `project.cwd` | An absolute, canonical directory | At submit: it exists, is a directory, and is not inside `COVEN_HOME` |
 | `task.statement` | A short title for the mission | 1–200 characters |
 | `task.prompt` | What the familiar is asked to do | 1 byte to 32 KiB |
@@ -279,7 +279,7 @@ M-16 is held by the transport authority tests.
 | Surface | M0 shape |
 | --- | --- |
 | Daemon | `mission.*.v1` in the command envelope, plus flat `coven.automations.mission.*.v1` actions. Owner-local only. |
-| CLI | `coven missions submit --json -` reads the payload on stdin and prints the response. It calls the running daemon over its owner socket, never the in-process action path, whose no-op runtime would record a launch that never happened. Also `coven missions get <id> --json`, `coven missions cancel <id> --json`, and `coven missions watch <id> --json`, which streams `MissionView` lines until terminal. Chat can call these without moving its pinned `coven-client`. |
+| CLI | `coven missions submit --json -` reads the payload on stdin and prints the response. It calls the running daemon over its owner socket, never the in-process action path, whose no-op runtime would record a launch that never happened. Also `coven missions get <id> --json`, `coven missions cancel <id> --json`, `coven missions watch <id> --json`, which streams `MissionView` lines until terminal, and `coven missions envelopes --json`, which prints the envelopes the daemon advertises. Chat can call these without moving its pinned `coven-client`. |
 | SDK | A `CovenMissionsClient` with `submit`, `get`, `cancel` and `watch`, the projection types, and the client-side vectors (M-01, M-02, M-11, M-14). Designed in the SDK's companion design doc. |
 | Chat | chat#155 builds typed native commands on the CLI or SDK surface. It stores the mission's adoption key and id, which needs the storage design its `SECURITY.md` calls for. |
 
@@ -297,13 +297,20 @@ because they are machine-facing. Each prints one JSON object per line on stdout:
 - **`watch <id>`** prints each view whose `revision` increased, waiting `--interval-ms`
   (default 1000) between reads, and returns after the first terminal view. A failed read
   ends the watch; running it again resumes from the current view.
+- **`envelopes`** prints `{"envelopes":[{"id","descriptorDigest"}]}`, the list the running
+  daemon advertises as `missionEnvelopes` in its capability catalog. A daemon from before
+  the advertisement has none, and the command fails rather than guess one.
 
-Without `--json`, `get`, `cancel` and `watch` print one summary line instead.
+When the daemon refuses a `get` or `watch` read, `--json` prints
+`{"missionId":…,"error":{"code":…}}` with the daemon's typed error, so a client can tell
+`NOT_FOUND` from a daemon it never reached, which prints nothing on stdout.
+
+Without `--json`, `get`, `cancel`, `watch` and `envelopes` print summary lines instead.
 
 | Exit status | Meaning |
 | --- | --- |
 | 0 | `committed`, `replayed`, or a view was read |
-| 1 | The daemon refused the command (its response is printed), or nothing was sent: a bad payload, no running daemon, or a failed connection |
+| 1 | The daemon refused the command or read (with `--json`, its typed error is printed), or nothing was sent: a bad payload, no running daemon, or a failed connection |
 | 3 | The request may have been applied and no answer proved it. The command prints `{"outcome":"unknown","command":…,"adoptionKey":…,"missionId":…}`; send it again with the same `--adoption-key` to learn the outcome |
 
 The CLI never resends on its own and never decides a mission's state.
