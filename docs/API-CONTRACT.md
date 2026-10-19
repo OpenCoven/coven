@@ -592,6 +592,23 @@ private IDs, owner strings, prompts, paths, logs, and raw errors are omitted.
 Missing scheduler pass data is omitted rather than reported as a zero-duration
 pass. Category/fact/gap/next-step mismatches are invalid reports.
 
+Receipt commitment inspection uses the existing committed-receipt validator in
+the same bounded snapshot. Its optional `receipt_commitments_checked` and
+`invalid_receipt_commitments` facts cover base receipt/event digests, indexes,
+run/attempt identity and terminal correlation. Checked count must equal the
+stored receipt count and stay within the 256-receipt cap; a nonzero invalid
+count requires `receipt_commitments_inconsistent`. Missing prerequisites,
+invalid key metadata and input/read limits have separate fixed gaps and omit
+both facts. `receipt_authority_not_verified` preserves the provider/authorized
+sidecar boundary. The read performs no authority verification or activation.
+All involved lookups use the main schema; temporary shadows are excluded.
+Identity comparisons exclude case variants and numeric-affinity aliases while
+retaining indexed candidate lookups on the supported schema.
+Receipt/event bodies are individually capped at 128 KiB and jointly at 1 MiB.
+A temporary SQLite string/BLOB/record limit of at most 256 KiB is restored on
+all return paths and never raises a stricter caller limit. Older reports with
+`receipt_integrity_not_verified` remain incomplete and cannot claim these facts.
+
 This initial diagnostic contract explicitly reports incomplete evidence. It has
 no aggregate health or certification bit. See the [doctor runbook](reference/automations-doctor.md)
 for each category's scope and remaining checks. The complete doctor outcome in
@@ -1031,7 +1048,9 @@ or `null`: `id`, `conversationId`, `sessionId` (the host it was sent to),
 `state` (`requested`, `compacted` or `failed`), `fillTokens` and
 `windowTokens` (the reading that triggered it), `requestedAt`, `settledAt`,
 `preTokens` and `postTokens` (as the harness reported them), and `reason` for
-a failure. See [Compaction](#compaction).
+a failure; once compacted, `flushState` (`appended`, `empty` or `failed`),
+`flushPath` (the daily note, relative to the familiar's workspace) and
+`flushReason`. See [Compaction](#compaction).
 
 ### `GET /api/v1/main-session/events`
 
@@ -1212,8 +1231,10 @@ The daemon compacts a Claude main session before Claude's own automatic point
   above it.
 - **How.** The daemon sends `/compact` with fixed summary headings (Decisions,
   Open TODOs, Constraints, Pending user asks, Exact identifiers) as an `input`
-  event on the host session. Claude compacts natively, with no rotation: the
-  conversation id and its feed continue.
+  event on the host session, and asks for the durable facts worth keeping
+  beyond the conversation between `<durable-facts>` and `</durable-facts>`
+  lines. Claude compacts natively, with no rotation: the conversation id and
+  its feed continue.
 - **Evidence.** The first `result` after the request ends it. A
   `compact_boundary` before that result settles it `compacted` and records a
   `main_session.compacted` event on the host session, so it is in the event
@@ -1230,12 +1251,14 @@ The daemon compacts a Claude main session before Claude's own automatic point
     "preTokens": 612502,
     "postTokens": 2310,
     "summary": "…",
-    "summaryTruncated": false
+    "summaryTruncated": false,
+    "flush": { "state": "appended", "path": "memory/2026-10-19.md", "facts": 4 }
   }
   ```
 
-  `summary` is Claude's summary, at most 16 KiB (`summaryTruncated` says if it
-  was cut), passed through the instance's privacy policy like other events.
+  `summary` is Claude's summary without the durable-facts block, at most
+  16 KiB (`summaryTruncated` says if it was cut), passed through the
+  instance's privacy policy like other events.
   `trigger` is as Claude reported it: `manual`, because the daemon issued the
   command. A result without a boundary, a host that stops first, or no result
   within 10 minutes settles it `failed` with a `reason` in `lastCompaction`.
@@ -1243,6 +1266,19 @@ The daemon compacts a Claude main session before Claude's own automatic point
   what the host emitted afterwards. After a daemon crash, the next tick
   settles the open request from that evidence, and no second `/compact` is
   sent while one is open.
+- **Daily-note flush.** Settlement appends the durable facts to the
+  familiar's daily note, `<workspace>/memory/YYYY-MM-DD.md` (the daemon's
+  local date), under a `### Home compaction, HH:MM` heading and a
+  `<!-- coven:main-session-compaction <id> -->` marker. The daemon only
+  appends; it never truncates or rewrites a note. It refuses a `memory`
+  directory or note that is a symlink, creates `memory` when it is missing,
+  and requires the workspace itself to exist. A settlement repeated after a
+  crash finds its marker and appends nothing. Facts are single lines with
+  terminal escapes and control characters removed, at most 50 of 1 KiB each.
+  `flush.state` is `appended` (with `path` and the fact count), `empty` when
+  Claude listed none, or `failed` with a `reason` (no block, no familiar, a
+  refused or failed write). A failed flush never fails the compaction, and
+  summaries are never written to `MEMORY.md`.
 
 ### Runtime notices (the main-session inbox)
 

@@ -17,6 +17,8 @@ mod read;
 #[path = "doctor_wal.rs"]
 mod wal;
 pub(crate) use read::ReadBudgetExceeded;
+#[path = "doctor_receipt_commitments.rs"]
+mod receipt_commitments;
 #[path = "doctor_receipt_links.rs"]
 mod receipt_links;
 #[path = "doctor_schema.rs"]
@@ -110,6 +112,8 @@ pub enum Fact {
     FailedDeliveries,
     PendingDeliveries,
     StoredReceipts,
+    ReceiptCommitmentsChecked,
+    InvalidReceiptCommitments,
     EventStreams,
     StoredEvents,
     StoredEventCheckpoints,
@@ -187,9 +191,11 @@ impl Fact {
             Self::LaunchRefusedAttempts | Self::UnsupportedAuthorityAttempts => {
                 Category::AuthorityRefusals
             }
-            Self::FailedDeliveries | Self::PendingDeliveries | Self::StoredReceipts => {
-                Category::DeliveryReceipts
-            }
+            Self::FailedDeliveries
+            | Self::PendingDeliveries
+            | Self::StoredReceipts
+            | Self::ReceiptCommitmentsChecked
+            | Self::InvalidReceiptCommitments => Category::DeliveryReceipts,
             Self::EventStreams
             | Self::StoredEvents
             | Self::StoredEventCheckpoints
@@ -262,6 +268,11 @@ pub enum Gap {
     AttemptFailureClassUnavailable,
     InvalidAttemptFailureClass,
     ReceiptIntegrityNotVerified,
+    ReceiptAuthorityNotVerified,
+    ReceiptCommitmentsUnavailable,
+    ReceiptCommitmentsMetadataInvalid,
+    ReceiptCommitmentsReadBudgetExceeded,
+    ReceiptCommitmentsInconsistent,
     ReceiptStoreUnavailable,
     DeliveryStateUnavailable,
     InvalidDeliveryState,
@@ -362,6 +373,8 @@ impl FailureGapScope {
 struct DeliveryGapScope {
     state_unavailable: bool,
     receipts_unavailable: bool,
+    commitments_checked: bool,
+    inconsistent_commitments: bool,
 }
 impl DeliveryGapScope {
     fn from_gaps(gaps: &[Gap]) -> Option<Self> {
@@ -369,7 +382,28 @@ impl DeliveryGapScope {
             return Some(Self::default());
         }
         let mut scope = Self::default();
+        let has_commitment_scope = gaps.last() == Some(&Gap::ReceiptAuthorityNotVerified);
         let mut remaining = gaps;
+        if has_commitment_scope {
+            remaining = &remaining[..remaining.len() - 1];
+            match remaining.last() {
+                Some(Gap::ReceiptCommitmentsInconsistent) => {
+                    scope.commitments_checked = true;
+                    scope.inconsistent_commitments = true;
+                    remaining = &remaining[..remaining.len() - 1];
+                }
+                Some(
+                    Gap::ReceiptCommitmentsUnavailable
+                    | Gap::ReceiptCommitmentsMetadataInvalid
+                    | Gap::ReceiptCommitmentsReadBudgetExceeded,
+                ) => {
+                    remaining = &remaining[..remaining.len() - 1];
+                }
+                _ => {
+                    scope.commitments_checked = true;
+                }
+            }
+        }
         if matches!(
             remaining.first(),
             Some(Gap::DeliveryStateUnavailable | Gap::InvalidDeliveryState)
@@ -378,6 +412,9 @@ impl DeliveryGapScope {
             remaining = &remaining[1..];
         }
         if let Some(rest) = remaining.strip_prefix(&[Gap::ReceiptStoreUnavailable]) {
+            if has_commitment_scope {
+                return None;
+            }
             scope.receipts_unavailable = true;
             remaining = rest;
         }
@@ -392,7 +429,11 @@ impl DeliveryGapScope {
             | Gap::ReceiptLinksInconsistent] => true,
             _ => return None,
         };
-        (scope.state_unavailable || scope.receipts_unavailable || links_incomplete).then_some(scope)
+        (has_commitment_scope
+            || scope.state_unavailable
+            || scope.receipts_unavailable
+            || links_incomplete)
+            .then_some(scope)
     }
 }
 
@@ -905,6 +946,22 @@ impl Report {
             if unavailable_delivery_state {
                 required_facts.remove(&Fact::FailedDeliveries);
                 required_facts.remove(&Fact::PendingDeliveries);
+            }
+
+            if let Some(scope) = &delivery_scope {
+                if scope.commitments_checked {
+                    required_facts.insert(Fact::ReceiptCommitmentsChecked);
+                    required_facts.insert(Fact::InvalidReceiptCommitments);
+                    let checked = observation.facts.get(&Fact::ReceiptCommitmentsChecked);
+                    let invalid = observation.facts.get(&Fact::InvalidReceiptCommitments);
+                    ensure!(
+                        checked == observation.facts.get(&Fact::StoredReceipts)
+                            && checked.is_some_and(|n| *n <= receipt_commitments::MAX_ROWS as u64)
+                            && invalid.zip(checked).is_some_and(|(bad, total)| bad <= total
+                                && (*bad > 0) == scope.inconsistent_commitments),
+                        "invalid receipt commitment counts or finding"
+                    );
+                }
             }
 
             if delivery_scope.is_some()
@@ -2034,7 +2091,19 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
     } else {
         None
     };
-    let mut delivery_facts = Vec::with_capacity(3);
+    let mut receipt_commitments_available = receipts.is_some();
+    for &(table, columns) in receipt_commitments::PREREQUISITES {
+        if !projection_available(&transaction, table, columns)? {
+            receipt_commitments_available = false;
+            break;
+        }
+    }
+    let receipt_commitment_observation = if receipt_commitments_available {
+        Some(receipt_commitments::inspect(&transaction)?)
+    } else {
+        None
+    };
+    let mut delivery_facts = Vec::with_capacity(5);
     if delivery_state_available && !invalid_delivery_state {
         delivery_facts.push((
             Fact::FailedDeliveries,
@@ -2111,6 +2180,21 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
             .into_iter()
             .zip(partitions),
         );
+    }
+    match &receipt_commitment_observation {
+        Some(receipt_commitments::Observation::Verified(checked)) => delivery_facts.extend([
+            (Fact::ReceiptCommitmentsChecked, *checked),
+            (Fact::InvalidReceiptCommitments, 0),
+        ]),
+        Some(receipt_commitments::Observation::Inconsistent(invalid)) => {
+            if let Some(total) = receipts {
+                delivery_facts.extend([
+                    (Fact::ReceiptCommitmentsChecked, total),
+                    (Fact::InvalidReceiptCommitments, *invalid),
+                ]);
+            }
+        }
+        _ => {}
     }
     let checkpoint_cursor_available = checkpoint_total.is_some()
         && projection_available(
@@ -2275,6 +2359,24 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
                         gaps.push(Gap::ReceiptLinksInconsistent)
                     }
                     Some(receipt_links::Observation::Consistent) => {}
+                }
+                if receipts.is_some() {
+                    match &receipt_commitment_observation {
+                        None | Some(receipt_commitments::Observation::Unavailable) => {
+                            gaps.push(Gap::ReceiptCommitmentsUnavailable)
+                        }
+                        Some(receipt_commitments::Observation::InvalidMetadata) => {
+                            gaps.push(Gap::ReceiptCommitmentsMetadataInvalid)
+                        }
+                        Some(receipt_commitments::Observation::BudgetExceeded) => {
+                            gaps.push(Gap::ReceiptCommitmentsReadBudgetExceeded)
+                        }
+                        Some(receipt_commitments::Observation::Inconsistent(_)) => {
+                            gaps.push(Gap::ReceiptCommitmentsInconsistent)
+                        }
+                        Some(receipt_commitments::Observation::Verified(_)) => {}
+                    }
+                    gaps.push(Gap::ReceiptAuthorityNotVerified);
                 }
                 if gaps.is_empty() {
                     gaps.push(gap);

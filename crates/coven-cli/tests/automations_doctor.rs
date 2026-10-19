@@ -31,6 +31,15 @@ fn doctor_missing_daemon_never_creates_home() -> anyhow::Result<()> {
 
 #[test]
 fn doctor_reports_every_category_through_owner_local_daemon() -> anyhow::Result<()> {
+    doctor_report_fixture(false)
+}
+
+#[test]
+fn doctor_verifies_base_receipt_through_owner_local_action_and_cli() -> anyhow::Result<()> {
+    doctor_report_fixture(true)
+}
+
+fn doctor_report_fixture(genuine_receipt: bool) -> anyhow::Result<()> {
     use coven_client::{DaemonClient, DaemonEndpoint};
     use serde_json::{json, Value};
     use std::time::{Duration, Instant};
@@ -96,11 +105,14 @@ fn doctor_reports_every_category_through_owner_local_daemon() -> anyhow::Result<
         "UPDATE automation_runs SET log_json=?1 WHERE id='doctor-private-run'",
         [&receipt_body],
     )?;
-    // The body is deliberately not authenticated evidence; doctor only inspects
-    // reciprocal ledger keys, and must retain its receipt-integrity evidence gap.
-    conn.execute("INSERT INTO automation_receipts(id,run_id,attempt_id,automation_id,automation_revision,occurrence_id,occurrence_fence_generation,attempt_number,outcome,receipt_digest,receipt_json,event_id,produced_at)
+    if genuine_receipt {
+        insert_committed_base_receipt(&conn)?;
+    } else {
+        // Deliberately oversized evidence must produce a bounded-read gap.
+        conn.execute("INSERT INTO automation_receipts(id,run_id,attempt_id,automation_id,automation_revision,occurrence_id,occurrence_fence_generation,attempt_number,outcome,receipt_digest,receipt_json,event_id,produced_at)
         VALUES('doctor-private-receipt','doctor-private-run','doctor-private-attempt','doctor-private-definition',1,'doctor-private-occurrence',1,1,'failed',?1,?2,'doctor-private-event','2026-10-18T00:00:01Z')",
         rusqlite::params!["a".repeat(64), receipt_body])?;
+    }
     conn.execute_batch("UPDATE automation_runs SET receipt_id='doctor-private-receipt' WHERE id='doctor-private-run'; COMMIT;")?;
     // Reserve the single writer so background scheduler/maintenance observations
     // cannot race the comparison. The WAL reader must still serve doctor;
@@ -201,7 +213,19 @@ fn doctor_reports_every_category_through_owner_local_daemon() -> anyhow::Result<
             .iter()
             .find(|observation| observation["category"] == "delivery_receipts")
             .unwrap();
-        assert_eq!(delivery["gaps"], json!(["receipt_integrity_not_verified"]));
+        if genuine_receipt {
+            assert_eq!(delivery["facts"]["receipt_commitments_checked"], 1);
+            assert_eq!(delivery["facts"]["invalid_receipt_commitments"], 0);
+            assert_eq!(delivery["gaps"], json!(["receipt_authority_not_verified"]));
+        } else {
+            assert_eq!(
+                delivery["gaps"],
+                json!([
+                    "receipt_commitments_read_budget_exceeded",
+                    "receipt_authority_not_verified"
+                ])
+            );
+        }
         assert!(
             snapshot()? == before,
             "doctor CLI changed application tables"
@@ -222,6 +246,23 @@ fn doctor_reports_every_category_through_owner_local_daemon() -> anyhow::Result<
     let observations = body["result"]["observations"]
         .as_array()
         .expect("doctor observations must be an array");
+    let delivery = observations
+        .iter()
+        .find(|o| o["category"] == "delivery_receipts")
+        .unwrap();
+    if genuine_receipt {
+        assert_eq!(delivery["facts"]["receipt_commitments_checked"], 1);
+        assert_eq!(delivery["facts"]["invalid_receipt_commitments"], 0);
+        assert_eq!(delivery["gaps"], json!(["receipt_authority_not_verified"]));
+    } else {
+        assert_eq!(
+            delivery["gaps"],
+            json!([
+                "receipt_commitments_read_budget_exceeded",
+                "receipt_authority_not_verified"
+            ])
+        );
+    }
     let mut categories = observations
         .iter()
         .map(|value| value["category"].as_str().expect("closed category code"))
@@ -247,6 +288,65 @@ fn doctor_reports_every_category_through_owner_local_daemon() -> anyhow::Result<
         body["result"].get("healthy").is_none(),
         "a generic health bit must not hide unobserved categories"
     );
+    Ok(())
+}
+
+// Seed independently canonicalized terminal evidence. The production reader,
+// reached through both public owner-local surfaces, must validate every binding.
+// This is unsigned base evidence and deliberately carries no authority claim.
+fn insert_committed_base_receipt(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    fn seal(value: &mut Value, receipt: bool) -> anyhow::Result<()> {
+        let bytes = Sha256::digest(serde_jcs::to_vec(&*value)?);
+        let mut digest = String::with_capacity(64);
+        for byte in bytes {
+            use std::fmt::Write;
+            write!(&mut digest, "{byte:02x}")?;
+        }
+        value["integrity"] = json!({
+            "algorithm":"sha256", "canonicalization":"jcs-rfc8785", "value":digest
+        });
+        if receipt {
+            value["integrity"]["authentication"] = json!("none");
+        }
+        Ok(())
+    }
+    conn.execute_batch("UPDATE automation_runs SET automation_revision=1,familiar_id='charm',runtime='coven-code' WHERE id='doctor-private-run';")?;
+    let sequence: i64 = conn.query_row("SELECT next_sequence FROM automation_event_stream_heads WHERE stream_kind='run' AND stream_id='doctor-private-run'", [], |row| row.get(0))?;
+    let time = "2026-10-18T00:00:01Z";
+    let producer = json!({"component":"coven-daemon", "instanceId":"local-doctor-fixture", "implementationVersion":env!("CARGO_PKG_VERSION")});
+    let privacy =
+        json!({"classification":"operational", "retention":{"classification":"standard"}});
+    let mut receipt = json!({
+        "schemaVersion":"coven.automations.v1", "receiptId":"doctor-private-receipt",
+        "automationId":"doctor-private-definition", "automationRevision":1,
+        "occurrenceId":"doctor-private-occurrence", "occurrenceFenceGeneration":1,
+        "runId":"doctor-private-run", "attemptId":"doctor-private-attempt", "attemptNumber":1,
+        "identity":{"familiarId":"charm"}, "sideEffectClass":"none",
+        "outcome":{"disposition":"failed", "failureClass":"launch_refused", "recoveryDisposition":"not_required"},
+        "producedAt":time, "producer":producer, "privacy":privacy
+    });
+    seal(&mut receipt, true)?;
+    let event_id = "evt00000000000000000000000000042";
+    let mut event = json!({
+        "schemaVersion":"coven.automations.v1", "eventId":event_id,
+        "stream":{"kind":"run", "id":"doctor-private-run"}, "sequence":sequence,
+        "recordedAt":time, "observedAt":time, "producer":producer,
+        "automationId":"doctor-private-definition", "occurrenceId":"doctor-private-occurrence",
+        "runId":"doctor-private-run", "attemptId":"doctor-private-attempt",
+        "kind":"receipt.recorded", "summary":"automation run receipt recorded",
+        "payload":{"receiptRef":"doctor-private-receipt", "outcome":"failed", "sideEffectClass":"none"},
+        "privacy":privacy
+    });
+    seal(&mut event, false)?;
+    conn.execute("UPDATE automation_event_stream_heads SET next_sequence=?1,updated_at=?2 WHERE stream_kind='run' AND stream_id='doctor-private-run'", rusqlite::params![sequence+1,time])?;
+    conn.execute("INSERT INTO automation_events(event_id,stream_kind,stream_id,sequence,recorded_at,recorded_at_millis,observed_at,event_json)
+        VALUES(?1,'run','doctor-private-run',?5,?2,?3,?2,?4)",
+        rusqlite::params![event_id,time,chrono::DateTime::parse_from_rfc3339(time)?.timestamp_millis(),serde_json::to_string(&event)?,sequence])?;
+    conn.execute("INSERT INTO automation_receipts(id,run_id,attempt_id,automation_id,automation_revision,occurrence_id,occurrence_fence_generation,attempt_number,outcome,receipt_digest,receipt_json,event_id,produced_at)
+        VALUES('doctor-private-receipt','doctor-private-run','doctor-private-attempt','doctor-private-definition',1,'doctor-private-occurrence',1,1,'failed',?1,?2,?3,?4)",
+        rusqlite::params![receipt["integrity"]["value"].as_str().unwrap(),serde_json::to_string(&receipt)?,event_id,time])?;
     Ok(())
 }
 
