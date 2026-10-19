@@ -194,7 +194,7 @@ New-CovenTokenPublisherInvocation -Capture $capture -Executable $Python -BundleP
 class RunnerInvocationControls(unittest.TestCase):
  @classmethod
  def setUpClass(cls):
-  cls.owned=tempfile.TemporaryDirectory(prefix='coven-runner-invocation-');cls.base=Path(cls.owned.name);cls.root=cls.base/"repo‘’'é;$literal";cls.root.mkdir()
+  cls.owned=tempfile.TemporaryDirectory(prefix='coven-runner-invocation-');cls.base=Path(cls.owned.name).resolve();cls.root=cls.base/"repo‘’'é;$literal";cls.root.mkdir()
   cls.source=b"param($Directory,$Commit,$OutputDirectory,$TemporaryRoot,$RunnerSourceHash)\n[ordered]@{directory=$Directory;commit=$Commit;output=$OutputDirectory;temporary=$TemporaryRoot;runnerHash=$RunnerSourceHash}|ConvertTo-Json -Compress\nexit 0\n"
   cls.binder=cls.base/'binder.ps1';cls.binder.write_bytes(PROBE.with_name('token-binding.ps1').read_bytes())
   cls.script=cls.base/'build.ps1';cls.script.write_text(r"""param($Binder,$Directory,$Mode)
