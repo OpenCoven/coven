@@ -104,7 +104,7 @@ jobs:
             --tag-object-sha "$TAG_OBJECT_SHA" \
             --output release-source-acceptance.json
       - name: Retain exact-source acceptance receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-release-source-acceptance-${{ steps.release-context.outputs.release_tag }}
           path: |
@@ -160,7 +160,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture | tee coven-tui-metrics.txt
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-release-performance-${{ needs.verify-tag.outputs.release_tag }}
           path: |
@@ -200,7 +200,7 @@ jobs:
         run: cargo build --release -p coven-afs --features mount --bins --target ${{ matrix.rust-target }}
         env:
           COVEN_BUILD_VERSION: v${{ needs.verify-tag.outputs.npm_version }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-${{ matrix.npm-target }}
           # Both binaries when the helper was built; the glob matches nothing
@@ -319,7 +319,7 @@ jobs:
             --output-dir release-publication-authorization
       - name: Retain publication authorization
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-release-publication-authorization-${{ needs.verify-tag.outputs.release_tag }}
           path: release-publication-authorization/
