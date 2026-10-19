@@ -63,7 +63,7 @@ try {
     $stage='output-binding'
     $output=[IO.Path]::GetFullPath($OutputDirectory)
     $relative=[IO.Path]::GetRelativePath($nativeTemp,$output)
-    if($relative -cnotmatch '^windows-reliability-token-[A-Za-z0-9-]{1,96}[\/]public$'){throw 'output'}
+    if($relative -cnotmatch '^windows-reliability-token-[A-Za-z0-9-]{1,96}[\\/]public$'){throw 'output'}
     $job=[IO.Path]::GetDirectoryName($output)
     $null=Assert-CovenTokenSourceRoot $job;$null=Assert-CovenTokenSourceRoot $output
     $stage='compilation';Add-CovenTokenCapturedTypes $capture

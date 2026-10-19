@@ -111,6 +111,23 @@ class ParentControls(unittest.TestCase):
  def test_primary_and_cleanup_survive_outcome_failure(self):
   result,events,execution,text=self.run_case('compile-close-and-outcome-fail');self.assertEqual(result.returncode,1,result.stderr.decode(errors='replace'));self.assertEqual(result.stdout,b'');self.assertEqual(result.stderr,b'token-execution-failed stage=compilation cleanupFailed=true outcomeFailed=true\n');self.assertIsNone(execution);self.assertNotIn('publisher-invocation',events)
  def test_child_cleanup_marker_survives_projection_failure(self):self.failure('child-cleanup-projection-fail','publication',True)
+class OutputBindingPathControls(unittest.TestCase):
+ def test_exact_runner_predicate_accepts_both_separators_and_rejects_other_shapes(self):
+  # Exercise the production statement on every host: POSIX-only parent tests
+  # otherwise miss a regex that rejects GetRelativePath's Windows separator.
+  statements=[line.strip() for line in RUNNER.read_text().splitlines() if line.strip().startswith('if($relative -cnotmatch ')]
+  self.assertEqual(len(statements),1)
+  cases=[]
+  for separator in ('/','\\'):
+   for suffix in ('a','a'*96):cases.append(('windows-reliability-token-'+suffix+separator+'public',True))
+   for value in ('windows-reliability-token-'+separator+'public','windows-reliability-token-'+'a'*97+separator+'public','windows-reliability-token-a'+separator+'private','windows-reliability-token-a'+separator+'public'+separator+'extra','..'+separator+'windows-reliability-token-a'+separator+'public','windows-reliability-token-a'+separator+'..'+separator+'public','windows-reliability-token-a'+separator+'PUBLIC'):
+    cases.append((value,False))
+  checks=[]
+  for value,expected in cases:
+   checks.append('$relative='+psq(value)+'; $accepted=$true; try {'+statements[0]+'} catch {$accepted=$false}; if($accepted -ne $'+str(expected).lower()+'){throw '+psq('Unexpected output-path admission: '+value)+'}')
+  result=subprocess.run(['pwsh','-NoProfile','-Command','\n'.join(checks)],capture_output=True,timeout=120)
+  self.assertEqual(result.returncode,0,result.stderr.decode())
+
 class TokenWorkflowContractControls(unittest.TestCase):
  def job(self,text):
   marker='\n  token-facts:\n';self.assertEqual(text.count(marker),1);job=text.split(marker,1)[1]
