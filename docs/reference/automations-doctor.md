@@ -63,7 +63,7 @@ incomplete.
 | `planning_start_lag` | Latest pass duration/start lag and bounded retained scheduled-occurrence planning delay, when observed | Actual runtime-start lag, full recovery/history evidence and ratified SLO comparisons |
 | `repeated_failures` | Quarantine, failed attempts, retry exhaustion and retained failed occurrences since latest retained success | Strict consecutive-occurrence streaks, full history and historical classification |
 | `authority_refusals` | Launch-refused and unsupported-authority attempt counts | Complete identity, authority and approval refusal evidence |
-| `delivery_receipts` | Failed/pending deliveries, stored receipts and bounded reciprocal index links | Delivery obligations, full receipt correlation and integrity |
+| `delivery_receipts` | Failed/pending deliveries, stored receipts, reciprocal index links and bounded base commitment validation | External delivery obligations and authenticated authority evidence |
 | `event_changefeed` | Stored events/streams and checkpoint expiry/cursor/retention observations | Cursor consistency, checkpoint resumability and actual subscriber reconnect/replay health |
 | `disk_retention` | Main page geometry, separately sampled filesystem available bytes, and WAL-sidecar metadata estimates | Active WAL/frame/checkpoint semantics, quota/write guarantees, retention pressure and clock/platform evidence |
 
@@ -222,9 +222,44 @@ whose receipt count or available failed-plus-pending run count exceeds the
 corresponding scan row cap. Link gaps follow independent delivery-state and
 receipt-store gaps; raw counts remain available. TEMP tables cannot supply
 links. Matching links do not validate receipt bodies, digests, attempt/occurrence
-bindings, authority evidence or external delivery. `receipt_integrity_not_verified`
-remains the default gap when no conditional finding applies. These caps do not
+bindings, authority evidence or external delivery. These link caps do not
 establish a whole-read time or release SLO bound.
+
+A separate commitment check reuses the Rust committed-receipt reader in the
+same read snapshot. It verifies canonical receipt/event digests, stored indexes,
+run/attempt identity, definition-digest and occurrence/fence references,
+terminal settlement and reciprocal commitment. Every read uses `main`; TEMP
+receipt, event, run, attempt or rich-revision tables cannot supply evidence.
+Identity matching is exact even if damaged columns have case-insensitive
+collation or numeric affinity. Healthy-schema lookups retain indexed candidate
+selection before applying exact identity checks.
+The result exposes only `receipt_commitments_checked` and
+`invalid_receipt_commitments`. A complete cohort has a checked count equal to
+`stored_receipts`; any invalid count adds `receipt_commitments_inconsistent`.
+
+The check accepts at most 256 receipts, 128 KiB per receipt/event body and
+1 MiB of combined receipt/event body input. Before reading those bodies, it
+validates bounded keys and sizes. A temporary SQLite string/BLOB/record limit
+of at most 256 KiB also bounds the reused reader's other stored metadata. A
+stricter caller limit stays in force, and the previous limit is restored after
+success, refusal or read error. These are implementation limits within the
+existing cooperative budget; they do not establish a hard filesystem deadline
+or ratified SLO.
+
+Missing prerequisites or unavailable reads add `receipt_commitments_unavailable`;
+malformed or ambiguous key metadata adds `receipt_commitments_metadata_invalid`.
+Input/length exhaustion adds `receipt_commitments_read_budget_exceeded`.
+These outcomes omit both commitment counts, preserving independently available
+delivery, receipt and link observations. A missing receipt table retains its
+existing receipt-store/link-store gaps and cannot acquire commitment counts.
+
+`receipt_authority_not_verified` remains explicit whenever a receipt cohort can
+be considered. The doctor does not invoke an authority-provider verifier or
+validate the authorized terminal sidecar. Base consistency also leaves external
+delivery obligations unobserved. Inspect the run and attempts through the
+existing owner-local commands; follow the authority runbook before any policy
+activation. Earlier reports with `receipt_integrity_not_verified` remain
+readable as incomplete observations and cannot carry the new checked counts.
 Other run-table dependencies still need complete isolation before every missing
 run-table case can return a report.
 

@@ -243,10 +243,13 @@ pub(crate) fn published_digest_sql(table: &str) -> String {
     format!(
         "COALESCE(
             (SELECT recorded.integrity
-             FROM automation_rich_definition_revisions AS recorded
+             FROM main.automation_rich_definition_revisions AS recorded
              WHERE {table}.definition_digest IS NOT NULL
                AND recorded.automation_id = {table}.automation_id
-               AND recorded.revision = {table}.automation_revision),
+               AND +recorded.automation_id COLLATE BINARY = +{table}.automation_id
+               AND recorded.revision = {table}.automation_revision
+               AND typeof(recorded.revision) = 'integer'
+               AND +recorded.revision = +{table}.automation_revision),
             {table}.definition_digest)"
     )
 }

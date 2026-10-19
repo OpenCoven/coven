@@ -455,7 +455,7 @@ fn read_receipt_in(conn: &Connection, receipt_id: &str) -> Result<Option<Automat
                     definition_digest, occurrence_id, occurrence_fence_generation,
                     attempt_number, outcome, receipt_digest, receipt_json, event_id,
                     produced_at
-             FROM automation_receipts WHERE id = ?1",
+             FROM main.automation_receipts WHERE (id = ?1 AND +id COLLATE BINARY = ?1)",
             [receipt_id],
             |row| {
                 Ok(StoredReceiptEvidence {
@@ -487,7 +487,7 @@ fn read_receipt_in(conn: &Connection, receipt_id: &str) -> Result<Option<Automat
         .query_row(
             "SELECT event_id, stream_kind, stream_id, sequence, recorded_at,
                     recorded_at_millis, observed_at, event_json
-             FROM automation_events WHERE event_id = ?1",
+             FROM main.automation_events WHERE (event_id = ?1 AND +event_id COLLATE BINARY = ?1)",
             [&stored.event_id],
             |row| {
                 Ok(StoredEventEvidence {
@@ -914,10 +914,11 @@ fn durable_correlation(
                     attempt.authority_extension_json, attempt.state, attempt.failure_class,
                     attempt.state_reason, run.finished_at, attempt.settled_at,
                     run.definition_digest
-             FROM automation_runs AS run
-             JOIN automation_attempts AS attempt
+             FROM main.automation_runs AS run
+             JOIN main.automation_attempts AS attempt
                ON attempt.run_id = run.id
-             WHERE run.id = ?1 AND attempt.id = ?2",
+              AND +attempt.run_id COLLATE BINARY = +run.id
+             WHERE (run.id = ?1 AND +run.id COLLATE BINARY = ?1) AND (attempt.id = ?2 AND +attempt.id COLLATE BINARY = ?2)",
             digest = super::rich_definition::published_digest_sql("run"),
         ),
         params![receipt.run_id.as_str(), receipt.attempt_id.as_str()],
@@ -1378,8 +1379,9 @@ fn existing_commit(
     let mut statement = conn
         .prepare(
             "SELECT id, run_id, attempt_id, event_id, receipt_json
-             FROM automation_receipts
-             WHERE id = ?1 OR run_id = ?2 OR attempt_id = ?3",
+             FROM main.automation_receipts
+             WHERE (id = ?1 OR run_id = ?2 OR attempt_id = ?3)
+               AND (+id COLLATE BINARY = ?1 OR +run_id COLLATE BINARY = ?2 OR +attempt_id COLLATE BINARY = ?3)",
         )
         .context("failed to prepare automation receipt replay query")?;
     let rows = statement
@@ -1413,7 +1415,7 @@ fn existing_commit(
     let (id, run_id, attempt_id, event_id, stored_receipt_json) = &existing[0];
     let stored_event_json = conn
         .query_row(
-            "SELECT event_json FROM automation_events WHERE event_id = ?1",
+            "SELECT event_json FROM main.automation_events WHERE (event_id = ?1 AND +event_id COLLATE BINARY = ?1)",
             [event_id],
             |row| row.get::<_, String>(0),
         )
@@ -1421,7 +1423,7 @@ fn existing_commit(
         .context("failed to read replayed automation receipt event")?;
     let run_receipt_id = conn
         .query_row(
-            "SELECT receipt_id FROM automation_runs WHERE id = ?1",
+            "SELECT receipt_id FROM main.automation_runs WHERE (id = ?1 AND +id COLLATE BINARY = ?1)",
             [receipt.run_id.as_str()],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -1460,7 +1462,7 @@ pub(crate) const fn terminal_states(outcome: TerminalOutcome) -> (&'static str, 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         build_no_launch_receipt, build_receipt_recorded_event, commit_authorized_receipt,
         commit_receipt, read_authorized_receipt, read_receipt, ReceiptCommitOutcome,
@@ -1957,6 +1959,15 @@ mod tests {
             "value": sha256_hex(&canonicalize_without_integrity(&value).unwrap())
         });
         serde_json::from_value(value).unwrap()
+    }
+
+    pub(crate) fn doctor_committed_receipt_fixture(
+    ) -> (tempfile::TempDir, Connection, AutomationReceipt) {
+        let fixture = fixture();
+        let receipt = make_receipt(&fixture, "receipt-daily-1");
+        let event = receipt_event(&fixture.conn, &receipt, 0);
+        commit_receipt(&fixture.conn, &receipt, &event).unwrap();
+        (fixture._temp, fixture.conn, receipt)
     }
 
     fn receipt_commit_state(
