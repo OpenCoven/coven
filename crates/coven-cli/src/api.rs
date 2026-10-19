@@ -922,6 +922,13 @@ fn handle_request_with_runtime_authority_and_automation_time(
             {
                 return json_response(rejection.0, &rejection.1);
             }
+            if payload.get("action").and_then(Value::as_str).map(str::trim)
+                == Some(crate::automations::doctor::ACTION)
+            {
+                let (status, response) =
+                    control_plane::doctor_existing_store(&store_path(coven_home));
+                return json_response(status, &response);
+            }
             let conn = match store::open_store(&store_path(coven_home)) {
                 Ok(conn) => conn,
                 Err(error) => {
@@ -17406,6 +17413,98 @@ pub(crate) mod tests {
     }
     use super::*;
     use crate::api_routes::{COVEN_API_ROUTE_VERSION, SUPPORTED_API_ROUTE_VERSIONS};
+
+    fn doctor_boundary_request(home: &Path, authority: RequestAuthority) -> Result<ApiResponse> {
+        handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/actions",
+            home,
+            None,
+            Some(r#"{"action":"coven.automations.doctor.v1"}"#),
+            &NoopSessionRuntime,
+            authority,
+        )
+    }
+
+    #[test]
+    fn doctor_api_boundary_missing_store_is_not_created() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("PRIVATE_missing_home");
+        let response = doctor_boundary_request(&home, RequestAuthority::OwnerLocalIpc)?;
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert!(!home.exists());
+        assert!(!response.body.contains("PRIVATE_missing_home"));
+        assert!(response
+            .body
+            .contains("Automation doctor observation unavailable."));
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_api_boundary_open_failure_is_sanitized_and_tcp_rejects_first() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("PRIVATE_blocked_home");
+        std::fs::write(&home, b"not a directory")?;
+        let owner = doctor_boundary_request(&home, RequestAuthority::OwnerLocalIpc)?;
+        assert_eq!(owner.status, 400, "{}", owner.body);
+        assert!(!owner.body.contains("PRIVATE_blocked_home"));
+        assert!(owner
+            .body
+            .contains("Automation doctor observation unavailable."));
+        let tcp = doctor_boundary_request(&home, RequestAuthority::Tcp)?;
+        assert_eq!(tcp.status, 403, "{}", tcp.body);
+        assert!(!tcp.body.contains("PRIVATE_blocked_home"));
+        assert_eq!(std::fs::read(&home)?, b"not a directory");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_api_boundary_preserves_permissions_and_uncached_schema() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        for initialized in [false, true] {
+            let root = tempfile::tempdir()?;
+            let home = root.path();
+            let path = store_path(home);
+            if initialized {
+                drop(store::open_store(&path)?);
+            } else {
+                // Bypass initialization and its process cache. An unsupported
+                // schema must report missing evidence without silently migrating it.
+                let conn = rusqlite::Connection::open(&path)?;
+                conn.execute_batch(
+                    "CREATE TABLE private_sentinel(value TEXT); PRAGMA user_version=7;",
+                )?;
+            }
+            std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o750))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+            let before = std::fs::read(&path)?;
+            let response = doctor_boundary_request(home, RequestAuthority::OwnerLocalIpc)?;
+            assert_eq!(response.status, 200, "{}", response.body);
+            if !initialized {
+                let value: Value = serde_json::from_str(&response.body)?;
+                let store = value["result"]["observations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["category"] == "store")
+                    .unwrap();
+                assert_eq!(store["facts"]["missing_required_schema_objects"], 73);
+                assert!(store["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|gap| gap == "contract_migration_store_unavailable"));
+            }
+            assert_eq!(std::fs::metadata(home)?.permissions().mode() & 0o777, 0o750);
+            assert_eq!(
+                std::fs::metadata(&path)?.permissions().mode() & 0o777,
+                0o640
+            );
+            assert_eq!(std::fs::read(&path)?, before);
+        }
+        Ok(())
+    }
 
     #[test]
     fn default_authorized_launch_refuses_before_launch_or_ownership() {

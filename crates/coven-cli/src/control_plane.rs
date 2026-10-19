@@ -160,6 +160,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.legacy.import.v1",
                     "coven.automations.health",
                     "coven.automations.definition.health.v1",
+                    "coven.automations.doctor.v1",
                     "coven.automations.scheduler.status.v1",
                     "coven.automations.occurrence.list.v1",
                     crate::automations::leases::ACTION,
@@ -202,6 +203,7 @@ const TCP_AUTOMATION_READS: &[&str] = &[
 /// issue a stored checkpoint.
 const OWNER_AUTOMATION_READS: &[&str] = &[
     crate::automations::leases::ACTION,
+    "coven.automations.doctor.v1",
     "coven.automations.list",
     "coven.automations.get",
     "coven.automations.definition.list.v1",
@@ -261,6 +263,48 @@ pub(crate) fn automation_transport_rejection(
             reason,
         ),
     ))
+}
+
+/// Called only after the API has rejected untrusted transports, before any
+/// writable store opener. Doctor failures deliberately omit underlying paths.
+pub(crate) fn doctor_existing_store(path: &std::path::Path) -> (u16, ControlActionResponse) {
+    doctor_response(crate::automations::doctor::inspect_owner_store_path(
+        path,
+        chrono::Utc::now(),
+    ))
+}
+
+fn doctor_response(
+    report: anyhow::Result<crate::automations::doctor::Report>,
+) -> (u16, ControlActionResponse) {
+    let action = crate::automations::doctor::ACTION;
+    match report.and_then(|report| Ok(serde_json::to_value(report)?)) {
+        Ok(report) => (
+            200,
+            ControlActionResponse {
+                ok: true,
+                accepted: true,
+                action: action.to_owned(),
+                status: ActionStatus::Completed,
+                reason: None,
+                error: None,
+                result: Some(report),
+                event: None,
+            },
+        ),
+        Err(error) => (
+            400,
+            rejected_action(
+                action,
+                if error.is::<crate::automations::doctor::ReadBudgetExceeded>() {
+                    "Automation doctor read budget exceeded."
+                } else {
+                    "Automation doctor observation unavailable."
+                }
+                .to_owned(),
+            ),
+        ),
+    }
 }
 
 /// Routes one control action as the owner, as the API's default entry does.
@@ -1089,6 +1133,9 @@ pub(crate) fn route_action_at(
             Ok(id) => automation_definition_health_result(conn, action, origin, intent_id, &id),
             Err(error) => validation_rejection(action, error),
         },
+        "coven.automations.doctor.v1" => doctor_response(
+            crate::automations::doctor::inspect_owner_store(conn, chrono::Utc::now()),
+        ),
         "coven.automations.scheduler.status.v1" => automation_result(
             action,
             origin,

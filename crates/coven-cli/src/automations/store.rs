@@ -213,18 +213,18 @@ pub fn list_definitions_with_tombstones(
     let query = if include_tombstoned {
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
                 tombstoned_at, updated_at
-         FROM automation_definitions
+         FROM main.automation_definitions
          WHERE NOT EXISTS (
-             SELECT 1 FROM automation_missions WHERE automation_id = automation_definitions.id
+             SELECT 1 FROM main.automation_missions WHERE automation_id = automation_definitions.id
          )
          ORDER BY name ASC, id ASC"
     } else {
         "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
                 tombstoned_at, updated_at
-         FROM automation_definitions
+         FROM main.automation_definitions
          WHERE tombstoned_at IS NULL
            AND NOT EXISTS (
-               SELECT 1 FROM automation_missions WHERE automation_id = automation_definitions.id
+               SELECT 1 FROM main.automation_missions WHERE automation_id = automation_definitions.id
            )
          ORDER BY name ASC, id ASC"
     };

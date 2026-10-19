@@ -393,3 +393,168 @@ fn run_control_envelopes_are_refused_before_tcp_store_access() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn doctor_requires_owner_ipc_and_leaves_the_store_unchanged() -> Result<()> {
+    let body = json!({
+        "action": "coven.automations.doctor.v1",
+        "principalId": "owner",
+        "authority": "OwnerLocalIpc",
+        "origin": "owner-local-ipc"
+    });
+    for route in ["/actions", "/api/v1/actions"] {
+        let unopened = tempfile::tempdir()?;
+        let response = request(unopened.path(), route, &body, RequestAuthority::Tcp)?;
+        assert_authority_refusal(&response, "coven.automations.doctor.v1")?;
+        assert_eq!(std::fs::read_dir(unopened.path())?.count(), 0);
+    }
+    let owner = tempfile::tempdir()?;
+    let created = request(
+        owner.path(),
+        "/actions",
+        &create_payload("doctor-owner-read"),
+        RequestAuthority::OwnerLocalIpc,
+    )?;
+    assert_eq!(created.status, 200);
+    let conn = crate::store::open_store(&owner.path().join("coven.sqlite3"))?;
+    let before = database_snapshot(&conn)?;
+    let response = request(
+        owner.path(),
+        "/api/v1/actions",
+        &body,
+        RequestAuthority::OwnerLocalIpc,
+    )?;
+    assert_eq!(response.status, 200);
+    let value: Value = serde_json::from_str(&response.body)?;
+    assert_eq!(
+        value["result"]["schemaVersion"],
+        "coven.automations.doctor.v1"
+    );
+    assert!(value.get("event").is_none());
+    assert!(!response.body.contains("A paused test definition"));
+    assert!(
+        before == database_snapshot(&conn)?,
+        "doctor changed durable state"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_uses_an_owned_read_connection_without_touching_caller_handlers() -> Result<()> {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let root = tempfile::tempdir()?;
+    let conn = crate::store::open_store(&root.path().join("coven.sqlite3"))?;
+    conn.busy_timeout(std::time::Duration::from_millis(1234))?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    conn.progress_handler(
+        1,
+        Some(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+    )?;
+    let (status, response) = crate::control_plane::route_action(
+        json!({"action":"coven.automations.doctor.v1"}),
+        &conn,
+        &NoEffectsRuntime,
+    );
+    assert_eq!(status, 200);
+    assert!(response.ok);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "doctor SQL must run on its own connection"
+    );
+    let timeout: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+    assert_eq!(timeout, 1234, "doctor must not replace caller busy policy");
+    assert!(
+        calls.load(Ordering::Relaxed) > 0,
+        "caller progress handler must remain installed"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_preserves_existing_store_permissions() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("coven.sqlite3");
+    let conn = crate::store::open_store(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+    let (status, response) = crate::control_plane::route_action(
+        json!({"action":"coven.automations.doctor.v1"}),
+        &conn,
+        &NoEffectsRuntime,
+    );
+    assert_eq!(status, 200);
+    assert!(response.ok);
+    assert_eq!(
+        std::fs::metadata(&path)?.permissions().mode() & 0o777,
+        0o640,
+        "doctor must not repair filesystem permissions"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_a_fixed_budget_failure_without_partial_results() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let conn = crate::store::open_store(&root.path().join("coven.sqlite3"))?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF; DROP TABLE main.automation_occurrences;
+        CREATE TABLE main.automation_occurrences(state,PRIVATE_payload);
+        WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<499999)
+        INSERT INTO main.automation_occurrences SELECT 'planned','PRIVATE_VALUE' FROM n;",
+    )?;
+    let before = conn.total_changes();
+    let (status, response) = crate::control_plane::route_action(
+        json!({"action":"coven.automations.doctor.v1"}),
+        &conn,
+        &NoEffectsRuntime,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(
+        response.reason.as_deref(),
+        Some("Automation doctor read budget exceeded.")
+    );
+    assert!(response.result.is_none());
+    assert!(!serde_json::to_string(&response)?.contains("PRIVATE"));
+    assert_eq!(conn.total_changes(), before);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM main.automation_occurrences",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        500000
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_refuses_a_locked_store_without_changing_caller_transaction() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let conn = crate::store::open_store(&root.path().join("coven.sqlite3"))?;
+    conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE")?;
+    let (status, response) = crate::control_plane::route_action(
+        json!({"action":"coven.automations.doctor.v1"}),
+        &conn,
+        &NoEffectsRuntime,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(
+        response.reason.as_deref(),
+        Some("Automation doctor observation unavailable.")
+    );
+    assert!(
+        !conn.is_autocommit(),
+        "doctor must leave caller transaction alone"
+    );
+    conn.execute_batch("ROLLBACK")?;
+    Ok(())
+}

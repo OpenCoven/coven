@@ -570,6 +570,33 @@ one, requires owner-local IPC before action validation.
 This transport gate does not supply a trusted Runtime Authority adapter or enable
 any currently refused execution command or SDK mutation phase.
 
+### Automations doctor observations
+
+`coven.automations.doctor.v1` is an owner-local diagnostic read. It returns a
+`coven.automations.doctor.v1` report in `result` and does not publish an event,
+issue a checkpoint, reserve an adoption key, migrate the store, or dispatch.
+TCP requests receive `403 AUTHORITY_REQUIRED` before store access, including
+requests with caller-supplied owner labels.
+
+The daemon uses a dedicated existing-store read-only connection with zero busy
+wait and cooperative SQLite work/elapsed budgets. Budget exhaustion returns
+`400` with reason `Automation doctor read budget exceeded.` and no partial
+result; other open/read/lock failures use `Automation doctor observation unavailable.`.
+The read does not repair file permissions or alter caller connection handlers.
+These budgets do not assert a hard OS/I/O deadline or a ratified SLO.
+
+The report contains `schemaVersion`, `observedAt`, and exactly eleven
+`observations`. Each observation has a closed `category`, numeric `facts`,
+explicit `gaps`, and a fixed `nextStep` code. Facts are bounded safe integers;
+private IDs, owner strings, prompts, paths, logs, and raw errors are omitted.
+Missing scheduler pass data is omitted rather than reported as a zero-duration
+pass. Category/fact/gap/next-step mismatches are invalid reports.
+
+This initial diagnostic contract explicitly reports incomplete evidence. It has
+no aggregate health or certification bit. See the [doctor runbook](reference/automations-doctor.md)
+for each category's scope and remaining checks. The complete doctor outcome in
+#1355 and the full certification outcome in #858 remain open.
+
 Other unknown action ids return `400` and fail closed:
 
 ```json

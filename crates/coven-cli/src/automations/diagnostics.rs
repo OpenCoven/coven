@@ -31,6 +31,21 @@ pub const AUTOMATION_SCHEDULER_DIAGNOSTICS_SCHEMA_SQL: &str = "
             OR (status = 'failed' AND error_class IS NOT NULL)
         )
     );
+
+    CREATE TABLE IF NOT EXISTS automation_scheduler_last_successful_pass (
+        id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+        scheduler_generation INTEGER NOT NULL CHECK (scheduler_generation >= 1),
+        finished_at TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0)
+    );
+
+    -- Initialization-only backfill: a failed latest pass proves no earlier
+    -- success. Never invent a historical timestamp from that failure.
+    INSERT INTO automation_scheduler_last_successful_pass
+        (id, scheduler_generation, finished_at, duration_ms)
+    SELECT id, scheduler_generation, finished_at, duration_ms
+    FROM automation_scheduler_last_pass WHERE status = 'succeeded'
+    ON CONFLICT(id) DO NOTHING;
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +159,26 @@ pub(crate) fn record_scheduler_pass(
             ],
         )
         .context("failed to persist scheduler pass status")?;
+    if record.status == "succeeded" {
+        // Same transaction and current-generation check as the latest pass.
+        // A stale writer cannot overwrite either diagnostic projection.
+        transaction
+            .execute(
+                "INSERT INTO automation_scheduler_last_successful_pass
+                (id, scheduler_generation, finished_at, duration_ms)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                scheduler_generation = excluded.scheduler_generation,
+                finished_at = excluded.finished_at,
+                duration_ms = excluded.duration_ms",
+                params![
+                    fence.generation(),
+                    iso(record.finished_at),
+                    record.duration_ms
+                ],
+            )
+            .context("failed to persist successful scheduler pass")?;
+    }
     transaction
         .commit()
         .context("failed to commit scheduler pass status")?;
