@@ -20,7 +20,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { assertInstallableDependencies, defaultTargetName, isMainModule, targetHelperBinaryName, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, prepareDistRoot, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { assertInstallableDependencies, assertPublishableSurface, assertSupportedReleaseLine, defaultTargetName, loadReleaseSupport, isMainModule, targetHelperBinaryName, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, prepareDistRoot, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 import { parseReleaseTag } from './release-npm-context.mjs';
 import { platformMatrix } from './release-npm-platform-matrix.mjs';
 
@@ -41,6 +41,7 @@ const OIDC_ENV = {
 /// run cannot collide with an already-published release. A real version number
 /// here passes only until that version ships, then fails permanently.
 const DRY_RUN_SENTINEL_VERSION = '999.0.0';
+
 
 test('release staging removes stale generated npm output before regeneration', () => {
   const fixture = mkdtempSync(path.join(tmpdir(), 'coven-stale-dist-'));
@@ -83,6 +84,11 @@ test('wrapper dry-run cannot reuse a stale generated package version', async () 
     copyFileSync(
       fileURLToPath(new URL('publish-npm.mjs', import.meta.url)),
       path.join(fixture, 'scripts', 'publish-npm.mjs')
+    );
+    mkdirSync(path.join(fixture, '.github'), { recursive: true });
+    copyFileSync(
+      fileURLToPath(new URL('../.github/release-support.json', import.meta.url)),
+      path.join(fixture, '.github', 'release-support.json')
     );
     cpSync(
       fileURLToPath(new URL('../npm/coven', import.meta.url)),
@@ -494,6 +500,11 @@ test('publish path fails closed on a wrapper dependency npm cannot install', () 
     copyFileSync(
       fileURLToPath(new URL('publish-npm.mjs', import.meta.url)),
       path.join(fixture, 'scripts', 'publish-npm.mjs')
+    );
+    mkdirSync(path.join(fixture, '.github'), { recursive: true });
+    copyFileSync(
+      fileURLToPath(new URL('../.github/release-support.json', import.meta.url)),
+      path.join(fixture, '.github', 'release-support.json')
     );
     cpSync(
       fileURLToPath(new URL('../npm/coven', import.meta.url)),
@@ -1782,14 +1793,97 @@ test('publish-npm uses Windows shell resolution for command shims', () => {
   assert.match(script, /spawnSync\('npm',\s*\['view'[\s\S]*?\.\.\.spawnOptionsForCommand\(\)/);
 });
 
-test('packageVersionPublished returns true when npm view exits 0 (version exists on registry)', () => {
-  const result = packageVersionPublished('@opencoven/cli', '0.0.49', () => ({ status: 0 }));
-  assert.equal(result, true);
+test('packageVersionPublished returns true only when npm prints the exact version back', () => {
+  assert.equal(packageVersionPublished('@opencoven/cli', '0.0.49', () => ({ status: 0, stdout: '0.0.49\n', stderr: '' })), true);
 });
 
-test('packageVersionPublished returns false when npm view exits non-zero (E404, not yet published)', () => {
-  const result = packageVersionPublished('@opencoven/cli', '99.99.99', () => ({ status: 1 }));
-  assert.equal(result, false);
+test('packageVersionPublished returns false only for npm E404', () => {
+  const e404 = 'npm error code E404\nnpm error 404 No match found for version 99.99.99\n';
+  assert.equal(packageVersionPublished('@opencoven/cli', '99.99.99', () => ({ status: 1, stdout: '', stderr: e404 })), false);
+});
+
+test('packageVersionPublished refuses to guess when npm cannot answer', () => {
+  // These used to return false, which let a publish proceed without knowing
+  // whether it would overwrite an existing version (#805).
+  for (const result of [
+    { status: 1, stdout: '', stderr: 'npm error code ETIMEDOUT\nnpm error network request failed' },
+    { status: 1, stdout: '', stderr: 'npm error code E403\nnpm error 403 Forbidden' },
+    { status: 0, stdout: '', stderr: '' },
+    { status: 0, stdout: '0.0.48\n', stderr: '' },
+    { status: null, stdout: '', stderr: '' }
+  ]) {
+    assert.throws(
+      () => packageVersionPublished('@opencoven/cli', '0.0.49', () => result),
+      /npm view could not say whether it is already published/,
+      JSON.stringify(result)
+    );
+  }
+});
+
+test('the release support policy gates every surface and the release line', () => {
+  const support = loadReleaseSupport();
+  assert.equal(support.supportedReleaseLine, '0.4');
+  assert.deepEqual(
+    Object.keys(support.packages).sort(),
+    [...wrapperPackageNameList(), ...nativeTargetNamesForPackageSet('post-intel').map(targetPackageName)].sort(),
+    'every package the release publishes must have a support state'
+  );
+  for (const packageName of Object.keys(support.packages)) {
+    assertPublishableSurface(support, packageName);
+  }
+  assertSupportedReleaseLine(support, '0.4.11');
+  assertSupportedReleaseLine(support, '0.0.0');
+  assert.throws(() => assertSupportedReleaseLine(support, '0.3.9'), /supports the 0\.4\.x line, not 0\.3\.x/);
+  assert.throws(() => assertSupportedReleaseLine(support, '0.5.0'), /supports the 0\.4\.x line, not 0\.5\.x/);
+  assert.throws(() => assertSupportedReleaseLine(support, '0.4.11-rc.1'), /not a stable MAJOR\.MINOR\.PATCH/);
+  assert.throws(() => assertPublishableSurface(support, '@opencoven/cli-linux-arm64'), /not listed in \.github\/release-support\.json/);
+});
+
+test('a blocked surface stays unpublishable whatever the package set says', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'release-support-'));
+  try {
+    const write = (packages) => {
+      const file = path.join(dir, 'release-support.json');
+      writeFileSync(file, JSON.stringify({ schemaVersion: 1, kind: 'coven.release-support', supportedReleaseLine: '0.4', packages }));
+      return file;
+    };
+    const blocked = loadReleaseSupport(write({
+      '@opencoven/cli': { state: 'supported' },
+      '@opencoven/cli-macos-x64': {
+        state: 'security-blocked',
+        reason: 'unsigned helper',
+        issue: 'https://github.com/OpenCoven/coven/issues/805'
+      }
+    }));
+    assert.throws(
+      () => assertPublishableSurface(blocked, '@opencoven/cli-macos-x64'),
+      /marks it security-blocked \(unsigned helper; https:\/\/github\.com\/OpenCoven\/coven\/issues\/805\)/
+    );
+    assert.throws(
+      () => loadReleaseSupport(write({ '@opencoven/cli': { state: 'support-disabled' } })),
+      /with a reason and an OpenCoven issue URL/
+    );
+    assert.throws(() => loadReleaseSupport(write({ '@opencoven/cli': { state: 'experimental' } })), /must be "supported"/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('publish-npm.mjs checks support before writing any package', () => {
+  const script = readFileSync(new URL('publish-npm.mjs', import.meta.url), 'utf8');
+  const main = script.slice(script.indexOf('function main()'), script.indexOf('export function prepareDistRoot'));
+  assert.match(main, /if \(!dryRun\) \{\s*assertSupportedReleaseLine\(support, version\);\s*\}/, 'a registry write must be on the supported line');
+  assert.ok(main.indexOf('assertPublishableSurface(support, target.packageName)') > 0);
+  assert.ok(
+    main.indexOf('assertPublishableSurface(support, targets[targetName].packageName)') < main.indexOf('prepareDistRoot()'),
+    'the wrapper natives must be checked before any package is prepared'
+  );
+});
+
+test('SECURITY.md names the supported release line from the support policy', () => {
+  const security = readFileSync(new URL('../SECURITY.md', import.meta.url), 'utf8');
+  const { supportedReleaseLine } = loadReleaseSupport();
+  assert.match(security, new RegExp(`\\(v${supportedReleaseLine.replace('.', '\\.')}\\.x\\s+as\\s+of\\s+this\\s+update\\)`));
 });
 
 test('publish-npm.mjs fails closed when a package version already exists', () => {

@@ -71,6 +71,7 @@ token, or a ruleset in `evaluate` mode all fail.
 | `branch.merge_queue` | Merges go through the merge queue, which tests each group against current `main`. |
 | `branch.non_fast_forward` | No force pushes to `main`. |
 | `branch.deletion` | `main` cannot be deleted. |
+| `branch.required-checks-verified` | Every check `main` requires, in any ruleset or classic protection, is one the release verifies on the exact commit. |
 | `branch.classic-protection` | Classic protection is absent or has `enforce_admins` enabled. |
 | `tags.update` | Release tags (`v*`, `coven-client-v*`) cannot be moved. |
 | `tags.deletion` | Release tags cannot be deleted. |
@@ -101,6 +102,7 @@ asserts this table's pass/fail column against that fixture.
 | `branch.merge_queue` | Ruleset `merge-queue-main` (#23575627), no bypass actors. | Pass |
 | `branch.non_fast_forward` | Only classic protection blocks force pushes, and it exempts administrators. | Fail |
 | `branch.deletion` | Only classic protection blocks deletion, and it exempts administrators. | Fail |
+| `branch.required-checks-verified` | `PR gate` is the only required check, and the release verifies it. | Pass |
 | `branch.classic-protection` | `enforce_admins=false`; the branch summary reports `enforcement_level: non_admins`. | Fail |
 | `tags.update` | No tag ruleset exists. | Fail |
 | `tags.deletion` | No tag ruleset exists. | Fail |

@@ -531,6 +531,40 @@ function readRulesets(snapshot) {
   return { rulesets };
 }
 
+/// Every check main requires must be one release acceptance verifies on the
+/// exact commit; a required check the release never looks at would let a
+/// release publish a commit that check failed. The policy's list is the
+/// release verifier's list (a test keeps the two equal).
+function unverifiedRequiredChecks({ rulesets, snapshot, policy, defaultBranch }) {
+  const verified = new Set((policy.branch.rules.required_status_checks?.checks ?? []).map((check) => check.context));
+  const enforced = new Set();
+  for (const ruleset of rulesets) {
+    if (ruleset?.target !== 'branch' || ruleset?.enforcement !== 'active' || !rulesetCoversRef(ruleset, policy.branch.ref, defaultBranch)) {
+      continue;
+    }
+    for (const rule of ruleset.rules ?? []) {
+      if (rule?.type === 'required_status_checks') {
+        for (const entry of rule.parameters?.required_status_checks ?? []) {
+          enforced.add(entry?.context);
+        }
+      }
+    }
+  }
+  const classic = snapshot?.responses?.classicProtection;
+  if (classic?.status === 200) {
+    for (const context of classic.body?.required_status_checks?.contexts ?? []) {
+      enforced.add(context);
+    }
+    for (const entry of classic.body?.required_status_checks?.checks ?? []) {
+      enforced.add(entry?.context);
+    }
+  }
+  const unverified = [...enforced].filter((context) => !verified.has(context)).sort();
+  return unverified.length === 0
+    ? []
+    : [`${policy.branch.ref} requires ${unverified.map((context) => JSON.stringify(context)).join(', ')}, which release acceptance does not verify on the exact commit; add it to the policy and REQUIRED_SOURCE_CHECKS together`];
+}
+
 function classicProtectionGaps(snapshot) {
   const gaps = [];
   const classic = snapshot?.responses?.classicProtection;
@@ -625,6 +659,11 @@ export function evaluateGovernance(policy, snapshot, { policySha256 = null, snap
       }))
     );
   }
+  record(
+    'branch.required-checks-verified',
+    'every check main requires is one the release verifies on the exact commit',
+    rulesetGaps(() => unverifiedRequiredChecks({ rulesets, snapshot, policy, defaultBranch }))
+  );
   record(
     'branch.classic-protection',
     'classic branch protection is absent or binds administrators',

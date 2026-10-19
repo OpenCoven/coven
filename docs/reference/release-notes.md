@@ -1,10 +1,19 @@
 ---
-summary: "Per-release notes for the Coven runtime, CLI, and local API."
-description: "Weekly release notes for Coven covering new features, fixes, and breaking changes across the runtime, CLI, TUI, and local daemon socket API."
+summary: "Where Coven's per-version changelog lives, and the weekly notes archive through August 2026."
+description: "Coven's per-version changelog is the GitHub Release for each tag; this page keeps the earlier weekly notes covering the runtime, CLI, TUI, and local daemon socket API."
+source_adjacent_reason: "Points at the release-record contract the release workflows in this repository enforce, and archives the weekly notes written before it."
 read_when:
   - Looking up what changed
 title: "Coven changelog and release notes"
 ---
+
+Each version's release notes are its
+[GitHub Release](https://github.com/OpenCoven/coven/releases), the changelog
+of record. The signed tag annotation becomes the Release body, and a release
+is refused unless that annotation is titled `Coven vX.Y.Z` and carries notes
+(see [releasing](releasing.md#tag-and-push)). The weekly notes below are an
+archive: they stop at the week of August 8, 2026, and are not updated per
+release.
 
 ## Week of August 8, 2026
 

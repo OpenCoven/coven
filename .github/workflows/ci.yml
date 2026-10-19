@@ -128,6 +128,7 @@ jobs:
       - run: python3 scripts/install-native-link-dependencies-test.py
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/release-governance.test.mjs
+      - run: node --test scripts/authorize-release-publication.test.mjs
       - run: node --test scripts/package-automations-protocol.test.mjs scripts/script-entrypoint.test.mjs
       - run: node --test scripts/package-automations-authority-profile.test.mjs
       - run: node --test scripts/check-action-pins.test.mjs

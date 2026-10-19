@@ -131,6 +131,7 @@ closing your terminal, and still reports a non-zero status, so a printed
 
   node --test scripts/package-github-release-test.mjs || fail=1
   node --test scripts/release-governance.test.mjs || fail=1
+  node --test scripts/authorize-release-publication.test.mjs || fail=1
   node --test scripts/package-automations-protocol.test.mjs scripts/script-entrypoint.test.mjs || fail=1
   node --test scripts/package-automations-authority-profile.test.mjs || fail=1
   node --test scripts/check-action-pins.test.mjs || fail=1
