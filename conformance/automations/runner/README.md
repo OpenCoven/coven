@@ -101,6 +101,31 @@ This initial standalone runner supports Linux and macOS. It fails closed on
 Windows until target processes can be contained in a kill-on-close Job Object.
 The native Coven target commands themselves remain cross-platform.
 
+PE32+ header inspection reports x64/ARM64 metadata only. It does not establish
+native execution, full image/signature validity, process containment or release
+eligibility. Windows execution remains refused pending native containment evidence.
+
+The planned Windows runner version `0.2.0-windows-job-v1` binds canonical JCS
+manifest bytes under `runner.artifactSha256`, using schema
+`coven.automations.windows-runner-artifact.v1`. The manifest records the immutable
+common source commit, `conformance.mjs` hash, and
+`coven-conformance-supervisor.exe` hash plus ABI
+`coven.automations.windows-job-supervisor.v1`. These two files belong to the
+runner artifact; `subjectArtifact.sha256` still names the independent target.
+The metadata constructor does not authenticate the source or execute a helper.
+Producer/consumer integration and native containment proof remain unfinished;
+constructing this manifest does not enable Windows. Existing POSIX bindings
+continue to identify the runner script bytes directly.
+
+The private Rust `coven-conformance-supervisor` package contains creation-time
+Job Object assignment, suspended launch, bounded command/header/body framing and
+an independent inherited controller-lease watcher. Its common tests and Windows
+cross-target checks do not prove native behavior. The helper executable,
+locked-image verification, process coordinator and Node producer/consumer wiring
+are unfinished. Windows refusal remains in place until actual native containment,
+controller-death, blocked-I/O and artifact-binding fixtures pass. These primitives
+are not a filesystem/network sandbox or Runtime Authority.
+
 ## Audit job
 
 The job is a closed JSON object. Its source, protocol, runner, subject, and
