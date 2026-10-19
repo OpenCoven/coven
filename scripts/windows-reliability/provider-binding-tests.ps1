@@ -1,3 +1,4 @@
+param([string]$BundleOutputFile)
 $ErrorActionPreference='Stop'
 $binding=Join-Path $PSScriptRoot 'provider-binding.ps1'
 if (-not (Test-Path -LiteralPath $binding)) { throw 'Provider source binding helper missing' }
@@ -47,6 +48,33 @@ try {
     $result=[CovenProviderBound.CovenKernelTemplate]::Project('<template><data name="Irp" inType="win:Pointer"/></template>',2048)
     if ($result.Status -cne 'supported-flat') { throw 'Captured source compilation changed projector semantics' }
     if (-not (Test-CovenProviderSourceCapture -Capture $capture)) { throw 'Unchanged captured source rejected' }
+    if ($BundleOutputFile) {
+        # Exercise the actual parent packet boundary with controlled identities only.
+        $source=ConvertTo-CovenProviderSourceDto -Capture $capture
+        $assemblies=[Collections.Generic.List[CovenProviderBound.CovenKernelAssembly]]::new()
+        foreach ($kind in @('corelib','crypto','json','powershell','xml')) {
+            $major=if ($kind -ceq 'powershell') { 7 } else { 8 }
+            $assemblies.Add([CovenProviderBound.CovenKernelAssembly]::new($kind,('3'*64),[uint[]]@($major,0,0,0)))
+        }
+        $hostProof=[CovenProviderBound.CovenKernelHost]::new(('2'*64),$assemblies,('4'*64),$true)
+        $summary=[ordered]@{kind='controlled-parent-packet'}
+        $query=[pscustomobject]@{Stdout='{}'}
+        $utf8=[Text.UTF8Encoding]::new($false,$true)
+        $runner=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'run-provider-schema.ps1'))
+        $start=$runner.IndexOf('    $packet=[ordered]@',[StringComparison]::Ordinal)
+        $end=$runner.IndexOf('    if ($packetBytes.Length',$start,[StringComparison]::Ordinal)
+        if ($start -lt 0 -or $end -le $start) { throw 'Parent packet boundary missing' }
+        . ([scriptblock]::Create($runner.Substring($start,$end-$start)))
+        [IO.File]::WriteAllBytes($BundleOutputFile,$packetBytes)
+        foreach ($candidate in @($capture,[pscustomobject]@{private='PRIVATE_SENTINEL'},
+            [CovenProviderBound.CovenKernelSource]::new(('x'*8192),$source.Files,$true))) {
+            $rejected=$false
+            try { ConvertTo-CovenProviderPublicObject -Value $candidate | Out-Null } catch { $rejected=$true }
+            if (-not $rejected) { throw 'Private or oversized identity admitted' }
+        }
+
+    }
+
     [IO.File]::AppendAllText($readerPath,"`n// changed after compilation")
     if (Test-CovenProviderSourceCapture -Capture $capture) { throw 'Post-compilation mutation accepted' }
     [IO.File]::WriteAllBytes($readerPath,$bytes)

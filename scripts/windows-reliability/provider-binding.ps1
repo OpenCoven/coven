@@ -230,6 +230,19 @@ function ConvertTo-CovenProviderHostDto {
     [CovenProviderBound.CovenKernelHost]::new($Binding.Managed.Files[0].Sha256,$assemblies,$Binding.LibrarySha256,$true)
 }
 
+# Project only the two public identity DTOs with the child's canonical casing.
+# Never pass private capture/runtime objects through PowerShell's reflection serializer.
+function ConvertTo-CovenProviderPublicObject {
+    param([Parameter(Mandatory)]$Value)
+    if ($Value.GetType() -notin @([CovenProviderBound.CovenKernelSource],[CovenProviderBound.CovenKernelHost])) { throw 'Provider public identity type rejected' }
+    $sink=[CovenProviderBound.CovenKernelCappedStream]::new(8192)
+    try {
+        [CovenProviderBound.CovenKernelJsonSerializer]::new().Serialize($sink,$Value)
+        $text=[Text.UTF8Encoding]::new($false,$true).GetString($sink.Complete())
+        ConvertFrom-Json -InputObject $text -AsHashtable -Depth 8 -ErrorAction Stop
+    } finally { $sink.Dispose() }
+}
+
 function Get-CovenProviderSystemLibraryPath {
     param([AllowEmptyString()][string]$SystemDirectory)
     if ([string]::IsNullOrEmpty($SystemDirectory) -or -not [IO.Path]::IsPathFullyQualified($SystemDirectory)) { throw 'Provider system directory unavailable' }

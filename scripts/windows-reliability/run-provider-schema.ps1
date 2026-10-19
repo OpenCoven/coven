@@ -4,6 +4,7 @@ $ErrorActionPreference='Stop'
 $PSNativeCommandUseErrorActionPreference=$false
 $binding=$null;$query=$null;$summary=$null;$capture=$null;$code=1
 $sourceBound=$false;$hostBound=$false;$published=$false;$failed=$false;$cleanupFailed=$false
+$stage='bootstrap';$failureStage='none'
 try {
     # Execute the same bounded private bytes that the closed inventory later names.
     # A path reread after dot-sourcing would not identify the executed script block.
@@ -22,9 +23,11 @@ try {
     } finally { $binderStream.Dispose() }
     $binderHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$binderBytes)).ToLowerInvariant()
     . ([scriptblock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$binderBytes)))
+    $stage='runtime-binding'
     $binding=Open-CovenProviderRuntimeBinding
     $nativeTemp=[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::GetTempPath()))
     if (-not [string]::Equals($nativeTemp,[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($TemporaryRoot)),[StringComparison]::OrdinalIgnoreCase)) { throw 'temp' }
+    $stage='source-binding'
     $capture=Get-CovenProviderSourceCapture -Directory $Directory -Commit $Commit
     $boundBinder=@($capture.Files | Where-Object { $_.Id -ceq 'binding' })
     if ($boundBinder.Count -ne 1 -or $boundBinder[0].Sha256 -cne $binderHash) { throw 'source' }
@@ -32,6 +35,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or $head -cne $Commit) { throw 'source' }
     $dirty=@(& git -C $Directory status --porcelain=v1 --untracked-files=all 2>$null)
     if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) { throw 'source' }
+    $stage='compilation'
     Add-CovenProviderCapturedTypes -Capture $capture
     $utf8=[Text.UTF8Encoding]::new($false,$true)
     foreach ($id in @('query-helper','query-summary')) {
@@ -39,24 +43,30 @@ try {
         . ([scriptblock]::Create($utf8.GetString($file.Bytes)))
     }
     if (-not (Test-CovenProviderSourceCapture -Capture $capture)) { throw 'source' }
+    $stage='identity-projection'
     $source=ConvertTo-CovenProviderSourceDto -Capture $capture
     $hostProof=ConvertTo-CovenProviderHostDto -Binding $binding
     $probePath=@($capture.Files | Where-Object { $_.Id -ceq 'probe' })[0].Path
     $executable=$binding.Managed.Files[0].Path
+    $stage='query'
     $query=[CovenNativeQuery]::Run($executable,@('-NoLogo','-NoProfile','-NonInteractive','-File',$probePath,'-Directory',$Directory,'-Commit',$Commit),10000,524288)
+    $stage='query-projection'
     $summary=ConvertTo-CovenProviderQuerySummary -Result $query
+    $stage='post-query-binding'
     # No child output is logged. The independent Python decoder admits or rejects it.
     if (-not (Test-CovenProviderSourceCapture -Capture $capture) -or -not (Test-CovenProviderRuntimeBinding -Binding $binding)) { throw 'binding' }
+    $stage='private-bundle'
     $privateRoot=Join-Path $nativeTemp ('coven-provider-probe-'+[Guid]::NewGuid().ToString('N'))
     if (Test-Path -LiteralPath $privateRoot) { throw 'private' }
     $private=Join-Path $privateRoot 'private'
     [IO.Directory]::CreateDirectory($private) | Out-Null
-    $packet=[ordered]@{source=$source;host=$hostProof;query=$summary;probe=[string]$query.Stdout}
+    $packet=[ordered]@{source=(ConvertTo-CovenProviderPublicObject -Value $source);host=(ConvertTo-CovenProviderPublicObject -Value $hostProof);query=$summary;probe=[string]$query.Stdout}
     $packetBytes=$utf8.GetBytes(($packet | ConvertTo-Json -Depth 16 -Compress))
     if ($packetBytes.Length -gt 1048576) { throw 'private-limit' }
     $bundle=Join-Path $private 'bundle.json'
     $stream=[IO.File]::Open($bundle,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
     try { $stream.Write($packetBytes,0,$packetBytes.Length);$stream.Flush($true) } finally { $stream.Dispose() }
+    $stage='public-validation'
     $pythonCommands=@(Get-Command python -CommandType Application -ErrorAction Stop)
     $python=$pythonCommands[0].Source
     $validator=@($capture.Files | Where-Object { $_.Id -ceq 'validator' })[0].Path
@@ -67,6 +77,7 @@ try {
     $publication=$publicationText | ConvertFrom-Json -ErrorAction Stop
     if ($publication.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $publication.bytes -le 0 -or $publication.bytes -gt 524288 -or $publication.PSObject.Properties.Name.Count -ne 2) { throw 'publication' }
     if ($publicationExit -ne $query.ExitCode) { throw 'exit' }
+    $stage='final-binding'
     $sourceBound=Test-CovenProviderSourceCapture -Capture $capture
     $hostBound=Test-CovenProviderRuntimeBinding -Binding $binding
     $headAfter=(& git -C $Directory rev-parse HEAD 2>$null)
@@ -77,16 +88,16 @@ try {
     $code=$publicationExit
     $published=$true
 } catch {
-    $failed=$true;$published=$false
+    $failed=$true;$published=$false;$failureStage=$stage
     $cleanupFailed=$_.Exception.Data['ProviderReleaseFailed'] -eq $true
 } finally {
     if ($null -ne $binding) {
         try { Close-CovenProviderRuntimeBinding -Binding $binding }
-        catch { $failed=$true;$published=$false;$hostBound=$false;$cleanupFailed=$true }
+        catch { if (-not $failed) { $failureStage='reference-release' };$failed=$true;$published=$false;$hostBound=$false;$cleanupFailed=$true }
     }
 }
 $effectiveCode=if ($failed -or -not $published) { 1 } else { $code }
-$execution=[ordered]@{kind='coven.kernel-file-execution.v1';captureAttempted=$false;metadataComplete=$false;sourceBound=$sourceBound;hostBound=$hostBound;cleanupFailed=$cleanupFailed;query=$summary;publicationSucceeded=$published;exitCode=$effectiveCode}
+$execution=[ordered]@{kind='coven.kernel-file-execution.v1';captureAttempted=$false;metadataComplete=$false;sourceBound=$sourceBound;hostBound=$hostBound;cleanupFailed=$cleanupFailed;failureStage=$failureStage;query=$summary;publicationSucceeded=$published;exitCode=$effectiveCode}
 if ($env:GITHUB_OUTPUT) {
     $executionText=$execution | ConvertTo-Json -Depth 8 -Compress
     [IO.File]::AppendAllText($env:GITHUB_OUTPUT,"execution=$executionText`n",[Text.UTF8Encoding]::new($false))

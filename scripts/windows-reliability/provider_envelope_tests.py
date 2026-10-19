@@ -48,6 +48,22 @@ def envelope():
 
 
 class EnvelopeTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell parent packet boundary required')
+    def test_actual_parent_typed_identity_packet_matches_strict_decoder(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder).resolve()
+            private=root/'coven-provider-probe-control'/'private';private.mkdir(parents=True)
+            bundle=private/'bundle.json'
+            script=Path(__file__).with_name('provider-binding-tests.ps1')
+            result=subprocess.run(['pwsh','-NoProfile','-File',str(script),'-BundleOutputFile',str(bundle)],capture_output=True,timeout=60)
+            self.assertEqual(result.returncode,0,result.stderr.decode())
+            packet=json.loads(bundle.read_bytes())
+            self.assertEqual(set(packet['source']), {'commit','files','beforeAfterMatch'})
+            self.assertEqual(set(packet['host']),set(host()))
+            self.assertEqual(receipt.read_provider_bundle(bundle,root),packet)
+            self.assertEqual(sorted(item['id'] for item in packet['source']['files']),IDS)
+            self.assertEqual(packet['probe'],'{}')
+
     def test_valid_controlled_bindings_and_query(self):
         validate_probe(probe(),source(),host())
         validate_probe(parse_probe(json.dumps(probe()).encode()),source(),host())
@@ -190,6 +206,37 @@ class EnvelopeTests(unittest.TestCase):
         self.assertEqual(result.stdout,b'')
         self.assertEqual(result.stderr,b'provider-binding-failed\n')
 
+    @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell error-tail control required')
+    def test_parent_error_tail_keeps_primary_stage_and_withholds_output(self):
+        # Execute the real catch/finally/output tail with controlled failures; no DLL,
+        # child process, private collector wire or publisher is invoked.
+        runner=Path(__file__).with_name('run-provider-schema.ps1').read_text()
+        marker="} catch {\n    $failed=$true;$published=$false"
+        self.assertEqual(runner.count(marker),1)
+        tail=runner[runner.index(marker):]
+        for primary,cleanup,expected in [(True,False,'public-validation'),(True,True,'public-validation'),(False,True,'reference-release')]:
+            with self.subTest(primary=primary,cleanup=cleanup), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder).resolve();output=root/'step-output'
+                setup=("$ErrorActionPreference='Stop';$binding=[pscustomobject]@{};$query=$null;$summary=$null;"
+                       "$sourceBound=$false;$hostBound=$false;$published=$true;$failed=$false;"
+                       "$cleanupFailed=$false;$stage='public-validation';$failureStage='none';$code=0;\n")
+                release="throw 'PRIVATE_CLEANUP_SENTINEL'" if cleanup else ''
+                body="throw 'PRIVATE_PRIMARY_SENTINEL'" if primary else ''
+                script=root/'controlled-tail.ps1'
+                script.write_text(setup+'function Close-CovenProviderRuntimeBinding { param($Binding) '+release+' }\ntry { '+body+'\n'+tail)
+                result=subprocess.run(['pwsh','-NoProfile','-File',str(script)],capture_output=True,timeout=15,env={**os.environ,'GITHUB_OUTPUT':str(output)})
+                self.assertEqual(result.returncode,1)
+                text=output.read_text();self.assertNotIn('public-receipt=',text)
+                execution=json.loads(text.removeprefix('execution='))
+                self.assertEqual(execution['failureStage'],expected)
+                self.assertEqual(execution['cleanupFailed'],cleanup)
+                self.assertFalse(execution['publicationSucceeded'])
+                self.assertEqual(execution['exitCode'],1)
+                self.assertEqual(result.stdout,b'')
+                expected_error=b'provider-execution-cleanup-failed\n' if cleanup else b'provider-execution-failed\n'
+                self.assertEqual(result.stderr,expected_error)
+                self.assertNotIn('PRIVATE_',text)
+
     @unittest.skipIf(sys.platform=='win32' or shutil.which('pwsh') is None,'portable unsupported-host control')
     def test_runner_unsupported_host_has_no_public_artifact(self):
         script=Path(__file__).with_name('run-provider-schema.ps1')
@@ -200,7 +247,7 @@ class EnvelopeTests(unittest.TestCase):
             output=(root/'outputs').read_text()
             self.assertTrue(output.startswith('execution='));self.assertNotIn('public-receipt=',output)
             execution=json.loads(output.removeprefix('execution='))
-            self.assertEqual(execution,{'kind':'coven.kernel-file-execution.v1','captureAttempted':False,'metadataComplete':False,'sourceBound':False,'hostBound':False,'cleanupFailed':False,'query':None,'publicationSucceeded':False,'exitCode':1})
+            self.assertEqual(execution,{'kind':'coven.kernel-file-execution.v1','captureAttempted':False,'metadataComplete':False,'sourceBound':False,'hostBound':False,'cleanupFailed':False,'failureStage':'runtime-binding','query':None,'publicationSucceeded':False,'exitCode':1})
             self.assertNotIn(str(root),output)
             self.assertEqual(result.returncode,1)
             self.assertEqual(result.stdout,b'')
