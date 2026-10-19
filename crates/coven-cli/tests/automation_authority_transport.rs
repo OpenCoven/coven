@@ -145,6 +145,313 @@ fn spawn_daemon(temp: &Path, home: &Path, address: SocketAddr, log: &Path) -> Re
     Ok(Daemon(command.spawn()?))
 }
 
+#[derive(Default)]
+struct ProbeObservation {
+    attempts: u64,
+    last_iteration: u64,
+    started_us: u128,
+    finished_us: u128,
+    class: &'static str,
+    status: Option<u16>,
+    io_kind: Option<std::io::ErrorKind>,
+    os_error: Option<i32>,
+}
+
+impl ProbeObservation {
+    fn observe(
+        &mut self,
+        started: Instant,
+        iteration: u64,
+        probe: impl FnOnce() -> Result<(u16, Value)>,
+    ) -> bool {
+        self.attempts += 1;
+        self.last_iteration = iteration;
+        self.started_us = started.elapsed().as_micros();
+        let result = probe();
+        self.finished_us = started.elapsed().as_micros();
+        self.status = None;
+        self.io_kind = None;
+        self.os_error = None;
+        self.class = match result {
+            Ok((status, _)) => {
+                self.status = Some(status);
+                if status == 200 {
+                    "ready"
+                } else {
+                    "http-status"
+                }
+            }
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                    self.io_kind = Some(error.kind());
+                    self.os_error = error.raw_os_error();
+                    "io-error"
+                } else if error.downcast_ref::<serde_json::Error>().is_some() {
+                    "json-error"
+                } else {
+                    "other-error"
+                }
+            }
+        };
+        self.status == Some(200)
+    }
+}
+
+impl std::fmt::Display for ProbeObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "attempts={} last_iteration={} started_us={} finished_us={} class={} status={:?} io_kind={:?} os_error={:?}",
+            self.attempts, self.last_iteration, self.started_us, self.finished_us,
+            self.class, self.status, self.io_kind, self.os_error)
+    }
+}
+
+fn wait_for_ready(
+    child: &mut Child,
+    started: Instant,
+    deadline: Instant,
+    log_path: &Path,
+    mut ipc: impl FnMut() -> Result<(u16, Value)>,
+    mut tcp: impl FnMut() -> Result<(u16, Value)>,
+    tcp_required: bool,
+) -> Result<()> {
+    let mut ipc_observation = ProbeObservation {
+        class: "not-attempted",
+        ..Default::default()
+    };
+    let mut tcp_observation = ProbeObservation {
+        class: "not-attempted",
+        ..Default::default()
+    };
+    let mut iteration = 0;
+    loop {
+        iteration += 1;
+        let ipc_ready = ipc_observation.observe(started, iteration, &mut ipc);
+        let tcp_attempted = ipc_ready && tcp_required;
+        if ipc_ready && (!tcp_required || tcp_observation.observe(started, iteration, &mut tcp)) {
+            return Ok(());
+        }
+        // Preserve the original single poll and IPC-first short circuit. Record
+        // only static classes/numeric status; never format probe error chains,
+        // response bodies, addresses or paths into the new projection.
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => bail!(
+                "isolated daemon readiness poll failed: elapsed_us={} io_kind={:?} os_error={:?} iteration={} ipc=[{}] tcp_attempted_this_iteration={} tcp=[{}]",
+                started.elapsed().as_micros(), error.kind(), error.raw_os_error(),
+                iteration, ipc_observation, tcp_attempted, tcp_observation
+            ),
+        };
+        let deadline_expired = Instant::now() >= deadline;
+        if status.is_some() || deadline_expired {
+            let child_state = if let Some(status) = status {
+                #[cfg(unix)]
+                let signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal()
+                };
+                #[cfg(windows)]
+                let signal: Option<i32> = None;
+                format!(
+                    "Exited {{ code: {:?}, signal: {:?} }}",
+                    status.code(),
+                    signal
+                )
+            } else {
+                "Running".to_owned()
+            };
+            // Preserve valid daemon stderr, but never let an attachment failure
+            // replace the primary readiness observations or expose its path.
+            let attachment = std::fs::read_to_string(log_path).unwrap_or_else(|error| {
+                format!(
+                    "[log_attachment=unavailable io_kind={:?} os_error={:?}]",
+                    error.kind(),
+                    error.raw_os_error()
+                )
+            });
+            bail!(
+                "isolated daemon did not become ready: elapsed_us={} deadline_expired={} child={} iteration={} ipc=[{}] tcp_attempted_this_iteration={} tcp=[{}]: {}",
+                started.elapsed().as_micros(), deadline_expired, child_state,
+                iteration, ipc_observation, tcp_attempted, tcp_observation,
+                attachment
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+// These owned shell fixtures exercise the readiness failure seam, not daemon
+// startup. Closing/killing and waiting remain covered by Daemon on every path.
+fn readiness_fixture(live: bool) -> Result<Daemon> {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", if live { "read fixture" } else { "exit 23" }]);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", if live { "set /p fixture=" } else { "exit 23" }]);
+        command
+    };
+    Ok(Daemon(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    ))
+}
+
+#[test]
+fn readiness_failure_retains_exited_child_status_with_empty_stderr() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let log = temp.path().join("empty.log");
+    std::fs::write(&log, "")?;
+    let mut child = readiness_fixture(false)?;
+    // Only an orphan/hang guard: normal exit is announced by try_wait, not a
+    // sleep or a tight promptness assumption on the shared runner.
+    let started = Instant::now();
+    let guard = started + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait()? {
+            break status;
+        }
+        anyhow::ensure!(
+            Instant::now() < guard,
+            "exit fixture did not finish: elapsed={:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(23));
+    let failure = wait_for_ready(
+        &mut child.0,
+        Instant::now(),
+        Instant::now() + Duration::from_secs(30),
+        &log,
+        || Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into()),
+        || panic!("TCP must remain uncalled after failed IPC"),
+        cfg!(unix),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(failure.contains("child=Exited"), "{failure}");
+    assert!(failure.contains("code: Some(23)"), "{failure}");
+    Ok(())
+}
+
+#[test]
+fn readiness_failure_distinguishes_live_child_at_expired_fixture_deadline() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let log = temp.path().join("empty.log");
+    std::fs::write(&log, "")?;
+    let mut child = readiness_fixture(true)?;
+    // This deliberately expired classification fixture does not alter the real
+    // daemon's 30s setup budget. The owned fixture is intended to wait on stdin;
+    // Running below reports only the actual pre-cleanup child poll.
+    let failure = wait_for_ready(
+        &mut child.0,
+        Instant::now(),
+        Instant::now(),
+        &log,
+        || anyhow::bail!("private-probe-sentinel"),
+        || panic!("TCP must remain uncalled after failed IPC"),
+        cfg!(unix),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(failure.contains("child=Running"), "{failure}");
+    assert!(failure.contains("deadline_expired=true"), "{failure}");
+    assert!(!failure.contains("private-probe-sentinel"), "{failure}");
+    Ok(())
+}
+
+#[test]
+fn readiness_failure_reports_tcp_only_after_successful_ipc_without_private_values() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let log = temp.path().join("empty.log");
+    std::fs::write(&log, "")?;
+    let mut child = readiness_fixture(true)?;
+    let failure = wait_for_ready(
+        &mut child.0,
+        Instant::now(),
+        Instant::now(),
+        &log,
+        || Ok((200, json!({"private": "private-body-sentinel"}))),
+        || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private-error-sentinel",
+            )
+            .into())
+        },
+        true,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(failure.contains("ipc=[attempts=1"), "{failure}");
+    assert!(
+        failure.contains("tcp_attempted_this_iteration=true"),
+        "{failure}"
+    );
+    assert!(failure.contains("class=io-error"), "{failure}");
+    assert!(failure.contains("PermissionDenied"), "{failure}");
+    assert!(!failure.contains("private-body-sentinel"), "{failure}");
+    assert!(!failure.contains("private-error-sentinel"), "{failure}");
+    Ok(())
+}
+
+#[test]
+fn readiness_failure_survives_invalid_utf8_log_attachment() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let log = temp.path().join("private-log-path-sentinel");
+    std::fs::write(&log, [0xff])?;
+    let mut child = readiness_fixture(true)?;
+    let failure = wait_for_ready(
+        &mut child.0,
+        Instant::now(),
+        Instant::now(),
+        &log,
+        || anyhow::bail!("private-probe-sentinel"),
+        || panic!("TCP must remain uncalled after failed IPC"),
+        cfg!(unix),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(failure.contains("child=Running"), "{failure}");
+    assert!(failure.contains("deadline_expired=true"), "{failure}");
+    assert!(failure.contains("log_attachment=unavailable"), "{failure}");
+    assert!(failure.contains("io_kind=InvalidData"), "{failure}");
+    assert!(!failure.contains("private-log-path-sentinel"), "{failure}");
+    assert!(!failure.contains("private-probe-sentinel"), "{failure}");
+    Ok(())
+}
+
+#[test]
+fn readiness_failure_preserves_valid_stderr_attachment() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let log = temp.path().join("fixture.log");
+    let stderr = "public fixture daemon stderr\n";
+    std::fs::write(&log, stderr)?;
+    let mut child = readiness_fixture(true)?;
+    let failure = wait_for_ready(
+        &mut child.0,
+        Instant::now(),
+        Instant::now(),
+        &log,
+        || anyhow::bail!("private-probe-sentinel"),
+        || panic!("TCP must remain uncalled after failed IPC"),
+        cfg!(unix),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(failure.contains("child=Running"), "{failure}");
+    assert!(failure.ends_with(stderr), "{failure}");
+    assert!(!failure.contains("private-probe-sentinel"), "{failure}");
+    Ok(())
+}
+
 #[test]
 fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -163,21 +470,17 @@ fn automation_mutations_require_real_owner_ipc_not_loopback_tcp() -> Result<()> 
     let ipc = |method: &str, route: &str, body: &Value| -> Result<(u16, Value)> {
         owner_exchange(&home, method, route, body)
     };
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if matches!(ipc("GET", "/health", &Value::Null), Ok((200, _)))
-            && (cfg!(windows) || matches!(tcp("GET", "/health", &Value::Null), Ok((200, _))))
-        {
-            break;
-        }
-        if daemon.0.try_wait()?.is_some() || Instant::now() >= deadline {
-            bail!(
-                "isolated daemon did not become ready: {}",
-                std::fs::read_to_string(&log_path)?
-            );
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(30);
+    wait_for_ready(
+        &mut daemon.0,
+        started,
+        deadline,
+        &log_path,
+        || ipc("GET", "/health", &Value::Null),
+        || tcp("GET", "/health", &Value::Null),
+        cfg!(unix),
+    )?;
     // Unix serves `--tcp`. The Windows daemon ignores it and binds no TCP
     // listener, so its owner-only pipe is the whole surface, and anything on the
     // released port there belongs to another process. Enable this for Windows
