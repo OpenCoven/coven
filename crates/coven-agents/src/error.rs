@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{AgentId, AgentRef, AgentRefError, InvocationContext, RunItem};
+use crate::{AgentId, AgentRef, AgentRefError, ContentDigest, InvocationContext, RunItem};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -102,6 +102,22 @@ pub enum RunError {
     },
     #[error("agent `{agent}` requested unknown tool `{tool}`")]
     UnknownTool { agent: AgentId, tool: String },
+    #[error("agent `{agent}` requested tool `{tool}` outside its delegated authority")]
+    UnauthorizedTool { agent: AgentId, tool: String },
+    #[error("context reference `{reference}` could not be resolved")]
+    ContextFailed {
+        reference: String,
+        #[source]
+        source: BoxError,
+    },
+    #[error("context reference `{reference}` resolved to items whose digest does not match")]
+    ContextDigestMismatch {
+        reference: String,
+        expected: ContentDigest,
+        actual: ContentDigest,
+    },
+    #[error("final output is {bytes} bytes; the result contract allows {limit}")]
+    OutputTooLarge { limit: usize, bytes: usize },
     #[error("agent `{agent}` reused tool call id `{call_id}`")]
     DuplicateToolCallId { agent: AgentId, call_id: String },
     #[error("tool `{tool}` for agent `{agent}` failed")]

@@ -12,6 +12,10 @@ pub enum RunFailureKind {
     Handoff,
     InvalidResponse,
     Limit,
+    /// A delegated invocation tried to use authority it was not granted.
+    Authority,
+    /// Selected context could not be resolved or did not match its digest.
+    Context,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

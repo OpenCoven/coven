@@ -4,11 +4,13 @@ use std::{
 };
 
 use crate::{
-    Agent, AgentId, AgentRef, ConfigError, GuardrailStage, GuardrailVerdict, HandoffDefinition,
+    Agent, AgentId, AgentRef, AuthorityScope, ConfigError, ContentDigest, ContextManifest,
+    ContextResolver, DelegationDigests, GuardrailStage, GuardrailVerdict, HandoffDefinition,
     InvocationContext, InvocationEvent, InvocationEventKind, InvocationFailureKind, InvocationId,
     InvocationObserver, InvocationRequest, InvocationSource, ModelAction, ModelRequest,
-    NoopInvocationObserver, NoopObserver, ReviewOutcome, ReviewVerdict, RunError, RunEvent,
-    RunFailure, RunFailureKind, RunItem, RunObserver, SessionStore, ToolCall, ToolProposal,
+    NoopInvocationObserver, NoopObserver, PreparedDelegation, ReviewOutcome, ReviewVerdict,
+    RunError, RunEvent, RunFailure, RunFailureKind, RunItem, RunObserver, SessionStore, ToolCall,
+    ToolProposal,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +40,71 @@ pub struct RunResult {
     pub handoffs: usize,
 }
 
+/// A completed delegated child invocation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelegationResult {
+    pub digests: DelegationDigests,
+    pub run: RunResult,
+}
+
+/// A delegated child invocation that failed after it was admitted. The run
+/// failure carries the child invocation identity and partial transcript.
+#[derive(Debug)]
+pub struct DelegationFailure {
+    pub digests: Box<DelegationDigests>,
+    pub failure: Box<RunFailure>,
+}
+
+impl std::fmt::Display for DelegationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.failure, formatter)
+    }
+}
+
+impl std::error::Error for DelegationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.failure.as_ref())
+    }
+}
+
+/// What bounds one run beyond its options: delegated authority, the result
+/// contract, and explicitly selected context in place of session history.
+/// The legacy entry points use the unbounded default.
+struct RunScope<'a, C>
+where
+    C: Sync,
+{
+    /// Whether the requested target must name a registered revision exactly.
+    require_revision: bool,
+    authority: Option<&'a AuthorityScope>,
+    max_output_bytes: Option<usize>,
+    context: Option<(&'a ContextManifest, &'a dyn ContextResolver<C>)>,
+}
+
+impl<C> Default for RunScope<'_, C>
+where
+    C: Sync,
+{
+    fn default() -> Self {
+        Self {
+            require_revision: false,
+            authority: None,
+            max_output_bytes: None,
+            context: None,
+        }
+    }
+}
+
+impl<C> RunScope<'_, C>
+where
+    C: Sync,
+{
+    fn permits_tool(&self, tool: &str) -> bool {
+        self.authority
+            .is_none_or(|authority| authority.permits_tool(tool))
+    }
+}
+
 /// Transcript and counters accumulated by a run in progress.
 ///
 /// The run loop records into this so the caller-facing wrapper can attach the
@@ -61,6 +128,8 @@ const fn invocation_failure_kind(kind: RunFailureKind) -> InvocationFailureKind 
         RunFailureKind::Handoff => InvocationFailureKind::ControlTransfer,
         RunFailureKind::InvalidResponse => InvocationFailureKind::InvalidResponse,
         RunFailureKind::Limit => InvocationFailureKind::Limit,
+        RunFailureKind::Authority => InvocationFailureKind::Authority,
+        RunFailureKind::Context => InvocationFailureKind::Context,
     }
 }
 
@@ -445,7 +514,7 @@ where
             input,
             context,
             options,
-            false,
+            RunScope::default(),
         )
         .await
     }
@@ -459,8 +528,73 @@ where
         context: &C,
         options: RunOptions,
     ) -> Result<RunResult, RunFailure> {
-        self.run_invocation_inner(request, input, context, options, true)
+        self.run_invocation_inner(
+            request,
+            input,
+            context,
+            options,
+            RunScope {
+                require_revision: true,
+                ..RunScope::default()
+            },
+        )
+        .await
+    }
+
+    /// Runs one prepared delegation as a child invocation of its parent.
+    ///
+    /// The child starts from the task input and the context the parent
+    /// selected, never from a session or the parent's transcript. Every
+    /// reference in the manifest is resolved through `resolver` and verified
+    /// against its digest before the first model turn; a mismatch fails the
+    /// invocation with [`RunFailureKind::Context`]. Tools outside the
+    /// attenuated authority are neither advertised to the model nor
+    /// executed; a request for one fails with [`RunFailureKind::Authority`].
+    /// A final output larger than the result contract fails with
+    /// [`RunFailureKind::Limit`] instead of completing.
+    ///
+    /// The prepared delegation is consumed, so one proof runs at most once.
+    /// This is local execution only: it does not adopt, persist, retry, or
+    /// place the child anywhere.
+    pub async fn run_delegation(
+        &self,
+        delegation: PreparedDelegation,
+        resolver: &dyn ContextResolver<C>,
+        context: &C,
+    ) -> Result<DelegationResult, DelegationFailure> {
+        let (invocation, source, spec, digests) = delegation.into_parts();
+        let requested_target = match spec.target.revision() {
+            Some(_) => spec.target.clone(),
+            None => self
+                .registered_agent_ref(spec.target.id())
+                .unwrap_or_else(|| spec.target.clone()),
+        };
+        let request = InvocationRequest::new(
+            invocation,
+            InvocationSource::Agent { agent: source },
+            requested_target,
+        );
+        let options = RunOptions {
+            max_turns: spec.budget.max_turns(),
+            max_handoffs: spec.budget.max_handoffs(),
+            session_id: None,
+        };
+        let scope = RunScope {
+            require_revision: false,
+            authority: Some(&spec.authority),
+            max_output_bytes: Some(spec.result.max_output_bytes()),
+            context: Some((&spec.context, resolver)),
+        };
+        match self
+            .run_invocation_inner(request, spec.task.as_str(), context, options, scope)
             .await
+        {
+            Ok(run) => Ok(DelegationResult { digests, run }),
+            Err(failure) => Err(DelegationFailure {
+                digests: Box::new(digests),
+                failure: Box::new(failure),
+            }),
+        }
     }
 
     async fn run_invocation_inner(
@@ -469,7 +603,7 @@ where
         input: impl Into<String>,
         context: &C,
         options: RunOptions,
-        require_revision: bool,
+        scope: RunScope<'_, C>,
     ) -> Result<RunResult, RunFailure> {
         let mut progress = RunProgress::default();
 
@@ -478,7 +612,7 @@ where
             input.into(),
             context,
             options,
-            require_revision,
+            scope,
             &mut progress,
         )
         .await
@@ -491,13 +625,57 @@ where
         })
     }
 
+    /// Resolves the selected context in manifest order and verifies each
+    /// reference's digest before any of it reaches a model.
+    async fn resolve_context(
+        &self,
+        request: &InvocationRequest,
+        agent: &AgentId,
+        manifest: &ContextManifest,
+        resolver: &dyn ContextResolver<C>,
+        context: &C,
+    ) -> Result<Vec<RunItem>, RunError> {
+        let mut items = Vec::new();
+        for reference in manifest.refs() {
+            let resolved = resolver
+                .resolve(reference, context)
+                .await
+                .map_err(|source| {
+                    self.fail(
+                        request,
+                        agent,
+                        RunFailureKind::Context,
+                        RunError::ContextFailed {
+                            reference: reference.id().to_owned(),
+                            source,
+                        },
+                    )
+                })?;
+            let actual = ContentDigest::of_items(&resolved);
+            if &actual != reference.digest() {
+                return Err(self.fail(
+                    request,
+                    agent,
+                    RunFailureKind::Context,
+                    RunError::ContextDigestMismatch {
+                        reference: reference.id().to_owned(),
+                        expected: reference.digest().clone(),
+                        actual,
+                    },
+                ));
+            }
+            items.extend(resolved);
+        }
+        Ok(items)
+    }
+
     async fn run_loop(
         &self,
         request: &InvocationRequest,
         input: String,
         context: &C,
         options: RunOptions,
-        require_revision: bool,
+        scope: RunScope<'_, C>,
         progress: &mut RunProgress,
     ) -> Result<RunResult, RunError> {
         let starting_agent = request.requested_target.id().clone();
@@ -521,7 +699,7 @@ where
         })?;
 
         let registered_target = current.agent_ref().expect("runner validates agent refs");
-        if require_revision
+        if scope.require_revision
             && (request.requested_target.revision().is_none()
                 || registered_target.revision().is_none())
         {
@@ -550,6 +728,14 @@ where
             .await?;
 
         let mut model_items = match (&options.session_id, &self.session) {
+            _ if scope.context.is_some() => {
+                let (manifest, resolver) = scope.context.expect("checked above");
+                let mut items = self
+                    .resolve_context(request, &current.id, manifest, resolver, context)
+                    .await?;
+                items.extend(progress.items.iter().cloned());
+                items
+            }
             (Some(session_id), Some(session)) => {
                 let mut items = session.load(session_id).await.map_err(|source| {
                     self.fail(
@@ -601,6 +787,7 @@ where
                 tools: current
                     .tools
                     .iter()
+                    .filter(|tool| scope.permits_tool(&tool.definition.name))
                     .map(|tool| tool.definition.clone())
                     .collect(),
                 handoffs: current
@@ -651,6 +838,19 @@ where
                         },
                     )
                 })?;
+                if let Some(limit) = scope.max_output_bytes {
+                    if output.len() > limit {
+                        return Err(self.fail(
+                            request,
+                            &current.id,
+                            RunFailureKind::Limit,
+                            RunError::OutputTooLarge {
+                                limit,
+                                bytes: output.len(),
+                            },
+                        ));
+                    }
+                }
 
                 for guardrail in &current.output_guardrails {
                     let verdict = guardrail.check(&output, context).await.map_err(|source| {
@@ -861,6 +1061,17 @@ where
                         },
                     ));
                 };
+                if !scope.permits_tool(&call.name) {
+                    return Err(self.fail(
+                        request,
+                        &current.id,
+                        RunFailureKind::Authority,
+                        RunError::UnauthorizedTool {
+                            agent: current.id.clone(),
+                            tool: call.name.clone(),
+                        },
+                    ));
+                }
                 let tool = current
                     .tools
                     .iter()
