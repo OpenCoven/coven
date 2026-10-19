@@ -9,21 +9,27 @@ source_adjacent_reason: "Maps the native command matrix and protocol artifacts t
 
 # Automations command acceptance
 
-Status: **incomplete**, inspected 2026-10-18. Owners: Coven #1054 (command
+Status: **incomplete**, inspected 2026-10-19. Owners: Coven #1054 (command
 parity), #857 (authority), #858 (certification), SDK #80 and Cave #5217
 (consumer paths). This packet does not authorize Runtime Authority activation
 or replace any original acceptance criterion.
 
 ## Source and release reconciliation
 
-Coven main `3fddd8603d0429448a657b99d271180973d6c585` implements all **19/19
+Coven main `365013d54a86923d230753d94510821f48d5e492` implements all **19/19
 base command names** in `crates/coven-cli/src/automations/command_matrix.rs`.
-The historical 15/19 checkpoint is superseded. A supported command name does
+The historical 15/19 checkpoint is superseded. The matrix lists every command
+in `command-envelope.schema.json`, so it now also carries the three mission
+commands (`mission.submit.v1`, `mission.get.v1`, `mission.cancel.v1`; Coven
+#1313, #1347), which are outside this packet's 19-command scope. A supported command name does
 not establish support for every payload variant, wire form or authority profile.
-In particular, `command_envelope.rs` refuses envelope `run.cancel.v1` because
-it lacks attempt/runtime correlation, while the flat versioned action exists.
-Retain this typed refusal until the correlation contract is reconciled; do not
-claim 19/19 executable envelope coverage.
+`command_envelope.rs` now routes envelope `run.cancel.v1` through the correlated
+cancel executor (`execute_run_cancel_envelope`, Coven #1323). It hashes the
+envelope request in its own digest domain, so envelope and flat adoptions can
+never replay one another. Its typed refusals are recorded in the
+`run.cancel.v1` row below. This reconciles source behavior only; do not claim
+19/19 executable envelope coverage, published consumer coverage or release
+eligibility from it.
 Authority-bearing manual grants, retry and recovery still follow the trusted
 adapter described in `docs/architecture/coven-automations-runtime-authority.md`.
 
@@ -105,7 +111,7 @@ paths and prompts. Never use real external effects to create fixture failures.
 | `definition.tombstone.v1` | Disabled definition tombstoned without deleting history | Stale revision; forbidden transition; envelope rejects reason | Replay after restart retains historical pins |
 | `occurrence.runNow.v1` | Flat action: ordinary active routine creates and dispatches one manual occurrence | Ineligible lifecycle; overlap; stale revision; unauthorized context | Same adoption yields one occurrence/dispatch, including lost-response replay after restart |
 | `occurrence.cancel.v1` | Flat action: cancel undispatched work; request stop for dispatched work | Wrong revision; unresolved stop fence; deadline precedence | One cancellation history; replay through restart never reports unacknowledged stop as success |
-| `run.cancel.v1` | Flat versioned correlated cancellation exists; envelope positive case needs correlation-contract reconciliation | Current envelope returns CAPABILITY_UNSUPPORTED; flat action covers missing run/stale context/completion race | Flat duplicate stop preserves original evidence; envelope refusal writes no execution state |
+| `run.cancel.v1` | Source (#1323): the envelope and the flat versioned action cancel the occurrence's running run, correlated to its current attempt and session; the released v0.4.10 envelope returns CAPABILITY_UNSUPPORTED | Envelope: NOT_FOUND for an unknown run; ILLEGAL_TRANSITION for a run that is not its occurrence's running run, or a run with no occurrence (#1358, fixed by #1409 as `365013d5`). Flat action covers missing run/stale context/completion race | Flat duplicate stop preserves original evidence; an envelope replay returns its stored terminal result (also after restart) or its stored rejection; a refusal writes no execution state |
 | `attempt.cancel.v1` | Flat action: stop the named current attempt | Old attempt or old dispatch fence; blank reason handled per contract | Duplicate/restart replay cannot stop a replacement attempt |
 | `attempt.retry.v1` | Flat action: held known failure, original deadline open, exact prior attempt/disposition; new attempt dispatches | Ambiguous prior outcome; expired deadline; ten-attempt cap; quarantine; pending cancel/stop fence | Same adoption opens one attempt; prior attempt and cancellation history remain immutable after restart |
 | `occurrence.recover.v1` | Flat action: separate recovery-required occurrences exercise failed_deterministic and retry_with_new_attempt | Wrong occurrence state; stale revision; authority run lacking authenticated evidence | Replay preserves determination and creates at most one new attempt across restart |
@@ -220,15 +226,15 @@ Keep these source changes separate from the selected published v0.4.10 daemon:
 | --- | --- | --- |
 | Retry/recovery envelopes | Coven #1312 merged as `0207d4a21bf5939959b203e87c409b5f1b209f12` | Authority-bearing behavior and exact published consumer execution |
 | Occurrence/attempt cancellation envelopes | Coven #1316 merged as `60ed9cf2d55bdc1b4b7ca9c9b7bf43c546d893d7` | Exact published consumer execution and authority acceptance |
-| Run cancellation envelope | [Coven #1323](https://github.com/OpenCoven/coven/pull/1323), head `40aa89d9930f31ca357a760c00d5eb205c449884`, remains draft | Readiness, protected delivery, published consumer execution |
-| Run-now envelope | [Coven #1335](https://github.com/OpenCoven/coven/pull/1335), head `ed57eecd42d04ec6389f6d4b031deac89725645c` | Exact-head CI, protected delivery, published consumer execution |
+| Run cancellation envelope | Coven #1323 merged as `24f487738ec42d69b980c2ecf5588c425b8135b0`; #1358's no-occurrence refusal merged as `365013d54a86923d230753d94510821f48d5e492` (#1409) | Exact published consumer execution and authority acceptance |
+| Run-now envelope | Coven #1335 merged as `7508fb2b8fb428479efcee1f01898a4bd3304e8d` | Exact published consumer execution and authority acceptance |
 
 #1335 retains immutable dispatch results and typed refusals, validates original
 attempt/session correlation, and refuses ambiguous replay without relaunching.
 Its local workspace, lint, Policy guard, and 22-suite native audit passed. The
 audit scope is `audit_only`; it does not prove production authority or released
-SDK/Cave behavior. #1323 and #1335 overlap in the router and portable vectors.
-Land sequentially, then rebase and reverify the second PR.
+SDK/Cave behavior. #1323 and #1335 overlapped in the router and portable
+vectors and landed sequentially on main.
 
 Cave PR OpenCoven/coven-cave#6077 merged as
 `e7a5cc602a07dc996f4a5263a9386c1c3729a358` from head
