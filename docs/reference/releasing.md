@@ -67,6 +67,40 @@ gh secret delete NPM_ACCESS_TOKEN --env npm-publish --repo OpenCoven/coven
 
 You can leave the `npm-publish` environment itself in place or remove it — the new workflow does not reference it.
 
+### Trusted release signers
+
+`.github/release-signers.json` pins who may sign a release tag. Each entry
+names a GitHub login, that account's numeric user id, and the id of one SSH
+signing key registered on it. No key material is committed: the verifier reads
+the public key from `GET /users/<login>/ssh_signing_keys` at release time and
+refuses when the key id is gone, the login now belongs to a different user id,
+or the key type differs from the pin. GitHub signing keys cannot be edited in
+place, so the id pins exactly one key.
+
+The release tag must verify against the pins at the tagged commit **and** at
+the current tip of `main`:
+
+- To add a signer, land the new entry on `main` through a reviewed pull
+  request, then tag a commit that contains it.
+- To revoke a signer, remove the entry on `main`. Every tag not yet released
+  stops verifying immediately, even if its own commit still pins the key.
+
+Find a key's id with `gh api users/<login>/ssh_signing_keys --jq '.[] | {id, title}'`.
+The signer pins apply to `release-npm.yml` and `release-crates.yml`. They
+replace the `NPM_RELEASE_ALLOWED_SIGNERS` repository variable, which nothing
+reads any more. Delete it, and the older unused `NPM_RELEASE_SIGNERS`, once
+this change is released:
+
+```sh
+gh variable delete NPM_RELEASE_ALLOWED_SIGNERS --repo OpenCoven/coven
+gh variable delete NPM_RELEASE_SIGNERS --repo OpenCoven/coven
+```
+
+The verifier runs from the workflow at the tagged commit, as every release job
+does. What stops a tag on an unmerged commit from running a modified gate is
+the release-tag creation ruleset, which only repository administrators can
+bypass.
+
 ## Cut a release
 
 ### Preflight
@@ -150,7 +184,7 @@ That single push is the entire release. The workflow takes over from there.
 ### What the workflow does
 
 1. **Release gates** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace --locked`, `python3 scripts/check-secrets.py`.
-2. **Verify signed release tag** — confirms the pushed ref is an annotated tag (not lightweight) and that GitHub has cryptographically verified the maintainer's signature. The workflow consults `gh api /repos/{owner}/{repo}/git/tags/{sha}` and requires `.verification.verified == true`. Any other state aborts the release.
+2. **Verify signed release tag** — `scripts/verify-release-tag.mjs` confirms the pushed ref is an annotated tag (not lightweight), that GitHub's ref and tag object agree with the local tag, that GitHub has cryptographically verified the signature (`.verification.verified == true`), and that the tagged commit is contained in `origin/main`. The signature must also come from a [trusted signer](#trusted-release-signers) pinned at both the tagged commit and the current tip of `main`. The signer, key fingerprint and pin-file digests are retained in `release-tag-verification.json` beside the source-acceptance receipt. Any other state aborts the release.
 3. **Verify exact-source acceptance** — resolves the tagged commit and requires
    exactly one matching `CI` workflow run from a `main` push at that SHA.
    That run must have completed successfully, and its stable `PR gate` job
@@ -409,6 +443,7 @@ procedure above and configure its trusted publisher before the next tag.
   git push origin v0.0.18
   ```
 - `Tag vX.Y.Z does not have a GitHub-verified signature (reason=...)` — the signing key isn't registered against your GitHub account. Add it under [GitHub → Settings → SSH and GPG keys → Signing keys](https://github.com/settings/keys), then push a signed tag for the next patch version.
+- `vX.Y.Z is not signed by a trusted signer in .github/release-signers.json` — the key is registered on GitHub but not pinned, or its pin was removed on `main`. Sign with a pinned key, or [add the key's pin](#trusted-release-signers) through a reviewed pull request first, then push a signed tag for the next patch version.
 
 Release tags cannot be moved or deleted once the tag rulesets in
 [release governance](release-governance.md) are applied, and deleting one is a

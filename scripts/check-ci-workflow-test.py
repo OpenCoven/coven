@@ -157,6 +157,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'node --test scripts/release-governance.test.mjs',
             'node --test scripts/package-automations-authority-profile.test.mjs',
             'node --test scripts/release-stress-test.mjs',
+            'node --test scripts/verify-release-tag.test.mjs',
             'automations-authority-profile-bundle',
             "needs.changes.outputs.docs_only != 'true'",
             'npm-onboarding-pr',
@@ -472,8 +473,9 @@ class CheckCiWorkflowTests(unittest.TestCase):
         )[0]
         self.assertIn("actions: read", verify_tag)
         self.assertIn("id: tag-verification", verify_tag)
-        self.assertIn('echo "head_sha=$TAGGED_COMMIT_SHA" >> "$GITHUB_OUTPUT"', verify_tag)
-        self.assertIn('echo "tag_object_sha=$TAG_OBJECT_SHA" >> "$GITHUB_OUTPUT"', verify_tag)
+        self.assertIn("node scripts/verify-release-tag.mjs", verify_tag)
+        self.assertIn('--output release-tag-verification.json >> "$GITHUB_OUTPUT"', verify_tag)
+        self.assertNotIn("vars.NPM_RELEASE_ALLOWED_SIGNERS", RELEASE_TEXT)
         self.assertIn("package-github-release.mjs verify-source-acceptance", verify_tag)
         self.assertIn('--head-sha "$HEAD_SHA"', verify_tag)
         self.assertIn('--tag-object-sha "$TAG_OBJECT_SHA"', verify_tag)
@@ -482,7 +484,10 @@ class CheckCiWorkflowTests(unittest.TestCase):
             "name: coven-release-source-acceptance-${{ steps.release-context.outputs.release_tag }}",
             verify_tag,
         )
-        self.assertIn("path: release-source-acceptance.json", verify_tag)
+        self.assertIn(
+            "path: |\n            release-tag-verification.json\n            release-source-acceptance.json\n",
+            verify_tag,
+        )
         self.assertNotIn("continue-on-error:", verify_tag)
         self.assertNotRegex(verify_tag, r"(?m)^\s+if:")
         self.assertLess(
@@ -490,8 +495,12 @@ class CheckCiWorkflowTests(unittest.TestCase):
             verify_tag.index("package-github-release.mjs verify-source-acceptance"),
         )
         self.assertLess(
+            verify_tag.index("node scripts/verify-release-tag.mjs"),
             verify_tag.index("package-github-release.mjs verify-source-acceptance"),
-            verify_tag.index("path: release-source-acceptance.json"),
+        )
+        self.assertLess(
+            verify_tag.index("package-github-release.mjs verify-source-acceptance"),
+            verify_tag.index("            release-source-acceptance.json\n"),
         )
 
     def test_release_build_and_publish_jobs_cannot_bypass_source_acceptance(self) -> None:

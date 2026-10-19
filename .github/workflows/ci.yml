@@ -132,6 +132,7 @@ jobs:
       - run: node --test scripts/package-automations-authority-profile.test.mjs
       - run: node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs
       - run: node --test scripts/release-stress-test.mjs
+      - run: node --test scripts/verify-release-tag.test.mjs
       # The benchmark harness tests also run inside `performance-baseline`,
       # but that job is push-only, so until this step existed a pull request
       # could break `benchmark-cli.mjs` and still show every check green -

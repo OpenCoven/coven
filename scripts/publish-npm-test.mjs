@@ -1377,11 +1377,15 @@ test('release workflow uses OIDC trusted publishing instead of a long-lived npm 
 });
 
 test('release workflow verifies the signed release tag before building or publishing', () => {
+  // The verification itself lives in scripts/verify-release-tag.mjs, whose
+  // suite exercises real signatures: an untrusted key, an unsigned annotated
+  // tag, a lightweight tag, a revoked pin, and a commit outside main.
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
+  const verifier = readFileSync(new URL('./verify-release-tag.mjs', import.meta.url), 'utf8');
   assert.match(workflow, /verify-tag:/, 'workflow must declare a verify-tag job');
   assert.match(
     workflow,
@@ -1390,48 +1394,8 @@ test('release workflow verifies the signed release tag before building or publis
   );
   assert.match(
     workflow,
-    /\.verification\.verified/,
-    'verify-tag must consult GitHub`s signature verification API'
-  );
-  assert.match(
-    workflow,
-    /git\/ref\/tags\/\$TAG_NAME/,
-    'verify-tag must resolve the exact remote tag ref before trusting the local tag object'
-  );
-  assert.match(
-    workflow,
-    /if \[ "\$api_tag_object_sha" != "\$TAG_OBJECT_SHA" \]; then/,
-    'verify-tag must require the local annotated tag object SHA to match the GitHub-verified tag object SHA'
-  );
-  assert.match(
-    workflow,
-    /jq -r '\.tag \/\/ ""'/,
-    'verify-tag must require the GitHub tag object payload to echo the requested tag name'
-  );
-  assert.match(
-    workflow,
-    /if \[ "\$tag_name" != "\$TAG_NAME" \]; then/,
-    'verify-tag must reject GitHub tag payloads that name a different tag'
-  );
-  assert.match(
-    workflow,
-    /lightweight tag/,
-    'verify-tag must explicitly reject lightweight (unsigned) tags'
-  );
-  assert.match(
-    workflow,
-    /git merge-base --is-ancestor .* origin\/main/,
-    'verify-tag must ensure the tagged commit is contained in origin/main'
-  );
-  assert.match(
-    workflow,
-    /vars\.NPM_RELEASE_ALLOWED_SIGNERS/,
-    'verify-tag must require an explicit SSH allowed-signers allowlist via NPM_RELEASE_ALLOWED_SIGNERS'
-  );
-  assert.match(
-    workflow,
-    /git verify-tag "\$TAG_NAME"/,
-    'verify-tag must locally verify the tag against the SSH allowed signers file'
+    /id: tag-verification[\s\S]*?node scripts\/verify-release-tag\.mjs \\\s*--repository "\$GITHUB_REPOSITORY" \\\s*--release-tag "\$RELEASE_TAG" \\\s*--output release-tag-verification\.json >> "\$GITHUB_OUTPUT"/,
+    'verify-tag must run the release tag verifier and export its verified tag object and commit'
   );
   assert.match(
     workflow,
@@ -1448,46 +1412,21 @@ test('release workflow verifies the signed release tag before building or publis
     /Trigger:[^\n]*any `v\*` tag push[\s\S]*Gate:[^\n]*requires an SSH-signed annotated tag/,
     'release instructions must separate the broad tag trigger from the signed-tag gate'
   );
-  assert.match(
-    workflow,
-    /empty line/,
-    'verify-tag must reject empty allowed signer entries before authorization checks'
-  );
-  assert.match(
-    workflow,
-    /gpg\.ssh\.allowedSignersFile/,
-    'verify-tag must configure git with the release SSH allowed signers file'
-  );
-  assert.doesNotMatch(
-    workflow,
-    /tagger_email_lc|tagger_email=\$\(jq -r '\.tagger\.email|NPM_RELEASE_SIGNERS/,
-    'verify-tag must not authorize releases by mutable tagger email allowlist'
-  );
-  assert.doesNotMatch(
-    workflow,
-    /\.signature\s*\{/,
-    'verify-tag must not query the removed GitHub GraphQL Tag.signature field'
-  );
-  assert.match(
-    workflow,
-    /tag_object_type=\$\(jq -r '\.object\.type/,
-    'verify-tag must inspect the annotated tag target type and SHA'
-  );
-  assert.match(
-    workflow,
-    /tag_object_type.*commit/s,
-    'verify-tag must reject annotated tags that do not target commits'
-  );
-  assert.match(
-    workflow,
-    /LOCAL_TAGGED_COMMIT_SHA=\$\(git rev-parse "\$TAG_NAME\^\{commit\}"\)/,
-    'verify-tag must resolve the local tagged commit after the tag-object identity check'
-  );
-  assert.match(
-    workflow,
-    /if \[ "\$LOCAL_TAGGED_COMMIT_SHA" != "\$TAGGED_COMMIT_SHA" \]; then/,
-    'verify-tag must reject local tag aliases that resolve to a different commit than the verified tag object'
-  );
+  for (const [label, text] of [['workflow', workflow], ['verifier', verifier]]) {
+    assert.doesNotMatch(
+      text,
+      /vars\.NPM_RELEASE_ALLOWED_SIGNERS|tagger_email|tagger\.email|NPM_RELEASE_SIGNERS/,
+      `${label} must not authorize releases by a mutable variable or tagger email`
+    );
+    assert.doesNotMatch(
+      text,
+      /\.signature\s*\{/,
+      `${label} must not query the removed GitHub GraphQL Tag.signature field`
+    );
+  }
+  assert.match(verifier, /verification\?\.verified !== true/, 'the verifier must require GitHub signature verification');
+  assert.match(verifier, /'merge-base', '--is-ancestor'/, 'the verifier must require the tagged commit on the default branch');
+  assert.match(verifier, /gpg\.ssh\.allowedSignersFile=/, 'the verifier must check the signature against the pinned signers');
 });
 
 test('release workflow carries no recovery-release path', () => {
@@ -1536,20 +1475,17 @@ test('release workflow carries no recovery-release path', () => {
 
 test('every release tag must be contained in origin/main', () => {
   // The ancestry gate used to sit inside the non-recovery branch, so a signed
-  // recovery tag could publish a commit that was never on main. It is now
-  // unconditional, and nothing may re-introduce a bypass around it.
+  // recovery tag could publish a commit that was never on main. It now runs
+  // unconditionally inside the verifier, and the workflow step that calls the
+  // verifier carries no condition that could skip it.
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-
-  assert.match(
-    workflow,
-    // `\s*` rather than `\n`: Windows checkouts read this file back as CRLF.
-    /git fetch --no-tags origin main\s*if ! git merge-base --is-ancestor "\$TAGGED_COMMIT_SHA" origin\/main; then/,
-    'the ancestry gate must run unconditionally for every release tag'
-  );
+  const step = workflow.split('      - name: Confirm tag is annotated and signer-authorized')[1]?.split('      - name: ')[0] ?? '';
+  assert.match(step, /node scripts\/verify-release-tag\.mjs/);
+  assert.doesNotMatch(step, /^\s+(if|continue-on-error):/m, 'no condition may guard the tag verifier');
   assert.doesNotMatch(
     workflow,
     /if \[ "\$RELEASE_MODE" != "recovery" \]/,
