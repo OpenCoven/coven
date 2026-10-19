@@ -1872,7 +1872,7 @@ fn unavailable_receipts_do_not_hide_delivery_counts_or_read_temp_shadows() {
                 0,
                 "must count main, not a TEMP shadow"
             );
-            assert_eq!(delivery.gaps, vec![Gap::ReceiptIntegrityNotVerified]);
+            assert_eq!(delivery.gaps, vec![Gap::ReceiptAuthorityNotVerified]);
         }
         assert_eq!(conn.total_changes(), before);
         assert!(!serde_json::to_string(&report).unwrap().contains("PRIVATE"));
@@ -2285,7 +2285,9 @@ fn unavailable_delivery_state_preserves_receipt_count_and_concurrent_gaps() {
                     serde_json::to_value(&delivery.gaps).unwrap(),
                     serde_json::json!([
                         "delivery_state_unavailable",
-                        "receipt_link_store_unavailable"
+                        "receipt_link_store_unavailable",
+                        "receipt_commitments_unavailable",
+                        "receipt_authority_not_verified"
                     ])
                 );
             }
@@ -4804,7 +4806,9 @@ fn malformed_delivery_states_preserve_receipts_without_partial_delivery_counts()
                     if receipts_available {
                         serde_json::json!([
                             "invalid_delivery_state",
-                            "receipt_link_store_unavailable"
+                            "receipt_link_store_unavailable",
+                            "receipt_commitments_unavailable",
+                            "receipt_authority_not_verified"
                         ])
                     } else {
                         serde_json::json!([
@@ -4847,7 +4851,14 @@ fn valid_delivery_states_include_null_and_ignore_temp_substitutes() {
         .unwrap();
     assert_eq!(delivery.facts[&Fact::PendingDeliveries], 2);
     assert_eq!(delivery.facts[&Fact::FailedDeliveries], 1);
-    assert_eq!(delivery.gaps, vec![Gap::ReceiptLinkStoreUnavailable]);
+    assert_eq!(
+        delivery.gaps,
+        vec![
+            Gap::ReceiptLinkStoreUnavailable,
+            Gap::ReceiptCommitmentsUnavailable,
+            Gap::ReceiptAuthorityNotVerified
+        ]
+    );
     assert_eq!(conn.total_changes(), before);
     report.validate().unwrap();
     conn.execute_batch("INSERT INTO main.automation_runs VALUES('PENDING')")
@@ -4860,7 +4871,12 @@ fn valid_delivery_states_include_null_and_ignore_temp_substitutes() {
         .unwrap();
     assert_eq!(
         delivery.gaps,
-        vec![Gap::InvalidDeliveryState, Gap::ReceiptLinkStoreUnavailable]
+        vec![
+            Gap::InvalidDeliveryState,
+            Gap::ReceiptLinkStoreUnavailable,
+            Gap::ReceiptCommitmentsUnavailable,
+            Gap::ReceiptAuthorityNotVerified
+        ]
     );
     assert!(!delivery.facts.contains_key(&Fact::PendingDeliveries));
 }
@@ -4903,9 +4919,17 @@ fn receipt_link_findings_detect_nonreciprocal_metadata_without_payload_reads() {
             .iter()
             .find(|o| o.category == Category::DeliveryReceipts)
             .unwrap();
+        let mut expected_gaps = Vec::new();
+        if expected != "receipt_integrity_not_verified" {
+            expected_gaps.push(expected);
+        }
+        expected_gaps.extend([
+            "receipt_commitments_unavailable",
+            "receipt_authority_not_verified",
+        ]);
         assert_eq!(
             serde_json::to_value(&delivery.gaps).unwrap(),
-            serde_json::json!([expected])
+            serde_json::json!(expected_gaps)
         );
         assert_eq!(delivery.facts[&Fact::StoredReceipts], 1);
         assert_eq!(conn.total_changes(), before);
