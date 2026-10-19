@@ -6,6 +6,7 @@
 //! durable invocation orchestration remains outside this crate.
 
 mod agent;
+mod agent_loop;
 mod delegation;
 mod error;
 mod guardrail;
