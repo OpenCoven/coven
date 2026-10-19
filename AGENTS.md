@@ -133,6 +133,7 @@ closing your terminal, and still reports a non-zero status, so a printed
   node --test scripts/release-governance.test.mjs || fail=1
   node --test scripts/package-automations-protocol.test.mjs scripts/script-entrypoint.test.mjs || fail=1
   node --test scripts/package-automations-authority-profile.test.mjs || fail=1
+  node --test scripts/check-action-pins.test.mjs || fail=1
   node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs || fail=1
   node --test scripts/release-stress-test.mjs || fail=1
   node --test scripts/verify-release-tag.test.mjs || fail=1

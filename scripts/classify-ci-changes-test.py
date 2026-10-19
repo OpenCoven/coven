@@ -144,6 +144,13 @@ class ClassifyTest(unittest.TestCase):
             if k != 'docs_only':
                 self.assertTrue(v, k)
 
+    def test_pinned_toolchains_and_action_lock_fan_all(self):
+        for path in ('rust-toolchain.toml', '.node-version', '.github/actions-lock.json', 'scripts/check-action-pins.mjs'):
+            result = self.classify(path)
+            for key, value in result.items():
+                if key != 'docs_only':
+                    self.assertTrue(value, f'{path}: {key}')
+
     def test_unknown_non_docs(self):
         self.assertTrue(self.classify('foo/bar.txt')['rust'])
 

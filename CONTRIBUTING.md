@@ -26,9 +26,13 @@ for the claim registry and worktree workflow layered on top of this guide.
 
 ## Prerequisites
 
-- Rust stable toolchain
+- Rust through `rustup`: `rust-toolchain.toml` pins the exact version CI and
+  releases build with, and rustup installs it on first use. A `cargo` that
+  does not come from rustup (Homebrew's, for example) ignores the pin, so put
+  `~/.cargo/bin` ahead of it on `PATH`.
 - Git
-- Node.js 18+ and `pnpm` for package/plugin work
+- Node.js 18+ and `pnpm` for package/plugin work (CI and releases run the
+  exact version in `.node-version`)
 - A supported harness CLI for manual smoke tests, usually Codex or Claude Code
 
 ## Contributor First 10 Minutes

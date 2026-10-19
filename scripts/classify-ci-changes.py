@@ -77,7 +77,13 @@ def classify(paths: list[str]) -> dict[str, bool]:
             'crates/coven-cli/engine.lock',
             'scripts/pin-engine.sh',
         }
+        # A pinned toolchain or action lock changes what every job runs.
         is_workflow = path.startswith('.github/workflows/') or path in {
+            'rust-toolchain.toml',
+            '.node-version',
+            '.github/actions-lock.json',
+            'scripts/check-action-pins.mjs',
+            'scripts/check-action-pins.test.mjs',
             'scripts/classify-ci-changes.py',
             'scripts/classify-ci-changes-test.py',
             'scripts/check-workflows.sh',
