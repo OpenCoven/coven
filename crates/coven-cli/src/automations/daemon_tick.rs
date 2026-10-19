@@ -451,6 +451,22 @@ fn reconcile_automation_runs(
             &format!("automation result delivery deferred: {error:#}"),
         ),
     }
+    // Compact Home once its reported fill crosses the threshold, and settle
+    // compactions already requested (coven#1181).
+    match crate::main_session_compaction::tick(coven_home, runtime, now) {
+        Ok(compaction) => {
+            for (id, reason) in &compaction.failed {
+                crate::daemon::append_daemon_recovery_log(
+                    coven_home,
+                    &format!("main-session compaction `{id}` failed: {reason}"),
+                );
+            }
+        }
+        Err(error) => crate::daemon::append_daemon_recovery_log(
+            coven_home,
+            &format!("main-session compaction deferred: {error:#}"),
+        ),
+    }
     super::runner::cleanup_terminal_containment_receipts(coven_home, conn)
         .map_err(anyhow::Error::msg)?;
     Ok(())

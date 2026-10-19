@@ -208,27 +208,10 @@ fn session_frames(
     // mid-line. That fragment never parses: a proper suffix of a one-object
     // line always carries an unmatched closing brace.
     let mut frames = Vec::new();
-    let mut line = String::new();
+    let mut lines = OutputLines::default();
     for (seq, created_at) in window.into_iter().rev() {
-        let payload: String = conn
-            .query_row(
-                "SELECT payload_json FROM events WHERE rowid = ?1",
-                [seq],
-                |row| row.get(0),
-            )
-            .context("failed to read main-session transcript event")?;
-        let Some(data) = serde_json::from_str::<Value>(&payload)
-            .ok()
-            .and_then(|payload| payload.get("data")?.as_str().map(str::to_owned))
-        else {
-            // Not stored stdout text: whatever line was open cannot be trusted.
-            line.clear();
-            continue;
-        };
-        let mut rest = data.as_str();
-        while let Some(end) = rest.find('\n') {
-            line.push_str(&rest[..end]);
-            rest = &rest[end + 1..];
+        let payload = event_payload(conn, seq)?;
+        for line in lines.feed(&payload) {
             if let Some(report) = report(&line) {
                 frames.push(Frame {
                     seq,
@@ -236,12 +219,50 @@ fn session_frames(
                     report,
                 });
             }
-            line.clear();
         }
-        // The newest event's unterminated tail is a line still being written.
-        line.push_str(rest);
     }
     Ok((frames, exhausted))
+}
+
+pub(crate) fn event_payload(conn: &Connection, seq: i64) -> Result<String> {
+    conn.query_row(
+        "SELECT payload_json FROM events WHERE rowid = ?1",
+        [seq],
+        |row| row.get(0),
+    )
+    .context("failed to read main-session transcript event")
+}
+
+/// Reassembles stdout lines from one session's consecutive `output` event
+/// payloads. The coalescing event writer can split a line across events or
+/// put several lines in one.
+#[derive(Default)]
+pub(crate) struct OutputLines {
+    line: String,
+}
+
+impl OutputLines {
+    /// Feeds one stored payload and returns the lines it completes. A trailing
+    /// unterminated line stays open: it is still being written.
+    pub(crate) fn feed(&mut self, payload: &str) -> Vec<String> {
+        let Some(data) = serde_json::from_str::<Value>(payload)
+            .ok()
+            .and_then(|payload| payload.get("data")?.as_str().map(str::to_owned))
+        else {
+            // Not stored stdout text: whatever line was open cannot be trusted.
+            self.line.clear();
+            return Vec::new();
+        };
+        let mut complete = Vec::new();
+        let mut rest = data.as_str();
+        while let Some(end) = rest.find('\n') {
+            self.line.push_str(&rest[..end]);
+            rest = &rest[end + 1..];
+            complete.push(std::mem::take(&mut self.line));
+        }
+        self.line.push_str(rest);
+        complete
+    }
 }
 
 fn report(line: &str) -> Option<Report> {
