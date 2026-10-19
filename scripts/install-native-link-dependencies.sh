@@ -2,7 +2,7 @@
 set -euo pipefail
 
 apt_etc_dir="${COVEN_APT_ETC_DIR:-/etc/apt}"
-workdir="$(mktemp -d)"
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/coven-native-link.XXXXXXXXXX")"
 apt_started=0
 cleanup() {
   if ((apt_started)); then
