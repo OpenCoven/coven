@@ -3,6 +3,10 @@ use super::final_commit_cases::{
 };
 use super::*;
 
+mod request_diagnostic_schema {
+    include!("threads_request_diagnostic_schema.rs");
+}
+
 const FORMAT_PATH: &str = "output-format.json";
 const FORMAT_BEFORE: &str =
     r#"{"schema":"coven.output-format/v1","indent":2,"final_newline":true}"#;
@@ -121,7 +125,7 @@ fn output_auto_submission_records_bounded_request_phases() -> Result<()> {
             let mut phases = Vec::new();
             for record in records {
                 let fields: Vec<_> = record.split_whitespace().collect();
-                anyhow::ensure!(fields.len() == 4, "unexpected diagnostic fields: {record}");
+                anyhow::ensure!(request_diagnostic_schema::native_fields_valid(&fields, cfg!(windows)), "unexpected diagnostic fields: {record}");
                 for (field, prefix) in [(fields[0], "request="), (fields[2], "elapsed_us="), (fields[3], "prior_observer_us=")] {
                     field.strip_prefix(prefix).context("numeric diagnostic field")?.parse::<u128>()?;
                 }
