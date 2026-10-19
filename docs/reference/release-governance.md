@@ -125,11 +125,22 @@ node scripts/release-governance.mjs check \
   --output governance-evaluation.json
 ```
 
-It reads with `RELEASE_GOVERNANCE_READ_TOKEN`, then `GH_TOKEN`, then
+The command reads with `RELEASE_GOVERNANCE_READ_TOKEN`, then `GH_TOKEN`, then
 `GITHUB_TOKEN`, then `gh auth token`. The snapshot records which source it
 used, never the value. It exits non-zero when any control fails, after writing
 both files. `evaluate --snapshot FILE --output FILE` re-evaluates a stored
 snapshot without network access.
+
+The **Release governance check** workflow (`.github/workflows/release-governance.yml`)
+runs the same check every Monday and on demand, reading with
+`RELEASE_GOVERNANCE_READ_TOKEN` only. It catches drift between releases (a
+break-glass change left in place, an edited ruleset, an expired credential)
+before a release does, and retains the snapshot and evaluation as an artifact.
+Dispatch it after changing protection or rotating the credential:
+
+```sh
+gh workflow run release-governance.yml --repo OpenCoven/coven
+```
 
 ## Apply the policy
 
