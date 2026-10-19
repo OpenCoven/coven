@@ -9,6 +9,7 @@ primitives:
 - bounded model/tool loops
 - journaled goal loops with explicit exit criteria
 - agent handoffs (control transfer within one run, not child delegation)
+- bounded child delegation with selected context and attenuated authority
 - blocking input and output guardrails
 - fail-closed review of proposed tool calls before dispatch
 - pluggable session journals
@@ -30,10 +31,10 @@ contributions from other agents.
 A handoff preserves the accumulated model transcript, including loaded session
 history, and passes the same host-provided `&C` to models, tools, guardrails,
 and proposal reviewers. The target uses its own instructions, tools, handoffs,
-and reviewers. The runner does not select a bounded child context, attenuate
-host authority, or establish cross-principal isolation. Use this compatibility
-behavior only within a host-established trust boundary; target ingress parity
-is not a complete delegation policy.
+and reviewers. A handoff does not select a bounded child context, attenuate
+host authority, or establish cross-principal isolation; `DelegationSpec`
+below is the contract for that. Use handoff only within a host-established
+trust boundary; target ingress parity is not a complete delegation policy.
 
 Durable invocation ownership belongs to Psyche's orchestration contracts;
 process execution, transport, and remote placement belong to Coven's existing
@@ -41,6 +42,57 @@ daemon/client/hub boundaries. The
 [invocation/delegation migration](https://github.com/OpenCoven/coven/issues/804)
 must preserve that split rather than turn this runner into a second distributed
 runtime.
+
+## Bounded delegation
+
+`DelegationSpec` is the structured child-invocation contract: a validated
+`AgentRef` target, a non-empty `TaskInput` of at most 64 KiB, a
+`ContextManifest` of at most 64 unique `ContextRef`s (id, `sha256:` digest,
+provenance; never payload), an `AuthorityScope` (project, tool names, opaque
+resource names, and whether the child may delegate further), a
+`DelegationBudget` of model turns and control transfers, and a
+`ResultContract` bounding the final output. Every component validates at
+construction and on the wire; the shape is closed and carries names and
+digests only, so no credential has a place to be serialized.
+
+The parent holds a `DelegationGrant`: its invocation, its `AgentRef`, and the
+authority, context and budget it may pass down. A root grant is a trusted host
+assertion, like `LoopRecoveryFence`. `PreparedDelegation::prepare` proves the
+spec against the grant before anything is dispatched, and every check fails
+closed with a distinct `AuthorityError`: the parent must hold `may_delegate`;
+the project must match; requested tools and resources must be subsets;
+`may_delegate` cannot be conferred by a parent without it; the budget cannot
+exceed the parent's; and every context reference must be one the parent holds,
+digest and provenance included. Nothing is narrowed on the requester's behalf:
+asking for more than the parent holds is a refusal, not a silent reduction.
+A successful proof binds a fresh child `InvocationContext` whose parent is the
+grant's invocation and records `DelegationDigests` (spec, authority, context)
+for traces. `child_grant` yields what the child may in turn pass down, so a
+grandchild is bounded by the child's attenuated authority and budget.
+
+`Runner::run_delegation` consumes a `PreparedDelegation` and runs the target
+as its own invocation with `InvocationSource::Agent` naming the parent. The
+child starts from the task input and the selected context only: there is no
+session load, and the parent's transcript is not inherited. Each reference is
+resolved through the host's `ContextResolver` and verified against its digest
+before the first model turn; a resolver error or mismatch fails with
+`RunFailureKind::Context`. Tools outside the attenuated authority are not
+advertised to the model, and a call to one fails with
+`RunFailureKind::Authority` before review or dispatch. Authority is bound to
+the invocation, so a handoff inside the child stays within it. Output larger
+than the result contract fails with `RunFailureKind::Limit` instead of
+completing. The failure carries the child invocation and partial transcript
+in a `DelegationFailure`.
+
+Identity, capability, authority and trust stay distinct: an `AgentRef` names
+an agent, registered tools are what it can do, `AuthorityScope` is what this
+invocation may use, and the grant is what the host vouches for. Resource
+names are proven as subsets at the boundary; the crate does not execute
+resources, so tools and the host enforce `AuthorityScope::resources` against
+the context they are given. Delegation here is local execution with
+correlation: it does not adopt, persist, retry, cancel, time out, or place the
+child anywhere. Legacy `Handoff` remains available as in-run control transfer
+during migration.
 
 ## Tool proposal review
 
@@ -167,13 +219,13 @@ not establish distributed fencing.
 
 ## Supported checkpoint and deferred orchestration
 
-The existing `Runner` provides local control transfer and correlation.
+The existing `Runner` provides local control transfer, correlation, and
+bounded local delegation with selected context and attenuated authority.
 `GoalLoopRunner` journals iteration boundaries; it does not supply durable
-child invocation adoption or shared executor conformance. Structured
-`DelegationSpec`, bounded/provenanced context, authority attenuation,
-`AgentLoop` extraction, deadlines/cancellation, durable invocation
-adoption/recovery, remote executors, and removal of legacy handoff/context
-behavior remain deferred under #804.
+child invocation adoption or shared executor conformance. `AgentLoop`
+extraction, wall-clock deadlines and cancellation, durable invocation
+adoption/recovery, remote executors, unified observability, and removal of
+legacy handoff/full-transcript behavior remain deferred under #804.
 
 ## Behavioral evidence
 
@@ -185,6 +237,11 @@ references, revision binding, and canonical invocation metadata.
 [`tests/legacy_boundary.rs`](tests/legacy_boundary.rs) characterizes inherited
 history, original-input-only checks, final-only output policy, shared host
 context, and a successful effect followed by session-append failure.
+[`tests/delegation.rs`](tests/delegation.rs) covers the closed delegation
+wire shape, fail-closed attenuation (cross-project, tool, resource,
+re-delegation, budget, context leak), bounded child context without parent
+transcript inheritance, authority enforcement across control transfer, digest
+verification before model execution, and result-contract and budget limits.
 [`tests/loop_runner.rs`](tests/loop_runner.rs) covers local checkpoint and
 reconciliation behavior. These are in-process tests with scripted models and
 tools, not real-daemon, provider-containment, packaged-client, or external A2A

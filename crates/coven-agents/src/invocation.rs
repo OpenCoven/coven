@@ -18,7 +18,10 @@ pub enum AgentRefError {
     InvalidCharacter { field: &'static str },
 }
 
-fn validate_agent_ref_component(value: &str, field: &'static str) -> Result<(), AgentRefError> {
+pub(crate) fn validate_agent_ref_component(
+    value: &str,
+    field: &'static str,
+) -> Result<(), AgentRefError> {
     if value.is_empty() {
         return Err(AgentRefError::Empty { field });
     }
@@ -184,6 +187,8 @@ pub enum InvocationFailureKind {
     ControlTransfer,
     InvalidResponse,
     Limit,
+    Authority,
+    Context,
 }
 
 /// Versioned metadata-only event for one provider-neutral agent invocation.
