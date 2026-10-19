@@ -3,9 +3,10 @@ $ErrorActionPreference='Stop'
 . $Helper
 . (Join-Path $PSScriptRoot query-test-handles.ps1)
 $summaries=[Collections.Generic.List[object]]::new()
-if ($SummaryOutput) { . "$PSScriptRoot/query-summary.ps1" }
+. "$PSScriptRoot/query-summary.ps1"
 foreach ($fault in $Faults) {
     $script:ownedRoot=$null; $script:stdoutReader=$null; $script:stderrReader=$null
+    $script:stdoutHandle=$null; $script:stderrHandle=$null
     $started=[Action[Diagnostics.Process]]{
         param([Diagnostics.Process]$queryProcess)
         $script:ownedRoot=[Diagnostics.Process]::GetProcessById($queryProcess.Id)
@@ -16,6 +17,14 @@ foreach ($fault in $Faults) {
     }
     try {
         $result=[CovenNativeQuery]::RunForTests($Node,@('-e','setInterval(()=>{},1000)'),1000,1024,$fault,$started)
+        # Snapshot helper-return state before the unchanged assertions and teardown.
+        # Emitting this bounded record can affect later fixture teardown scheduling.
+        try {
+            $observation=ConvertTo-CovenCleanupObservation -Result $result -Fault $fault -StdoutHandle $script:stdoutHandle -StderrHandle $script:stderrHandle
+            Write-Host ('COVEN_CLEANUP_OBSERVATION '+($observation | ConvertTo-Json -Depth 5 -Compress))
+        } catch {
+            try { Write-Host 'COVEN_CLEANUP_OBSERVATION {"kind":"cleanup-fixture","projectionFailed":true}' } catch { }
+        }
         if ($result.Failure -eq '' -or -not $result.RootExited -or -not $result.ReadersSettled) { throw 'Fault did not retain structured cleanup evidence' }
         if (-not $script:stdoutHandle.IsClosed -or -not $script:stderrHandle.IsClosed) { throw 'Fault left owned reader handles open' }
         if ($null -eq $result.Phases -or $null -eq $result.Phases.StartCallReturnedTicks -or $null -eq $result.Phases.RootWaitReturnedTicks -or $null -eq $result.Phases.ReaderDisposalAttemptsFinishedTicks) { throw 'Fault cleanup phase evidence missing' }

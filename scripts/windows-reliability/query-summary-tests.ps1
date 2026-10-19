@@ -38,4 +38,33 @@ try {
  if ($_.Exception.Message -cne 'Invalid query phase observations') { throw 'Missing property lost fixed failure class' }
 } finally { $raw.Phases=$originalPhases }
 try { ConvertTo-CovenQuerySummary -Id 'SECRET' -Result $raw; throw 'Unexpected success' } catch { if ($_.Exception.Message -eq 'Unexpected success') { throw } }
+# The fixture observation must distinguish each failed assertion member without
+# publishing raw failure text, output, arbitrary fault labels or query identity.
+if (-not (Get-Command ConvertTo-CovenCleanupObservation -ErrorAction SilentlyContinue)) { throw 'Cleanup observation projection missing' }
+foreach ($case in @('empty-failure','root-not-exited','readers-unsettled')) {
+ $raw.Failure=if ($case -eq 'empty-failure') { '' } else { 'SECRET failure' }
+ $raw.RootExited=$case -ne 'root-not-exited'; $raw.ReadersSettled=$case -ne 'readers-unsettled'
+ foreach ($fault in @('after-start','reader','SECRET private fault')) {
+  $o=ConvertTo-CovenCleanupObservation -Result $raw -Fault $fault
+  $expectedFault=if ($fault -in @('after-start','reader')) { $fault } else { 'other' }
+  if ($o.fault -cne $expectedFault -or $o.projectionFailed -or $o.kind -cne 'cleanup-fixture') { throw 'Cleanup fixture identity lost' }
+  if ($o.hasFailure -ne ($case -ne 'empty-failure') -or $o.rootExited -ne $raw.RootExited -or $o.readersSettled -ne $raw.ReadersSettled) { throw 'Cleanup predicate observations conflated' }
+  if ($null -ne $o.stdoutHandleClosed -or $null -ne $o.stderrHandleClosed) { throw 'Unknown handle state was invented' }
+  if ($o.phases.PSObject.Properties.Name.Count -ne 22 -or $o.phases.startCallReturnedTicks -ne 2L) { throw 'Cleanup phase projection lost' }
+  $j=$o | ConvertTo-Json -Depth 5 -Compress
+  if ($j -match 'SECRET|/Users|foreign-session|S-1-5-21|OperationEnd|xperf|Sha256|stdoutChars|stderrChars|"id"') { throw 'Cleanup fixture leaked private or unrelated query data' }
+ }
+}
+$handle=[Microsoft.Win32.SafeHandles.SafeFileHandle]::new([IntPtr](-1),$false)
+try {
+ $o=ConvertTo-CovenCleanupObservation -Result $raw -Fault 'reader' -StdoutHandle $handle
+ if ($o.stdoutHandleClosed -cne $false) { throw 'Open retained handle state lost' }
+ $handle.Dispose()
+ $o=ConvertTo-CovenCleanupObservation -Result $raw -Fault 'reader' -StdoutHandle $handle
+ if ($o.stdoutHandleClosed -cne $true) { throw 'Closed retained handle state lost' }
+} finally { $handle.Dispose() }
+$raw.Phases=$bad
+$o=ConvertTo-CovenCleanupObservation -Result $raw -Fault 'SECRET private fault'
+$j=$o | ConvertTo-Json -Compress
+if (-not $o.projectionFailed -or $o.fault -cne 'other' -or $o.PSObject.Properties.Name.Count -ne 3 -or $j -match 'SECRET') { throw 'Projection failure lost its fixed safe marker' }
 'query summary privacy and accounting PASS'

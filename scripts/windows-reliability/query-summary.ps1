@@ -49,3 +49,22 @@ function ConvertTo-CovenQuerySummary {
         stderrSha256 = & $digest ([string]$Result.Stderr)
     }
 }
+
+# A fixture observation is distinct from an executed metadata query. Projection
+# failure must not replace the fixture assertion or bypass its owned teardown.
+function ConvertTo-CovenCleanupObservation {
+    param($Result,[string]$Fault,[Runtime.InteropServices.SafeHandle]$StdoutHandle,[Runtime.InteropServices.SafeHandle]$StderrHandle)
+    $label=if ($Fault -ceq 'after-start') { 'after-start' } elseif ($Fault -ceq 'reader') { 'reader' } else { 'other' }
+    try {
+        $summary=ConvertTo-CovenQuerySummary -Id 'xperf-start-help' -Result $Result
+        [pscustomobject][ordered]@{
+            kind='cleanup-fixture'; fault=$label; projectionFailed=$false
+            started=$summary.started; timedOut=$summary.timedOut; outputLimited=$summary.outputLimited
+            rootExited=$summary.rootExited; readersSettled=$summary.readersSettled; reaped=$summary.reaped
+            exitCode=$summary.exitCode; elapsedMs=$summary.elapsedMs; phases=$summary.phases
+            hasFailure=$summary.hasFailure; hasCleanupFailure=$summary.hasCleanupFailure; hasReaderFailure=$summary.hasReaderFailure
+            stdoutHandleClosed=if ($null -eq $StdoutHandle) { $null } else { [bool]$StdoutHandle.IsClosed }
+            stderrHandleClosed=if ($null -eq $StderrHandle) { $null } else { [bool]$StderrHandle.IsClosed }
+        }
+    } catch { [pscustomobject][ordered]@{ kind='cleanup-fixture'; fault=$label; projectionFailed=$true } }
+}
