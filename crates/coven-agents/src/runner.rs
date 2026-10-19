@@ -5,11 +5,11 @@ use std::{
 
 use crate::{
     agent_loop::{AgentLoop, AgentPolicy, AgentStop, ModelHistory, RunEmitter, RunProgress},
-    Agent, AgentId, AgentRef, ConfigError, ContentDigest, ContextManifest, ContextResolver,
+    Agent, AgentId, AgentRef, Clock, ConfigError, ContentDigest, ContextManifest, ContextResolver,
     DelegationDigests, HandoffCall, InvocationContext, InvocationEventKind, InvocationId,
     InvocationObserver, InvocationRequest, InvocationSource, NoopInvocationObserver, NoopObserver,
-    PreparedDelegation, RunError, RunEvent, RunFailure, RunFailureKind, RunItem, RunObserver,
-    SessionStore,
+    PreparedDelegation, RunControls, RunError, RunEvent, RunFailure, RunFailureKind, RunItem,
+    RunObserver, RunSignal, SessionStore, SystemClock,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +77,7 @@ where
     require_revision: bool,
     policy: AgentPolicy<'a>,
     context: Option<(&'a ContextManifest, &'a dyn ContextResolver<C>)>,
+    controls: RunControls,
 }
 
 impl<C> Default for RunScope<'_, C>
@@ -88,6 +89,7 @@ where
             require_revision: false,
             policy: AgentPolicy::default(),
             context: None,
+            controls: RunControls::default(),
         }
     }
 }
@@ -100,6 +102,7 @@ where
     session: Option<Arc<dyn SessionStore>>,
     observer: Arc<dyn RunObserver>,
     invocation_observer: Arc<dyn InvocationObserver>,
+    clock: Arc<dyn Clock>,
 }
 
 impl<C> Runner<C>
@@ -172,6 +175,7 @@ where
             session: None,
             observer: Arc::new(NoopObserver),
             invocation_observer: Arc::new(NoopInvocationObserver),
+            clock: Arc::new(SystemClock::default()),
         })
     }
 
@@ -187,6 +191,12 @@ where
 
     pub fn with_invocation_observer(mut self, observer: Arc<dyn InvocationObserver>) -> Self {
         self.invocation_observer = observer;
+        self
+    }
+
+    /// Replaces the monotonic clock used for run deadlines.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -336,6 +346,39 @@ where
         .await
     }
 
+    /// Runs one validated invocation request under caller-supplied
+    /// cancellation and deadline controls.
+    ///
+    /// The runner checks for a stop before each model turn, after each model
+    /// response, and before each tool dispatch. A stop observed there ends
+    /// the run with [`RunFailureKind::Cancelled`]; completed tool effects
+    /// remain in the partial transcript. A tool that fails after a stop
+    /// arrived while it ran ends the run with
+    /// [`RunFailureKind::TerminationUnknown`] unless it returns
+    /// [`crate::NotStarted`]. Once the final output passes policy, the run
+    /// completes. Nothing is retried.
+    pub async fn run_invocation_controlled(
+        &self,
+        request: InvocationRequest,
+        input: impl Into<String>,
+        context: &C,
+        options: RunOptions,
+        controls: RunControls,
+    ) -> Result<RunResult, RunFailure> {
+        self.run_invocation_inner(
+            request,
+            input,
+            context,
+            options,
+            RunScope {
+                require_revision: true,
+                controls,
+                ..RunScope::default()
+            },
+        )
+        .await
+    }
+
     /// Runs one prepared delegation as a child invocation of its parent.
     ///
     /// The child starts from the task input and the context the parent
@@ -381,6 +424,7 @@ where
                 max_output_bytes: Some(spec.result.max_output_bytes()),
             },
             context: Some((&spec.context, resolver)),
+            controls: RunControls::default(),
         };
         match self
             .run_invocation_inner(request, spec.task.as_str(), context, options, scope)
@@ -552,6 +596,7 @@ where
             self.invocation_observer.as_ref(),
             request,
         );
+        let signal = RunSignal::start(scope.controls, Arc::clone(&self.clock));
         let starting_agent = request.requested_target.id().clone();
         emitter.run_event(RunEvent::RunStarted {
             invocation: request.invocation.clone(),
@@ -598,7 +643,7 @@ where
             ));
         }
 
-        let agent_loop = AgentLoop::new(&emitter, scope.policy, options.max_turns);
+        let agent_loop = AgentLoop::new(&emitter, scope.policy, options.max_turns, &signal);
         agent_loop.check_ingress(&current, &input, context).await?;
 
         let prior = match (&options.session_id, &self.session) {
@@ -724,6 +769,7 @@ mod tests {
             session: None,
             observer: Arc::new(NoopObserver),
             invocation_observer: Arc::new(NoopInvocationObserver),
+            clock: Arc::new(SystemClock::default()),
         };
         let request = InvocationRequest::new(
             InvocationContext::root(InvocationId::new()),
@@ -759,6 +805,17 @@ mod tests {
             InvocationContext::root(InvocationId::new()),
         ));
         assert_send(&runner.run_invocation(request, "input", &(), RunOptions::default()));
+        assert_send(&runner.run_invocation_controlled(
+            InvocationRequest::new(
+                InvocationContext::root(InvocationId::new()),
+                InvocationSource::Caller,
+                AgentRef::new("agent").unwrap(),
+            ),
+            "input",
+            &(),
+            RunOptions::default(),
+            RunControls::new().with_cancellation(crate::CancellationToken::new()),
+        ));
         assert_send(&runner.run_delegation(prepared, &NoContext, &()));
     }
 }

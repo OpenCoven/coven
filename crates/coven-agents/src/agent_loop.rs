@@ -13,8 +13,8 @@ use crate::{
     Agent, AgentId, AgentRef, AuthorityScope, GuardrailStage, GuardrailVerdict, HandoffCall,
     HandoffDefinition, InvocationContext, InvocationEvent, InvocationEventKind,
     InvocationFailureKind, InvocationObserver, InvocationRequest, ModelAction, ModelRequest,
-    ReviewOutcome, ReviewVerdict, RunError, RunEvent, RunFailureKind, RunItem, RunObserver,
-    ToolCall, ToolProposal,
+    NotStarted, ReviewOutcome, ReviewVerdict, RunError, RunEvent, RunFailureKind, RunItem,
+    RunObserver, RunSignal, StopReason, ToolCall, ToolProposal,
 };
 
 /// Transcript and counters accumulated by a run in progress.
@@ -42,6 +42,8 @@ const fn invocation_failure_kind(kind: RunFailureKind) -> InvocationFailureKind 
         RunFailureKind::Limit => InvocationFailureKind::Limit,
         RunFailureKind::Authority => InvocationFailureKind::Authority,
         RunFailureKind::Context => InvocationFailureKind::Context,
+        RunFailureKind::Cancelled => InvocationFailureKind::Cancelled,
+        RunFailureKind::TerminationUnknown => InvocationFailureKind::TerminationUnknown,
     }
 }
 
@@ -160,13 +162,15 @@ pub(crate) enum AgentStop {
     ControlTransfer(HandoffCall),
 }
 
-/// Runs one agent's model/tool loop under an invocation's policy and turn
-/// budget. The budget is shared by every agent in the invocation, so it is
-/// read from [`RunProgress::turns`] rather than reset per agent.
+/// Runs one agent's model/tool loop under an invocation's policy, turn
+/// budget, and stop signal. The budget is shared by every agent in the
+/// invocation, so it is read from [`RunProgress::turns`] rather than reset
+/// per agent.
 pub(crate) struct AgentLoop<'a> {
     emitter: &'a RunEmitter<'a>,
     policy: AgentPolicy<'a>,
     max_turns: usize,
+    signal: &'a RunSignal,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -174,11 +178,46 @@ impl<'a> AgentLoop<'a> {
         emitter: &'a RunEmitter<'a>,
         policy: AgentPolicy<'a>,
         max_turns: usize,
+        signal: &'a RunSignal,
     ) -> Self {
         Self {
             emitter,
             policy,
             max_turns,
+            signal,
+        }
+    }
+
+    /// Records that the runner observed a stop request.
+    fn observe_stop<C: Sync>(&self, agent: &Agent<C>, reason: StopReason) {
+        self.emitter.run_event(RunEvent::CancellationRequested {
+            invocation: self.emitter.invocation().clone(),
+            agent: agent.id.clone(),
+            reason,
+        });
+        self.emitter
+            .invocation_event(InvocationEventKind::CancellationRequested { reason });
+    }
+
+    /// Acknowledges a stop with no tool in flight.
+    fn acknowledge_stop<C: Sync>(&self, agent: &Agent<C>, reason: StopReason) -> RunError {
+        self.observe_stop(agent, reason);
+        self.fail(
+            agent,
+            RunFailureKind::Cancelled,
+            RunError::Cancelled {
+                agent: agent.id.clone(),
+                reason,
+            },
+        )
+    }
+
+    /// Stops cleanly if a stop has been requested. Called only where no tool
+    /// is in flight.
+    fn checkpoint<C: Sync>(&self, agent: &Agent<C>) -> Result<(), RunError> {
+        match self.signal.stop_reason() {
+            Some(reason) => Err(self.acknowledge_stop(agent, reason)),
+            None => Ok(()),
         }
     }
 
@@ -379,6 +418,7 @@ impl<'a> AgentLoop<'a> {
         context: &C,
     ) -> Result<AgentStop, RunError> {
         while progress.turns < self.max_turns {
+            self.checkpoint(agent)?;
             progress.turns += 1;
             let turn = progress.turns;
 
@@ -409,21 +449,25 @@ impl<'a> AgentLoop<'a> {
                     })
                     .collect(),
             };
-            let response =
-                agent
-                    .model
-                    .generate(model_request, context)
-                    .await
-                    .map_err(|source| {
-                        self.fail(
-                            agent,
-                            RunFailureKind::Model,
-                            RunError::ModelFailed {
-                                agent: agent.id.clone(),
-                                source,
-                            },
-                        )
-                    })?;
+            let response = agent
+                .model
+                .generate_with_signal(model_request, context, self.signal)
+                .await;
+            // A response that arrives after a stop is discarded: none of its
+            // actions run, whether or not the model call succeeded.
+            if let Some(reason) = self.signal.stop_reason() {
+                return Err(self.acknowledge_stop(agent, reason));
+            }
+            let response = response.map_err(|source| {
+                self.fail(
+                    agent,
+                    RunFailureKind::Model,
+                    RunError::ModelFailed {
+                        agent: agent.id.clone(),
+                        source,
+                    },
+                )
+            })?;
 
             if let Some(message) = &response.assistant_message {
                 progress.items.push(RunItem::AssistantMessage {
@@ -507,6 +551,7 @@ impl<'a> AgentLoop<'a> {
                         },
                     ));
                 };
+                self.checkpoint(agent)?;
                 if !self.policy.permits_tool(&call.name) {
                     return Err(self.fail(
                         agent,
@@ -535,6 +580,10 @@ impl<'a> AgentLoop<'a> {
                 // proposal stays in the transcript either way; only a permit
                 // reaches the tool.
                 let review = self.review_tool_proposal(agent, &call, context).await?;
+                if review.is_none() {
+                    // Last point at which a stop leaves nothing in flight.
+                    self.checkpoint(agent)?;
+                }
                 progress.items.push(RunItem::ToolCall {
                     agent: agent.id.clone(),
                     call: call.clone(),
@@ -561,12 +610,34 @@ impl<'a> AgentLoop<'a> {
                     tool: call.name.clone(),
                     call_id: call.id.clone(),
                 });
-                let output =
-                    tool.tool
-                        .execute(call.arguments, context)
-                        .await
-                        .map_err(|source| {
-                            self.fail(
+                let output = match tool
+                    .tool
+                    .execute_with_signal(call.arguments, context, self.signal)
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(source) => {
+                        return Err(match self.signal.stop_reason() {
+                            // The tool proved it produced nothing.
+                            Some(reason) if source.downcast_ref::<NotStarted>().is_some() => {
+                                self.acknowledge_stop(agent, reason)
+                            }
+                            // A stop arrived while the tool ran and it failed
+                            // without that proof: the effect is unknown.
+                            Some(reason) => {
+                                self.observe_stop(agent, reason);
+                                self.fail(
+                                    agent,
+                                    RunFailureKind::TerminationUnknown,
+                                    RunError::TerminationUnknown {
+                                        agent: agent.id.clone(),
+                                        call_id: call.id.clone(),
+                                        reason,
+                                        source,
+                                    },
+                                )
+                            }
+                            None => self.fail(
                                 agent,
                                 RunFailureKind::Tool,
                                 RunError::ToolFailed {
@@ -574,8 +645,10 @@ impl<'a> AgentLoop<'a> {
                                     tool: call.name.clone(),
                                     source,
                                 },
-                            )
-                        })?;
+                            ),
+                        });
+                    }
+                };
                 progress.items.push(RunItem::ToolResult {
                     agent: agent.id.clone(),
                     call_id: call.id.clone(),

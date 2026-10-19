@@ -11,6 +11,7 @@ mod delegation;
 mod error;
 mod guardrail;
 mod invocation;
+mod lifecycle;
 mod loop_journal;
 mod loop_runner;
 mod model;
@@ -33,6 +34,10 @@ pub use invocation::{
     AgentRef, AgentRefError, AgentRevision, InvocationContext, InvocationEvent,
     InvocationEventKind, InvocationEventVersion, InvocationFailureKind, InvocationId,
     InvocationRequest, InvocationSource,
+};
+pub use lifecycle::{
+    CancellationToken, Clock, ManualClock, NotStarted, RunControls, RunSignal, StopReason,
+    SystemClock,
 };
 pub use loop_journal::FileLoopJournal;
 pub use loop_runner::{
