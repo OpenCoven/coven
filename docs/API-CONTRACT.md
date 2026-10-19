@@ -345,6 +345,24 @@ including `version`, `contractProfile`, `supported`, `experimental`, `refused`,
 and `negotiationRules`. Entries without variant negotiation omit the field, so
 the catalog remains distinct from the harness manifests below.
 
+The `coven.automations` entry also carries `missionEnvelopes`, the runtime
+envelopes a mission submit may name, each with the descriptor digest the submit
+check enforces:
+
+```json
+"missionEnvelopes": [
+  {
+    "id": "r0-read.1",
+    "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "<64 hex>" }
+  }
+]
+```
+
+A submit naming any other envelope or digest is refused with
+`CAPABILITY_UNSUPPORTED`, and `details.supportedEnvelopes` repeats this list.
+Other entries omit the field. See
+[the mission contract](architecture/coven-automations-missions.md).
+
 ## Harness capability manifests (`v1`)
 
 Distinct from the control-plane catalog above, `GET /api/v1/capabilities/harnesses` returns what each installed harness brings (global instructions, skills, plugins) plus Coven-owned skills, and `GET /api/v1/capabilities/:harnessId` returns a single harness's manifest. Both accept `?refresh=1` to invalidate the 5-minute scan cache. This surface keeps the snake_case field names pinned by `specs/coven-harness-capabilities/`:

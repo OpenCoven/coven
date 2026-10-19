@@ -1,4 +1,5 @@
-//! `coven missions`: submit, read, watch and cancel one familiar mission (#1313).
+//! `coven missions`: submit, read, watch and cancel one familiar mission (#1313),
+//! and list the runtime envelopes a mission may name.
 //!
 //! Every command calls the running daemon over its owner-only socket or pipe
 //! through `coven_client::DaemonClient`. None uses the in-process action path,
@@ -20,6 +21,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const ACTIONS_PATH: &str = "/api/v1/actions";
+const CAPABILITIES_PATH: &str = "/api/v1/capabilities";
 const ENVELOPE_ACTION: &str = "coven.automations.command.v1";
 const GET_ACTION: &str = "coven.automations.mission.get.v1";
 const SCHEMA_VERSION: &str = "coven.automations.v1";
@@ -75,6 +77,12 @@ pub(crate) enum MissionsCommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Print the runtime envelopes the running daemon accepts for missions")]
+    Envelopes {
+        /// Print the daemon's JSON instead of one line per envelope.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The command printed its result, and its exit status says what kind it was.
@@ -127,7 +135,8 @@ pub(crate) fn run(command: MissionsCommand) -> Result<()> {
             }
         }
         MissionsCommand::Get { mission_id, json } => {
-            let view = read_view(&mut daemon, &mission_id)?;
+            let view = read_view(&mut daemon, &mission_id)
+                .map_err(|error| read_failed(error, json, stdout))?;
             print_view(&view, json, stdout)
         }
         MissionsCommand::Watch {
@@ -140,6 +149,10 @@ pub(crate) fn run(command: MissionsCommand) -> Result<()> {
             json,
             stdout,
         ),
+        MissionsCommand::Envelopes { json } => {
+            let envelopes = daemon.envelopes()?;
+            print_envelopes(&envelopes, json, stdout)
+        }
     }
 }
 
@@ -166,6 +179,77 @@ impl Daemon {
             Err(error) => Delivery::Unknown(error),
         }
     }
+
+    /// The envelopes the daemon's capability catalog advertises for missions.
+    fn envelopes(&mut self) -> Result<Value> {
+        let response = self
+            .0
+            .request_json("GET", CAPABILITIES_PATH, None)
+            .map_err(|error| anyhow!(error).context("failed to read the daemon's capabilities"))?;
+        catalog_envelopes(response.status, &response.body)
+    }
+}
+
+/// The mission envelopes in a capability catalog answer, as
+/// `{"envelopes": [{id, descriptorDigest}]}`. A daemon from before the
+/// advertisement has no `missionEnvelopes`, and nothing is guessed for it.
+fn catalog_envelopes(status: u16, body: &[u8]) -> Result<Value> {
+    if status != 200 {
+        bail!("the daemon refused the capability read with HTTP status {status}");
+    }
+    let catalog: Value = serde_json::from_slice(body)
+        .context("the daemon's capability catalog was not valid JSON")?;
+    let automations = catalog
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .and_then(|capabilities| {
+            capabilities
+                .iter()
+                .find(|capability| capability.get("id") == Some(&json!("coven.automations")))
+        })
+        .context("the daemon's capability catalog has no coven.automations entry")?;
+    let envelopes = automations.get("missionEnvelopes").context(
+        "the running daemon does not advertise mission envelopes; restart it after updating Coven",
+    )?;
+    let well_formed = envelopes.as_array().is_some_and(|envelopes| {
+        envelopes.iter().all(|envelope| {
+            let digest = &envelope["descriptorDigest"];
+            envelope["id"]
+                .as_str()
+                .is_some_and(|id| (1..=64).contains(&id.len()))
+                && digest["algorithm"] == "sha256"
+                && digest["canonicalization"] == "jcs-rfc8785"
+                && digest["value"].as_str().is_some_and(|value| {
+                    value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                })
+        })
+    });
+    if !well_formed {
+        bail!("the daemon advertised a malformed mission envelope list");
+    }
+    Ok(json!({ "envelopes": envelopes }))
+}
+
+fn print_envelopes(envelopes: &Value, json: bool, out: &mut impl Write) -> Result<()> {
+    if json {
+        writeln!(out, "{}", serde_json::to_string(envelopes)?)?;
+    } else {
+        for envelope in envelopes["envelopes"].as_array().into_iter().flatten() {
+            writeln!(
+                out,
+                "{} sha256:{}",
+                envelope["id"].as_str().unwrap_or("?"),
+                envelope["descriptorDigest"]["value"]
+                    .as_str()
+                    .unwrap_or("?")
+            )?;
+        }
+    }
+    out.flush()?;
+    Ok(())
 }
 
 /// What happened to one request.
@@ -416,11 +500,14 @@ fn view_answer(status: u16, body: &[u8], mission_id: &str) -> Result<Value> {
         bail!("the daemon's answer was not a mission read");
     }
     if status != 200 || wrapper.get("ok") != Some(&json!(true)) {
-        let code = wrapper
-            .pointer("/error/code")
-            .and_then(Value::as_str)
+        let error = wrapper
+            .get("error")
+            .filter(|error| error.get("code").and_then(Value::as_str).is_some())
             .context("the daemon refused the read without a typed error")?;
-        bail!(MissionRefused(code.to_owned()));
+        bail!(MissionRefused {
+            mission_id: mission_id.to_owned(),
+            error: error.clone(),
+        });
     }
     let view = wrapper.get("result").cloned().unwrap_or(Value::Null);
     if view.get("missionId").and_then(Value::as_str) != Some(mission_id)
@@ -432,17 +519,40 @@ fn view_answer(status: u16, body: &[u8], mission_id: &str) -> Result<Value> {
     Ok(view)
 }
 
-/// The daemon refused a mission read with this typed code.
+/// The daemon refused a mission read with this typed error.
 #[derive(Debug)]
-struct MissionRefused(String);
+struct MissionRefused {
+    mission_id: String,
+    error: Value,
+}
+
+impl MissionRefused {
+    fn code(&self) -> &str {
+        self.error["code"].as_str().unwrap_or("?")
+    }
+}
 
 impl fmt::Display for MissionRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "the daemon refused the mission read: {}", self.0)
+        write!(f, "the daemon refused the mission read: {}", self.code())
     }
 }
 
 impl std::error::Error for MissionRefused {}
+
+/// Under `--json`, a typed read refusal is printed on standard output as
+/// `{"missionId", "error"}` with the daemon's own error, as a command's refusal
+/// is, and the command exits 1. Any other failure prints nothing there.
+fn read_failed(error: anyhow::Error, json: bool, out: &mut impl Write) -> anyhow::Error {
+    let Some(refused) = error.downcast_ref::<MissionRefused>().filter(|_| json) else {
+        return error;
+    };
+    let line = json!({ "missionId": refused.mission_id, "error": refused.error });
+    match writeln!(out, "{line}").and_then(|()| out.flush()) {
+        Ok(()) => MissionsExit(1).into(),
+        Err(write) => write.into(),
+    }
+}
 
 fn print_view(view: &Value, json: bool, out: &mut impl Write) -> Result<()> {
     if json {
@@ -474,7 +584,7 @@ fn watch(
 ) -> Result<()> {
     let mut shown = 0;
     loop {
-        let view = read()?;
+        let view = read().map_err(|error| read_failed(error, json, out))?;
         let revision = view
             .get("revision")
             .and_then(Value::as_u64)
@@ -669,9 +779,76 @@ mod tests {
         assert_eq!(
             error
                 .downcast_ref::<MissionRefused>()
-                .map(|refused| refused.0.as_str()),
+                .map(MissionRefused::code),
             Some("NOT_FOUND")
         );
+
+        // With --json the refusal is printed, so a client can tell NOT_FOUND
+        // from a daemon it never reached; without it, nothing is printed.
+        let mut out = Vec::new();
+        let exit = read_failed(view_answer(404, &missing, &id).unwrap_err(), true, &mut out);
+        assert_eq!(
+            exit.downcast_ref::<MissionsExit>().map(|exit| exit.0),
+            Some(1)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap(),
+            json!({ "missionId": id, "error": { "code": "NOT_FOUND", "httpStatus": 404 } })
+        );
+        let mut quiet = Vec::new();
+        let error = read_failed(
+            view_answer(404, &missing, &id).unwrap_err(),
+            false,
+            &mut quiet,
+        );
+        assert!(error.downcast_ref::<MissionRefused>().is_some());
+        assert!(quiet.is_empty());
+        let unreached = read_failed(anyhow!("no running Coven daemon"), true, &mut quiet);
+        assert!(unreached.downcast_ref::<MissionsExit>().is_none());
+        assert!(quiet.is_empty());
+    }
+
+    #[test]
+    fn envelopes_are_read_from_the_catalog_and_never_guessed() {
+        let digest = json!({ "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "3".repeat(64) });
+        let catalog = |automations: Value| {
+            serde_json::to_vec(&json!({ "capabilities": [
+                { "id": "coven.control.actions", "actions": [] },
+                automations,
+            ] }))
+            .unwrap()
+        };
+        let advertised = catalog(json!({
+            "id": "coven.automations",
+            "missionEnvelopes": [{ "id": "r0-read.1", "descriptorDigest": digest }],
+        }));
+        let envelopes = catalog_envelopes(200, &advertised).unwrap();
+        assert_eq!(
+            envelopes,
+            json!({ "envelopes": [{ "id": "r0-read.1", "descriptorDigest": digest }] })
+        );
+        let mut out = Vec::new();
+        print_envelopes(&envelopes, false, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("r0-read.1 sha256:{}\n", "3".repeat(64))
+        );
+
+        // A daemon from before the advertisement, a refusal, and a malformed
+        // list all fail; none becomes an empty or invented list.
+        let older = catalog(json!({ "id": "coven.automations", "actions": [] }));
+        assert!(catalog_envelopes(200, &older).is_err());
+        assert!(catalog_envelopes(503, &advertised).is_err());
+        for bad in [
+            json!({ "id": "r0-read.1", "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "3".repeat(63) } }),
+            json!({ "id": "r0-read.1", "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "A".repeat(64) } }),
+            json!({ "id": "r0-read.1", "descriptorDigest": { "algorithm": "sha512", "canonicalization": "jcs-rfc8785", "value": "3".repeat(64) } }),
+            json!({ "id": "", "descriptorDigest": digest }),
+        ] {
+            let malformed =
+                catalog(json!({ "id": "coven.automations", "missionEnvelopes": [bad] }));
+            assert!(catalog_envelopes(200, &malformed).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -697,6 +874,41 @@ mod tests {
             format!("{id} queued (revision 1)\n{id} running (revision 2)\n{id} unavailable (revision 3)\n")
         );
         assert!(views.next().is_none());
+    }
+
+    #[test]
+    fn a_refused_watch_prints_the_refusal_under_json() {
+        let id = mission_id_for(KEY).unwrap();
+        let missing = serde_json::to_vec(&json!({ "ok": false, "accepted": false, "action": GET_ACTION, "status": "rejected", "error": { "code": "NOT_FOUND" } })).unwrap();
+        let mut reads = vec![
+            Ok(view(1, "queued", false)),
+            view_answer(404, &missing, &id),
+        ]
+        .into_iter();
+        let mut out = Vec::new();
+        let error = watch(
+            || reads.next().context("read past the end")?,
+            Duration::ZERO,
+            true,
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<MissionsExit>().map(|exit| exit.0),
+            Some(1)
+        );
+        let lines: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                view(1, "queued", false),
+                json!({ "missionId": id, "error": { "code": "NOT_FOUND" } }),
+            ]
+        );
     }
 
     #[test]

@@ -20,6 +20,10 @@ pub struct Capability {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant_negotiation:
         Option<&'static crate::automations::capability_negotiation::CapabilityProfile>,
+    /// The runtime envelopes a mission may name, each with the descriptor
+    /// digest the submit check enforces. Only `coven.automations` has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_envelopes: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -83,6 +87,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
                 variant_negotiation: None,
+                mission_envelopes: None,
             },
             Capability {
                 id: "coven.travel",
@@ -92,6 +97,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
                 variant_negotiation: None,
+                mission_envelopes: None,
             },
             Capability {
                 id: "coven.scheduler",
@@ -101,6 +107,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
                 variant_negotiation: None,
+                mission_envelopes: None,
             },
             Capability {
                 id: "coven.control.actions",
@@ -110,6 +117,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 policy: CapabilityPolicy::Allow,
                 actions: vec!["coven.capabilities.refresh"],
                 variant_negotiation: None,
+                mission_envelopes: None,
             },
             Capability {
                 id: "coven.automations",
@@ -163,6 +171,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 variant_negotiation: Some(
                     crate::automations::capability_negotiation::capability_profile(),
                 ),
+                mission_envelopes: Some(crate::automations::missions::advertised_envelopes()),
             },
             Capability {
                 id: "desktop.automation",
@@ -172,6 +181,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 policy: CapabilityPolicy::RequiresApproval,
                 actions: vec![],
                 variant_negotiation: None,
+                mission_envelopes: None,
             },
         ],
     }
@@ -2550,6 +2560,38 @@ mod tests {
         {
             assert!(
                 capability.get("variantNegotiation").is_none(),
+                "unrelated capability changed: {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_catalog_advertises_the_mission_envelopes_the_submit_check_enforces() {
+        use crate::automations::runtime_envelope::CLAUDE_R0_READ;
+
+        let catalog = serde_json::to_value(capabilities()).unwrap();
+        let capabilities = catalog["capabilities"].as_array().unwrap();
+        let automations = capabilities
+            .iter()
+            .find(|capability| capability["id"] == "coven.automations")
+            .unwrap();
+        assert_eq!(
+            automations["missionEnvelopes"],
+            json!([{
+                "id": "r0-read.1",
+                "descriptorDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": CLAUDE_R0_READ.descriptor_digest(),
+                },
+            }])
+        );
+        for capability in capabilities
+            .iter()
+            .filter(|capability| capability["id"] != "coven.automations")
+        {
+            assert!(
+                capability.get("missionEnvelopes").is_none(),
                 "unrelated capability changed: {capability}"
             );
         }

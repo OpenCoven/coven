@@ -475,10 +475,7 @@ fn claim_in(
     if request.envelope.id.as_str() != CLAUDE_R0_READ.descriptor_version
         || request.envelope.descriptor_digest.value.as_str() != supported_digest
     {
-        return Ok(Err(unsupported_envelope(
-            request.envelope.id.as_str(),
-            &supported_digest,
-        )));
+        return Ok(Err(unsupported_envelope(request.envelope.id.as_str())));
     }
 
     let cwd = match canonical_directory(request.project.cwd.as_str()) {
@@ -838,7 +835,17 @@ fn project(state: &str, failure_reason: Option<&str>) -> (&'static str, Option<&
     }
 }
 
-fn unsupported_envelope(requested: &str, supported_digest: &str) -> ErrorEnvelope {
+/// The runtime envelopes a mission may name. The capability catalog
+/// advertises this list as `missionEnvelopes`, and an unsupported-envelope
+/// refusal repeats it, so a client learns the digest before it submits.
+pub(crate) fn advertised_envelopes() -> Value {
+    json!([{
+        "id": CLAUDE_R0_READ.descriptor_version,
+        "descriptorDigest": digest_value(&CLAUDE_R0_READ.descriptor_digest()),
+    }])
+}
+
+fn unsupported_envelope(requested: &str) -> ErrorEnvelope {
     typed_error(
         ErrorCode::CapabilityUnsupported,
         format!(
@@ -847,10 +854,7 @@ fn unsupported_envelope(requested: &str, supported_digest: &str) -> ErrorEnvelop
     )
     .with_details(BTreeMap::from([(
         "supportedEnvelopes".to_owned(),
-        json!([{
-            "id": CLAUDE_R0_READ.descriptor_version,
-            "descriptorDigest": digest_value(supported_digest),
-        }]),
+        advertised_envelopes(),
     )]))
 }
 
@@ -934,10 +938,9 @@ mod tests {
     fn payload(fixture: &Fixture, requested_at: DateTime<Utc>) -> Value {
         json!({
             "familiar": { "rootId": fixture.root_id, "revisionId": fixture.revision_id },
-            "envelope": {
-                "id": "r0-read.1",
-                "descriptorDigest": digest_value(&CLAUDE_R0_READ.descriptor_digest()),
-            },
+            // What the catalog advertises, so every commit below proves the
+            // daemon accepts the envelope it advertises.
+            "envelope": advertised_envelopes()[0].clone(),
             "project": { "cwd": fixture.project.path().display().to_string() },
             "task": {
                 "statement": "Summarize the open issues.",
@@ -1206,7 +1209,8 @@ mod tests {
             assert_eq!(error["code"], code, "{name}: {error}");
             match name {
                 "envelope-id" => assert_eq!(
-                    error["details"]["supportedEnvelopes"][0]["id"], "r0-read.1",
+                    error["details"]["supportedEnvelopes"],
+                    advertised_envelopes(),
                     "{error}"
                 ),
                 "stale-revision" => assert_eq!(
