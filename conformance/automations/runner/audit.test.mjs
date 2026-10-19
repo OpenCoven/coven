@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { loadInventory, sourceScopedTarget } from "./audit.mjs";
+import { loadInventory, nativePlatform, sourceScopedTarget } from "./audit.mjs";
 import { digestBytes, digestCanonical } from "./conformance.mjs";
 import { verifyAutomationsProtocolBundle } from "../../../scripts/package-automations-protocol.mjs";
 
@@ -998,4 +998,71 @@ test("standalone Windows invocation fails explicitly before creating output", (t
   assert.equal(execution.status, 2);
   assert.match(execution.stderr, /Windows is unsupported/);
   assert.ok(!existsSync(output));
+});
+
+function nativePeFixture(machine = 0x8664, sections = 1) {
+  const bytes = Buffer.alloc(Math.max(512, 0x98 + 0xf0 + sections * 40));
+  bytes.writeUInt16LE(0x5a4d, 0);
+  bytes.writeUInt32LE(0x80, 0x3c);
+  bytes.writeUInt32LE(0x00004550, 0x80);
+  bytes.writeUInt16LE(machine, 0x84);
+  bytes.writeUInt16LE(sections, 0x86);
+  bytes.writeUInt16LE(0xf0, 0x94);
+  bytes.writeUInt16LE(0x0002, 0x96);
+  bytes.writeUInt16LE(0x20b, 0x98);
+  return bytes;
+}
+
+test("native binary PE32+ headers identify architecture without claiming execution", () => {
+  assert.deepEqual(nativePlatform(nativePeFixture()), { os: "win32", arch: "x64" });
+  assert.deepEqual(nativePlatform(nativePeFixture(0xaa64)), { os: "win32", arch: "arm64" });
+  assert.deepEqual(nativePlatform(nativePeFixture(0x8664, 96)), { os: "win32", arch: "x64" });
+});
+
+test("native binary PE metadata refuses truncated prefixes with fixed errors", () => {
+  const bytes = nativePeFixture();
+  for (let length = 0; length < 0x98 + 0xf0 + 40; length += 1) {
+    assert.throws(() => nativePlatform(bytes.subarray(0, length)), (error) =>
+      error.name !== "RangeError" && /^native binary /.test(error.message),
+    `accepted truncated PE prefix: ${length}`);
+  }
+});
+
+test("native binary PE metadata refuses incompatible and malformed images", () => {
+  const mutations = [
+    (bytes) => bytes.writeUInt32LE(63, 0x3c),
+    (bytes) => bytes.writeUInt32LE(0xffffffff, 0x3c),
+    (bytes) => bytes.writeUInt32LE(0, 0x80),
+    (bytes) => bytes.writeUInt16LE(0x14c, 0x84),
+    (bytes) => bytes.writeUInt16LE(0xffff, 0x84),
+    (bytes) => bytes.writeUInt16LE(0, 0x86),
+    (bytes) => bytes.writeUInt16LE(97, 0x86),
+    (bytes) => bytes.writeUInt16LE(111, 0x94),
+    (bytes) => bytes.writeUInt16LE(0xffff, 0x94),
+    (bytes) => bytes.writeUInt16LE(0, 0x96),
+    (bytes) => bytes.writeUInt16LE(0x2002, 0x96),
+    (bytes) => bytes.writeUInt16LE(0x10b, 0x98),
+  ];
+  for (const mutate of mutations) {
+    const bytes = nativePeFixture();
+    bytes.write("PRIVATE-PE-MARKER", 8, "ascii");
+    mutate(bytes);
+    assert.throws(() => nativePlatform(bytes), (error) =>
+      error.name !== "RangeError" && /^native binary /.test(error.message) &&
+        !error.message.includes("PRIVATE-PE-MARKER"));
+  }
+});
+
+test("native binary metadata keeps Mach-O and ELF recognition", () => {
+  const macho = Buffer.alloc(64);
+  macho.writeUInt32LE(0xfeedfacf, 0);
+  macho.writeUInt32LE(0x01000007, 4);
+  macho.writeUInt32LE(2, 12);
+  assert.deepEqual(nativePlatform(macho), { os: "darwin", arch: "x64" });
+  const elf = Buffer.alloc(64);
+  elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);
+  elf.writeUInt16LE(2, 16);
+  elf.writeUInt16LE(62, 18);
+  elf.writeUInt32LE(1, 20);
+  assert.deepEqual(nativePlatform(elf), { os: "linux", arch: "x64" });
 });

@@ -788,3 +788,57 @@ test("turns excessively deep target evidence into a failed result", async () => 
   const report = JSON.parse(result.stdout);
   assert.equal(report.statement.overallStatus, "failed");
 });
+
+test("Windows runner artifact binds canonical runner/helper identity separately from the subject", async () => {
+  const { createWindowsRunnerArtifact } = await import("./conformance.mjs");
+  const runner = Buffer.from("runner-fixture");
+  const helper = Buffer.from("helper-fixture");
+  const sourceCommit = "1".repeat(40);
+  const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  const artifact = createWindowsRunnerArtifact(runner, helper, sourceCommit);
+  const expected = {
+    schemaVersion: "coven.automations.windows-runner-artifact.v1",
+    sourceCommit,
+    runner: { fileName: "conformance.mjs", sha256: sha256(runner) },
+    containmentHelper: {
+      fileName: "coven-conformance-supervisor.exe",
+      abi: "coven.automations.windows-job-supervisor.v1",
+      sha256: sha256(helper),
+    },
+  };
+  assert.equal(artifact.version, "0.2.0-windows-job-v1");
+  assert.equal(artifact.bytes.toString("utf8"), canonicalize(expected));
+  assert.equal(artifact.sha256, sha256(artifact.bytes));
+  assert.deepEqual(JSON.parse(artifact.bytes), expected);
+  const repeated = createWindowsRunnerArtifact(Buffer.from(runner), Buffer.from(helper), sourceCommit);
+  assert.deepEqual(repeated, artifact);
+});
+
+test("Windows runner artifact rejects byte, role and source ambiguity", async () => {
+  const { createWindowsRunnerArtifact } = await import("./conformance.mjs");
+  const source = "1".repeat(40);
+  const bind = (runner, helper, commit = source) =>
+    createWindowsRunnerArtifact(Buffer.from(runner), Buffer.from(helper), commit).sha256;
+  const original = bind("runner", "helper");
+  assert.notEqual(bind("Runner", "helper"), original);
+  assert.notEqual(bind("runner", "Helper"), original);
+  assert.notEqual(bind("helper", "runner"), original);
+  assert.notEqual(bind("runner", "helper", "2".repeat(40)), original);
+  assert.notEqual(bind("a", "bc"), bind("ab", "c"));
+});
+
+test("Windows runner artifact refuses invalid inputs without echoing them", async () => {
+  const { createWindowsRunnerArtifact } = await import("./conformance.mjs");
+  const bytes = Buffer.from("fixture");
+  const source = "1".repeat(40);
+  for (const args of [
+    [null, bytes, source], [bytes, null, source],
+    ["PRIVATE-RUNNER", bytes, source], [bytes, "PRIVATE-HELPER", source],
+    [Buffer.alloc(0), bytes, source], [bytes, Buffer.alloc(0), source],
+    [bytes, bytes, "main"], [bytes, bytes, "PRIVATE-SOURCE"],
+    [bytes, bytes, "A".repeat(40)], [bytes, bytes, undefined],
+  ]) {
+    assert.throws(() => createWindowsRunnerArtifact(...args),
+      { message: "Windows runner artifact input is invalid" });
+  }
+});

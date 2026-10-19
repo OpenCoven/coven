@@ -215,8 +215,34 @@ export function loadInventory(directory = RUNNER_DIR) {
   return suites;
 }
 
-function nativePlatform(bytes) {
+function nativePePlatform(bytes) {
+  const offset = bytes.readUInt32LE(0x3c);
+  requireAudit(offset >= 64 && offset <= bytes.length - 24,
+    "native binary PE header offset is invalid");
+  requireAudit(bytes.readUInt32LE(offset) === 0x00004550,
+    "native binary PE signature is invalid");
+  const sections = bytes.readUInt16LE(offset + 6);
+  const optionalSize = bytes.readUInt16LE(offset + 20);
+  const optional = offset + 24;
+  const sectionTable = optional + optionalSize;
+  requireAudit(
+    optionalSize >= 112 && sections >= 1 && sections <= 96 &&
+      sectionTable <= bytes.length && sectionTable + sections * 40 <= bytes.length,
+    "native binary PE optional header or section table is invalid",
+  );
+  const arch = { 0x8664: "x64", 0xaa64: "arm64" }[bytes.readUInt16LE(offset + 4)];
+  const characteristics = bytes.readUInt16LE(offset + 22);
+  requireAudit(
+    arch !== undefined && bytes.readUInt16LE(optional) === 0x20b &&
+      (characteristics & 0x0002) !== 0 && (characteristics & 0x2000) === 0,
+    "native binary architecture or PE32+ executable header is unsupported",
+  );
+  return { os: "win32", arch };
+}
+
+export function nativePlatform(bytes) {
   requireAudit(bytes.length >= 64, "native binary header is truncated");
+  if (bytes.readUInt16LE(0) === 0x5a4d) return nativePePlatform(bytes);
   if (bytes.readUInt32LE(0) === 0xfeedfacf) {
     const arch = { 0x01000007: "x64", 0x0100000c: "arm64" }[bytes.readUInt32LE(4)];
     requireAudit(arch !== undefined && bytes.readUInt32LE(12) === 2,
@@ -224,7 +250,7 @@ function nativePlatform(bytes) {
     return { os: "darwin", arch };
   }
   requireAudit(bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])),
-    "native binary format is unsupported (expected thin Mach-O or ELF)");
+    "native binary format is unsupported (expected thin Mach-O, ELF or PE32+)");
   requireAudit([1, 2].includes(bytes[5]) && bytes[6] === 1,
     "native binary ELF encoding is invalid");
   const read16 = (offset) => bytes[5] === 1 ? bytes.readUInt16LE(offset) : bytes.readUInt16BE(offset);

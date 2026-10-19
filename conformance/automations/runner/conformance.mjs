@@ -354,6 +354,31 @@ export function digestBytes(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+// The Windows execution boundary is a versioned two-file artifact. The subject
+// remains independently bound by subjectArtifact.sha256; no wrapper substitution.
+export function createWindowsRunnerArtifact(runnerBytes, helperBytes, sourceCommit) {
+  if (
+    !Buffer.isBuffer(runnerBytes) || runnerBytes.length === 0 ||
+    !Buffer.isBuffer(helperBytes) || helperBytes.length === 0 ||
+    !isStringMatching(sourceCommit, SOURCE_COMMIT)
+  ) {
+    throw new JobError("Windows runner artifact input is invalid");
+  }
+  const manifest = {
+    schemaVersion: "coven.automations.windows-runner-artifact.v1",
+    sourceCommit,
+    runner: { fileName: "conformance.mjs", sha256: digestBytes(runnerBytes) },
+    containmentHelper: {
+      fileName: "coven-conformance-supervisor.exe",
+      abi: "coven.automations.windows-job-supervisor.v1",
+      sha256: digestBytes(helperBytes),
+    },
+  };
+  const bytes = Buffer.from(canonicalize(manifest), "utf8");
+  return { version: "0.2.0-windows-job-v1", bytes, sha256: digestBytes(bytes) };
+}
+
+
 async function validateArtifactBindings(job, subjectPath) {
   let runnerBytes;
   let subjectBytes;
