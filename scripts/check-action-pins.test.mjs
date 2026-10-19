@@ -130,3 +130,63 @@ test('remote verification follows annotated tags and requires branch containment
     `dtolnay/rust-toolchain commit ${TOOLCHAIN} is no longer contained in branch master (diverged).`
   ]);
 });
+
+test('update locks a verified Dependabot-style bump and writes one changed line', async () => {
+  const { updateLock, renderLock } = await import('./check-action-pins.mjs');
+  const bumped = '7'.repeat(40);
+  const workflow = GOOD.replaceAll(`actions/checkout@${CHECKOUT} # v7.0.1`, `actions/checkout@${bumped} # v7.0.2`);
+  let written = null;
+  const result = updateLock(inputs(workflow), {
+    ghApi: (endpoint) => {
+      assert.equal(endpoint, '/repos/actions/checkout/git/ref/tags/v7.0.2', 'only the changed pin is verified');
+      return { object: { type: 'commit', sha: bumped } };
+    },
+    write: (text) => { written = text; }
+  });
+  assert.deepEqual(result.findings, []);
+  assert.deepEqual(result.proposal.changed, ['actions/checkout']);
+  assert.deepEqual(JSON.parse(written).actions['actions/checkout'], { sha: bumped, ref: 'v7.0.2', refKind: 'tag' });
+  assert.equal(written, renderLock(JSON.parse(written)));
+  assert.equal(JSON.parse(written).actions['dtolnay/rust-toolchain'].refKind, 'branch', 'an unchanged branch pin stays a branch');
+});
+
+test('update refuses a bump whose tag names another commit and writes nothing', async () => {
+  const { updateLock } = await import('./check-action-pins.mjs');
+  const workflow = GOOD.replaceAll(`actions/checkout@${CHECKOUT} # v7.0.1`, `actions/checkout@${'7'.repeat(40)} # v7.0.2`);
+  let written = false;
+  const result = updateLock(inputs(workflow), {
+    ghApi: () => ({ object: { type: 'commit', sha: '8'.repeat(40) } }),
+    write: () => { written = true; }
+  });
+  assert.match(result.findings.join('\n'), /tag v7\.0\.2 now resolves to 8{40}, the lock pins 7{40}/);
+  assert.equal(written, false);
+});
+
+test('update refuses conflicting or uncommented pins and drops unused entries', async () => {
+  const { proposeLock, updateLock } = await import('./check-action-pins.mjs');
+  const conflicting = GOOD.replace(`actions/checkout@${CHECKOUT} # v7.0.1\n      - run: cargo`, `actions/checkout@${'9'.repeat(40)} # v7.0.9\n      - run: cargo`);
+  assert.match(proposeLock(inputs(conflicting)).problems.join('\n'), /disagrees with .*use one pin per action/);
+  const uncommented = GOOD.replace(`@${SETUP_NODE} # v7.1.0`, `@${SETUP_NODE}`);
+  assert.match(proposeLock(inputs(uncommented)).problems.join('\n'), /with a "# <ref>" comment/);
+  let written = false;
+  const refused = updateLock(inputs(uncommented), { ghApi: () => { throw new Error('no network'); }, write: () => { written = true; } });
+  assert.ok(refused.findings.length > 0);
+  assert.equal(written, false);
+
+  const withoutNode = GOOD
+    .replace(`      - uses: actions/setup-node@${SETUP_NODE} # v7.1.0\n        with:\n          node-version-file: .node-version\n`, '')
+    .replace('      - run: node --test scripts/example.test.mjs\n', '');
+  let text = null;
+  const pruned = updateLock(inputs(withoutNode), { ghApi: () => { throw new Error('nothing changed to verify'); }, write: (value) => { text = value; } });
+  assert.deepEqual(pruned.findings, []);
+  assert.deepEqual(pruned.proposal.removed, ['actions/setup-node']);
+  assert.equal('actions/setup-node' in JSON.parse(text).actions, false);
+});
+
+test('update writes nothing when the lock already matches', async () => {
+  const { updateLock } = await import('./check-action-pins.mjs');
+  let written = false;
+  const result = updateLock(inputs(GOOD), { ghApi: () => { throw new Error('nothing to verify'); }, write: () => { written = true; } });
+  assert.deepEqual(result.findings, []);
+  assert.equal(written, false);
+});
