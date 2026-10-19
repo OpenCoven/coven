@@ -1,4 +1,4 @@
-//! Bounded unit-test observations; no provider values, paths or raw errors.
+//! Bounded conformance observations; no provider values, paths or raw errors.
 use std::fmt::Write as _;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Instant;
