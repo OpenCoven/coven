@@ -158,6 +158,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'node --test scripts/authorize-release-publication.test.mjs',
             'node --test scripts/package-automations-authority-profile.test.mjs',
             'node --test scripts/check-action-pins.test.mjs',
+            'node --test scripts/release-receipt.test.mjs scripts/release-dependency-inventory.test.mjs',
             'node --test scripts/release-stress-test.mjs',
             'node --test scripts/verify-release-tag.test.mjs',
             'automations-authority-profile-bundle',
@@ -471,15 +472,23 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("Release npm packages", RELEASE_GITHUB_TEXT)
         self.assertIn("workflow_dispatch:", RELEASE_GITHUB_TEXT)
         self.assertIn("source_run_attempt:", RELEASE_GITHUB_TEXT)
-        self.assertIn("actions: read", RELEASE_GITHUB_TEXT)
-        self.assertIn("contents: write", RELEASE_GITHUB_TEXT)
-        self.assertNotIn("id-token: write", RELEASE_GITHUB_TEXT)
+        verify = RELEASE_GITHUB_TEXT.split("\n  verify-release:\n", 1)[1].split("\n  publish-release:\n", 1)[0]
+        publish = RELEASE_GITHUB_TEXT.split("\n  publish-release:\n", 1)[1]
+        self.assertIn("    permissions:\n      actions: read\n      contents: read\n", verify)
+        self.assertNotIn("write", verify)
+        # id-token signs the asset and reconciliation attestations; npm is
+        # never published from this workflow.
+        self.assertIn(
+            "    permissions:\n      attestations: write\n      contents: write\n      id-token: write\n",
+            publish,
+        )
         self.assertEqual(
             RELEASE_GITHUB_TEXT.count(
                 "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
             ),
-            3,
+            8,
         )
+        self.assertIn("RELEASE_GOVERNANCE_READ_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_READ_TOKEN }}", verify)
         self.assertNotIn(
             "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
             RELEASE_GITHUB_TEXT,

@@ -309,7 +309,29 @@ npm view @opencoven/cli-windows version dist-tags
 
 All five should now show the tag's version as `latest`. The package pages on npmjs.com should display a **"Provenance"** badge with a link back to the GitHub Actions run.
 
-After the npm workflow succeeds, **Publish GitHub Release** (`.github/workflows/release-github.yml`) runs automatically from the default-branch workflow code. It refuses to touch GitHub Releases until it re-verifies the successful source npm workflow run through the GitHub API, confirms the signed annotated tag still resolves to that exact commit on `origin/main`, and proves all five npm packages have trusted-publisher / SLSA provenance tied to `https://github.com/OpenCoven/coven`, `.github/workflows/release-npm.yml`, `refs/tags/vX.Y.Z`, the tagged commit, and the source workflow run attempt. Its signature-audit preflight also rebuilds a throwaway consumer `package-lock.json` and rejects any final lock whose root dependency set is not exactly those five canonical packages at the tag version. After the four artifact downloads complete, it rechecks that the latest run attempt still equals the selected `source_run_attempt`; if a rerun started during download, the workflow fails closed before packaging or any GitHub Release mutation. Existing Releases are only accepted for recovery when the tag, title `Coven vX.Y.Z`, `draft=false`, and `prerelease=false` already match the canonical public release. Only then does it package deterministic archives and reconcile the matching GitHub Release.
+After the npm workflow succeeds, **Publish GitHub Release** (`.github/workflows/release-github.yml`) runs automatically from the default-branch workflow code. It refuses to touch GitHub Releases until it re-verifies the successful source npm workflow run through the GitHub API, confirms the signed annotated tag still resolves to that exact commit on `origin/main`, and proves all five npm packages have trusted-publisher / SLSA provenance tied to `https://github.com/OpenCoven/coven`, `.github/workflows/release-npm.yml`, `refs/tags/vX.Y.Z`, the tagged commit, and the source workflow run attempt. Its signature-audit preflight also rebuilds a throwaway consumer `package-lock.json` and rejects any final lock whose root dependency set is not exactly those five canonical packages at the tag version. After the four artifact downloads complete, it rechecks that the latest run attempt still equals the selected `source_run_attempt`; if a rerun started during download, the workflow fails closed before packaging or any GitHub Release mutation. Existing Releases are only accepted when the tag, title `Coven vX.Y.Z`, and `prerelease=false` already match, and the release reports whether it is a draft. Only then does it package deterministic archives and reconcile the matching GitHub Release.
+
+The workflow runs as two jobs. `verify-release` holds only read permissions.
+It does everything above, then, for tags whose source carries
+`scripts/release-receipt.mjs`:
+
+- re-verifies the signed tag and the exact-source `CI` run again;
+- checks live protection against [release governance](release-governance.md);
+- requires the npm run's publication authorization;
+- builds the CycloneDX SBOM from the tagged source;
+- builds the release receipt.
+
+`publish-release` is the only job that can write, and it shares the
+`coven-release-channel` concurrency group with npm publication. It:
+
+1. attests every asset;
+2. creates the release as a **draft**, or resumes the existing draft;
+3. uploads and digest-checks every asset, the receipt included;
+4. re-checks the tag;
+5. publishes;
+6. reads the release back and requires GitHub to report it immutable;
+7. reconciles every channel against the receipt;
+8. attests that reconciliation with the receipt as its subject.
 
 The workflow creates or repairs one GitHub Release titled `Coven vX.Y.Z` using the signed tag annotation notes, with exactly these assets:
 
@@ -319,6 +341,12 @@ The workflow creates or repairs one GitHub Release titled `Coven vX.Y.Z` using t
 - `coven-vX.Y.Z-windows-x64.zip`
 - `coven-automations-v1-contract-<tagged-commit>.tar.gz`
 - `coven-automations-authority-v1-contract-<tagged-commit>.tar.gz`
+- `coven-vX.Y.Z-sbom.cdx.json` — the CycloneDX 1.5 dependency inventory: every
+  package `Cargo.lock` resolves (a superset of what each binary links), with
+  checksums or pinned commits, the pinned engine's archive digests, and the
+  locked build actions
+- `coven-vX.Y.Z-release-receipt.json` — the final release record, described
+  below
 - `SHA256SUMS`
 
 `SHA256SUMS` contains exactly four lexically ordered entries naming only the
@@ -326,6 +354,50 @@ four native archive filenames. Both Automations contract bundles are verified
 separately through their embedded `manifest.json`; neither is added to
 `SHA256SUMS`. The GitHub Release is the public binary/checksum surface; npm
 provenance remains the package-integrity surface.
+
+### The release receipt
+
+`coven-vX.Y.Z-release-receipt.json` (`coven.release-receipt`, schema 1) binds
+everything the release produced:
+
+- **source:** commit, tag object, and the signer verification with its pin
+  digests;
+- **checks:** the exact-source `CI` result observed before registry writes and
+  again before GitHub publication;
+- **protection:** the governance snapshot digests and per-control results from
+  both points;
+- **cleanliness:** the metadata and artifact controls from the publication
+  authorization, plus that record's own digest;
+- **npm:** every package's integrity, shasum, tarball, and provenance
+  references;
+- **GitHub:** every asset's SHA-256 and size, and the SBOM's identity;
+- **toolchains and channels:** the versions that built and published, npm's
+  `latest`, the supported line, and the release-notes digest;
+- **recovery:** the recovery decision.
+
+The builder refuses to write a receipt when any of that evidence disagrees
+about the tag object or commit, or when the npm publication was not
+authorized. It also refuses when live protection no longer matches policy or
+npm does not serve the version.
+
+Because the receipt is uploaded to the draft before publication, publishing
+the immutable release locks it. The reconciliation that follows is attested
+with predicate type `https://opencoven.ai/attestations/release-reconciliation/v1`
+and the receipt as its subject. It checks that the release is published and
+immutable, that every served asset is byte-identical to the receipt (the
+receipt included), that the tag is unchanged, that the published notes are
+the authorized annotation (v0.4.1, v0.4.4, and v0.4.6 through v0.4.9 also
+published the raw SSH signature block GitHub's tag API appends; it is now
+stripped), that npm
+and GitHub `latest` are current or superseded by a later release, and that
+the support line still covers the version. Verify both records from a checkout:
+
+```sh
+gh release download vX.Y.Z --repo OpenCoven/coven --pattern 'coven-vX.Y.Z-release-receipt.json'
+gh attestation verify coven-vX.Y.Z-release-receipt.json --repo OpenCoven/coven
+gh attestation verify coven-vX.Y.Z-release-receipt.json --repo OpenCoven/coven \
+  --predicate-type https://opencoven.ai/attestations/release-reconciliation/v1
+```
 
 Download the published assets and verify the checksums actually match, rather
 than trusting that the file exists:
@@ -464,13 +536,17 @@ To collect the recovery inputs safely:
 
 The recovery path is deliberately narrow:
 
-- A missing GitHub Release may be created.
-- A missing canonical asset may be uploaded.
+- A missing GitHub Release may be created, always as a draft, and a draft left
+  by a failed run is resumed rather than duplicated.
+- A missing canonical asset may be uploaded to a draft, or to a published
+  release from before immutable releases. A **published immutable release is
+  never repaired**: a missing or mismatched asset there fails closed, and the
+  release bumps forward to a new version.
 - A canonical asset that already exists is streamed to a local file and hash-checked first; it is skipped only on an exact byte match.
 - Any mismatched canonical asset or any extra/renamed asset fails closed. The workflow never overwrites GitHub assets automatically, never moves or reuses the tag, and never republishes npm.
 - The workflow rechecks the latest run attempt once before download and once again after all downloads. If either check sees a newer attempt than the supplied `source_run_attempt`, recovery fails closed before packaging or mutation because `actions/download-artifact` is keyed only by run ID. In that case, use the newer successful run's ID/attempt pair instead of reusing the old attempt.
 
-When a mismatch blocks recovery, record **the observed hash, the expected hash, and the reason** in the release log or incident notes. Then delete **only** the mismatched GitHub asset through an audited operator action (for example the GitHub UI or `gh release delete-asset ...`), and rerun the GitHub-only workflow with the same immutable tag plus the same source run ID/attempt pair. Do not delete matching assets, do not retag, and do not rerun the npm publish workflow for the same version.
+When a mismatch blocks recovery of a draft or of a pre-immutability release, record **the observed hash, the expected hash, and the reason** in the release log or incident notes. Then delete **only** the mismatched GitHub asset through an audited operator action (for example the GitHub UI or `gh release delete-asset ...`), and rerun the GitHub-only workflow with the same immutable tag plus the same source run ID/attempt pair. Do not delete matching assets, do not retag, and do not rerun the npm publish workflow for the same version.
 
 ### Recover a partial npm publication
 
