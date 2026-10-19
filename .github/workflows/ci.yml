@@ -724,7 +724,9 @@ jobs:
     needs: changes
     if: ${{ github.event_name == 'push' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Intel release compilation consumed 17m43s before helper/npm work (#1380).
+    # This outer hang guard leaves every inner test and production deadline intact.
+    timeout-minutes: ${{ matrix.job-timeout }}
     strategy:
       fail-fast: false
       matrix:
@@ -732,15 +734,19 @@ jobs:
           - os: macos-26
             npm-target: macos
             rust-target: aarch64-apple-darwin
+            job-timeout: 20
           - os: macos-15-intel
             npm-target: macos-x64
             rust-target: x86_64-apple-darwin
+            job-timeout: 30
           - os: ubuntu-latest
             npm-target: linux-x64
             rust-target: x86_64-unknown-linux-gnu
+            job-timeout: 20
           - os: windows-latest
             npm-target: windows
             rust-target: x86_64-pc-windows-msvc
+            job-timeout: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
