@@ -462,7 +462,7 @@ fn result_excerpt(output: &str) -> (String, bool) {
 
 /// Drops terminal escape sequences (CSI, OSC and two-character escapes), so
 /// the notice carries the text a terminal shows rather than its styling.
-fn strip_escape_sequences(text: &str) -> String {
+pub(crate) fn strip_escape_sequences(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
