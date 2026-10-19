@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "kind": "coven.release-governance-policy",
+  "repository": "OpenCoven/coven",
+  "issue": "https://github.com/OpenCoven/coven/issues/805",
+  "branch": {
+    "ref": "refs/heads/main",
+    "rules": {
+      "pull_request": {
+        "required_approving_review_count": 0,
+        "required_review_thread_resolution": true
+      },
+      "required_status_checks": {
+        "checks": [
+          {
+            "context": "PR gate",
+            "integration_id": 15368
+          }
+        ]
+      },
+      "merge_queue": {},
+      "non_fast_forward": {},
+      "deletion": {}
+    },
+    "classicProtection": "absent-or-admin-enforced"
+  },
+  "releaseTags": {
+    "patterns": [
+      "refs/tags/v*",
+      "refs/tags/coven-client-v*"
+    ],
+    "probeRefs": [
+      "refs/tags/v0.0.0",
+      "refs/tags/v0.4.11",
+      "refs/tags/v10.20.30",
+      "refs/tags/coven-client-v0.1.0"
+    ],
+    "immutableRules": [
+      "update",
+      "deletion"
+    ],
+    "creationBypassActors": [
+      {
+        "actor_type": "RepositoryRole",
+        "actor_id": 5,
+        "bypass_mode": "always"
+      }
+    ]
+  },
+  "repositorySettings": {
+    "immutableReleases": true,
+    "actionsShaPinningRequired": true,
+    "defaultWorkflowPermissions": "read",
+    "workflowsCanApprovePullRequestReviews": false
+  }
+}

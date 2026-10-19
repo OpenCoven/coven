@@ -154,6 +154,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'python3 scripts/check-docs-ownership.py --range',
             'scripts/check-workflows.sh',
             'node --test scripts/package-github-release-test.mjs',
+            'node --test scripts/release-governance.test.mjs',
             'node --test scripts/package-automations-authority-profile.test.mjs',
             'node --test scripts/release-stress-test.mjs',
             'automations-authority-profile-bundle',
