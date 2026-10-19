@@ -23,6 +23,7 @@ pub mod command;
 pub mod control;
 pub mod image;
 pub mod lease;
+pub mod panic_site;
 pub mod protocol;
 pub mod transfer;
 

@@ -103,3 +103,23 @@ fn descendant() {
         std::thread::park();
     }
 }
+
+#[test]
+fn standalone_panic_exit_identifies_compiled_site_without_payload_or_paths() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "panic_exit_fixture", "--ignored", "--nocapture"])
+        .output()
+        .unwrap();
+    let code = output.status.code().expect("native fixture exit status") as u32;
+    assert_eq!(code & 0xffff_0000, 0xe0ce_0000);
+    assert_ne!(code & 0xffff, 0);
+    assert!(output.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private-panic-payload"));
+}
+
+#[test]
+#[ignore = "standalone panic entrypoint; exercised by its owning native test"]
+fn panic_exit_fixture() {
+    coven_conformance_supervisor::panic_site::install_hook();
+    panic!("private-panic-payload must never be emitted");
+}

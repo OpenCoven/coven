@@ -3,7 +3,7 @@ fn main() -> std::process::ExitCode {
     #[cfg(windows)]
     {
         // This hook is local to the helper binary, never Coven's production host.
-        std::panic::set_hook(Box::new(|_| {}));
+        coven_conformance_supervisor::panic_site::install_hook();
         let args: Vec<_> = std::env::args_os().skip(1).take(3).collect();
         if args.len() != 2 {
             return std::process::ExitCode::from(2);

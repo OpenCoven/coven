@@ -210,3 +210,37 @@ helper from a private pinned Git clone using a separate Cargo target and invokes
 that produced artifact through the consumer. This native path is only cross-
 checked so far. Full Windows audit activation and all native runtime results are
 still pending; neither mock metadata nor cross-target checks establish them.
+
+## First native execution: failed, not acceptance
+
+CI run `39283249776`, attempt 1, tested PR merge commit
+`1e36da858b4284e551c23b4eadbc171c20cf85e9` from signed source
+`c63b7b23e71b1fe887ad7f49256fafad35b3857b`. Native image, Job,
+lease and pipe unit fixtures passed, but the standalone matrix stopped on its
+first success case with helper status 101 and no control record. Its silent
+panic hook prevented source localization; this does not establish the cause.
+Windows Threads separately failed detached daemon startup before same-home
+fixture setup (84 passed, one failed). The original failed run and artifacts
+remain retained. Neither failure is waived by Linux or host results.
+
+The standalone panic hook now encodes only a fixed compiled source-component
+number and a bounded source line in a failing u32 exit status:
+`0xe0c00000 | (component << 16) | min(line, 65535)`. Unknown sources use exactly
+`0xe0c00000`, with no line. Component numbers are the ordered allowlist in
+`src/panic_site.rs`; they expose no build path, panic payload, arguments or
+backtrace. The hook performs no pipe I/O or formatting/allocation. It requests
+self-termination without unwinding through pending I/O. It is installed only
+in the private standalone executable and its owning native fixture, never the
+Coven host. This is always failed invocation with cleanup unproven, not a new
+successful control sequence, cleanup proof, supported-platform declaration or
+ABI acceptance status. Existing consumers reject every nonzero helper status.
+
+Use self-`TerminateProcess`, with abort if the request unexpectedly returns,
+rather than `ExitProcess` while panicking with unknown thread lock state.
+Microsoft documents the DLL-detach deadlock distinction in
+[ExitProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitprocess)
+and the self-termination/pending-I/O semantics in
+[TerminateProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess).
+Kernel completion is not a hard wall-clock guarantee. A native child fixture
+must prove the actual numeric status and absence of private stderr/stdout;
+host encoding tests alone do not prove this behavior on Windows.
