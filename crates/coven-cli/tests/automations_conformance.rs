@@ -554,12 +554,8 @@ fn native_target_evaluates_checked_in_scheduler_leadership_fencing_vectors() -> 
     Ok(())
 }
 
-#[test]
-fn native_target_evaluates_checked_in_startup_reconciliation_wake_vectors() -> anyhow::Result<()> {
-    let temp_dir = tempfile::tempdir()?;
-    let coven_home = temp_dir.path().join("must-not-be-created");
-    let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS)?;
-    let request = json!({
+fn startup_reconciliation_request(vectors: Value) -> Value {
+    json!({
         "schemaVersion": "coven.automations.conformance-suite-request.v1",
         "profile": "scheduler_reliability",
         "suiteId": "startup-reconciliation-wake",
@@ -577,7 +573,91 @@ fn native_target_evaluates_checked_in_startup_reconciliation_wake_vectors() -> a
             "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         },
         "vector": vectors
-    });
+    })
+}
+
+// File-backed I/O and an owned root keep diagnostic fixtures bounded and
+// retain their files if child exit cannot be proved during teardown.
+fn run_startup_diagnostic_target(
+    request: &Value,
+    invalid_scratch: bool,
+) -> anyhow::Result<(Output, tempfile::TempDir)> {
+    use std::time::{Duration, Instant};
+
+    struct OwnedChild {
+        child: std::process::Child,
+        root: Option<tempfile::TempDir>,
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            if self.child.wait().is_err() {
+                if let Some(root) = self.root.take() {
+                    let _ = root.keep();
+                }
+                eprintln!("conformance diagnostic child exit unproved; owned root retained");
+            }
+        }
+    }
+
+    let root = tempfile::tempdir()?;
+    let coven_home = root.path().join("PRIVATE_CONFORMANCE_HOME_SENTINEL");
+    let scratch = root.path().join("PRIVATE_CONFORMANCE_SCRATCH_SENTINEL");
+    if invalid_scratch {
+        std::fs::write(&scratch, b"owned scratch fixture")?;
+    } else {
+        std::fs::create_dir(&scratch)?;
+    }
+    let input = root.path().join("request.json");
+    let stdout = root.path().join("child.stdout");
+    let stderr = root.path().join("child.stderr");
+    std::fs::write(&input, serde_json::to_vec(request)?)?;
+    let child = Command::new(coven_bin())
+        .args(["automations", "conformance", "evaluate"])
+        .env("COVEN_HOME", &coven_home)
+        .env("COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH", &scratch)
+        .stdin(Stdio::from(std::fs::File::open(input)?))
+        .stdout(Stdio::from(std::fs::File::create(&stdout)?))
+        .stderr(Stdio::from(std::fs::File::create(&stderr)?))
+        .spawn()?;
+    let mut owned = OwnedChild {
+        child,
+        root: Some(root),
+    };
+    let started = Instant::now();
+    // This outer hang guard catches a wedged fixture; it does not assert or
+    // extend any scheduler or production lifecycle deadline.
+    let deadline = started + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = owned.child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "conformance diagnostic child exceeded hang guard; elapsed={:?}",
+                started.elapsed()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let output = Output {
+        status,
+        stdout: std::fs::read(stdout)?,
+        stderr: std::fs::read(stderr)?,
+    };
+    let root = owned
+        .root
+        .take()
+        .expect("owned root remains until child exit");
+    Ok((output, root))
+}
+
+#[test]
+fn native_target_evaluates_checked_in_startup_reconciliation_wake_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS)?;
+    let request = startup_reconciliation_request(vectors);
 
     let output = run_target(&coven_home, "evaluate", Some(&request))?;
 
@@ -592,6 +672,77 @@ fn native_target_evaluates_checked_in_startup_reconciliation_wake_vectors() -> a
     assert_eq!(response["evidence"]["executedCases"], 2);
     assert_eq!(response["evidence"]["passedCases"], 2);
     assert!(!coven_home.exists());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("startup-reconciliation-trace"));
+    Ok(())
+}
+
+#[test]
+fn native_target_reports_startup_reconciliation_execution_phase_without_private_paths(
+) -> anyhow::Result<()> {
+    let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS)?;
+    let request = startup_reconciliation_request(vectors);
+    let (output, root) = run_startup_diagnostic_target(&request, true)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("conformance suite execution failed"));
+    assert!(
+        stderr.contains("startup-reconciliation-trace scenario=startup overflow=false")
+            && stderr.contains("phase=temp-home outcome=begin")
+            && stderr.contains("phase=temp-home outcome=error"),
+        "missing real CLI owning-operation trace: {stderr}"
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("phase="))
+            .count(),
+        2
+    );
+    assert!(!stderr.contains("phase=scheduler-start"));
+    assert!(
+        stderr.len() <= 32_768,
+        "bounded trace exceeded diagnostic size guard"
+    );
+    assert!(
+        !stderr.contains("PRIVATE_CONFORMANCE_"),
+        "diagnostic leaked private sentinel"
+    );
+    assert!(
+        !stderr.contains(root.path().to_string_lossy().as_ref()),
+        "diagnostic leaked owned fixture path"
+    );
+    assert!(!root
+        .path()
+        .join("PRIVATE_CONFORMANCE_HOME_SENTINEL")
+        .exists());
+    assert_eq!(
+        std::fs::read(root.path().join("PRIVATE_CONFORMANCE_SCRATCH_SENTINEL"))?,
+        b"owned scratch fixture"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_target_keeps_startup_expectation_mismatch_separate_from_execution_error(
+) -> anyhow::Result<()> {
+    let mut vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS)?;
+    vectors["cases"][0]["expected"]["launchCount"] = json!(2);
+    let request = startup_reconciliation_request(vectors);
+    let (output, root) = run_startup_diagnostic_target(&request, false)?;
+    assert!(
+        output.status.success(),
+        "valid mismatch failed execution: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["status"], "failed");
+    assert!(response["evidence"].is_null());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("startup-reconciliation-trace"));
+    assert!(!root
+        .path()
+        .join("PRIVATE_CONFORMANCE_HOME_SENTINEL")
+        .exists());
     Ok(())
 }
 

@@ -37,9 +37,7 @@ mod command_transaction_rollback;
 mod legacy_import_source_preservation;
 mod mission_commands;
 mod runtime_authority_terminal_recovery;
-#[cfg(test)]
 mod startup_wake_trace;
-#[cfg(test)]
 use startup_wake_trace::{StartupWakeOutcome, StartupWakePhase, StartupWakeTrace};
 
 /// Execute the disposable hidden process-crash conformance worker.
@@ -3688,65 +3686,47 @@ impl super::daemon_tick::AutomationClock for SchedulerConformanceClock {
 fn startup_reconciliation_wake_case_matches(
     case: &StartupReconciliationWakeVectorCase,
 ) -> Result<bool, &'static str> {
-    #[cfg(test)]
-    {
-        let mut trace = StartupWakeTrace::new(case.scenario);
-        let result = startup_reconciliation_wake_case_observed(case, &mut trace);
-        if let Some(report) = trace.failure_report(&result) {
-            eprintln!("{report}");
+    let mut trace = StartupWakeTrace::new(case.scenario);
+    let result = startup_reconciliation_wake_case_observed(case, &mut trace);
+    if let Some(report) = trace.failure_report(&result) {
+        // Preserve libtest's existing stderr capture in the unit target.
+        #[cfg(test)]
+        eprintln!("{report}");
+        #[cfg(not(test))]
+        {
+            use std::io::Write as _;
+            // Reporting must not replace the existing execution error if
+            // stderr is unavailable. Only bounded static/numeric data is sent.
+            let _ = writeln!(std::io::stderr().lock(), "{report}");
         }
-        result
     }
-    #[cfg(not(test))]
-    startup_reconciliation_wake_case_observed(case)
+    result
 }
 
 fn startup_reconciliation_wake_case_observed(
     case: &StartupReconciliationWakeVectorCase,
-    #[cfg(test)] trace: &mut StartupWakeTrace,
+    trace: &mut StartupWakeTrace,
 ) -> Result<bool, &'static str> {
-    #[cfg(test)]
     let scheduler_home =
         trace.operation(StartupWakePhase::TempHome, scheduler_conformance_tempdir)?;
-    #[cfg(not(test))]
-    let scheduler_home = scheduler_conformance_tempdir()?;
-    startup_reconciliation_wake_case_in_home(
-        case,
-        scheduler_home,
-        #[cfg(test)]
-        trace,
-    )
+    startup_reconciliation_wake_case_in_home(case, scheduler_home, trace)
 }
 
 fn startup_reconciliation_wake_case_in_home(
     case: &StartupReconciliationWakeVectorCase,
     scheduler_home: tempfile::TempDir,
-    #[cfg(test)] trace: &mut StartupWakeTrace,
+    trace: &mut StartupWakeTrace,
 ) -> Result<bool, &'static str> {
-    // Timing, buffering and emission compile only into the native unit target.
-    // Each non-test expansion evaluates the original operation exactly once.
+    // Share bounded observations with the real conformance command. Each
+    // wrapper evaluates the original operation exactly once.
     macro_rules! observed {
         ($phase:ident, $operation:expr) => {{
-            #[cfg(test)]
-            {
-                trace.operation(StartupWakePhase::$phase, || $operation)
-            }
-            #[cfg(not(test))]
-            {
-                $operation
-            }
+            trace.operation(StartupWakePhase::$phase, || $operation)
         }};
     }
     macro_rules! received {
         ($phase:ident, $operation:expr) => {{
-            #[cfg(test)]
-            {
-                trace.receive(StartupWakePhase::$phase, || $operation)
-            }
-            #[cfg(not(test))]
-            {
-                $operation
-            }
+            trace.receive(StartupWakePhase::$phase, || $operation)
         }};
     }
     observed!(
@@ -3810,7 +3790,6 @@ fn startup_reconciliation_wake_case_in_home(
     .map_err(|_| "conformance suite execution failed")?;
 
     let synchronization_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
-    #[cfg(test)]
     trace.set_deadline(StartupWakePhase::SharedDeadline, synchronization_deadline);
     let system_wait_observed = received!(
         SystemWaitReceive,
@@ -3819,7 +3798,6 @@ fn startup_reconciliation_wake_case_in_home(
     )
     .is_ok();
     let launches_before_first_wait = runtime.launches.load(Ordering::SeqCst);
-    #[cfg(test)]
     trace.value(
         StartupWakePhase::LaunchCountBeforeWait,
         launches_before_first_wait as u64,
@@ -3855,7 +3833,6 @@ fn startup_reconciliation_wake_case_in_home(
         );
         action_accepted = response.as_ref().is_ok_and(|response| {
             if response.status != 200 {
-                #[cfg(test)]
                 trace.event(StartupWakePhase::ActionOutcome, StartupWakeOutcome::Non200);
                 return false;
             }
@@ -3865,7 +3842,6 @@ fn startup_reconciliation_wake_case_in_home(
                 .ok()
                 .and_then(|body| body["accepted"].as_bool())
                 == Some(true);
-            #[cfg(test)]
             trace.event(
                 StartupWakePhase::ActionOutcome,
                 if body.is_err() {
@@ -3878,7 +3854,6 @@ fn startup_reconciliation_wake_case_in_home(
             );
             accepted
         });
-        #[cfg(test)]
         if response.is_err() {
             trace.event(
                 StartupWakePhase::ActionOutcome,
@@ -3897,7 +3872,6 @@ fn startup_reconciliation_wake_case_in_home(
         handle,
         scheduler_home,
         synchronization_deadline,
-        #[cfg(test)]
         trace,
         #[cfg(test)]
         || {},
@@ -3939,7 +3913,6 @@ fn startup_reconciliation_wake_case_in_home(
     .map_err(|_| "conformance suite execution failed")?
     .map(|record| record.revision);
     let launches = runtime.launches.load(Ordering::SeqCst);
-    #[cfg(test)]
     {
         trace.value(
             StartupWakePhase::OccurrencePresent,
@@ -3998,19 +3971,12 @@ fn finish_startup_reconciliation_scheduler(
     mut handle: super::daemon_tick::AutomationSchedulerHandle,
     scheduler_home: tempfile::TempDir,
     synchronization_deadline: StdInstant,
-    #[cfg(test)] trace: &mut StartupWakeTrace,
+    trace: &mut StartupWakeTrace,
     #[cfg(test)] after_first_failure: impl FnOnce(),
 ) -> Result<tempfile::TempDir, &'static str> {
     macro_rules! joined {
         ($phase:ident, $operation:expr) => {{
-            #[cfg(test)]
-            {
-                trace.join(StartupWakePhase::$phase, || $operation)
-            }
-            #[cfg(not(test))]
-            {
-                $operation
-            }
+            trace.join(StartupWakePhase::$phase, || $operation)
         }};
     }
     if joined!(
@@ -4022,7 +3988,6 @@ fn finish_startup_reconciliation_scheduler(
         #[cfg(test)]
         after_first_failure();
         let cleanup_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
-        #[cfg(test)]
         trace.set_deadline(StartupWakePhase::CleanupDeadline, cleanup_deadline);
         if joined!(
             CleanupJoin,
@@ -4030,7 +3995,6 @@ fn finish_startup_reconciliation_scheduler(
         )
         .is_err()
         {
-            #[cfg(test)]
             trace.event(StartupWakePhase::RetainHome, StartupWakeOutcome::Ok);
             std::mem::forget(handle);
             std::mem::forget(scheduler_home);
