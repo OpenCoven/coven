@@ -222,6 +222,26 @@ fn action(client: &mut DaemonClient, request: &Value) -> anyhow::Result<Value> {
     Ok(body)
 }
 
+/// Elapsed time of each import request in a case, by step. Measurement only
+/// (#1360, draft): no request or response content.
+#[derive(Default)]
+struct ImportTimes(BTreeMap<&'static str, u64>);
+
+impl ImportTimes {
+    fn action(
+        &mut self,
+        step: &'static str,
+        client: &mut DaemonClient,
+        request: &Value,
+    ) -> anyhow::Result<Value> {
+        let started = Instant::now();
+        let result = action(client, request);
+        let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.0.insert(step, millis);
+        result
+    }
+}
+
 fn source_snapshot(root: &Path) -> anyhow::Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
     let mut snapshot = BTreeMap::new();
     for entry in fs::read_dir(root)? {
@@ -307,6 +327,7 @@ fn case_matches(case: &Case) -> anyhow::Result<(bool, Value)> {
             "adoptionKey":"import-fixture", "dryRun":false})
     };
     let mut passed = true;
+    let mut times = ImportTimes::default();
     let mut dry_run_preserved = None;
     if case.route == Route::V1 {
         let before = (
@@ -316,7 +337,7 @@ fn case_matches(case: &Case) -> anyhow::Result<(bool, Value)> {
         let mut dry = request.clone();
         dry["dryRun"] = json!(true);
         dry["adoptionKey"] = json!("dry-import-fixture");
-        let result = action(&mut client, &dry)?;
+        let result = times.action("dryRun", &mut client, &dry)?;
         let preserved = result["result"]["outcome"] == "committed"
             && result["result"]["result"]["dryRun"] == true
             && result["result"]["result"]["imported"] == json!(case.expected.imported)
@@ -329,7 +350,7 @@ fn case_matches(case: &Case) -> anyhow::Result<(bool, Value)> {
         dry_run_preserved = Some(preserved);
         passed &= preserved;
     }
-    let response = action(&mut client, &request)?;
+    let response = times.action("import", &mut client, &request)?;
     let command_outcome = if case.route == Route::Legacy {
         "legacy_completed"
     } else if response["result"]["outcome"] == "committed" {
@@ -373,7 +394,7 @@ fn case_matches(case: &Case) -> anyhow::Result<(bool, Value)> {
         work_counts.insert(table, count);
     }
     let committed = state(&conn)?;
-    let replay = action(&mut client, &request)?;
+    let replay = times.action("replay", &mut client, &request)?;
     let mut replay_preserved = committed == state(&conn)?;
     if case.route == Route::V1 {
         replay_preserved &= replay["result"]["outcome"] == "replayed"
@@ -391,7 +412,7 @@ fn case_matches(case: &Case) -> anyhow::Result<(bool, Value)> {
     reopened.busy_timeout(Duration::from_secs(30))?;
     let mut restart_preserved = committed == state(&reopened)?;
     source_preserved &= before_source == source_snapshot(&source_root)?;
-    let replay = action(&mut client, &request)?;
+    let replay = times.action("restartReplay", &mut client, &request)?;
     if case.route == Route::V1 {
         restart_preserved &= replay["result"]["outcome"] == "replayed"
             && replay["result"]["result"] == response["result"]["result"];
@@ -399,8 +420,9 @@ fn case_matches(case: &Case) -> anyhow::Result<(bool, Value)> {
     restart_preserved &= committed == state(&reopened)?;
     source_preserved &= before_source == source_snapshot(&source_root)?;
     passed &= restart_preserved && source_preserved;
-    // Only fixed classifications, booleans, counts and caller-supplied case IDs
-    // leave this fixture. Never copy raw daemon reports, prompts or paths.
+    // Only fixed classifications, booleans, counts, elapsed milliseconds and
+    // caller-supplied case IDs leave this fixture. Never copy raw daemon
+    // reports, prompts or paths.
     let status = match status.as_str() {
         "ACTIVE" => "ACTIVE",
         "PAUSED" => "PAUSED",
@@ -428,6 +450,7 @@ fn case_matches(case: &Case) -> anyhow::Result<(bool, Value)> {
             "sourcePreserved": source_preserved, "preexistingPreserved": preexisting_preserved,
             "dryRunPreserved": dry_run_preserved, "replayPreserved": replay_preserved,
             "restartPreserved": restart_preserved, "workCounts": work_counts,
+            "importActionMillis": times.0,
             "passed": passed
         }),
     ))

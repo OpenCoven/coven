@@ -1522,6 +1522,10 @@ fn native_target_imports_legacy_sources_through_real_daemon() -> anyhow::Result<
         ] {
             assert_eq!(observed[field], true, "{field}: {observed}");
         }
+        assert!(
+            observed["importActionMillis"]["import"].is_u64(),
+            "{observed}"
+        );
         for table in [
             "automation_occurrences",
             "automation_runs",
@@ -1564,6 +1568,79 @@ fn native_target_imports_legacy_sources_through_real_daemon() -> anyhow::Result<
     );
     assert!(!home.exists());
     Ok(())
+}
+
+/// #1360 measurement, draft only and never merged. Runs the legacy-import
+/// suite repeatedly under the normal parallel test load, then fails on purpose
+/// with one summary line so the job log keeps it.
+#[test]
+fn measure_legacy_import_headroom_1360() -> anyhow::Result<()> {
+    const RUNS: usize = 12;
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/legacy-import-source-preservation.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion":"coven.automations.conformance-suite-request.v1",
+        "profile":"scheduler_reliability", "suiteId":"legacy-import-source-preservation",
+        "protocolArtifact":{}, "subjectArtifact":{}, "vector":vector
+    });
+    let mut by_step: std::collections::BTreeMap<String, Vec<u64>> = Default::default();
+    let mut statuses: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut evaluate_millis = Vec::new();
+    for _ in 0..RUNS {
+        #[cfg(unix)]
+        let temp = tempfile::tempdir_in("/tmp")?;
+        #[cfg(not(unix))]
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("must-not-be-created");
+        let started = std::time::Instant::now();
+        let output = run_target(&home, "evaluate", Some(&request))?;
+        evaluate_millis.push(started.elapsed().as_millis() as u64);
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        let status = response["status"].as_str().unwrap_or("unparsed").to_owned();
+        *statuses.entry(status).or_default() += 1;
+        for observed in response["evidence"]["caseObservations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for (step, millis) in observed["importActionMillis"]
+                .as_object()
+                .into_iter()
+                .flatten()
+            {
+                by_step
+                    .entry(step.clone())
+                    .or_default()
+                    .push(millis.as_u64().unwrap_or(u64::MAX));
+            }
+        }
+    }
+    fn spread(values: &mut [u64]) -> String {
+        values.sort_unstable();
+        let at = |q: usize| values[(values.len() - 1) * q / 100];
+        format!(
+            "n{}/p50:{}/p90:{}/max:{}",
+            values.len(),
+            at(50),
+            at(90),
+            at(100)
+        )
+    }
+    let mut summary = format!(
+        "HEADROOM-1360 os={} runs={RUNS} statuses={statuses:?} evaluateMs={}",
+        std::env::consts::OS,
+        spread(&mut evaluate_millis)
+    );
+    let mut all = Vec::new();
+    for (step, values) in &mut by_step {
+        all.extend(values.iter().copied());
+        summary += &format!(" {step}Ms={}", spread(values));
+    }
+    if !all.is_empty() {
+        summary += &format!(" anyActionMs={}", spread(&mut all));
+    }
+    panic!("{summary}");
 }
 
 #[test]
