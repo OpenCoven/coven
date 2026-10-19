@@ -104,6 +104,52 @@ class PublicReceiptTests(unittest.TestCase):
                 self.assertFalse((output/'receipt.json').exists())
 
 
+    def test_workflow_publication_uses_the_query_temporary_root(self):
+        repo=Path(__file__).resolve().parents[2]
+        lines=(repo/'.github/workflows/windows-reliability.yml').read_text(encoding='utf-8').splitlines()
+        def workflow_step(name):
+            start=lines.index('      - name: '+name)
+            end=next((i for i in range(start+1,len(lines)) if lines[i].startswith('      - ')),len(lines))
+            begin=lines.index('        run: |',start,end)+1
+            return '\n'.join(line[10:] for line in lines[begin:end])
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);native_temp=root/'native-temp';runner_temp=root/'runner-temp'
+            native_temp.mkdir();runner_temp.mkdir()
+            env=dict(os.environ,TMPDIR=str(native_temp),TMP=str(native_temp),TEMP=str(native_temp),
+                     RUNNER_TEMP=str(runner_temp),GITHUB_RUN_ID='publication-test',GITHUB_RUN_ATTEMPT='1',
+                     GITHUB_ENV=str(root/'github-env'))
+            def run_script(name,script,*arguments):
+                path=root/(name+'.ps1')
+                if not script.startswith('param('):script="$ErrorActionPreference='Stop'\n"+script
+                path.write_text(script,encoding='utf-8')
+                result=subprocess.run(['pwsh','-NoProfile','-File',str(path),*map(str,arguments)],
+                                      cwd=repo,env=env,capture_output=True,text=True)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                return result.stdout
+            run_script('prepare',workflow_step('Prepare isolated public evidence directory'))
+            for line in (root/'github-env').read_text(encoding='utf-8-sig').splitlines():
+                key,separator,value=line.partition('=');self.assertEqual(separator,'=');env[key]=value
+            fixture_path=root/'fixture.json';fixture_path.write_text(json.dumps(fixture()),encoding='utf-8')
+            paths=json.loads(run_script('writer',"""
+param([string]$Writer,[string]$Fixture)
+$ErrorActionPreference='Stop'
+. $Writer
+$result=[pscustomobject]@{public=(Get-Content -LiteralPath $Fixture -Raw | ConvertFrom-Json);rawResults=@{}}
+Write-CovenPreflightReceipt -Result $result | ConvertTo-Json -Compress
+""".lstrip(),repo/'scripts/windows-reliability/receipt-writer.ps1',fixture_path))
+            source=Path(paths['publicDirectory'])/'receipt.json'
+            self.assertEqual(Path(paths['root']).parent.resolve(),native_temp.resolve())
+            with self.assertRaises(ValueError):read_public_receipt(source,runner_temp)
+            expected=parse_public_receipt(source.read_bytes())
+            env['PUBLIC_SOURCE_RECEIPT']=str(source)
+            run_script('publish',workflow_step('Validate and publish only the public receipt'))
+            output=Path(env['EXPERIMENT_ROOT']);published=(output/'receipt.json').read_bytes()
+            self.assertEqual(parse_public_receipt(published),expected)
+            publication=json.loads((output/'publication.json').read_text(encoding='utf-8-sig'))
+            import hashlib
+            self.assertEqual(publication['sha256'],hashlib.sha256(published).hexdigest())
+
+
     @unittest.skipUnless(os.name=='nt','native Windows junction execution required')
     def test_native_windows_intermediate_junctions_are_refused(self):
         with tempfile.TemporaryDirectory() as directory:

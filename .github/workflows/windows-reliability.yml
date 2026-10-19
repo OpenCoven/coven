@@ -252,11 +252,14 @@ jobs:
         id: prepare
         shell: pwsh
         run: |
-          $root = Join-Path $env:RUNNER_TEMP "windows-reliability-metadata-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          # The native receipt writer uses this temp root; RUNNER_TEMP can be on another drive.
+          $metadataTempRoot = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetTempPath())
+          $root = Join-Path $metadataTempRoot "windows-reliability-metadata-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           if (Test-Path $root) { throw 'Evidence directory already exists' }
           $public = Join-Path $root 'public'
           New-Item -ItemType Directory -Path $public | Out-Null
           "EXPERIMENT_ROOT=$public" >> $env:GITHUB_ENV
+          "METADATA_TEMP_ROOT=$metadataTempRoot" >> $env:GITHUB_ENV
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
         with:
           ref: ${{ github.sha }}
@@ -448,7 +451,7 @@ jobs:
           PUBLIC_SOURCE_RECEIPT: ${{ steps.metadata.outputs.public-receipt }}
         shell: pwsh
         run: |
-          $result = python scripts/windows-reliability/public_receipt.py "$env:PUBLIC_SOURCE_RECEIPT" "$env:RUNNER_TEMP" "$env:EXPERIMENT_ROOT"
+          $result = python scripts/windows-reliability/public_receipt.py "$env:PUBLIC_SOURCE_RECEIPT" "$env:METADATA_TEMP_ROOT" "$env:EXPERIMENT_ROOT"
           if ($LASTEXITCODE -ne 0) { throw 'Public receipt publication failed' }
           $result | Set-Content "$env:EXPERIMENT_ROOT/publication.json"
       - name: Record separate stage outcomes
