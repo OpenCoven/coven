@@ -1,8 +1,8 @@
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'token-binding.ps1')
 $script:cases=0
-function Assert-Controlled([bool]$Value){if(-not $Value){throw 'Controlled assertion failed'}}
-function Reject-Controlled([scriptblock]$Action){try{& $Action | Out-Null}catch{return};throw 'Invalid source admitted'}
+function Assert-Controlled([bool]$Value){if(-not $Value){throw "Controlled assertion failed at case=$script:cases"}}
+function Reject-Controlled([scriptblock]$Action){try{& $Action | Out-Null}catch{return};throw "Invalid source admitted at case=$script:cases"}
 $root=Join-Path ([IO.Path]::GetTempPath()) ('coven-token-binding-controlled-'+[Guid]::NewGuid().ToString('N'))
 $inventory=Get-CovenTokenSourceInventory
 [IO.Directory]::CreateDirectory($root) | Out-Null
@@ -14,7 +14,28 @@ try {
     }
     $capture=Get-CovenTokenSourceCapture -Directory $root -Commit ('a'*40)
     Assert-Controlled ($capture.Files.Count -eq $inventory.Count -and (Test-CovenTokenSourceCapture $capture));$script:cases++
-    Reject-Controlled {Get-CovenTokenSourceCapture -Directory ([IO.Path]::GetRelativePath((Get-Location).Path,$root)) -Commit ('a'*40)};$script:cases++
+    $savedProcessDirectory=[Environment]::CurrentDirectory
+    try {
+        [Environment]::CurrentDirectory=$root
+        $relativeRoot='.'
+        Assert-Controlled (-not [IO.Path]::IsPathFullyQualified($relativeRoot))
+        # The relative input must name an existing complete fixture: rejecting a
+        # nonexistent path would not discriminate the absolute-root guard.
+        $relativeAbsolute=[IO.Path]::GetFullPath($relativeRoot)
+        $relativeCapture=Get-CovenTokenSourceCapture -Directory $relativeAbsolute -Commit ('a'*40)
+        Assert-Controlled ($relativeCapture.Files.Count -eq $inventory.Count -and (Test-CovenTokenSourceCapture $relativeCapture))
+        Reject-Controlled {Get-CovenTokenSourceCapture -Directory $relativeRoot -Commit ('a'*40)};$script:cases++
+    } finally {[Environment]::CurrentDirectory=$savedProcessDirectory}
+    # GetRelativePath deliberately returns the absolute target across volumes.
+    # Verify that native Windows contrast without using it as a negative input.
+    if ($IsWindows -and -not [StringComparer]::OrdinalIgnoreCase.Equals(
+        [IO.Path]::GetPathRoot((Get-Location).Path),[IO.Path]::GetPathRoot($root))) {
+        $crossVolume=[IO.Path]::GetRelativePath((Get-Location).Path,$root)
+        Assert-Controlled ([IO.Path]::IsPathFullyQualified($crossVolume))
+        $crossCapture=Get-CovenTokenSourceCapture -Directory $crossVolume -Commit ('a'*40)
+        Assert-Controlled ($crossCapture.Files.Count -eq $inventory.Count -and (Test-CovenTokenSourceCapture $crossCapture));$script:cases++
+        'token source binding cross-volume fixture precondition PASS'
+    }
     $rootFile=$root+'-file'
     try {
         [IO.File]::WriteAllText($rootFile,'controlled root file')
