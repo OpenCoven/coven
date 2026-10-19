@@ -476,10 +476,10 @@ if($Mode -eq 'artifact'){
   self.assertEqual(built.returncode,0,built.stderr.decode());admission=json.loads(built.stdout);self.assertEqual(admission['PublisherSha256'],expected)
   env=os.environ.copy();env.update(EXECUTION_JSON=json.dumps(proof),PUBLIC_RECEIPT=str(self.output/'receipt.json'))
   admitted=subprocess.run([sys.executable,*admission['Arguments']],capture_output=True,env=env,timeout=60)
-  self.assertEqual((admitted.returncode,admitted.stdout,admitted.stderr),(0,b'token-artifact-admission-pass\n',b''))
+  self.assertEqual((admitted.returncode,admitted.stdout,admitted.stderr),(0,b'token-artifact-admission-pass'+os.linesep.encode('ascii'),b''))
   admission['Arguments'][-1]='0'*64
   rejected=subprocess.run([sys.executable,*admission['Arguments']],capture_output=True,env=env,timeout=60)
-  self.assertEqual((rejected.returncode,rejected.stdout,rejected.stderr),(1,b'',b'token-artifact-admission-failed\n'));self.assertEqual((self.output/'receipt.json').read_bytes(),data)
+  self.assertEqual((rejected.returncode,rejected.stdout,rejected.stderr),(1,b'',b'token-artifact-admission-failed'+os.linesep.encode('ascii')));self.assertEqual((self.output/'receipt.json').read_bytes(),data)
 
 class ArtifactAdmissionControls(unittest.TestCase):
  setUp=PublicationControls.setUp

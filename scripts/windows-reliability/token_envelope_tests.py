@@ -174,7 +174,7 @@ New-CovenTokenPublisherInvocation -Capture $capture -Executable $Python -BundleP
   if source is not None:script=script.replace(hashlib.sha256(self.source).hexdigest(),hashlib.sha256(source).hexdigest())
   return script
  def reject(self,script):
-  p=self.execute(script);self.assertEqual(p.returncode,1);self.assertEqual(p.stdout,b'');self.assertEqual(p.stderr,b'token-publication-failed cleanupFailed=false\n')
+  p=self.execute(script);self.assertEqual(p.returncode,1);self.assertEqual(p.stdout,b'');self.assertEqual(p.stderr,b'token-publication-failed cleanupFailed=false'+os.linesep.encode('ascii'))
  def test_exact_captured_bytes_and_paths_roundtrip(self):
   p=self.execute();self.assertEqual(p.returncode,0,p.stderr);value=json.loads(p.stdout);self.assertEqual(value['args'],self.invocation['Arguments'][3:]);self.assertEqual(value['executed'],hashlib.sha256(self.source).hexdigest());self.assertLessEqual(self.invocation['CommandCharacterBound'],32760)
  def test_wrong_hash_rejected_before_execution(self):self.reject(self.bootstrap.replace("hexdigest()=='"+hashlib.sha256(self.source).hexdigest(),"hexdigest()=='"+'0'*64))
