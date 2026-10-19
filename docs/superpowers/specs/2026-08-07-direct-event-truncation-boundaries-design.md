@@ -81,6 +81,29 @@ constructs the marker through the existing marker builder, queues
 `output_truncated -> input`, waits for durable acknowledgement, and then
 releases the boundary. A consumed or dropped reservation cannot commit twice.
 
+**Amendment (coven#1396).** A stream harness answers its stdin within
+milliseconds, so the response to an input routinely arrives while that input's
+reservation is still pending. Rejecting it lost Claude's per-turn
+`system/init` frame after nearly every live input. With a harness that answers
+instantly, it lost the whole response. Output for a session with a pending
+*input reservation* is therefore held, not rejected:
+
+- **Bound.** Chunks are held in arrival order, at most 64 KiB per session, and
+  only while they would be admitted if released at once. Held output stays
+  outside queue capacity, so it can never stall the commit it waits on.
+- **Commit.** After the input commits, held chunks are admitted behind it
+  through normal output admission.
+- **Cancel.** A cancelled reservation marks its detached episode first, then
+  admits the held chunks.
+- **Overflow.** The first chunk that cannot be held is rejected into a new
+  episode, and so is every later chunk of that reservation. Held output
+  therefore never runs ahead of its marker.
+- **Nothing held.** With nothing held, commit and cancel behave exactly as
+  described above.
+
+The `EventWriter::record` critical path (targeted cast and other action-free
+boundaries) still rejects output while claimed.
+
 The existing `EventWriter::record` path remains critical and synchronous for
 targeted cast and other action-free boundaries. Its marker construction remains
 the sole implementation of `output_truncated`.
