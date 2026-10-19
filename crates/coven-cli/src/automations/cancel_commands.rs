@@ -489,14 +489,28 @@ fn plan_in(
     // The occurrence, its running run, and that run's latest attempt.
     let occurrence_id: Option<String> = match target {
         Target::Occurrence => Some(request.target_id.clone()),
-        Target::Run => conn
-            .query_row(
-                "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
-                [&request.target_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| format!("failed to read the run: {error}"))?,
+        Target::Run => {
+            // `occurrence_id` is nullable: a run can start without an
+            // occurrence, and deleting one sets its runs' column to NULL.
+            let occurrence: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
+                    [&request.target_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("failed to read the run: {error}"))?;
+            if occurrence == Some(None) {
+                return refuse(
+                    ErrorCode::IllegalTransition,
+                    format!(
+                        "run `{}` has no occurrence; only an occurrence's running run can be cancelled",
+                        request.target_id
+                    ),
+                );
+            }
+            occurrence.flatten()
+        }
         Target::Attempt => conn
             .query_row(
                 "SELECT occurrence_id FROM automation_attempts WHERE id = ?1",
@@ -1460,6 +1474,63 @@ mod tests {
             ),
             ErrorCode::IllegalTransition
         );
+        assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_run_without_an_occurrence_is_refused_and_the_refusal_replays() {
+        // `automation_runs.occurrence_id` is nullable: a run started without
+        // an occurrence, or whose occurrence was deleted (ON DELETE SET NULL).
+        let (_temp, conn) = store();
+        let runtime = KillCounting::default();
+        let start = now();
+        super::super::runs::record_run_start(
+            &conn,
+            "run-unbound",
+            super::super::runs::RunStart {
+                automation_id: "notes",
+                occurrence_id: None,
+                authority_profile: None,
+                session_id: None,
+                familiar_id: None,
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
+            start,
+        )
+        .unwrap();
+
+        let request = cancel_envelope(run_cancel("adopt:cancel:unbound", "run-unbound"));
+        let (status, first) = crate::control_plane::route_action(request.clone(), &conn, &runtime);
+        let first = first.result.unwrap();
+        assert_eq!(
+            first["error"]["code"], "ILLEGAL_TRANSITION",
+            "{status}: {first}"
+        );
+        assert_eq!(
+            state(
+                &conn,
+                "SELECT status FROM automation_runs WHERE id = ?1",
+                "run-unbound"
+            ),
+            "running",
+            "a refusal writes no execution state"
+        );
+        assert_eq!(
+            state(
+                &conn,
+                "SELECT outcome FROM automation_command_adoptions WHERE adoption_key = ?1",
+                "adopt:cancel:unbound"
+            ),
+            "rejected"
+        );
+        let (replay_status, replay) = crate::control_plane::route_action(request, &conn, &runtime);
+        assert_eq!(replay_status, status);
+        assert_eq!(replay.result.unwrap()["error"], first["error"]);
+
+        let unknown = cancel_envelope(run_cancel("adopt:cancel:unknown-run", "run-none"));
+        let (_, unknown) = crate::control_plane::route_action(unknown, &conn, &runtime);
+        assert_eq!(unknown.result.unwrap()["error"]["code"], "NOT_FOUND");
         assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
     }
 
