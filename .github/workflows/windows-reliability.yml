@@ -398,7 +398,9 @@ jobs:
         shell: pwsh
         run: |
           $root = Join-Path $pwd 'scripts/windows-reliability'
-          $node = (Get-Command node -CommandType Application -ErrorAction Stop).Source
+          $nodeCommands = @(Get-Command node -CommandType Application -ErrorAction Stop)
+          $node = $nodeCommands[0].Source
+          Write-Host ('COVEN_HELPER_NODE_SELECTION '+(@{candidateCount=$nodeCommands.Count; selectedCount=@($node).Count} | ConvertTo-Json -Compress))
           foreach ($name in @('query-helper-tests.ps1','query-cleanup-tests.ps1','query-inherited-pipe-test.ps1','query-stream-disposal-controlled-test.ps1')) {
             & pwsh -NoProfile -File (Join-Path $root $name) -Helper (Join-Path $root 'query-helper.ps1') -Node $node
             if ($LASTEXITCODE -ne 0) { throw "Bounded helper test failed: $name" }
