@@ -215,6 +215,43 @@ impl std::fmt::Display for RuntimeOwnershipRetainedError {
 
 impl std::error::Error for RuntimeOwnershipRetainedError {}
 
+// Only post-spawn prompt delivery has a detached startup observer to drain.
+// Ordinary spawn/admission errors must not wait for an observer that cannot run.
+#[derive(Debug)]
+struct InitialStreamPromptDeliveryFailed;
+
+impl std::fmt::Display for InitialStreamPromptDeliveryFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("initial stream prompt delivery failed")
+    }
+}
+
+impl std::error::Error for InitialStreamPromptDeliveryFailed {}
+
+type StartupObservation =
+    std::result::Result<crate::main_session_start::StartupOutcome, &'static str>;
+
+fn recover_startup_after_launch_error(
+    error: anyhow::Error,
+    wait: impl FnOnce() -> Option<StartupObservation>,
+    poll: impl FnOnce() -> Option<StartupObservation>,
+) -> Result<crate::main_session_start::StartupOutcome> {
+    // Killing the child does not join the detached stderr/exit observer.
+    // Post-spawn delivery failures await its completion within the caller's
+    // original startup deadline; pre-spawn/admission errors only poll.
+    let observed = if error.is::<InitialStreamPromptDeliveryFailed>() {
+        wait()
+    } else {
+        poll()
+    };
+    match observed {
+        Some(Ok(crate::main_session_start::StartupOutcome::Stale)) => {
+            Ok(crate::main_session_start::StartupOutcome::Stale)
+        }
+        _ => Err(error),
+    }
+}
+
 #[derive(Default)]
 pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
@@ -1289,12 +1326,11 @@ impl LiveSessionRuntime {
                 {
                     return Err(error);
                 }
-                // Ordinary initial-delivery failures have completed cleanup;
-                // retain a stale diagnostic drained before stdin closed.
-                match receiver.try_recv() {
-                    Ok(Ok(StartupOutcome::Stale)) => Ok(StartupOutcome::Stale),
-                    _ => Err(error),
-                }
+                recover_startup_after_launch_error(
+                    error,
+                    || receiver.recv_timeout(monitor.remaining()).ok(),
+                    || receiver.try_recv().ok(),
+                )
             }
         };
         if monitor.timed_out() {
@@ -1735,8 +1771,9 @@ impl LiveSessionRuntime {
                 }
                 Err(cleanup) => Err(anyhow::anyhow!(
                     "{primary:#}; failed to terminate the rejected stream launch: {cleanup:#}"
-                )),
-                Ok(()) => Err(primary),
+                )
+                .context(InitialStreamPromptDeliveryFailed)),
+                Ok(()) => Err(primary.context(InitialStreamPromptDeliveryFailed)),
             };
         }
         Ok(())
@@ -10372,6 +10409,156 @@ mod tests {
                 assert_eq!(outcome, expected, "{harness}, stale={stale}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn main_session_delivery_failure_selects_completion_instead_of_pending_poll() {
+        use crate::main_session_start::StartupOutcome;
+        // Controlled channel contract: its instantaneous poll is empty, but a
+        // completion wait observes the eventual stale record. No scheduler race
+        // or wall-clock bound can make a nonblocking receive pass this case.
+        let result = recover_startup_after_launch_error(
+            anyhow::anyhow!("original delivery failure").context(InitialStreamPromptDeliveryFailed),
+            || Some(Ok(StartupOutcome::Stale)),
+            || None,
+        );
+        assert_eq!(result.unwrap(), StartupOutcome::Stale);
+
+        let error = recover_startup_after_launch_error(
+            anyhow::anyhow!("original admission failure"),
+            || panic!("unmarked failures have no observer completion to await"),
+            || None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "original admission failure");
+        for completion in [
+            Some(Ok(StartupOutcome::Ready("native-id".into()))),
+            Some(Err("observer exited without identity")),
+            None,
+        ] {
+            let error = recover_startup_after_launch_error(
+                anyhow::anyhow!("original delivery failure")
+                    .context(InitialStreamPromptDeliveryFailed),
+                || completion,
+                || panic!("marked delivery failures must await observation"),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("original delivery failure"));
+        }
+    }
+
+    #[test]
+    fn main_session_delivery_failure_drains_delayed_observer_completion() -> Result<()> {
+        use crate::main_session_start::StartupOutcome;
+        for stale in [false, true] {
+            let runtime = Arc::new(LiveSessionRuntime::default());
+            let mut launch = stream_launch_fixture("delayed-startup-exit", "hello");
+            launch.harness = "claude".into();
+            let (failed_tx, failed_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let worker_runtime = Arc::clone(&runtime);
+            let worker = std::thread::spawn(move || -> Result<StartupOutcome> {
+                let mut exit_worker = None;
+                let outcome = worker_runtime.launch_main_session_observed(
+                    &launch,
+                    Duration::from_secs(60),
+                    || {
+                        let monitor = worker_runtime
+                            .main_session_starts
+                            .lock()
+                            .unwrap()
+                            .get(&launch.id)
+                            .unwrap()
+                            .clone();
+                        let (observer, registration) =
+                            worker_runtime.observer_for_session(launch.id.clone());
+                        worker_runtime.register_kind_with_registration(
+                            launch.id.clone(),
+                            LiveSessionKind::Stream,
+                            Box::new(Vec::<u8>::new()),
+                            Box::new(RecordingKiller::default()),
+                            registration,
+                        )?;
+                        if stale {
+                            monitor.status_observer()(
+                                pty_runner::PipedOutputSource::Stderr,
+                                b"No conversation found with session ID: old",
+                            );
+                        }
+                        let observer = monitor.observe_exit(observer);
+                        worker_runtime.kill_session(&launch.id)?;
+                        exit_worker = Some(std::thread::spawn(move || {
+                            // Explicit release after delivery failure: no sleep or
+                            // scheduling deadline chooses the observer ordering.
+                            release_rx.recv().unwrap();
+                            (observer.on_exit)(pty_runner::PtyRunResult {
+                                status: "failed",
+                                exit_code: Some(1),
+                            });
+                        }));
+                        failed_tx.send(())?;
+                        Err(anyhow::anyhow!("original prompt delivery failure")
+                            .context(InitialStreamPromptDeliveryFailed))
+                    },
+                );
+                exit_worker.unwrap().join().expect("exit observer panicked");
+                outcome
+            });
+            // Hang guard only; the channel establishes the failed-delivery phase.
+            let ready = failed_rx.recv_timeout(Duration::from_secs(60));
+            let _ = release_tx.send(());
+            let result = worker.join().expect("startup worker panicked");
+            ready?;
+            if stale {
+                assert_eq!(result?, StartupOutcome::Stale);
+            } else {
+                let error =
+                    result.expect_err("exit without stale evidence must retain delivery error");
+                assert!(format!("{error:#}").contains("original prompt delivery failure"));
+            }
+            assert_eq!(
+                runtime.live_session_accepts_turn("delayed-startup-exit")?,
+                None
+            );
+            assert!(runtime.main_session_starts.lock().unwrap().is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn main_session_unmarked_failure_preserves_admission_error() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let mut launch = stream_launch_fixture("unstarted-main", "hello");
+        launch.harness = "claude".into();
+        let error = runtime
+            .launch_main_session_observed(&launch, Duration::from_secs(60), || {
+                Err(anyhow::anyhow!("original admission refusal"))
+            })
+            .expect_err("an admission refusal must not become startup success");
+        assert_eq!(error.to_string(), "original admission refusal");
+        assert!(runtime.main_session_starts.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn main_session_delivery_failure_wait_stays_inside_existing_deadline() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let mut launch = stream_launch_fixture("pending-main-exit", "hello");
+        launch.harness = "claude".into();
+        // Genuine timeout case: the observer channel deliberately never supplies
+        // an outcome. Assert the failure class, not wall-clock promptness.
+        let error = runtime
+            .launch_main_session_observed(&launch, Duration::from_millis(50), || {
+                Err(anyhow::anyhow!("original pending delivery error")
+                    .context(InitialStreamPromptDeliveryFailed))
+            })
+            .expect_err("missing observation must exhaust the same startup deadline");
+        assert_eq!(
+            error.to_string(),
+            "harness exceeded main-session startup budget"
+        );
+        assert!(runtime.main_session_starts.lock().unwrap().is_empty());
         Ok(())
     }
 
