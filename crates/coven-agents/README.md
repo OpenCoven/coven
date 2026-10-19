@@ -222,10 +222,21 @@ not establish distributed fencing.
 The existing `Runner` provides local control transfer, correlation, and
 bounded local delegation with selected context and attenuated authority.
 `GoalLoopRunner` journals iteration boundaries; it does not supply durable
-child invocation adoption or shared executor conformance. `AgentLoop`
-extraction, wall-clock deadlines and cancellation, durable invocation
-adoption/recovery, remote executors, unified observability, and removal of
-legacy handoff/full-transcript behavior remain deferred under #804.
+child invocation adoption or shared executor conformance. Wall-clock
+deadlines and cancellation, durable invocation adoption/recovery, remote
+executors, unified observability, and removal of legacy
+handoff/full-transcript behavior remain deferred under #804.
+
+Internally, `Runner` is a facade over a crate-private `AgentLoop`. The loop
+runs one agent's model and tool turns: input and output guardrails, the
+result contract, proposal review, authority filtering, and tool dispatch. It
+stops at a final output, a control-transfer request, or the shared turn
+budget. The runner owns everything around it: request and revision
+validation, session load and append, delegated context resolution,
+control-transfer counting and target lookup, and the lifecycle events that
+start and end an invocation. Legacy handoff is visible as the runner passing
+one transcript from agent to agent. `AgentLoop` is not public API; it is the
+intended core of a future in-process executor.
 
 ## Behavioral evidence
 
