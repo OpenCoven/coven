@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "kind": "coven.release-signers",
+  "signers": [
+    {
+      "githubLogin": "BunsDev",
+      "githubUserId": 68980965,
+      "sshSigningKeyId": 880193,
+      "keyType": "ssh-ed25519"
+    }
+  ]
+}

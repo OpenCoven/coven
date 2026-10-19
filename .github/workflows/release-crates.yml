@@ -89,52 +89,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ steps.context.outputs.tag }}
-          NPM_RELEASE_ALLOWED_SIGNERS: ${{ vars.NPM_RELEASE_ALLOWED_SIGNERS }}
         run: |
           set -euo pipefail
-          tag_object_sha=$(git rev-parse "$TAG_NAME")
-          if [ "$(git cat-file -t "$tag_object_sha")" != "tag" ]; then
-            echo "::error::Refusing to release: $TAG_NAME is a lightweight tag, not an annotated signed tag. Re-tag with \`git tag -s $TAG_NAME -m ...\`."
-            exit 1
-          fi
-          ref_payload=$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME")
-          api_tag_object_sha=$(jq -r '.object.sha // ""' <<<"$ref_payload")
-          if [ "$(jq -r '.object.type // ""' <<<"$ref_payload")" != "tag" ] || [ "$api_tag_object_sha" != "$tag_object_sha" ]; then
-            echo "::error::Refusing to release: GitHub's ref for $TAG_NAME does not resolve to the local annotated tag object $tag_object_sha."
-            exit 1
-          fi
-          payload=$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$api_tag_object_sha")
-          verified=$(jq -r '.verification.verified' <<<"$payload")
-          reason=$(jq -r '.verification.reason' <<<"$payload")
-          if [ "$verified" != "true" ]; then
-            echo "::error::Tag $TAG_NAME does not have a GitHub-verified signature (reason=$reason)."
-            exit 1
-          fi
-          tagged_commit=$(jq -r '.object.sha // ""' <<<"$payload")
-          if [ "$(jq -r '.object.type // ""' <<<"$payload")" != "commit" ] || [ "$tagged_commit" != "$(git rev-parse "$TAG_NAME^{commit}")" ]; then
-            echo "::error::Refusing to release: $TAG_NAME does not target the GitHub-verified commit."
-            exit 1
-          fi
-          allowed_signers_raw="${NPM_RELEASE_ALLOWED_SIGNERS:-}"
-          if [ -z "${allowed_signers_raw//[[:space:]]/}" ]; then
-            echo "::error::Repository variable NPM_RELEASE_ALLOWED_SIGNERS must contain the allowed release signers."
-            exit 1
-          fi
-          allowed_signers_file="$RUNNER_TEMP/coven-crate-allowed-signers"
-          printf '%s\n' "$allowed_signers_raw" > "$allowed_signers_file"
-          git config gpg.format ssh
-          git config gpg.ssh.allowedSignersFile "$allowed_signers_file"
-          if ! git verify-tag "$TAG_NAME" >/dev/null 2>&1; then
-            echo "::error::Local verification of $TAG_NAME failed against the allowed release signers."
-            exit 1
-          fi
           default_branch=$(gh api "/repos/$GITHUB_REPOSITORY" --jq .default_branch)
-          git fetch --quiet origin "$default_branch"
-          if ! git merge-base --is-ancestor "$tagged_commit" "origin/$default_branch"; then
-            echo "::error::Refusing to release: $TAG_NAME points at $tagged_commit, which is not on $default_branch."
-            exit 1
-          fi
-          echo "tag=$TAG_NAME verified=$verified reason=$reason commit=$tagged_commit"
+          node scripts/verify-release-tag.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$TAG_NAME" \
+            --default-branch "$default_branch" \
+            --output crate-tag-verification.json >/dev/null
       - name: Confirm the tag version matches the crate manifest
         env:
           TAG_NAME: ${{ steps.context.outputs.tag }}

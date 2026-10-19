@@ -135,6 +135,7 @@ closing your terminal, and still reports a non-zero status, so a printed
   node --test scripts/package-automations-authority-profile.test.mjs || fail=1
   node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs || fail=1
   node --test scripts/release-stress-test.mjs || fail=1
+  node --test scripts/verify-release-tag.test.mjs || fail=1
   node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs || fail=1
   bash scripts/check-workflows.sh || fail=1
 
