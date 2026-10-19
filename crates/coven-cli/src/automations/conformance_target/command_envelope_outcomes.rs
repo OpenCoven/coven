@@ -210,12 +210,12 @@ fn case_matches(case: &Case) -> Result<bool, &'static str> {
 /// Every automation row, split into the adoption ledger and everything else
 /// the router can write: definitions, rich revisions, events and execution
 /// state.
-struct DurableState {
-    adoptions: Vec<String>,
-    domain: Vec<String>,
+pub(super) struct DurableState {
+    pub(super) adoptions: Vec<String>,
+    pub(super) domain: Vec<String>,
 }
 
-fn durable_state(conn: &Connection) -> Result<DurableState, &'static str> {
+pub(super) fn durable_state(conn: &Connection) -> Result<DurableState, &'static str> {
     let failed = |_| "conformance suite execution failed";
     let tables: Vec<String> = conn
         .prepare(

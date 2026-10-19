@@ -2072,6 +2072,41 @@ pub fn daemon_socket_path(coven_home: &Path) -> PathBuf {
     coven_home.join("coven.sock")
 }
 
+/// `(length, limit)` in bytes when the daemon socket for `coven_home` is too
+/// long to bind: `sun_path` must hold the path and its NUL terminator (103
+/// usable bytes on macOS, 107 on Linux). Always `None` where the daemon
+/// listens on a named pipe. Pass the canonical home, since that is the path
+/// the daemon binds (coven#1345).
+pub(crate) fn socket_path_overflow(coven_home: &Path) -> Option<(usize, usize)> {
+    #[cfg(unix)]
+    {
+        let length = daemon_socket_path(coven_home).as_os_str().as_bytes().len();
+        let limit = std::mem::size_of::<libc::sockaddr_un>()
+            - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+            - 1;
+        (length > limit).then_some((length, limit))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = coven_home;
+        None
+    }
+}
+
+/// Refuses a home whose socket cannot be bound, naming the path and the
+/// limit, before a daemon is spawned to fail where nobody sees its error.
+fn ensure_socket_path_fits(coven_home: &Path) -> Result<()> {
+    if let Some((length, limit)) = socket_path_overflow(coven_home) {
+        anyhow::bail!(
+            "Coven daemon socket path {} is {length} bytes, but Unix sockets on this platform \
+             allow at most {limit}; set COVEN_HOME to a shorter directory (symlinks are \
+             resolved first)",
+            daemon_socket_path(coven_home).display()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonIpcPlatform {
     Unix,
@@ -2440,6 +2475,7 @@ fn start_background_server_with_spawn(
     spawn: impl FnOnce(&DaemonSpawnSpec) -> Result<u32>,
 ) -> Result<DaemonStatus> {
     let coven_home = canonical_lifecycle_home(coven_home)?;
+    ensure_socket_path_fits(&coven_home)?;
     let spec = background_server_spec(current_exe, &coven_home, &started_at);
     let pid = spawn(&spec)?;
     Ok(DaemonStatus {
@@ -2612,9 +2648,14 @@ static OPTIONAL_DIAGNOSTIC_DELAY_MILLIS: std::sync::atomic::AtomicU64 =
 fn optional_diagnostic_test_delay() {
     #[cfg(test)]
     {
+        // Poll rather than sleep once, so a test's reset ends the injected
+        // delay instead of leaving a detached worker asleep past its test.
         let delay = OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.load(std::sync::atomic::Ordering::SeqCst);
-        if delay != 0 {
-            std::thread::sleep(Duration::from_millis(delay));
+        let until = Instant::now() + Duration::from_millis(delay);
+        while Instant::now() < until
+            && OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.load(std::sync::atomic::Ordering::SeqCst) != 0
+        {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -4890,6 +4931,7 @@ fn bind_api_socket_with_publisher(
     // boundary. daemon_socket_path() builds `<coven_home>/coven.sock`, so this is
     // an explicit guard so a future change can't let it escape. See docs/AUTH.md
     // "Current hardening gap".
+    ensure_socket_path_fits(coven_home)?;
     if socket_path.parent() != Some(coven_home) {
         anyhow::bail!(
             "refusing to bind Coven API socket {}: resolves outside Coven home {}",
@@ -7070,6 +7112,84 @@ mod tests {
         capacity.saturating_sub(path.as_os_str().as_bytes().len() + 1)
     }
 
+    /// A home under `base` whose `coven.sock` path is exactly `socket_len`
+    /// bytes, or `None` when `base` is already too long to get there.
+    #[cfg(unix)]
+    fn home_with_socket_len(base: &Path, socket_len: usize) -> Option<PathBuf> {
+        let fixed = base.as_os_str().as_bytes().len() + "/".len() + "/coven.sock".len();
+        let name_len = socket_len.checked_sub(fixed).filter(|len| *len > 0)?;
+        Some(base.join("h".repeat(name_len)))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_overflow_matches_what_bind_accepts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        let probe = home_with_socket_len(&base, 200).unwrap();
+        let (_, limit) = socket_path_overflow(&probe).expect("200 bytes cannot fit");
+        let at_limit = home_with_socket_len(&base, limit).expect("temp dir leaves headroom");
+        let over_limit = home_with_socket_len(&base, limit + 1).unwrap();
+        assert_eq!(socket_path_overflow(&at_limit), None);
+        assert_eq!(socket_path_overflow(&over_limit), Some((limit + 1, limit)));
+
+        // The limit is the kernel's: a socket binds at exactly the limit and
+        // not one byte past it.
+        for home in [&at_limit, &over_limit] {
+            std::fs::create_dir(home)?;
+        }
+        let bound = UnixListener::bind(daemon_socket_path(&at_limit));
+        assert!(bound.is_ok(), "{bound:?}");
+        let refused = UnixListener::bind(daemon_socket_path(&over_limit));
+        assert!(refused.is_err(), "bind accepted {} bytes", limit + 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_start_refuses_a_home_whose_socket_cannot_bind() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        let probe = home_with_socket_len(&base, 200).unwrap();
+        let (_, limit) = socket_path_overflow(&probe).unwrap();
+        let long_home = home_with_socket_len(&base, limit + 1).unwrap();
+        std::fs::create_dir(&long_home)?;
+        let spawned = std::cell::Cell::new(false);
+        let error = start_background_server_with_spawn(
+            &long_home,
+            Path::new("/usr/bin/coven"),
+            "now".to_owned(),
+            |_| {
+                spawned.set(true);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+        assert!(!spawned.get(), "no daemon is spawned to fail out of sight");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "is {} bytes, but Unix sockets on this platform allow at most {limit}",
+                limit + 1
+            )) && message.contains("set COVEN_HOME to a shorter directory"),
+            "{message}"
+        );
+
+        let short_home = base.join("home");
+        std::fs::create_dir(&short_home)?;
+        start_background_server_with_spawn(
+            &short_home,
+            Path::new("/usr/bin/coven"),
+            "now".to_owned(),
+            |_| {
+                spawned.set(true);
+                Ok(1)
+            },
+        )?;
+        assert!(spawned.get());
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn read_bounded_test_request(stream: &mut UnixStream, deadline: Instant) -> Result<String> {
         stream.set_nonblocking(false)?;
@@ -7497,9 +7617,14 @@ mod tests {
         };
         write_status(temp_dir.path(), &status)?;
         let started = std::sync::Arc::new(std::sync::Mutex::new(0));
-        OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.store(500, std::sync::atomic::Ordering::SeqCst);
+        // The restart deadline is a budget handed to the code under test, so
+        // it must leave the mandatory work (stop, start, recording the startup
+        // budget) room under load: at 100ms that work alone could exhaust it
+        // and fail the restart before this test's question was asked
+        // (coven#1333). The injected delay stays well past the deadline.
+        OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.store(5_000, std::sync::atomic::Ordering::SeqCst);
         let _delay_guard = DiagnosticDelayGuard;
-        let deadline = LifecycleDeadline::after(Duration::from_millis(100))?;
+        let deadline = LifecycleDeadline::after(Duration::from_secs(1))?;
         let started_at = Instant::now();
 
         let restarted = restart_background_server_with_controllers_until(
@@ -7521,13 +7646,13 @@ mod tests {
         )?;
 
         assert!(restarted.0);
-        // The injected diagnostic delay is 500ms and the restart deadline is
-        // 100ms, so any bound strictly between them proves the scan did not
-        // block. 250ms sat close to the fast path; 400ms keeps the same signal
-        // with more room for jitter.
+        // A discriminating threshold: restart returns by its 1s deadline when
+        // the optional scan does not block, and not before 5s when it does.
+        // The bound sits near the midpoint so jitter cannot cross it.
+        let elapsed = started_at.elapsed();
         assert!(
-            started_at.elapsed() < Duration::from_millis(400),
-            "optional diagnostic scan delayed restart completion"
+            elapsed < Duration::from_secs(3),
+            "optional diagnostic scan delayed restart completion: {elapsed:?}"
         );
         Ok(())
     }

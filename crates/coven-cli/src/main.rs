@@ -66,6 +66,7 @@ mod main_session_start;
 mod maintenance_gate;
 mod memory_dashboard;
 mod memory_import;
+mod missions_cli;
 pub mod mobile_memory;
 mod observe;
 mod openclaw_repo;
@@ -819,6 +820,14 @@ Exit codes: 0 ok · 3 refused (JSON {refused, detail}) · 1 error")]
         #[command(subcommand)]
         command: AutomationsCommand,
     },
+    #[command(
+        hide = true,
+        about = "Submit, read, watch and cancel one familiar mission on the running daemon"
+    )]
+    Missions {
+        #[command(subcommand)]
+        command: missions_cli::MissionsCommand,
+    },
     #[command(about = "Inspect travel-mode handoff state (read-only)")]
     Travel {
         #[command(subcommand)]
@@ -1138,6 +1147,42 @@ enum SchedulerCommand {
 
 #[derive(Subcommand, Debug)]
 enum AutomationsCommand {
+    #[command(
+        about = "Inspect scheduler leadership, last pass, and queue through the local daemon"
+    )]
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one occurrence and its bounded run history")]
+    Occurrence {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one run without raw logs or private failure text")]
+    Run {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one run's attempts, fences, and retry classifications")]
+    Attempts {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect occurrence lease metadata through the owner-local daemon")]
+    Leases {
+        #[arg(long)]
+        automation_id: Option<String>,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
+        limit: u8,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Expose the native conformance target protocol")]
     Conformance {
         #[command(subcommand)]
@@ -1147,6 +1192,8 @@ enum AutomationsCommand {
 
 #[derive(Subcommand, Debug)]
 enum AutomationsConformanceCommand {
+    #[command(hide = true, name = "command-crash-worker")]
+    CommandCrashWorker,
     #[command(about = "Print the native conformance suites supported by this binary")]
     Capability,
     #[command(about = "Evaluate one conformance suite request from standard input")]
@@ -1603,6 +1650,11 @@ fn main() -> Result<()> {
         &cli.command,
         Some(Command::Automations {
             command: AutomationsCommand::Conformance { .. }
+                | AutomationsCommand::Leases { .. }
+                | AutomationsCommand::Status { .. }
+                | AutomationsCommand::Occurrence { .. }
+                | AutomationsCommand::Run { .. }
+                | AutomationsCommand::Attempts { .. }
         })
     ) || matches!(
         &cli.command,
@@ -1673,6 +1725,10 @@ fn main() -> Result<()> {
             .is_some()
         {
             std::process::exit(1);
+        }
+        // Mission commands print their result as JSON before choosing a status.
+        if let Some(exit) = error.downcast_ref::<missions_cli::MissionsExit>() {
+            std::process::exit(exit.0);
         }
         if let Some(reset_error) = error.downcast_ref::<reset::ResetError>() {
             eprintln!("Error: {reset_error}");
@@ -1914,6 +1970,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             SchedulerCommand::Loop { loop_id, json } => observe::run_scheduler_loop(&loop_id, json),
         },
         Some(Command::Automations { command }) => run_automations_command(command),
+        Some(Command::Missions { command }) => missions_cli::run(command),
         Some(Command::Travel { command }) => match command {
             TravelCommand::State {
                 client,
@@ -2755,8 +2812,22 @@ struct DoctorEngineReport {
 impl DoctorReport {
     /// A blocking problem exists exactly when one of these holds; prose exit
     /// codes and the JSON `ok` field both derive from this list.
+    /// `(length, limit)` when no daemon runs and none could: the home's
+    /// socket path is too long to bind (coven#1345).
+    fn daemon_socket_overflow(&self) -> Option<(usize, usize)> {
+        if self.daemon.is_some() {
+            return None;
+        }
+        let home = self
+            .home
+            .canonicalize()
+            .unwrap_or_else(|_| self.home.clone());
+        daemon::socket_path_overflow(&home)
+    }
+
     fn healthy(&self) -> bool {
-        let daemon_ok = !matches!(self.daemon, Some(daemon::DaemonStatusState::Stale(_)));
+        let daemon_ok = !matches!(self.daemon, Some(daemon::DaemonStatusState::Stale(_)))
+            && self.daemon_socket_overflow().is_none();
         let repos_ok = self.repos.iter().all(|repo| repo.ok);
         let harness_ok = self.harnesses.iter().any(|harness| harness.available);
         let engine_ok = match &self.engine {
@@ -2953,7 +3024,12 @@ fn print_doctor_prose(report: &DoctorReport) {
                 status.pid, status.socket
             ));
         }
-        None => println!("  [--] Not running — run: coven daemon start"),
+        None => match report.daemon_socket_overflow() {
+            Some((length, limit)) => println!(
+                "  [!!] Not running, and its socket path is {length} bytes; Unix sockets here allow at most {limit} — set COVEN_HOME to a shorter directory"
+            ),
+            None => println!("  [--] Not running — run: coven daemon start"),
+        },
     }
 
     if !report.repos.is_empty() {
@@ -3268,11 +3344,22 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             ),
             Some("run: coven daemon restart".to_string()),
         ),
-        None => DoctorCheck::warn(
-            "daemon",
-            "not running",
-            Some("run: coven daemon start".to_string()),
-        ),
+        // A home whose socket cannot be bound would fail `daemon start` too,
+        // so name that instead of suggesting it (coven#1345).
+        None => match report.daemon_socket_overflow() {
+            Some((length, limit)) => DoctorCheck::fail(
+                "daemon",
+                format!(
+                    "not running, and its socket path is {length} bytes; Unix sockets here allow at most {limit}"
+                ),
+                Some("set COVEN_HOME to a shorter directory".to_string()),
+            ),
+            None => DoctorCheck::warn(
+                "daemon",
+                "not running",
+                Some("run: coven daemon start".to_string()),
+            ),
+        },
     });
 
     for repo in &report.repos {
@@ -4036,8 +4123,26 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
 }
 
 fn run_automations_command(command: AutomationsCommand) -> Result<()> {
+    use automations::operator_cli::{run, View};
     match command {
+        AutomationsCommand::Status { json } => run(View::Status, json),
+        AutomationsCommand::Occurrence { id, json } => run(View::Occurrence(&id), json),
+        AutomationsCommand::Run { id, json } => run(View::Run(&id), json),
+        AutomationsCommand::Attempts { run_id, json } => run(View::Attempts(&run_id), json),
+        AutomationsCommand::Leases {
+            automation_id,
+            limit,
+            cursor,
+            json,
+        } => automations::lease_cli::run(automation_id.as_deref(), limit, cursor.as_deref(), json),
         AutomationsCommand::Conformance { command } => match command {
+            AutomationsConformanceCommand::CommandCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::command_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
             AutomationsConformanceCommand::Capability => {
                 println!(
                     "{}",
@@ -9405,6 +9510,35 @@ mod tests {
 
     /// The JSON `ok` field is derived from check statuses while the exit code
     /// derives from `healthy()`; they must agree for every failure mode.
+    #[test]
+    fn doctor_names_a_socket_path_too_long_to_bind() {
+        let mut stopped = make_doctor_report();
+        stopped.daemon = None;
+        let check = |report: &DoctorReport| {
+            doctor_checks(report)
+                .into_iter()
+                .find(|check| check.id == "daemon")
+                .unwrap()
+        };
+        let plain = check(&stopped);
+        assert_eq!(plain.status, "warn");
+        assert_eq!(plain.hint.as_deref(), Some("run: coven daemon start"));
+
+        stopped.home = PathBuf::from(format!("/tmp/{}", "h".repeat(200)));
+        let long = check(&stopped);
+        if cfg!(unix) {
+            assert_eq!(long.status, "fail");
+            assert!(long.message.starts_with("not running, and its socket path is 216 bytes; Unix sockets here allow at most "), "{}", long.message);
+            assert_eq!(
+                long.hint.as_deref(),
+                Some("set COVEN_HOME to a shorter directory")
+            );
+            assert!(!stopped.healthy());
+        } else {
+            assert_eq!(long.status, "warn");
+        }
+    }
+
     #[test]
     fn doctor_checks_fail_statuses_match_healthy() {
         let healthy = make_doctor_report();

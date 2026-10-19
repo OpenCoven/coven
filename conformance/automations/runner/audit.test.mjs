@@ -29,13 +29,15 @@ const REQUIRED = {
     "attempt-terminal-immutability", "capability-negotiation",
     "command-adoption-idempotency", "command-envelope-outcomes",
     "definition-lifecycle-transitions", "definition-validation",
-    "event-reducer-determinism", "occurrence-fence-uniqueness",
+    "event-reducer-determinism", "mission-commands", "occurrence-fence-uniqueness",
     "receipt-integrity-validation", "rrule-vocabulary",
     "run-terminal-monotonicity",
   ],
   scheduler_reliability: [
     "calendar-schedule-resolution", "cancellation-timeout-arbitration",
-    "command-storage-lock-recovery", "misfire-latest-planning", "occurrence-lease-recovery", "overlap-forbid-claiming",
+    "command-storage-lock-recovery", "command-storage-readonly-recovery", "command-transaction-rollback",
+    "legacy-import-source-preservation", "command-storage-capacity-recovery",
+    "command-process-crash-recovery", "misfire-latest-planning", "occurrence-lease-recovery", "overlap-forbid-claiming",
     "retry-backoff-timing", "retry-quarantine-recovery",
     "scheduler-leadership-fencing", "startup-reconciliation-wake",
   ],
@@ -338,9 +340,9 @@ function run(f, { name = "output", output, env = {}, args } = {}) {
   };
 }
 
-test("reviewed inventory covers every vector, all 22 suites, and exact metadata", () => {
+test("reviewed inventory covers every vector, all 28 suites, and exact metadata", () => {
   const suites = loadInventory();
-  assert.equal(suites.length, 22);
+  assert.equal(suites.length, 28);
   assert.deepEqual(
     Object.fromEntries(Object.keys(REQUIRED).map((profile) =>
       [profile, suites.filter((suite) => suite.profile === profile).map((suite) => suite.suiteId)])),
@@ -382,7 +384,7 @@ test("CLI packages, builds, binds and retains repeatable all-suite audit artifac
   assert.equal(report.statement.overallStatus, "passed");
   assert.deepEqual(report.statement.decisionScope, { kind: "audit_only" });
   assert.equal(report.statement.source.commit, f.head);
-  assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 22);
+  assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 28);
   assert.deepEqual(report, json(path.join(first.outputDir, "result.json")));
   assert.deepEqual(report.statementDigest, digestCanonical(report.statement));
   assert.doesNotMatch(first.stdout, /productionReady|release_eligibility|"full"|privateOutput|privatePath/);
@@ -720,10 +722,10 @@ test("an unadvertised required suite stays in the job and fails the whole audit"
   assert.equal(result.status, 1);
   const report = json(path.join(result.outputDir, "result.json"));
   assert.equal(report.statement.overallStatus, "incomplete", result.diagnostics);
-  assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 22);
+  assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 28);
   assert.deepEqual(report.statement.profileResults.at(-1).suiteResults,
     [{ suiteId: "runtime-authority-terminal-recovery", status: "not_applicable" }]);
-  assert.equal(json(path.join(result.outputDir, "job.json")).suites.length, 22);
+  assert.equal(json(path.join(result.outputDir, "job.json")).suites.length, 28);
 });
 
 test("fixture data cannot claim native execution without the explicit test transport", (t) => {
@@ -750,7 +752,7 @@ test("unavailable, failed, incomplete and malformed targets cannot pass or leak 
       assert.equal(result.status, 1, result.stderr);
       const report = json(path.join(result.outputDir, "result.json"));
       assert.notEqual(report.statement.overallStatus, "passed");
-      assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 22);
+      assert.equal(report.statement.profileResults.flatMap((profile) => profile.suiteResults).length, 28);
       assert.doesNotMatch(JSON.stringify(report), new RegExp(MARKER));
     });
   }

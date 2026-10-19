@@ -187,11 +187,14 @@ The checked-in
 [`calendar-schedule-resolution.vectors.json`](calendar-schedule-resolution.vectors.json),
 [`cancellation-timeout-arbitration.vectors.json`](cancellation-timeout-arbitration.vectors.json),
 [`command-adoption-idempotency.vectors.json`](command-adoption-idempotency.vectors.json),
+[`legacy-import-source-preservation.vectors.json`](legacy-import-source-preservation.vectors.json),
 [`command-envelope-outcomes.vectors.json`](command-envelope-outcomes.vectors.json),
+[`command-transaction-rollback.vectors.json`](command-transaction-rollback.vectors.json),
 [`definition-lifecycle-transitions.vectors.json`](definition-lifecycle-transitions.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
 [`misfire-latest-planning.vectors.json`](misfire-latest-planning.vectors.json),
+[`mission-commands.vectors.json`](mission-commands.vectors.json),
 [`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
 [`occurrence-lease-recovery.vectors.json`](occurrence-lease-recovery.vectors.json),
 [`overlap-forbid-claiming.vectors.json`](overlap-forbid-claiming.vectors.json),
@@ -225,6 +228,7 @@ The runner invokes the target directly without a shell.
         "definition-lifecycle-transitions",
         "definition-validation",
         "event-reducer-determinism",
+        "mission-commands",
         "occurrence-fence-uniqueness",
         "receipt-integrity-validation",
         "rrule-vocabulary",
@@ -236,6 +240,9 @@ The runner invokes the target directly without a shell.
       "suites": [
         "calendar-schedule-resolution",
         "cancellation-timeout-arbitration",
+        "command-storage-lock-recovery",
+        "command-transaction-rollback",
+        "legacy-import-source-preservation",
         "misfire-latest-planning",
         "occurrence-lease-recovery",
         "overlap-forbid-claiming",
@@ -259,7 +266,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eleven structural suites, ten
+The native Coven target currently implements eleven structural suites, fifteen
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -293,6 +300,16 @@ normalized JCS digest matches and rejecting a tampered definition.
 `event-reducer-determinism` replays a portable event stream through the native
 Rust reducer both canonically and with an exact duplicate delivery, requiring
 the same normalized final state and expected digest.
+`mission-commands` sends `mission.submit.v1`, `mission.get.v1` and
+`mission.cancel.v1` to a store holding one familiar whose first revision has
+been superseded, on a clock that advances a minute per step. It covers the
+vectors M0 can reach (M-01 to M-06, M-09, M-11 and M-15 in
+`docs/architecture/coven-automations-missions.md`): a replayed submit, a reused
+key, a stale revision, an unenforced envelope, the no-launch settlement, a
+cancel after it, another caller, and every bound. It checks what each refusal
+leaves behind, as `command-envelope-outcomes` does. Values that exist only at
+run time, such as the familiar's ids and `validUntil`, are whole-string tokens
+such as `{{revisionId}}` and `{{start:10m}}`.
 `calendar-schedule-resolution` executes fixed UTC and IANA-timezone cases
 through the production scheduler. It covers same-day and multi-hour daily
 schedules, weekly weekday selection, winter and summer offsets, skipped DST
@@ -397,3 +414,108 @@ This is audit-only evidence for command-adoption lock refusal and recovery.
 It does not certify process crashes, disk-full, I/O errors, corruption,
 permission loss, runtime dispatch, or release eligibility. The zero busy wait
 belongs only to the fixture connection; production deadlines are unchanged.
+
+The `command-storage-readonly-recovery` suite creates a private disposable store,
+seeds unrelated definition/adoption/event and authority records, then closes it.
+A fresh `SQLITE_OPEN_READ_ONLY` connection must refuse the production definition
+command with actual `SQLITE_READONLY`. The complete persisted projections must
+remain unchanged and the transaction must close. A fresh writable connection
+then retries the same key once; a second reopen must replay the exact result,
+event reference, revision, and first commit timestamp without further writes.
+A writable control exercises the same command without the refusal. Machine
+readable observations are included in the suite evidence.
+
+This is audit-only evidence for SQLite read-only mode. It does not prove OS
+permission loss, full-disk or I/O recovery, corruption tolerance, runtime
+execution, complete conformance profiles, or release eligibility. The fixture
+never opens an existing user store, launches a provider, or changes production
+connection permissions.
+### Command transaction rollback audit
+
+`command-transaction-rollback` exercises the real definition-command transaction
+with rich v1 draft definitions in disposable file-backed stores. Mandatory cases
+inject SQLite trigger aborts at event insertion and final adoption insertion,
+plus an uninjected control. Each abort must leave zero definition, rich revision,
+event, stream-head and adoption rows, including after reopening and repeating the
+same request while the fault remains installed. Removing the trigger permits the
+same adoption key to commit; another reopen must replay the original result,
+revision, event reference and first-commit timestamp with exactly one durable
+record of each kind. The stored event must match the returned stream and sequence.
+
+These are deterministic transaction-abort probes. They do not prove process-kill
+recovery, disk-full, filesystem I/O/corruption, runtime authority, or release
+eligibility. The fixtures remain draft and launch no runtime. Invalid definitions,
+missing/duplicate fault cases, and weakened expected invariants are refused with
+static errors before executing any case.
+
+## Legacy import audit boundary
+
+The `legacy-import-source-preservation` suite calls existing import actions
+through an identity-bound owner-local daemon in a disposable home. Its two
+routes distinguish legacy `PAUSED`/`paused` records from v1 `PAUSED`/`draft`
+records. Source definitions request ACTIVE status; import must keep them inactive.
+The fixture compares source bytes and inventory, preserves a preexisting
+definition, exercises duplicate IDs and unsupported schedules, and checks v1
+dry run and adoption replay. It compares persisted records across daemon restart
+and requires zero occurrences, runs and attempts. Case observations expose only
+fixed state/outcome classifications, counts, preservation booleans and case IDs;
+they are retained for both passing and failed expectations.
+
+This adds audit-only evidence toward golden scenario 20. It does not certify
+runtime launch, principal-scoped disclosure, broad crash boundaries, all
+platform containment, complete profiles or release eligibility. The daemon
+receives an isolated home and no provider environment. The runner uses a short
+owned scratch path on macOS for Unix sockets and a separate fixture hang guard;
+production startup and maintenance deadlines are unchanged.
+
+## Command SQLite capacity audit boundary
+
+The `command-storage-capacity-recovery` suite initializes a disposable file-backed
+store, seeds an unrelated definition, then caps SQLite `max_page_count` at the
+current page count. A bounded synthetic 128 KiB prompt forces page growth through
+the production definition-command API. The fault case requires actual
+`rusqlite::ErrorCode::DiskFull` (`SQLITE_FULL`); the other case is unconstrained.
+The fault source is `sqlite_max_page_count`. This does not cover physical disk
+exhaustion, permission loss, I/O errors or corruption. No runtime is launched.
+
+Private snapshots compare every row in definitions, rich revisions, owner
+principal/grants, command adoptions/reservations and events after failure. The
+fixture lifts its quota, retries the same command/key, checks one added
+definition/adoption/event, reopens the store and requires stable replay without
+additional writes. Synthetic payloads and database snapshots remain internal.
+Unsupported fixture conditions and malformed vectors fail with static errors.
+This remains `audit_only`; it supplies no production release eligibility.
+
+## Command process-crash audit boundary
+
+`command-process-crash-recovery` uses three abrupt process-termination cases
+and an uninterrupted commit control. Each worker is the exact audited binary,
+creates a new private child directory under parent-owned scratch, initializes
+a disposable file-backed store, and verifies a preexisting paused definition.
+No worker input can select an existing database. No providers or runtimes launch.
+
+Fixture-only TEMP triggers call a local SQLite callback after the definition,
+event or adoption INSERT. The callback announces the boundary and parks. The
+parent verifies the WAL header, frame salts and rolling checksums, and
+requires complete frames with zero commit markers before abruptly killing and
+reaping the child. The disposable connection uses a one-page cache and cache
+spill after a verified truncating checkpoint. Production cache/durability
+settings do not change. SQL abort and panic unwinding are not crash evidence.
+
+Raw reopen checks integrity and complete snapshots before production schema
+initialization. Definitions, rich revisions, owner principal/grants, adoptions,
+reservations, events and stream heads must retain the baseline without partial
+writes. Retrying the same command/key must add one definition/adoption/event
+and its stream head, with a correlated event reference. Reopen/replay must
+preserve the full response and first commit time without additional writes.
+
+Worker handshakes, private snapshots and synthetic prompts remain internal.
+Exported observations contain fixed boundary/outcome classes, counts and
+preservation booleans. Child input/output and waits are bounded; error cleanup
+kills/reaps the child before removing scratch. The runner's two-minute fixture
+hang guard is not a measured recovery SLO. Native-target tests run on Windows;
+standalone Windows runner containment remains unsupported.
+
+This adds `audit_only` command transaction crash coverage. It does not cover
+external dispatch crashes, physical disk exhaustion, permission/I/O/corruption,
+complete profiles, production authority, or release eligibility.

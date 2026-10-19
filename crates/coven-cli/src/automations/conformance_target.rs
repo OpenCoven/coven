@@ -29,8 +29,23 @@ use super::runs::{
 };
 
 mod command_envelope_outcomes;
+mod command_process_crash_recovery;
+mod command_storage_capacity_recovery;
 mod command_storage_lock_recovery;
+mod command_storage_readonly_recovery;
+mod command_transaction_rollback;
+mod legacy_import_source_preservation;
+mod mission_commands;
 mod runtime_authority_terminal_recovery;
+#[cfg(test)]
+mod startup_wake_trace;
+#[cfg(test)]
+use startup_wake_trace::{StartupWakeOutcome, StartupWakePhase, StartupWakeTrace};
+
+/// Execute the disposable hidden process-crash conformance worker.
+pub fn command_crash_worker(request: &Value) -> Result<(), &'static str> {
+    command_process_crash_recovery::worker(request)
+}
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
 const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-request.v1";
@@ -92,12 +107,18 @@ pub const CALENDAR_SCHEDULE_RESOLUTION_SUITE: &str = "calendar-schedule-resoluti
 pub const CANCELLATION_TIMEOUT_ARBITRATION_SUITE: &str = "cancellation-timeout-arbitration";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
+pub const COMMAND_STORAGE_READONLY_RECOVERY_SUITE: &str = "command-storage-readonly-recovery";
+pub const COMMAND_TRANSACTION_ROLLBACK_SUITE: &str = "command-transaction-rollback";
+pub const COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE: &str = "command-storage-capacity-recovery";
+pub const COMMAND_PROCESS_CRASH_RECOVERY_SUITE: &str = "command-process-crash-recovery";
 pub const COMMAND_STORAGE_LOCK_RECOVERY_SUITE: &str = "command-storage-lock-recovery";
 pub const COMMAND_ENVELOPE_OUTCOMES_SUITE: &str = "command-envelope-outcomes";
 pub const DEFINITION_LIFECYCLE_TRANSITIONS_SUITE: &str = "definition-lifecycle-transitions";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
+pub const LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE: &str = "legacy-import-source-preservation";
 pub const MISFIRE_LATEST_PLANNING_SUITE: &str = "misfire-latest-planning";
+pub const MISSION_COMMANDS_SUITE: &str = "mission-commands";
 pub const OCCURRENCE_LEASE_RECOVERY_SUITE: &str = "occurrence-lease-recovery";
 pub const OVERLAP_FORBID_CLAIMING_SUITE: &str = "overlap-forbid-claiming";
 pub const RETRY_BACKOFF_TIMING_SUITE: &str = "retry-backoff-timing";
@@ -1544,6 +1565,7 @@ pub fn capability() -> TargetCapability {
                     DEFINITION_LIFECYCLE_TRANSITIONS_SUITE,
                     DEFINITION_VALIDATION_SUITE,
                     EVENT_REDUCER_DETERMINISM_SUITE,
+                    MISSION_COMMANDS_SUITE,
                     OCCURRENCE_FENCE_UNIQUENESS_SUITE,
                     RECEIPT_INTEGRITY_VALIDATION_SUITE,
                     RRULE_VOCABULARY_SUITE,
@@ -1556,6 +1578,11 @@ pub fn capability() -> TargetCapability {
                     CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                     CANCELLATION_TIMEOUT_ARBITRATION_SUITE,
                     COMMAND_STORAGE_LOCK_RECOVERY_SUITE,
+                    COMMAND_STORAGE_READONLY_RECOVERY_SUITE,
+                    COMMAND_TRANSACTION_ROLLBACK_SUITE,
+                    LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE,
+                    COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE,
+                    COMMAND_PROCESS_CRASH_RECOVERY_SUITE,
                     MISFIRE_LATEST_PLANNING_SUITE,
                     OCCURRENCE_LEASE_RECOVERY_SUITE,
                     OVERLAP_FORBID_CLAIMING_SUITE,
@@ -1605,6 +1632,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         (STRUCTURAL_PROFILE, EVENT_REDUCER_DETERMINISM_SUITE) => {
             evaluate_event_reducer_determinism(&request.vector)?
         }
+        (STRUCTURAL_PROFILE, MISSION_COMMANDS_SUITE) => {
+            mission_commands::evaluate(&request.vector)?
+        }
         (STRUCTURAL_PROFILE, OCCURRENCE_FENCE_UNIQUENESS_SUITE) => {
             evaluate_occurrence_fence_uniqueness(&request.vector)?
         }
@@ -1621,8 +1651,44 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         (SCHEDULER_RELIABILITY_PROFILE, CANCELLATION_TIMEOUT_ARBITRATION_SUITE) => {
             evaluate_cancellation_timeout_arbitration(&request.vector)?
         }
+        (SCHEDULER_RELIABILITY_PROFILE, COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                command_storage_capacity_recovery::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, COMMAND_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = command_process_crash_recovery::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, COMMAND_STORAGE_READONLY_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                command_storage_readonly_recovery::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
         (SCHEDULER_RELIABILITY_PROFILE, COMMAND_STORAGE_LOCK_RECOVERY_SUITE) => {
             command_storage_lock_recovery::evaluate(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, COMMAND_TRANSACTION_ROLLBACK_SUITE) => {
+            command_transaction_rollback::evaluate(&request.vector)?
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE) => {
+            let (passed, observations) =
+                legacy_import_source_preservation::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            result.evidence.get_or_insert_with(|| json!({}))["caseObservations"] = observations;
+            return Ok(result);
         }
         (SCHEDULER_RELIABILITY_PROFILE, MISFIRE_LATEST_PLANNING_SUITE) => {
             evaluate_misfire_latest_planning(&request.vector)?
@@ -3622,21 +3688,90 @@ impl super::daemon_tick::AutomationClock for SchedulerConformanceClock {
 fn startup_reconciliation_wake_case_matches(
     case: &StartupReconciliationWakeVectorCase,
 ) -> Result<bool, &'static str> {
+    #[cfg(test)]
+    {
+        let mut trace = StartupWakeTrace::new(case.scenario);
+        let result = startup_reconciliation_wake_case_observed(case, &mut trace);
+        if let Some(report) = trace.failure_report(&result) {
+            eprintln!("{report}");
+        }
+        result
+    }
+    #[cfg(not(test))]
+    startup_reconciliation_wake_case_observed(case)
+}
+
+fn startup_reconciliation_wake_case_observed(
+    case: &StartupReconciliationWakeVectorCase,
+    #[cfg(test)] trace: &mut StartupWakeTrace,
+) -> Result<bool, &'static str> {
+    #[cfg(test)]
+    let scheduler_home =
+        trace.operation(StartupWakePhase::TempHome, scheduler_conformance_tempdir)?;
+    #[cfg(not(test))]
     let scheduler_home = scheduler_conformance_tempdir()?;
-    crate::daemon::ensure_private_coven_home(scheduler_home.path())
-        .map_err(|_| "conformance suite execution failed")?;
+    startup_reconciliation_wake_case_in_home(
+        case,
+        scheduler_home,
+        #[cfg(test)]
+        trace,
+    )
+}
+
+fn startup_reconciliation_wake_case_in_home(
+    case: &StartupReconciliationWakeVectorCase,
+    scheduler_home: tempfile::TempDir,
+    #[cfg(test)] trace: &mut StartupWakeTrace,
+) -> Result<bool, &'static str> {
+    // Timing, buffering and emission compile only into the native unit target.
+    // Each non-test expansion evaluates the original operation exactly once.
+    macro_rules! observed {
+        ($phase:ident, $operation:expr) => {{
+            #[cfg(test)]
+            {
+                trace.operation(StartupWakePhase::$phase, || $operation)
+            }
+            #[cfg(not(test))]
+            {
+                $operation
+            }
+        }};
+    }
+    macro_rules! received {
+        ($phase:ident, $operation:expr) => {{
+            #[cfg(test)]
+            {
+                trace.receive(StartupWakePhase::$phase, || $operation)
+            }
+            #[cfg(not(test))]
+            {
+                $operation
+            }
+        }};
+    }
+    observed!(
+        PrivateHome,
+        crate::daemon::ensure_private_coven_home(scheduler_home.path())
+    )
+    .map_err(|_| "conformance suite execution failed")?;
     let store_path = scheduler_home.path().join("coven.sqlite3");
-    let conn =
-        crate::store::open_store(&store_path).map_err(|_| "conformance suite execution failed")?;
+    let conn = observed!(StoreOpenInitial, crate::store::open_store(&store_path))
+        .map_err(|_| "conformance suite execution failed")?;
     let definition = super::definition::RoutineDefinition::from_json(&case.definition)
         .map_err(|_| "conformance vector is invalid")?;
-    super::store::insert_definition(&conn, &definition)
-        .map_err(|_| "conformance suite execution failed")?;
-    conn.execute(
-        "UPDATE automation_definitions
-         SET created_at = ?1, updated_at = ?1
-         WHERE id = ?2",
-        params![&case.created_at, &definition.id],
+    observed!(
+        DefinitionInsert,
+        super::store::insert_definition(&conn, &definition)
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    observed!(
+        DefinitionTimeUpdate,
+        conn.execute(
+            "UPDATE automation_definitions
+     SET created_at = ?1, updated_at = ?1
+     WHERE id = ?2",
+            params![&case.created_at, &definition.id],
+        )
     )
     .map_err(|_| "conformance suite execution failed")?;
     drop(conn);
@@ -3664,19 +3799,32 @@ fn startup_reconciliation_wake_case_matches(
         waits: AtomicUsize::new(0),
         first_reason: Mutex::new(None),
     });
-    let mut handle = super::daemon_tick::start_automations_scheduler_with_clock(
-        scheduler_home.path(),
-        runtime.clone(),
-        clock.clone(),
+    let handle = observed!(
+        SchedulerStart,
+        super::daemon_tick::start_automations_scheduler_with_clock(
+            scheduler_home.path(),
+            runtime.clone(),
+            clock.clone(),
+        )
     )
     .map_err(|_| "conformance suite execution failed")?;
 
     let synchronization_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
-    let system_wait_observed = wait_ready_rx
-        .recv_timeout(synchronization_deadline.saturating_duration_since(StdInstant::now()))
-        .is_ok();
+    #[cfg(test)]
+    trace.set_deadline(StartupWakePhase::SharedDeadline, synchronization_deadline);
+    let system_wait_observed = received!(
+        SystemWaitReceive,
+        wait_ready_rx
+            .recv_timeout(synchronization_deadline.saturating_duration_since(StdInstant::now()))
+    )
+    .is_ok();
     let launches_before_first_wait = runtime.launches.load(Ordering::SeqCst);
-    let _ = wait_release_tx.send(());
+    #[cfg(test)]
+    trace.value(
+        StartupWakePhase::LaunchCountBeforeWait,
+        launches_before_first_wait as u64,
+    );
+    let _ = observed!(GateRelease, wait_release_tx.send(()));
     let mut action_accepted = false;
     if case.scenario == StartupReconciliationWakeScenario::DefinitionChangeWake {
         let revised_definition = case
@@ -3690,67 +3838,123 @@ fn startup_reconciliation_wake_case_matches(
             "definition": revised_definition
         })
         .to_string();
-        let response = crate::api::handle_request_with_body_at(
-            "POST",
-            "/api/v1/actions",
-            scheduler_home.path(),
-            None,
-            Some(&body),
-            case.changed_at
-                .as_deref()
-                .ok_or("conformance vector is invalid")?,
+        let changed_at = case
+            .changed_at
+            .as_deref()
+            .ok_or("conformance vector is invalid")?;
+        let response = observed!(
+            Action,
+            crate::api::handle_request_with_body_at(
+                "POST",
+                "/api/v1/actions",
+                scheduler_home.path(),
+                None,
+                Some(&body),
+                changed_at,
+            )
         );
         action_accepted = response.as_ref().is_ok_and(|response| {
-            response.status == 200
-                && serde_json::from_str::<Value>(&response.body)
-                    .ok()
-                    .and_then(|body| body["accepted"].as_bool())
-                    == Some(true)
+            if response.status != 200 {
+                #[cfg(test)]
+                trace.event(StartupWakePhase::ActionOutcome, StartupWakeOutcome::Non200);
+                return false;
+            }
+            let body = serde_json::from_str::<Value>(&response.body);
+            let accepted = body
+                .as_ref()
+                .ok()
+                .and_then(|body| body["accepted"].as_bool())
+                == Some(true);
+            #[cfg(test)]
+            trace.event(
+                StartupWakePhase::ActionOutcome,
+                if body.is_err() {
+                    StartupWakeOutcome::InvalidBody
+                } else if accepted {
+                    StartupWakeOutcome::Accepted
+                } else {
+                    StartupWakeOutcome::NotAccepted
+                },
+            );
+            accepted
         });
-        let _ = started_rx
-            .recv_timeout(synchronization_deadline.saturating_duration_since(StdInstant::now()));
-    }
-    if handle
-        .shutdown_and_join_until(synchronization_deadline)
-        .is_err()
-    {
-        let cleanup_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
-        if handle.shutdown_and_join_until(cleanup_deadline).is_err() {
-            std::mem::forget(handle);
-            std::mem::forget(scheduler_home);
+        #[cfg(test)]
+        if response.is_err() {
+            trace.event(
+                StartupWakePhase::ActionOutcome,
+                StartupWakeOutcome::TransportError,
+            );
         }
-        return Err("conformance suite execution failed");
+        let _ = received!(
+            LaunchReceive,
+            started_rx.recv_timeout(
+                synchronization_deadline.saturating_duration_since(StdInstant::now())
+            )
+        );
     }
+    // Keep the joined scheduler home alive through the final store assertions.
+    let _scheduler_home = finish_startup_reconciliation_scheduler(
+        handle,
+        scheduler_home,
+        synchronization_deadline,
+        #[cfg(test)]
+        trace,
+        #[cfg(test)]
+        || {},
+    )?;
 
     let first_wait_reason = *clock
         .first_reason
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let wake_observed = first_wait_reason == Some(super::daemon_tick::WakeReason::Signaled);
-    let conn =
-        crate::store::open_store(&store_path).map_err(|_| "conformance suite execution failed")?;
-    let occurrence_state = conn
-        .query_row(
+    let conn = observed!(StoreOpenFinal, crate::store::open_store(&store_path))
+        .map_err(|_| "conformance suite execution failed")?;
+    let occurrence_state = observed!(
+        OccurrenceQuery,
+        conn.query_row(
             "SELECT state
-             FROM automation_occurrences
-             WHERE automation_id = ?1",
+         FROM automation_occurrences
+         WHERE automation_id = ?1",
             [&definition.id],
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|_| "conformance suite execution failed")?;
-    let last_pass_trigger = conn
-        .query_row(
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let last_pass_trigger = observed!(
+        LastPassQuery,
+        conn.query_row(
             "SELECT trigger FROM automation_scheduler_last_pass WHERE id = 1",
             [],
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|_| "conformance suite execution failed")?;
-    let revision = super::store::get_definition(&conn, &definition.id)
-        .map_err(|_| "conformance suite execution failed")?
-        .map(|record| record.revision);
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    let revision = observed!(
+        DefinitionReadback,
+        super::store::get_definition(&conn, &definition.id)
+    )
+    .map_err(|_| "conformance suite execution failed")?
+    .map(|record| record.revision);
     let launches = runtime.launches.load(Ordering::SeqCst);
+    #[cfg(test)]
+    {
+        trace.value(
+            StartupWakePhase::OccurrencePresent,
+            u64::from(occurrence_state.is_some()),
+        );
+        trace.value(
+            StartupWakePhase::LastPassPresent,
+            u64::from(last_pass_trigger.is_some()),
+        );
+        trace.value(
+            StartupWakePhase::DefinitionPresent,
+            u64::from(revision.is_some()),
+        );
+        trace.event(StartupWakePhase::Comparison, StartupWakeOutcome::Ok);
+    }
     Ok(match &case.expected {
         ExpectedStartupReconciliationWake::StartupReconciled {
             production_start_path,
@@ -3788,6 +3992,53 @@ fn startup_reconciliation_wake_case_matches(
                 && occurrence_state.as_deref() == Some(expected_state.as_str())
         }
     })
+}
+
+fn finish_startup_reconciliation_scheduler(
+    mut handle: super::daemon_tick::AutomationSchedulerHandle,
+    scheduler_home: tempfile::TempDir,
+    synchronization_deadline: StdInstant,
+    #[cfg(test)] trace: &mut StartupWakeTrace,
+    #[cfg(test)] after_first_failure: impl FnOnce(),
+) -> Result<tempfile::TempDir, &'static str> {
+    macro_rules! joined {
+        ($phase:ident, $operation:expr) => {{
+            #[cfg(test)]
+            {
+                trace.join(StartupWakePhase::$phase, || $operation)
+            }
+            #[cfg(not(test))]
+            {
+                $operation
+            }
+        }};
+    }
+    if joined!(
+        FirstJoin,
+        handle.shutdown_and_join_until(synchronization_deadline)
+    )
+    .is_err()
+    {
+        #[cfg(test)]
+        after_first_failure();
+        let cleanup_deadline = StdInstant::now() + SCHEDULER_CONFORMANCE_SYNC_TIMEOUT;
+        #[cfg(test)]
+        trace.set_deadline(StartupWakePhase::CleanupDeadline, cleanup_deadline);
+        if joined!(
+            CleanupJoin,
+            handle.shutdown_and_join_until(cleanup_deadline)
+        )
+        .is_err()
+        {
+            #[cfg(test)]
+            trace.event(StartupWakePhase::RetainHome, StartupWakeOutcome::Ok);
+            std::mem::forget(handle);
+            std::mem::forget(scheduler_home);
+        }
+        return Err("conformance suite execution failed");
+    }
+
+    Ok(scheduler_home)
 }
 
 fn scheduler_conformance_tempdir() -> Result<tempfile::TempDir, &'static str> {

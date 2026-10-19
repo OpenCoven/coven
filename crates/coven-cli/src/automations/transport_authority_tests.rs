@@ -21,8 +21,9 @@ const PUBLIC_READ_ACTIONS: &[&str] = &[
     "coven.automations.occurrence.history.v1",
 ];
 
-/// Reads that return definition prompts or run `logJson`.
-const PROMPT_OR_LOG_READ_ACTIONS: &[&str] = &[
+/// Owner-local reads: sensitive records and minimized lease diagnostics.
+const OWNER_LOCAL_READ_ACTIONS: &[&str] = &[
+    "coven.automations.occurrence.leases.v1",
     "coven.automations.list",
     "coven.automations.get",
     "coven.automations.definition.list.v1",
@@ -322,7 +323,7 @@ fn prompt_and_log_reads_require_owner_ipc() -> Result<()> {
         RequestAuthority::OwnerLocalIpc,
     )?;
     assert_eq!(owner.status, 200, "{}", owner.body);
-    for action in PROMPT_OR_LOG_READ_ACTIONS {
+    for action in OWNER_LOCAL_READ_ACTIONS {
         let body = json!({
             "action": action,
             "id": "authority-boundary-fixture",
@@ -375,6 +376,7 @@ fn run_control_envelopes_are_refused_before_tcp_store_access() -> Result<()> {
             json!({"occurrenceId": "occurrence-1"}),
         ),
         ("attempt.cancel.v1", json!({"attemptId": "attempt-1"})),
+        ("run.cancel.v1", json!({"runId": "run-1"})),
     ] {
         for route in ["/actions", "/api/v1/actions"] {
             let temp = tempfile::tempdir()?;

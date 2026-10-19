@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use super::cancellation::{execute_run_cancellation, CancellationExecution};
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{ErrorCode, ErrorEnvelope};
-use super::contract::types::{AdoptionKey, AttemptId, OccurrenceId};
+use super::contract::types::{AdoptionKey, AttemptId, OccurrenceId, RunId};
 use super::occurrences::settle_occurrence;
 use super::runs::{record_run_finish, RunFinish};
 use crate::api::SessionRuntime;
@@ -60,6 +60,7 @@ pub struct TerminalAdoption {
 enum Target {
     Occurrence,
     Attempt,
+    Run,
 }
 
 impl Target {
@@ -67,6 +68,7 @@ impl Target {
         match self {
             Self::Occurrence => OCCURRENCE_CANCEL_ACTION,
             Self::Attempt => ATTEMPT_CANCEL_ACTION,
+            Self::Run => "coven.automations.run.cancel.v1",
         }
     }
 
@@ -74,6 +76,7 @@ impl Target {
         match self {
             Self::Occurrence => "occurrence.cancel.v1",
             Self::Attempt => "attempt.cancel.v1",
+            Self::Run => "run.cancel.v1",
         }
     }
 
@@ -81,6 +84,7 @@ impl Target {
         match self {
             Self::Occurrence => "occurrenceId",
             Self::Attempt => "attemptId",
+            Self::Run => "runId",
         }
     }
 }
@@ -101,6 +105,16 @@ struct AttemptCancelRequest {
     action: String,
     adoption_key: String,
     attempt_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunCancelEnvelopeRequest {
+    action: String,
+    adoption_key: String,
+    run_id: String,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -138,6 +152,17 @@ pub fn execute_attempt_cancel(
     execute(conn, runtime, Target::Attempt, body, now)
 }
 
+/// Bind the envelope's run target once, before delegating to the correlated
+/// flat cancellation executor. Replay must never resolve a newer attempt.
+pub fn execute_run_cancel_envelope(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+) -> Result<CancelExecution, String> {
+    execute(conn, runtime, Target::Run, body, now)
+}
+
 fn execute(
     conn: &Connection,
     runtime: &dyn SessionRuntime,
@@ -145,10 +170,19 @@ fn execute(
     body: Value,
     now: DateTime<Utc>,
 ) -> Result<CancelExecution, String> {
-    let digest = sha256_hex(
-        &canonicalize(&body)
-            .map_err(|error| format!("failed to canonicalize cancel request: {error:#}"))?,
-    );
+    let canonical = canonicalize(&body)
+        .map_err(|error| format!("failed to canonicalize cancel request: {error:#}"))?;
+    let digest = if target == Target::Run {
+        // The envelope resolves a run ID; the flat command requires an exact
+        // attempt/session. They share a command name, but must never replay
+        // one another's adoptions, including a pending delegation record.
+        // This prefix cannot be the beginning of a canonical JSON request.
+        let mut input = b"coven.run-cancel-envelope.v1\0".to_vec();
+        input.extend_from_slice(&canonical);
+        sha256_hex(&input)
+    } else {
+        sha256_hex(&canonical)
+    };
     let adoption_key = body
         .get("adoptionKey")
         .and_then(Value::as_str)
@@ -376,6 +410,21 @@ fn adopted(
 fn parse(target: Target, body: &Value) -> Result<CancelRequest, ErrorEnvelope> {
     let invalid = |message: String| typed_error(ErrorCode::ValidationFailed, message);
     let (action, adoption_key, target_id, reason) = match target {
+        Target::Run => {
+            let request: RunCancelEnvelopeRequest =
+                serde_json::from_value(body.clone()).map_err(|error| {
+                    invalid(format!("invalid run cancel envelope request: {error}"))
+                })?;
+            if RunId::new(request.run_id.clone()).is_err() {
+                return Err(invalid("runId is not a valid run id".to_owned()));
+            }
+            (
+                request.action,
+                request.adoption_key,
+                request.run_id,
+                request.reason,
+            )
+        }
         Target::Occurrence => {
             let request: OccurrenceCancelRequest = serde_json::from_value(body.clone())
                 .map_err(|error| invalid(format!("invalid occurrence cancel request: {error}")))?;
@@ -440,6 +489,14 @@ fn plan_in(
     // The occurrence, its running run, and that run's latest attempt.
     let occurrence_id: Option<String> = match target {
         Target::Occurrence => Some(request.target_id.clone()),
+        Target::Run => conn
+            .query_row(
+                "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
+                [&request.target_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("failed to read the run: {error}"))?,
         Target::Attempt => conn
             .query_row(
                 "SELECT occurrence_id FROM automation_attempts WHERE id = ?1",
@@ -452,7 +509,7 @@ fn plan_in(
     let Some(occurrence_id) = occurrence_id else {
         return refuse(
             ErrorCode::NotFound,
-            format!("no attempt `{}`", request.target_id),
+            format!("no {} `{}`", target.id_field(), request.target_id),
         );
     };
     let Some(occurrence_state) = conn
@@ -478,6 +535,14 @@ fn plan_in(
         )
         .optional()
         .map_err(|error| format!("failed to read the occurrence's run: {error}"))?;
+    // A historical run must not redirect cancellation to another run of the
+    // same occurrence. Resolve and validate inside the adoption transaction.
+    if target == Target::Run && run.as_ref().map(|(id, _)| id) != Some(&request.target_id) {
+        return refuse(
+            ErrorCode::IllegalTransition,
+            "only the targeted running run can be cancelled".to_owned(),
+        );
+    }
     let latest: Option<(String, String)> = match &run {
         Some((run_id, _)) => conn
             .query_row(
@@ -624,7 +689,7 @@ fn plan_in(
         // has settled, so the run and occurrence are released now instead of
         // at the run's deadline. The settled attempt itself is not cancelled.
         Some((_, "failed"))
-            if target == Target::Occurrence
+            if matches!(target, Target::Occurrence | Target::Run)
                 && matches!(occurrence_state.as_str(), "claimed" | "running") =>
         {
             let (run_id, session_id) = run.clone().expect("a latest attempt has its run");
@@ -698,6 +763,7 @@ fn automation_of(
     };
     let sql = match target {
         Target::Occurrence => "SELECT automation_id FROM automation_occurrences WHERE id = ?1",
+        Target::Run => "SELECT automation_id FROM automation_runs WHERE id = ?1",
         Target::Attempt => {
             "SELECT run.automation_id FROM automation_attempts AS attempt
              JOIN automation_runs AS run ON run.id = attempt.run_id WHERE attempt.id = ?1"
@@ -786,6 +852,10 @@ mod tests {
         json!({ "action": ATTEMPT_CANCEL_ACTION, "adoptionKey": key, "attemptId": attempt })
     }
 
+    fn run_cancel(key: &str, run: &str) -> Value {
+        json!({ "action": "coven.automations.run.cancel.v1", "adoptionKey": key, "runId": run })
+    }
+
     fn cancel_envelope(mut body: Value) -> Value {
         let fields = body.as_object_mut().unwrap();
         let action = fields.remove("action").unwrap();
@@ -807,6 +877,209 @@ mod tests {
     }
 
     #[test]
+    fn run_cancel_envelope_settles_waiting_and_held_runs_without_stopping() {
+        for waiting in [false, true] {
+            let (temp, conn) = store();
+            let runtime = KillCounting::default();
+            insert_claimed_occurrence(&conn, "occ.notes-1", "notes", "daemon", 60, now()).unwrap();
+            let run = dispatch_claimed_occurrences_with_clock(&conn, &runtime, now(), now)
+                .unwrap()
+                .dispatched[0]
+                .clone();
+            let session = state(
+                &conn,
+                "SELECT session_id FROM automation_runs WHERE id = ?1",
+                &run,
+            );
+            if waiting {
+                mark_unconfirmed_stop_for_recovery(&conn, &run, "fixture uncertain stop", now())
+                    .unwrap();
+                conn.execute(
+                    "UPDATE sessions SET status = 'orphaned' WHERE id = ?1",
+                    [&session],
+                )
+                .unwrap();
+                let recovered = execute_occurrence_recovery(&conn, json!({
+                    "action": RECOVER_ACTION, "adoptionKey": "adopt:recover:waiting-run",
+                    "occurrenceId": "occ.notes-1", "evidenceDetermination": "retry_with_new_attempt"
+                }), now()).unwrap();
+                assert!(
+                    matches!(
+                        recovered,
+                        super::super::recovery::RecoveryExecution::Success { .. }
+                    ),
+                    "{recovered:?}"
+                );
+            } else {
+                crate::store::update_session_terminal_if_active(
+                    &conn,
+                    &session,
+                    "failed",
+                    Some(1),
+                    &iso(now()),
+                )
+                .unwrap();
+                assert_eq!(
+                    super::super::runner::settle_finished_runs(&conn, now())
+                        .unwrap()
+                        .failed,
+                    0
+                );
+            }
+            let request = cancel_envelope(run_cancel("adopt:cancel:idle-run", &run));
+            let (status, first) =
+                crate::control_plane::route_action(request.clone(), &conn, &runtime);
+            assert_eq!(status, 200, "waiting={waiting}: {first:?}");
+            let first = first.result.unwrap();
+            assert!(super::super::command_envelope::tests::response_validator().is_valid(&first));
+            assert_eq!(first["outcome"], "committed");
+            assert_eq!(first["result"]["runId"], run);
+            assert_eq!(first["result"]["status"], "cancelled");
+            assert_eq!(
+                state(
+                    &conn,
+                    "SELECT status FROM automation_runs WHERE id = ?1",
+                    &run
+                ),
+                "cancelled"
+            );
+            let attempt = format!("attempt-{run}-{}", if waiting { 2 } else { 1 });
+            assert_eq!(
+                state(
+                    &conn,
+                    "SELECT state FROM automation_attempts WHERE id = ?1",
+                    &attempt
+                ),
+                if waiting { "cancelled" } else { "failed" }
+            );
+            drop(conn);
+            let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+            let (status, replay) = crate::control_plane::route_action(request, &conn, &runtime);
+            assert_eq!(status, 200, "{replay:?}");
+            let replay = replay.result.unwrap();
+            assert_eq!(replay["outcome"], "replayed");
+            assert_eq!(replay["result"], first["result"]);
+            assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn run_cancel_envelope_adoption_cannot_replay_as_flat_success() {
+        let (_temp, conn) = store();
+        let runtime = KillCounting::default();
+        insert_claimed_occurrence(&conn, "occ.notes-1", "notes", "daemon", 60, now()).unwrap();
+        let run = dispatch_claimed_occurrences_with_clock(&conn, &runtime, now(), now)
+            .unwrap()
+            .dispatched[0]
+            .clone();
+        let body = run_cancel("adopt:run-cancel:cross-wire", &run);
+        let (status, first) =
+            crate::control_plane::route_action(cancel_envelope(body.clone()), &conn, &runtime);
+        assert_eq!(status, 200, "{first:?}");
+        let (status, flat) = crate::control_plane::route_action(body, &conn, &runtime);
+        assert_eq!(status, 409, "{flat:?}");
+        assert!(!flat.ok);
+        assert!(flat.event.is_none());
+        assert_eq!(runtime.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn flat_run_cancel_adoption_cannot_be_reused_by_an_envelope() {
+        let (_temp, conn) = store();
+        let runtime = KillCounting::default();
+        insert_claimed_occurrence(&conn, "occ.notes-1", "notes", "daemon", 60, now()).unwrap();
+        let run = dispatch_claimed_occurrences_with_clock(&conn, &runtime, now(), now)
+            .unwrap()
+            .dispatched[0]
+            .clone();
+        let session = state(
+            &conn,
+            "SELECT session_id FROM automation_runs WHERE id = ?1",
+            &run,
+        );
+        let flat = json!({
+            "action": "coven.automations.run.cancel.v1", "adoptionKey": "adopt:flat-first",
+            "runId": run, "attemptId": format!("attempt-{run}-1"),
+            "runtimeCorrelation": { "sessionId": session }, "scope": "run",
+            "reason": "owner cancellation", "requestedBy": { "principalId": "owner" }
+        });
+        let (status, first) = crate::control_plane::route_action(flat.clone(), &conn, &runtime);
+        assert_eq!(status, 200, "{first:?}");
+        let (status, refused) = crate::control_plane::route_action(
+            cancel_envelope(run_cancel("adopt:flat-first", &run)),
+            &conn,
+            &runtime,
+        );
+        assert_eq!(status, 409, "{refused:?}");
+        assert!(refused.event.is_none());
+        assert_eq!(
+            refused.result.unwrap()["error"]["code"],
+            "ADOPTION_REPLAY_MISMATCH"
+        );
+        let (status, replay) = crate::control_plane::route_action(flat, &conn, &runtime);
+        assert_eq!(status, 200, "{replay:?}");
+        assert_eq!(replay.result, first.result);
+        assert_eq!(runtime.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn run_cancel_envelope_retains_its_terminal_target_across_restart() {
+        let (temp, conn) = store();
+        let runtime = KillCounting::default();
+        insert_claimed_occurrence(&conn, "occ.notes-1", "notes", "daemon", 60, now()).unwrap();
+        let run = dispatch_claimed_occurrences_with_clock(&conn, &runtime, now(), now)
+            .unwrap()
+            .dispatched[0]
+            .clone();
+        let request = cancel_envelope(json!({
+            "action": "coven.automations.run.cancel.v1",
+            "adoptionKey": "adopt:run-cancel:envelope",
+            "runId": run,
+            "reason": "owner requested cancellation"
+        }));
+        let (status, first) = crate::control_plane::route_action(request.clone(), &conn, &runtime);
+        assert_eq!(status, 200, "{first:?}");
+        let first = first.result.unwrap();
+        let validator = super::super::command_envelope::tests::response_validator();
+        assert!(validator.is_valid(&first), "{first}");
+        assert_eq!(first["outcome"], "committed");
+        assert_eq!(first["result"]["runId"], run);
+        assert_eq!(first["result"]["attemptId"], format!("attempt-{run}-1"));
+        assert_eq!(first["result"]["status"], "cancelled");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        insert_claimed_occurrence(&conn, "occ.notes-2", "notes", "daemon", 60, now()).unwrap();
+        let next_run = dispatch_claimed_occurrences_with_clock(&conn, &runtime, now(), now)
+            .unwrap()
+            .dispatched[0]
+            .clone();
+        let (status, replay) = crate::control_plane::route_action(request.clone(), &conn, &runtime);
+        assert_eq!(status, 200, "{replay:?}");
+        let replay = replay.result.unwrap();
+        assert!(validator.is_valid(&replay), "{replay}");
+        assert_eq!(replay["outcome"], "replayed");
+        assert_eq!(replay["result"], first["result"]);
+        assert_eq!(runtime.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state(
+                &conn,
+                "SELECT status FROM automation_runs WHERE id = ?1",
+                &next_run
+            ),
+            "running"
+        );
+        let mut changed = request;
+        changed["envelope"]["payload"]["runId"] = json!(next_run);
+        let (status, refused) = crate::control_plane::route_action(changed, &conn, &runtime);
+        assert_eq!(status, 409, "{refused:?}");
+        assert_eq!(
+            refused.result.unwrap()["error"]["code"],
+            "ADOPTION_REPLAY_MISMATCH"
+        );
+        assert_eq!(runtime.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn cancellation_envelopes_retain_terminal_results_across_restart() {
         let validator = super::super::command_envelope::tests::response_validator();
         for (target, dispatch) in [
@@ -824,6 +1097,9 @@ mod tests {
                     .clone()
             });
             let body = match target {
+                Target::Run => {
+                    unreachable!("this fixture covers flat occurrence/attempt compatibility")
+                }
                 Target::Occurrence => occurrence_cancel("adopt:cancel:envelope", "occ.notes-1"),
                 Target::Attempt => attempt_cancel(
                     "adopt:cancel:envelope",
@@ -899,6 +1175,14 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 let body = match self.target {
+                    Target::Run => {
+                        let run: String = conn.query_row(
+                            "SELECT run_id FROM automation_attempts WHERE id = ?1",
+                            [&attempt],
+                            |row| row.get(0),
+                        )?;
+                        run_cancel("adopt:cancel:pending-envelope", &run)
+                    }
                     Target::Occurrence => {
                         occurrence_cancel("adopt:cancel:pending-envelope", "occ.notes-1")
                     }
@@ -937,7 +1221,7 @@ mod tests {
             }
         }
         let validator = super::super::command_envelope::tests::response_validator();
-        for target in [Target::Occurrence, Target::Attempt] {
+        for target in [Target::Occurrence, Target::Attempt, Target::Run] {
             for ambiguous in [false, true] {
                 let (temp, conn) = store();
                 let runtime = CancelDuringLaunch {
@@ -969,13 +1253,73 @@ mod tests {
                 );
                 drop(conn);
                 let conn = crate::store::open_store(&runtime.path).unwrap();
-                let (status, replay) = crate::control_plane::route_action(request, &conn, &runtime);
+                let (status, replay) =
+                    crate::control_plane::route_action(request.clone(), &conn, &runtime);
                 assert_eq!(status, 200, "{replay:?}");
                 let replay = replay.result.unwrap();
                 assert!(validator.is_valid(&replay), "{replay}");
                 assert_eq!(replay["outcome"], "replayed");
                 assert_eq!(first["result"], replay["result"]);
                 assert_eq!(runtime.kills.load(Ordering::SeqCst), 1);
+                if target == Target::Run && ambiguous {
+                    let run = first["result"]["runId"].as_str().unwrap();
+                    conn.execute("UPDATE sessions SET status = 'orphaned' WHERE id = (SELECT session_id FROM automation_runs WHERE id = ?1)", [run]).unwrap();
+                    let recovered = execute_occurrence_recovery(&conn, json!({
+                        "action": RECOVER_ACTION, "adoptionKey": "adopt:recover:run-envelope",
+                        "occurrenceId": "occ.notes-1", "evidenceDetermination": "retry_with_new_attempt"
+                    }), now()).unwrap();
+                    assert!(
+                        matches!(
+                            recovered,
+                            super::super::recovery::RecoveryExecution::Success { .. }
+                        ),
+                        "{recovered:?}"
+                    );
+                    assert_eq!(
+                        super::super::occurrences::claim_due_occurrence(
+                            &conn,
+                            "notes",
+                            "daemon",
+                            60,
+                            now()
+                        )
+                        .unwrap(),
+                        Some("occ.notes-1".to_owned())
+                    );
+                    let next_runtime = KillCounting::default();
+                    let next =
+                        dispatch_claimed_occurrences_with_clock(&conn, &next_runtime, now(), now)
+                            .unwrap();
+                    assert_eq!(next.dispatched, vec![run.to_owned()]);
+                    let attempt = format!("attempt-{run}-2");
+                    let before = state(
+                        &conn,
+                        "SELECT state FROM automation_attempts WHERE id = ?1",
+                        &attempt,
+                    );
+                    let (status, replay) =
+                        crate::control_plane::route_action(request, &conn, &runtime);
+                    assert_eq!(status, 200, "{replay:?}");
+                    assert_eq!(replay.result.unwrap()["result"], first["result"]);
+                    assert_eq!(
+                        state(
+                            &conn,
+                            "SELECT state FROM automation_attempts WHERE id = ?1",
+                            &attempt
+                        ),
+                        before
+                    );
+                    assert_eq!(
+                        state(
+                            &conn,
+                            "SELECT status FROM automation_runs WHERE id = ?1",
+                            run
+                        ),
+                        "running"
+                    );
+                    assert_eq!(runtime.kills.load(Ordering::SeqCst), 1);
+                    assert_eq!(next_runtime.0.load(Ordering::SeqCst), 0);
+                }
             }
         }
     }
@@ -986,6 +1330,7 @@ mod tests {
             (Target::Occurrence, false),
             (Target::Occurrence, true),
             (Target::Attempt, true),
+            (Target::Run, true),
         ] {
             for corruption in [
                 "nonterminal",
@@ -1009,6 +1354,7 @@ mod tests {
                         .clone()
                 });
                 let body = match target {
+                    Target::Run => run_cancel("adopt:cancel:corrupt", run.as_ref().unwrap()),
                     Target::Occurrence => occurrence_cancel("adopt:cancel:corrupt", "occ.notes-1"),
                     Target::Attempt => attempt_cancel(
                         "adopt:cancel:corrupt",
@@ -1024,6 +1370,10 @@ mod tests {
                 } else {
                     target.command()
                 };
+                let terminal_key: String = conn.query_row(
+                    "SELECT adoption_key FROM automation_command_adoptions WHERE command = ?1 AND json_extract(response_json, '$.result.status') IS NOT NULL",
+                    [command], |row| row.get(0),
+                ).unwrap();
                 // Simulate damaged persisted evidence, bypassing only the test
                 // store's normal append-only guards.
                 conn.execute_batch(
@@ -1032,15 +1382,18 @@ mod tests {
                 )
                 .unwrap();
                 let sql = match corruption {
-                    "nonterminal" => "UPDATE automation_command_adoptions SET response_json = json_set(response_json, '$.result.status', 'stopping') WHERE command = ?1",
-                    "timestamp" => "UPDATE automation_command_adoptions SET adopted_at = 'not-a-timestamp' WHERE command = ?1",
-                    "missing-result" => "UPDATE automation_command_adoptions SET response_json = json_remove(response_json, '$.result') WHERE command = ?1",
-                    "scalar-result" => "UPDATE automation_command_adoptions SET response_json = json_set(response_json, '$.result', 42) WHERE command = ?1",
-                    "wrong-run" => "UPDATE automation_command_adoptions SET response_json = json_set(response_json, '$.result.runId', 'another-run') WHERE command = ?1",
-                    "outcome" => "UPDATE automation_command_adoptions SET response_json = json_set(response_json, '$.outcome', 'pending') WHERE command = ?1",
+                    "nonterminal" => "UPDATE automation_command_adoptions SET response_json = json_set(response_json, '$.result.status', 'stopping') WHERE command = ?1 AND adoption_key = ?2",
+                    "timestamp" => "UPDATE automation_command_adoptions SET adopted_at = 'not-a-timestamp' WHERE command = ?1 AND adoption_key = ?2",
+                    "missing-result" => "UPDATE automation_command_adoptions SET response_json = json_remove(response_json, '$.result') WHERE command = ?1 AND adoption_key = ?2",
+                    "scalar-result" => "UPDATE automation_command_adoptions SET response_json = json_set(response_json, '$.result', 42) WHERE command = ?1 AND adoption_key = ?2",
+                    "wrong-run" => "UPDATE automation_command_adoptions SET response_json = json_set(response_json, '$.result.runId', 'another-run') WHERE command = ?1 AND adoption_key = ?2",
+                    "outcome" => "UPDATE automation_command_adoptions SET response_json = json_set(response_json, '$.outcome', 'pending') WHERE command = ?1 AND adoption_key = ?2",
                     _ => unreachable!(),
                 };
-                assert_eq!(conn.execute(sql, [command]).unwrap(), 1);
+                assert_eq!(
+                    conn.execute(sql, [command, terminal_key.as_str()]).unwrap(),
+                    1
+                );
                 let (status, answer) = crate::control_plane::route_action(request, &conn, &runtime);
                 assert_eq!(status, 500, "{corruption}: {answer:?}");
                 assert!(answer.event.is_none());
@@ -1170,6 +1523,9 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 let body = match self.target {
+                    Target::Run => {
+                        unreachable!("this fixture covers flat occurrence/attempt compatibility")
+                    }
                     Target::Occurrence => occurrence_cancel("adopt:cancel:dispatch", "occ.notes-1"),
                     Target::Attempt => attempt_cancel("adopt:cancel:dispatch", &attempt),
                 };
@@ -1227,6 +1583,9 @@ mod tests {
                     dispatch_claimed_occurrences_with_clock(&conn, &runtime, now(), now).unwrap();
                 let run_id = &report.dispatched[0];
                 let mut body = match target {
+                    Target::Run => {
+                        unreachable!("this fixture covers flat occurrence/attempt compatibility")
+                    }
                     Target::Occurrence => occurrence_cancel("adopt:cancel:blank", "occ.notes-1"),
                     Target::Attempt => {
                         attempt_cancel("adopt:cancel:blank", &format!("attempt-{run_id}-1"))
@@ -1250,7 +1609,7 @@ mod tests {
 
     #[test]
     fn waiting_cancellation_preserves_an_expired_deadline() {
-        for target in [Target::Occurrence, Target::Attempt] {
+        for target in [Target::Occurrence, Target::Attempt, Target::Run] {
             let (_temp, conn) = store();
             let runtime = KillCounting::default();
             insert_claimed_occurrence(&conn, "occ.notes-1", "notes", "daemon", 60, now()).unwrap();
@@ -1281,6 +1640,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
             let body = match target {
+                Target::Run => run_cancel("adopt:cancel:deadline", run_id),
                 Target::Occurrence => occurrence_cancel("adopt:cancel:deadline", "occ.notes-1"),
                 Target::Attempt => attempt_cancel("adopt:cancel:deadline", &waiting),
             };

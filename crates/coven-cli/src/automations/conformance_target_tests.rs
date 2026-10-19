@@ -16,6 +16,8 @@ const COMMAND_ADOPTION_IDEMPOTENCY_VECTORS: &str = include_str!(
 const COMMAND_ENVELOPE_OUTCOMES_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/command-envelope-outcomes.vectors.json"
 );
+const MISSION_COMMANDS_VECTORS: &str =
+    include_str!("../../../../conformance/automations/runner/mission-commands.vectors.json");
 const CALENDAR_SCHEDULE_RESOLUTION_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/calendar-schedule-resolution.vectors.json"
 );
@@ -110,6 +112,7 @@ fn capability_advertises_the_native_structural_suites() {
                         "definition-lifecycle-transitions",
                         "definition-validation",
                         "event-reducer-determinism",
+                        "mission-commands",
                         "occurrence-fence-uniqueness",
                         "receipt-integrity-validation",
                         "rrule-vocabulary",
@@ -122,6 +125,11 @@ fn capability_advertises_the_native_structural_suites() {
                         CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                         "cancellation-timeout-arbitration",
                         "command-storage-lock-recovery",
+                        "command-storage-readonly-recovery",
+                        "command-transaction-rollback",
+                        "legacy-import-source-preservation",
+                        "command-storage-capacity-recovery",
+                        "command-process-crash-recovery",
                         MISFIRE_LATEST_PLANNING_SUITE,
                         OCCURRENCE_LEASE_RECOVERY_SUITE,
                         OVERLAP_FORBID_CLAIMING_SUITE,
@@ -783,6 +791,103 @@ fn scheduler_leadership_fencing_suite_requires_scheduler_profile() {
     );
 }
 
+// Run environment-sensitive error paths in a child so no parallel test sees
+// the deliberately invalid temporary directory configuration.
+#[test]
+fn startup_reconciliation_trace_failure_child() {
+    if std::env::var("COVEN_STARTUP_TRACE_CHILD").as_deref() != Ok("temp-home") {
+        return;
+    }
+    let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
+    let result = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "startup-reconciliation-wake",
+        vectors,
+    ));
+    assert_eq!(result.unwrap_err(), "conformance suite execution failed");
+    println!("startup trace child confirmed the existing execution error");
+}
+
+#[test]
+fn startup_reconciliation_trace_identifies_temp_home_failure_without_private_path() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct OwnedChild {
+        child: std::process::Child,
+        home: Option<tempfile::TempDir>,
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            if self.child.wait().is_err() {
+                if let Some(home) = self.home.take() {
+                    let _ = home.keep();
+                }
+                eprintln!("conformance diagnostic child cleanup incomplete; owned home retained");
+            }
+        }
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix("coven-conformance-error-child-")
+        .tempdir()
+        .unwrap();
+    let invalid_root = temp.path().join("private-conformance-path");
+    std::fs::write(&invalid_root, b"not a directory").unwrap();
+    let stdout = temp.path().join("child.stdout");
+    let stderr = temp.path().join("child.stderr");
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "automations::conformance_target_tests::startup_reconciliation_trace_failure_child",
+            "--nocapture",
+        ])
+        .env("COVEN_STARTUP_TRACE_CHILD", "temp-home")
+        .env("TMPDIR", &invalid_root)
+        .env("TMP", &invalid_root)
+        .env("TEMP", &invalid_root)
+        .stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()))
+        .spawn()
+        .unwrap();
+    // This guard also kills/reaps on polling errors or assertion unwinding.
+    let mut owned = OwnedChild {
+        child,
+        home: Some(temp),
+    };
+    // This guard catches a wedged owned test process; it asserts no runtime
+    // promptness or production lifecycle deadline.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = owned.child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            panic!("startup trace child exceeded its 60-second hang guard");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let output = format!(
+        "{}{}",
+        std::fs::read_to_string(stdout).unwrap(),
+        std::fs::read_to_string(stderr).unwrap()
+    );
+    assert!(status.success(), "child failed: {output}");
+    assert!(
+        output.contains("startup trace child confirmed the existing execution error"),
+        "child did not exercise the intended failure: {output}"
+    );
+    assert!(
+        output.contains("phase=temp-home outcome=error"),
+        "missing owning-operation diagnostic: {output}"
+    );
+    assert!(
+        !output.contains("private-conformance-path"),
+        "diagnostic leaked the private path"
+    );
+}
+
 #[test]
 fn startup_reconciliation_wake_suite_executes_the_checked_in_vectors() {
     let vectors: Value = serde_json::from_str(STARTUP_RECONCILIATION_WAKE_VECTORS).unwrap();
@@ -1259,6 +1364,96 @@ fn command_envelope_outcomes_suite_fails_when_the_router_disagrees() {
         mutate(&mut vectors);
         let response = evaluate(&request_for("command-envelope-outcomes", vectors)).unwrap();
         assert_eq!(response.status, TargetSuiteStatus::Failed);
+    }
+}
+
+#[test]
+fn mission_commands_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(MISSION_COMMANDS_VECTORS).unwrap();
+    let response = evaluate(&request_for("mission-commands", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 10);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 10);
+}
+
+#[test]
+fn mission_commands_suite_fails_when_the_executors_disagree() {
+    let wrong_expectations: [fn(&mut Value); 8] = [
+        // A lost acknowledgement would have to commit a second time.
+        |vectors| {
+            vectors["cases"][1]["steps"][1]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+        // The changed request under a used key would have to be adopted.
+        |vectors| vectors["cases"][2]["steps"][1]["expect"]["writes"] = json!("adoption"),
+        // The stale revision would have to name itself as current.
+        |vectors| {
+            vectors["cases"][3]["steps"][0]["expect"]["details"] =
+                json!({ "currentRevisionId": "{{staleRevisionId}}" });
+        },
+        // An unenforced envelope would have to be accepted.
+        |vectors| {
+            vectors["cases"][4]["steps"][0]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+        // Without Runtime Authority the mission would have to stay queued.
+        |vectors| vectors["cases"][5]["steps"][1]["expect"]["state"] = json!("queued"),
+        // A settled mission would have to be cancelled.
+        |vectors| vectors["cases"][6]["steps"][1]["expect"]["state"] = json!("cancelled"),
+        // Another caller would have to learn the mission exists.
+        |vectors| {
+            vectors["cases"][7]["steps"][1]["expect"] =
+                json!({ "outcome": "committed", "state": "unavailable" });
+        },
+        // A 61-minute timeout would have to pass.
+        |vectors| {
+            vectors["cases"][8]["steps"][1]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+    ];
+
+    for mutate in wrong_expectations {
+        let mut vectors: Value = serde_json::from_str(MISSION_COMMANDS_VECTORS).unwrap();
+        mutate(&mut vectors);
+        let response = evaluate(&request_for("mission-commands", vectors)).unwrap();
+        assert_eq!(response.status, TargetSuiteStatus::Failed);
+    }
+}
+
+#[test]
+fn mission_commands_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 7] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        // A get takes no adoption key, and a submit needs a payload.
+        |vectors| vectors["cases"][0]["steps"][0]["adoptionKey"] = json!("adopt:mission:get"),
+        |vectors| {
+            vectors["cases"][0]["steps"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("payload");
+        },
+        // A replay must name an earlier, identical commit.
+        |vectors| vectors["cases"][1]["steps"][1]["adoptionKey"] = json!("adopt:mission:other"),
+        // A refusal must say what it writes.
+        |vectors| {
+            vectors["cases"][3]["steps"][0]["expect"]
+                .as_object_mut()
+                .unwrap()
+                .remove("writes");
+        },
+        // Every token must be one the suite knows.
+        |vectors| vectors["cases"][1]["steps"][0]["payload"]["project"]["cwd"] = json!("{{home}}"),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(MISSION_COMMANDS_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for("mission-commands", vectors)).unwrap_err(),
+            "conformance vector is invalid"
+        );
     }
 }
 
@@ -1991,5 +2186,237 @@ fn storage_lock_suite_rejects_malformed_vectors() {
             evaluate(&request).unwrap_err(),
             "conformance vector is invalid"
         );
+    }
+}
+
+const COMMAND_TRANSACTION_ROLLBACK_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/command-transaction-rollback.vectors.json"
+);
+
+#[test]
+fn transaction_rollback_suite_executes_checked_in_faults_and_control() {
+    let vector = serde_json::from_str(COMMAND_TRANSACTION_ROLLBACK_VECTORS).unwrap();
+    let response = evaluate(&request_for_profile(
+        "scheduler_reliability",
+        "command-transaction-rollback",
+        vector,
+    ))
+    .unwrap();
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+}
+
+#[test]
+fn transaction_rollback_suite_rejects_weakened_invariants() {
+    for index in 0..3 {
+        for (field, value) in [
+            ("initialRows", json!(7)),
+            ("finalRows", json!(0)),
+            ("replayPreserved", json!(false)),
+        ] {
+            let mut vector: Value =
+                serde_json::from_str(COMMAND_TRANSACTION_ROLLBACK_VECTORS).unwrap();
+            vector["cases"][index]["expected"][field] = value;
+            assert_eq!(
+                evaluate(&request_for_profile(
+                    "scheduler_reliability",
+                    "command-transaction-rollback",
+                    vector
+                ))
+                .unwrap_err(),
+                "conformance vector is invalid"
+            );
+        }
+    }
+}
+
+#[test]
+fn transaction_rollback_suite_requires_both_faults_and_control() {
+    for index in 0..3 {
+        let mut vector: Value = serde_json::from_str(COMMAND_TRANSACTION_ROLLBACK_VECTORS).unwrap();
+        vector["cases"].as_array_mut().unwrap().remove(index);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                "command-transaction-rollback",
+                vector
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn transaction_rollback_suite_rejects_invalid_inputs_before_execution() {
+    let mutations: [fn(&mut Value); 6] = [
+        |vector| vector["cases"][1]["fault"] = json!("event_insert"),
+        |vector| vector["cases"][1]["caseId"] = vector["cases"][0]["caseId"].clone(),
+        |vector| vector["cases"][0]["unexpected"] = json!("PRIVATE-ROLLBACK-MARKER"),
+        |vector| vector["cases"][0]["definition"]["integrity"]["value"] = json!("0".repeat(64)),
+        |vector| vector["cases"][0]["adoptionKey"] = json!(""),
+        |vector| vector["cases"][0]["fault"] = json!("PRIVATE-ROLLBACK-MARKER"),
+    ];
+    for mutate in mutations {
+        let mut vector: Value = serde_json::from_str(COMMAND_TRANSACTION_ROLLBACK_VECTORS).unwrap();
+        mutate(&mut vector);
+        assert_eq!(
+            evaluate(&request_for_profile(
+                "scheduler_reliability",
+                "command-transaction-rollback",
+                vector
+            ))
+            .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn storage_readonly_suite_executes_real_refusal_recovery_and_writable_control() {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../../conformance/automations/runner/command-storage-readonly-recovery.vectors.json"
+    ))
+    .unwrap();
+    let request = request_for_profile(
+        "scheduler_reliability",
+        "command-storage-readonly-recovery",
+        vector,
+    );
+    let response = evaluate(&request).unwrap();
+    assert_eq!(
+        response.status,
+        TargetSuiteStatus::Passed,
+        "real read-only recovery suite must execute"
+    );
+    assert!(response.evidence.is_some());
+}
+
+#[test]
+fn storage_readonly_suite_rejects_missing_controls_and_weakened_expectations() {
+    let original: Value = serde_json::from_str(include_str!(
+        "../../../../conformance/automations/runner/command-storage-readonly-recovery.vectors.json"
+    ))
+    .unwrap();
+    for (pointer, value) in [
+        ("/schemaVersion", json!("unknown")),
+        ("/cases/0/fault", json!("none")),
+        ("/cases/1/fault", json!("sqlite_open_read_only")),
+        ("/cases/0/expected/initialOutcome", json!("committed")),
+        ("/cases/0/expected/baselinePreserved", json!(false)),
+        ("/cases/0/expected/initialRows", json!(1)),
+        ("/cases/0/expected/finalRows", json!(0)),
+        ("/cases/0/expected/replayPreserved", json!(false)),
+        ("/cases/0/adoptionKey", json!("")),
+        ("/cases/0/adoptionKey", json!("adopt:readonly:baseline")),
+        ("/cases/0/definition/id", json!("readonly-preexisting")),
+        ("/cases/0/definition/status", json!("ACTIVE")),
+        ("/cases/1/caseId", json!("read-only-refuses-then-recovers")),
+        ("/cases/0/caseId", json!("../unsafe")),
+    ] {
+        let mut vector = original.clone();
+        *vector.pointer_mut(pointer).unwrap() = value;
+        let request = request_for_profile(
+            "scheduler_reliability",
+            "command-storage-readonly-recovery",
+            vector,
+        );
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid",
+            "accepted weakened vector at {pointer}"
+        );
+    }
+    let mut vector = original;
+    vector["cases"].as_array_mut().unwrap().pop();
+    let request = request_for_profile(
+        "scheduler_reliability",
+        "command-storage-readonly-recovery",
+        vector,
+    );
+    assert_eq!(
+        evaluate(&request).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn storage_readonly_suite_rejects_unknown_fixture_fields() {
+    let original: Value = serde_json::from_str(include_str!(
+        "../../../../conformance/automations/runner/command-storage-readonly-recovery.vectors.json"
+    ))
+    .unwrap();
+    for pointer in ["", "/cases/0", "/cases/0/expected"] {
+        let mut vector = original.clone();
+        vector.pointer_mut(pointer).unwrap()["unknown"] = json!(true);
+        let request = request_for_profile(
+            "scheduler_reliability",
+            "command-storage-readonly-recovery",
+            vector,
+        );
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+fn storage_capacity_request() -> Value {
+    request_for_profile(
+        "scheduler_reliability",
+        "command-storage-capacity-recovery",
+        serde_json::from_str(include_str!(
+            "../../../../conformance/automations/runner/command-storage-capacity-recovery.vectors.json"
+        ))
+        .unwrap(),
+    )
+}
+
+#[test]
+fn storage_capacity_suite_executes_real_quota_and_unbounded_control() {
+    let response = evaluate(&storage_capacity_request()).unwrap();
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+}
+
+#[test]
+fn storage_capacity_suite_rejects_missing_control_and_duplicate_cases() {
+    let mut missing = storage_capacity_request();
+    missing["vector"]["cases"].as_array_mut().unwrap().pop();
+    assert_eq!(
+        evaluate(&missing).unwrap_err(),
+        "conformance vector is invalid"
+    );
+    let mut duplicate = storage_capacity_request();
+    duplicate["vector"]["cases"][1] = duplicate["vector"]["cases"][0].clone();
+    assert_eq!(
+        evaluate(&duplicate).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn storage_capacity_suite_rejects_weakened_invariant_expectations() {
+    for case_index in 0..2 {
+        for (field, wrong) in [
+            ("initialRows", json!(3)),
+            ("finalRows", json!(2)),
+            ("replayPreserved", json!(false)),
+            ("baselinePreserved", json!(false)),
+            (
+                "initialOutcome",
+                json!(if case_index == 0 {
+                    "committed"
+                } else {
+                    "disk_full"
+                }),
+            ),
+        ] {
+            let mut request = storage_capacity_request();
+            request["vector"]["cases"][case_index]["expected"][field] = wrong;
+            assert_eq!(
+                evaluate(&request).unwrap_err(),
+                "conformance vector is invalid",
+                "case {case_index}: {field}"
+            );
+        }
     }
 }

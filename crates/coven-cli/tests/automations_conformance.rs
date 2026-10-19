@@ -12,6 +12,8 @@ const COMMAND_ADOPTION_IDEMPOTENCY_VECTORS: &str = include_str!(
 );
 const COMMAND_ENVELOPE_OUTCOMES_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/command-envelope-outcomes.vectors.json");
+const MISSION_COMMANDS_VECTORS: &str =
+    include_str!("../../../conformance/automations/runner/mission-commands.vectors.json");
 const CALENDAR_SCHEDULE_RESOLUTION_VECTORS: &str = include_str!(
     "../../../conformance/automations/runner/calendar-schedule-resolution.vectors.json"
 );
@@ -138,6 +140,7 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "definition-lifecycle-transitions",
                         "definition-validation",
                         "event-reducer-determinism",
+                        "mission-commands",
                         "occurrence-fence-uniqueness",
                         "receipt-integrity-validation",
                         "rrule-vocabulary",
@@ -150,6 +153,11 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "calendar-schedule-resolution",
                         "cancellation-timeout-arbitration",
                         "command-storage-lock-recovery",
+                        "command-storage-readonly-recovery",
+                        "command-transaction-rollback",
+                        "legacy-import-source-preservation",
+                        "command-storage-capacity-recovery",
+                        "command-process-crash-recovery",
                         "misfire-latest-planning",
                         "occurrence-lease-recovery",
                         "overlap-forbid-claiming",
@@ -752,6 +760,47 @@ fn native_target_evaluates_checked_in_command_envelope_vectors() -> anyhow::Resu
 }
 
 #[test]
+fn native_target_evaluates_checked_in_mission_command_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(MISSION_COMMANDS_VECTORS)?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "structural",
+        "suiteId": "mission-commands",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "mission-commands");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 10);
+    assert_eq!(response["evidence"]["passedCases"], 10);
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
 fn native_target_evaluates_checked_in_receipt_integrity_vectors() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("must-not-be-created");
@@ -1177,6 +1226,359 @@ fn native_target_evaluates_checked_in_storage_lock_vectors() -> anyhow::Result<(
     assert_eq!(response["status"], "passed");
     assert_eq!(response["evidence"]["executedCases"], 2);
     assert_eq!(response["evidence"]["passedCases"], 2);
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_transaction_rollback_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/command-transaction-rollback.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "command-transaction-rollback",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "command-transaction-rollback");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 3);
+    assert_eq!(response["evidence"]["passedCases"], 3);
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_storage_readonly_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/command-storage-readonly-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "command-storage-readonly-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "command-storage-readonly-recovery");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 2);
+    assert_eq!(response["evidence"]["passedCases"], 2);
+    let observations = response["evidence"]["observations"].as_array().unwrap();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0]["sqliteErrorCode"], 8);
+    assert_eq!(observations[0]["initialOutcome"], "read_only");
+    assert_eq!(observations[1]["initialOutcome"], "committed");
+    for observation in observations {
+        assert_eq!(observation["baselinePreserved"], true);
+        assert_eq!(observation["initialTransactionClosed"], true);
+        assert_eq!(observation["finalAddedDefinitions"], 1);
+        assert_eq!(observation["replayPreserved"], true);
+        assert_eq!(observation["replayWritesUnchanged"], true);
+    }
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_imports_legacy_sources_through_real_daemon() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let temp = tempfile::tempdir_in("/tmp")?;
+    #[cfg(not(unix))]
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("must-not-be-created");
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/legacy-import-source-preservation.vectors.json"
+    ))?;
+    let mut request = json!({
+        "schemaVersion":"coven.automations.conformance-suite-request.v1",
+        "profile":"scheduler_reliability", "suiteId":"legacy-import-source-preservation",
+        "protocolArtifact":{}, "subjectArtifact":{}, "vector":vector
+    });
+    let output = run_target(&home, "evaluate", Some(&request))?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 2);
+    assert_eq!(response["evidence"]["passedCases"], 2);
+    let observations = response["evidence"]["caseObservations"].as_array().unwrap();
+    assert_eq!(observations.len(), 2);
+    for (index, lifecycle, outcome) in
+        [(0, "paused", "legacy_completed"), (1, "draft", "committed")]
+    {
+        let observed = &observations[index];
+        assert_eq!(observed["definitionStatus"], "PAUSED");
+        assert_eq!(observed["lifecycleState"], lifecycle);
+        assert_eq!(observed["commandOutcome"], outcome);
+        for field in [
+            "sourcePreserved",
+            "preexistingPreserved",
+            "replayPreserved",
+            "restartPreserved",
+            "passed",
+        ] {
+            assert_eq!(observed[field], true, "{field}: {observed}");
+        }
+        for table in [
+            "automation_occurrences",
+            "automation_runs",
+            "automation_attempts",
+        ] {
+            assert_eq!(observed["workCounts"][table], 0);
+        }
+    }
+    assert_eq!(observations[0]["dryRunPreserved"], Value::Null);
+    assert_eq!(observations[1]["dryRunPreserved"], true);
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains("synthetic sentinel"));
+    assert!(!text.contains("synthetic import sentinel"));
+    assert!(!text.contains(temp.path().to_string_lossy().as_ref()));
+    assert!(!home.exists());
+
+    request["vector"]["cases"][0]["expected"]["skipped"] = json!(0);
+    let output = run_target(&home, "evaluate", Some(&request))?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["status"], "failed");
+    assert_eq!(
+        response["evidence"]["caseObservations"][0]["skippedCount"],
+        1
+    );
+    assert_eq!(response["evidence"]["caseObservations"][0]["passed"], false);
+    assert!(!home.exists());
+
+    request["vector"]["cases"][0]["expected"]["sourcePreserved"] = json!(false);
+    let output = run_target(&home, "evaluate", Some(&request))?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "Error: conformance vector is invalid\n"
+    );
+    assert!(!home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_storage_capacity_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/command-storage-capacity-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "command-storage-capacity-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "command-storage-capacity-recovery");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 2);
+    assert_eq!(response["evidence"]["passedCases"], 2);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("capacity observations");
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0]["faultSource"], "sqlite_max_page_count");
+    assert_eq!(observations[0]["sqliteErrorCode"], 13);
+    assert_eq!(observations[0]["initialAddedDefinitions"], 0);
+    assert_eq!(observations[1]["initialAddedDefinitions"], 1);
+    for observation in observations {
+        assert_eq!(observation["baselinePreserved"], true);
+        assert_eq!(observation["finalAddedDefinitions"], 1);
+        assert_eq!(observation["replayPreserved"], true);
+        assert_eq!(observation["replayWritesUnchanged"], true);
+    }
+    for (field, value) in [
+        ("promptBytes", json!(131073)),
+        ("fault", json!("physical_disk_full")),
+        ("unexpected", json!("private-invalid-value")),
+    ] {
+        let mut malformed = request.clone();
+        malformed["vector"]["cases"][0][field] = value;
+        let rejected = run_target(&coven_home, "evaluate", Some(&malformed))?;
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(error.contains("conformance vector is invalid"));
+        assert!(!error.contains("private-invalid-value"));
+    }
+    let mut wrong_expectation = request.clone();
+    wrong_expectation["vector"]["cases"][0]["expected"]["initialOutcome"] = json!("committed");
+    let rejected = run_target(&coven_home, "evaluate", Some(&wrong_expectation))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_process_crash_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/command-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "command-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "command-process-crash-recovery");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 4);
+    assert_eq!(response["evidence"]["passedCases"], 4);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("crash observations");
+    assert_eq!(observations.len(), 4);
+    for (index, observed) in observations.iter().enumerate() {
+        let crash = index < 3;
+        assert_eq!(
+            observed["boundary"],
+            request["vector"]["cases"][index]["boundary"]
+        );
+        assert_eq!(observed["abruptlyTerminated"], crash);
+        assert_eq!(observed["uncommittedWalFramesObserved"], crash);
+        for field in [
+            "baselinePreserved",
+            "integrityOk",
+            "preexistingPreserved",
+            "replayPreserved",
+            "replayWritesUnchanged",
+        ] {
+            assert_eq!(observed[field], true, "case {index}: {field}");
+        }
+        for field in [
+            "finalAddedDefinitions",
+            "finalAddedAdoptions",
+            "finalAddedEvents",
+        ] {
+            assert_eq!(observed[field], 1, "case {index}: {field}");
+        }
+    }
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("adopt:process-crash"));
+    for field in ["baselinePreserved", "integrityOk", "replayPreserved"] {
+        let mut invalid = request.clone();
+        invalid["vector"]["cases"][0]["expected"][field] = json!(false);
+        let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["databasePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(
+        &coven_home,
+        "command-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains("private-must-not-be-read"));
     assert!(!coven_home.exists());
     Ok(())
 }
