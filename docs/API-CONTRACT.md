@@ -948,7 +948,6 @@ project root for its lifetime. A turn that names different values is a
       "tokens": 91240,
       "window": 1000000,
       "model": "claude-opus-5-5",
-      "source": "usage",
       "eventSeq": 9312,
       "reportedAt": "2026-09-29T14:05:00.000000000Z"
     }
@@ -972,10 +971,11 @@ event stream, from events the daemon already stores (coven#1181):
 - `context` is the context occupancy the harness last reported, or `null` when
   none is known. For Claude it is the newest top-level model call's usage
   (uncached input plus cache reads plus cache writes; subagent calls are
-  excluded), with `source: "usage"`. A compaction boundary newer than that
-  call reports its post-compaction size with `source: "compaction"`.
-  `window` is the model's context window from the harness's result frame, or
-  `null` when not reported. `eventSeq` is the cursor of the event that
+  excluded). After the harness reports a compaction, `context` is `null`
+  until the next model call: the earlier reading is stale, and a compaction's
+  own size counts only the summarised messages, not the system prompt and
+  tools. `window` is the model's context window from the harness's result
+  frame, or `null` when not reported. `eventSeq` is the cursor of the event that
   completed the report. Codex's plain-text output reports no usage, so its
   `context` is `null`. Reports are read from the conversation's newest 512
   output events or 4 MiB, whichever is smaller; an older report reads as

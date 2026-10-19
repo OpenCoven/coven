@@ -1337,7 +1337,6 @@ description = "Builds and debugs."
         assert_eq!(transcript["context"]["tokens"], 42_003);
         assert_eq!(transcript["context"]["window"], 200_000);
         assert_eq!(transcript["context"]["model"], "claude-opus-5-5");
-        assert_eq!(transcript["context"]["source"], "usage");
         assert!(transcript["context"]["eventSeq"].is_i64());
 
         // A reset starts a conversation with nothing to measure.

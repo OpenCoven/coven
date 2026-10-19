@@ -16,8 +16,11 @@
 //!   Frames from a subagent (`parent_tool_use_id` set) describe another
 //!   context and are skipped. The window comes from a `result` frame's
 //!   `modelUsage` entry for that model. A `compact_boundary` frame newer than
-//!   the last usage report supersedes it with its `post_tokens`. Codex's
-//!   plain-text output reports nothing, so its `context` is `None`.
+//!   the last usage report makes that report stale, and its `post_tokens`
+//!   counts only the summarised messages, not the system prompt and tools, so
+//!   it is no fill reading either: `context` is `None` until the next model
+//!   call reports. Codex's plain-text output reports nothing, so its
+//!   `context` is `None` too.
 //!
 //! Reports are found by reading the conversation's newest output events
 //! backwards within a fixed budget and reassembling stdout lines per session,
@@ -55,20 +58,10 @@ pub struct ReportedContext {
     /// The model's context window, when the harness reported one.
     pub window: Option<u64>,
     pub model: Option<String>,
-    pub source: ContextSource,
     /// Cursor of the event that completed the report, as the event stream
     /// numbers it.
     pub event_seq: i64,
     pub reported_at: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ContextSource {
-    /// A model call's usage report.
-    Usage,
-    /// The `post_tokens` of a compaction newer than any usage report.
-    Compaction,
 }
 
 pub fn measure(conn: &Connection, record: &MainSessionRecord) -> Result<TranscriptMeasure> {
@@ -108,7 +101,7 @@ struct Frame {
 
 enum Report {
     Usage { tokens: u64, model: Option<String> },
-    Compaction { post_tokens: Option<u64> },
+    Compaction,
     Windows(Map<String, Value>),
 }
 
@@ -133,55 +126,35 @@ fn reported_context(
         events: max_events,
         bytes: max_bytes,
     };
-    let mut context: Option<(i64, String, u64, ContextSource)> = None;
-    let mut model: Option<Option<String>> = None;
+    let mut usage: Option<(Frame, u64, Option<String>)> = None;
     let mut windows: Option<Map<String, Value>> = None;
-    for session in sessions {
+    'sessions: for session in sessions {
         let (frames, exhausted) = session_frames(conn, &session, &mut budget)?;
         // Newest first: the first report of each kind wins.
         for frame in frames.into_iter().rev() {
             match frame.report {
-                Report::Usage {
-                    tokens,
-                    model: frame_model,
-                } => {
-                    if context.is_none() {
-                        context = Some((frame.seq, frame.created_at, tokens, ContextSource::Usage));
-                    }
-                    if model.is_none() {
-                        model = Some(frame_model);
-                    }
+                // The newest reading predates a compaction: stale, and the
+                // compaction itself reports no fill.
+                Report::Compaction if usage.is_none() => return Ok(None),
+                Report::Usage { tokens, ref model } if usage.is_none() => {
+                    let model = model.clone();
+                    usage = Some((frame, tokens, model));
                 }
-                Report::Compaction {
-                    post_tokens: Some(tokens),
-                } if context.is_none() => {
-                    context = Some((
-                        frame.seq,
-                        frame.created_at,
-                        tokens,
-                        ContextSource::Compaction,
-                    ));
-                }
-                Report::Compaction { .. } => {}
-                Report::Windows(map) => {
-                    if windows.is_none() {
-                        windows = Some(map);
-                    }
-                }
+                Report::Windows(ref map) if windows.is_none() => windows = Some(map.clone()),
+                _ => {}
             }
-            if context.is_some() && model.is_some() && windows.is_some() {
-                break;
+            if usage.is_some() && windows.is_some() {
+                break 'sessions;
             }
         }
-        if exhausted || (context.is_some() && model.is_some() && windows.is_some()) {
+        if exhausted {
             break;
         }
     }
 
-    let Some((event_seq, reported_at, tokens, source)) = context else {
+    let Some((frame, tokens, model)) = usage else {
         return Ok(None);
     };
-    let model = model.flatten();
     let window = model
         .as_deref()
         .zip(windows.as_ref())
@@ -192,9 +165,8 @@ fn reported_context(
         tokens,
         window,
         model,
-        source,
-        event_seq,
-        reported_at,
+        event_seq: frame.seq,
+        reported_at: frame.created_at,
     }))
 }
 
@@ -289,12 +261,7 @@ fn report(line: &str) -> Option<Report> {
             Some(Report::Usage { tokens, model })
         }
         "system" if frame.get("subtype")?.as_str()? == "compact_boundary" => {
-            Some(Report::Compaction {
-                post_tokens: frame
-                    .get("compact_metadata")
-                    .and_then(|metadata| metadata.get("post_tokens"))
-                    .and_then(Value::as_u64),
-            })
+            Some(Report::Compaction)
         }
         "result" => Some(Report::Windows(
             frame.get("modelUsage")?.as_object()?.clone(),
@@ -453,13 +420,12 @@ mod tests {
         assert_eq!(context.tokens, 2_302);
         assert_eq!(context.window, Some(1_000_000));
         assert_eq!(context.model.as_deref(), Some(MODEL));
-        assert_eq!(context.source, ContextSource::Usage);
         assert_eq!(context.event_seq, completed);
         assert_eq!(context.reported_at, NOW);
     }
 
     #[test]
-    fn a_newer_compaction_supersedes_the_last_usage_report() {
+    fn a_compaction_leaves_context_unknown_until_the_next_model_call() {
         let h = Home::new("claude");
         let conversation = h.record.conversation_id.clone();
         h.session("home", &conversation, "claude", NOW);
@@ -467,27 +433,23 @@ mod tests {
             "home",
             &format!(
                 "{}\n{}\n",
-                assistant(1, 280_000, 0, None),
+                assistant(2, 0, 280_912, None),
                 result(1_000_000)
             ),
         );
-        let compacted = h.output("home", &format!("{}\n", compact_boundary(280_001, 2_310)));
+        // Captured numbers: post_tokens counts only the summary, while the
+        // next model call, system prompt and tools included, read 305,499.
+        h.output("home", &format!("{}\n", compact_boundary(280_918, 2_310)));
+        assert_eq!(h.measure().context, None);
 
-        let context = h.measure().context.unwrap();
-        assert_eq!(context.tokens, 2_310);
-        assert_eq!(context.source, ContextSource::Compaction);
-        assert_eq!(context.event_seq, compacted);
-        assert_eq!(context.model.as_deref(), Some(MODEL));
-        assert_eq!(context.window, Some(1_000_000));
-
-        // The next model call is the fill reading again.
-        let next = h.output("home", &format!("{}\n", assistant(3, 2_400, 50, None)));
-        let context = h.measure().context.unwrap();
-        assert_eq!(
-            (context.tokens, context.source),
-            (2_453, ContextSource::Usage)
+        let next = h.output(
+            "home",
+            &format!("{}\n", assistant(2, 270_546, 34_951, None)),
         );
+        let context = h.measure().context.unwrap();
+        assert_eq!(context.tokens, 305_499);
         assert_eq!(context.event_seq, next);
+        assert_eq!(context.window, Some(1_000_000));
     }
 
     #[test]
