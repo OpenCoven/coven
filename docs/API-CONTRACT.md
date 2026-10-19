@@ -592,6 +592,23 @@ private IDs, owner strings, prompts, paths, logs, and raw errors are omitted.
 Missing scheduler pass data is omitted rather than reported as a zero-duration
 pass. Category/fact/gap/next-step mismatches are invalid reports.
 
+Receipt commitment inspection uses the existing committed-receipt validator in
+the same bounded snapshot. Its optional `receipt_commitments_checked` and
+`invalid_receipt_commitments` facts cover base receipt/event digests, indexes,
+run/attempt identity and terminal correlation. Checked count must equal the
+stored receipt count and stay within the 256-receipt cap; a nonzero invalid
+count requires `receipt_commitments_inconsistent`. Missing prerequisites,
+invalid key metadata and input/read limits have separate fixed gaps and omit
+both facts. `receipt_authority_not_verified` preserves the provider/authorized
+sidecar boundary. The read performs no authority verification or activation.
+All involved lookups use the main schema; temporary shadows are excluded.
+Identity comparisons exclude case variants and numeric-affinity aliases while
+retaining indexed candidate lookups on the supported schema.
+Receipt/event bodies are individually capped at 128 KiB and jointly at 1 MiB.
+A temporary SQLite string/BLOB/record limit of at most 256 KiB is restored on
+all return paths and never raises a stricter caller limit. Older reports with
+`receipt_integrity_not_verified` remain incomplete and cannot claim these facts.
+
 This initial diagnostic contract explicitly reports incomplete evidence. It has
 no aggregate health or certification bit. See the [doctor runbook](reference/automations-doctor.md)
 for each category's scope and remaining checks. The complete doctor outcome in
