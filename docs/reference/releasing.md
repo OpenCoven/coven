@@ -192,6 +192,8 @@ administrator enforcement, required pull-request review, protected release-tag
 governance, explicit break-glass evidence, release-channel synchronization, and
 a durable final receipt with publication and artifact outcomes. Passing this
 source preflight does not establish those controls or authorize a release.
+[Release governance](release-governance.md) defines the branch, tag, and
+repository policy, and the check that compares live protection against it.
 
 ### Postflight
 
@@ -401,14 +403,17 @@ procedure above and configure its trusted publisher before the next tag.
 
 `verify-tag` fails with one of:
 
-- `Refusing to release: vX.Y.Z is a lightweight tag` — re-tag with `git tag -s` and force-replace:
+- `Refusing to release: vX.Y.Z is a lightweight tag` — leave the refused tag in place and push a signed tag for the next patch version:
   ```sh
-  git tag -d v0.0.17
-  git push origin :refs/tags/v0.0.17
-  git tag -s v0.0.17 -m "Coven v0.0.17"
-  git push origin v0.0.17
+  git tag -s v0.0.18 -m "Coven v0.0.18"
+  git push origin v0.0.18
   ```
-- `Tag vX.Y.Z does not have a GitHub-verified signature (reason=...)` — the signing key isn't registered against your GitHub account. Add it under [GitHub → Settings → SSH and GPG keys → Signing keys](https://github.com/settings/keys), then re-tag.
+- `Tag vX.Y.Z does not have a GitHub-verified signature (reason=...)` — the signing key isn't registered against your GitHub account. Add it under [GitHub → Settings → SSH and GPG keys → Signing keys](https://github.com/settings/keys), then push a signed tag for the next patch version.
+
+Release tags cannot be moved or deleted once the tag rulesets in
+[release governance](release-governance.md) are applied, and deleting one is a
+break-glass action. A refused tag never published anything, so bumping forward
+loses nothing.
 
 ### Build matrix failure on a single platform
 
@@ -416,7 +421,7 @@ The platform matrix uses `fail-fast: false`, so the other targets still attempt 
 
 ### Dry-run shows a version conflict
 
-`npm publish --dry-run` returns an error like *"previously published version X is higher than the new version Y"*. The tag is below the registry's current `latest`. Delete the tag and push a higher one.
+`npm publish --dry-run` returns an error like *"previously published version X is higher than the new version Y"*. The tag is below the registry's current `latest`. Leave it in place and push a signed tag above `latest`.
 
 ### Real publish fails with `403 Forbidden` (or anything OIDC-related)
 
