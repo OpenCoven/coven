@@ -77,7 +77,23 @@ impl ProcessLauncher for SystemProcessLauncher {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         apply_launch_context(&mut command, request);
-        Ok(Box::new(spawn_managed(&mut command)?))
+        #[cfg(unix)]
+        let handoff = foreground::Handoff::prepare();
+        #[cfg(unix)]
+        if let Some(handoff) = &handoff {
+            handoff.claim_in_child(&mut command);
+        }
+        let process = spawn_managed(&mut command)?;
+        #[cfg(unix)]
+        let process = {
+            let mut process = process;
+            if let Some(handoff) = handoff {
+                handoff.give_to(process.process_group);
+                process.foreground = Some(handoff);
+            }
+            process
+        };
+        Ok(Box::new(process))
     }
 }
 
@@ -278,8 +294,19 @@ struct SystemRunningProcess {
     child: Child,
     #[cfg(unix)]
     process_group: libc::pid_t,
+    #[cfg(unix)]
+    foreground: Option<foreground::Handoff>,
     #[cfg(windows)]
     job: windows_job::Job,
+}
+
+impl SystemRunningProcess {
+    fn return_terminal(&mut self) {
+        #[cfg(unix)]
+        if let Some(mut handoff) = self.foreground.take() {
+            handoff.restore();
+        }
+    }
 }
 
 fn spawn_managed(command: &mut Command) -> io::Result<SystemRunningProcess> {
@@ -320,6 +347,8 @@ fn spawn_managed(command: &mut Command) -> io::Result<SystemRunningProcess> {
     Ok(SystemRunningProcess {
         #[cfg(unix)]
         process_group: child.id() as libc::pid_t,
+        #[cfg(unix)]
+        foreground: None,
         child,
         #[cfg(windows)]
         job,
@@ -330,6 +359,7 @@ impl Drop for SystemRunningProcess {
     fn drop(&mut self) {
         let _ = terminate_system_tree(self);
         let _ = self.child.try_wait();
+        self.return_terminal();
     }
 }
 
@@ -345,7 +375,9 @@ impl RunningProcess for SystemRunningProcess {
     }
 
     fn wait(&mut self) -> io::Result<ProcessExit> {
-        self.child.wait().map(classify_exit)
+        let exit = self.child.wait();
+        self.return_terminal();
+        exit.map(classify_exit)
     }
 }
 
@@ -402,6 +434,108 @@ fn signal_process_group(process_group: libc::pid_t, signal: libc::c_int) -> io::
 fn process_group_is_alive(process_group: libc::pid_t) -> bool {
     let result = unsafe { libc::kill(-process_group, 0) };
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Terminal ownership for a provider that was promised direct terminal access.
+///
+/// The provider runs in its own process group so a timeout can stop everything
+/// it started, but only the terminal's foreground group may change terminal
+/// modes or read input. A background group is stopped by SIGTTOU or SIGTTIN the
+/// moment it tries, which is how `coven setup` hung right after consent (#1370):
+/// interactive logins switch the terminal into raw mode before printing
+/// anything. While the provider runs its group owns the foreground; afterwards
+/// Coven takes the foreground back and restores the modes it had, so a login
+/// that dies in raw mode does not leave the terminal unusable.
+#[cfg(unix)]
+mod foreground {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    pub(super) struct Handoff {
+        terminal: libc::c_int,
+        coven_group: libc::pid_t,
+        modes: Option<libc::termios>,
+    }
+
+    impl Handoff {
+        /// Only when Coven itself owns the terminal is there anything to hand
+        /// over; a background Coven, or one without a terminal, changes nothing.
+        pub(super) fn prepare() -> Option<Self> {
+            let terminal = libc::STDIN_FILENO;
+            // SAFETY: plain queries on the process's own stdin descriptor.
+            unsafe {
+                if libc::isatty(terminal) != 1 {
+                    return None;
+                }
+                let coven_group = libc::getpgrp();
+                if libc::tcgetpgrp(terminal) != coven_group {
+                    return None;
+                }
+                let mut modes: libc::termios = std::mem::zeroed();
+                let modes = (libc::tcgetattr(terminal, &mut modes) == 0).then_some(modes);
+                Some(Self {
+                    terminal,
+                    coven_group,
+                    modes,
+                })
+            }
+        }
+
+        /// The child takes the foreground itself between fork and exec, so the
+        /// provider owns the terminal before its first instruction runs. The
+        /// parent repeats it in `give_to`; whichever runs first wins the race.
+        pub(super) fn claim_in_child(&self, command: &mut Command) {
+            let terminal = self.terminal;
+            // SAFETY: the hook runs after fork in the child and only calls
+            // async-signal-safe functions (getpid, pthread_sigmask, tcsetpgrp).
+            unsafe {
+                command.pre_exec(move || {
+                    set_foreground(terminal, libc::getpid());
+                    Ok(())
+                });
+            }
+        }
+
+        pub(super) fn give_to(&self, group: libc::pid_t) {
+            set_foreground(self.terminal, group);
+            // A provider that touched the terminal before either side moved
+            // the foreground is already stopped; continuing its group is a
+            // no-op otherwise.
+            // SAFETY: signals only the provider's own process group.
+            unsafe {
+                libc::kill(-group, libc::SIGCONT);
+            }
+        }
+
+        pub(super) fn restore(&mut self) {
+            set_foreground(self.terminal, self.coven_group);
+            if let Some(modes) = self.modes.take() {
+                // SAFETY: restores the attributes read from the same descriptor.
+                unsafe {
+                    libc::tcsetattr(self.terminal, libc::TCSADRAIN, &modes);
+                }
+            }
+        }
+    }
+
+    /// `tcsetpgrp` from a background group raises SIGTTOU unless the caller
+    /// blocks it, which is exactly the state Coven is in when it takes the
+    /// terminal back.
+    fn set_foreground(terminal: libc::c_int, group: libc::pid_t) {
+        // SAFETY: the signal mask change is reverted before returning, and
+        // every call here is async-signal-safe for use from `pre_exec`.
+        unsafe {
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            let mut previous: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGTTOU);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous);
+            // A group that already exited cannot take the terminal; there is
+            // nothing to hand over then, so the result is not an error.
+            libc::tcsetpgrp(terminal, group);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        }
+    }
 }
 
 #[cfg(windows)]

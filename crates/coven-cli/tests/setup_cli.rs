@@ -2524,3 +2524,141 @@ fn wait_for_process_exit(pid: u32) -> Result<()> {
     }
     Ok(())
 }
+
+/// Waits until the PTY transcript contains `needle`. The deadline is only a
+/// hang guard: a provider stopped by job control never prints again, so the
+/// failure shows the transcript instead of wedging the suite.
+#[cfg(unix)]
+fn wait_for_transcript(
+    transcript: &std::sync::Arc<std::sync::Mutex<String>>,
+    needle: &str,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        if transcript.lock().expect("transcript lock").contains(needle) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for {needle:?}; transcript so far:\n{}",
+                transcript.lock().expect("transcript lock")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Regression for #1370. A provider login runs in its own process group so a
+/// timeout can stop everything it started; without also owning the terminal's
+/// foreground, that group is stopped by SIGTTOU as soon as the login changes
+/// terminal modes, and `coven setup` hangs after consent. This drives the real
+/// binary through a real PTY with a fake provider that does what an
+/// interactive login does: change modes, then read a line. `--verify` then
+/// makes Coven itself read a second consent, which only works once it has
+/// taken the terminal back.
+#[cfg(unix)]
+#[test]
+fn login_owns_the_terminal_so_an_interactive_provider_can_change_modes_and_read() -> Result<()> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+
+    for (selector, executable) in [
+        ("claude", "claude"),
+        ("codex", "codex"),
+        ("copilot", "copilot"),
+    ] {
+        let temp = test_tempdir()?;
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&bin)?;
+        let fake = bin.join(executable);
+        fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             case \"$1\" in --version|-v|version) echo \"9.9.9\"; exit 0;; esac\n\
+             case \"$*\" in *'Reply with OK.'*) echo OK; exit 0;; esac\n\
+             echo \"fake login: started\"\n\
+             stty -echo\n\
+             echo \"fake login: modes changed\"\n\
+             read answer\n\
+             stty echo\n\
+             echo \"fake login: read '$answer'\"\n",
+        )?;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755))?;
+
+        let pair = native_pty_system().openpty(PtySize {
+            rows: 24,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut command = CommandBuilder::new(coven_bin());
+        command.args(["setup", selector, "--verify"]);
+        command.cwd(temp.path());
+        command.env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        command.env("COVEN_HOME", temp.path().join("coven-home"));
+        command.env("HOME", temp.path());
+        command.env("TERM", "xterm-256color");
+        let mut child = pair.slave.spawn_command(command)?;
+        drop(pair.slave);
+
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let mut reader = pair.master.try_clone_reader()?;
+        let sink = Arc::clone(&transcript);
+        let reader_thread = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 1024];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                sink.lock()
+                    .expect("transcript lock")
+                    .push_str(&String::from_utf8_lossy(&buffer[..read]));
+            }
+        });
+        let mut writer = pair.master.take_writer()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        wait_for_transcript(&transcript, "Continue? [y/N]", deadline)
+            .with_context(|| format!("{selector}: consent prompt"))?;
+        writer.write_all(b"y\n")?;
+        writer.flush()?;
+        wait_for_transcript(&transcript, "fake login: modes changed", deadline).with_context(
+            || format!("{selector}: the provider must be able to change terminal modes"),
+        )?;
+        writer.write_all(b"hello\n")?;
+        writer.flush()?;
+        wait_for_transcript(&transcript, "fake login: read 'hello'", deadline).with_context(
+            || format!("{selector}: the provider must be able to read the terminal"),
+        )?;
+        wait_for_transcript(&transcript, "verification will launch", deadline).with_context(
+            || format!("{selector}: Coven must get the terminal back to ask the second consent"),
+        )?;
+        writer.write_all(b"y\n")?;
+        writer.flush()?;
+
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                anyhow::bail!(
+                    "{selector}: coven setup did not exit after the login finished; transcript:\n{}",
+                    transcript.lock().expect("transcript lock")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(writer);
+        drop(pair.master);
+        let _ = reader_thread.join();
+        assert!(
+            status.success(),
+            "{selector}: coven setup exited {status:?}; transcript:\n{}",
+            transcript.lock().expect("transcript lock")
+        );
+    }
+    Ok(())
+}
