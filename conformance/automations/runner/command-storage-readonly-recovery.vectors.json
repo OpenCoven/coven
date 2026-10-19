@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "coven.automations.command-storage-readonly-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "read-only-refuses-then-recovers",
+      "adoptionKey": "adopt:storage-readonly:0001",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "expected": {
+        "initialOutcome": "read_only",
+        "initialRows": 0,
+        "finalRows": 1,
+        "replayPreserved": true,
+        "baselinePreserved": true
+      },
+      "fault": "sqlite_open_read_only"
+    },
+    {
+      "caseId": "writable-control",
+      "adoptionKey": "adopt:storage-readonly:0001",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "expected": {
+        "initialOutcome": "committed",
+        "initialRows": 1,
+        "finalRows": 1,
+        "replayPreserved": true,
+        "baselinePreserved": true
+      },
+      "fault": "none"
+    }
+  ]
+}

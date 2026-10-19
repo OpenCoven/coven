@@ -122,6 +122,7 @@ fn capability_advertises_the_native_structural_suites() {
                         CALENDAR_SCHEDULE_RESOLUTION_SUITE,
                         "cancellation-timeout-arbitration",
                         "command-storage-lock-recovery",
+                        "command-storage-readonly-recovery",
                         "command-transaction-rollback",
                         "legacy-import-source-preservation",
                         "command-storage-capacity-recovery",
@@ -2172,6 +2173,95 @@ fn transaction_rollback_suite_rejects_invalid_inputs_before_execution() {
                 vector
             ))
             .unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn storage_readonly_suite_executes_real_refusal_recovery_and_writable_control() {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../../conformance/automations/runner/command-storage-readonly-recovery.vectors.json"
+    ))
+    .unwrap();
+    let request = request_for_profile(
+        "scheduler_reliability",
+        "command-storage-readonly-recovery",
+        vector,
+    );
+    let response = evaluate(&request).unwrap();
+    assert_eq!(
+        response.status,
+        TargetSuiteStatus::Passed,
+        "real read-only recovery suite must execute"
+    );
+    assert!(response.evidence.is_some());
+}
+
+#[test]
+fn storage_readonly_suite_rejects_missing_controls_and_weakened_expectations() {
+    let original: Value = serde_json::from_str(include_str!(
+        "../../../../conformance/automations/runner/command-storage-readonly-recovery.vectors.json"
+    ))
+    .unwrap();
+    for (pointer, value) in [
+        ("/schemaVersion", json!("unknown")),
+        ("/cases/0/fault", json!("none")),
+        ("/cases/1/fault", json!("sqlite_open_read_only")),
+        ("/cases/0/expected/initialOutcome", json!("committed")),
+        ("/cases/0/expected/baselinePreserved", json!(false)),
+        ("/cases/0/expected/initialRows", json!(1)),
+        ("/cases/0/expected/finalRows", json!(0)),
+        ("/cases/0/expected/replayPreserved", json!(false)),
+        ("/cases/0/adoptionKey", json!("")),
+        ("/cases/0/adoptionKey", json!("adopt:readonly:baseline")),
+        ("/cases/0/definition/id", json!("readonly-preexisting")),
+        ("/cases/0/definition/status", json!("ACTIVE")),
+        ("/cases/1/caseId", json!("read-only-refuses-then-recovers")),
+        ("/cases/0/caseId", json!("../unsafe")),
+    ] {
+        let mut vector = original.clone();
+        *vector.pointer_mut(pointer).unwrap() = value;
+        let request = request_for_profile(
+            "scheduler_reliability",
+            "command-storage-readonly-recovery",
+            vector,
+        );
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid",
+            "accepted weakened vector at {pointer}"
+        );
+    }
+    let mut vector = original;
+    vector["cases"].as_array_mut().unwrap().pop();
+    let request = request_for_profile(
+        "scheduler_reliability",
+        "command-storage-readonly-recovery",
+        vector,
+    );
+    assert_eq!(
+        evaluate(&request).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn storage_readonly_suite_rejects_unknown_fixture_fields() {
+    let original: Value = serde_json::from_str(include_str!(
+        "../../../../conformance/automations/runner/command-storage-readonly-recovery.vectors.json"
+    ))
+    .unwrap();
+    for pointer in ["", "/cases/0", "/cases/0/expected"] {
+        let mut vector = original.clone();
+        vector.pointer_mut(pointer).unwrap()["unknown"] = json!(true);
+        let request = request_for_profile(
+            "scheduler_reliability",
+            "command-storage-readonly-recovery",
+            vector,
+        );
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
             "conformance vector is invalid"
         );
     }

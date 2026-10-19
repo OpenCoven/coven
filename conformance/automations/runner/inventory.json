@@ -16,6 +16,7 @@
     { "profile": "scheduler_reliability", "suiteId": "calendar-schedule-resolution", "vectorFile": "calendar-schedule-resolution.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "cancellation-timeout-arbitration", "vectorFile": "cancellation-timeout-arbitration.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "command-storage-lock-recovery", "vectorFile": "command-storage-lock-recovery.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "command-storage-readonly-recovery", "vectorFile": "command-storage-readonly-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "command-transaction-rollback", "vectorFile": "command-transaction-rollback.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "legacy-import-source-preservation", "vectorFile": "legacy-import-source-preservation.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "command-storage-capacity-recovery", "vectorFile": "command-storage-capacity-recovery.vectors.json" },
