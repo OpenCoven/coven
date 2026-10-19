@@ -156,6 +156,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'node --test scripts/package-github-release-test.mjs',
             'node --test scripts/release-governance.test.mjs',
             'node --test scripts/package-automations-authority-profile.test.mjs',
+            'node --test scripts/check-action-pins.test.mjs',
             'node --test scripts/release-stress-test.mjs',
             'node --test scripts/verify-release-tag.test.mjs',
             'automations-authority-profile-bundle',
@@ -386,7 +387,8 @@ class CheckCiWorkflowTests(unittest.TestCase):
                 self.assertIn("\n    timeout-minutes: 20\n", job)
                 self.assertIn("needs: changes", job)
                 self.assertIn("if: ${{ needs.changes.outputs.rust == 'true' }}", job)
-                self.assertIn("dtolnay/rust-toolchain@stable", job)
+                # check-action-pins.mjs governs the action SHA and toolchain version.
+                self.assertIn("uses: dtolnay/rust-toolchain@", job)
                 self.assertIn("bash scripts/install-native-link-dependencies.sh", job)
                 self.assertIn('CARGO_TARGET_DIR=${{ runner.temp }}/coven-target', job)
                 self.assertNotIn("continue-on-error:", job)

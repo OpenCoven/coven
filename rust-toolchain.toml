@@ -1,0 +1,7 @@
+# The exact Rust toolchain for CI, releases and local builds (#805). Workflow
+# rust-toolchain steps pass this same version; scripts/check-action-pins.mjs
+# keeps them in step. Bump it through a reviewed pull request.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

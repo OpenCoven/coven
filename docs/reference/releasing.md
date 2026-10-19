@@ -101,6 +101,25 @@ does. What stops a tag on an unmerged commit from running a modified gate is
 the release-tag creation ruleset, which only repository administrators can
 bypass.
 
+### Pinned actions and toolchains
+
+Nothing a release or `PR gate` runs may move without a change to this
+repository:
+
+- Every action is pinned to a full commit SHA with a `# <ref>` comment, and
+  `.github/actions-lock.json` records which tag or branch each SHA came from.
+- `rust-toolchain.toml` pins the exact Rust release; every
+  `dtolnay/rust-toolchain` step passes the same version.
+- `.node-version` pins Node, and with it the bundled npm that publishes; every
+  job that runs `node` installs it through `actions/setup-node`.
+
+`node scripts/check-action-pins.mjs check` enforces all three offline and runs
+in `Policy guard`. `node scripts/check-action-pins.mjs verify-remote` asks
+GitHub whether each locked SHA is still what its tag names, or is still
+contained in its branch. Run it when updating a pin. To bump an action, resolve
+the new tag to its commit, update the lock entry and every `uses:` line
+together, then run both commands.
+
 ## Cut a release
 
 ### Preflight
