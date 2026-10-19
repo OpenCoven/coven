@@ -166,9 +166,10 @@ deleting what it created, but every one of them changes who can do what on
      -F enabled=true -f allowed_actions=all -F sha_pinning_required=true
    ```
 
-3. Enable immutable releases only after the GitHub Release workflow publishes
-   draft-first; the current create-then-upload flow cannot add assets to a
-   published immutable release:
+3. Enable immutable releases once `release-github.yml` publishes draft-first
+   (it creates a draft, uploads every asset and the receipt, then publishes);
+   the older create-then-upload flow could not add assets to a published
+   immutable release:
 
    ```sh
    gh api -X PUT repos/OpenCoven/coven/immutable-releases
