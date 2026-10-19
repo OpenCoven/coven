@@ -1150,6 +1150,13 @@ enum SchedulerCommand {
 #[derive(Subcommand, Debug)]
 enum AutomationsCommand {
     #[command(
+        about = "Inspect Automations facts and explicit evidence gaps through the owner-local daemon"
+    )]
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(
         about = "Inspect scheduler leadership, last pass, and queue through the local daemon"
     )]
     Status {
@@ -1651,7 +1658,8 @@ fn main() -> Result<()> {
     ) || matches!(
         &cli.command,
         Some(Command::Automations {
-            command: AutomationsCommand::Conformance { .. }
+            command: AutomationsCommand::Doctor { .. }
+                | AutomationsCommand::Conformance { .. }
                 | AutomationsCommand::Leases { .. }
                 | AutomationsCommand::Status { .. }
                 | AutomationsCommand::Occurrence { .. }
@@ -4127,6 +4135,7 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
 fn run_automations_command(command: AutomationsCommand) -> Result<()> {
     use automations::operator_cli::{run, View};
     match command {
+        AutomationsCommand::Doctor { json } => automations::doctor_cli::run(json),
         AutomationsCommand::Status { json } => run(View::Status, json),
         AutomationsCommand::Occurrence { id, json } => run(View::Occurrence(&id), json),
         AutomationsCommand::Run { id, json } => run(View::Run(&id), json),

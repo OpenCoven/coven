@@ -50,13 +50,96 @@ pub(crate) struct Lease {
     pub issues: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Expiry {
     Active,
     Expired,
     Missing,
     Invalid,
+}
+
+/// The shared bounded timestamp interpretation used by paging and summaries.
+pub(crate) fn classify_expiry(
+    value: Option<&[u8]>,
+    now: DateTime<Utc>,
+) -> (Option<DateTime<Utc>>, Expiry) {
+    let Some(value) = value else {
+        return (None, Expiry::Missing);
+    };
+    let parsed = (value.len() <= 64)
+        .then_some(value)
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    match parsed {
+        Some(value) => (
+            Some(value),
+            if value <= now {
+                Expiry::Expired
+            } else {
+                Expiry::Active
+            },
+        ),
+        None => (None, Expiry::Invalid),
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct LeaseSummary {
+    pub total: u64,
+    pub active: u64,
+    pub expired: u64,
+    pub missing_expiry: u64,
+    pub invalid_expiry: u64,
+}
+
+/// The caller owns the coherent read snapshot. No IDs, owner text or history
+/// are selected, and each timestamp is bounded before decoding.
+pub(crate) fn summarize_expiry(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<LeaseSummary, ReadError> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT substr(CAST(lease_expires_at AS BLOB), 1, 65)
+         FROM main.automation_occurrences WHERE {CARRIES_LEASE}"
+        ))
+        .map_err(|_| ReadError::Store)?;
+    let mut rows = statement.query([]).map_err(|_| ReadError::Store)?;
+    let mut summary = LeaseSummary::default();
+    while let Some(row) = rows.next().map_err(|_| ReadError::Store)? {
+        if summary.total == 9_007_199_254_740_991 {
+            return Err(ReadError::Store);
+        }
+        let value: Option<Vec<u8>> = row.get(0).map_err(|_| ReadError::Store)?;
+        summary.total += 1;
+        match classify_expiry(value.as_deref(), now).1 {
+            Expiry::Active => summary.active += 1,
+            Expiry::Expired => summary.expired += 1,
+            Expiry::Missing => summary.missing_expiry += 1,
+            Expiry::Invalid => summary.invalid_expiry += 1,
+        }
+    }
+    Ok(summary)
+}
+
+pub(crate) fn outside_active_state_count(conn: &Connection) -> Result<u64, ReadError> {
+    let value: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM main.automation_occurrences WHERE {CARRIES_LEASE}
+            AND (CASE WHEN state IN ('claimed', 'running') THEN 0 ELSE 1 END)=1"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| ReadError::Store)?;
+    let count = u64::try_from(value).map_err(|_| ReadError::Store)?;
+    if count > 9_007_199_254_740_991 {
+        return Err(ReadError::Store);
+    }
+    Ok(count)
 }
 
 fn valid_id(id: &str) -> bool {
@@ -146,36 +229,13 @@ fn project(row: RawLease, now: DateTime<Utc>) -> Result<Lease, ReadError> {
             None
         }
     };
-    let (lease_expires_at, expiry) = match row.expires {
-        // The query returns at most 65 bytes. Byte 65 is an overflow sentinel,
-        // not part of a timestamp that may be accepted after truncation.
-        Some(value) if value.len() > 64 => {
-            issues.push("invalid_expiry".to_owned());
-            (None, Expiry::Invalid)
-        }
-        Some(value) => match DateTime::parse_from_rfc3339(&value) {
-            Ok(value) => (
-                Some(
-                    value
-                        .with_timezone(&Utc)
-                        .to_rfc3339_opts(SecondsFormat::AutoSi, true),
-                ),
-                if value <= now {
-                    Expiry::Expired
-                } else {
-                    Expiry::Active
-                },
-            ),
-            Err(_) => {
-                issues.push("invalid_expiry".to_owned());
-                (None, Expiry::Invalid)
-            }
-        },
-        None => {
-            issues.push("missing_expiry".to_owned());
-            (None, Expiry::Missing)
-        }
-    };
+    let (expires, expiry) = classify_expiry(row.expires.as_deref().map(str::as_bytes), now);
+    let lease_expires_at = expires.map(|value| value.to_rfc3339_opts(SecondsFormat::AutoSi, true));
+    match expiry {
+        Expiry::Missing => issues.push("missing_expiry".to_owned()),
+        Expiry::Invalid => issues.push("invalid_expiry".to_owned()),
+        Expiry::Active | Expiry::Expired => {}
+    }
     let state: Option<OccurrenceState> = serde_json::from_value(Value::String(row.state)).ok();
     if !matches!(
         state,

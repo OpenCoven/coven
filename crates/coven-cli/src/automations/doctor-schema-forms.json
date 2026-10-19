@@ -1,0 +1,346 @@
+{
+  "schemaVersion": "coven.automations.doctor-schema-forms.v1",
+  "metadataRecipe": "coven.automations.doctor-schema-object.v1",
+  "captureSha256": "ddd5d7854e77dddd69e988462082ec361c767fcdde636565cb6b3dbd37704dae",
+  "fixtureForms": [
+    "fresh",
+    "v0.4.3",
+    "v0.4.6",
+    "v0.4.6-rollback"
+  ],
+  "objects": {
+    "index:automation_cancellations_active_run": [
+      "0165e5285eb13584b59fd3424f2efb5573ff97f900a833a518eb5172aeb752c1"
+    ],
+    "index:idx_automation_attempts_dispatch": [
+      "cf23fb271b7eba4bbb83804e2637430847e5586f0943dd855d38a5ada88fadca"
+    ],
+    "index:idx_automation_command_adoptions_automation": [
+      "e8d7feead02893b8993ae89b8ae22a565424576e279f76dc9a579f6cdd19a809"
+    ],
+    "index:idx_automation_definitions_planning": [
+      "b46b6347a2f355a797810ae3f1ce75f8470ac55e8c9921687cfec15ce7e77efc"
+    ],
+    "index:idx_automation_definitions_updated_at": [
+      "28e85216d3637f21850e6a1e3bacab748fc80450df89d21ae8bee4e8d0b69c86",
+      "b6dce63ea2a8c70483c6c99243f679faa5c2f14d1f93cc54c2f609ae60913fe6",
+      "fc3bf663c2f025e955d1e5aa93f1c53fc59cf16477ed8e174dbebdacf9d36fa0"
+    ],
+    "index:idx_automation_event_checkpoints_expiry": [
+      "4badae4b5f60f5132f3dd46c46c669a50d506907aaf8f851812f3fc1bcaf2eae"
+    ],
+    "index:idx_automation_events_recorded": [
+      "d594c6e343bea7956693e9deceeca1c23220ef376ca646e4f53e5d0720551132"
+    ],
+    "index:idx_automation_missions_scope": [
+      "a08557500a9460112f128583972ba7debbd4aeeb9aa736f432f90bce2b7dd846"
+    ],
+    "index:idx_automation_occurrences_history": [
+      "d51ebf7d17513c3d15bd643ede99ba6dad1e518105dcc3bf84775a726f79c4df"
+    ],
+    "index:idx_automation_occurrences_leases": [
+      "59dadfa01b054a20edf707e2c79af40e58f5c18bd537d4170986debfb8862f68"
+    ],
+    "index:idx_automation_occurrences_leases_by_automation": [
+      "fc27dc4902a93417ee4e62619f86be7009eaf2074f81e4cd086095e82de8e5b9"
+    ],
+    "index:idx_automation_occurrences_scheduled": [
+      "1ad1eb11096566ab4a7f92fce2cc221fbebeb082486d9fe43a402ac429548731",
+      "b1eac5546b767f6efea00b36fe4c3cc6e147890f18c87ed96d9ad46c4ed120b2"
+    ],
+    "index:idx_automation_occurrences_state": [
+      "844230c94b8a0585099fe16f696c773bc3b541b6dbf361e1048b9fa328b635c9",
+      "e51f72de07876315830a83aa0e3bc452e5cd8b94b2c381bac29ae13c39bcda86"
+    ],
+    "index:idx_automation_runs_automation_started": [
+      "36d047afdfa04d6bb25fad8cdf36382470f32214a982c6be272ebde40ae92484",
+      "6e767c31e43a50a79f564cdcbfc0abc773eee4668bc1d3f11a2dbe30ec565150"
+    ],
+    "index:idx_automation_runs_delivery_pending": [
+      "4f6b51564f90f26f8c808180e00f73b042a7f16d1a2194bfe8d832613472827a",
+      "bc2f4daf3c897af0f3f9065b1e3a6764bdc19a204e25026ad6ba93a23e4edd4e"
+    ],
+    "index:idx_automation_runs_history": [
+      "7e794e9d73ee324d2b986f06469096a4ed9a4f94c21d0698c7a6cb4dc7f86423"
+    ],
+    "index:idx_automation_runtime_terminal_evidence_binding": [
+      "326bb4f943634a6a4f20043afb2c105d1938e26e1bf02c2426849c72626aa1c5"
+    ],
+    "index:idx_automation_runtime_terminal_evidence_run": [
+      "688dfa4ee6816b16f5af64b966f8c75eec03b6bfbd3dca15f082073836312aa5"
+    ],
+    "table:automation_attempts": [
+      "f025c0c38792549c8bb66b381b3c1299de0191f6e70f542b36021ba95892d4b2"
+    ],
+    "table:automation_cancellations": [
+      "243070b647b868a12df7e0ba343e75b2645b220f39034467c962c75ddca52ef7"
+    ],
+    "table:automation_command_adoptions": [
+      "a0d6288ca01e54b0596b4032d66546cd63dc9655903925748f589cf1611b2eb7"
+    ],
+    "table:automation_command_reservations": [
+      "956308899263cf8d4483896c3eb25a9494c33b258e6172c56ddb662443eb553b"
+    ],
+    "table:automation_contract_migrations": [
+      "0d40fbae905b7651fca67bd11e66ed495d39a1cb6a3056656ccd01afe1e0e45d"
+    ],
+    "table:automation_definitions": [
+      "0f535378803dd127eb3aa3eb9c5d15d18c5dd43b859aa9d1971ed06e18a455c8",
+      "321d4b9de9069e58fafe936d0ea81bb9dd8b6af749b7783083cc0afdd2b9da42",
+      "ec0551dc4dae934ee30902e90f391b305a5e10f88306d7e14ee246f297fba33e"
+    ],
+    "table:automation_event_checkpoints": [
+      "dbcb6b0ccec5b56d14831b3254a29fe02474a3233396c0aa3ca92c0dcca422e8"
+    ],
+    "table:automation_event_id_scratch": [
+      "4040f544a656158037026529b8c7fc650424737cfe2b2e68d464126d59579fbe"
+    ],
+    "table:automation_event_migrations": [
+      "3e169ee499349f2d2cd3dc8f070b705f600510cbc34fea0783c276ea18c3b3cc"
+    ],
+    "table:automation_event_stream_heads": [
+      "a42c480c57ba714e3ffa0c706738da462f52fdad07778dac7e4f6fa9caf86d38"
+    ],
+    "table:automation_events": [
+      "e28f69f319f9c6ac00390c7c560ff2d62c930f066c7289a984e32c85b4c0c918"
+    ],
+    "table:automation_missions": [
+      "8d8c42b605a28cc8605587025fa9e1be70bdad696b297e29c0a60dd26debfd59"
+    ],
+    "table:automation_occurrences": [
+      "130d6ef8dc1ed03cd6c7a88b1bb311cc5953d0eea333b9f1cf41a0db40044e3b",
+      "16993a118eab3e3a3cb6367eea0c5448eab1380fceb8255ff537de362f0ab299",
+      "9d95240b2b615a9e4e85e8b8623216e342f8dec7cc47826a669e97845c9389ea"
+    ],
+    "table:automation_receipt_authority_extensions": [
+      "a562e516c6ba39e768490b24df0d4a5e0590671281d5b3bde4b23d2bbfd3a988"
+    ],
+    "table:automation_receipts": [
+      "bc83e46803d0c866b9f1713c25f573e5d4f3d191a304596d53dd842d95dd78c2"
+    ],
+    "table:automation_retry_state": [
+      "2a25d7f1ad5221ecf1d19db12a3e8f16da6b460e9c5f99fc6aee9b1f6b1f1474"
+    ],
+    "table:automation_rich_definition_revisions": [
+      "4e8d186eb7ca614a34ce09513d671de51a02c39f022ee3ba527fe48a4d37c6e1"
+    ],
+    "table:automation_runs": [
+      "5d899226909bd92c895f71f8b0a4fa13bdaa7a1c92d75a4a5b58c8af64d828cb",
+      "8155f1e776b5909cea7095b6c26a171327259cad23e8812c990e4a8088746875",
+      "c72f2158b04d97fa3991e947d6f5ee54a0af8bcbed15d676f37b69d45a5a2481"
+    ],
+    "table:automation_runtime_terminal_evidence": [
+      "a5a39adb0b228cf1867b5b84f74560e2ac54dda73dd0b27abd2e6ac39e540036"
+    ],
+    "table:automation_scheduler_authority": [
+      "dd4820bdeee7a30fc525af058ea779c5c6be8e64204889585b7c35d6ced6a656"
+    ],
+    "table:automation_scheduler_last_pass": [
+      "7c59966e9784d8379fac4c51beeded9d50e14f57174c6d16814c4b5118f77ec5"
+    ],
+    "table:automation_scheduler_last_successful_pass": [
+      "40be1152567f887ac9706a2c19108d9f14bc5feb6a63f86ac4bce6585f3178b4"
+    ],
+    "table:automation_scheduler_planning_cursor": [
+      "1801d37ad62d99d4724820fc4a2b92b6fe9e8dbbb17e8972d6cab5b32234c81b"
+    ],
+    "table:automation_stop_fences": [
+      "ffc60ffe6242d678fe41772c09d30222ddd0168f76e2619b0f8a7f3e12d639f7"
+    ],
+    "table:automation_timezone_migrations": [
+      "6012bf78fbb24ce4ddff35505fb38700bc56eda686fdc6f024dfbfff84ee648e"
+    ],
+    "trigger:automation_attempt_adoption_key_global_insert": [
+      "9288373b8390b87e1366006d80c0c4aa79257e9385df91597d00af5ecc405865"
+    ],
+    "trigger:automation_attempt_authority_delete_refused": [
+      "48a971bef8ac5906c9039b6e016803ba20fec0f75cae84732d99d0ccb104fb66"
+    ],
+    "trigger:automation_attempt_authority_immutable": [
+      "0cb9e055a6281474cc8d55649e67c2745fe7ff3f3d1acce1c0fdf81c6478be78"
+    ],
+    "trigger:automation_attempt_transition_changed": [
+      "f93adef258b8ac9a8ff1d94d0f3106ad48fffb282dd4b7d07f45ceb9382cccbf"
+    ],
+    "trigger:automation_attempt_transition_created": [
+      "56a8358859634843c22f357be7190767f89e51c6be5da77cccc9a79b3f14b516"
+    ],
+    "trigger:automation_attempts_delete_terminal_refused": [
+      "f193039c8ecbd81f4e1dc72531589353293a0caab97e086e65bac7c9399b9d6c"
+    ],
+    "trigger:automation_attempts_terminal_immutable": [
+      "6ca4e18c025680b71757c3631edf1eda9f4ad0d32481793ed314b10ba00e38f0"
+    ],
+    "trigger:automation_command_adoption_key_global_insert": [
+      "a93bff970de27fab8262f3cfe4bf5581103579f16cdc7a14ea1c1a0960cc5e8d"
+    ],
+    "trigger:automation_command_adoptions_immutable_columns": [
+      "dc683797fab788e3fb608af2e4b9667812167dde069b7c8cc6ce3aceec6e70e2"
+    ],
+    "trigger:automation_command_adoptions_immutable_rowid": [
+      "6bedb7352bb1dd12e33d80b4f045ab6b98e9f624f4ed2f40239b4f3cb75d7337"
+    ],
+    "trigger:automation_command_adoptions_no_delete": [
+      "381876c9fe10f7882481b9d9b2837554dbe108f2ffa80992d519b18a1e23c0d7"
+    ],
+    "trigger:automation_command_adoptions_response_update_guard": [
+      "517bf7bbd6c1e7cd884c067a059738df2cc09570573ac03886b901e031866a2d"
+    ],
+    "trigger:automation_command_reservation_key_global_insert": [
+      "7b849a94e09be76f2f56371fb481eb5b30da971c1121e723c9d3afcbe651d85c"
+    ],
+    "trigger:automation_events_no_delete": [
+      "bc7096d2cda7f725b545aead75f5381e9007ab1a2b33e69f5c51570cd9613246"
+    ],
+    "trigger:automation_events_no_update": [
+      "a7aa7917881619d25f2f168b04f53157ae2fcf490d3b7fe4af58925eae65dd98"
+    ],
+    "trigger:automation_missions_immutable": [
+      "515b45463302853ba57e2a458f717ec995e2f03827dfc0554ca34d2e595dbd4e"
+    ],
+    "trigger:automation_missions_retained": [
+      "4cfe35876fc1eb47676afec03ba54a0c9c0ac94f393464d7b8c4b012fe6e6fff"
+    ],
+    "trigger:automation_occurrence_transition_changed": [
+      "f3bde4a5df8ec8ebf29b90451d73717acc90a608d4b0df09d33d14753bfb83e8"
+    ],
+    "trigger:automation_occurrence_transition_created": [
+      "b4fa68edd9539ca2854b22f73ea9921580cb00e72d1e5681d2272b73f3addd9f"
+    ],
+    "trigger:automation_receipt_authority_extensions_no_delete": [
+      "a3384e3c5d371e7541d0faeedcbfa05d6fc61ac61d2c4d9ab23facf07463baa0"
+    ],
+    "trigger:automation_receipt_authority_extensions_no_update": [
+      "75f2bd3616ac8cf302cd7b73bd8ad19f31ec4c8f8b419e3a9233c0814aecd4f4"
+    ],
+    "trigger:automation_receipts_no_delete": [
+      "12ad22468f4fd780cda5d5be5baadbe606be692f83b36f82470d36feb4206f39"
+    ],
+    "trigger:automation_receipts_no_update": [
+      "f7dea6a4f0dff4dfcf3818bbab844b3187a33d9ea81ab8a3409e6e896367edd9"
+    ],
+    "trigger:automation_run_authority_profile_immutable": [
+      "a9ec78a1b868f1eaf304f6553172af4dbfb56a524e0983b46d2e46ea3a302fa5"
+    ],
+    "trigger:automation_run_delivery_settled_immutable": [
+      "707eaf42067eeec3656d788300f9e17e580283f48aac59c85cb19ec096248eed"
+    ],
+    "trigger:automation_run_receipt_once": [
+      "1b45ee4f4980038371914c4658222de79520f5174bca9118ae4bcad45eb94064"
+    ],
+    "trigger:automation_run_transition_changed": [
+      "17be6562e177df598df8dc798a328c077ffa88356fd1e10c818c4274746063c4"
+    ],
+    "trigger:automation_run_transition_created": [
+      "75b7d84b4378a062d07594e63406fcef26bbef6f1629181a70951d97c3e6d995"
+    ],
+    "trigger:automation_runtime_terminal_evidence_no_delete": [
+      "fc0926812047ea0361a075eb8944ac418c236df9d4f74eab86925a0eb1eee8d1"
+    ],
+    "trigger:automation_runtime_terminal_evidence_no_update": [
+      "2ef9ba542ca8b6d6157cb3ab70c07788091538b949981c66545a72da9a36f6f2"
+    ]
+  },
+  "knownIndexes": {
+    "table:automation_attempts": [
+      "idx_automation_attempts_dispatch",
+      "sqlite_autoindex_automation_attempts_1",
+      "sqlite_autoindex_automation_attempts_2",
+      "sqlite_autoindex_automation_attempts_3",
+      "sqlite_autoindex_automation_attempts_4"
+    ],
+    "table:automation_cancellations": [
+      "automation_cancellations_active_run",
+      "sqlite_autoindex_automation_cancellations_1",
+      "sqlite_autoindex_automation_cancellations_2"
+    ],
+    "table:automation_command_adoptions": [
+      "idx_automation_command_adoptions_automation",
+      "sqlite_autoindex_automation_command_adoptions_1"
+    ],
+    "table:automation_command_reservations": [
+      "sqlite_autoindex_automation_command_reservations_1"
+    ],
+    "table:automation_contract_migrations": [
+      "sqlite_autoindex_automation_contract_migrations_1"
+    ],
+    "table:automation_definitions": [
+      "idx_automation_definitions_planning",
+      "idx_automation_definitions_updated_at",
+      "sqlite_autoindex_automation_definitions_1"
+    ],
+    "table:automation_event_checkpoints": [
+      "idx_automation_event_checkpoints_expiry",
+      "sqlite_autoindex_automation_event_checkpoints_1"
+    ],
+    "table:automation_event_id_scratch": [],
+    "table:automation_event_migrations": [
+      "sqlite_autoindex_automation_event_migrations_1"
+    ],
+    "table:automation_event_stream_heads": [
+      "sqlite_autoindex_automation_event_stream_heads_1"
+    ],
+    "table:automation_events": [
+      "idx_automation_events_recorded",
+      "sqlite_autoindex_automation_events_1",
+      "sqlite_autoindex_automation_events_2"
+    ],
+    "table:automation_missions": [
+      "idx_automation_missions_scope",
+      "sqlite_autoindex_automation_missions_1",
+      "sqlite_autoindex_automation_missions_2",
+      "sqlite_autoindex_automation_missions_3",
+      "sqlite_autoindex_automation_missions_4"
+    ],
+    "table:automation_occurrences": [
+      "idx_automation_occurrences_history",
+      "idx_automation_occurrences_leases",
+      "idx_automation_occurrences_leases_by_automation",
+      "idx_automation_occurrences_scheduled",
+      "idx_automation_occurrences_state",
+      "sqlite_autoindex_automation_occurrences_1",
+      "sqlite_autoindex_automation_occurrences_2"
+    ],
+    "table:automation_receipt_authority_extensions": [
+      "sqlite_autoindex_automation_receipt_authority_extensions_1",
+      "sqlite_autoindex_automation_receipt_authority_extensions_2",
+      "sqlite_autoindex_automation_receipt_authority_extensions_3"
+    ],
+    "table:automation_receipts": [
+      "sqlite_autoindex_automation_receipts_1",
+      "sqlite_autoindex_automation_receipts_2",
+      "sqlite_autoindex_automation_receipts_3",
+      "sqlite_autoindex_automation_receipts_4"
+    ],
+    "table:automation_retry_state": [
+      "sqlite_autoindex_automation_retry_state_1"
+    ],
+    "table:automation_rich_definition_revisions": [
+      "sqlite_autoindex_automation_rich_definition_revisions_1"
+    ],
+    "table:automation_runs": [
+      "idx_automation_runs_automation_started",
+      "idx_automation_runs_delivery_pending",
+      "idx_automation_runs_history",
+      "sqlite_autoindex_automation_runs_1"
+    ],
+    "table:automation_runtime_terminal_evidence": [
+      "idx_automation_runtime_terminal_evidence_binding",
+      "idx_automation_runtime_terminal_evidence_run",
+      "sqlite_autoindex_automation_runtime_terminal_evidence_1",
+      "sqlite_autoindex_automation_runtime_terminal_evidence_2",
+      "sqlite_autoindex_automation_runtime_terminal_evidence_3",
+      "sqlite_autoindex_automation_runtime_terminal_evidence_4"
+    ],
+    "table:automation_scheduler_authority": [],
+    "table:automation_scheduler_last_pass": [],
+    "table:automation_scheduler_last_successful_pass": [],
+    "table:automation_scheduler_planning_cursor": [],
+    "table:automation_stop_fences": [
+      "sqlite_autoindex_automation_stop_fences_1"
+    ],
+    "table:automation_timezone_migrations": [
+      "sqlite_autoindex_automation_timezone_migrations_1"
+    ]
+  }
+}

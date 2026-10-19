@@ -721,6 +721,102 @@ pub(crate) fn tick_with_scheduler_fence(
     Ok(report)
 }
 
+// Shared with observation only; reading these rows never grants a scheduler fence.
+const STALE_SCHEDULER_CLAIMS_PREDICATE: &str = "state = 'claimed'
+           AND lease_owner = 'daemon'
+           AND scheduler_generation IS NOT ?1
+           AND EXISTS (
+               SELECT 1
+               FROM main.automation_scheduler_authority
+               WHERE id = 1 AND owner_id = ?3 AND generation = ?1
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM main.automation_runs
+               WHERE automation_runs.occurrence_id = automation_occurrences.id
+           )";
+
+#[derive(Debug)]
+pub(crate) enum RecordedSchedulerAuthority {
+    Unobserved { generation: Option<u64> },
+    InvalidMetadata,
+    Observed(RecordedAssignedAuthority),
+}
+
+/// The caller owns the read snapshot. This returns only non-authorizing numeric
+/// observations; it never constructs SchedulerFence or acquires its OS lock.
+pub(crate) fn recorded_scheduler_authority(
+    conn: &Connection,
+) -> Result<RecordedSchedulerAuthority> {
+    let raw: Option<(Option<i64>, i64, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT CASE WHEN typeof(generation) = 'integer'
+                        AND generation BETWEEN 0 AND 9007199254740991 THEN generation END,
+                CASE typeof(owner_id) WHEN 'null' THEN 0 WHEN 'text' THEN 1 ELSE -1 END,
+                substr(CAST(owner_id AS BLOB), 1, 513)
+         FROM main.automation_scheduler_authority WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .context("failed to inspect recorded scheduler metadata")?;
+    let Some((generation, kind, owner)) = raw else {
+        return Ok(RecordedSchedulerAuthority::Unobserved { generation: None });
+    };
+    let Some(generation) = generation else {
+        return Ok(RecordedSchedulerAuthority::InvalidMetadata);
+    };
+    if kind == 0 && owner.is_none() {
+        return Ok(RecordedSchedulerAuthority::Unobserved {
+            generation: Some(generation as u64),
+        });
+    }
+    let Some(owner) = owner.filter(|value| !value.is_empty() && value.len() <= 512) else {
+        return Ok(RecordedSchedulerAuthority::InvalidMetadata);
+    };
+    let Ok(owner) = std::str::from_utf8(&owner) else {
+        return Ok(RecordedSchedulerAuthority::InvalidMetadata);
+    };
+    if kind != 1 || generation == 0 || owner.trim() != owner || owner.chars().any(char::is_control)
+    {
+        return Ok(RecordedSchedulerAuthority::InvalidMetadata);
+    }
+    Ok(RecordedSchedulerAuthority::Observed(
+        RecordedAssignedAuthority {
+            generation: generation as u64,
+            owner: owner.to_owned(),
+        },
+    ))
+}
+
+// Private bounded owner metadata is retained only for the read query below.
+// It is never serialized, returned in diagnostics, or converted to a fence.
+#[derive(Debug)]
+pub(crate) struct RecordedAssignedAuthority {
+    generation: u64,
+    owner: String,
+}
+
+impl RecordedAssignedAuthority {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn mismatched_claim_count(&self, conn: &Connection) -> Result<u64> {
+        let generation =
+            i64::try_from(self.generation).context("invalid recorded scheduler generation")?;
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM main.automation_occurrences WHERE {STALE_SCHEDULER_CLAIMS_PREDICATE}"),
+            params![generation, rusqlite::types::Null, self.owner], |row| row.get(0),
+        ).context("failed to count recorded scheduler claim mismatches")?;
+        let count = u64::try_from(count).context("invalid recorded scheduler claim count")?;
+        anyhow::ensure!(
+            count <= 9_007_199_254_740_991,
+            "recorded scheduler claim count exceeds supported range"
+        );
+        Ok(count)
+    }
+}
+
 fn recover_stale_scheduler_claims(
     conn: &Connection,
     fence: &super::leadership::SchedulerFence,
@@ -728,25 +824,16 @@ fn recover_stale_scheduler_claims(
 ) -> Result<usize> {
     let recovered = conn
         .execute(
-            "UPDATE automation_occurrences
+            &format!(
+                "UPDATE automation_occurrences
          SET state = 'planned',
              lease_owner = NULL,
              lease_expires_at = NULL,
              scheduler_generation = NULL,
              failure_reason = NULL,
              updated_at = ?2
-         WHERE state = 'claimed'
-           AND lease_owner = 'daemon'
-           AND scheduler_generation IS NOT ?1
-           AND EXISTS (
-               SELECT 1
-               FROM automation_scheduler_authority
-               WHERE id = 1 AND owner_id = ?3 AND generation = ?1
-           )
-           AND NOT EXISTS (
-               SELECT 1 FROM automation_runs
-               WHERE automation_runs.occurrence_id = automation_occurrences.id
-           )",
+         WHERE {STALE_SCHEDULER_CLAIMS_PREDICATE}"
+            ),
             params![fence.generation(), iso(now), fence.owner_id()],
         )
         .context("failed to recover stale scheduler claims")?;
@@ -1144,7 +1231,7 @@ fn active_definitions(conn: &Connection) -> Result<(Vec<RoutineDefinition>, Vec<
         let mut statement = conn
             .prepare(
                 "SELECT automation_id
-                 FROM automation_retry_state
+                 FROM main.automation_retry_state
                  WHERE quarantined_at IS NOT NULL",
             )
             .context("failed to prepare retry quarantine list")?;
@@ -1239,6 +1326,205 @@ pub(crate) fn eligible_occurrences_for_automation(
     )
 }
 
+// Shared candidate relation: scheduler pages and doctor totals must apply
+// identical latest-only, definition, retry, quarantine and overlap predicates.
+// Direct candidate-query and transitive active-definition prerequisites.
+// The doctor checks these before calling the canonical eligibility reader.
+pub(crate) const ELIGIBILITY_QUERY_PREREQUISITES: &[(&str, &[&str])] = &[
+    (
+        "automation_definitions",
+        &[
+            "id",
+            "name",
+            "status",
+            "definition_json",
+            "revision",
+            "definition_digest",
+            "lifecycle_state",
+            "tombstoned_at",
+            "updated_at",
+        ],
+    ),
+    ("automation_missions", &["automation_id"]),
+    (
+        "automation_retry_state",
+        &["automation_id", "quarantined_at"],
+    ),
+    (
+        "automation_occurrences",
+        &["id", "automation_id", "scheduled_for", "state"],
+    ),
+    (
+        "automation_runs",
+        &[
+            "id",
+            "automation_id",
+            "occurrence_id",
+            "status",
+            "timeout_at",
+        ],
+    ),
+    ("automation_attempts", &["run_id", "state", "not_before"]),
+];
+
+const ELIGIBLE_OCCURRENCES_SQL: &str = "WITH active_definition(automation_id) AS (
+                     SELECT value FROM json_each(?2)
+                 )
+                 SELECT occurrence.id,
+                        occurrence.automation_id,
+                        occurrence.scheduled_for
+                 FROM main.automation_occurrences AS occurrence
+                 WHERE occurrence.state = 'planned'
+                   AND occurrence.scheduled_for <= ?1
+                   AND occurrence.scheduled_for = (
+                       SELECT MAX(candidate.scheduled_for)
+                       FROM main.automation_occurrences AS candidate
+                       WHERE candidate.automation_id = occurrence.automation_id
+                         AND candidate.state = 'planned'
+                         AND candidate.scheduled_for <= ?1
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM main.automation_runs AS active_run
+                             WHERE active_run.automation_id = candidate.automation_id
+                               AND active_run.status = 'running'
+                               AND active_run.occurrence_id IS NOT candidate.id
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM main.automation_runs AS retry_run
+                             JOIN main.automation_attempts AS retry_attempt
+                               ON retry_attempt.run_id = retry_run.id
+                             WHERE retry_run.occurrence_id = candidate.id
+                               AND retry_run.status = 'running'
+                               AND retry_attempt.state = 'adopted'
+                               AND (
+                                   retry_attempt.not_before > ?1
+                                   OR retry_run.timeout_at <= ?1
+                               )
+                         )
+                   )
+                   AND (
+                       occurrence.automation_id IN (
+                           SELECT automation_id FROM active_definition
+                       )
+                       OR EXISTS (
+                            SELECT 1
+                            FROM main.automation_runs AS retry_run
+                            JOIN main.automation_attempts AS retry_attempt
+                              ON retry_attempt.run_id = retry_run.id
+                            WHERE retry_run.occurrence_id = occurrence.id
+                              AND retry_run.status = 'running'
+                              AND retry_attempt.state = 'adopted'
+                              AND retry_attempt.not_before <= ?1
+                              AND (
+                                  retry_run.timeout_at IS NULL
+                                  OR retry_run.timeout_at > ?1
+                              )
+                        )
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM main.automation_retry_state
+                       WHERE automation_id = occurrence.automation_id
+                         AND quarantined_at IS NOT NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM main.automation_occurrences AS active_occurrence
+                       WHERE active_occurrence.automation_id = occurrence.automation_id
+                         AND active_occurrence.state IN ('claimed', 'running')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM main.automation_runs AS active_run
+                       WHERE active_run.automation_id = occurrence.automation_id
+                         AND active_run.status = 'running'
+                         AND active_run.occurrence_id IS NOT occurrence.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM main.automation_runs AS retry_run
+                       JOIN main.automation_attempts AS retry_attempt
+                         ON retry_attempt.run_id = retry_run.id
+                       WHERE retry_run.occurrence_id = occurrence.id
+                         AND retry_run.status = 'running'
+                         AND retry_attempt.state = 'adopted'
+                         AND (
+                             retry_attempt.not_before > ?1
+                             OR retry_run.timeout_at <= ?1
+                         )
+                   )
+                   AND (?3 IS NULL OR occurrence.automation_id = ?3)";
+
+/// A closed classification for selected queue metadata; no persisted text is retained.
+#[derive(Debug)]
+pub(crate) struct InvalidEligibleTimestamp;
+
+impl std::fmt::Display for InvalidEligibleTimestamp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid eligible occurrence timestamp")
+    }
+}
+
+impl std::error::Error for InvalidEligibleTimestamp {}
+
+/// A closed diagnostic classification; loader reasons and IDs never cross this boundary.
+#[derive(Debug)]
+pub(crate) struct InvalidEligibleDefinition;
+
+impl std::fmt::Display for InvalidEligibleDefinition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid eligible automation definition")
+    }
+}
+
+impl std::error::Error for InvalidEligibleDefinition {}
+
+/// The caller owns the read snapshot spanning definition validation and this count.
+pub(crate) fn eligible_occurrence_count(conn: &Connection, now: DateTime<Utc>) -> Result<u64> {
+    let (definitions, failures) = active_definitions(conn)?;
+    // Scheduler claiming may skip invalid definitions. A diagnostic count must
+    // not turn those failures into apparently complete empty/partial evidence.
+    if !failures.is_empty() {
+        return Err(InvalidEligibleDefinition.into());
+    }
+    let active_definition_ids = definitions
+        .into_iter()
+        .map(|definition| definition.id)
+        .collect::<BTreeSet<_>>();
+    let active_definition_ids_json = serde_json::to_string(&active_definition_ids)
+        .context("failed to encode validated automation definition ids")?;
+    // Stream only bounded timestamps, rather than materializing IDs, prompts
+    // or the complete queue. The scheduler also validates selected timestamps;
+    // COUNT(*) alone would silently count malformed persisted candidates.
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT substr(CAST(scheduled_for AS BLOB), 1, 65) FROM ({ELIGIBLE_OCCURRENCES_SQL})"
+        ))
+        .context("failed to prepare eligible automation count")?;
+    let mut rows = statement
+        .query(params![iso(now), active_definition_ids_json, None::<&str>])
+        .context("failed to query eligible automation count")?;
+    let mut count = 0_u64;
+    while let Some(row) = rows
+        .next()
+        .context("failed to read eligible automation count")?
+    {
+        let timestamp: Vec<u8> = row
+            .get(0)
+            .context("invalid eligible occurrence timestamp")?;
+        if timestamp.len() > 64 {
+            return Err(InvalidEligibleTimestamp.into());
+        }
+        let timestamp = std::str::from_utf8(&timestamp).map_err(|_| InvalidEligibleTimestamp)?;
+        DateTime::parse_from_rfc3339(timestamp).map_err(|_| InvalidEligibleTimestamp)?;
+        count = count
+            .checked_add(1)
+            .context("eligible automation count overflow")?;
+    }
+    Ok(count)
+}
+
 fn eligible_occurrences_for_active_definition_ids(
     conn: &Connection,
     now: DateTime<Utc>,
@@ -1257,101 +1543,14 @@ fn eligible_occurrences_for_active_definition_ids(
     let candidates: Vec<(String, String, String)> = {
         let mut statement = conn
             .prepare(
-                "WITH active_definition(automation_id) AS (
-                     SELECT value FROM json_each(?2)
-                 )
-                 SELECT occurrence.id,
-                        occurrence.automation_id,
-                        occurrence.scheduled_for
-                 FROM automation_occurrences AS occurrence
-                 WHERE occurrence.state = 'planned'
-                   AND occurrence.scheduled_for <= ?1
-                   AND occurrence.scheduled_for = (
-                       SELECT MAX(candidate.scheduled_for)
-                       FROM automation_occurrences AS candidate
-                       WHERE candidate.automation_id = occurrence.automation_id
-                         AND candidate.state = 'planned'
-                         AND candidate.scheduled_for <= ?1
-                         AND NOT EXISTS (
-                             SELECT 1
-                             FROM automation_runs AS active_run
-                             WHERE active_run.automation_id = candidate.automation_id
-                               AND active_run.status = 'running'
-                               AND active_run.occurrence_id IS NOT candidate.id
-                         )
-                         AND NOT EXISTS (
-                             SELECT 1
-                             FROM automation_runs AS retry_run
-                             JOIN automation_attempts AS retry_attempt
-                               ON retry_attempt.run_id = retry_run.id
-                             WHERE retry_run.occurrence_id = candidate.id
-                               AND retry_run.status = 'running'
-                               AND retry_attempt.state = 'adopted'
-                               AND (
-                                   retry_attempt.not_before > ?1
-                                   OR retry_run.timeout_at <= ?1
-                               )
-                         )
-                   )
-                   AND (
-                       occurrence.automation_id IN (
-                           SELECT automation_id FROM active_definition
-                       )
-                       OR EXISTS (
-                            SELECT 1
-                            FROM automation_runs AS retry_run
-                            JOIN automation_attempts AS retry_attempt
-                              ON retry_attempt.run_id = retry_run.id
-                            WHERE retry_run.occurrence_id = occurrence.id
-                              AND retry_run.status = 'running'
-                              AND retry_attempt.state = 'adopted'
-                              AND retry_attempt.not_before <= ?1
-                              AND (
-                                  retry_run.timeout_at IS NULL
-                                  OR retry_run.timeout_at > ?1
-                              )
-                        )
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM automation_retry_state
-                       WHERE automation_id = occurrence.automation_id
-                         AND quarantined_at IS NOT NULL
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM automation_occurrences AS active_occurrence
-                       WHERE active_occurrence.automation_id = occurrence.automation_id
-                         AND active_occurrence.state IN ('claimed', 'running')
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM automation_runs AS active_run
-                       WHERE active_run.automation_id = occurrence.automation_id
-                         AND active_run.status = 'running'
-                         AND active_run.occurrence_id IS NOT occurrence.id
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM automation_runs AS retry_run
-                       JOIN automation_attempts AS retry_attempt
-                         ON retry_attempt.run_id = retry_run.id
-                       WHERE retry_run.occurrence_id = occurrence.id
-                         AND retry_run.status = 'running'
-                         AND retry_attempt.state = 'adopted'
-                         AND (
-                             retry_attempt.not_before > ?1
-                             OR retry_run.timeout_at <= ?1
-                         )
-                   )
-                   AND (?4 IS NULL OR occurrence.automation_id = ?4)
-                 ORDER BY occurrence.scheduled_for ASC, occurrence.id ASC
-                 LIMIT ?3",
+                &format!(
+                    "{ELIGIBLE_OCCURRENCES_SQL} ORDER BY occurrence.scheduled_for ASC, occurrence.id ASC LIMIT ?4"
+                ),
             )
             .context("failed to prepare automations eligible queue query")?;
         let rows = statement
             .query_map(
-                params![now_iso, active_definition_ids_json, bounded, automation_id],
+                params![now_iso, active_definition_ids_json, automation_id, bounded],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .context("failed to query automations eligible queue")?;
@@ -2942,6 +3141,102 @@ mod tests {
         assert_eq!(
             counts,
             vec![("a-planning".to_string(), 1), ("b-planning".to_string(), 1),]
+        );
+    }
+
+    #[test]
+    fn eligible_count_is_not_truncated_to_a_scheduler_page() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        for index in 0..105 {
+            let id = format!("doctor-eligible-{index:03}");
+            insert_definition(&conn, &definition(&id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+            for (suffix, offset) in [("older", -2), ("latest", -1), ("future", 1)] {
+                let at = iso(now + chrono::Duration::seconds(offset));
+                conn.execute(
+                    "INSERT INTO automation_occurrences
+                    (id, automation_id, scheduled_for, created_at, updated_at)
+                    VALUES (?1, ?2, ?3, ?3, ?3)",
+                    params![format!("{id}-{suffix}"), id, at],
+                )
+                .unwrap();
+            }
+        }
+        let before = conn.total_changes();
+        assert_eq!(eligible_occurrences(&conn, now, 100).unwrap().len(), 100);
+        assert_eq!(eligible_occurrence_count(&conn, now).unwrap(), 105);
+        assert_eq!(conn.total_changes(), before);
+        assert!(conn.is_autocommit());
+        conn.execute(
+            "UPDATE automation_definitions SET status='PAUSED' WHERE id='doctor-eligible-000'",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO automation_retry_state (automation_id, consecutive_exhaustions, quarantined_at, failure_class, reason, updated_at)
+            VALUES ('doctor-eligible-001', 1, ?1, 'runtime_error', 'synthetic test quarantine', ?1)", [iso(now)]).unwrap();
+        conn.execute("UPDATE automation_occurrences SET state='claimed' WHERE id='doctor-eligible-002-latest'", []).unwrap();
+        assert_eq!(eligible_occurrence_count(&conn, now).unwrap(), 102);
+        conn.execute("INSERT INTO automation_runs
+            (id, automation_id, occurrence_id, status, started_at, timeout_at)
+            VALUES ('doctor-retry', 'doctor-eligible-003', 'doctor-eligible-003-latest', 'running', ?1, ?2)",
+            params![iso(now), iso(now + chrono::Duration::seconds(1))]).unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts
+            (id, run_id, occurrence_id, attempt_number, adoption_key, occurrence_fence_generation,
+             state, retry_classification, not_before, opened_at)
+            VALUES ('doctor-retry', 'doctor-retry', 'doctor-eligible-003-latest', 1,
+                'doctor-retry-key', 1, 'adopted', 'initial', ?1, ?2)",
+            params![iso(now + chrono::Duration::seconds(1)), iso(now)],
+        )
+        .unwrap();
+        assert_eq!(eligible_occurrence_count(&conn, now).unwrap(), 101);
+        conn.execute(
+            "UPDATE automation_attempts SET not_before=?1 WHERE id='doctor-retry'",
+            [iso(now)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET status='PAUSED' WHERE id='doctor-eligible-003'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_occurrence_count(&conn, now).unwrap(),
+            102,
+            "an already admitted retry can remain eligible on an inactive definition"
+        );
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at=?1 WHERE id='doctor-retry'",
+            [iso(now)],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_occurrence_count(&conn, now).unwrap(),
+            101,
+            "the timeout boundary excludes the retry"
+        );
+        conn.execute(
+            "INSERT INTO automation_runs(id, automation_id, status, started_at)
+            VALUES ('doctor-overlap', 'doctor-eligible-004', 'running', ?1)",
+            [iso(now)],
+        )
+        .unwrap();
+        assert_eq!(eligible_occurrence_count(&conn, now).unwrap(), 100);
+
+        conn.execute(
+            "UPDATE automation_occurrences SET scheduled_for = ?1
+            WHERE id = 'doctor-eligible-005-latest'",
+            [format!(
+                "{}\0PRIVATE-DOCTOR-SCHEDULE",
+                iso(now - chrono::Duration::seconds(1))
+            )],
+        )
+        .unwrap();
+        let failure = eligible_occurrence_count(&conn, now).unwrap_err();
+        assert!(!format!("{failure:#}").contains("PRIVATE-DOCTOR-SCHEDULE"));
+        assert!(
+            eligible_occurrences(&conn, now, 100).is_err(),
+            "both projections must refuse malformed selected timestamps"
         );
     }
 

@@ -65,6 +65,7 @@ pub const COMMAND_MATRIX: &[CommandEntry] = &[
 #[cfg(test)]
 pub const PRODUCER_READ_EXTENSIONS: &[&str] = &[
     "coven.automations.occurrence.leases.v1",
+    "coven.automations.doctor.v1",
     "coven.automations.receipt.get.v1",
     "coven.automations.scheduler.status.v1",
     "coven.automations.occurrence.list.v1",

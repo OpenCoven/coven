@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::canonical_json::sha256_digest;
 
-const PROFILE: &str = "coven.automations.v1";
+pub(crate) const PROFILE: &str = "coven.automations.v1";
 
 pub const AUTOMATION_CONTRACT_MIGRATIONS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_contract_migrations (
