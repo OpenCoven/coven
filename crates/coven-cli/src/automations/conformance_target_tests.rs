@@ -16,6 +16,8 @@ const COMMAND_ADOPTION_IDEMPOTENCY_VECTORS: &str = include_str!(
 const COMMAND_ENVELOPE_OUTCOMES_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/command-envelope-outcomes.vectors.json"
 );
+const MISSION_COMMANDS_VECTORS: &str =
+    include_str!("../../../../conformance/automations/runner/mission-commands.vectors.json");
 const CALENDAR_SCHEDULE_RESOLUTION_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/calendar-schedule-resolution.vectors.json"
 );
@@ -110,6 +112,7 @@ fn capability_advertises_the_native_structural_suites() {
                         "definition-lifecycle-transitions",
                         "definition-validation",
                         "event-reducer-determinism",
+                        "mission-commands",
                         "occurrence-fence-uniqueness",
                         "receipt-integrity-validation",
                         "rrule-vocabulary",
@@ -1361,6 +1364,96 @@ fn command_envelope_outcomes_suite_fails_when_the_router_disagrees() {
         mutate(&mut vectors);
         let response = evaluate(&request_for("command-envelope-outcomes", vectors)).unwrap();
         assert_eq!(response.status, TargetSuiteStatus::Failed);
+    }
+}
+
+#[test]
+fn mission_commands_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(MISSION_COMMANDS_VECTORS).unwrap();
+    let response = evaluate(&request_for("mission-commands", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 10);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 10);
+}
+
+#[test]
+fn mission_commands_suite_fails_when_the_executors_disagree() {
+    let wrong_expectations: [fn(&mut Value); 8] = [
+        // A lost acknowledgement would have to commit a second time.
+        |vectors| {
+            vectors["cases"][1]["steps"][1]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+        // The changed request under a used key would have to be adopted.
+        |vectors| vectors["cases"][2]["steps"][1]["expect"]["writes"] = json!("adoption"),
+        // The stale revision would have to name itself as current.
+        |vectors| {
+            vectors["cases"][3]["steps"][0]["expect"]["details"] =
+                json!({ "currentRevisionId": "{{staleRevisionId}}" });
+        },
+        // An unenforced envelope would have to be accepted.
+        |vectors| {
+            vectors["cases"][4]["steps"][0]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+        // Without Runtime Authority the mission would have to stay queued.
+        |vectors| vectors["cases"][5]["steps"][1]["expect"]["state"] = json!("queued"),
+        // A settled mission would have to be cancelled.
+        |vectors| vectors["cases"][6]["steps"][1]["expect"]["state"] = json!("cancelled"),
+        // Another caller would have to learn the mission exists.
+        |vectors| {
+            vectors["cases"][7]["steps"][1]["expect"] =
+                json!({ "outcome": "committed", "state": "unavailable" });
+        },
+        // A 61-minute timeout would have to pass.
+        |vectors| {
+            vectors["cases"][8]["steps"][1]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+    ];
+
+    for mutate in wrong_expectations {
+        let mut vectors: Value = serde_json::from_str(MISSION_COMMANDS_VECTORS).unwrap();
+        mutate(&mut vectors);
+        let response = evaluate(&request_for("mission-commands", vectors)).unwrap();
+        assert_eq!(response.status, TargetSuiteStatus::Failed);
+    }
+}
+
+#[test]
+fn mission_commands_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 7] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        // A get takes no adoption key, and a submit needs a payload.
+        |vectors| vectors["cases"][0]["steps"][0]["adoptionKey"] = json!("adopt:mission:get"),
+        |vectors| {
+            vectors["cases"][0]["steps"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("payload");
+        },
+        // A replay must name an earlier, identical commit.
+        |vectors| vectors["cases"][1]["steps"][1]["adoptionKey"] = json!("adopt:mission:other"),
+        // A refusal must say what it writes.
+        |vectors| {
+            vectors["cases"][3]["steps"][0]["expect"]
+                .as_object_mut()
+                .unwrap()
+                .remove("writes");
+        },
+        // Every token must be one the suite knows.
+        |vectors| vectors["cases"][1]["steps"][0]["payload"]["project"]["cwd"] = json!("{{home}}"),
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value = serde_json::from_str(MISSION_COMMANDS_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for("mission-commands", vectors)).unwrap_err(),
+            "conformance vector is invalid"
+        );
     }
 }
 
