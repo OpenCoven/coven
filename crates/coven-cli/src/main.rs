@@ -63,6 +63,7 @@ mod main_session_events;
 mod main_session_notices;
 mod main_session_routes;
 mod main_session_start;
+mod main_session_transcript;
 mod maintenance_gate;
 mod memory_dashboard;
 mod memory_import;

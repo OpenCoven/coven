@@ -940,7 +940,19 @@ project root for its lifetime. A turn that names different values is a
     "updatedAt": "2026-09-29T14:05:00.000000000Z"
   },
   "currentSession": { "id": "a91c…", "status": "running", "…": "session record" },
-  "hasHistory": true
+  "hasHistory": true,
+  "transcript": {
+    "events": 214,
+    "bytes": 1893422,
+    "context": {
+      "tokens": 91240,
+      "window": 1000000,
+      "model": "claude-opus-5-5",
+      "source": "usage",
+      "eventSeq": 9312,
+      "reportedAt": "2026-09-29T14:05:00.000000000Z"
+    }
+  }
 }
 ```
 
@@ -949,6 +961,25 @@ first launch, after a reset or rollover, or once the row was deleted).
 `hasHistory` is whether any session row has ever carried the current
 conversation id, which is what the next turn uses to pick `init` or `resume`.
 `404 main_session_not_found` before the first turn.
+
+`transcript` measures the current conversation over the same sessions as the
+event stream, from events the daemon already stores (coven#1181):
+
+- `events` and `bytes` are the count and stored payload size of its `input` and
+  `output` events. They approximate transcript size: the prompt that launches
+  a process is handed to the harness rather than stored as an event, and
+  retention can delete history.
+- `context` is the context occupancy the harness last reported, or `null` when
+  none is known. For Claude it is the newest top-level model call's usage
+  (uncached input plus cache reads plus cache writes; subagent calls are
+  excluded), with `source: "usage"`. A compaction boundary newer than that
+  call reports its post-compaction size with `source: "compaction"`.
+  `window` is the model's context window from the harness's result frame, or
+  `null` when not reported. `eventSeq` is the cursor of the event that
+  completed the report. Codex's plain-text output reports no usage, so its
+  `context` is `null`. Reports are read from the conversation's newest 512
+  output events or 4 MiB, whichever is smaller; an older report reads as
+  `null`, never as a stale value.
 
 ### `GET /api/v1/main-session/events`
 
