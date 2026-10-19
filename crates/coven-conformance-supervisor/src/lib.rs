@@ -20,6 +20,7 @@ impl std::fmt::Display for Failure {
 impl std::error::Error for Failure {}
 
 pub mod command;
+pub mod image;
 pub mod lease;
 pub mod protocol;
 
