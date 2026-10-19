@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import subprocess
 import unittest
+from unittest.mock import patch
 from public_receipt import validate_public_receipt, parse_public_receipt, read_public_receipt, publish_public_receipt
 
 
@@ -94,14 +95,13 @@ class PublicReceiptTests(unittest.TestCase):
             public=run/'public';public.mkdir(parents=True);(run/'private').mkdir()
             source=public/'receipt.json';source.write_text(json.dumps(fixture()),encoding='utf-8')
             output=root/'windows-reliability-metadata-test'/'public';output.mkdir(parents=True)
-            original=Path.is_junction
-            delattr(Path,'is_junction')
-            try:
+            # Deletion exposes PathBase's callable fallback in Python 3.13.
+            # Mask it explicitly so this host truly lacks the capability.
+            with patch.object(Path,'is_junction',None):
+                self.assertFalse(callable(getattr(Path,'is_junction',None)))
                 with self.assertRaises(ValueError):read_public_receipt(source,root)
                 with self.assertRaises(ValueError):publish_public_receipt(source,root,output)
                 self.assertFalse((output/'receipt.json').exists())
-            finally:
-                Path.is_junction=original
 
 
     @unittest.skipUnless(os.name=='nt','native Windows junction execution required')
