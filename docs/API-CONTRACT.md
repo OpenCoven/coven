@@ -999,6 +999,13 @@ event stream, from events the daemon already stores (coven#1181):
   output events or 4 MiB, whichever is smaller; an older report reads as
   `null`, never as a stale value.
 
+`lastCompaction` is the newest daemon compaction of the current conversation,
+or `null`: `id`, `conversationId`, `sessionId` (the host it was sent to),
+`state` (`requested`, `compacted` or `failed`), `fillTokens` and
+`windowTokens` (the reading that triggered it), `requestedAt`, `settledAt`,
+`preTokens` and `postTokens` (as the harness reported them), and `reason` for
+a failure. See [Compaction](#compaction).
+
 ### `GET /api/v1/main-session/events`
 
 Streams the current main conversation as UTF-8 `text/event-stream`. Optional
@@ -1163,6 +1170,52 @@ the daemon itself observes native startup records and recognized stale-resume
 diagnostics, cleans up the rejected launch, and performs the rollover and one
 fresh retry automatically. Automatic rollover compares the complete pointer
 generation so a concurrently replaced binding cannot be rotated away.
+
+### Compaction
+
+The daemon compacts a Claude main session before Claude's own automatic point
+(coven#1181). No route triggers it; the daemon's scheduler tick decides:
+
+- **When.** The host process is idle, the transcript's `context` reading has
+  reached 60% of its reported `window`, and no compaction of the conversation
+  is still open. No reported window means no daemon compaction. A failed
+  compaction holds off the next attempt for 30 minutes. Compaction cannot
+  shrink the system prompt and tools, so the first reading after a compaction
+  is its floor, and the next one waits until the fill is 10% of the window
+  above it.
+- **How.** The daemon sends `/compact` with fixed summary headings (Decisions,
+  Open TODOs, Constraints, Pending user asks, Exact identifiers) as an `input`
+  event on the host session. Claude compacts natively, with no rotation: the
+  conversation id and its feed continue.
+- **Evidence.** The first `result` after the request ends it. A
+  `compact_boundary` before that result settles it `compacted` and records a
+  `main_session.compacted` event on the host session, so it is in the event
+  stream:
+
+  ```json
+  {
+    "scopeKey": "instance:main",
+    "conversationId": "5f0d…",
+    "compactionId": "1b9e…",
+    "trigger": "manual",
+    "fillTokens": 612480,
+    "windowTokens": 1000000,
+    "preTokens": 612502,
+    "postTokens": 2310,
+    "summary": "…",
+    "summaryTruncated": false
+  }
+  ```
+
+  `summary` is Claude's summary, at most 16 KiB (`summaryTruncated` says if it
+  was cut), passed through the instance's privacy policy like other events.
+  `trigger` is as Claude reported it: `manual`, because the daemon issued the
+  command. A result without a boundary, a host that stops first, or no result
+  within 10 minutes settles it `failed` with a `reason` in `lastCompaction`.
+  The request is recorded before the input is sent, and settlement reads only
+  what the host emitted afterwards. After a daemon crash, the next tick
+  settles the open request from that evidence, and no second `/compact` is
+  sent while one is open.
 
 ### Runtime notices (the main-session inbox)
 

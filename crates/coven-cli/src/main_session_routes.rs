@@ -50,7 +50,7 @@ use crate::{
         self, MainSessionRecord, MainSessionSettings, RotatedMainSession, StaleIdRotation,
         DEFAULT_MAIN_SESSION_FAMILIAR_ID, DEFAULT_MAIN_SESSION_HARNESS, INSTANCE_MAIN_SCOPE_KEY,
     },
-    main_session_notices, main_session_transcript,
+    main_session_compaction, main_session_notices, main_session_transcript,
     request_authority::RequestAuthority,
     store,
 };
@@ -262,6 +262,7 @@ pub(crate) fn get_main_session(coven_home: &Path, query: Option<&str>) -> Result
     let session = current_session(&conn, &record)?;
     let history = has_history(&conn, &record)?;
     let transcript = main_session_transcript::measure(&conn, &record)?;
+    let last_compaction = main_session_compaction::latest(&conn, &record)?;
     json_response(
         200,
         &json!({
@@ -269,6 +270,7 @@ pub(crate) fn get_main_session(coven_home: &Path, query: Option<&str>) -> Result
             "currentSession": session,
             "hasHistory": history,
             "transcript": transcript,
+            "lastCompaction": last_compaction,
         }),
     )
 }
