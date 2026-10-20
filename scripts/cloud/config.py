@@ -47,6 +47,8 @@ def read_pins(repo):
         managers = {}
         for manifest in sorted((repo / "packages").glob("*/package.json")):
             package = json.loads(manifest.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+            if not isinstance(package, dict):
+                raise PreflightError("package manifest must be an object")
             manager = package.get("packageManager")
             if manager is None and manifest.parent.name != "openclaw-coven":
                 continue

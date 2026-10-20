@@ -54,6 +54,7 @@ class ConfigTests(unittest.TestCase):
             ("rust-toolchain.toml", '[toolchain]\nchannel="stable"\n'),
             ("rust-toolchain.toml", '[toolchain]\nchannel="1.2.3"\nchannel="1.2.4"\n'),
             ("packages/openclaw-coven/package.json", '{"packageManager":"pnpm@latest"}'),
+            ("packages/openclaw-coven/package.json", "[]"),
             ("packages/openclaw-coven/package.json", '{"packageManager":"pnpm@10.1.2","packageManager":"pnpm@10.2.3"}'),
         ):
             with self.subTest(filename=filename, contents=contents):
