@@ -368,7 +368,8 @@ unadvertised until slice 6.
 
    `occurrence.recover.v1` is implemented. The owner settles a
    `recovery_required` occurrence `failed_deterministic`, or opens its next
-   attempt with `retry_with_new_attempt`. Recovering a Runtime Authority run
+   attempt with `retry_with_new_attempt`. A run cancellation still being
+   reconciled blocks both until the daemon answers it. Recovering a Runtime Authority run
    needs authority-evidenced receipts, so it follows with the adapter.
 8. **Certification.** #858 Runtime Authority certification, then SDK Phase 3
    authority-bearing commands.

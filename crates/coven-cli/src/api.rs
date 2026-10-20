@@ -18799,6 +18799,333 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn owner_recovery_waits_for_a_pending_cancellation_on_a_killed_session() -> anyhow::Result<()> {
+        assert_owner_recovery_waits_for_a_pending_cancellation("killed")
+    }
+
+    #[test]
+    fn owner_recovery_waits_for_a_pending_cancellation_on_an_orphaned_session() -> anyhow::Result<()>
+    {
+        assert_owner_recovery_waits_for_a_pending_cancellation("orphaned")
+    }
+
+    /// The run's occurrence, run, cancellation and attempts.
+    type RecoveryState = (String, String, String, Vec<(i64, String)>);
+
+    fn recovery_state(conn: &rusqlite::Connection, run_id: &str) -> anyhow::Result<RecoveryState> {
+        let (occurrence, run, cancellation) = conn.query_row(
+            "SELECT o.state, r.status, c.state FROM automation_runs r
+             JOIN automation_occurrences o ON o.id = r.occurrence_id
+             JOIN automation_cancellations c ON c.run_id = r.id
+             WHERE r.id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT attempt_number, state FROM automation_attempts
+             WHERE run_id = ?1 ORDER BY attempt_number",
+        )?;
+        let attempts = statement
+            .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((occurrence, run, cancellation, attempts))
+    }
+
+    fn stop_fences(conn: &rusqlite::Connection, run_id: &str) -> anyhow::Result<i64> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn attempts(states: &[&str]) -> Vec<(i64, String)> {
+        (1..)
+            .zip(states)
+            .map(|(number, state)| (number, (*state).to_owned()))
+            .collect()
+    }
+
+    fn recovery_state_of(
+        occurrence: &str,
+        run: &str,
+        cancellation: &str,
+        attempt_states: &[&str],
+    ) -> RecoveryState {
+        (
+            occurrence.to_owned(),
+            run.to_owned(),
+            cancellation.to_owned(),
+            attempts(attempt_states),
+        )
+    }
+
+    fn retry_recovery(
+        conn: &rusqlite::Connection,
+        occurrence_id: &str,
+        adoption_key: &str,
+    ) -> anyhow::Result<crate::automations::recovery::RecoveryExecution> {
+        crate::automations::recovery::execute_occurrence_recovery(
+            conn,
+            json!({
+                "action": crate::automations::recovery::RECOVER_ACTION,
+                "adoptionKey": adoption_key,
+                "occurrenceId": occurrence_id,
+                "evidenceDetermination": "retry_with_new_attempt",
+                "statement": "The report is idempotent."
+            }),
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    /// One scheduler pass's cancellation and settlement work, after the
+    /// cancellation's lease.
+    fn pass_after_cancellation_lease(
+        conn: &rusqlite::Connection,
+        adoption_key: &str,
+    ) -> anyhow::Result<usize> {
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state IN ('requested', 'stopping')",
+            rusqlite::params![adoption_key, expired],
+        )?;
+        let reconciled = crate::automations::cancellation::reconcile_expired_cancellations(
+            conn,
+            &NoopSessionRuntime,
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        crate::automations::runner::settle_finished_runs(conn, Utc::now())
+            .map_err(anyhow::Error::msg)?;
+        Ok(reconciled)
+    }
+
+    fn dispatch_retry(conn: &rusqlite::Connection, run_id: &str) -> anyhow::Result<()> {
+        let now = Utc::now();
+        assert!(crate::automations::occurrences::claim_due_occurrence(
+            conn,
+            "cancellation-target",
+            "daemon",
+            60,
+            now,
+        )
+        .map_err(anyhow::Error::msg)?
+        .is_some());
+        let report = crate::automations::runner::dispatch_claimed_occurrences_with_clock(
+            conn,
+            &NoopSessionRuntime,
+            now,
+            || now,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(report.dispatched, [run_id], "{:?}", report.failed);
+        Ok(())
+    }
+
+    /// Starts a run, then crashes its cancellation after it marked its attempt
+    /// ambiguous and before its answer. The restart's containment leaves the
+    /// session `killed` or `orphaned`. Returns the run, attempt and occurrence.
+    fn crash_cancellation_after_its_ambiguity(
+        adoption_key: &str,
+        session_status: &str,
+    ) -> anyhow::Result<(tempfile::TempDir, String, String, String)> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            adoption_key,
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "stop the report",
+        );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        crate::automations::runner::mark_unconfirmed_attempt_stop_for_recovery(
+            &conn,
+            &run_id,
+            &attempt_id,
+            "cancellation stop outcome was not durably recorded",
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        if session_status == "killed" {
+            assert!(store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "killed",
+                None,
+                &current_timestamp(),
+            )?);
+        } else {
+            store::mark_running_sessions_orphaned(&conn, &current_timestamp())?;
+        }
+        let occurrence_id: String = conn.query_row(
+            "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            recovery_state(&conn, &run_id)?,
+            recovery_state_of("recovery_required", "running", "stopping", &["ambiguous"])
+        );
+        assert_eq!(stop_fences(&conn, &run_id)?, 1);
+        Ok((temp_dir, run_id, attempt_id, occurrence_id))
+    }
+
+    fn assert_owner_recovery_waits_for_a_pending_cancellation(
+        session_status: &str,
+    ) -> anyhow::Result<()> {
+        use crate::automations::recovery::RecoveryExecution;
+
+        let adoption_key = "adopt:cancel:cancellation-target:recover-while-pending";
+        let (temp_dir, run_id, _, occurrence_id) =
+            crash_cancellation_after_its_ambiguity(adoption_key, session_status)?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let crashed_state =
+            recovery_state_of("recovery_required", "running", "stopping", &["ambiguous"]);
+
+        // The owner's retry waits while the cancellation is unresolved. Its
+        // refusal is stored under its key and changes nothing else.
+        let RecoveryExecution::Rejected(refusal) =
+            retry_recovery(&conn, &occurrence_id, "adopt:recover:while-pending")?
+        else {
+            panic!("recovery ran under a pending cancellation");
+        };
+        assert_eq!(
+            serde_json::to_value(&refusal)?["code"],
+            json!("CANCEL_PENDING")
+        );
+        assert_eq!(recovery_state(&conn, &run_id)?, crashed_state);
+        assert_eq!(stop_fences(&conn, &run_id)?, 1);
+        let stored: String = conn.query_row(
+            "SELECT outcome FROM automation_command_adoptions WHERE adoption_key = ?1",
+            ["adopt:recover:while-pending"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stored, "rejected");
+
+        // The pass after the lease answers the cancellation.
+        assert_eq!(pass_after_cancellation_lease(&conn, adoption_key)?, 1);
+        if session_status == "killed" {
+            // Its ended session settles the ambiguous run failed in the same
+            // pass (#1461), and the owner has nothing left to retry.
+            assert_eq!(
+                recovery_state(&conn, &run_id)?,
+                recovery_state_of("failed", "failed", "recovery_required", &["ambiguous"])
+            );
+            assert_eq!(stop_fences(&conn, &run_id)?, 0);
+            let RecoveryExecution::Rejected(refusal) =
+                retry_recovery(&conn, &occurrence_id, "adopt:recover:after-settlement")?
+            else {
+                panic!("recovered a settled occurrence");
+            };
+            assert_eq!(
+                serde_json::to_value(&refusal)?["code"],
+                json!("ILLEGAL_TRANSITION")
+            );
+            return Ok(());
+        }
+        assert_eq!(
+            recovery_state(&conn, &run_id)?,
+            recovery_state_of(
+                "recovery_required",
+                "running",
+                "recovery_required",
+                &["ambiguous"]
+            )
+        );
+        assert_eq!(stop_fences(&conn, &run_id)?, 1);
+
+        // Then the retry runs, and nothing marks it.
+        let RecoveryExecution::Success { .. } =
+            retry_recovery(&conn, &occurrence_id, "adopt:recover:after-reconcile")?
+        else {
+            panic!("recovery refused after the cancellation was answered");
+        };
+        dispatch_retry(&conn, &run_id)?;
+        let retried = recovery_state_of(
+            "running",
+            "running",
+            "recovery_required",
+            &["ambiguous", "started"],
+        );
+        assert_eq!(recovery_state(&conn, &run_id)?, retried);
+        assert_eq!(pass_after_cancellation_lease(&conn, adoption_key)?, 0);
+        assert_eq!(recovery_state(&conn, &run_id)?, retried);
+        assert_eq!(stop_fences(&conn, &run_id)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancellation_pending_across_an_owner_retry_marks_only_its_own_attempt(
+    ) -> anyhow::Result<()> {
+        use crate::automations::recovery::RecoveryExecution;
+
+        let adoption_key = "adopt:cancel:cancellation-target:pending-across-retry";
+        let (temp_dir, run_id, attempt_id, occurrence_id) =
+            crash_cancellation_after_its_ambiguity(adoption_key, "orphaned")?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        // A store from before recovery waited for the cancellation: the
+        // owner's retry ran under it and dispatched attempt 2.
+        let set_cancellation = |state: &str| {
+            conn.execute(
+                "UPDATE automation_cancellations SET state = ?2 WHERE adoption_key = ?1",
+                rusqlite::params![adoption_key, state],
+            )
+        };
+        set_cancellation("rejected")?;
+        let RecoveryExecution::Success { .. } =
+            retry_recovery(&conn, &occurrence_id, "adopt:recover:under-pending")?
+        else {
+            panic!("the retry was refused");
+        };
+        set_cancellation("stopping")?;
+        dispatch_retry(&conn, &run_id)?;
+        assert_eq!(
+            recovery_state(&conn, &run_id)?,
+            recovery_state_of("running", "running", "stopping", &["ambiguous", "started"])
+        );
+
+        // The cancellation's unconfirmed stop cannot reach attempt 2.
+        assert!(
+            crate::automations::runner::mark_unconfirmed_attempt_stop_for_recovery(
+                &conn,
+                &run_id,
+                &attempt_id,
+                "cancellation stop outcome was not durably recorded",
+                Utc::now(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            recovery_state(&conn, &run_id)?,
+            recovery_state_of("running", "running", "stopping", &["ambiguous", "started"])
+        );
+
+        // Its reconciliation answers from its own ambiguous attempt.
+        assert_eq!(pass_after_cancellation_lease(&conn, adoption_key)?, 1);
+        assert_eq!(
+            recovery_state(&conn, &run_id)?,
+            recovery_state_of(
+                "running",
+                "running",
+                "recovery_required",
+                &["ambiguous", "started"]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn command_adoption_keys_cannot_alias_attempt_keys() -> anyhow::Result<()> {
         let (temp_dir, run_id, attempt_id, session_id) =
             start_running_automation_for_cancellation()?;
