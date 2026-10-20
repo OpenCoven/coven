@@ -231,6 +231,7 @@ The checked-in
 [`result-delivery-recovery.vectors.json`](result-delivery-recovery.vectors.json),
 [`result-delivery-process-crash-recovery.vectors.json`](result-delivery-process-crash-recovery.vectors.json),
 [`run-settlement-process-crash-recovery.vectors.json`](run-settlement-process-crash-recovery.vectors.json),
+[`run-launch-process-crash-recovery.vectors.json`](run-launch-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -726,3 +727,65 @@ process kill inside one plain successful settlement. It does not cover kills
 during dispatch or launch, held-for-retry, timeout, cancellation or Runtime
 Authority settlement, power loss, load, complete profiles or release
 eligibility.
+
+## Run launch process-crash audit boundary
+
+The `run-launch-process-crash-recovery` suite kills a daemon worker while it
+launches a claimed scheduled occurrence, then restarts the daemon's scheduler
+over the store it left. The launch writes the session as `created`, starts the
+run and marks its first attempt `dispatching` in one transaction. The runtime
+launch then publishes ownership in a second: the session, attempt and
+occurrence become `running`, `started` and `running`. Each of six cases starts
+the exact audited binary as a hidden worker with the same harness as
+`run-settlement-process-crash-recovery`. The worker stores the fixed synthetic
+active daily definition, takes scheduler leadership, runs the fenced tick that
+plans and claims the 09:00 slot, and runs the fenced dispatch with a no-op
+runtime. Vectors cannot choose a path, run, definition, clock or pause
+mechanics, and every expected outcome is fixed per boundary.
+
+- **After session, after dispatching:** a fixture TEMP trigger pauses the
+  worker after the session insert or the attempt's `dispatching` update, the
+  launch transaction's first and last writes.
+- **After launch commit:** the dispatching connection's WAL hook pauses it once
+  SQLite has committed the launch.
+- **After ownership:** a fixture TEMP trigger pauses it after the occurrence's
+  `running` update, the ownership transaction's last write.
+- **After ownership commit:** the WAL hook pauses it once SQLite has committed
+  ownership, its second commit.
+- **Control:** no pause. The worker dispatches and exits without the graceful
+  shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one. Before the launch commits, it must read
+the occurrence claimed with no run, attempt or session. After the launch
+commits, and inside ownership, it must read the launch. After ownership
+commits, it must read the occurrence, run and session `running`. The parent
+then kills and reaps the worker. The store's raw integrity check must pass, and
+the store must hold what the parent read while the worker was paused.
+
+The parent then restarts in the daemon's startup order, through production
+entry points and without the scheduler thread. Session recovery orphans
+`running` sessions; it never fails the launch's `created` session, which a
+running run owns. Scheduler leadership follows, with a bounded wait because
+Windows documents a delay before it releases a dead holder's lock. The
+scheduler's own startup recovery and its startup pass come last.
+That pass runs with the startup cutoff, on a runtime that counts launches. A
+claim with no launch must be restored and launched exactly once. A launch or
+published ownership must never launch again: restart containment kills the
+session, and the run is held for an operator retry. The relaunched session then
+ends with exit code 0. An ordinary pass before the run's deadline must settle
+the relaunched run `succeeded` and keep the held run held. A pass after the
+deadline must settle the held run `failed`. Every case ends with one session in
+the store, and no pass after the restart's may launch. A store that recovery
+refuses fails the case. A further pass must change no occurrence, run, attempt,
+event or session row.
+
+Observations carry boundary, launch, state and pass classes, counts and
+booleans. They never carry run, attempt, occurrence or session ids, paths,
+handshakes or output. As with delivery, these cases do not require uncommitted
+frames in the WAL. This is `audit_only` evidence for a daemon killed while it
+launches one scheduled occurrence with no no-process containment receipt. It
+does not cover a real runtime process, receipt-proven no-process retry, which
+relaunches by design, Runtime Authority launches, manual
+occurrences, kills during held-for-retry, timeout or cancellation, power loss,
+load, complete profiles or release eligibility.

@@ -140,7 +140,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "startup-reconciliation-wake",
                         "result-delivery-recovery",
                         "result-delivery-process-crash-recovery",
-                        "run-settlement-process-crash-recovery"
+                        "run-settlement-process-crash-recovery",
+                        "run-launch-process-crash-recovery"
                     ]
                 },
                 {
