@@ -31,6 +31,7 @@
     { "profile": "scheduler_reliability", "suiteId": "scheduler-leadership-fencing", "vectorFile": "scheduler-leadership-fencing.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "startup-reconciliation-wake", "vectorFile": "startup-reconciliation-wake.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "result-delivery-recovery", "vectorFile": "result-delivery-recovery.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "result-delivery-process-crash-recovery", "vectorFile": "result-delivery-process-crash-recovery.vectors.json" },
     { "profile": "runtime_authority", "suiteId": "runtime-authority-terminal-recovery", "vectorFile": "runtime-authority-terminal-recovery.vectors.json" }
   ]
 }

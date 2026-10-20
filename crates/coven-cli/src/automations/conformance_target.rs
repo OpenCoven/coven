@@ -37,6 +37,7 @@ mod command_storage_readonly_recovery;
 mod command_transaction_rollback;
 mod legacy_import_source_preservation;
 mod mission_commands;
+mod result_delivery_process_crash;
 mod result_delivery_recovery;
 mod runtime_authority_terminal_recovery;
 mod startup_wake_trace;
@@ -45,6 +46,11 @@ use startup_wake_trace::{StartupWakeOutcome, StartupWakePhase, StartupWakeTrace}
 /// Execute the disposable hidden process-crash conformance worker.
 pub fn command_crash_worker(request: &Value) -> Result<(), &'static str> {
     command_process_crash_recovery::worker(request)
+}
+
+/// Execute the disposable hidden result-delivery crash conformance worker.
+pub fn result_delivery_crash_worker(request: &Value) -> Result<(), &'static str> {
+    result_delivery_process_crash::worker(request)
 }
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -127,6 +133,8 @@ pub const RETRY_QUARANTINE_RECOVERY_SUITE: &str = "retry-quarantine-recovery";
 pub const SCHEDULER_LEADERSHIP_FENCING_SUITE: &str = "scheduler-leadership-fencing";
 pub const STARTUP_RECONCILIATION_WAKE_SUITE: &str = "startup-reconciliation-wake";
 pub const RESULT_DELIVERY_RECOVERY_SUITE: &str = "result-delivery-recovery";
+pub const RESULT_DELIVERY_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "result-delivery-process-crash-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -1594,6 +1602,7 @@ pub fn capability() -> TargetCapability {
                     SCHEDULER_LEADERSHIP_FENCING_SUITE,
                     STARTUP_RECONCILIATION_WAKE_SUITE,
                     RESULT_DELIVERY_RECOVERY_SUITE,
+                    RESULT_DELIVERY_PROCESS_CRASH_RECOVERY_SUITE,
                 ],
             },
             TargetProfileCapability {
@@ -1674,6 +1683,14 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, RESULT_DELIVERY_RECOVERY_SUITE) => {
             let (passed, observations) = result_delivery_recovery::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RESULT_DELIVERY_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = result_delivery_process_crash::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);

@@ -138,7 +138,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "retry-quarantine-recovery",
                         "scheduler-leadership-fencing",
                         "startup-reconciliation-wake",
-                        "result-delivery-recovery"
+                        "result-delivery-recovery",
+                        "result-delivery-process-crash-recovery"
                     ]
                 },
                 {
