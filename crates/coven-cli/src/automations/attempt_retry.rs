@@ -499,7 +499,8 @@ mod tests {
     use crate::automations::definition::RoutineDefinition;
     use crate::automations::occurrences::{claim_due_occurrence, insert_claimed_occurrence};
     use crate::automations::runner::{
-        dispatch_claimed_occurrences_with_clock, settle_finished_runs,
+        dispatch_claimed_occurrences_with_clock, mark_active_attempts_for_restart_reconciliation,
+        settle_finished_runs,
     };
     use crate::automations::store::insert_definition;
 
@@ -891,6 +892,72 @@ mod tests {
                 .unwrap()
                 .unwrap()["status"],
             "cancelled"
+        );
+    }
+
+    /// The occurrence's state and failure reason.
+    fn occurrence(fixture: &Fixture) -> (String, Option<String>) {
+        fixture
+            .conn
+            .query_row(
+                "SELECT state, failure_reason FROM automation_occurrences
+                 WHERE id = 'occ.notes-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_graceful_shutdown_keeps_a_held_run_retryable() {
+        let fixture = held();
+        // The scheduler's shutdown reconciliation finds no active attempt and
+        // leaves the held run's occurrence as settlement left it.
+        assert_eq!(
+            mark_active_attempts_for_restart_reconciliation(&fixture.conn, fixture.now).unwrap(),
+            0
+        );
+        assert_eq!(occurrence(&fixture), ("running".to_owned(), None));
+        let RetryExecution::Success { payload, replayed } = execute_attempt_retry(
+            &fixture.conn,
+            request(&fixture, "adopt:retry:after-shutdown", 1, "failed"),
+            fixture.now,
+        )
+        .unwrap() else {
+            panic!("a held run must stay retryable across a graceful shutdown");
+        };
+        assert!(!replayed);
+        assert_eq!(payload["attemptNumber"], json!(2));
+        assert_eq!(
+            claim_due_occurrence(&fixture.conn, "notes", "daemon", 60, fixture.now).unwrap(),
+            Some("occ.notes-1".to_owned())
+        );
+        assert_eq!(
+            dispatch_claimed_occurrences_with_clock(
+                &fixture.conn,
+                &NoopSessionRuntime,
+                fixture.now,
+                || fixture.now
+            )
+            .unwrap()
+            .dispatched,
+            [fixture.run_id.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_graceful_shutdown_still_marks_an_active_attempt_for_reconciliation() {
+        let fixture = running();
+        assert_eq!(
+            mark_active_attempts_for_restart_reconciliation(&fixture.conn, fixture.now).unwrap(),
+            1
+        );
+        assert_eq!(
+            occurrence(&fixture),
+            (
+                "recovery_required".to_owned(),
+                Some("daemon shutdown requires restart reconciliation".to_owned())
+            )
         );
     }
 
