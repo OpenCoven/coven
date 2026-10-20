@@ -291,7 +291,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements twelve structural suites, sixteen
+The native Coven target currently implements twelve structural suites, seventeen
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -591,3 +591,48 @@ initializer nor the command reads stays latent, and the command commits around
 it; no production integrity scan exists, and this suite does not claim one. It
 does not cover other corruption patterns, WAL-frame corruption, I/O faults,
 disk exhaustion, process crashes, complete profiles or release eligibility.
+
+## Result delivery audit boundary
+
+The `result-delivery-recovery` suite drives a settled run's `pending`
+main-session delivery obligation through the production discharge path,
+`deliver_pending_results`. Each of six cases uses its own disposable private
+store and Coven home. The fixture stores the vector's definition, which must
+target the main session, and settles a run through the production run record,
+which writes the obligation. Vectors cannot choose a path, run id or fault
+mechanics. The definition they supply must be paused, target the main session
+and carry no working directory, and every expected outcome is fixed per fault.
+
+- **Control:** the first pass delivers one notice, and the run's record names
+  it.
+- **Held gate:** the fixture holds the main-session scope gate. The pass defers
+  the run, which stays `pending` with no notice. After release, it delivers
+  once.
+- **Full inbox:** the scope already holds the most pending notices it keeps.
+  The pass defers the run and evicts none of the waiting notices. After the
+  fixture marks them delivered, as a turn would, the run delivers once.
+- **Discharge rollback:** a fixture TEMP trigger on the delivering connection
+  aborts the `delivered` record inside the discharge transaction, and only once
+  the notice it names is visible there. The pass fails with that abort, the
+  notice rolls back with the record, and the run stays `pending`. With the
+  trigger removed, it delivers once. A failed discharge ends the whole pass, so
+  runs after it wait for the next pass.
+- **Gate unavailable:** a file stands where the gate's lock directory belongs.
+  The run is recorded `failed` with the fixed gate reason and no notice. A
+  later pass with the directory restored neither retries nor reopens it.
+- **Unreadable result:** the run is launched through the production runner with
+  a no-op runtime, and its session holds a malformed output event. It alone is
+  recorded `failed` with the fixed unreadable reason, while a healthy run that
+  settled after it is delivered in the same pass.
+
+Every case then runs a further pass that must change nothing. The settled
+record must refuse, through the production immutability trigger, to point at
+another notice or to reopen, and must read back unchanged; a failed record
+names no notice. Observations carry fixed pass, state, reason and fault
+classes, counts and booleans. They never carry run or notice ids, notice text,
+paths or output.
+
+This is `audit_only` evidence for deferral, transactional rollback and failure
+isolation. It does not cover a process kill between the notice and its record,
+the offer to an idle live session, per-familiar or other principals' scopes
+(#857), delivery SLOs, load, complete profiles or release eligibility.
