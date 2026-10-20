@@ -87,7 +87,7 @@ enum FailureReason {
     ResultUnreadable,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum DeliveryState {
     Pending,
@@ -163,7 +163,7 @@ pub(super) fn at(base: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
     base + chrono::Duration::seconds(seconds)
 }
 
-fn iso(instant: DateTime<Utc>) -> String {
+pub(super) fn iso(instant: DateTime<Utc>) -> String {
     instant.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
