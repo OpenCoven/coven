@@ -3679,6 +3679,9 @@ pub fn mark_active_attempts_for_restart_reconciliation(
             rusqlite::params![reason],
         )
         .map_err(|error| format!("failed to mark active attempts for reconciliation: {error}"))?;
+    // A run held for an operator retry (`attempt.retry.v1`) has no work to
+    // reconcile: its latest attempt has settled `failed`. Its occurrence keeps
+    // the state the retry command requires until the run's deadline.
     transaction
         .execute(
             "UPDATE automation_occurrences
@@ -3689,9 +3692,19 @@ pub fn mark_active_attempts_for_restart_reconciliation(
                  updated_at = ?2
              WHERE state IN ('claimed', 'running')
                AND id IN (
-                   SELECT occurrence_id
-                   FROM automation_runs
-                   WHERE status = 'running'
+                   SELECT r.occurrence_id
+                   FROM automation_runs AS r
+                   WHERE r.status = 'running'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM automation_attempts AS latest
+                         WHERE latest.run_id = r.id
+                           AND latest.state = 'failed'
+                           AND latest.attempt_number = (
+                               SELECT MAX(attempt_number)
+                               FROM automation_attempts
+                               WHERE run_id = r.id
+                           )
+                     )
                )",
             rusqlite::params![reason, now_iso],
         )
@@ -10218,6 +10231,11 @@ mod tests {
                     super::super::runs::clear_retry_quarantine(&conn, &routine.id, now).unwrap()
                 );
             }
+            // A graceful shutdown inside the hold window keeps the claim retryable.
+            assert_eq!(
+                mark_active_attempts_for_restart_reconciliation(&conn, now).unwrap(),
+                0
+            );
             assert!(matches!(
                 execute_attempt_retry(&conn, request("adopt:retry:launch-hold"), now).unwrap(),
                 RetryExecution::Success { .. }

@@ -1829,7 +1829,7 @@ mod tests {
             ready
                 .recv_timeout(HANG_GUARD)
                 .expect("successor startup must finish");
-            // Snapshot BEFORE this successor's own shutdown can mark recovery_required.
+            // Snapshot BEFORE this successor's own shutdown reconciliation runs.
             let recovered = recovery_rows(&conn);
             assert!(
                 matches!(
@@ -1880,12 +1880,11 @@ mod tests {
         if let Err(panic) = checked {
             std::panic::resume_unwind(panic);
         }
+        // The held runs have no work to reconcile, so the successor's graceful
+        // shutdown leaves them retryable until their deadline (#1432).
         for (old, row) in before.iter().zip(recovery_rows(&conn)) {
             assert_eq!(row.identity, old.identity);
-            assert_eq!(
-                row.states,
-                ["recovery_required", "running", "failed", "killed"]
-            );
+            assert_eq!(row.states, ["running", "running", "failed", "killed"]);
             assert_eq!(
                 row.reason.as_deref(),
                 Some("session killed; held for an operator retry until the run's deadline")
