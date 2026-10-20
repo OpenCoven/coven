@@ -298,6 +298,9 @@ fn startup_failure_report_fixture() -> Result<()> {
 #[test]
 fn early_errors_and_unwinds_report_only_bounded_startup_checkpoints() -> Result<()> {
     let temp = tempfile::tempdir()?;
+    // Windows creates the nested fixture beneath the isolated TEMP/TMP path.
+    // Unix uses /tmp directly, so it cannot expose this missing-directory error.
+    fs::create_dir(temp.path().join("tmp"))?;
     for mode in ["early-error", "unwind"] {
         let output = temp.path().join(format!("{mode}.stderr"));
         let child = command(temp.path(), &[]);
