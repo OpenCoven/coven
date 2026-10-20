@@ -2,7 +2,7 @@
 mod daemon_startup_diagnostics;
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -24,6 +24,28 @@ const RUNTIME_PHASES: &[&str] = &[
 ];
 
 struct OwnedChild(Child);
+
+struct StartupFailureReport<'a> {
+    home: &'a Path,
+    started: Instant,
+    complete: bool,
+}
+
+impl Drop for StartupFailureReport<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            // Constructed before owned children and after TempDir: cleanup
+            // runs first, then filtered capture, then fixture removal. This
+            // also runs on Result propagation and assertion unwinding.
+            let _ = writeln!(
+                std::io::stderr(),
+                "startup exercise failed elapsed_ms={}\n{}",
+                self.started.elapsed().as_millis(),
+                daemon_startup_diagnostics::capture_startup_checkpoints(self.home)
+            );
+        }
+    }
+}
 
 impl OwnedChild {
     fn terminate(&mut self) -> Result<()> {
@@ -130,6 +152,14 @@ fn assert_runtime_phases(home: &Path, expected: &[&str]) -> Result<()> {
 }
 
 fn exercise_startup(fail_mobile: bool, unavailable_log: bool) -> Result<()> {
+    exercise_startup_with(fail_mobile, unavailable_log, |_, _| Ok(()))
+}
+
+fn exercise_startup_with(
+    fail_mobile: bool,
+    unavailable_log: bool,
+    after_launch: impl FnOnce(&Path, &mut OwnedChild) -> Result<()>,
+) -> Result<()> {
     // Short synthetic paths also fit the Unix socket pathname limit on macOS.
     let temp_base = if cfg!(unix) {
         PathBuf::from("/tmp")
@@ -141,6 +171,11 @@ fn exercise_startup(fail_mobile: bool, unavailable_log: bool) -> Result<()> {
         .tempdir_in(temp_base)?;
     let root = temp.path().canonicalize()?;
     let home = root.join("coven");
+    let mut failure_report = StartupFailureReport {
+        home: &home,
+        started: Instant::now(),
+        complete: false,
+    };
     for directory in [&home, &root.join("user"), &root.join("tmp")] {
         fs::create_dir(directory)?;
     }
@@ -168,6 +203,7 @@ fn exercise_startup(fail_mobile: bool, unavailable_log: bool) -> Result<()> {
             .stderr(File::create(&stderr_path)?)
             .spawn()?,
     );
+    after_launch(&home, &mut daemon)?;
     // A harness hang guard, not a startup-performance assertion or a change
     // to Coven's own lifecycle budget.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -215,6 +251,7 @@ fn exercise_startup(fail_mobile: bool, unavailable_log: bool) -> Result<()> {
         daemon.0.try_wait()?.is_some(),
         "owned daemon cleanup not confirmed"
     );
+    failure_report.complete = true;
     Ok(())
 }
 
@@ -231,4 +268,71 @@ fn native_startup_checkpoints_omit_completion_after_mobile_initialization_failur
 #[test]
 fn native_startup_checkpoints_remain_advisory_when_log_is_unavailable() -> Result<()> {
     exercise_startup(false, true)
+}
+
+// Invoked in a child test process so the parent can inspect the exact failure
+// report produced by both Result propagation and assertion unwinding.
+#[test]
+fn startup_failure_report_fixture() -> Result<()> {
+    let Ok(mode) = std::env::var("COVEN_TEST_STARTUP_FAILURE_REPORT") else {
+        return Ok(());
+    };
+    exercise_startup_with(true, false, |home, daemon| {
+        let status = wait_exit(daemon, Instant::now() + Duration::from_secs(30))?;
+        assert!(!status.success(), "invalid mobile fixture should exit");
+        // The daemon has exited and been reaped before this injected failure.
+        // Include arbitrary text to prove that failure output uses the filter.
+        writeln!(
+            fs::OpenOptions::new()
+                .append(true)
+                .open(home.join("daemon-recovery.log"))?,
+            "[synthetic] private-marker-must-stay-out-of-failure-report"
+        )?;
+        if mode == "unwind" {
+            panic!("synthetic assertion failure before phase validation");
+        }
+        anyhow::bail!("synthetic early error before phase validation")
+    })
+}
+
+#[test]
+fn early_errors_and_unwinds_report_only_bounded_startup_checkpoints() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    for mode in ["early-error", "unwind"] {
+        let output = temp.path().join(format!("{mode}.stderr"));
+        let child = command(temp.path(), &[]);
+        // Reuse the isolated environment, replacing only the executable/args.
+        // Command has no program setter, so carry its explicit environment over.
+        let mut fixture = Command::new(std::env::current_exe()?);
+        fixture
+            .env_clear()
+            .envs(
+                child
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .env("COVEN_TEST_STARTUP_FAILURE_REPORT", mode)
+            .args(["--exact", "startup_failure_report_fixture", "--nocapture"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&output)?);
+        let mut fixture = OwnedChild(fixture.spawn()?);
+        let status = wait_exit(&mut fixture, Instant::now() + Duration::from_secs(30))?;
+        assert!(!status.success(), "injected fixture must still fail");
+        let report = read_bounded(&output)?;
+        assert!(
+            report.contains("startup exercise failed elapsed_ms="),
+            "{report}"
+        );
+        assert!(
+            report.contains("startup_checkpoint phase=automations-scheduler-end"),
+            "{report}"
+        );
+        assert!(!report.contains("phase=mobile-gateway-end"), "{report}");
+        assert!(
+            !report.contains("private-marker-must-stay-out-of-failure-report"),
+            "{report}"
+        );
+    }
+    Ok(())
 }
