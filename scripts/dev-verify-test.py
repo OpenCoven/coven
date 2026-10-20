@@ -211,6 +211,16 @@ class PreflightTests(unittest.TestCase):
         path.write_text('original')
         self.assertEqual(self.runner.changed_paths(self.root, 'HEAD...HEAD'), ['packages/channels/source.ts'])
 
+    def test_range_resolves_refs_before_other_worktrees_can_move_them(self):
+        self.init_repo()
+        original = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.root, text=True).strip()
+        subprocess.run(['git', 'branch', 'base'], cwd=self.root, check=True)
+        resolved = self.runner.resolve_range(self.root, 'base...HEAD')
+        subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=1+test@users.noreply.github.com', 'commit', '--allow-empty', '-qm', 'next'], cwd=self.root, check=True)
+        subprocess.run(['git', 'branch', '-f', 'base', 'HEAD'], cwd=self.root, check=True)
+        self.assertEqual(resolved, original + '...' + original)
+        self.assertNotEqual(resolved, self.runner.resolve_range(self.root, 'base...HEAD'))
+
     def test_bad_revision_fails_before_any_execution(self):
         script = Path(__file__).with_name('dev-verify.sh')
         result = subprocess.run(['bash', str(script), '--quick', '--range', 'nonexistent-base...HEAD'], capture_output=True, text=True)

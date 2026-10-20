@@ -19,6 +19,10 @@ Select exactly one tier. `--plan` prints command arguments, working directories,
 prerequisite names, and skips; it does not execute checks or report a pass.
 The default committed range is `origin/main...HEAD`. Fetch the appropriate base
 yourself before running; this tool never fetches or rewrites the checkout.
+Both range endpoints are resolved to commit SHAs at startup and printed. The
+same immutable range drives routing and later guards even if another worktree
+fetches a new base. Do not edit the checkout during execution: working-file,
+compiler and package checks inspect live contents, not an atomic snapshot.
 An invalid or unavailable range fails before check execution. In shallow
 checkouts, fetch the base/history rather than substituting a narrower range.
 

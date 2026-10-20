@@ -171,6 +171,19 @@ def git_output(root, *args):
     return subprocess.check_output(['git', *args], cwd=root, text=True)
 
 
+def resolve_range(root, revision_range):
+    """Pin both ends before shared worktree refs can move during verification."""
+    if revision_range.startswith('-') or '..' not in revision_range:
+        raise ValueError('revision range must be START..END or START...END, not an option')
+    separator = '...' if '...' in revision_range else '..'
+    ends = revision_range.split(separator)
+    if len(ends) != 2 or not all(ends):
+        raise ValueError('revision range requires explicit START and END commits')
+    commits = [git_output(root, 'rev-parse', '--verify', '--end-of-options',
+                          revision + '^{commit}').strip() for revision in ends]
+    return separator.join(commits)
+
+
 def changed_paths(root, revision_range):
     if revision_range.startswith('-') or '..' not in revision_range:
         raise ValueError('revision range must be START..END or START...END, not an option')
@@ -248,9 +261,11 @@ def main():
     try:
         if args.internal:
             return internal_check(args.internal, root)
-        changed = changed_paths(root, args.revision_range)
-        checks, skips = plan(args.tier, args.revision_range, changed, root, platform.system())
-        print(f'Tier: {args.tier}; root: {root}; range: {args.revision_range}', flush=True)
+        revision_range = resolve_range(root, args.revision_range)
+        changed = changed_paths(root, revision_range)
+        checks, skips = plan(args.tier, revision_range, changed, root, platform.system())
+        print(f'Tier: {args.tier}; root: {root}; requested range: {args.revision_range}', flush=True)
+        print(f'Resolved committed range: {revision_range}', flush=True)
         print('CI remains final merge authority.', flush=True)
         for reason in skips:
             print(f'SKIP {reason}', flush=True)
