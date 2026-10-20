@@ -18169,10 +18169,11 @@ pub(crate) mod tests {
         );
         let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
         assert_eq!(rejected.status, 422, "{}", rejected.body);
-        assert!(
-            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
-            "{}",
-            rejected.body
+        let rejected: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected["error"]["code"], "ILLEGAL_TRANSITION");
+        assert_eq!(
+            rejected["error"]["message"],
+            "automation completion already won the cancellation race"
         );
         let history = cancellation_history(temp_dir.path())?;
         assert_eq!(
@@ -18677,11 +18678,24 @@ pub(crate) mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(attempts, 1);
+        let fences = |conn: &rusqlite::Connection| -> rusqlite::Result<i64> {
+            conn.query_row(
+                "SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = ?1",
+                [&run_id],
+                |row| row.get(0),
+            )
+        };
+        assert_eq!(fences(&conn)?, 1, "the unknown stop keeps its fence");
         assert_eq!(
             crate::automations::runner::settle_finished_runs(&conn, Utc::now())
                 .map_err(anyhow::Error::msg)?
                 .failed,
             1
+        );
+        assert_eq!(
+            fences(&conn)?,
+            0,
+            "settlement releases the cancellation's fence"
         );
         let final_attempt: String = conn.query_row(
             "SELECT state FROM automation_attempts WHERE id = ?1",
@@ -18689,6 +18703,98 @@ pub(crate) mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(final_attempt, "ambiguous");
+        Ok(())
+    }
+
+    #[test]
+    fn reconciled_cancellation_of_a_held_run_claims_no_completion() -> anyhow::Result<()> {
+        assert_reconciled_cancellation_of_a_failed_run(true)
+    }
+
+    #[test]
+    fn reconciled_cancellation_of_a_finished_failed_run_claims_no_completion() -> anyhow::Result<()>
+    {
+        assert_reconciled_cancellation_of_a_failed_run(false)
+    }
+
+    fn assert_reconciled_cancellation_of_a_failed_run(retry_window: bool) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let adoption_key = "adopt:cancel:cancellation-target:failed-before-fence";
+        let body = cancellation_body(
+            adoption_key,
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "stop it before the retry window",
+        );
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after the cancellation reservation")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        // The session fails on its own while the cancellation is still
+        // `requested`. With a deadline ahead, settlement holds the run for an
+        // operator retry; without one, it settles the run failed.
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        if !retry_window {
+            conn.execute(
+                "UPDATE automation_runs SET timeout_at = NULL WHERE id = ?1",
+                [&run_id],
+            )?;
+        }
+        assert!(store::update_session_terminal_if_active(
+            &conn,
+            &session_id,
+            "failed",
+            Some(1),
+            &current_timestamp(),
+        )?);
+        crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+            .map_err(anyhow::Error::msg)?;
+        let read_run = || -> rusqlite::Result<(String, String)> {
+            conn.query_row(
+                "SELECT r.status, a.state FROM automation_runs r
+                 JOIN automation_attempts a ON a.run_id = r.id WHERE r.id = ?1",
+                [&run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        };
+        let settled = if retry_window { "running" } else { "failed" };
+        assert_eq!(read_run()?, (settled.into(), "failed".into()));
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params![adoption_key, expired],
+        )?;
+        crate::automations::cancellation::reconcile_expired_cancellations(
+            &conn,
+            &NoopSessionRuntime,
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let cancellation: String = conn.query_row(
+            "SELECT state FROM automation_cancellations WHERE adoption_key = ?1",
+            [adoption_key],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cancellation, "rejected");
+        assert_eq!(read_run()?, (settled.into(), "failed".into()));
+        drop(conn);
+
+        let replayed = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(replayed.status, 422, "{}", replayed.body);
+        let replayed: Value = serde_json::from_str(&replayed.body)?;
+        assert_eq!(replayed["error"]["code"], "ILLEGAL_TRANSITION");
+        assert_eq!(
+            replayed["error"]["message"],
+            "the targeted automation attempt is no longer cancellable"
+        );
         Ok(())
     }
 
