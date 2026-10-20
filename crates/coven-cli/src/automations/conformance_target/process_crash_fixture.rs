@@ -33,9 +33,18 @@ pub(super) enum Pause<'a> {
 
 /// Announces the pause, then parks until the parent kills this process.
 fn pause() -> ! {
-    if let Some(message) = PAUSE.get() {
-        let _ = announce(message);
+    match PAUSE.get() {
+        Some(message) => park(message),
+        None => loop {
+            std::thread::park();
+        },
     }
+}
+
+/// Announces `handshake`, then parks until the parent kills this process. For
+/// a pause outside SQLite, such as a runtime's.
+pub(super) fn park(handshake: &Value) -> ! {
+    let _ = announce(handshake);
     loop {
         std::thread::park();
     }

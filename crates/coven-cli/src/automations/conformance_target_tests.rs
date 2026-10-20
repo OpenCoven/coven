@@ -143,7 +143,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "run-settlement-process-crash-recovery",
                         "run-launch-process-crash-recovery",
                         "attempt-retry-process-crash-recovery",
-                        "occurrence-recovery-process-crash-recovery"
+                        "occurrence-recovery-process-crash-recovery",
+                        "run-cancellation-process-crash-recovery"
                     ]
                 },
                 {

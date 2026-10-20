@@ -404,15 +404,21 @@ pub(super) fn snapshot_tables(
     Ok(rows)
 }
 
-/// A no-op runtime that counts the launches the restarted daemon makes.
+/// A no-op runtime that counts the launches and stops the restarted daemon
+/// makes. It confirms every stop.
 #[derive(Default)]
 pub(super) struct CountingRuntime {
     launches: AtomicUsize,
+    stops: AtomicUsize,
 }
 
 impl CountingRuntime {
     pub(super) fn launches(&self) -> u64 {
         self.launches.load(Ordering::SeqCst) as u64
+    }
+
+    pub(super) fn stops(&self) -> u64 {
+        self.stops.load(Ordering::SeqCst) as u64
     }
 }
 
@@ -427,6 +433,7 @@ impl crate::api::SessionRuntime for CountingRuntime {
     }
 
     fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
