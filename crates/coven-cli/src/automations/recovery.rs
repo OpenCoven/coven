@@ -10,6 +10,9 @@
 //! - `retry_with_new_attempt` opens the next attempt, carrying the ambiguous
 //!   prior disposition, and plans the occurrence for dispatch.
 //!
+//! Either determination also releases the stop fence the unconfirmed stop
+//! left on the run's session, so it no longer owns the run.
+//!
 //! Either determination is refused while the latest attempt's session is
 //! still `created` or `running`. That work may still be happening, and the
 //! owner cancels it first, so a retry never runs alongside it. A retry also
@@ -469,6 +472,16 @@ fn recover_in(
             payload["status"] = json!("planned");
         }
     }
+    // The determination settles the outcome of the stop that could not be
+    // confirmed. Left in place, that stop's fence keeps owning the run, so a
+    // retried attempt could never be settled, timed out or cancelled.
+    if let Some((run_id, _, Some(session_id), _)) = &run {
+        conn.execute(
+            "DELETE FROM automation_stop_fences WHERE run_id = ?1 AND session_id = ?2",
+            params![run_id, session_id],
+        )
+        .map_err(|error| format!("failed to release the recovered stop's fence: {error}"))?;
+    }
     Ok(Ok(payload))
 }
 
@@ -492,10 +505,14 @@ fn iso(now: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use crate::api::NoopSessionRuntime;
+    use crate::automations::cancel_commands::{
+        execute_occurrence_cancel, CancelExecution, OCCURRENCE_CANCEL_ACTION,
+    };
     use crate::automations::definition::RoutineDefinition;
     use crate::automations::occurrences::{claim_due_occurrence, insert_claimed_occurrence};
     use crate::automations::runner::{
         dispatch_claimed_occurrences_with_clock, mark_unconfirmed_stop_for_recovery,
+        settle_finished_runs,
     };
     use crate::automations::store::insert_definition;
     use chrono::TimeZone;
@@ -521,6 +538,20 @@ mod tests {
     }
 
     fn recovering_at(at: DateTime<Utc>) -> (tempfile::TempDir, Connection, String) {
+        let (temp, conn, run_id) = dispatched_at(at);
+        mark_unconfirmed_stop_for_recovery(&conn, &run_id, "timeout stop was not confirmed", at)
+            .unwrap();
+        conn.execute(
+            "UPDATE sessions SET status = 'orphaned'
+             WHERE id = (SELECT session_id FROM automation_runs WHERE id = ?1)",
+            [&run_id],
+        )
+        .unwrap();
+        (temp, conn, run_id)
+    }
+
+    /// A store with routine `notes` whose first occurrence is running.
+    fn dispatched_at(at: DateTime<Utc>) -> (tempfile::TempDir, Connection, String) {
         let (temp, conn) = store();
         let routine = RoutineDefinition::from_json(&json!({
             "schemaVersion": 1, "id": "notes", "name": "Notes", "status": "ACTIVE",
@@ -534,15 +565,84 @@ mod tests {
         let report =
             dispatch_claimed_occurrences_with_clock(&conn, &NoopSessionRuntime, at, || at).unwrap();
         let run_id = report.dispatched[0].clone();
-        mark_unconfirmed_stop_for_recovery(&conn, &run_id, "timeout stop was not confirmed", at)
-            .unwrap();
-        conn.execute(
-            "UPDATE sessions SET status = 'orphaned'
-             WHERE id = (SELECT session_id FROM automation_runs WHERE id = ?1)",
-            [&run_id],
-        )
-        .unwrap();
         (temp, conn, run_id)
+    }
+
+    /// A runtime that never confirms a stop.
+    struct UnconfirmedStops;
+
+    impl crate::api::SessionRuntime for UnconfirmedStops {
+        fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("the runtime did not confirm the stop")
+        }
+    }
+
+    /// The production path to recovery after a cancellation: the owner
+    /// cancelled `notes`'s running occurrence, the runtime never confirmed the
+    /// stop, and a daemon restart then lost the session. The cancellation's stop
+    /// fence is still on the run. Cancellation fences stops on the real clock,
+    /// so this store uses it too.
+    fn cancelled_without_confirmation() -> (tempfile::TempDir, Connection, String, DateTime<Utc>) {
+        let at = Utc::now();
+        let (temp, conn, run_id) = dispatched_at(at);
+        let CancelExecution::Success { payload, .. } = execute_occurrence_cancel(
+            &conn,
+            &UnconfirmedStops,
+            json!({"action": OCCURRENCE_CANCEL_ACTION, "adoptionKey": "adopt:cancel:unconfirmed",
+                "occurrenceId": OCCURRENCE, "reason": "not needed today"}),
+            at,
+        )
+        .unwrap() else {
+            panic!("the cancellation was refused");
+        };
+        assert_eq!(payload["status"], json!("recovery_required"));
+        assert!(stop_fenced(&conn, &run_id));
+        crate::store::mark_running_sessions_orphaned(&conn, &iso(at)).unwrap();
+        (temp, conn, run_id, at)
+    }
+
+    fn stop_fenced(conn: &Connection, run_id: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM automation_stop_fences WHERE run_id = ?1)",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Recovers with a retry and dispatches the retried attempt, returning its
+    /// session.
+    fn retried(conn: &Connection, run_id: &str, at: DateTime<Utc>) -> String {
+        let RecoveryExecution::Success { .. } = execute_occurrence_recovery(
+            conn,
+            request("adopt:recover:retry", "retry_with_new_attempt"),
+            at,
+        )
+        .unwrap() else {
+            panic!("refused");
+        };
+        assert!(!stop_fenced(conn, run_id));
+        assert_eq!(
+            claim_due_occurrence(conn, "notes", "daemon", 60, at).unwrap(),
+            Some(OCCURRENCE.to_owned())
+        );
+        let report =
+            dispatch_claimed_occurrences_with_clock(conn, &NoopSessionRuntime, at, || at).unwrap();
+        assert_eq!(report.dispatched, [run_id], "{:?}", report.failed);
+        state(
+            conn,
+            "SELECT session_id FROM automation_attempts
+             WHERE run_id = ?1 AND attempt_number = 2 AND state = 'started'",
+            run_id,
+        )
     }
 
     fn request(key: &str, determination: &str) -> Value {
@@ -727,6 +827,77 @@ mod tests {
             ),
             "started"
         );
+    }
+
+    #[test]
+    fn a_retry_after_an_unconfirmed_cancellation_settles_when_its_session_ends() {
+        let (_temp, conn, run_id, at) = cancelled_without_confirmation();
+        let session = retried(&conn, &run_id, at);
+        assert!(crate::store::update_session_terminal_if_active(
+            &conn,
+            &session,
+            "completed",
+            Some(0),
+            &iso(at)
+        )
+        .unwrap());
+        assert_eq!(settle_finished_runs(&conn, at).unwrap().succeeded, 1);
+        assert_eq!(
+            state(
+                &conn,
+                "SELECT status FROM automation_runs WHERE id = ?1",
+                &run_id
+            ),
+            "succeeded"
+        );
+        assert_eq!(
+            state(
+                &conn,
+                "SELECT state FROM automation_occurrences WHERE id = ?1",
+                OCCURRENCE
+            ),
+            "succeeded"
+        );
+    }
+
+    #[test]
+    fn a_retry_after_an_unconfirmed_cancellation_can_be_cancelled() {
+        let (_temp, conn, run_id, at) = cancelled_without_confirmation();
+        retried(&conn, &run_id, at);
+        let CancelExecution::Success { payload, .. } = execute_occurrence_cancel(
+            &conn,
+            &NoopSessionRuntime,
+            json!({"action": OCCURRENCE_CANCEL_ACTION, "adoptionKey": "adopt:cancel:retry",
+                "occurrenceId": OCCURRENCE, "reason": "not needed after all"}),
+            at,
+        )
+        .unwrap() else {
+            panic!("the retried attempt's cancellation was refused");
+        };
+        assert_eq!(payload["status"], json!("cancelled"));
+        assert_eq!(
+            state(
+                &conn,
+                "SELECT state FROM automation_attempts WHERE run_id = ?1 AND attempt_number = 2",
+                &run_id
+            ),
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn a_failed_determination_releases_the_unconfirmed_stop() {
+        let (_temp, conn, run_id, at) = cancelled_without_confirmation();
+        let RecoveryExecution::Success { payload, .. } = execute_occurrence_recovery(
+            &conn,
+            request("adopt:recover:failed", "failed_deterministic"),
+            at,
+        )
+        .unwrap() else {
+            panic!("refused");
+        };
+        assert_eq!(payload["status"], json!("failed"));
+        assert!(!stop_fenced(&conn, &run_id));
     }
 
     #[test]
