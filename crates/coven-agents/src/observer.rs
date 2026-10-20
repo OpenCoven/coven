@@ -1,4 +1,6 @@
-use crate::{AgentId, GuardrailStage, InvocationContext, InvocationEvent, ReviewOutcome};
+use crate::{
+    AgentId, GuardrailStage, InvocationContext, InvocationEvent, ReviewOutcome, StopReason,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunFailureKind {
@@ -16,6 +18,13 @@ pub enum RunFailureKind {
     Authority,
     /// Selected context could not be resolved or did not match its digest.
     Context,
+    /// A stop was acknowledged at a checkpoint with no tool in flight.
+    Cancelled,
+    /// A tool was in flight when a stop arrived and did not prove it
+    /// produced no effect.
+    TerminationUnknown,
+    /// A tool reported a descendant invocation whose termination is unknown.
+    RecoveryRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +74,13 @@ pub enum RunEvent {
         to: AgentId,
         name: String,
     },
+    /// The runner observed a stop request. Emitted at most once, immediately
+    /// before the terminal `RunFailed`.
+    CancellationRequested {
+        invocation: InvocationContext,
+        agent: AgentId,
+        reason: StopReason,
+    },
     RunCompleted {
         invocation: InvocationContext,
         final_agent: AgentId,
@@ -88,6 +104,7 @@ impl RunEvent {
             | Self::ToolStarted { invocation, .. }
             | Self::ToolCompleted { invocation, .. }
             | Self::Handoff { invocation, .. }
+            | Self::CancellationRequested { invocation, .. }
             | Self::RunCompleted { invocation, .. }
             | Self::RunFailed { invocation, .. } => invocation,
         }

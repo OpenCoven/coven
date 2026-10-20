@@ -11,6 +11,7 @@ mod delegation;
 mod error;
 mod guardrail;
 mod invocation;
+mod lifecycle;
 mod loop_journal;
 mod loop_runner;
 mod model;
@@ -34,6 +35,10 @@ pub use invocation::{
     InvocationEventKind, InvocationEventVersion, InvocationFailureKind, InvocationId,
     InvocationRequest, InvocationSource,
 };
+pub use lifecycle::{
+    CancellationToken, Clock, ManualClock, NotStarted, RunControls, RunSignal, StopReason,
+    SystemClock,
+};
 pub use loop_journal::FileLoopJournal;
 pub use loop_runner::{
     GoalLoopRunner, InMemoryLoopJournal, LoopAttempt, LoopCheckpoint, LoopCheckpointStatus,
@@ -48,6 +53,8 @@ pub use observer::{
     InvocationObserver, NoopInvocationObserver, NoopObserver, RunEvent, RunFailureKind, RunObserver,
 };
 pub use review::{ProposalReview, ReviewOutcome, ReviewVerdict, ToolProposal};
-pub use runner::{DelegationFailure, DelegationResult, RunOptions, RunResult, Runner};
+pub use runner::{
+    DelegationDisposition, DelegationFailure, DelegationResult, RunOptions, RunResult, Runner,
+};
 pub use session::{InMemorySession, SessionStore};
 pub use tool::{Tool, ToolDefinition};

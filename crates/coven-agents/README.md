@@ -10,6 +10,10 @@ primitives:
 - journaled goal loops with explicit exit criteria
 - agent handoffs (control transfer within one run, not child delegation)
 - bounded child delegation with selected context and attenuated authority
+- cooperative cancellation and deadlines on an injectable clock
+- parent-to-child cancellation, deadlines and concurrency bounds for
+  delegated children, with a recovery disposition when a child's effect is
+  unknown
 - blocking input and output guardrails
 - fail-closed review of proposed tool calls before dispatch
 - pluggable session journals
@@ -90,9 +94,82 @@ invocation may use, and the grant is what the host vouches for. Resource
 names are proven as subsets at the boundary; the crate does not execute
 resources, so tools and the host enforce `AuthorityScope::resources` against
 the context they are given. Delegation here is local execution with
-correlation: it does not adopt, persist, retry, cancel, time out, or place the
-child anywhere. Legacy `Handoff` remains available as in-run control transfer
-during migration.
+correlation: it does not adopt, persist, retry, or place the child anywhere.
+A delegated child can be cancelled and bounded in time, as described under
+[delegated children](#delegated-children). Legacy `Handoff` remains available
+as in-run control transfer during migration.
+
+## Deadlines and cancellation
+
+`Runner::run_invocation_controlled` runs a request under `RunControls`: an
+optional `CancellationToken` and an optional timeout measured on the runner's
+`Clock` (`SystemClock` by default; `ManualClock` for deterministic tests;
+replace it with `Runner::with_clock`). Cancelling a token cancels its child
+tokens, never its parent. The default controls never stop a run, and the
+legacy entry points use them.
+
+The runner never preempts a future. It observes a stop at checkpoints: before
+each model turn, after each model response, and before each tool dispatch.
+Tools and models can watch the same `RunSignal` through
+`Tool::execute_with_signal` and `Model::generate_with_signal`. Both default
+to `execute` and `generate`, so existing implementations are unchanged. The
+signal reports `stop_reason()` (`cancelled` ahead of `deadline_exceeded`) and
+`remaining()` time.
+
+Outcomes are distinct and never retried:
+
+- **Cancellation requested.** One `CancellationRequested` event, in both
+  streams, the first time the runner observes the stop. It is always
+  followed immediately by the terminal failure below.
+- **Cancelled.** The stop was acknowledged with no tool in flight. A model
+  response that arrives after the stop is discarded and none of its actions
+  run. Tool calls that already returned keep their results in the partial
+  transcript. Cancellation does not mean nothing happened.
+- **Termination unknown.** A tool was in flight when the stop arrived and
+  then failed. Its effect may or may not have happened, so the run fails as
+  `TerminationUnknown` with the call id. A tool turns this into a clean
+  cancellation only by returning `NotStarted`. That mirrors Coven's rule
+  that `not_started` is asserted explicitly and never inferred from errors,
+  timeouts, cancellation or disconnection. `NotStarted` without a stop is an
+  ordinary tool failure.
+
+A tool that returns successfully during a stop is a known effect: its result
+is recorded and the run is acknowledged as cancelled at the next checkpoint.
+Once a final output passes policy, the run completes even if a stop arrives
+afterwards. These are in-memory outcomes of one local run. They are not
+persisted states, adoption decisions, or proof that an external process
+stopped.
+
+### Delegated children
+
+`Runner::run_delegation_controlled` runs a prepared delegation under controls
+derived from its parent, usually `RunSignal::child_controls()`. Cancelling the
+parent's token stops the child; cancelling the child never stops the parent.
+The child's deadline is the earlier of the parent's remaining time and the
+spec's own `DelegationBudget::with_timeout`. When the parent's budget has a
+timeout, `PreparedDelegation::prepare` refuses a child with none or a longer
+one (`DeadlineWidened`). A host that orchestrates delegation outside any run
+can start a `RunSignal::new` to derive child controls from.
+
+`Runner::with_child_limit(n)` lets at most `n` delegated children of one
+parent invocation run at once on that runner. A child beyond the limit is
+refused with `ChildLimitExceeded` before its target runs, as a `Limit`
+failure with the usual paired lifecycle events. A slot is released when the
+child finishes or its future is dropped. There is no limit by default.
+
+`DelegationFailure::disposition()` tells the parent what a failed child means:
+
+- **Failed.** The child failed or was refused, and nothing about its outcome
+  is ambiguous beyond its partial transcript.
+- **Cancelled.** The child acknowledged a stop with no tool in flight.
+- **Recovery required.** The child, or one of its descendants, left an effect
+  whose outcome is unknown (`TerminationUnknown` or `RecoveryRequired`).
+
+A tool that returns such a child failure fails its own run as
+`RecoveryRequired`, with the call id, whether or not a stop arrived. It
+counts even when wrapped in another error, as long as the wrapper reports
+its source. That outcome outranks a clean cancellation, and the work must be
+reconciled before any retry.
 
 ## Tool proposal review
 
@@ -156,7 +233,8 @@ currently registered revision automatically.
 changing the existing `RunObserver` event shapes. Every admitted request emits
 one versioned `started` event and one terminal `completed` or `failed` event.
 Legacy handoffs inside the same run are emitted as `control_transferred`, not as
-durable delegation. Every event carries the original requested target and
+durable delegation. A run that observes a stop emits one
+`cancellation_requested` event immediately before its terminal `failed`. Every event carries the original requested target and
 source; failures separately identify `failed_at`, so a target-resolution
 failure is not mislabeled as execution by that target. The
 `coven.agent-invocation-event.v1` wire schema rejects unknown fields. Attempt
@@ -222,10 +300,9 @@ not establish distributed fencing.
 The existing `Runner` provides local control transfer, correlation, and
 bounded local delegation with selected context and attenuated authority.
 `GoalLoopRunner` journals iteration boundaries; it does not supply durable
-child invocation adoption or shared executor conformance. Wall-clock
-deadlines and cancellation, durable invocation adoption/recovery, remote
-executors, unified observability, and removal of legacy
-handoff/full-transcript behavior remain deferred under #804.
+child invocation adoption or shared executor conformance. Durable invocation
+adoption/recovery, remote executors, unified observability, and removal of
+legacy handoff/full-transcript behavior remain deferred under #804.
 
 Internally, `Runner` is a facade over a crate-private `AgentLoop`. The loop
 runs one agent's model and tool turns: input and output guardrails, the
@@ -253,6 +330,11 @@ wire shape, fail-closed attenuation (cross-project, tool, resource,
 re-delegation, budget, context leak), bounded child context without parent
 transcript inheritance, authority enforcement across control transfer, digest
 verification before model execution, and result-contract and budget limits.
+[`tests/lifecycle.rs`](tests/lifecycle.rs) covers cancellation before start,
+deadlines on an injected clock, stops during model calls and tool batches,
+termination-unknown versus `NotStarted`, signal observation by tools, the
+closed stop vocabulary, and unchanged legacy entry points. Interleavings are
+driven from inside scripted models and tools; nothing sleeps.
 [`tests/loop_runner.rs`](tests/loop_runner.rs) covers local checkpoint and
 reconciliation behavior. These are in-process tests with scripted models and
 tools, not real-daemon, provider-containment, packaged-client, or external A2A
