@@ -2,15 +2,19 @@
 //!
 //! The crate owns bounded model/tool loops, local control transfer, and
 //! bounded local delegation with attenuated authority. Host adapters supply
-//! provider transport, session persistence, context resolution, and policy;
-//! durable invocation orchestration remains outside this crate.
+//! provider transport, session persistence, context resolution, and policy.
+//! The crate records local invocations durably, at most once per id; distributed
+//! orchestration, placement and retries remain outside it.
 
 mod agent;
 mod agent_loop;
 mod delegation;
+mod durable_runner;
+mod durable_store;
 mod error;
 mod guardrail;
 mod invocation;
+mod invocation_journal;
 mod lifecycle;
 mod loop_journal;
 mod loop_runner;
@@ -28,12 +32,19 @@ pub use delegation::{
     DelegationSpecError, PreparedDelegation, ProjectRef, ResultContract, TaskInput,
     MAX_AUTHORITY_ENTRIES, MAX_CONTEXT_REFS, MAX_TASK_INPUT_BYTES,
 };
+pub use durable_runner::{
+    DurableInvocation, DurableInvocationError, DurableInvocationRunner, InvocationDisposition,
+};
 pub use error::{BoxError, ConfigError, GuardrailStage, RunError, RunFailure};
 pub use guardrail::{GuardrailVerdict, InputGuardrail, OutputGuardrail};
 pub use invocation::{
     AgentRef, AgentRefError, AgentRevision, InvocationContext, InvocationEvent,
     InvocationEventKind, InvocationEventVersion, InvocationFailureKind, InvocationId,
     InvocationRequest, InvocationSource,
+};
+pub use invocation_journal::{
+    invocation_request_digest, FileInvocationJournal, InMemoryInvocationJournal, InvocationAttempt,
+    InvocationJournal, InvocationRecord, InvocationState,
 };
 pub use lifecycle::{
     CancellationToken, Clock, ManualClock, NotStarted, RunControls, RunSignal, StopReason,

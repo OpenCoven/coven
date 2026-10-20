@@ -1,8 +1,8 @@
 use thiserror::Error;
 
 use crate::{
-    AgentId, AgentRef, AgentRefError, ContentDigest, InvocationContext, InvocationId, RunItem,
-    StopReason,
+    AgentId, AgentRef, AgentRefError, ContentDigest, InvocationContext, InvocationId,
+    RunFailureKind, RunItem, StopReason,
 };
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -193,6 +193,43 @@ pub struct RunFailure {
 }
 
 impl RunError {
+    /// The failure kind the runner reports for this error in both observer
+    /// streams. Every error has exactly one kind.
+    pub fn failure_kind(&self) -> RunFailureKind {
+        match self {
+            Self::UnknownStartingAgent(_)
+            | Self::AgentRevisionMismatch { .. }
+            | Self::AgentRevisionRequired { .. }
+            | Self::InvalidAgentRef { .. }
+            | Self::InvalidConfiguration { .. } => RunFailureKind::Configuration,
+            Self::SessionUnavailable | Self::SessionFailed { .. } => RunFailureKind::Session,
+            Self::ProposalReviewFailed { .. } => RunFailureKind::ProposalReview,
+            Self::ModelFailed { .. } => RunFailureKind::Model,
+            Self::GuardrailFailed { stage, .. } | Self::GuardrailRejected { stage, .. } => {
+                match stage {
+                    GuardrailStage::Input => RunFailureKind::InputGuardrail,
+                    GuardrailStage::Output => RunFailureKind::OutputGuardrail,
+                }
+            }
+            Self::UnknownTool { .. } | Self::ToolFailed { .. } => RunFailureKind::Tool,
+            Self::UnauthorizedTool { .. } => RunFailureKind::Authority,
+            Self::ContextFailed { .. } | Self::ContextDigestMismatch { .. } => {
+                RunFailureKind::Context
+            }
+            Self::OutputTooLarge { .. }
+            | Self::ChildLimitExceeded { .. }
+            | Self::MaxTurnsExceeded { .. }
+            | Self::MaxHandoffsExceeded { .. } => RunFailureKind::Limit,
+            Self::Cancelled { .. } => RunFailureKind::Cancelled,
+            Self::TerminationUnknown { .. } => RunFailureKind::TerminationUnknown,
+            Self::RecoveryRequired { .. } => RunFailureKind::RecoveryRequired,
+            Self::DuplicateToolCallId { .. } | Self::InvalidModelResponse { .. } => {
+                RunFailureKind::InvalidResponse
+            }
+            Self::UnknownHandoff { .. } => RunFailureKind::Handoff,
+        }
+    }
+
     /// Whether this failure leaves an effect whose outcome is unknown, here
     /// or in a descendant, so that work must be reconciled before any retry.
     pub fn leaves_unknown_effect(&self) -> bool {
@@ -221,6 +258,11 @@ pub(crate) fn chain_leaves_unknown_effect(error: &(dyn std::error::Error + 'stat
 }
 
 impl RunFailure {
+    /// The failure kind both observer streams reported for this run.
+    pub fn kind(&self) -> RunFailureKind {
+        self.error.failure_kind()
+    }
+
     /// Discards the partial transcript and keeps only the error.
     pub fn into_error(self) -> RunError {
         self.error

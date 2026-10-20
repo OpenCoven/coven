@@ -608,22 +608,34 @@ where
         scope: RunScope<'_, C>,
     ) -> Result<RunResult, RunFailure> {
         let mut progress = RunProgress::default();
-
-        self.run_loop(
+        let emitter = RunEmitter::new(
+            self.observer.as_ref(),
+            self.invocation_observer.as_ref(),
             &request,
-            input.into(),
-            context,
-            options,
-            scope,
-            &mut progress,
-        )
-        .await
-        .map_err(|error| RunFailure {
-            invocation: Box::new(request.invocation.clone()),
-            error,
-            new_items: progress.items.into_boxed_slice(),
-            turns: progress.turns,
-            handoffs: progress.handoffs,
+        );
+
+        let outcome = self
+            .run_loop(
+                &emitter,
+                input.into(),
+                context,
+                options,
+                scope,
+                &mut progress,
+            )
+            .await;
+        outcome.map_err(|error| {
+            // Every failure inside the loop is emitted before it returns, and
+            // its kind is a function of the error, so `RunFailure::kind`
+            // always reports what observers saw.
+            debug_assert_eq!(emitter.failure_kind(), Some(error.failure_kind()));
+            RunFailure {
+                invocation: Box::new(request.invocation.clone()),
+                error,
+                new_items: progress.items.into_boxed_slice(),
+                turns: progress.turns,
+                handoffs: progress.handoffs,
+            }
         })
     }
 
@@ -745,18 +757,14 @@ where
 
     async fn run_loop(
         &self,
-        request: &InvocationRequest,
+        emitter: &RunEmitter<'_>,
         input: String,
         context: &C,
         options: RunOptions,
         scope: RunScope<'_, C>,
         progress: &mut RunProgress,
     ) -> Result<RunResult, RunError> {
-        let emitter = RunEmitter::new(
-            self.observer.as_ref(),
-            self.invocation_observer.as_ref(),
-            request,
-        );
+        let request = emitter.request();
         let signal = RunSignal::new(scope.controls, Arc::clone(&self.clock));
         let starting_agent = request.requested_target.id().clone();
         emitter.run_event(RunEvent::RunStarted {
@@ -804,19 +812,19 @@ where
             ));
         }
 
-        let agent_loop = AgentLoop::new(&emitter, scope.policy, options.max_turns, &signal);
+        let agent_loop = AgentLoop::new(emitter, scope.policy, options.max_turns, &signal);
         agent_loop.check_ingress(&current, &input, context).await?;
 
         let prior = match (&options.session_id, &self.session) {
             _ if scope.context.is_some() => {
                 let (manifest, resolver) = scope.context.expect("checked above");
-                self.resolve_context(&emitter, &current.id, manifest, resolver, context)
+                self.resolve_context(emitter, &current.id, manifest, resolver, context)
                     .await?
             }
             (Some(session_id), Some(session)) => {
                 session.load(session_id).await.map_err(|source| {
                     self.fail(
-                        &emitter,
+                        emitter,
                         &current.id,
                         RunFailureKind::Session,
                         RunError::SessionFailed {
@@ -828,7 +836,7 @@ where
             }
             (Some(_), None) => {
                 return Err(self.fail(
-                    &emitter,
+                    emitter,
                     &current.id,
                     RunFailureKind::Session,
                     RunError::SessionUnavailable,
@@ -851,7 +859,7 @@ where
                             .await
                             .map_err(|source| {
                                 self.fail(
-                                    &emitter,
+                                    emitter,
                                     &current.id,
                                     RunFailureKind::Session,
                                     RunError::SessionFailed {
@@ -884,7 +892,7 @@ where
                 }
                 AgentStop::ControlTransfer(call) => {
                     current = self.transfer_control(
-                        &emitter,
+                        emitter,
                         &current,
                         &call,
                         options.max_handoffs,

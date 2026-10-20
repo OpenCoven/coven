@@ -22,6 +22,8 @@ primitives:
 - metadata-only lifecycle observation
 - validated logical agent references with optional immutable revisions
 - versioned, serializable invocation lifecycle events
+- durable, at-most-once invocation records that survive a restart and keep
+  unknown outcomes explicit
 
 ## Policy and context boundaries
 
@@ -219,6 +221,8 @@ individual event variants. `Runner::run_with_invocation` accepts an explicit
 context, including an optional parent invocation ID for caller-managed nested
 work. These IDs provide correlation only: they do not authorize execution or
 promise durable adoption, idempotency, deduplication, or safe retries.
+`DurableInvocationRunner` adds at-most-once execution per id (see
+[durable invocations](#durable-invocations)).
 
 `AgentRef` pairs a validated logical agent ID with an optional immutable
 `AgentRevision`. Agent IDs and revisions are non-empty, at most 127 bytes, and
@@ -295,14 +299,73 @@ executor termination. The host/reconciler must establish that the previous
 executor cannot act before supplying it; a nonempty evidence string alone does
 not establish distributed fencing.
 
+## Durable invocations
+
+`DurableInvocationRunner` runs an `InvocationRequest` against an
+`InvocationJournal`, so each invocation id executes at most once and its
+outcome survives a restart. `FileInvocationJournal` stores records with the
+same crash-safe checkpoints as `FileLoopJournal`. `InMemoryInvocationJournal`
+is for tests.
+
+The journal is separate from any `SessionStore`. An `InvocationRecord` holds
+the invocation's identity, source and target, a digest of the exact request,
+its state and the attempt that adopted it. Content appears only as digests;
+no prompt, transcript or output is stored.
+
+Every run takes the same steps:
+
+1. **Reserve.** The request and its digest are written as `reserved` before
+   anything runs. `invocation_request_digest` covers the identity, source,
+   target, input and run options.
+2. **Adopt.** One attempt, bound to the runner's process instance id, writes
+   `running` before the first model turn. Effects may happen from here on.
+3. **Run** under the caller's `RunControls`.
+4. **Settle** into exactly one state.
+
+The state names follow Psyche's attempt vocabulary:
+
+| State | Meaning | A duplicate submission |
+| --- | --- | --- |
+| `reserved` | Recorded and never adopted, so proven not adopted. | Dispatches it, once. |
+| `running` | Adopted by an attempt. | `ActiveInFlight` while that attempt runs in this process; otherwise `RecoveryRequired`. |
+| `completed` | The final output passed policy. Only its digest is kept. | Replayed from the journal. |
+| `rejected` | Failed before the first model turn, so nothing ran. | Replayed. |
+| `failed` | Failed with a known kind after execution began. | Replayed. |
+| `cancelled` | A stop was acknowledged with no tool in flight. | Replayed. |
+| `termination_unknown` | A stop arrived while a tool ran, and the tool did not prove it did nothing. | `RecoveryRequired`. |
+| `recovery_required` | A tool reported a descendant whose outcome is unknown. | `RecoveryRequired`. |
+
+The same invocation id with a different request, input or options is a
+`Conflict`, never a replay. Nothing is retried: to try again after a settled
+failure, use a new invocation id.
+
+Unknown stays unknown across a restart:
+
+- `adoption_unknown` is never written. If the adoption write fails, the
+  runner returns `AdoptionUnknown` and does not run. A later read finds the
+  record either still `reserved`, which is proven not adopted and safe to
+  dispatch, or `running`, which requires recovery.
+- A `running` record whose attempt is not executing in this process requires
+  recovery in every process. That covers a restart, a dropped run future and
+  a failed settlement write. `SettlementFailed` still hands the run's outcome
+  to the caller.
+- As with `GoalLoopRunner`, `process_instance_id` must change on every
+  process start.
+
+There is no reconciliation path yet. A record that requires recovery stays
+that way until a fenced reconciliation contract exists, and delegated
+children are not journaled yet.
+
 ## Supported checkpoint and deferred orchestration
 
 The existing `Runner` provides local control transfer, correlation, and
 bounded local delegation with selected context and attenuated authority.
 `GoalLoopRunner` journals iteration boundaries; it does not supply durable
-child invocation adoption or shared executor conformance. Durable invocation
-adoption/recovery, remote executors, unified observability, and removal of
-legacy handoff/full-transcript behavior remain deferred under #804.
+child invocation adoption or shared executor conformance.
+`DurableInvocationRunner` records root invocations durably. Several things
+remain deferred under #804: fenced reconciliation of an invocation whose
+outcome is unknown, journaled delegated children, remote executors, unified
+observability, and removal of legacy handoff/full-transcript behavior.
 
 Internally, `Runner` is a facade over a crate-private `AgentLoop`. The loop
 runs one agent's model and tool turns: input and output guardrails, the
