@@ -177,7 +177,7 @@ jobs:
             '.sourceCommit == $sourceCommit and (.contractContentSha256 | test("^[0-9a-f]{64}$"))' \
             "$AUTOMATIONS_ARTIFACT_DIR/manifest.json"
       - name: Upload exact-commit Automations protocol
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-automations-v1-contract-${{ github.sha }}
           path: |
@@ -216,7 +216,7 @@ jobs:
             '.sourceCommit == $sourceCommit and .contractProfile == "coven.automations.authority.v1" and (.contractContentSha256 | test("^[0-9a-f]{64}$"))' \
             "$AUTHORITY_ARTIFACT_DIR/manifest.json"
       - name: Upload exact-commit Automations authority profile
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-automations-authority-v1-contract-${{ github.sha }}
           path: |
@@ -287,7 +287,7 @@ jobs:
         run: node conformance/automations/runner/audit.mjs --output "$AUTOMATIONS_AUDIT_DIR"
       - name: Upload native Automations audit
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: automations-audit-linux-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/automations-audit
@@ -395,7 +395,7 @@ jobs:
         run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock --test threads_identity_invariants --test threads_protected_intake --test threads_terminal_recovery --no-fail-fast
       - name: Upload Threads daemon evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: threads-daemon-windows-feature-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
@@ -588,7 +588,7 @@ jobs:
           set -o pipefail
           cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture | tee coven-tui-metrics.txt
       - name: Upload baseline artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-cli-performance-baseline
           path: |

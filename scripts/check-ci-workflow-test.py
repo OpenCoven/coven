@@ -571,7 +571,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("--suite unix --iterations 10 --command-timeout-ms 180000", stress_text)
         self.assertIn("--suite windows --iterations 10 --command-timeout-ms 180000", stress_text)
         self.assertEqual(stress_text.count("if: ${{ always() }}"), 2)
-        self.assertEqual(stress_text.count("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"), 2)
+        self.assertEqual(stress_text.count("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"), 2)
 
     def test_release_governance_check_runs_read_only_with_the_dedicated_credential(self) -> None:
         text = (CI_WORKFLOW.parent / 'release-governance.yml').read_text(encoding='utf-8')
