@@ -8,6 +8,7 @@
 mod agent;
 mod agent_loop;
 mod delegation;
+mod durable_store;
 mod error;
 mod guardrail;
 mod invocation;

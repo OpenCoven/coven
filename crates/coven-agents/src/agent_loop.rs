@@ -7,7 +7,7 @@
 //! delegated context, or own invocation lifecycle. [`crate::Runner`] composes
 //! those around it.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::OnceLock};
 
 use crate::{
     Agent, AgentId, AgentRef, AuthorityScope, GuardrailStage, GuardrailVerdict, HandoffCall,
@@ -28,7 +28,7 @@ pub(crate) struct RunProgress {
     pub(crate) handoffs: usize,
 }
 
-const fn invocation_failure_kind(kind: RunFailureKind) -> InvocationFailureKind {
+pub(crate) const fn invocation_failure_kind(kind: RunFailureKind) -> InvocationFailureKind {
     match kind {
         RunFailureKind::Configuration => InvocationFailureKind::Configuration,
         RunFailureKind::Session => InvocationFailureKind::Session,
@@ -53,6 +53,8 @@ pub(crate) struct RunEmitter<'a> {
     observer: &'a dyn RunObserver,
     invocation_observer: &'a dyn InvocationObserver,
     request: &'a InvocationRequest,
+    /// The kind of the run's one terminal failure, as emitted to observers.
+    failure_kind: OnceLock<RunFailureKind>,
 }
 
 impl<'a> RunEmitter<'a> {
@@ -65,7 +67,17 @@ impl<'a> RunEmitter<'a> {
             observer,
             invocation_observer,
             request,
+            failure_kind: OnceLock::new(),
         }
+    }
+
+    /// The kind of the terminal failure this emitter reported, if any.
+    pub(crate) fn failure_kind(&self) -> Option<RunFailureKind> {
+        self.failure_kind.get().copied()
+    }
+
+    pub(crate) fn request(&self) -> &'a InvocationRequest {
+        self.request
     }
 
     pub(crate) fn invocation(&self) -> &InvocationContext {
@@ -94,6 +106,7 @@ impl<'a> RunEmitter<'a> {
         kind: RunFailureKind,
         error: RunError,
     ) -> RunError {
+        let _ = self.failure_kind.set(kind);
         self.run_event(RunEvent::RunFailed {
             invocation: self.request.invocation.clone(),
             agent: agent.clone(),
