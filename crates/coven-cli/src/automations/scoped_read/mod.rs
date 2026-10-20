@@ -55,6 +55,9 @@ pub(crate) enum Refusal {
     ScopeMissing,
     /// A scope names this file, but not for reading.
     ScopeAccessDenied,
+    /// Only a recursive scope covers the path, and the path passes through a
+    /// `.git` folder or a `.env` file beneath that scope's directory.
+    ScopeExcluded,
     /// The file or one of its parent directories does not exist.
     ResourceNotFound,
     /// A component is a symbolic link.
@@ -104,6 +107,7 @@ impl Refusal {
             Self::RootMoved => "root_moved",
             Self::ScopeMissing => "scope_missing",
             Self::ScopeAccessDenied => "scope_access_denied",
+            Self::ScopeExcluded => "scope_excluded",
             Self::ResourceNotFound => "resource_not_found",
             Self::ResourceSymlink => "resource_symlink",
             Self::ResourceDirectory => "resource_directory",

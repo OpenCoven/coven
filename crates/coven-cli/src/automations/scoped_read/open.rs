@@ -365,6 +365,7 @@ mod platform {
     use cap_std::ambient_authority;
     use cap_std::fs::{Dir, Metadata, MetadataExt, OpenOptions, OpenOptionsExt};
 
+    use super::super::scope::is_excluded_name;
     use super::{
         excerpt, Entry, EntryKind, Found, Identity, Listing, Match, ReadPolicy, Refusal,
         RelativePath, RootKind, SearchPosition, Step,
@@ -771,8 +772,8 @@ mod platform {
         }
     }
 
-    /// The names in `directory` a request could ever use, sorted by bytes,
-    /// and the name bytes it took to scan them all.
+    /// The names in `directory` a request could ever use, less the excluded
+    /// ones, sorted by bytes, and the name bytes it took to scan them all.
     fn names(
         directory: &Dir,
         policy: &ReadPolicy,
@@ -788,7 +789,7 @@ mod platform {
             }
             if let Some(name) = name
                 .to_str()
-                .filter(|name| RelativePath::is_name(name, policy))
+                .filter(|name| RelativePath::is_name(name, policy) && !is_excluded_name(name))
             {
                 names.push(name.to_owned());
             }

@@ -28,6 +28,7 @@ yet. They cover:
 - the open walk on Unix;
 - protected resources, held by identity;
 - the recheck from the root after the open;
+- the `.git` and `.env` exclusions beneath recursive scopes;
 - listings and searches that leave out every entry a read would refuse;
 - the per-file, per-attempt, scan, call, page, depth and path-length limits.
 
@@ -51,9 +52,21 @@ records it in the profile as an additive consumer note.
 A non-recursive scope on a directory lets the model see the directory's entry
 names but read none of them. Recursion stops 32 components from the root.
 
+**Excluded names.** Val decided on 2026-10-20 (#857) that a recursive scope
+leaves out every `.git` folder and every `.env` or `.env.*` file beneath its
+directory, in any ASCII case, because project secrets usually sit there:
+- A read, listing or search whose path passes through one beneath the scope's
+  directory is refused before any filesystem access (`scope_excluded`).
+- A scope whose own path names one covers it. A non-recursive scope on
+  `.env` can read it, and a recursive scope on `repo/.git` covers what is
+  beneath.
+- Listings and searches never show an excluded name, even when another scope
+  names it.
+
 **Listings and searches show only what a read would admit.** They leave out:
 - links, special files and hard-linked files;
 - entries on another filesystem and protected resources;
+- excluded names;
 - names a request could never spell.
 
 **A listing** returns entry names and kinds, never sizes. Each page holds up to
