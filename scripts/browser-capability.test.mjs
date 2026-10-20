@@ -85,3 +85,74 @@ test('non-object manifests and dependency maps are rejected', async (t) => {
     assert.throws(() => detect(root), { code: 'invalid-manifest' });
   }
 });
+
+async function lockedFixture(t, kind) {
+  const { cpSync } = await import('node:fs');
+  const root = fixture(t, {});
+  cpSync(new URL(`./fixtures/browser-${kind}/`, import.meta.url), root, { recursive: true });
+  return root;
+}
+
+for (const kind of ['npm', 'pnpm']) {
+  test(`resolves exact browser core from real ${kind} lock graph`, async t => {
+    const { resolveLockedBrowser } = await import(moduleUrl);
+    const result = resolveLockedBrowser(await lockedFixture(t, kind));
+    assert.equal(result.status, 'applicable');
+    assert.equal(result.coreVersion, '1.63.0');
+    assert.equal(result.manager, kind);
+    assert.match(result.lockSha256, /^[a-f0-9]{64}$/);
+  });
+  test(`rejects stale ${kind} root declaration`, async t => {
+    const { resolveLockedBrowser } = await import(moduleUrl);
+    const root = await lockedFixture(t, kind);
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ devDependencies: { '@playwright/test': '1.62.0' }, packageManager: 'pnpm@10.11.1' }));
+    assert.throws(() => resolveLockedBrowser(root), { code: 'stale-lock' });
+  });
+}
+
+test('absent browser declaration bypasses lock and parser requirements', async t => {
+  const { resolveLockedBrowser } = await import(moduleUrl);
+  assert.equal(resolveLockedBrowser(fixture(t, {})).status, 'not-applicable');
+});
+
+test('declared browser fails on missing or competing locks', async t => {
+  const { resolveLockedBrowser } = await import(moduleUrl);
+  const root = fixture(t, { devDependencies: { '@playwright/test': '1.63.0' } });
+  assert.throws(() => resolveLockedBrowser(root), { code: 'missing-lock' });
+  writeFileSync(path.join(root, 'package-lock.json'), '{}');
+  writeFileSync(path.join(root, 'pnpm-lock.yaml'), '{}');
+  assert.throws(() => resolveLockedBrowser(root), { code: 'ambiguous-lock' });
+});
+
+test('missing npm graph edge fails closed', async t => {
+  const { readFileSync } = await import('node:fs');
+  const { resolveLockedBrowser } = await import(moduleUrl);
+  const root = await lockedFixture(t, 'npm');
+  const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json')));
+  delete lock.packages['node_modules/playwright-core'];
+  writeFileSync(path.join(root, 'package-lock.json'), JSON.stringify(lock));
+  assert.throws(() => resolveLockedBrowser(root), { code: 'invalid-lock-graph' });
+});
+
+test('duplicate PNPM YAML keys fail without echoing input', async t => {
+  const { resolveLockedBrowser } = await import(moduleUrl);
+  const root = await lockedFixture(t, 'pnpm');
+  writeFileSync(path.join(root, 'pnpm-lock.yaml'), 'private-sentinel: one\nprivate-sentinel: two\n');
+  assert.throws(() => resolveLockedBrowser(root), e => e.code === 'invalid-lock' && !e.message.includes('private-sentinel'));
+});
+
+test('PNPM requires an exact manager pin and a complete core snapshot', async t => {
+  const { readFileSync } = await import('node:fs');
+  const { resolveLockedBrowser } = await import(moduleUrl);
+  const root = await lockedFixture(t, 'pnpm');
+  const manifestPath = path.join(root, 'package.json');
+  const manifest = JSON.parse(readFileSync(manifestPath));
+  delete manifest.packageManager;
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  assert.throws(() => resolveLockedBrowser(root), { code: 'manager-pin-missing' });
+  manifest.packageManager = 'pnpm@10.11.1';
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const lockPath = path.join(root, 'pnpm-lock.yaml');
+  writeFileSync(lockPath, readFileSync(lockPath, 'utf8').replace('  playwright-core@1.63.0: {}', ''));
+  assert.throws(() => resolveLockedBrowser(root), { code: 'invalid-lock-graph' });
+});

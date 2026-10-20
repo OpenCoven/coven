@@ -1,0 +1,13 @@
+{
+  "name": "coven-browser-pnpm-contract-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:browser": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  },
+  "packageManager": "pnpm@10.11.1"
+}
