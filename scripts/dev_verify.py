@@ -134,6 +134,7 @@ def plan(tier, revision_range, changed, root, system):
     add('dependency-audit', ['cargo', 'deny', '--all-features', 'check', 'advisories', 'licenses', 'bans', 'sources'], needs=['rust-pins'])
 
     categories = load_script(root, 'classify-ci-changes').classify(changed) if changed else {}
+    package_installs = []
     for package, category, manager in [('channels', 'channels', 'npm'), ('openclaw-coven', 'openclaw', 'pnpm')]:
         if tier != 'full' and not categories.get(category, False):
             skips.append(f'{package}: not applicable to changed paths under CI classification')
@@ -145,10 +146,11 @@ def plan(tier, revision_range, changed, root, system):
             needs = ['pnpm-pin']
         install = [manager, 'ci'] if manager == 'npm' else [manager, 'install', '--frozen-lockfile', '--ignore-scripts']
         add(f'{package}-install', install, cwd, needs)
+        package_installs.append(f'{package}-install')
         add(f'{package}-build', [manager, 'run', 'build'], cwd, [f'{package}-install'])
         add(f'{package}-test', [manager, 'test'], cwd, [f'{package}-install'])
 
-    add('browser-readiness', ['node', 'scripts/browser-capability.mjs', '--check'], needs=['node-pin', browser_tools_setup])
+    add('browser-readiness', ['node', 'scripts/browser-capability.mjs', '--check'], needs=['node-pin', browser_tools_setup, *package_installs])
 
     if tier == 'full':
         add('threads-unit', ['cargo', 'test', '--locked', '-p', 'coven-cli', '--bin', 'coven', '--features', 'threads-test-clock', 'threads_'], needs=['rust-pins'])
