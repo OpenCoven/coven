@@ -126,6 +126,7 @@ fn capability_advertises_the_native_structural_suites() {
                         "cancellation-timeout-arbitration",
                         "command-storage-lock-recovery",
                         "command-storage-readonly-recovery",
+                        "command-storage-corruption-recovery",
                         "command-transaction-rollback",
                         "legacy-import-source-preservation",
                         "command-storage-capacity-recovery",
@@ -2419,4 +2420,183 @@ fn storage_capacity_suite_rejects_weakened_invariant_expectations() {
             );
         }
     }
+}
+
+fn storage_corruption_request() -> Value {
+    request_for_profile(
+        "scheduler_reliability",
+        "command-storage-corruption-recovery",
+        serde_json::from_str(include_str!(
+            "../../../../conformance/automations/runner/command-storage-corruption-recovery.vectors.json"
+        ))
+        .unwrap(),
+    )
+}
+
+fn storage_corruption_observations() -> Vec<Value> {
+    let result = evaluate(&storage_corruption_request()).unwrap();
+    assert_eq!(result.status, TargetSuiteStatus::Passed);
+    result.evidence.unwrap()["observations"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn storage_corruption_suite_executes_real_faults_and_control() {
+    let observations = storage_corruption_observations();
+    assert_eq!(observations.len(), 3);
+    for (observation, (fault, outcome, code, initial)) in observations.iter().zip([
+        ("sqlite_header", "not_a_database", json!(26), 0),
+        ("definition_btree", "database_corrupt", json!(11), 0),
+        ("none", "committed", Value::Null, 1),
+    ]) {
+        assert_eq!(observation["faultSource"], fault, "{observation}");
+        assert_eq!(observation["initialOutcome"], outcome, "{observation}");
+        assert_eq!(observation["sqliteErrorCode"], code, "{observation}");
+        assert_eq!(observation["initialAddedDefinitions"], initial);
+        assert_eq!(observation["finalAddedDefinitions"], 1);
+        // The probe path is fresh by construction; this shows the observed
+        // production initializer actually ran on it.
+        assert_eq!(observation["coldInitializationEntered"], true);
+        for field in [
+            "baselinePreserved",
+            "storeNotReset",
+            "oneByteRestorePreservedOtherBytes",
+            "replayPreserved",
+        ] {
+            assert_eq!(observation[field], true, "{field}: {observation}");
+        }
+    }
+    // Both faults are refused by the cold initializer itself, before the
+    // definition command is reachable, and the refusal leaves the corrupted
+    // main file byte-for-byte as written. The control is never refused.
+    for observation in &observations[..2] {
+        assert_eq!(observation["refusalStage"], "cold_open", "{observation}");
+        assert_eq!(observation["refusalLeftMainFileUnchanged"], true);
+        assert_eq!(observation["coldInitializationCompleted"], false);
+        assert_eq!(observation["initialTransactionClosed"], Value::Null);
+    }
+    let control = &observations[2];
+    assert_eq!(control["refusalStage"], Value::Null, "{control}");
+    assert_eq!(control["refusalLeftMainFileUnchanged"], Value::Null);
+    assert_eq!(control["coldInitializationCompleted"], true);
+    assert_eq!(control["initialTransactionClosed"], true);
+}
+
+#[test]
+fn storage_corruption_suite_proves_populated_baselines_in_every_observed_table() {
+    for observation in storage_corruption_observations() {
+        let counts = observation["baselineTableRows"]
+            .as_array()
+            .expect("each case must prove populated preexisting state");
+        assert_eq!(counts.len(), 11);
+        assert!(
+            counts.iter().all(|count| count.as_u64().unwrap() > 0),
+            "{counts:?}"
+        );
+    }
+}
+
+#[test]
+fn storage_corruption_evidence_carries_no_locations_or_contents() {
+    let result = evaluate(&storage_corruption_request()).unwrap();
+    let text = serde_json::to_string(&result.evidence).unwrap();
+    for forbidden in [
+        "/",
+        "\\",
+        ".sqlite",
+        "probe",
+        "offset",
+        "Synthetic rich baseline",
+        "native adoption conformance probe",
+        "corruption-preexisting",
+        "adopt:",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden} leaked: {text}");
+    }
+}
+
+#[test]
+fn storage_corruption_suite_rejects_missing_controls_and_weakened_expectations() {
+    for (pointer, value) in [
+        ("/schemaVersion", json!("unknown")),
+        ("/cases/0/fault", json!("none")),
+        ("/cases/1/fault", json!("sqlite_header")),
+        ("/cases/2/fault", json!("definition_btree")),
+        (
+            "/cases/0/expected/initialOutcome",
+            json!("database_corrupt"),
+        ),
+        ("/cases/1/expected/initialOutcome", json!("not_a_database")),
+        ("/cases/2/expected/initialOutcome", json!("not_a_database")),
+        ("/cases/0/expected/initialRows", json!(1)),
+        ("/cases/2/expected/initialRows", json!(0)),
+        ("/cases/1/expected/finalRows", json!(0)),
+        ("/cases/1/expected/baselinePreserved", json!(false)),
+        ("/cases/1/expected/storeNotReset", json!(false)),
+        ("/cases/2/expected/replayPreserved", json!(false)),
+        ("/cases/0/adoptionKey", json!("")),
+        ("/cases/0/adoptionKey", json!("adopt:corruption:baseline")),
+        (
+            "/cases/1/adoptionKey",
+            json!("adopt:corruption:pending-result"),
+        ),
+        ("/cases/2/adoptionKey", json!("adopt:corruption:attempt-1")),
+        ("/cases/0/definition/id", json!("corruption-preexisting")),
+        (
+            "/cases/2/definition/id",
+            json!("corruption-preexisting-rich"),
+        ),
+        ("/cases/0/definition/status", json!("ACTIVE")),
+        (
+            "/cases/1/caseId",
+            json!("corrupt-header-refuses-then-recovers"),
+        ),
+        ("/cases/0/caseId", json!("../unsafe")),
+    ] {
+        let mut request = storage_corruption_request();
+        *request["vector"].pointer_mut(pointer).unwrap() = value;
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid",
+            "accepted weakened vector at {pointer}"
+        );
+    }
+}
+
+#[test]
+fn storage_corruption_suite_rejects_missing_duplicate_and_caller_chosen_fields() {
+    let mut missing = storage_corruption_request();
+    missing["vector"]["cases"].as_array_mut().unwrap().pop();
+    let mut duplicate = storage_corruption_request();
+    duplicate["vector"]["cases"][2] = duplicate["vector"]["cases"][0].clone();
+    let mut requests = vec![missing, duplicate];
+    for (pointer, field) in [
+        ("", "unknown"),
+        ("/cases/0", "path"),
+        ("/cases/0", "offset"),
+        ("/cases/1", "bytes"),
+        ("/cases/0/expected", "unknown"),
+    ] {
+        let mut request = storage_corruption_request();
+        request["vector"].pointer_mut(pointer).unwrap()[field] = json!(0);
+        requests.push(request);
+    }
+    for request in requests {
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn storage_corruption_suite_is_scheduler_reliability_only() {
+    let mut request = storage_corruption_request();
+    request["profile"] = json!("structural");
+    assert_eq!(
+        evaluate(&request).unwrap_err(),
+        "conformance suite is unsupported"
+    );
 }
