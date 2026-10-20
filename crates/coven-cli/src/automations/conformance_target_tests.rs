@@ -137,7 +137,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "retry-backoff-timing",
                         "retry-quarantine-recovery",
                         "scheduler-leadership-fencing",
-                        "startup-reconciliation-wake"
+                        "startup-reconciliation-wake",
+                        "result-delivery-recovery"
                     ]
                 },
                 {
@@ -2621,6 +2622,195 @@ fn storage_corruption_suite_rejects_missing_duplicate_and_caller_chosen_fields()
 #[test]
 fn storage_corruption_suite_is_scheduler_reliability_only() {
     let mut request = storage_corruption_request();
+    request["profile"] = json!("structural");
+    assert_eq!(
+        evaluate(&request).unwrap_err(),
+        "conformance suite is unsupported"
+    );
+}
+
+fn result_delivery_request() -> Value {
+    request_for_profile(
+        "scheduler_reliability",
+        "result-delivery-recovery",
+        serde_json::from_str(include_str!(
+            "../../../../conformance/automations/runner/result-delivery-recovery.vectors.json"
+        ))
+        .unwrap(),
+    )
+}
+
+fn result_delivery_observations() -> Vec<Value> {
+    let result = evaluate(&result_delivery_request()).unwrap();
+    assert_eq!(result.status, TargetSuiteStatus::Passed);
+    result.evidence.unwrap()["observations"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn result_delivery_suite_executes_every_fault_through_production_discharge() {
+    let observations = result_delivery_observations();
+    assert_eq!(observations.len(), 6);
+    for (observation, (fault, first, after_first, final_state, notices)) in
+        observations.iter().zip([
+            ("none", "delivered", "delivered", "delivered", 1),
+            ("gate_held", "deferred", "pending", "delivered", 1),
+            ("inbox_full", "deferred", "pending", "delivered", 1),
+            (
+                "discharge_rollback",
+                "pass_failed",
+                "pending",
+                "delivered",
+                1,
+            ),
+            ("gate_unavailable", "failed", "failed", "failed", 0),
+            ("unreadable_result", "failed", "failed", "failed", 0),
+        ])
+    {
+        assert_eq!(observation["faultSource"], fault, "{observation}");
+        assert_eq!(observation["obligationPendingBeforeFault"], true);
+        assert_eq!(observation["firstPass"], first, "{observation}");
+        assert_eq!(observation["stateAfterFirstPass"], after_first);
+        assert_eq!(observation["finalState"], final_state);
+        assert_eq!(observation["noticesForRun"], notices);
+        assert_eq!(observation["replayIsNoop"], true);
+        assert_eq!(observation["settledRecordImmutable"], true);
+        // Only a delivered first pass may leave a notice behind it.
+        assert_eq!(
+            observation["noticesAfterFirstPass"],
+            u64::from(first == "delivered")
+        );
+        let delivered = final_state == "delivered";
+        assert_eq!(
+            observation["recordNamesNotice"],
+            if delivered { json!(true) } else { Value::Null }
+        );
+    }
+    // The rollback is the fixture's own abort, after the notice insert; the
+    // notice rolled back with the record, so the run stayed pending.
+    assert_eq!(observations[3]["passFailureFromFixture"], true);
+    assert_eq!(observations[2]["waitingNoticesPreserved"], true);
+    assert_eq!(observations[4]["failureReason"], "gate_unavailable");
+    assert_eq!(observations[5]["failureReason"], "result_unreadable");
+    // The unreadable run fails alone: the run settled after it still posts.
+    assert_eq!(observations[5]["healthyRunDelivered"], true);
+    for (index, field) in [
+        (3, "passFailureFromFixture"),
+        (2, "waitingNoticesPreserved"),
+        (5, "healthyRunDelivered"),
+    ] {
+        for (other, observation) in observations.iter().enumerate() {
+            if other != index {
+                assert_eq!(observation[field], Value::Null, "{field}: {observation}");
+            }
+        }
+    }
+}
+
+#[test]
+fn result_delivery_evidence_carries_no_identifiers_or_contents() {
+    let result = evaluate(&result_delivery_request()).unwrap();
+    let text = serde_json::to_string(&result.evidence).unwrap();
+    for forbidden in [
+        "/",
+        "\\",
+        "delivery-conformance",
+        "conformance-delivery",
+        "conformance-handoff",
+        "Conformance handoff",
+        "native delivery conformance probe",
+        "instance:main",
+        "main-session-locks",
+        "notice-",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden} leaked: {text}");
+    }
+}
+
+#[test]
+fn result_delivery_suite_rejects_missing_controls_and_weakened_expectations() {
+    for (pointer, value) in [
+        (
+            "/schemaVersion",
+            json!("coven.automations.result-delivery-recovery-vectors.v2"),
+        ),
+        ("/cases/0/fault", json!("gate_held")),
+        ("/cases/5/fault", json!("none")),
+        ("/cases/0/expected/firstPass", json!("deferred")),
+        ("/cases/1/expected/firstPass", json!("delivered")),
+        ("/cases/3/expected/firstPass", json!("deferred")),
+        ("/cases/4/expected/firstPass", json!("deferred")),
+        (
+            "/cases/4/expected/failureReason",
+            json!("result_unreadable"),
+        ),
+        ("/cases/5/expected/failureReason", Value::Null),
+        ("/cases/2/expected/finalState", json!("pending")),
+        ("/cases/4/expected/finalState", json!("delivered")),
+        ("/cases/3/expected/finalNotices", json!(2)),
+        ("/cases/4/expected/finalNotices", json!(1)),
+        ("/cases/0/expected/replayIsNoop", json!(false)),
+        ("/cases/4/expected/settledRecordImmutable", json!(false)),
+        ("/cases/0/definition/outputTarget", Value::Null),
+        ("/cases/0/definition/outputTarget", json!({"kind": "notes"})),
+        ("/cases/0/definition/status", json!("ACTIVE")),
+        ("/cases/0/definition/cwd", json!("/work/project")),
+        ("/cases/1/caseId", json!("uninterrupted-delivery-control")),
+        ("/cases/0/caseId", json!("../unsafe")),
+    ] {
+        let mut request = result_delivery_request();
+        let vector = &mut request["vector"];
+        match vector.pointer_mut(pointer) {
+            Some(slot) => *slot = value,
+            None => {
+                let (parent, field) = pointer.rsplit_once('/').unwrap();
+                vector.pointer_mut(parent).unwrap()[field] = value;
+            }
+        }
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid",
+            "accepted weakened vector at {pointer}"
+        );
+    }
+}
+
+#[test]
+fn result_delivery_suite_rejects_missing_duplicate_and_caller_chosen_fields() {
+    let mut missing = result_delivery_request();
+    missing["vector"]["cases"].as_array_mut().unwrap().pop();
+    let mut duplicate = result_delivery_request();
+    duplicate["vector"]["cases"][5] = duplicate["vector"]["cases"][0].clone();
+    // A second control under its own case id, replacing a fault.
+    let mut duplicate_fault = result_delivery_request();
+    let mut control = duplicate_fault["vector"]["cases"][0].clone();
+    control["caseId"] = json!("second-uninterrupted-delivery-control");
+    duplicate_fault["vector"]["cases"][5] = control;
+    let mut requests = vec![missing, duplicate, duplicate_fault];
+    for (pointer, field) in [
+        ("", "unknown"),
+        ("/cases/0", "runId"),
+        ("/cases/1", "path"),
+        ("/cases/2", "noticeText"),
+        ("/cases/0/expected", "unknown"),
+    ] {
+        let mut request = result_delivery_request();
+        request["vector"].pointer_mut(pointer).unwrap()[field] = json!(0);
+        requests.push(request);
+    }
+    for request in requests {
+        assert_eq!(
+            evaluate(&request).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
+fn result_delivery_suite_is_scheduler_reliability_only() {
+    let mut request = result_delivery_request();
     request["profile"] = json!("structural");
     assert_eq!(
         evaluate(&request).unwrap_err(),
