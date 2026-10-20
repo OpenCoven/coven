@@ -1,2 +1,234 @@
 #[path = "fixtures/daemon_startup_diagnostics.rs"]
 mod daemon_startup_diagnostics;
+
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+
+const RUNTIME_PHASES: &[&str] = &[
+    "runtime-initialize-begin",
+    "orphaned-sessions-end",
+    "stale-created-sessions-end",
+    "afs-recovery-end",
+    "session-runtime-end",
+    "threads-scheduler-end",
+    "maintenance-scheduler-end",
+    "liveness-sweeper-end",
+    "automations-scheduler-end",
+    "mobile-gateway-end",
+    "api-accept-loop-enter",
+];
+
+struct OwnedChild(Child);
+
+impl OwnedChild {
+    fn terminate(&mut self) -> Result<()> {
+        if self.0.try_wait()?.is_none() {
+            self.0.kill().context("terminate own foreground daemon")?;
+        }
+        self.0.wait().context("reap own foreground daemon")?;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
+fn command(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coven"));
+    command.env_clear();
+    for name in ["PATH", "Path", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .args(args)
+        .current_dir(root)
+        .env("HOME", root.join("user"))
+        .env("USERPROFILE", root.join("user"))
+        .env("COVEN_HOME", root.join("coven"))
+        .env("XDG_CONFIG_HOME", root.join("user/config"))
+        .env("XDG_DATA_HOME", root.join("user/data"))
+        .env("XDG_CACHE_HOME", root.join("user/cache"))
+        .env("TMPDIR", root.join("tmp"))
+        .env("TMP", root.join("tmp"))
+        .env("TEMP", root.join("tmp"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn wait_exit(child: &mut OwnedChild, deadline: Instant) -> Result<ExitStatus> {
+    loop {
+        if let Some(status) = child.0.try_wait()? {
+            return Ok(status);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "owned command exceeded test hang guard"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_bounded(path: &Path) -> Result<String> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(64 * 1024)
+        .read_to_string(&mut text)?;
+    Ok(text)
+}
+
+fn assert_runtime_phases(home: &Path, expected: &[&str]) -> Result<()> {
+    let captured = daemon_startup_diagnostics::capture_startup_checkpoints(home);
+    let mut phases = Vec::new();
+    let mut previous_elapsed = 0;
+    let mut previous_observer = 0;
+    for line in captured.lines() {
+        let Some(fields) = line.strip_prefix("startup_checkpoint phase=") else {
+            continue;
+        };
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        if !RUNTIME_PHASES.contains(&fields[0]) {
+            continue;
+        }
+        phases.push(fields[0]);
+        let elapsed = fields[1]
+            .strip_prefix("elapsed_ms=")
+            .context("elapsed")?
+            .parse::<u128>()?;
+        let observer = fields[2]
+            .strip_prefix("prior_observer_ms=")
+            .context("observer")?
+            .parse::<u128>()?;
+        let interval = fields[3]
+            .strip_prefix("interval_us=")
+            .context("interval")?
+            .parse::<u128>()?;
+        assert!(
+            elapsed >= previous_elapsed && observer >= previous_observer,
+            "{captured}"
+        );
+        assert!(
+            observer <= elapsed && interval <= elapsed * 1000 + 999,
+            "{captured}"
+        );
+        previous_elapsed = elapsed;
+        previous_observer = observer;
+    }
+    assert_eq!(phases, expected, "{captured}");
+    Ok(())
+}
+
+fn exercise_startup(fail_mobile: bool, unavailable_log: bool) -> Result<()> {
+    // Short synthetic paths also fit the Unix socket pathname limit on macOS.
+    let temp_base = if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let temp = tempfile::Builder::new()
+        .prefix("coven-phases-")
+        .tempdir_in(temp_base)?;
+    let root = temp.path().canonicalize()?;
+    let home = root.join("coven");
+    for directory in [&home, &root.join("user"), &root.join("tmp")] {
+        fs::create_dir(directory)?;
+    }
+    if unavailable_log {
+        fs::create_dir(home.join("daemon-recovery.log"))?;
+    }
+    if fail_mobile {
+        let mobile = home.join("mobile");
+        fs::create_dir(&mobile)?;
+        let config = mobile.join("gateway.json");
+        fs::write(
+            &config,
+            r#"{"enabled":true,"bind":"192.168.1.10:0","advertisedEndpoint":"https://192.168.1.10"}"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&mobile, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let stderr_path = root.join("serve.stderr");
+    let mut daemon = OwnedChild(
+        command(&root, &["daemon", "serve"])
+            .stderr(File::create(&stderr_path)?)
+            .spawn()?,
+    );
+    // A harness hang guard, not a startup-performance assertion or a change
+    // to Coven's own lifecycle budget.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    if fail_mobile {
+        let status = wait_exit(&mut daemon, deadline)?;
+        assert!(
+            !status.success(),
+            "invalid enabled mobile configuration was accepted"
+        );
+        assert!(read_bounded(&stderr_path)?.contains("mobile gateway bind port must be non-zero"));
+        assert_runtime_phases(&home, &RUNTIME_PHASES[..9])?;
+    } else {
+        loop {
+            anyhow::ensure!(
+                daemon.0.try_wait()?.is_none(),
+                "foreground daemon exited before readiness"
+            );
+            let output = root.join("status.json");
+            let mut probe = OwnedChild(
+                command(&root, &["daemon", "status", "--json"])
+                    .stdout(File::create(&output)?)
+                    .spawn()?,
+            );
+            let status = wait_exit(&mut probe, deadline)?;
+            let result = read_bounded(&output)?;
+            if status.success() {
+                let status: serde_json::Value = serde_json::from_str(&result)?;
+                if status["status"] == "running" {
+                    assert_eq!(status["pid"].as_u64(), Some(u64::from(daemon.0.id())));
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "authenticated readiness exceeded test hang guard"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !unavailable_log {
+            assert_runtime_phases(&home, RUNTIME_PHASES)?;
+        }
+    }
+    daemon.terminate()?;
+    assert!(
+        daemon.0.try_wait()?.is_some(),
+        "owned daemon cleanup not confirmed"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_startup_checkpoints_cover_initialization_through_authenticated_serving() -> Result<()> {
+    exercise_startup(false, false)
+}
+
+#[test]
+fn native_startup_checkpoints_omit_completion_after_mobile_initialization_failure() -> Result<()> {
+    exercise_startup(true, false)
+}
+
+#[test]
+fn native_startup_checkpoints_remain_advisory_when_log_is_unavailable() -> Result<()> {
+    exercise_startup(false, true)
+}
