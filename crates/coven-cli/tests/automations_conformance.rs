@@ -169,7 +169,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "result-delivery-recovery",
                         "result-delivery-process-crash-recovery",
                         "run-settlement-process-crash-recovery",
-                        "run-launch-process-crash-recovery"
+                        "run-launch-process-crash-recovery",
+                        "attempt-retry-process-crash-recovery"
                     ]
                 },
                 {
@@ -2069,6 +2070,118 @@ fn native_target_evaluates_checked_in_run_launch_process_crash_vectors() -> anyh
     let rejected = run_target(
         &coven_home,
         "run-launch-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_attempt_retry_process_crash_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/attempt-retry-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "attempt-retry-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "attempt-retry-process-crash-recovery");
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 6);
+    assert_eq!(response["evidence"]["passedCases"], 6);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("retry crash observations");
+    assert_eq!(observations.len(), 6);
+    for (observation, (boundary, committed)) in observations.iter().zip([
+        ("after_attempt", false),
+        ("after_replan", false),
+        ("after_release", false),
+        ("after_adoption", false),
+        ("after_commit", true),
+        ("none", true),
+    ]) {
+        let killed = boundary != "none";
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(
+            observation["transactionOpenAtPause"],
+            if killed {
+                json!(!committed)
+            } else {
+                json!(null)
+            }
+        );
+        let at_exit = if committed { "retried" } else { "held" };
+        assert_eq!(
+            observation["retryAtPause"],
+            if killed { json!(at_exit) } else { json!(null) }
+        );
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["retryAfterExit"], at_exit);
+        assert_eq!(observation["sessionsAfterExit"], 1);
+        assert_eq!(observation["recoveryRefused"], false);
+        assert_eq!(observation["restartLaunches"], u64::from(committed));
+        assert_eq!(
+            observation["retryAfterRestart"],
+            if committed { "relaunched" } else { "held" }
+        );
+        assert_eq!(
+            observation["reissue"],
+            if committed { "replayed" } else { "committed" }
+        );
+        assert_eq!(
+            observation["retryAfterReissue"],
+            if committed { "relaunched" } else { "retried" }
+        );
+        assert_eq!(observation["launches"], 1);
+        assert_eq!(observation["finalRetry"], "succeeded");
+        assert_eq!(observation["finalSessions"], 2);
+        assert_eq!(observation["replayIsNoop"], true);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "attempt-retry-crash-worker",
         Some(&invalid["vector"]["cases"][0]),
     )?;
     assert!(!rejected.status.success());

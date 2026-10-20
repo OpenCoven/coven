@@ -368,14 +368,25 @@ fn launch(conn: &Connection) -> Result<(Launch, u64), &'static str> {
 /// Every occurrence, run, attempt, event and session row, for an exact
 /// before/after comparison.
 fn snapshot(conn: &Connection) -> Result<Vec<Vec<rusqlite::types::Value>>, &'static str> {
+    snapshot_tables(
+        conn,
+        &[
+            "automation_occurrences",
+            "automation_runs",
+            "automation_attempts",
+            "automation_events",
+            "sessions",
+        ],
+    )
+}
+
+/// Every row of `tables`, in table and key order.
+pub(super) fn snapshot_tables(
+    conn: &Connection,
+    tables: &[&str],
+) -> Result<Vec<Vec<rusqlite::types::Value>>, &'static str> {
     let mut rows = Vec::new();
-    for table in [
-        "automation_occurrences",
-        "automation_runs",
-        "automation_attempts",
-        "automation_events",
-        "sessions",
-    ] {
+    for table in tables {
         let mut statement = conn
             .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
             .map_err(|_| FAILED)?;
@@ -395,12 +406,12 @@ fn snapshot(conn: &Connection) -> Result<Vec<Vec<rusqlite::types::Value>>, &'sta
 
 /// A no-op runtime that counts the launches the restarted daemon makes.
 #[derive(Default)]
-struct CountingRuntime {
+pub(super) struct CountingRuntime {
     launches: AtomicUsize,
 }
 
 impl CountingRuntime {
-    fn launches(&self) -> u64 {
+    pub(super) fn launches(&self) -> u64 {
         self.launches.load(Ordering::SeqCst) as u64
     }
 }
@@ -446,7 +457,7 @@ impl AutomationClock for FixedClock {
 }
 
 /// One scheduler pass at `now`, as the daemon's scheduler thread runs it.
-fn pass(
+pub(super) fn pass(
     home: &Path,
     runtime: &CountingRuntime,
     leadership: &SchedulerLeadership,
@@ -496,7 +507,7 @@ fn acquire_leadership(
 /// The daemon's startup order without its scheduler thread: session recovery
 /// (`daemon.rs`), then scheduler leadership, its startup recovery and its
 /// startup pass (`daemon_tick.rs`).
-fn restart(
+pub(super) fn restart(
     home: &Path,
     runtime: &CountingRuntime,
     now: DateTime<Utc>,
