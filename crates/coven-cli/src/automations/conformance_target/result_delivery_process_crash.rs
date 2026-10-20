@@ -2,16 +2,17 @@
 //! settled run's result and is killed at a delivery boundary. No runtime
 //! launch, inbox turn or release claim.
 use std::collections::BTreeSet;
-use std::path::{Component, Path};
-use std::sync::OnceLock;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{functions::FunctionFlags, Connection, ErrorCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::command_process_crash_recovery::{
     abruptly_terminated, announce, spawn_worker, CHILD_GUARD, SCRATCH_ENV,
+};
+use super::process_crash_fixture::{
+    install_pause, open_raw, raw_integrity_ok, worker_home, write_transaction_open, Pause,
 };
 use super::result_delivery_recovery::{at, notices_for, settle_run, state, DeliveryState, BASE};
 use super::valid_case_id;
@@ -26,7 +27,6 @@ const SCHEMA_VERSION: &str = "coven.automations.result-delivery-process-crash-re
 const WORKER: &str = "result-delivery-crash-worker";
 const HOME_PREFIX: &str = "delivery-crash-";
 const RUN_ID: &str = "delivery-crash-run";
-const PAUSE_FUNCTION: &str = "coven_delivery_crash_pause";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -133,25 +133,6 @@ fn base() -> Result<DateTime<Utc>, &'static str> {
         .with_timezone(&Utc))
 }
 
-/// The worker's handshake when it pauses. The pause runs inside SQLite (a
-/// trigger function or the WAL hook), which cannot capture it.
-static PAUSE: OnceLock<Value> = OnceLock::new();
-
-/// Announces the pause, then parks until the parent kills this process.
-fn pause() -> ! {
-    if let Some(message) = PAUSE.get() {
-        let _ = announce(message);
-    }
-    loop {
-        std::thread::park();
-    }
-}
-
-/// Runs after SQLite has committed a transaction to the WAL.
-fn pause_after_commit(_: &rusqlite::hooks::Wal, _: std::ffi::c_int) -> rusqlite::Result<()> {
-    pause()
-}
-
 /// Hidden worker: its input cannot choose a database. Every invocation creates
 /// a fresh random child directory under the caller's conformance scratch root.
 /// The parent owns that root and removes it after killing/reaping this worker.
@@ -176,36 +157,19 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
     let definition = RoutineDefinition::from_json(&case.definition).map_err(|_| INVALID)?;
     crate::automations::store::insert_definition(&conn, &definition).map_err(|_| FAILED)?;
     settle_run(&conn, base, &definition.id, RUN_ID, 0)?;
-    if case.boundary != Boundary::None {
-        let message =
-            json!({"state":"paused", "boundary":case.boundary, "relativeHome":relative_home});
-        PAUSE.set(message).map_err(|_| FAILED)?;
-    }
-    // `open_store` already set `wal_autocheckpoint`, which would replace the hook.
-    if case.boundary == Boundary::AfterCommit {
-        conn.wal_hook(Some(pause_after_commit));
-    }
-    let trigger = match case.boundary {
-        Boundary::AfterNotice => Some("AFTER INSERT ON main.session_notices"),
-        Boundary::AfterRecord => Some(
+    let pause_at = match case.boundary {
+        Boundary::AfterNotice => Some(Pause::After("AFTER INSERT ON main.session_notices")),
+        Boundary::AfterRecord => Some(Pause::After(
             "AFTER UPDATE OF delivery_state ON main.automation_runs
              WHEN NEW.delivery_state = 'delivered'",
-        ),
-        Boundary::AfterCommit | Boundary::None => None,
+        )),
+        Boundary::AfterCommit => Some(Pause::AfterCommit),
+        Boundary::None => None,
     };
-    if let Some(trigger) = trigger {
-        conn.create_scalar_function(
-            PAUSE_FUNCTION,
-            0,
-            FunctionFlags::SQLITE_UTF8,
-            |_| -> rusqlite::Result<i64> { pause() },
-        )
-        .map_err(|_| FAILED)?;
-        conn.execute_batch(&format!(
-            "CREATE TEMP TRIGGER coven_delivery_crash_fixture {trigger}
-             BEGIN SELECT {PAUSE_FUNCTION}(); END;"
-        ))
-        .map_err(|_| FAILED)?;
+    if let Some(pause_at) = pause_at {
+        let handshake =
+            json!({"state":"paused", "boundary":case.boundary, "relativeHome":relative_home});
+        install_pause(&conn, pause_at, handshake)?;
     }
     let report = deliver_pending_results(&home, &conn, None, at(base, 180)).map_err(|_| FAILED)?;
     if case.boundary != Boundary::None || report.delivered != [RUN_ID] {
@@ -256,19 +220,8 @@ pub(super) fn evaluate(vector: &Value) -> Result<(bool, Vec<Value>), &'static st
 /// The parent's view of the store while the worker is paused: whether the
 /// worker's write transaction is still open, and the run's committed state.
 fn observe_pause(path: &Path) -> Result<(bool, DeliveryState), &'static str> {
-    let probe = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|_| FAILED)?;
-    probe
-        .busy_timeout(std::time::Duration::ZERO)
-        .map_err(|_| FAILED)?;
-    let open = match probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
-        Ok(()) => false,
-        Err(error) if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => true,
-        Err(_) => return Err(FAILED),
-    };
+    let probe = open_raw(path)?;
+    let open = write_transaction_open(&probe)?;
     let (state, _) = state(&probe, RUN_ID)?;
     Ok((open, state))
 }
@@ -316,23 +269,11 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
     let (mut process, receiver) = spawn_worker::<Handshake>(WORKER, payload, root.path())?;
     let ready = receiver.recv_timeout(CHILD_GUARD).map_err(|_| FAILED)??;
     let crash = case.boundary != Boundary::None;
-    let mut components = Path::new(&ready.relative_home).components();
-    if ready.boundary != case.boundary
-        || ready.state != if crash { "paused" } else { "delivered" }
-        || !ready.relative_home.starts_with(HOME_PREFIX)
-        || !matches!(components.next(), Some(Component::Normal(_)))
-        || components.next().is_some()
+    if ready.boundary != case.boundary || ready.state != if crash { "paused" } else { "delivered" }
     {
         return Err(FAILED);
     }
-    let home = root
-        .path()
-        .join(&ready.relative_home)
-        .canonicalize()
-        .map_err(|_| FAILED)?;
-    if !home.starts_with(root.path().canonicalize().map_err(|_| FAILED)?) {
-        return Err(FAILED);
-    }
+    let home = worker_home(root.path(), &ready.relative_home, HOME_PREFIX)?;
     let path = home.join("store.sqlite");
     // The paused worker is inside delivery, so it still holds the gate.
     let gate_held_at_pause = crash
@@ -359,25 +300,7 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
     }
     drop(process);
     let gate_released = gate_released(&home)?;
-
-    if !std::fs::symlink_metadata(&path)
-        .map_err(|_| FAILED)?
-        .is_file()
-    {
-        return Err(FAILED);
-    }
-    // Observe raw recovery before the production initializer can repair schema
-    // or metadata. Never create a replacement database if the worker lost it.
-    let raw = Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|_| FAILED)?;
-    let integrity: String = raw
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|_| FAILED)?;
-    drop(raw);
-    let integrity_ok = integrity == "ok";
+    let integrity_ok = raw_integrity_ok(&path)?;
 
     let base = base()?;
     let conn = crate::store::open_store(&path).map_err(|_| FAILED)?;

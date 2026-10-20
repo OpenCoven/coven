@@ -230,6 +230,7 @@ The checked-in
 [`startup-reconciliation-wake.vectors.json`](startup-reconciliation-wake.vectors.json),
 [`result-delivery-recovery.vectors.json`](result-delivery-recovery.vectors.json),
 [`result-delivery-process-crash-recovery.vectors.json`](result-delivery-process-crash-recovery.vectors.json),
+[`run-settlement-process-crash-recovery.vectors.json`](run-settlement-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -293,7 +294,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements twelve structural suites, eighteen
+The native Coven target currently implements twelve structural suites, nineteen
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -678,4 +679,50 @@ never carry run or notice ids, notice text, paths, handshakes or output. This
 is `audit_only` evidence for a process kill inside one delivery. It does not
 cover power loss or unsynced pages, a kill inside a failure record, the idle
 session offer, per-familiar scopes (#857), load, complete profiles or release
+eligibility.
+
+## Run settlement process-crash audit boundary
+
+The `run-settlement-process-crash-recovery` suite kills the process that is
+settling a run whose session has ended. Settlement writes the occurrence's
+terminal state, the attempt's terminal state, and the run's terminal status
+with its pinned delivery obligation, in one transaction. Each of five cases
+starts the exact audited binary as a hidden worker with the same harness as
+`result-delivery-process-crash-recovery`. The worker stores the fixed synthetic
+paused, main-session-targeted definition, launches one run through
+`run_routine_now` with a no-op runtime, ends its session with exit code 0, and
+runs `settle_finished_runs`. Vectors cannot choose a path, run, definition or
+pause mechanics, and every expected outcome is fixed per boundary.
+
+- **After occurrence, after attempt, after run:** a fixture TEMP trigger
+  pauses the worker after that terminal update, inside the settlement
+  transaction.
+- **After commit:** the settling connection's WAL hook pauses it once SQLite
+  has committed the settlement.
+- **Control:** no pause. The worker settles the run and exits.
+
+While the worker is paused, the parent must fail to begin a write transaction
+before the commit and read the run, attempt and occurrence exactly as the
+launch left them. After the commit, it must begin one, and read all three
+settled with a `pending` obligation. The parent then kills and reaps the
+worker, and the store's raw integrity check must pass.
+
+After the kill, a run killed before the commit must be unsettled with no
+obligation, and one killed after it settled with its obligation pending; no
+notice exists either way. The parent then runs the settlement and delivery
+steps of the daemon's reconciliation, in its order, with no runtime and so no
+idle-session offer. The steps before them recover containment, expired
+cancellations, abandoned launches and timeouts, none of which these cases
+hold. It must settle a killed-before-commit run once, never settle a settled
+run again, and deliver each run's result once, with the record naming its one
+notice. A store that recovery refuses fails the case. A further
+reconciliation from a fresh connection must change nothing.
+
+Observations carry boundary, settlement, state and pass classes, counts and
+booleans. They never carry run, attempt, occurrence, session or notice ids,
+notice text, paths, handshakes or output. As with delivery, these cases do not
+require uncommitted frames in the WAL. This is `audit_only` evidence for a
+process kill inside one plain successful settlement. It does not cover kills
+during dispatch or launch, held-for-retry, timeout, cancellation or Runtime
+Authority settlement, power loss, load, complete profiles or release
 eligibility.
