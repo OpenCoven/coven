@@ -57,6 +57,14 @@ start with the [README](README.md) and the canonical
 
 ## Local Development
 
+Use `bash scripts/dev-verify.sh --quick` for the fast verification loop,
+`--pr` for local PR preparation, or `--full` for additional native feature
+checks. Add `--plan` to inspect the commands without executing them. The
+[verification contract](docs/development/dev-verification.md) defines every
+tier, prerequisite, failure status, and check that remains CI-only. Local
+success does not replace the protected-main CI gate. The canonical commands
+below remain usable individually.
+
 1. Build the workspace:
 
 ```bash
