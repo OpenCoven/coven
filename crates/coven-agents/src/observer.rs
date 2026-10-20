@@ -23,6 +23,8 @@ pub enum RunFailureKind {
     /// A tool was in flight when a stop arrived and did not prove it
     /// produced no effect.
     TerminationUnknown,
+    /// A tool reported a descendant invocation whose termination is unknown.
+    RecoveryRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

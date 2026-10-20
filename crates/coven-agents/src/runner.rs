@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -66,6 +66,54 @@ impl std::error::Error for DelegationFailure {
     }
 }
 
+/// What a failed delegated child means for its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DelegationDisposition {
+    /// The child failed or was refused, and nothing about its outcome is
+    /// ambiguous beyond what its partial transcript shows.
+    Failed,
+    /// The child acknowledged a stop with no tool in flight.
+    Cancelled,
+    /// The child, or a descendant, left an effect whose outcome is unknown.
+    /// The parent must reconcile it before any retry.
+    RecoveryRequired,
+}
+
+impl DelegationFailure {
+    pub fn disposition(&self) -> DelegationDisposition {
+        match &self.failure.error {
+            error if error.leaves_unknown_effect() => DelegationDisposition::RecoveryRequired,
+            RunError::Cancelled { .. } => DelegationDisposition::Cancelled,
+            _ => DelegationDisposition::Failed,
+        }
+    }
+}
+
+type ActiveChildren = Mutex<BTreeMap<InvocationId, usize>>;
+
+/// One running delegated child, counted against its parent until dropped.
+/// Dropping the run's future releases the slot too.
+struct ChildSlot<'a> {
+    active: &'a ActiveChildren,
+    parent: InvocationId,
+}
+
+impl Drop for ChildSlot<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Entry::Occupied(mut entry) = active.entry(self.parent) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+
 /// What bounds one run beyond its options: whether the request must name an
 /// exact revision, the policy every agent runs under, and explicitly selected
 /// context in place of session history. The legacy entry points use the
@@ -103,6 +151,8 @@ where
     observer: Arc<dyn RunObserver>,
     invocation_observer: Arc<dyn InvocationObserver>,
     clock: Arc<dyn Clock>,
+    child_limit: Option<usize>,
+    active_children: ActiveChildren,
 }
 
 impl<C> Runner<C>
@@ -176,6 +226,8 @@ where
             observer: Arc::new(NoopObserver),
             invocation_observer: Arc::new(NoopInvocationObserver),
             clock: Arc::new(SystemClock::default()),
+            child_limit: None,
+            active_children: Mutex::default(),
         })
     }
 
@@ -198,6 +250,36 @@ where
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Allows at most `limit` delegated children of the same parent
+    /// invocation to run on this runner at once. A delegation beyond the
+    /// limit is refused before its target runs. Unlimited by default.
+    pub fn with_child_limit(mut self, limit: usize) -> Self {
+        self.child_limit = Some(limit);
+        self
+    }
+
+    fn acquire_child_slot(
+        &self,
+        parent: Option<InvocationId>,
+    ) -> Result<Option<ChildSlot<'_>>, RunError> {
+        let (Some(limit), Some(parent)) = (self.child_limit, parent) else {
+            return Ok(None);
+        };
+        let mut active = self
+            .active_children
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let running = active.get(&parent).copied().unwrap_or(0);
+        if running >= limit {
+            return Err(RunError::ChildLimitExceeded { parent, limit });
+        }
+        active.insert(parent, running + 1);
+        Ok(Some(ChildSlot {
+            active: &self.active_children,
+            parent,
+        }))
     }
 
     fn registered_agent_ref(&self, id: &AgentId) -> Option<AgentRef> {
@@ -400,6 +482,26 @@ where
         resolver: &dyn ContextResolver<C>,
         context: &C,
     ) -> Result<DelegationResult, DelegationFailure> {
+        self.run_delegation_controlled(delegation, resolver, context, RunControls::default())
+            .await
+    }
+
+    /// Runs one prepared delegation under controls derived from its parent,
+    /// usually [`RunSignal::child_controls`].
+    ///
+    /// The child stops when the parent's token is cancelled or its own is.
+    /// Its deadline is the earlier of `controls`' timeout and the spec's
+    /// budget timeout. With [`Runner::with_child_limit`], a delegation beyond
+    /// the parent's limit is refused with [`RunFailureKind::Limit`] before
+    /// its target runs. [`DelegationFailure::disposition`] tells the parent
+    /// whether the child failed, was cancelled, or requires recovery.
+    pub async fn run_delegation_controlled(
+        &self,
+        delegation: PreparedDelegation,
+        resolver: &dyn ContextResolver<C>,
+        context: &C,
+        controls: RunControls,
+    ) -> Result<DelegationResult, DelegationFailure> {
         let (invocation, source, spec, digests) = delegation.into_parts();
         let requested_target = match spec.target.revision() {
             Some(_) => spec.target.clone(),
@@ -412,6 +514,33 @@ where
             InvocationSource::Agent { agent: source },
             requested_target,
         );
+
+        let _slot = match self.acquire_child_slot(request.invocation.parent_id) {
+            Ok(slot) => slot,
+            Err(error) => {
+                return Err(DelegationFailure {
+                    digests: Box::new(digests),
+                    failure: Box::new(self.refuse_before_start(
+                        &request,
+                        spec.task.as_str(),
+                        error,
+                    )),
+                });
+            }
+        };
+
+        let timeout = match (controls.timeout(), spec.budget.timeout()) {
+            (Some(parent), Some(own)) => Some(parent.min(own)),
+            (parent, own) => parent.or(own),
+        };
+        let mut child_controls = RunControls::new();
+        if let Some(token) = controls.cancellation() {
+            child_controls = child_controls.with_cancellation(token.clone());
+        }
+        if let Some(timeout) = timeout {
+            child_controls = child_controls.with_timeout(timeout);
+        }
+
         let options = RunOptions {
             max_turns: spec.budget.max_turns(),
             max_handoffs: spec.budget.max_handoffs(),
@@ -424,7 +553,7 @@ where
                 max_output_bytes: Some(spec.result.max_output_bytes()),
             },
             context: Some((&spec.context, resolver)),
-            controls: RunControls::default(),
+            controls: child_controls,
         };
         match self
             .run_invocation_inner(request, spec.task.as_str(), context, options, scope)
@@ -435,6 +564,38 @@ where
                 digests: Box::new(digests),
                 failure: Box::new(failure),
             }),
+        }
+    }
+
+    /// Refuses an admitted request before any agent runs, with the same
+    /// paired lifecycle events as any other pre-execution failure.
+    fn refuse_before_start(
+        &self,
+        request: &InvocationRequest,
+        input: &str,
+        error: RunError,
+    ) -> RunFailure {
+        let emitter = RunEmitter::new(
+            self.observer.as_ref(),
+            self.invocation_observer.as_ref(),
+            request,
+        );
+        let target = request.requested_target.id().clone();
+        emitter.run_event(RunEvent::RunStarted {
+            invocation: request.invocation.clone(),
+            starting_agent: target.clone(),
+        });
+        emitter.invocation_event(InvocationEventKind::Started {});
+        let error = emitter.fail(&target, None, RunFailureKind::Limit, error);
+        RunFailure {
+            invocation: Box::new(request.invocation.clone()),
+            error,
+            new_items: vec![RunItem::UserMessage {
+                content: input.to_owned(),
+            }]
+            .into_boxed_slice(),
+            turns: 0,
+            handoffs: 0,
         }
     }
 
@@ -596,7 +757,7 @@ where
             self.invocation_observer.as_ref(),
             request,
         );
-        let signal = RunSignal::start(scope.controls, Arc::clone(&self.clock));
+        let signal = RunSignal::new(scope.controls, Arc::clone(&self.clock));
         let starting_agent = request.requested_target.id().clone();
         emitter.run_event(RunEvent::RunStarted {
             invocation: request.invocation.clone(),
@@ -770,6 +931,8 @@ mod tests {
             observer: Arc::new(NoopObserver),
             invocation_observer: Arc::new(NoopInvocationObserver),
             clock: Arc::new(SystemClock::default()),
+            child_limit: None,
+            active_children: Mutex::default(),
         };
         let request = InvocationRequest::new(
             InvocationContext::root(InvocationId::new()),

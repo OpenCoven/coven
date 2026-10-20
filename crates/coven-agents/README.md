@@ -11,6 +11,9 @@ primitives:
 - agent handoffs (control transfer within one run, not child delegation)
 - bounded child delegation with selected context and attenuated authority
 - cooperative cancellation and deadlines on an injectable clock
+- parent-to-child cancellation, deadlines and concurrency bounds for
+  delegated children, with a recovery disposition when a child's effect is
+  unknown
 - blocking input and output guardrails
 - fail-closed review of proposed tool calls before dispatch
 - pluggable session journals
@@ -91,9 +94,10 @@ invocation may use, and the grant is what the host vouches for. Resource
 names are proven as subsets at the boundary; the crate does not execute
 resources, so tools and the host enforce `AuthorityScope::resources` against
 the context they are given. Delegation here is local execution with
-correlation: it does not adopt, persist, retry, cancel, time out, or place the
-child anywhere. Legacy `Handoff` remains available as in-run control transfer
-during migration.
+correlation: it does not adopt, persist, retry, or place the child anywhere.
+A delegated child can be cancelled and bounded in time, as described under
+[delegated children](#delegated-children). Legacy `Handoff` remains available
+as in-run control transfer during migration.
 
 ## Deadlines and cancellation
 
@@ -134,8 +138,38 @@ is recorded and the run is acknowledged as cancelled at the next checkpoint.
 Once a final output passes policy, the run completes even if a stop arrives
 afterwards. These are in-memory outcomes of one local run. They are not
 persisted states, adoption decisions, or proof that an external process
-stopped. Parent/child propagation for delegated runs, concurrency bounds, and
-the parent-side recovery disposition are the next step.
+stopped.
+
+### Delegated children
+
+`Runner::run_delegation_controlled` runs a prepared delegation under controls
+derived from its parent, usually `RunSignal::child_controls()`. Cancelling the
+parent's token stops the child; cancelling the child never stops the parent.
+The child's deadline is the earlier of the parent's remaining time and the
+spec's own `DelegationBudget::with_timeout`. When the parent's budget has a
+timeout, `PreparedDelegation::prepare` refuses a child with none or a longer
+one (`DeadlineWidened`). A host that orchestrates delegation outside any run
+can start a `RunSignal::new` to derive child controls from.
+
+`Runner::with_child_limit(n)` lets at most `n` delegated children of one
+parent invocation run at once on that runner. A child beyond the limit is
+refused with `ChildLimitExceeded` before its target runs, as a `Limit`
+failure with the usual paired lifecycle events. A slot is released when the
+child finishes or its future is dropped. There is no limit by default.
+
+`DelegationFailure::disposition()` tells the parent what a failed child means:
+
+- **Failed.** The child failed or was refused, and nothing about its outcome
+  is ambiguous beyond its partial transcript.
+- **Cancelled.** The child acknowledged a stop with no tool in flight.
+- **Recovery required.** The child, or one of its descendants, left an effect
+  whose outcome is unknown (`TerminationUnknown` or `RecoveryRequired`).
+
+A tool that returns such a child failure fails its own run as
+`RecoveryRequired`, with the call id, whether or not a stop arrived. It
+counts even when wrapped in another error, as long as the wrapper reports
+its source. That outcome outranks a clean cancellation, and the work must be
+reconciled before any retry.
 
 ## Tool proposal review
 
@@ -266,8 +300,7 @@ not establish distributed fencing.
 The existing `Runner` provides local control transfer, correlation, and
 bounded local delegation with selected context and attenuated authority.
 `GoalLoopRunner` journals iteration boundaries; it does not supply durable
-child invocation adoption or shared executor conformance. Delegated
-cancellation propagation and child concurrency bounds, durable invocation
+child invocation adoption or shared executor conformance. Durable invocation
 adoption/recovery, remote executors, unified observability, and removal of
 legacy handoff/full-transcript behavior remain deferred under #804.
 

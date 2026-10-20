@@ -4,8 +4,8 @@
 //! This is the structured replacement for treating a legacy handoff as
 //! delegation. A [`DelegationSpec`] names the target, a bounded task input,
 //! a [`ContextManifest`] of references with provenance, the
-//! [`AuthorityScope`] the child may hold, a turn/handoff budget, and the
-//! result contract the parent will accept. [`PreparedDelegation::prepare`]
+//! [`AuthorityScope`] the child may hold, a turn, handoff and optional
+//! timeout budget, and the result contract the parent will accept. [`PreparedDelegation::prepare`]
 //! proves the spec against the parent's [`DelegationGrant`] before anything is
 //! dispatched: every check fails closed, and nothing is silently narrowed.
 //!
@@ -16,10 +16,12 @@
 //! names and references, and context travels as digests that the runner
 //! verifies against what the host resolves.
 //!
-//! Wall-clock deadlines, cancellation, durable adoption, retries and remote
+//! A child's timeout may never widen a bounded parent's. At run time,
+//! `Runner::run_delegation_controlled` propagates the parent's cancellation
+//! and remaining deadline to the child. Durable adoption, retries and remote
 //! executors remain outside this contract (see OpenCoven/coven#804).
 
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -64,6 +66,8 @@ pub enum DelegationSpecError {
     TooManyAuthorityEntries { field: &'static str, count: usize },
     #[error("budget must allow at least one model turn")]
     ZeroTurnBudget,
+    #[error("a delegation timeout must be at least one millisecond")]
+    ZeroTimeout,
     #[error("result contract must accept at least one output byte")]
     ZeroResultBudget,
 }
@@ -493,13 +497,17 @@ impl TryFrom<RawAuthorityScope> for AuthorityScope {
     }
 }
 
-/// Model-turn and control-transfer budget for one invocation. Wall-clock
-/// deadlines and cancellation are a separate, later contract.
+/// Model-turn, control-transfer and optional wall-clock budget for one
+/// invocation. The timeout is measured on the runner's clock from when the
+/// child starts; at run time the child's deadline is also capped by whatever
+/// remains of its parent's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawDelegationBudget")]
 pub struct DelegationBudget {
     max_turns: usize,
     max_handoffs: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -507,6 +515,8 @@ pub struct DelegationBudget {
 struct RawDelegationBudget {
     max_turns: usize,
     max_handoffs: usize,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 impl DelegationBudget {
@@ -517,7 +527,18 @@ impl DelegationBudget {
         Ok(Self {
             max_turns,
             max_handoffs,
+            timeout_ms: None,
         })
+    }
+
+    /// Bounds the invocation to `timeout`, at millisecond resolution.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, DelegationSpecError> {
+        let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        if millis == 0 {
+            return Err(DelegationSpecError::ZeroTimeout);
+        }
+        self.timeout_ms = Some(millis);
+        Ok(self)
     }
 
     pub fn max_turns(&self) -> usize {
@@ -528,7 +549,22 @@ impl DelegationBudget {
         self.max_handoffs
     }
 
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout_ms.map(Duration::from_millis)
+    }
+
     fn check_within(&self, parent: &DelegationBudget) -> Result<(), AuthorityError> {
+        if let Some(parent_ms) = parent.timeout_ms {
+            if self
+                .timeout_ms
+                .is_none_or(|requested| requested > parent_ms)
+            {
+                return Err(AuthorityError::DeadlineWidened {
+                    parent_ms,
+                    requested_ms: self.timeout_ms,
+                });
+            }
+        }
         if self.max_turns > parent.max_turns {
             return Err(AuthorityError::BudgetExceeded {
                 field: "max_turns",
@@ -551,7 +587,11 @@ impl TryFrom<RawDelegationBudget> for DelegationBudget {
     type Error = DelegationSpecError;
 
     fn try_from(raw: RawDelegationBudget) -> Result<Self, Self::Error> {
-        Self::new(raw.max_turns, raw.max_handoffs)
+        let budget = Self::new(raw.max_turns, raw.max_handoffs)?;
+        match raw.timeout_ms {
+            Some(millis) => budget.with_timeout(Duration::from_millis(millis)),
+            None => Ok(budget),
+        }
     }
 }
 
@@ -634,6 +674,13 @@ pub enum AuthorityError {
     },
     #[error("context reference `{reference}` is not held by the parent")]
     ContextLeak { reference: String },
+    #[error(
+        "child timeout {requested_ms:?} ms is unbounded or exceeds the parent timeout of {parent_ms} ms"
+    )]
+    DeadlineWidened {
+        parent_ms: u64,
+        requested_ms: Option<u64>,
+    },
 }
 
 /// What a delegating invocation holds. A root grant is a trusted host
@@ -678,7 +725,8 @@ pub struct PreparedDelegation {
 impl PreparedDelegation {
     /// Proves `spec` against `grant`, in this order: the parent may delegate
     /// at all; same project; tools ⊆; resources ⊆; no delegation widening;
-    /// budget ≤; every context reference is one the parent holds. The first
+    /// timeout, turns and handoffs ≤ the parent's; every context reference is
+    /// one the parent holds. The first
     /// failure is returned and nothing is dispatched.
     pub fn prepare(grant: &DelegationGrant, spec: DelegationSpec) -> Result<Self, AuthorityError> {
         if !grant.authority.may_delegate() {

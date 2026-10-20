@@ -1,7 +1,8 @@
 use thiserror::Error;
 
 use crate::{
-    AgentId, AgentRef, AgentRefError, ContentDigest, InvocationContext, RunItem, StopReason,
+    AgentId, AgentRef, AgentRefError, ContentDigest, InvocationContext, InvocationId, RunItem,
+    StopReason,
 };
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -133,6 +134,18 @@ pub enum RunError {
         #[source]
         source: BoxError,
     },
+    #[error(
+        "tool call `{call_id}` for agent `{agent}` reported a descendant whose termination is \
+         unknown; reconcile it before any retry"
+    )]
+    RecoveryRequired {
+        agent: AgentId,
+        call_id: String,
+        #[source]
+        source: BoxError,
+    },
+    #[error("parent invocation `{parent}` already has {limit} delegated children running")]
+    ChildLimitExceeded { parent: InvocationId, limit: usize },
     #[error("agent `{agent}` reused tool call id `{call_id}`")]
     DuplicateToolCallId { agent: AgentId, call_id: String },
     #[error("tool `{tool}` for agent `{agent}` failed")]
@@ -177,6 +190,34 @@ pub struct RunFailure {
     pub turns: usize,
     /// Handoffs performed before the failure.
     pub handoffs: usize,
+}
+
+impl RunError {
+    /// Whether this failure leaves an effect whose outcome is unknown, here
+    /// or in a descendant, so that work must be reconciled before any retry.
+    pub fn leaves_unknown_effect(&self) -> bool {
+        matches!(
+            self,
+            Self::TerminationUnknown { .. } | Self::RecoveryRequired { .. }
+        )
+    }
+}
+
+/// Whether `error`, or any error in its source chain, is a [`RunError`] that
+/// leaves an unknown effect. Wrapping a child failure in another error keeps
+/// it visible as long as the wrapper reports its source.
+pub(crate) fn chain_leaves_unknown_effect(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<RunError>()
+            .is_some_and(RunError::leaves_unknown_effect)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 impl RunFailure {

@@ -196,6 +196,7 @@ pub enum InvocationFailureKind {
     Context,
     Cancelled,
     TerminationUnknown,
+    RecoveryRequired,
 }
 
 /// Versioned metadata-only event for one provider-neutral agent invocation.

@@ -669,5 +669,9 @@ fn stop_vocabulary_has_a_closed_snake_case_wire_shape() {
         serde_json::to_value(InvocationFailureKind::Cancelled).unwrap(),
         json!("cancelled")
     );
+    assert_eq!(
+        serde_json::to_value(InvocationFailureKind::RecoveryRequired).unwrap(),
+        json!("recovery_required")
+    );
     assert!(serde_json::from_value::<StopReason>(json!("timeout")).is_err());
 }

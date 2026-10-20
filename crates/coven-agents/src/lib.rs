@@ -53,6 +53,8 @@ pub use observer::{
     InvocationObserver, NoopInvocationObserver, NoopObserver, RunEvent, RunFailureKind, RunObserver,
 };
 pub use review::{ProposalReview, ReviewOutcome, ReviewVerdict, ToolProposal};
-pub use runner::{DelegationFailure, DelegationResult, RunOptions, RunResult, Runner};
+pub use runner::{
+    DelegationDisposition, DelegationFailure, DelegationResult, RunOptions, RunResult, Runner,
+};
 pub use session::{InMemorySession, SessionStore};
 pub use tool::{Tool, ToolDefinition};

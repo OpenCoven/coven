@@ -44,6 +44,7 @@ const fn invocation_failure_kind(kind: RunFailureKind) -> InvocationFailureKind 
         RunFailureKind::Context => InvocationFailureKind::Context,
         RunFailureKind::Cancelled => InvocationFailureKind::Cancelled,
         RunFailureKind::TerminationUnknown => InvocationFailureKind::TerminationUnknown,
+        RunFailureKind::RecoveryRequired => InvocationFailureKind::RecoveryRequired,
     }
 }
 
@@ -617,6 +618,22 @@ impl<'a> AgentLoop<'a> {
                 {
                     Ok(output) => output,
                     Err(source) => {
+                        // A descendant whose effect is unknown outranks every
+                        // other reading of this failure, stop or no stop.
+                        if crate::error::chain_leaves_unknown_effect(source.as_ref()) {
+                            if let Some(reason) = self.signal.stop_reason() {
+                                self.observe_stop(agent, reason);
+                            }
+                            return Err(self.fail(
+                                agent,
+                                RunFailureKind::RecoveryRequired,
+                                RunError::RecoveryRequired {
+                                    agent: agent.id.clone(),
+                                    call_id: call.id.clone(),
+                                    source,
+                                },
+                            ));
+                        }
                         return Err(match self.signal.stop_reason() {
                             // The tool proved it produced nothing.
                             Some(reason) if source.downcast_ref::<NotStarted>().is_some() => {

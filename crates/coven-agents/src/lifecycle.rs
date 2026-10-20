@@ -206,8 +206,10 @@ impl fmt::Debug for RunSignal {
 }
 
 impl RunSignal {
-    /// Starts the run's deadline on `clock` now.
-    pub(crate) fn start(controls: RunControls, clock: Arc<dyn Clock>) -> Self {
+    /// Starts a signal whose deadline, if any, begins on `clock` now. The
+    /// runner starts one per run; a host that orchestrates delegation outside
+    /// any run can start one to derive child controls from.
+    pub fn new(controls: RunControls, clock: Arc<dyn Clock>) -> Self {
         let deadline = controls
             .timeout
             .map(|timeout| clock.now().saturating_add(timeout));
@@ -242,6 +244,17 @@ impl RunSignal {
     pub fn remaining(&self) -> Option<Duration> {
         self.deadline
             .map(|deadline| deadline.saturating_sub(self.clock.now()))
+    }
+
+    /// Controls for a child invocation started from this one. Cancelling
+    /// this run's token cancels the child; cancelling the child does not
+    /// cancel this run. The child's timeout is whatever remains of this
+    /// run's deadline, so a child never outlives its parent's bound.
+    pub fn child_controls(&self) -> RunControls {
+        RunControls {
+            cancellation: self.cancellation.as_ref().map(CancellationToken::child),
+            timeout: self.remaining(),
+        }
     }
 }
 
@@ -295,7 +308,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         clock.advance(Duration::from_secs(100));
         let cancellation = CancellationToken::new();
-        let signal = RunSignal::start(
+        let signal = RunSignal::new(
             RunControls::new()
                 .with_cancellation(cancellation.clone())
                 .with_timeout(Duration::from_secs(10)),
@@ -316,7 +329,7 @@ mod tests {
 
     #[test]
     fn default_controls_never_stop() {
-        let signal = RunSignal::start(RunControls::default(), Arc::new(ManualClock::new()));
+        let signal = RunSignal::new(RunControls::default(), Arc::new(ManualClock::new()));
         assert_eq!(signal.stop_reason(), None);
         assert_eq!(signal.remaining(), None);
     }
