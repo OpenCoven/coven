@@ -6,6 +6,11 @@ podcast video rendering, and ambient loops.
 
 ## Auth
 
+Before any command, run `sh ~/.agents/skills/higgsfield-generate/scripts/preflight.sh`
+and use the `HIGGSFIELD_BIN` path it prints instead of a bare `higgsfield` (where
+the examples below say `higgsfield`). Never run a 0.x copy: on 2026-10-13 the
+0.2.1 copy that PATH falls back to answered "Session expired" and the saved login
+was gone the same minute.
 Credentials live at `~/.config/higgsfield/credentials.json` (set by `higgsfield auth login`).
 Never pass keys as CLI args or bake them into specs.
 `HIGGSFIELD_API_KEY` / `HIGGSFIELD_API_SECRET` are the env var names if needed.
