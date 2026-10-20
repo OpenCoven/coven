@@ -141,7 +141,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "result-delivery-recovery",
                         "result-delivery-process-crash-recovery",
                         "run-settlement-process-crash-recovery",
-                        "run-launch-process-crash-recovery"
+                        "run-launch-process-crash-recovery",
+                        "attempt-retry-process-crash-recovery"
                     ]
                 },
                 {

@@ -232,6 +232,7 @@ The checked-in
 [`result-delivery-process-crash-recovery.vectors.json`](result-delivery-process-crash-recovery.vectors.json),
 [`run-settlement-process-crash-recovery.vectors.json`](run-settlement-process-crash-recovery.vectors.json),
 [`run-launch-process-crash-recovery.vectors.json`](run-launch-process-crash-recovery.vectors.json),
+[`attempt-retry-process-crash-recovery.vectors.json`](attempt-retry-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -295,7 +296,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements twelve structural suites, nineteen
+The native Coven target implements twelve structural suites, twenty-one
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -789,3 +790,54 @@ does not cover a real runtime process, receipt-proven no-process retry, which
 relaunches by design, Runtime Authority launches, manual
 occurrences, kills during held-for-retry, timeout or cancellation, power loss,
 load, complete profiles or release eligibility.
+
+## Operator retry process-crash audit boundary
+
+The `attempt-retry-process-crash-recovery` suite kills a daemon worker while it
+handles the operator's `attempt.retry.v1` request for a held run. The parent
+then restarts the daemon's scheduler and sends the identical request again,
+with the same adoption key, as an operator who never saw an answer would. The
+retry is one transaction. It opens attempt 2 as `adopted`, an operator retry
+of attempt 1's failure. It returns the occurrence to `planned` and releases the
+run's session. Last, it stores the response under the request's adoption key.
+Each of six cases starts the exact audited binary as a hidden worker, with the
+same harness and daemon restart as `run-launch-process-crash-recovery`. The
+worker stores a fixed synthetic active daily definition with no automatic
+retry, and claims and launches its 09:00 slot through a no-op runtime. The
+session then ends with exit code 1, and an ordinary pass holds the run for an
+operator retry. Vectors cannot choose a path, run, definition, adoption key,
+clock or pause mechanics, and every expected outcome is fixed per boundary.
+
+- **After attempt, after replan, after release, after adoption:** a fixture
+  TEMP trigger pauses the worker after each of the retry transaction's four
+  writes, in order.
+- **After commit:** the WAL hook pauses it once SQLite has committed the retry.
+- **Control:** no pause. The worker answers the request and exits without the
+  graceful shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one. Inside it, the parent must read the held
+run with no attempt 2 or stored answer. After the commit it must read the
+whole retry. The parent then kills and reaps the worker. The store's raw
+integrity check must pass, and the store must hold what the parent read while
+the worker was paused.
+
+After the restart's startup pass, a committed retry must have dispatched
+attempt 2 once, and a held run must be untouched. The re-sent request must then
+commit the retry if it was lost. If it had committed, the request must replay
+the stored response, which names the attempt 2 the store opened earlier, even
+though that attempt has since started. The next pass dispatches a retry that
+has not yet launched. Its session ends with exit code 0, and a pass settles the
+run `succeeded`. Every case ends with one launch since the restart, two
+sessions and the request's one stored answer. A store that recovery refuses,
+or a request that errors, fails the case. The same request and a further pass
+must then change no occurrence, run, attempt, event, session or adoption row.
+
+Observations carry boundary, retry, answer and state classes, counts and
+booleans. They never carry run, attempt, occurrence or session ids, adoption
+keys, responses, paths, handshakes or output. This is `audit_only` evidence for
+a daemon killed while it handles one operator retry of a failed scheduled run.
+It does not cover Runtime Authority runs, which this command refuses,
+`occurrence.recover.v1`, cancellation, retries of a timed-out or cancelled
+attempt, a graceful daemon restart, a real runtime process, power loss, load,
+complete profiles or release eligibility.
