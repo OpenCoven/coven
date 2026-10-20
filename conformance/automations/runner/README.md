@@ -553,16 +553,27 @@ records its owner grant, and a richly authored draft. The fixture then inserts
 a settled occurrence/run/attempt chain and a pending runNow result reservation
 with SQL, so every compared table holds rows before the fault. After a truncating checkpoint it
 copies the main database to a path that has never been opened, then sets one
-byte to zero: the first header byte (`sqlite_header`) or the first byte of the
-definition table's B-tree root page (`definition_btree`). A third case writes
-nothing. Vectors cannot choose a path, offset or bytes.
+byte to zero: the first header byte (`sqlite_header`), or the first byte of the
+B-tree root page of the definition table (`definition_btree`) or of the command
+adoption table (`adoption_btree`). A fourth case writes nothing. Vectors cannot
+choose a path, offset or bytes.
 
 The production store initializer opens the copy cold, and the production
 definition command runs only if that open succeeds. The header case must fail
-with `rusqlite::ErrorCode::NotADatabase`, the B-tree case with
-`DatabaseCorrupt`, and the control must commit. The suite records which stage
-refused (`cold_open` or `command`); in practice both faults are refused by the
-cold initializer, so the command is never reached for them. A refusal must
+with `rusqlite::ErrorCode::NotADatabase`, both B-tree cases with
+`DatabaseCorrupt`, and the control must commit. Each vector states the stage
+that must refuse its fault, and the suite fixes that stage per fault. The cold
+initializer reads the header and the definition table, so it refuses those two
+(`cold_open`), and the command is never reached. It never reads the adoption
+table's root page, so the command itself must refuse that fault (`command`).
+The command writes the definition row and its lifecycle event (stream head and
+event row) before it inserts the adoption row. The adoption case must show that
+the command had completed at least one write before it was refused
+(`refusedAfterEarlierWrites`, from SQLite's total-change counter), that the
+connection is left outside a transaction, and that none of those writes
+persisted. If a future initializer refused the adoption fault at cold open, the
+case would no longer exercise the command, so the suite fails rather than
+silently losing that coverage. A refusal must
 leave the corrupted main file byte-for-byte as written, which proves it wrote
 nothing there. The suite then restores only the damaged byte and requires every
 other main, WAL, shared-memory and rollback-journal byte to be unchanged. A read-only inspection must find every seeded row
@@ -575,6 +586,8 @@ result and event reference without further writes. Observations carry fixed
 fault, error and stage classes, per-table counts and booleans, never offsets,
 paths, SQL, native errors or row values. Restoring the byte is a fixture step,
 not operator guidance or a production repair. This is `audit_only` evidence
-for two deterministic corruption modes. It does not cover other corruption
-patterns, I/O faults, disk exhaustion, process crashes, complete profiles or
-release eligibility.
+for three deterministic corruption modes. Corruption on a page that neither the
+initializer nor the command reads stays latent, and the command commits around
+it; no production integrity scan exists, and this suite does not claim one. It
+does not cover other corruption patterns, WAL-frame corruption, I/O faults,
+disk exhaustion, process crashes, complete profiles or release eligibility.

@@ -54,6 +54,14 @@ struct Expected {
     final_rows: u64,
     replay_preserved: bool,
     store_not_reset: bool,
+    refusal_stage: Option<RefusalStage>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum RefusalStage {
+    ColdOpen,
+    Command,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Clone, Copy)]
@@ -69,13 +77,14 @@ enum InitialOutcome {
 enum Fault {
     SqliteHeader,
     DefinitionBtree,
+    AdoptionBtree,
     None,
 }
 
 pub(super) fn evaluate(vector: &Value) -> Result<(bool, Vec<Value>), &'static str> {
     let vectors: VectorSet = serde_json::from_value(vector.clone()).map_err(|_| INVALID)?;
     if vectors.schema_version != "coven.automations.command-storage-corruption-recovery-vectors.v1"
-        || vectors.cases.len() != 3
+        || vectors.cases.len() != 4
     {
         return Err(INVALID);
     }
@@ -98,6 +107,7 @@ pub(super) fn evaluate(vector: &Value) -> Result<(bool, Vec<Value>), &'static st
             || !case.expected.store_not_reset
             || case.expected.initial_rows != u64::from(case.fault == Fault::None)
             || case.expected.initial_outcome != expected_outcome(case.fault)
+            || case.expected.refusal_stage != expected_stage(case.fault)
         {
             return Err(INVALID);
         }
@@ -164,8 +174,29 @@ const MAX_STORE_BYTES: u64 = 16 * 1024 * 1024;
 fn expected_outcome(fault: Fault) -> InitialOutcome {
     match fault {
         Fault::SqliteHeader => InitialOutcome::NotADatabase,
-        Fault::DefinitionBtree => InitialOutcome::DatabaseCorrupt,
+        Fault::DefinitionBtree | Fault::AdoptionBtree => InitialOutcome::DatabaseCorrupt,
         Fault::None => InitialOutcome::Committed,
+    }
+}
+/// The stage each fault must be refused at, which every vector states. The cold
+/// initializer reads the header and the definition B-tree, so it refuses those.
+/// It never reads the adoption table's root page, so only the command can reach
+/// that fault. If a future initializer refused it at cold open, the case would
+/// stop exercising the command path, so it fails rather than silently losing
+/// that coverage; the vectors would then need to change visibly.
+fn expected_stage(fault: Fault) -> Option<RefusalStage> {
+    match fault {
+        Fault::SqliteHeader | Fault::DefinitionBtree => Some(RefusalStage::ColdOpen),
+        Fault::AdoptionBtree => Some(RefusalStage::Command),
+        Fault::None => None,
+    }
+}
+/// The table whose B-tree root page a fault damages, if any.
+fn fault_table(fault: Fault) -> Option<&'static str> {
+    match fault {
+        Fault::DefinitionBtree => Some("automation_definitions"),
+        Fault::AdoptionBtree => Some("automation_command_adoptions"),
+        Fault::SqliteHeader | Fault::None => None,
     }
 }
 fn error_outcome(error: &anyhow::Error) -> Result<InitialOutcome, &'static str> {
@@ -372,12 +403,27 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
     let page_size: i64 = conn
         .query_row("PRAGMA page_size", [], |row| row.get(0))
         .map_err(|_| FAILED)?;
-    let root_page: i64 = conn.query_row("SELECT rootpage FROM sqlite_schema WHERE type='table' AND name='automation_definitions'", [], |row| row.get(0)).map_err(|_| FAILED)?;
     let page_size = u64::try_from(page_size).map_err(|_| FAILED)?;
-    let root_page = u64::try_from(root_page).map_err(|_| FAILED)?;
-    if root_page < 2 || !page_size.is_power_of_two() || !(512..=65536).contains(&page_size) {
+    if !page_size.is_power_of_two() || !(512..=65536).contains(&page_size) {
         return Err(FAILED);
     }
+    // A B-tree fault zeroes the page-type byte that starts its table's root page.
+    let root_offset = fault_table(case.fault)
+        .map(|table| {
+            let root_page: i64 = conn
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(|_| FAILED)?;
+            u64::try_from(root_page)
+                .ok()
+                .filter(|page| *page >= 2)
+                .and_then(|page| (page - 1).checked_mul(page_size))
+                .ok_or(FAILED)
+        })
+        .transpose()?;
     let checkpoint: (i64, i64, i64) = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -393,12 +439,7 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
     }
     let position = match case.fault {
         Fault::SqliteHeader => Some(0),
-        Fault::DefinitionBtree => Some(
-            root_page
-                .checked_sub(1)
-                .and_then(|p| p.checked_mul(page_size))
-                .ok_or(FAILED)?,
-        ),
+        Fault::DefinitionBtree | Fault::AdoptionBtree => Some(root_offset.ok_or(FAILED)?),
         Fault::None => None,
     };
     let original = position
@@ -431,12 +472,17 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
         );
     });
     let mut committed = None;
-    // Both stay `None` when the cold open refuses: no connection or command
+    // These stay `None` when the cold open refuses: no connection or command
     // existed, so there is no transaction to observe and the stage is the open.
     let mut initial_transaction_closed = None;
+    // Only a command refusal sets this. SQLite's total-change counter keeps
+    // statements that completed inside a transaction later rolled back, so a
+    // rise shows the command had already written before it was refused.
+    let mut refused_after_earlier_writes = None;
     let (initial_outcome, stage) = match opened {
-        Err(error) => (error_outcome(&error)?, Some("cold_open")),
+        Err(error) => (error_outcome(&error)?, Some(RefusalStage::ColdOpen)),
         Ok(conn) => {
+            let changes_before = conn.total_changes();
             let result = execute(&conn, case, FIRST_AT);
             initial_transaction_closed = Some(conn.is_autocommit());
             let (outcome, stage) = match result {
@@ -444,7 +490,10 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
                     committed = Some(response);
                     (InitialOutcome::Committed, None)
                 }
-                Err(error) => (error_outcome(&error)?, Some("command")),
+                Err(error) => {
+                    refused_after_earlier_writes = Some(conn.total_changes() > changes_before);
+                    (error_outcome(&error)?, Some(RefusalStage::Command))
+                }
                 _ => return Err(FAILED),
             };
             drop(conn);
@@ -498,6 +547,8 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
     let store_not_reset =
         baseline_preserved && restoration_exact && refusal_left_main_unchanged != Some(false);
     let mut passed = cold_entered
+        && stage == case.expected.refusal_stage
+        && refused_after_earlier_writes == (case.fault == Fault::AdoptionBtree).then_some(true)
         && initial_transaction_closed != Some(false)
         && initial_outcome == case.expected.initial_outcome
         && initial_rows as u64 == case.expected.initial_rows
@@ -552,7 +603,8 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
         "initialOutcome":initial_outcome,"refusalStage":stage,
         "sqliteErrorCode":match initial_outcome {InitialOutcome::NotADatabase=>Some(26),InitialOutcome::DatabaseCorrupt=>Some(11),InitialOutcome::Committed=>None},
         "coldInitializationEntered":cold_entered,"coldInitializationCompleted":cold_completed,
-        "initialTransactionClosed":initial_transaction_closed,"baselinePreserved":baseline_preserved,
+        "initialTransactionClosed":initial_transaction_closed,
+        "refusedAfterEarlierWrites":refused_after_earlier_writes,"baselinePreserved":baseline_preserved,
         "storeNotReset":store_not_reset,"oneByteRestorePreservedOtherBytes":restoration_exact,
         "refusalLeftMainFileUnchanged":refusal_left_main_unchanged,
         "walObservedAfterInitial":sidecars_before_restore[0].is_some(),
