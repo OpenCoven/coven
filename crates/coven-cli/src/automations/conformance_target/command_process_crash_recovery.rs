@@ -16,7 +16,7 @@ use crate::automations::owner_grants::CommandAuthority;
 const INVALID: &str = "conformance vector is invalid";
 const FAILED: &str = "conformance suite execution failed";
 const FIRST_AT: &str = "2026-08-30T09:00:00.000Z";
-const SCRATCH_ENV: &str = "COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH";
+pub(super) const SCRATCH_ENV: &str = "COVEN_AUTOMATIONS_CONFORMANCE_SCRATCH";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -154,7 +154,7 @@ fn projection(response: &DefinitionCommandResponse) -> Result<Value, &'static st
         "eventRef": response.event_ref, "firstCommittedAt": FIRST_AT}),
     )
 }
-fn announce(message: &Value) -> Result<(), &'static str> {
+pub(super) fn announce(message: &Value) -> Result<(), &'static str> {
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, message).map_err(|_| FAILED)?;
     stdout.write_all(b"\n").map_err(|_| FAILED)?;
@@ -268,8 +268,8 @@ struct Handshake {
 }
 
 // These are fixture hang guards, not claims about production recovery speed.
-const CHILD_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
-struct WorkerProcess {
+pub(super) const CHILD_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) struct WorkerProcess {
     child: std::process::Child,
     reader: Option<std::thread::JoinHandle<()>>,
     writer: Option<std::thread::JoinHandle<()>>,
@@ -293,7 +293,10 @@ impl WorkerProcess {
             let _ = reader.join();
         }
     }
-    fn finish(&mut self, terminate: bool) -> Result<std::process::ExitStatus, &'static str> {
+    pub(super) fn finish(
+        &mut self,
+        terminate: bool,
+    ) -> Result<std::process::ExitStatus, &'static str> {
         if terminate {
             // The handshake callback cannot return normally. Require it to be
             // alive when the parent issues the abrupt OS termination request.
@@ -318,16 +321,27 @@ impl WorkerProcess {
         }
     }
 }
-type HandshakeReceiver = std::sync::mpsc::Receiver<Result<Handshake, &'static str>>;
+pub(super) type HandshakeReceiver<H> = std::sync::mpsc::Receiver<Result<H, &'static str>>;
 fn start_worker(
     case: &Case,
     scratch: &std::path::Path,
-) -> Result<(WorkerProcess, HandshakeReceiver), &'static str> {
+) -> Result<(WorkerProcess, HandshakeReceiver<Handshake>), &'static str> {
+    let payload = serde_json::to_vec(case).map_err(|_| INVALID)?;
+    spawn_worker("command-crash-worker", payload, scratch)
+}
+/// Starts this binary's hidden `subcommand` worker with a scrubbed environment
+/// and the parent-owned scratch root, sends it `payload`, and reads one bounded
+/// handshake line.
+pub(super) fn spawn_worker<H: serde::de::DeserializeOwned + Send + 'static>(
+    subcommand: &str,
+    payload: Vec<u8>,
+    scratch: &std::path::Path,
+) -> Result<(WorkerProcess, HandshakeReceiver<H>), &'static str> {
     use std::io::{BufRead, Read};
     use std::process::{Command, Stdio};
     let mut command = Command::new(std::env::current_exe().map_err(|_| FAILED)?);
     command
-        .args(["automations", "conformance", "command-crash-worker"])
+        .args(["automations", "conformance", subcommand])
         .env_clear()
         .env(SCRATCH_ENV, scratch)
         .env("COVEN_HOME", scratch.join("must-not-create"))
@@ -364,7 +378,6 @@ fn start_worker(
             });
         let _ = sender.send(result);
     }));
-    let payload = serde_json::to_vec(case).map_err(|_| INVALID)?;
     let mut stdin = process.child.stdin.take().ok_or(FAILED)?;
     // Input delivery shares the handshake guard. A stalled child must not
     // block the parent before it can kill/reap and close both pipes.
@@ -446,6 +459,19 @@ fn uncommitted_wal(home: &std::path::Path) -> Result<bool, &'static str> {
     }
     Ok(true)
 }
+/// The worker died from the parent's kill: SIGKILL on Unix, any failure
+/// status elsewhere.
+pub(super) fn abruptly_terminated(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal() == Some(9)
+    }
+    #[cfg(not(unix))]
+    {
+        !status.success()
+    }
+}
 fn preserves(before: &Snapshot, after: &Snapshot) -> bool {
     before.len() == after.len()
         && before
@@ -503,13 +529,7 @@ fn case_matches(case: &Case) -> Result<(bool, Value), &'static str> {
         return Err(FAILED);
     }
     let status = process.finish(crash)?;
-    #[cfg(unix)]
-    let terminated = {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal() == Some(9)
-    };
-    #[cfg(not(unix))]
-    let terminated = !status.success();
+    let terminated = abruptly_terminated(&status);
     if crash != terminated || (!crash && !status.success()) {
         return Err(FAILED);
     }

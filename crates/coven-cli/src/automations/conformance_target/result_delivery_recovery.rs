@@ -28,7 +28,7 @@ const DELIVERY_IMMUTABLE: &str = "settled automation run delivery is immutable";
 /// A fixed future instant. The production runner dispatches at the later of
 /// its argument and the wall clock, so a future base keeps the claim lease
 /// valid without making any case depend on the time it runs.
-const BASE: &str = "2099-10-20T09:00:00.000Z";
+pub(super) const BASE: &str = "2099-10-20T09:00:00.000Z";
 /// The runner launches only a routine with a working directory; a no-op
 /// runtime never touches it.
 const FIXTURE_CWD: &str = "/work/project";
@@ -89,7 +89,7 @@ enum FailureReason {
 
 #[derive(Deserialize, Serialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
-enum DeliveryState {
+pub(super) enum DeliveryState {
     Pending,
     Delivered,
     Failed,
@@ -159,7 +159,7 @@ pub(super) fn evaluate(vector: &Value) -> Result<(bool, Vec<Value>), &'static st
     Ok((passed, observations))
 }
 
-fn at(base: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
+pub(super) fn at(base: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
     base + chrono::Duration::seconds(seconds)
 }
 
@@ -169,7 +169,7 @@ fn iso(instant: DateTime<Utc>) -> String {
 
 /// Starts and settles one run through the production run record, which writes
 /// its `pending` delivery obligation in the same guarded update.
-fn settle_run(
+pub(super) fn settle_run(
     conn: &Connection,
     base: DateTime<Utc>,
     automation_id: &str,
@@ -250,7 +250,10 @@ fn settle_unreadable_run(
     Ok(outcome.run_id)
 }
 
-fn state(conn: &Connection, run_id: &str) -> Result<(DeliveryState, Option<String>), &'static str> {
+pub(super) fn state(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<(DeliveryState, Option<String>), &'static str> {
     let delivery = get_run(conn, run_id)
         .map_err(|_| FAILED)?
         .ok_or(FAILED)?
@@ -273,7 +276,7 @@ fn finished_at(conn: &Connection, run_id: &str) -> Result<String, &'static str> 
         .ok_or(FAILED)
 }
 
-fn notices_for(conn: &Connection, run_id: &str) -> Result<Vec<String>, &'static str> {
+pub(super) fn notices_for(conn: &Connection, run_id: &str) -> Result<Vec<String>, &'static str> {
     let mut statement = conn
         .prepare(
             "SELECT id FROM session_notices

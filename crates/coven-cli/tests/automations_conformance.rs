@@ -166,7 +166,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "retry-quarantine-recovery",
                         "scheduler-leadership-fencing",
                         "startup-reconciliation-wake",
-                        "result-delivery-recovery"
+                        "result-delivery-recovery",
+                        "result-delivery-process-crash-recovery"
                     ]
                 },
                 {
@@ -1732,6 +1733,115 @@ fn native_target_evaluates_checked_in_process_crash_vectors() -> anyhow::Result<
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
     assert!(!String::from_utf8_lossy(&rejected.stderr).contains("private-must-not-be-read"));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_result_delivery_process_crash_vectors() -> anyhow::Result<()>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/result-delivery-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "result-delivery-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        response["suiteId"],
+        "result-delivery-process-crash-recovery"
+    );
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 4);
+    assert_eq!(response["evidence"]["passedCases"], 4);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("delivery crash observations");
+    assert_eq!(observations.len(), 4);
+    for (observation, (boundary, after_exit, recovery)) in observations.iter().zip([
+        ("after_notice", "pending", "delivered"),
+        ("after_record", "pending", "delivered"),
+        ("after_commit", "delivered", "unchanged"),
+        ("none", "delivered", "unchanged"),
+    ]) {
+        let killed = boundary != "none";
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(
+            observation["gateHeldAtPause"],
+            if killed { json!(true) } else { json!(null) }
+        );
+        assert_eq!(observation["stateAfterExit"], after_exit);
+        assert_eq!(observation["recoveryPass"], recovery);
+        assert_eq!(observation["finalState"], "delivered");
+        assert_eq!(observation["finalNotices"], 1);
+        let before_commit = matches!(boundary, "after_notice" | "after_record");
+        assert_eq!(
+            observation["transactionOpenAtPause"],
+            if killed {
+                json!(before_commit)
+            } else {
+                json!(null)
+            }
+        );
+        assert_eq!(
+            observation["stateAtPause"],
+            match (killed, before_commit) {
+                (false, _) => json!(null),
+                (true, true) => json!("pending"),
+                (true, false) => json!("delivered"),
+            }
+        );
+        assert_eq!(observation["exitConsistent"], true);
+        assert_eq!(observation["gateReleased"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["recordNamesNotice"], true);
+        assert_eq!(observation["replayIsNoop"], true);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "result-delivery-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
     assert!(!coven_home.exists());
     Ok(())
 }

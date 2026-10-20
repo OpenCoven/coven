@@ -228,6 +228,8 @@ The checked-in
 [`runtime-authority-terminal-recovery.vectors.json`](runtime-authority-terminal-recovery.vectors.json),
 [`scheduler-leadership-fencing.vectors.json`](scheduler-leadership-fencing.vectors.json),
 [`startup-reconciliation-wake.vectors.json`](startup-reconciliation-wake.vectors.json),
+[`result-delivery-recovery.vectors.json`](result-delivery-recovery.vectors.json),
+[`result-delivery-process-crash-recovery.vectors.json`](result-delivery-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -291,7 +293,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements twelve structural suites, seventeen
+The native Coven target currently implements twelve structural suites, eighteen
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -633,6 +635,47 @@ classes, counts and booleans. They never carry run or notice ids, notice text,
 paths or output.
 
 This is `audit_only` evidence for deferral, transactional rollback and failure
-isolation. It does not cover a process kill between the notice and its record,
-the offer to an idle live session, per-familiar or other principals' scopes
-(#857), delivery SLOs, load, complete profiles or release eligibility.
+isolation. A process kill during delivery is the next suite's. This one does
+not cover the offer to an idle live session, per-familiar or other principals'
+scopes (#857), delivery SLOs, load, complete profiles or release eligibility.
+
+## Result delivery process-crash audit boundary
+
+The `result-delivery-process-crash-recovery` suite kills the process that is
+delivering a result. Each of four cases starts the exact audited binary as a
+hidden worker, with the same scrubbed environment and parent-owned scratch
+root as `command-process-crash-recovery`. The worker creates a private Coven
+home and disposable store, stores the fixed synthetic paused definition, settles
+one run with a `pending` main-session obligation through the production run
+record, and runs `deliver_pending_results`. Vectors cannot choose a path, run,
+definition or pause mechanics, and every expected outcome is fixed per boundary.
+
+- **After notice:** a fixture TEMP trigger calls a local callback after the
+  result notice insert, inside the delivery transaction.
+- **After record:** the same, after the `delivered` update and before commit.
+- **After commit:** the delivering connection's WAL hook calls the callback
+  once SQLite has committed the delivery, while the worker still holds the
+  scope gate.
+- **Control:** no pause. The worker delivers once and exits.
+
+The callback announces the boundary and parks. While the worker is paused, the
+parent must fail to take the main-session gate and to begin a write
+transaction before the commit, and must read the run as `pending` before the
+commit and `delivered` after it. The parent then kills and reaps the worker.
+SQLite may still hold a killed transaction's pages in memory, so these cases
+do not require uncommitted frames in the WAL; `command-process-crash-recovery`
+proves recovery from spilled frames.
+
+After the kill, the gate must become free, and the store's raw integrity check
+must pass before the production initializer opens it. Before the commit, the
+run is `pending` with no notice; after it, the run is `delivered` and its
+record names its one notice. A recovery pass in the parent delivers the
+pending run once, or changes nothing for a delivered one. A further pass from a
+fresh connection must change nothing.
+
+Observations carry boundary, state and pass classes, counts and booleans. They
+never carry run or notice ids, notice text, paths, handshakes or output. This
+is `audit_only` evidence for a process kill inside one delivery. It does not
+cover power loss or unsynced pages, a kill inside a failure record, the idle
+session offer, per-familiar scopes (#857), load, complete profiles or release
+eligibility.
