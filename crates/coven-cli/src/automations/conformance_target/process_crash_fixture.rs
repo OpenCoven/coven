@@ -2,6 +2,7 @@
 //! process-crash suites. A worker parks inside a production transaction, and
 //! the parent inspects the store before and after killing it.
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use rusqlite::{functions::FunctionFlags, Connection, ErrorCode};
@@ -16,12 +17,18 @@ const PAUSE_FUNCTION: &str = "coven_process_crash_pause";
 /// trigger function or the WAL hook), which cannot capture it.
 static PAUSE: OnceLock<Value> = OnceLock::new();
 
+/// Commits the WAL hook lets through before it pauses.
+static COMMITS_BEFORE_PAUSE: AtomicUsize = AtomicUsize::new(0);
+
 /// Where a fixture worker parks inside a production transaction.
 pub(super) enum Pause<'a> {
     /// A TEMP trigger on the row change this clause names, before commit.
     After(&'a str),
     /// The connection's WAL hook, once SQLite has committed.
     AfterCommit,
+    /// The connection's WAL hook, once SQLite has committed this many
+    /// transactions (at least one).
+    AfterCommits(usize),
 }
 
 /// Announces the pause, then parks until the parent kills this process.
@@ -36,6 +43,12 @@ fn pause() -> ! {
 
 /// Runs after SQLite has committed a transaction to the WAL.
 fn pause_after_commit(_: &rusqlite::hooks::Wal, _: std::ffi::c_int) -> rusqlite::Result<()> {
+    // Only the worker's one connection, on its one thread, runs this hook.
+    let left = COMMITS_BEFORE_PAUSE.load(Ordering::SeqCst);
+    if left > 0 {
+        COMMITS_BEFORE_PAUSE.store(left - 1, Ordering::SeqCst);
+        return Ok(());
+    }
     pause()
 }
 
@@ -50,6 +63,11 @@ pub(super) fn install_pause(
     PAUSE.set(handshake).map_err(|_| FAILED)?;
     match pause_at {
         Pause::AfterCommit => conn.wal_hook(Some(pause_after_commit)),
+        Pause::AfterCommits(commits) => {
+            let before_pause = commits.checked_sub(1).ok_or(FAILED)?;
+            COMMITS_BEFORE_PAUSE.store(before_pause, Ordering::SeqCst);
+            conn.wal_hook(Some(pause_after_commit));
+        }
         Pause::After(trigger) => {
             conn.create_scalar_function(
                 PAUSE_FUNCTION,
