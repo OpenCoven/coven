@@ -35,7 +35,7 @@ import shlex
 
 apt_etc_dir, sourceparts, os_release = map(pathlib.Path, sys.argv[1:])
 archives = {
-    "ubuntu": re.compile(r"https?://(?:[a-z0-9-]+\.)*ubuntu\.com/ubuntu/?", re.IGNORECASE),
+    "ubuntu": re.compile(r"https?://(?:[a-z0-9-]+\.)*ubuntu\.com/ubuntu(?:-ports)?/?", re.IGNORECASE),
     "debian": re.compile(r"https?://(?:[a-z0-9-]+\.)*debian\.org/debian(?:-security)?/?", re.IGNORECASE),
 }
 

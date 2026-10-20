@@ -177,6 +177,25 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
                     self.assertIn("debian.sources", "\n".join(sources))
                 self.assertEqual((source.parent / "debian.sources").read_bytes(), before)
 
+    def test_ubuntu_ports_archive_is_supported_in_both_source_formats(self) -> None:
+        for deb822 in (False, True):
+            with self.subTest(deb822=deb822), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                uri = "https://ports.ubuntu.com/ubuntu-ports/"
+                if deb822:
+                    self.write_deb822_ubuntu_source(root)
+                    source = root / "sources.list.d/ubuntu.sources"
+                    source.write_text(
+                        f"Types: deb\nURIs: {uri}\nSuites: noble noble-updates noble-security\n"
+                        "Components: main universe\n"
+                        "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
+                else:
+                    (root / "sources.list").write_text(f"deb {uri} noble main universe\n")
+                completed, calls, sources = self.run_installer(root)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(len(calls), 2)
+                self.assertIn(uri, "\n".join(sources))
+
     def test_unsupported_distro_and_cross_distro_fail_before_apt(self) -> None:
         for distro in ("fedora", "debian"):
             with self.subTest(distro=distro), tempfile.TemporaryDirectory() as directory:
@@ -409,6 +428,8 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
     def test_lookalike_archive_hosts_are_never_installed(self) -> None:
         for uri in [
             "https://evilubuntu.com/ubuntu",
+            "https://ports.ubuntu.com.attacker.example/ubuntu-ports",
+            "https://archive.ubuntu.com/ubuntu-ports-extra",
             "https://ubuntu.com.attacker.example/ubuntu",
             "https://attacker.example/ubuntu.com/ubuntu",
         ]:
