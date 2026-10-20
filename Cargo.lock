@@ -840,6 +840,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "similar",
+ "syn 2.0.117",
  "sysinfo",
  "tempfile",
  "textwrap",

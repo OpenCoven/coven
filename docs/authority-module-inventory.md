@@ -1,3 +1,9 @@
+---
+title: "Authority module inventory"
+summary: "Source-anchored authority concentration, extraction priorities, and compatibility gates."
+source_adjacent_reason: "Tracks Rust authority ownership and extraction evidence alongside the modules it governs."
+---
+
 # Authority module inventory
 
 Status: living inventory for [OpenCoven/coven#806](https://github.com/OpenCoven/coven/issues/806)
@@ -9,7 +15,7 @@ belong. Update it when a slice lands or the concentration picture changes.
 ## Method
 
 This snapshot was generated from commit
-`08ebe8531541bf2bead1763dd35be510fbcf7442` on 2026-09-13. Every measurement
+`10a7cecf6882243eb52233a8b1463781f329cdba` on 2026-10-20. Every measurement
 below uses that same immutable revision. Reproduce the ranking without changing
 your checkout:
 
@@ -18,7 +24,7 @@ python3 - <<'PY'
 import re
 import subprocess
 
-ref = "08ebe8531541bf2bead1763dd35be510fbcf7442"
+ref = "10a7cecf6882243eb52233a8b1463781f329cdba"
 paths = subprocess.check_output(
     ["git", "ls-tree", "-r", "--name-only", ref, "crates"], text=True
 ).splitlines()
@@ -56,19 +62,19 @@ security sensitivity), not size alone.
 
 | Module | Total / production lines | Bytes | Responsibility classes | Review and coupling evidence |
 | --- | ---: | ---: | --- | --- |
-| [`api.rs`](../crates/coven-cli/src/api.rs) | 49,744 / 17,100 | 1,916,424 | transport dispatch, parsing, validation, transport authority, domain orchestration, persistence access, response mapping | **Highest concentration.** `handle_request_with_runtime_and_authority` remains the central route dispatcher. Session lifecycle, Ward/Threads proposals, and Automations handlers share the module. The proposal path also coordinates a process-wide Ward audit lock, filesystem artifacts, SQLite state, recovery, and response precedence. |
-| [`daemon.rs`](../crates/coven-cli/src/daemon.rs) | 14,329 / 6,210 | 539,126 | local IPC and TCP transport, daemon lifecycle, live session ownership, process supervision, recovery, scheduler startup, telemetry | **High mutable-state risk.** `LiveSessionRuntime` owns the shared live-session registry and launch/shutdown coordination; `serve_forever` acquires lifecycle authority, initializes durable state, starts recovery and schedulers, and accepts concurrent transports. In `handle_http_stream_with_lifecycle`, ordinary API requests not consumed by owner-local lifecycle or mobile local-control handling derive transport authority and enter the central API dispatch. |
-| [`store.rs`](../crates/coven-cli/src/store.rs) | 11,785 / 4,939 | 431,136 | initialization facade and cache, query/command persistence, retention, storage health mapping | **High fan-out.** The production portion exposes 107 crate/public free functions. `open_store_with_initialization_observer` delegates schema work to its private `schema` module and retains the initialized connection, while session, handoff, event, Ward, hub, Automations, maintenance, and health queries remain in the parent. The process-global `initialized_store_paths` cache and `STORAGE_HEALTH_SNAPSHOTS` add ownership coupling. |
-| [`store/schema.rs`](../crates/coven-cli/src/store/schema.rs) | 1,301 / 1,301 | 52,229 | schema and migration, SQLite connection configuration, compatibility and FTS backfills | **Private initialization boundary.** The parent facade calls this module without changing SQL, migration order, transaction/rollback boundaries, or startup observation order. Initialization returns the live connection without an intervening close/reopen. Successful-initialization caching and domain commands/queries remain in `store.rs`; daemon startup still owns the final close before readiness. |
-| [`automations/runner.rs`](../crates/coven-cli/src/automations/runner.rs) | 10,125 / 3,990 | 376,902 | occurrence dispatch, scheduler fencing, runtime adoption, retries, timeout/cancellation, crash recovery, terminal settlement | **High state-machine risk.** `dispatch_occurrence_with_clock` combines direct SQL, scheduler-generation checks, runtime launch, cancellation, and settlement; recovery and stop fencing share the production module. #856 has landed, but remaining #857 correctness work should settle before structural movement. |
-| [`ward.rs`](../crates/coven-cli/src/ward.rs) | 9,963 / 6,100 | 368,032 | authorization/policy, path materialization, edit budgets, verified filesystem mutation, rollback/cleanup, audit evidence | **Highest security sensitivity, bounded apply engine.** `Ward::evaluate` is the read-only policy entry point. Direct `Ward::apply` and the Threads-, coherence-, and scheduled-approval families retain fail-closed evaluation and conditional mutation. Their commit-check variants preserve final authority checks; decomposition must not expose private atomic-write helpers. |
-| [`pty_runner.rs`](../crates/coven-cli/src/pty_runner.rs) | 9,956 / 5,551 | 367,766 | harness command construction, PTY/piped I/O, stream decoding, platform process containment, timeout/cancellation, supervisor protocol | **High platform/security risk.** Strict child containment, guardian/supervisor protocol, stream adapters, and detached/attached execution share one module. Windows and Unix ownership guarantees converge at `spawn_strict_child_process_tree`, while cancellation also uses process-global signal coordination in `SUPERVISED_STREAM_CANCELLATION_SIGNAL` and `SUPERVISED_STREAM_CANCELLATION_LOCK`. |
-| [`main.rs`](../crates/coven-cli/src/main.rs) | 9,032 / 5,546 | 330,978 | CLI parsing and command dispatch, setup, user-facing mapping | **Medium.** High fan-in but mostly presentation/entry-point code. Do not prioritize it ahead of authority-bearing modules merely for size. |
-| [`memory_import.rs`](../crates/coven-cli/src/memory_import.rs) | 8,914 / 4,598 | 322,653 | untrusted external-format parsing, normalization, validation, persistence | **Medium-high input risk.** Large because it combines several importer grammars with durable writes. It is not a central authority router, but malformed and cross-format ambiguity need characterization before splitting parsers from persistence. |
-| [`harness.rs`](../crates/coven-cli/src/harness.rs) | 6,264 / 2,506 | 231,228 | supported-harness policy, adapter selection, launch validation and construction | **High policy sensitivity, narrower scope.** It exposes 26 production functions. Preserve the supported Codex/Claude Code/GitHub Copilot CLI set and keep process ownership in `pty_runner.rs`/the daemon. |
-| [`automations/command_adoption.rs`](../crates/coven-cli/src/automations/command_adoption.rs) | 3,711 / 1,580 | 135,827 | command adoption, attempt/executor binding, durable receipts, recovery | **High adoption sensitivity.** Keep the distinction between dispatch and durable adoption explicit; extraction must preserve command identity, binding checks, and non-replay after ambiguous execution. |
-| [`automations/occurrences.rs`](../crates/coven-cli/src/automations/occurrences.rs) | 3,469 / 1,629 | 133,189 | occurrence persistence, claim transitions, deduplication, scheduler fencing | **High concurrency risk.** Claims and state transitions share SQL and fencing rules; characterize races and restart behavior before splitting storage from transitions. |
-| [`automations/contract/types.rs`](../crates/coven-cli/src/automations/contract/types.rs) | 3,437 / 3,437 | 110,776 | canonical wire/domain types and validation | **Medium.** Large but cohesive contract code. Split only by stable protocol ownership, not line count. |
+| [`api.rs`](../crates/coven-cli/src/api.rs) | 50,746 / 17,400 | 1,956,423 | transport dispatch, parsing, validation, transport authority, domain orchestration, persistence access, response mapping | **Highest concentration.** `handle_request_with_runtime_and_authority` remains the central route dispatcher. Session lifecycle, Ward/Threads proposals, and Automations handlers share the module. The proposal path also coordinates a process-wide Ward audit lock, filesystem artifacts, SQLite state, recovery, and response precedence. |
+| [`daemon.rs`](../crates/coven-cli/src/daemon.rs) | 17,028 / 7,136 | 651,303 | local IPC and TCP transport, daemon lifecycle, live session ownership, process supervision, recovery, scheduler startup, telemetry | **High mutable-state risk.** `LiveSessionRuntime` owns the shared live-session registry and launch/shutdown coordination; `serve_forever` acquires lifecycle authority, initializes durable state, starts recovery and schedulers, and accepts concurrent transports. In `handle_http_stream_with_lifecycle`, ordinary API requests not consumed by owner-local lifecycle or mobile local-control handling derive transport authority and enter the central API dispatch. |
+| [`store.rs`](../crates/coven-cli/src/store.rs) | 12,178 / 5,138 | 446,029 | initialization facade and cache, query/command persistence, retention, storage health mapping | **High fan-out.** The production portion exposes 110 crate/public free functions. `open_store_with_initialization_observer` delegates schema work to its private `schema` module and retains the initialized connection, while session, handoff, event, Ward, hub, Automations, maintenance, and health queries remain in the parent. The process-global `initialized_store_paths` cache and `STORAGE_HEALTH_SNAPSHOTS` add ownership coupling. |
+| [`store/schema.rs`](../crates/coven-cli/src/store/schema.rs) | 1,399 / 1,399 | 56,647 | schema and migration, SQLite connection configuration, compatibility and FTS backfills | **Private initialization boundary.** The parent facade calls this module without changing SQL, migration order, transaction/rollback boundaries, or startup observation order. Initialization returns the live connection without an intervening close/reopen. Successful-initialization caching and domain commands/queries remain in `store.rs`; daemon startup still owns the final close before readiness. |
+| [`automations/runner.rs`](../crates/coven-cli/src/automations/runner.rs) | 12,001 / 4,722 | 452,981 | occurrence dispatch, scheduler fencing, runtime adoption, retries, timeout/cancellation, crash recovery, terminal settlement | **High state-machine risk.** `dispatch_occurrence_with_clock` combines direct SQL, scheduler-generation checks, runtime launch, cancellation, and settlement; recovery and stop fencing share the production module. #856 has landed, but remaining #857 correctness work should settle before structural movement. |
+| [`ward.rs`](../crates/coven-cli/src/ward.rs) | 10,052 / 6,115 | 371,057 | authorization/policy, path materialization, edit budgets, verified filesystem mutation, rollback/cleanup, audit evidence | **Highest security sensitivity, bounded apply engine.** `Ward::evaluate` is the read-only policy entry point. Direct `Ward::apply` and the Threads-, coherence-, and scheduled-approval families retain fail-closed evaluation and conditional mutation. Their commit-check variants preserve final authority checks; decomposition must not expose private atomic-write helpers. |
+| [`pty_runner.rs`](../crates/coven-cli/src/pty_runner.rs) | 11,026 / 6,130 | 408,676 | harness command construction, PTY/piped I/O, stream decoding, platform process containment, timeout/cancellation, supervisor protocol | **High platform/security risk.** Strict child containment, guardian/supervisor protocol, stream adapters, and detached/attached execution share one module. Windows and Unix ownership guarantees converge at `spawn_strict_child_process_tree`, while cancellation also uses process-global signal coordination in `SUPERVISED_STREAM_CANCELLATION_SIGNAL` and `SUPERVISED_STREAM_CANCELLATION_LOCK`. |
+| [`main.rs`](../crates/coven-cli/src/main.rs) | 9,873 / 6,236 | 363,894 | CLI parsing and command dispatch, setup, user-facing mapping | **Medium.** High fan-in but mostly presentation/entry-point code. Do not prioritize it ahead of authority-bearing modules merely for size. |
+| [`memory_import.rs`](../crates/coven-cli/src/memory_import.rs) | 9,051 / 4,598 | 328,142 | untrusted external-format parsing, normalization, validation, persistence | **Medium-high input risk.** Large because it combines several importer grammars with durable writes. It is not a central authority router, but malformed and cross-format ambiguity need characterization before splitting parsers from persistence. |
+| [`harness.rs`](../crates/coven-cli/src/harness.rs) | 6,610 / 2,662 | 243,410 | supported-harness policy, adapter selection, launch validation and construction | **High policy sensitivity, narrower scope.** It exposes 27 production functions. Preserve the supported Codex/Claude Code/GitHub Copilot CLI set and keep process ownership in `pty_runner.rs`/the daemon. |
+| [`automations/command_adoption.rs`](../crates/coven-cli/src/automations/command_adoption.rs) | 4,510 / 2,021 | 164,895 | command adoption, attempt/executor binding, durable receipts, recovery | **High adoption sensitivity.** Keep the distinction between dispatch and durable adoption explicit; extraction must preserve command identity, binding checks, and non-replay after ambiguous execution. |
+| [`automations/occurrences.rs`](../crates/coven-cli/src/automations/occurrences.rs) | 3,798 / 1,858 | 146,975 | occurrence persistence, claim transitions, deduplication, scheduler fencing | **High concurrency risk.** Claims and state transitions share SQL and fencing rules; characterize races and restart behavior before splitting storage from transitions. |
+| [`automations/contract/types.rs`](../crates/coven-cli/src/automations/contract/types.rs) | 3,585 / 3,585 | 115,912 | canonical wire/domain types and validation | **Medium.** Large but cohesive contract code. Split only by stable protocol ownership, not line count. |
 
 Large TUI modules are intentionally omitted from the authority priority. They
 matter for maintainability, but they do not outrank modules that decide
@@ -126,6 +132,12 @@ These extractions are complete and remain the model for bounded movement:
    configuration into private `store::schema`. The facade retains the initialized
    connection, successful-initialization cache, and domain command/query surface.
    Daemon startup still owns the final close before readiness.
+5. **Proposal-envelope preflight.** Private `api::proposal_preflight` owns the
+   streaming structural scan and decoded-content accounting behind the existing
+   `api::validate_proposal_envelope_preflight` entry point. It returns an edit
+   budget, never an authorization decision. Typed proposal decoding, revision
+   serialization, audit reservation, file reads, claims, recovery, and final
+   policy checks remain with the coordinator. No unchecked decoding API is added.
 
 These seams preserve the public HTTP API, daemon socket protocol, and existing
 caller entry points. They do not complete #806's broader highest-risk module
@@ -138,8 +150,8 @@ The ranking accounts for current dependency blockers as well as inherent risk.
 
 | Priority | Boundary | Characterization and stable contract | Must not change | Readiness |
 | ---: | --- | --- | --- | --- |
-| 1 | **Threads proposal coordinator out of `api.rs`** | Existing proposal/Ward tests in `api.rs`, `threads_gate.rs`, the public `/threads/proposals` API, Ward audit records, and the real-daemon work in #884 | transport-owner gate, decision/error precedence, lock ordering, audit reservation, filesystem recovery, fail-closed uncertainty | **Component integration landed; parent acceptance remains open.** #969, #1022, and #1029 supply identity/publication/recovery wiring. Reconcile the #884 and #885-#888 contract dossiers before moving the coordinator; merged component fixes do not establish every parent acceptance gate. |
-| 2 | **Session route family out of `api.rs`** | `SessionRuntime`, request-adoption and execution-binding tests, API contract docs, session lifecycle integration tests, Windows daemon lifecycle tests | launch/input/kill adoption semantics, event ordering, status/error payloads, lock release before runtime calls, crash/restart behavior | **Characterization in progress.** Use #884's real-daemon harness before moving the full family. |
+| 1 | **Threads proposal coordinator out of `api.rs`** | Existing proposal/Ward tests in `api.rs`, `threads_gate.rs`, the public `/threads/proposals` API, Ward audit records, and the real-daemon work in #884 | transport-owner gate, decision/error precedence, lock ordering, audit reservation, filesystem recovery, fail-closed uncertainty | **Engineering prerequisites accepted.** #884 and #885–#888 are closed with finite engineering dossiers; see reconciliation below. Start with envelope preflight characterization, then move coordinator responsibilities in separate slices. Live Cave, reliability, and human freeze acceptance remain separate. |
+| 2 | **Session route family out of `api.rs`** | `SessionRuntime`, request-adoption and execution-binding tests, API contract docs, session lifecycle integration tests, Windows daemon lifecycle tests | launch/input/kill adoption semantics, event ordering, status/error payloads, lock release before runtime calls, crash/restart behavior | **Harness available.** #884 is closed. Retain its feature-enabled real-daemon targets and add session-specific adoption/error/restart characterization before moving the family. |
 | 3 | **Store initialization/schema from runtime commands and queries** | `open_store`, `initialize_store`, `open_initialized_store`, migration/compatibility tests, store health and smoke tests | schema and migration order, transaction boundaries, per-request no-DDL path, function signatures, and policy remaining outside persistence | **Landed in #1033.** Private `store::schema` owns initialization behind the existing facade. Domain-query decomposition and the broader #806 acceptance criteria remain separate work. |
 | 4 | **Daemon transport accept loops from live-session supervision** | daemon inline tests, Unix/TCP request tests, `windows_daemon_lifecycle.rs`, stop/restart budget and recovery tests | single-writer lifecycle locks, owner-derived request authority, bounded in-flight handling, shutdown cleanup, live-session registry semantics | Ready only as separate platform-complete slices; Unix and Windows must keep equivalent outer behavior. |
 | 5 | **Process containment/supervisor from adapter and stream code in `pty_runner.rs`** | strict-containment tests, native Windows lifecycle tests, piped/PTY integration tests, timeout/cancellation tests | before-first-instruction ownership, kill-on-close/process-group guarantees, receipt protocol, terminal callback ordering | Characterize the supervisor protocol as one unit before moving it. Never split Unix and Windows into contracts that can drift. |
@@ -151,11 +163,72 @@ below these boundaries because they do not currently dominate authority review
 risk. They are suitable fallback slices only when a higher-risk boundary is
 blocked and the move does not create a second policy path.
 
+## Correctness dossier reconciliation (2026-10-20)
+
+At source `10a7cecf6882243eb52233a8b1463781f329cdba`, the prior blanket
+Threads dependency hold is stale. The accepted scope is finite:
+
+- [#884 closing review](https://github.com/OpenCoven/coven/issues/884#issuecomment-6000558436)
+  accepts the isolated real-daemon harness, deterministic clock, typed closes,
+  restart coverage, and pinned compatibility mechanism. Run all four Threads
+  integration targets with `--features threads-test-clock`; workspace tests
+  alone intentionally omit these targets.
+- [#885](https://github.com/OpenCoven/coven/issues/885) accepts identity binding
+  for enumerated current intake/replay routes at `226bfcc8`, not future APIs.
+- [#886 disposition](https://github.com/OpenCoven/coven/issues/886#issuecomment-5719691181)
+  accepts the five terminal families and the inspected deployed profile's empty
+  audit census. This is not evidence about arbitrary deployments or permission
+  to repair ambiguous history.
+- [#887 acceptance](https://github.com/OpenCoven/coven/issues/887#issuecomment-5656608527)
+  accepts the nine-route protected-intake matrix; separate protected writes stay
+  fail-closed and source forwarding evidence is not live Cave acceptance.
+- [#888 acceptance](https://github.com/OpenCoven/coven/issues/888#issuecomment-5656608528)
+  accepts seven retired-corpus scenarios, contention, and ordered typed closes.
+- #924 remains open for final-delete identity guarantees; #857 remains open
+  for automation dispatch/receipt authority. Do not move those unsettled engines.
+  Current #1436 startup instrumentation and #857 PRs also require coordination.
+
+These historical receipts establish which contracts were accepted. Every new
+extraction still needs fresh exact-source tests and supported-platform CI.
+They do not discharge Threads' long-run reliability, live Cave acceptance, or
+human coherence/freeze gates. #806 remains open for the full decomposition.
+
+## Proposal preflight extraction contract
+
+The first post-refresh Threads slice removes the structural scanner, preflight
+wire readers, and content accounting from the API coordinator without changing
+any production expression. Against the snapshot above, `api.rs` drops from
+50,746 to 49,284 lines; the new pure module contains 1,221 lines. This is one
+parsing responsibility, not completion of the Threads coordinator decomposition.
+
+Focused tests pin structural errors before content decoding, duplicate-field
+rejection, validation of shadowed legacy edits, nested-before-legacy budget
+errors independent of JSON field order, UTF-8/base64 accounting, overflow,
+cardinality, nesting, and exact content limits. Existing API tests continue to
+prove preflight precedes target access and Ward adjudication. Removing structural
+scanning or shadowed-field validation was independently detected by the new
+characterization before extraction.
+
+`tests/proposal_preflight_boundary.rs` parses the Rust AST and rejects new
+internal dependencies, I/O imports, exposed unchecked helpers, and production
+submodules. Its negative fixtures exercise the guard itself. This is a drift
+check, not a Rust sandbox. Production helpers stay private and the original
+crate-visible entry point is a re-export of the single implementation.
+
+No persistence, serialization, process, or protocol behavior is changed. The
+four feature-enabled Threads integration targets remain required to verify the
+outer authority/restart paths. Rollback restores the original module placement
+and callers together; it requires no data migration and must retain all accepted
+identity and fail-closed policy fixes. Platform execution evidence belongs in
+the delivering PR; historical dossier acceptance does not substitute for it.
+
 ## Where new behavior belongs
 
 - **Route/version policy** (new route arm, version bump, gate rejection):
   `api_routes.rs` for the gate and the `api.rs` dispatch for the arm. Never use
   a helper that bypasses the gate.
+- **Proposal-envelope syntax and resource validation**: private
+  `api::proposal_preflight`; keep authority decisions and I/O outside it.
 - **Validation and domain policy**: the module that owns the domain
   (`ward.rs`, `threads_gate.rs`, `harness.rs`, `session_launch.rs`) rather than
   inline transport code where a characterized seam exists.
