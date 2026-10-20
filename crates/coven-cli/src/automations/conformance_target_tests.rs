@@ -2445,11 +2445,12 @@ fn storage_corruption_observations() -> Vec<Value> {
 #[test]
 fn storage_corruption_suite_executes_real_faults_and_control() {
     let observations = storage_corruption_observations();
-    assert_eq!(observations.len(), 3);
+    assert_eq!(observations.len(), 4);
     for (observation, (fault, outcome, code, initial)) in observations.iter().zip([
         ("sqlite_header", "not_a_database", json!(26), 0),
         ("definition_btree", "database_corrupt", json!(11), 0),
         ("none", "committed", Value::Null, 1),
+        ("adoption_btree", "database_corrupt", json!(11), 0),
     ]) {
         assert_eq!(observation["faultSource"], fault, "{observation}");
         assert_eq!(observation["initialOutcome"], outcome, "{observation}");
@@ -2468,20 +2469,34 @@ fn storage_corruption_suite_executes_real_faults_and_control() {
             assert_eq!(observation[field], true, "{field}: {observation}");
         }
     }
-    // Both faults are refused by the cold initializer itself, before the
-    // definition command is reachable, and the refusal leaves the corrupted
-    // main file byte-for-byte as written. The control is never refused.
+    // The header and definition faults are refused by the cold initializer
+    // itself, before the definition command is reachable, and the refusal
+    // leaves the corrupted main file byte-for-byte as written. The control is
+    // never refused.
     for observation in &observations[..2] {
         assert_eq!(observation["refusalStage"], "cold_open", "{observation}");
         assert_eq!(observation["refusalLeftMainFileUnchanged"], true);
         assert_eq!(observation["coldInitializationCompleted"], false);
         assert_eq!(observation["initialTransactionClosed"], Value::Null);
+        assert_eq!(observation["refusedAfterEarlierWrites"], Value::Null);
     }
     let control = &observations[2];
     assert_eq!(control["refusalStage"], Value::Null, "{control}");
     assert_eq!(control["refusalLeftMainFileUnchanged"], Value::Null);
     assert_eq!(control["coldInitializationCompleted"], true);
     assert_eq!(control["initialTransactionClosed"], true);
+    assert_eq!(control["refusedAfterEarlierWrites"], Value::Null);
+    // The cold initializer never reads the adoption table's root page, so the
+    // command reaches the fault itself, after completing earlier writes. None
+    // of them persisted: the connection is left outside a transaction, the
+    // corrupted main file is unchanged and no WAL remains.
+    let adoption = &observations[3];
+    assert_eq!(adoption["refusalStage"], "command", "{adoption}");
+    assert_eq!(adoption["coldInitializationCompleted"], true);
+    assert_eq!(adoption["refusedAfterEarlierWrites"], true);
+    assert_eq!(adoption["initialTransactionClosed"], true);
+    assert_eq!(adoption["refusalLeftMainFileUnchanged"], true);
+    assert_eq!(adoption["walObservedAfterInitial"], false);
 }
 
 #[test]
@@ -2521,15 +2536,27 @@ fn storage_corruption_evidence_carries_no_locations_or_contents() {
 fn storage_corruption_suite_rejects_missing_controls_and_weakened_expectations() {
     for (pointer, value) in [
         ("/schemaVersion", json!("unknown")),
+        (
+            "/schemaVersion",
+            json!("coven.automations.command-storage-corruption-recovery-vectors.v2"),
+        ),
         ("/cases/0/fault", json!("none")),
         ("/cases/1/fault", json!("sqlite_header")),
         ("/cases/2/fault", json!("definition_btree")),
+        ("/cases/3/fault", json!("definition_btree")),
+        ("/cases/3/fault", json!("none")),
         (
             "/cases/0/expected/initialOutcome",
             json!("database_corrupt"),
         ),
         ("/cases/1/expected/initialOutcome", json!("not_a_database")),
         ("/cases/2/expected/initialOutcome", json!("not_a_database")),
+        ("/cases/3/expected/initialOutcome", json!("committed")),
+        ("/cases/3/expected/initialRows", json!(1)),
+        ("/cases/0/expected/refusalStage", json!("command")),
+        ("/cases/1/expected/refusalStage", Value::Null),
+        ("/cases/2/expected/refusalStage", json!("command")),
+        ("/cases/3/expected/refusalStage", json!("cold_open")),
         ("/cases/0/expected/initialRows", json!(1)),
         ("/cases/2/expected/initialRows", json!(0)),
         ("/cases/1/expected/finalRows", json!(0)),

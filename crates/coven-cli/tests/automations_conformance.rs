@@ -1772,16 +1772,17 @@ fn native_target_evaluates_checked_in_storage_corruption_vectors() -> anyhow::Re
     let response: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(response["suiteId"], "command-storage-corruption-recovery");
     assert_eq!(response["status"], "passed");
-    assert_eq!(response["evidence"]["executedCases"], 3);
-    assert_eq!(response["evidence"]["passedCases"], 3);
+    assert_eq!(response["evidence"]["executedCases"], 4);
+    assert_eq!(response["evidence"]["passedCases"], 4);
     let observations = response["evidence"]["observations"]
         .as_array()
         .expect("corruption observations");
-    assert_eq!(observations.len(), 3);
+    assert_eq!(observations.len(), 4);
     for (observation, (fault, outcome, stage)) in observations.iter().zip([
         ("sqlite_header", "not_a_database", json!("cold_open")),
         ("definition_btree", "database_corrupt", json!("cold_open")),
         ("none", "committed", Value::Null),
+        ("adoption_btree", "database_corrupt", json!("command")),
     ]) {
         assert_eq!(observation["faultSource"], fault);
         assert_eq!(observation["initialOutcome"], outcome);
@@ -1791,6 +1792,11 @@ fn native_target_evaluates_checked_in_storage_corruption_vectors() -> anyhow::Re
         assert_eq!(observation["finalAddedDefinitions"], 1);
         assert_eq!(observation["replayPreserved"], true);
     }
+    let adoption = &observations[3];
+    assert_eq!(adoption["refusedAfterEarlierWrites"], true);
+    assert_eq!(adoption["initialTransactionClosed"], true);
+    assert_eq!(adoption["refusalLeftMainFileUnchanged"], true);
+    assert_eq!(adoption["walObservedAfterInitial"], false);
     for (field, value) in [
         ("offset", json!(0)),
         ("path", json!("private-invalid-value")),

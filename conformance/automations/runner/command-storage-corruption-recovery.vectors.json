@@ -24,7 +24,8 @@
         "finalRows": 1,
         "baselinePreserved": true,
         "storeNotReset": true,
-        "replayPreserved": true
+        "replayPreserved": true,
+        "refusalStage": "cold_open"
       }
     },
     {
@@ -50,7 +51,8 @@
         "finalRows": 1,
         "baselinePreserved": true,
         "storeNotReset": true,
-        "replayPreserved": true
+        "replayPreserved": true,
+        "refusalStage": "cold_open"
       }
     },
     {
@@ -76,7 +78,35 @@
         "finalRows": 1,
         "baselinePreserved": true,
         "storeNotReset": true,
-        "replayPreserved": true
+        "replayPreserved": true,
+        "refusalStage": null
+      }
+    },
+    {
+      "caseId": "corrupt-adoption-page-rolls-back-then-recovers",
+      "fault": "adoption_btree",
+      "adoptionKey": "adopt:storage-corruption:0001",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "expected": {
+        "initialOutcome": "database_corrupt",
+        "initialRows": 0,
+        "finalRows": 1,
+        "baselinePreserved": true,
+        "storeNotReset": true,
+        "replayPreserved": true,
+        "refusalStage": "command"
       }
     }
   ]
