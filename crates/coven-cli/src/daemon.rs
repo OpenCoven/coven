@@ -5628,6 +5628,20 @@ enum StartupCheckpoint {
     DaemonStoreEnd,
     StatusPublicationBegin,
     StatusPublicationEnd,
+    // Runtime end markers observe call return, not completion of background
+    // work or success of best-effort recovery. Existing failures retain their
+    // original handling; authenticated health remains the readiness contract.
+    RuntimeInitializeBegin,
+    OrphanedSessionsEnd,
+    StaleCreatedSessionsEnd,
+    AfsRecoveryEnd,
+    SessionRuntimeEnd,
+    ThreadsSchedulerEnd,
+    MaintenanceSchedulerEnd,
+    LivenessSweeperEnd,
+    AutomationsSchedulerEnd,
+    MobileGatewayEnd,
+    ApiAcceptLoopEnter,
 }
 
 impl StartupCheckpoint {
@@ -5664,6 +5678,17 @@ impl StartupCheckpoint {
             Self::DaemonStoreEnd => "daemon-store-end",
             Self::StatusPublicationBegin => "status-publication-begin",
             Self::StatusPublicationEnd => "status-publication-end",
+            Self::RuntimeInitializeBegin => "runtime-initialize-begin",
+            Self::OrphanedSessionsEnd => "orphaned-sessions-end",
+            Self::StaleCreatedSessionsEnd => "stale-created-sessions-end",
+            Self::AfsRecoveryEnd => "afs-recovery-end",
+            Self::SessionRuntimeEnd => "session-runtime-end",
+            Self::ThreadsSchedulerEnd => "threads-scheduler-end",
+            Self::MaintenanceSchedulerEnd => "maintenance-scheduler-end",
+            Self::LivenessSweeperEnd => "liveness-sweeper-end",
+            Self::AutomationsSchedulerEnd => "automations-scheduler-end",
+            Self::MobileGatewayEnd => "mobile-gateway-end",
+            Self::ApiAcceptLoopEnter => "api-accept-loop-enter",
         }
     }
 }
@@ -5855,19 +5880,32 @@ pub fn serve_forever(
             socket_path.display()
         ),
     );
+    // A published status/socket precedes runtime initialization and is not
+    // readiness. Measure this interval separately from store/publication work.
+    let mut startup = StartupCheckpointObserver::new(Instant::now());
+    startup.append(coven_home, StartupCheckpoint::RuntimeInitializeBegin);
     recover_orphaned_sessions(coven_home, &started_at)?;
+    startup.append(coven_home, StartupCheckpoint::OrphanedSessionsEnd);
     recover_stale_created_sessions(coven_home, &started_at)?;
+    startup.append(coven_home, StartupCheckpoint::StaleCreatedSessionsEnd);
     recover_orphaned_afs_mounts(coven_home);
+    startup.append(coven_home, StartupCheckpoint::AfsRecoveryEnd);
     let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
         coven_home.to_path_buf(),
     )?);
+    startup.append(coven_home, StartupCheckpoint::SessionRuntimeEnd);
     start_threads_proposal_scheduler(coven_home)?;
+    startup.append(coven_home, StartupCheckpoint::ThreadsSchedulerEnd);
     start_store_maintenance_scheduler(coven_home)?;
+    startup.append(coven_home, StartupCheckpoint::MaintenanceSchedulerEnd);
     start_session_liveness_sweeper(coven_home, &runtime)?;
+    startup.append(coven_home, StartupCheckpoint::LivenessSweeperEnd);
     let automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
     let mobile_gateway =
         crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
+    startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     let (tcp_thread, active_tcp_connection) = if let Some(tcp_listener) = tcp_listener {
         let tcp_home = coven_home.to_path_buf();
@@ -5982,6 +6020,8 @@ pub fn serve_forever(
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let shutdown_connections = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
     use std::sync::atomic::Ordering;
+    // Entry alone does not prove authenticated health or readiness.
+    startup.append(coven_home, StartupCheckpoint::ApiAcceptLoopEnter);
     loop {
         if daemon_termination_requested() {
             break;
@@ -7033,23 +7073,36 @@ fn serve_forever_with_lifetime_job_installer(
     // or marking sessions owned by that live daemon orphaned.
     initialize_daemon_store(coven_home)?;
     write_startup_status(coven_home, &status)?;
+    // Match the Unix runtime interval; status publication is not readiness.
+    let mut startup = StartupCheckpointObserver::new(Instant::now());
+    startup.append(coven_home, StartupCheckpoint::RuntimeInitializeBegin);
     recover_orphaned_sessions(coven_home, &started_at)?;
+    startup.append(coven_home, StartupCheckpoint::OrphanedSessionsEnd);
     recover_stale_created_sessions(coven_home, &started_at)?;
+    startup.append(coven_home, StartupCheckpoint::StaleCreatedSessionsEnd);
     recover_orphaned_afs_mounts(coven_home);
+    startup.append(coven_home, StartupCheckpoint::AfsRecoveryEnd);
 
     let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
         coven_home.to_path_buf(),
     )?);
+    startup.append(coven_home, StartupCheckpoint::SessionRuntimeEnd);
     start_threads_proposal_scheduler(coven_home)?;
+    startup.append(coven_home, StartupCheckpoint::ThreadsSchedulerEnd);
     start_store_maintenance_scheduler(coven_home)?;
+    startup.append(coven_home, StartupCheckpoint::MaintenanceSchedulerEnd);
     start_session_liveness_sweeper(coven_home, &runtime)?;
+    startup.append(coven_home, StartupCheckpoint::LivenessSweeperEnd);
     let _automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
     let _mobile_gateway =
         crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
+    startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));
+    startup.append(coven_home, StartupCheckpoint::ApiAcceptLoopEnter);
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,
