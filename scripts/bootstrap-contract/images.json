@@ -1,0 +1,16 @@
+{
+  "debian12": {
+    "image": "docker.io/library/debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+    "platform": "linux/amd64",
+    "tag_at_resolution": "bookworm-slim",
+    "distribution": "debian",
+    "codename": "bookworm"
+  },
+  "ubuntu24": {
+    "image": "docker.io/library/ubuntu@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac",
+    "platform": "linux/amd64",
+    "tag_at_resolution": "noble",
+    "distribution": "ubuntu",
+    "codename": "noble"
+  }
+}
