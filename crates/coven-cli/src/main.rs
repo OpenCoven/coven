@@ -1225,6 +1225,8 @@ enum AutomationsConformanceCommand {
     AutomaticRetryCrashWorker,
     #[command(hide = true, name = "retry-timeout-crash-worker")]
     RetryTimeoutCrashWorker,
+    #[command(hide = true, name = "waiting-retry-cancellation-crash-worker")]
+    WaitingRetryCancellationCrashWorker,
     #[command(about = "Print the native conformance suites supported by this binary")]
     Capability,
     #[command(about = "Evaluate one conformance suite request from standard input")]
@@ -4262,6 +4264,13 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
                 let request = serde_json::from_str(&payload)
                     .map_err(|_| anyhow!("conformance request is invalid"))?;
                 automations::conformance_target::retry_timeout_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::WaitingRetryCancellationCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::waiting_retry_cancellation_crash_worker(&request)
                     .map_err(|message| anyhow!(message))
             }
             AutomationsConformanceCommand::Capability => {

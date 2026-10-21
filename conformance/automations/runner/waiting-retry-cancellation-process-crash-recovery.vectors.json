@@ -1,0 +1,521 @@
+{
+  "schemaVersion": "coven.automations.waiting-retry-cancellation-process-crash-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "retry-cancel-killed-after-retry-cancelled",
+      "boundary": "after_retry_cancelled",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "storedAfterExit": "none",
+        "retryAfterRestart": "scheduled",
+        "storedAfterRestart": "none",
+        "restartIsNoop": true,
+        "reissue": "withdrawn",
+        "retryAfterReissue": "cancelled",
+        "storedAfterReissue": "withdrawn",
+        "passIsNoop": true,
+        "resend": "replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-run-cancelled",
+      "boundary": "after_run_cancelled",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "storedAfterExit": "none",
+        "retryAfterRestart": "scheduled",
+        "storedAfterRestart": "none",
+        "restartIsNoop": true,
+        "reissue": "withdrawn",
+        "retryAfterReissue": "cancelled",
+        "storedAfterReissue": "withdrawn",
+        "passIsNoop": true,
+        "resend": "replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-occurrence-cancelled",
+      "boundary": "after_occurrence_cancelled",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "storedAfterExit": "none",
+        "retryAfterRestart": "scheduled",
+        "storedAfterRestart": "none",
+        "restartIsNoop": true,
+        "reissue": "withdrawn",
+        "retryAfterReissue": "cancelled",
+        "storedAfterReissue": "withdrawn",
+        "passIsNoop": true,
+        "resend": "replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-withdrawal-adoption",
+      "boundary": "after_withdrawal_adoption",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "storedAfterExit": "none",
+        "retryAfterRestart": "scheduled",
+        "storedAfterRestart": "none",
+        "restartIsNoop": true,
+        "reissue": "withdrawn",
+        "retryAfterReissue": "cancelled",
+        "storedAfterReissue": "withdrawn",
+        "passIsNoop": true,
+        "resend": "replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-withdrawal-commit",
+      "boundary": "after_withdrawal_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "cancelled",
+        "storedAfterExit": "withdrawn",
+        "retryAfterRestart": "cancelled",
+        "storedAfterRestart": "withdrawn",
+        "restartIsNoop": true,
+        "reissue": "replayed",
+        "retryAfterReissue": "cancelled",
+        "storedAfterReissue": "withdrawn",
+        "passIsNoop": true,
+        "resend": "replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "uninterrupted-waiting-retry-cancellation-control",
+      "boundary": "waiting_control",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "answered",
+        "retryAfterExit": "cancelled",
+        "storedAfterExit": "withdrawn",
+        "retryAfterRestart": "cancelled",
+        "storedAfterRestart": "withdrawn",
+        "restartIsNoop": true,
+        "reissue": "replayed",
+        "retryAfterReissue": "cancelled",
+        "storedAfterReissue": "withdrawn",
+        "passIsNoop": true,
+        "resend": "replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-retry-timed-out",
+      "boundary": "after_retry_timed_out",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "storedAfterExit": "none",
+        "retryAfterRestart": "timed_out",
+        "storedAfterRestart": "none",
+        "restartIsNoop": false,
+        "reissue": "refused",
+        "retryAfterReissue": "timed_out",
+        "storedAfterReissue": "attempt_refusal",
+        "passIsNoop": true,
+        "resend": "refusal_replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-occurrence-failed",
+      "boundary": "after_occurrence_failed",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "storedAfterExit": "none",
+        "retryAfterRestart": "timed_out",
+        "storedAfterRestart": "none",
+        "restartIsNoop": false,
+        "reissue": "refused",
+        "retryAfterReissue": "timed_out",
+        "storedAfterReissue": "attempt_refusal",
+        "passIsNoop": true,
+        "resend": "refusal_replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-run-failed",
+      "boundary": "after_run_failed",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "storedAfterExit": "none",
+        "retryAfterRestart": "timed_out",
+        "storedAfterRestart": "none",
+        "restartIsNoop": false,
+        "reissue": "refused",
+        "retryAfterReissue": "timed_out",
+        "storedAfterReissue": "attempt_refusal",
+        "passIsNoop": true,
+        "resend": "refusal_replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-refusal-adoption",
+      "boundary": "after_refusal_adoption",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "storedAfterExit": "none",
+        "retryAfterRestart": "timed_out",
+        "storedAfterRestart": "none",
+        "restartIsNoop": false,
+        "reissue": "refused",
+        "retryAfterReissue": "timed_out",
+        "storedAfterReissue": "attempt_refusal",
+        "passIsNoop": true,
+        "resend": "refusal_replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-cancel-killed-after-refusal-commit",
+      "boundary": "after_refusal_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "timed_out",
+        "storedAfterExit": "timeout_refusal",
+        "retryAfterRestart": "timed_out",
+        "storedAfterRestart": "timeout_refusal",
+        "restartIsNoop": true,
+        "reissue": "refusal_replayed",
+        "retryAfterReissue": "timed_out",
+        "storedAfterReissue": "timeout_refusal",
+        "passIsNoop": true,
+        "resend": "refusal_replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "uninterrupted-expired-retry-cancellation-control",
+      "boundary": "expired_control",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-retry-cancel-crash",
+        "name": "Conformance waiting retry cancellation crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native waiting retry cancellation crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 120,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "answered",
+        "retryAfterExit": "timed_out",
+        "storedAfterExit": "timeout_refusal",
+        "retryAfterRestart": "timed_out",
+        "storedAfterRestart": "timeout_refusal",
+        "restartIsNoop": true,
+        "reissue": "refusal_replayed",
+        "retryAfterReissue": "timed_out",
+        "storedAfterReissue": "timeout_refusal",
+        "passIsNoop": true,
+        "resend": "refusal_replayed",
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    }
+  ]
+}

@@ -52,6 +52,7 @@ mod run_settlement_process_crash;
 mod runtime_authority_terminal_recovery;
 mod startup_wake_trace;
 mod timeout_enforcement_process_crash;
+mod waiting_retry_cancellation_process_crash;
 use startup_wake_trace::{StartupWakeOutcome, StartupWakePhase, StartupWakeTrace};
 
 /// Execute the disposable hidden process-crash conformance worker.
@@ -112,6 +113,12 @@ pub fn automatic_retry_crash_worker(request: &Value) -> Result<(), &'static str>
 /// Execute the disposable hidden retry-timeout crash conformance worker.
 pub fn retry_timeout_crash_worker(request: &Value) -> Result<(), &'static str> {
     retry_timeout_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden waiting-retry cancellation crash conformance
+/// worker.
+pub fn waiting_retry_cancellation_crash_worker(request: &Value) -> Result<(), &'static str> {
+    waiting_retry_cancellation_process_crash::worker(request)
 }
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -213,6 +220,8 @@ pub const HELD_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE: &str =
 pub const AUTOMATIC_RETRY_PROCESS_CRASH_RECOVERY_SUITE: &str =
     "automatic-retry-process-crash-recovery";
 pub const RETRY_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE: &str = "retry-timeout-process-crash-recovery";
+pub const WAITING_RETRY_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "waiting-retry-cancellation-process-crash-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -1691,6 +1700,7 @@ pub fn capability() -> TargetCapability {
                     HELD_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE,
                     AUTOMATIC_RETRY_PROCESS_CRASH_RECOVERY_SUITE,
                     RETRY_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE,
+                    WAITING_RETRY_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
                 ],
             },
             TargetProfileCapability {
@@ -1862,6 +1872,18 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, RETRY_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE) => {
             let (passed, observations) = retry_timeout_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (
+            SCHEDULER_RELIABILITY_PROFILE,
+            WAITING_RETRY_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
+        ) => {
+            let (passed, observations) =
+                waiting_retry_cancellation_process_crash::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);
