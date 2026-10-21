@@ -15,9 +15,12 @@
 //!
 //! Either determination is refused while the latest attempt's session is
 //! still `created` or `running`. That work may still be happening, and the
-//! owner cancels it first, so a retry never runs alongside it. A retry also
-//! needs the run's deadline to be open. A Runtime Authority run is refused:
-//! settling it needs authority-evidenced receipts, which its adapter produces.
+//! owner cancels it first, so a retry never runs alongside it. Both wait with
+//! `CANCEL_PENDING` while a run cancellation is still being reconciled: the
+//! daemon answers it after its lease, and it settles the stop it owns. A
+//! retry also needs the run's deadline to be open. A Runtime Authority run is
+//! refused: settling it needs authority-evidenced receipts, which its adapter
+//! produces.
 //!
 //! The command has no side effect outside the store. So its adoption, checks
 //! and state change share one transaction, and an exact replay returns the
@@ -313,6 +316,15 @@ fn recover_in(
              which this command cannot produce yet"
                 .to_owned(),
         );
+    }
+    if let Some((run_id, ..)) = &run {
+        if super::cancellation::has_pending_cancellation(conn, run_id)? {
+            return refuse(
+                ErrorCode::CancelPending,
+                "the run's cancellation is still being reconciled; recover after it is answered"
+                    .to_owned(),
+            );
+        }
     }
     if let Some((_, attempt_state, session_status)) = &attempt {
         if matches!(

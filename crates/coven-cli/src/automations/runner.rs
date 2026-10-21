@@ -3480,9 +3480,31 @@ pub(crate) fn mark_unconfirmed_stop_for_recovery(
     state_reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
+    mark_unconfirmed_stop(conn, run_id, None, state_reason, now)
+}
+
+/// The same for one attempt: a command's unconfirmed stop never marks an
+/// attempt it did not target, such as one an owner opened since.
+pub(crate) fn mark_unconfirmed_attempt_stop_for_recovery(
+    conn: &Connection,
+    run_id: &str,
+    attempt_id: &str,
+    state_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    mark_unconfirmed_stop(conn, run_id, Some(attempt_id), state_reason, now)
+}
+
+fn mark_unconfirmed_stop(
+    conn: &Connection,
+    run_id: &str,
+    attempt_id: Option<&str>,
+    state_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin ambiguous stop settlement: {error}"))?;
-    mark_unconfirmed_stop_for_recovery_in(&transaction, run_id, state_reason, now)?;
+    mark_unconfirmed_stop_for_recovery_in(&transaction, run_id, attempt_id, state_reason, now)?;
     transaction
         .commit()
         .map_err(|error| format!("failed to commit ambiguous stop settlement: {error}"))
@@ -3491,6 +3513,7 @@ pub(crate) fn mark_unconfirmed_stop_for_recovery(
 fn mark_unconfirmed_stop_for_recovery_in(
     conn: &Connection,
     run_id: &str,
+    attempt_id: Option<&str>,
     state_reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
@@ -3503,6 +3526,7 @@ fn mark_unconfirmed_stop_for_recovery_in(
                  state_reason = ?2,
                  settled_at = ?3
              WHERE run_id = ?1
+               AND (?4 IS NULL OR id = ?4)
                AND state IN ('dispatching', 'started', 'observing')
                AND NOT EXISTS (
                    SELECT 1 FROM automation_runs r
@@ -3551,7 +3575,7 @@ fn mark_unconfirmed_stop_for_recovery_in(
                        )
                    )
                )",
-            rusqlite::params![run_id, state_reason, now_iso],
+            rusqlite::params![run_id, state_reason, now_iso, attempt_id],
         )
         .map_err(|error| format!("failed to mark ambiguous automation attempt: {error}"))?;
     if attempt_changed != 1 {
@@ -4004,6 +4028,7 @@ pub(crate) fn settle_finished_runs_with(
                 mark_unconfirmed_stop_for_recovery_in(
                     &transaction,
                     &run_id,
+                    None,
                     "stop owner expired after terminal session evidence",
                     now,
                 )?;
