@@ -12,6 +12,10 @@ fn main() {
         .expect("probe executable name")
         .to_ascii_lowercase();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--hold-version-stdout"] {
+        thread::sleep(Duration::from_secs(20));
+        return;
+    }
     if args == ["--hold-stdout"] {
         thread::sleep(Duration::from_secs(60));
         return;
@@ -26,6 +30,30 @@ fn main() {
 
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["--version"] => {
+            match std::env::var("COVEN_DOCTOR_PROBE_MODE").as_deref() {
+                Ok("version-timeout") => thread::sleep(Duration::from_secs(20)),
+                Ok("combined-timeout") => thread::sleep(Duration::from_secs(2)),
+                Ok("version-descendant") => {
+                    let descendant = Command::new(&executable)
+                        .arg("--hold-version-stdout")
+                        .spawn()
+                        .expect("spawn version stdout holder");
+                    record_descendant_pid(descendant.id());
+                }
+                Ok("version-flood") => {
+                    // A valid tail must not make an oversized response acceptable.
+                    print!("{} ", "private-version-sentinel".repeat(100_000));
+                }
+                Ok("version-malformed") => {
+                    println!("private-version-sentinel");
+                    return;
+                }
+                Ok("version-nonzero") => {
+                    println!("coven-code 0.6.1 private-version-sentinel");
+                    process::exit(2);
+                }
+                _ => {}
+            }
             println!("coven-code 0.6.1");
         }
         ["auth", "status", "--json"] => match std::env::var("COVEN_DOCTOR_PROBE_MODE")
@@ -33,6 +61,14 @@ fn main() {
             .unwrap_or("configured")
         {
             "configured" => println!(r#"{{"loggedIn":true}}"#),
+            "version-timeout" | "version-descendant" | "version-flood"
+            | "version-malformed" | "version-nonzero" => {
+                println!(r#"{{"loggedIn":true}}"#);
+            }
+            "combined-timeout" => {
+                thread::sleep(Duration::from_secs(20));
+                println!(r#"{{"loggedIn":true}}"#);
+            }
             "unconfigured" => {
                 println!(r#"{{"loggedIn":false}}"#);
                 process::exit(1);

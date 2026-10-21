@@ -1211,6 +1211,8 @@ enum AutomationsConformanceCommand {
     RunLaunchCrashWorker,
     #[command(hide = true, name = "attempt-retry-crash-worker")]
     AttemptRetryCrashWorker,
+    #[command(hide = true, name = "occurrence-recovery-crash-worker")]
+    OccurrenceRecoveryCrashWorker,
     #[command(about = "Print the native conformance suites supported by this binary")]
     Capability,
     #[command(about = "Evaluate one conformance suite request from standard input")]
@@ -1627,9 +1629,11 @@ fn main() -> Result<()> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
             let coven_desc = env!("COVEN_VERSION_DESC");
-            let installed = engine::resolve()
-                .and_then(|r| engine::engine_version(&r.path).ok())
-                .map(|(a, b, c)| format!("{a}.{b}.{c}"));
+            let installed = engine::resolve().map(|r| {
+                engine::engine_version(&r.path)
+                    .map(|(a, b, c)| format!("{a}.{b}.{c}"))
+                    .unwrap_or_else(|_| "unknown".to_owned())
+            });
             let pinned = engine::pinned_version();
             println!("{}", version_line(coven_desc, installed.as_deref(), pinned));
             std::process::exit(0);
@@ -2872,7 +2876,12 @@ fn doctor_repo_config_path(
     }
 }
 
+const ENGINE_VERSION_RECOVERY_HINT: &str =
+    "check COVEN_ENGINE_BIN and PATH, or repair the managed engine with: coven engine install";
+
 fn gather_doctor_report() -> Result<DoctorReport> {
+    // Leave headroom for rendering within Cave's six-second execution limit.
+    let probe_deadline = std::time::Instant::now() + engine::PROBE_TIMEOUT;
     let home = coven_home_dir()?;
     let project_root = std::env::current_dir()
         .ok()
@@ -2902,11 +2911,12 @@ fn gather_doctor_report() -> Result<DoctorReport> {
     let harnesses = harness::configured_harnesses()?;
     let (engine, engine_auth) = match engine::resolve() {
         Some(resolved) => {
-            let auth = engine_auth_summary(&resolved.path);
+            let version = engine::engine_version_until(&resolved.path, probe_deadline).ok();
+            let auth = engine_auth_summary(&resolved.path, probe_deadline);
             (
                 Some(DoctorEngineReport {
                     source_label: engine_source_label(&resolved.source).to_string(),
-                    version: engine::engine_version(&resolved.path).ok(),
+                    version,
                     other_on_path: engine_other_on_path(&resolved),
                     path: resolved.path,
                 }),
@@ -3118,7 +3128,10 @@ fn print_doctor_prose(report: &DoctorReport) {
                         );
                     }
                 }
-                None => println!("  [--] version: unknown (could not run the engine)"),
+                None => {
+                    println!("  [--] version: unknown (could not run the engine)");
+                    println!("       {ENGINE_VERSION_RECOVERY_HINT}");
+                }
             }
             println!("       pin: {}", engine::pinned_version());
         }
@@ -3455,7 +3468,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
                 None => DoctorCheck::warn(
                     "engine",
                     format!("{located}, version unknown (could not run the engine)"),
-                    None,
+                    Some(ENGINE_VERSION_RECOVERY_HINT.to_string()),
                 ),
                 Some(version) => {
                     let (a, b, c) = version;
@@ -4190,6 +4203,13 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
                 automations::conformance_target::attempt_retry_crash_worker(&request)
                     .map_err(|message| anyhow!(message))
             }
+            AutomationsConformanceCommand::OccurrenceRecoveryCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::occurrence_recovery_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
             AutomationsConformanceCommand::Capability => {
                 println!(
                     "{}",
@@ -4484,105 +4504,15 @@ fn engine_source_label(source: &engine::EngineSource) -> &'static str {
     }
 }
 
-/// Query the engine's local auth state via `auth status --json`, bounded to ~5s
-/// so a hung engine never hangs `coven doctor`. Returns `Some(configured)` only
+/// Query the engine's local auth state via `auth status --json` within Doctor's
+/// shared deadline, so a hung engine cannot hold the report open. Returns `Some(configured)` only
 /// when the JSON value agrees with the engine contract's exit status (0 for
 /// configured, 1 for not configured). This is local configuration evidence,
 /// not proof that a provider turn succeeds.
-fn engine_auth_summary(binary: &Path) -> Option<bool> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc::{self, TryRecvError};
-    use std::time::{Duration, Instant};
-
-    const TIMEOUT: Duration = Duration::from_secs(5);
-    const CLEANUP_BUDGET: Duration = Duration::from_millis(500);
-    const OUTPUT_LIMIT: usize = 1024 * 1024;
-    let total_deadline = Instant::now() + TIMEOUT;
-    let probe_deadline = total_deadline - CLEANUP_BUDGET;
-
-    let mut command = Command::new(binary);
-    command
-        .args(["auth", "status", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let (mut child, mut process_tree) =
-        pty_runner::spawn_strict_child_process_tree(&mut command).ok()?;
-    let terminate_and_reap = |process_tree: &mut pty_runner::StrictChildProcessTree,
-                              child: &mut std::process::Child| {
-        process_tree.terminate(child);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => break,
-                Ok(None) => {}
-            }
-            let remaining = total_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10).min(remaining));
-        }
-    };
-
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_and_reap(&mut process_tree, &mut child);
-            return None;
-        }
-    };
-    let (sender, receiver) = mpsc::channel::<std::io::Result<Vec<u8>>>();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .take((OUTPUT_LIMIT + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = sender.send(result);
-    });
-
-    let mut status = None;
-    let mut output = None;
-    loop {
-        if output.is_none() {
-            match receiver.try_recv() {
-                Ok(Ok(bytes)) if bytes.len() <= OUTPUT_LIMIT => output = Some(bytes),
-                Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-                    terminate_and_reap(&mut process_tree, &mut child);
-                    return None;
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit_status)) => {
-                    status = Some(exit_status);
-                    // The direct engine has exited. Terminate anything it left
-                    // behind before waiting for pipe EOF; a descendant that
-                    // inherited stdout must not extend Doctor's deadline.
-                    terminate_and_reap(&mut process_tree, &mut child);
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    terminate_and_reap(&mut process_tree, &mut child);
-                    return None;
-                }
-            }
-        }
-
-        if let (Some(status), Some(bytes)) = (status.as_ref(), output.as_ref()) {
-            let stdout = std::str::from_utf8(bytes).ok()?;
-            return parse_engine_auth_summary(status.code(), stdout);
-        }
-
-        if Instant::now() >= probe_deadline {
-            terminate_and_reap(&mut process_tree, &mut child);
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+fn engine_auth_summary(binary: &Path, deadline: std::time::Instant) -> Option<bool> {
+    let (status, bytes) =
+        engine::probe_stdout(binary, &["auth", "status", "--json"], deadline, 1024 * 1024)?;
+    parse_engine_auth_summary(status.code(), std::str::from_utf8(&bytes).ok()?)
 }
 
 /// Parse only the engine's boolean auth summary and reject contradictory
@@ -9393,7 +9323,13 @@ mod tests {
         } else {
             "missing-coven-code"
         });
-        assert_eq!(engine_auth_summary(&missing), None);
+        assert_eq!(
+            engine_auth_summary(
+                &missing,
+                std::time::Instant::now() + std::time::Duration::from_secs(5)
+            ),
+            None
+        );
     }
 
     #[test]
