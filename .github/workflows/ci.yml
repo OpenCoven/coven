@@ -126,6 +126,7 @@ jobs:
       - run: python3 scripts/check-workflows-test.py
       - run: python3 scripts/check-ci-workflow-test.py
       - run: python3 scripts/install-native-link-dependencies-test.py
+      - run: python3 scripts/dev-verify-test.py
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/release-governance.test.mjs
       - run: node --test scripts/authorize-release-publication.test.mjs
