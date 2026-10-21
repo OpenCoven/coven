@@ -43,6 +43,8 @@ def verify(repo, cache, *, run=run_command):
                 report["stages"].append({"name": stage, "exit_code": result.get("exit_code"),
                                          "timed_out": bool(result.get("timed_out")), "passed": passed})
                 if not passed and not permit_doctor:
+                    if stage == "cli_smoke" and result.get("smoke_diagnostic") is not None:
+                        report["smoke_diagnostic"] = result["smoke_diagnostic"]
                     raise StageFailure
                 return result
 

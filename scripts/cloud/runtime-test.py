@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -65,6 +66,39 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(result["native_diagnostic"]["code"], expected)
                     self.assertNotIn("private-fixture-marker", json.dumps(result))
                     self.assertTrue(result["native_diagnostic"]["recovery"])
+
+    def test_smoke_diagnostic_only_reports_source_names_and_panic_locations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "crates/coven-cli/tests/smoke.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("#[test]\nfn known_case() {}\n")
+            stdout = "test known_case ... FAILED\ntest private_marker ... FAILED\nprivate-marker\n"
+            stderr = "thread 'known_case' panicked at crates/coven-cli/tests/smoke.rs:2:3:\nprivate-marker\n"
+            diagnostic = runtime.smoke_diagnostic(root, stdout, stderr)
+            self.assertEqual(diagnostic, {"failed_tests": ["known_case"], "panic_lines": [2]})
+            self.assertNotIn("private", json.dumps(diagnostic))
+            self.assertEqual(runtime.smoke_diagnostic(root, "", ""),
+                             {"failed_tests": [], "panic_lines": []})
+
+    def test_real_rust_smoke_failure_reports_safe_source_evidence(self):
+        rustc = shutil.which("rustc")
+        if not rustc:
+            self.skipTest("real diagnostic check requires the repository Rust toolchain")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "crates/coven-cli/tests/smoke.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text('#[test]\nfn smoke_case() { panic!("private-fixture-marker"); }\n')
+            binary = root / "smoke-test"
+            compiled = subprocess.run([rustc, "--test", "crates/coven-cli/tests/smoke.rs", "-o", str(binary)],
+                                      cwd=root, capture_output=True)
+            self.assertEqual(compiled.returncode, 0)
+            result = runtime.run_command([str(binary), "--test", "smoke", "--nocapture"],
+                                         cwd=root, env={}, timeout=30)
+            self.assertEqual(result["exit_code"], 101)
+            self.assertEqual(result["smoke_diagnostic"], {"failed_tests": ["smoke_case"], "panic_lines": [2]})
+            self.assertNotIn("private-fixture-marker", json.dumps(result["smoke_diagnostic"]))
 
     def test_timeout_terminates_owned_command(self):
         with tempfile.TemporaryDirectory() as folder:

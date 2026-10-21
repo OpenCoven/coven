@@ -85,6 +85,20 @@ class ReadinessTests(fixtures.ConfigTests):
         self.assertTrue(report["doctor"]["operational_ready"])
         self.assertEqual(report["blocked_stage"], "cli_smoke")
 
+    def test_smoke_failure_keeps_safe_diagnostic_without_raw_output(self):
+        runner = self.runner("smoke")
+        def diagnostic_runner(argv, **kwargs):
+            result = runner(argv, **kwargs)
+            if "smoke" in argv:
+                result.update(stdout="private-fixture-marker",
+                              smoke_diagnostic={"failed_tests": ["known_case"], "panic_lines": [12]})
+            return result
+        report = readiness.verify(self.root, Path(self.temp.name) / "cache", run=diagnostic_runner)
+        self.assertFalse(report["development_ready"])
+        self.assertEqual(report["blocked_stage"], "cli_smoke")
+        self.assertEqual(report["smoke_diagnostic"]["failed_tests"], ["known_case"])
+        self.assertNotIn("private-fixture-marker", json.dumps(report))
+
     def test_missing_pinned_components_block_build(self):
         runner = self.runner()
         def missing_component(argv, **kwargs):

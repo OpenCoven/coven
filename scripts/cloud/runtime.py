@@ -1,6 +1,7 @@
 """Credential-free child execution and faithful doctor capability classification."""
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -69,6 +70,23 @@ def native_diagnostic(stderr):
     return None
 
 
+def smoke_diagnostic(repo, stdout, stderr):
+    """Export only source-known identifiers and bounded source line numbers."""
+    summary = {"failed_tests": [], "panic_lines": []}
+    try:
+        source = (Path(repo) / "crates/coven-cli/tests/smoke.rs").read_text()
+    except (OSError, UnicodeError):
+        return summary
+    names = set(re.findall(r"^fn ([a-z][a-z0-9_]{0,127})\(", source, re.MULTILINE))
+    failed = set(re.findall(r"^test ([a-z][a-z0-9_]{0,127}) \.\.\. FAILED$", stdout, re.MULTILINE))
+    failed.update(re.findall(r"^thread '([a-z][a-z0-9_]{0,127})'(?: \([0-9]+\))? panicked at ", stderr, re.MULTILINE))
+    summary["failed_tests"] = sorted(failed & names)
+    lines = re.findall(r"^thread '[a-z][a-z0-9_]{0,127}'(?: \([0-9]+\))? panicked at crates/coven-cli/tests/smoke\.rs:([0-9]{1,6}):[0-9]{1,6}:$",
+                       stderr, re.MULTILINE)
+    summary["panic_lines"] = sorted({int(line) for line in lines if 0 < int(line) <= len(source.splitlines())})
+    return summary
+
+
 def run_command(argv, *, cwd, env, timeout):
     """Run an owned process group; never print potentially sensitive raw output."""
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -90,9 +108,11 @@ def run_command(argv, *, cwd, env, timeout):
         data = stdout.read(1024 * 1024 + 1)
         oversized = len(data) > 1024 * 1024
         stderr.seek(0)
-        safe_diagnostic = native_diagnostic(stderr.read(1024 * 1024).decode("utf-8", errors="replace"))
-        return {"native_diagnostic": safe_diagnostic, "exit_code": process.returncode, "timed_out": timed_out,
-                "stdout": "" if oversized else data.decode("utf-8", errors="replace"),
+        error_text = stderr.read(1024 * 1024).decode("utf-8", errors="replace")
+        output_text = "" if oversized else data.decode("utf-8", errors="replace")
+        safe_smoke = smoke_diagnostic(cwd, output_text, error_text) if "--test" in argv and "smoke" in argv else None
+        return {"native_diagnostic": native_diagnostic(error_text), "smoke_diagnostic": safe_smoke, "exit_code": process.returncode, "timed_out": timed_out,
+                "stdout": output_text,
                 "output_oversized": oversized, "launch_failed": False}
 
 
