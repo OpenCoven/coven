@@ -161,7 +161,7 @@ def plan(tier, revision_range, changed, root, system):
         'exact-commit protocol and authority artifact packaging/upload: CI-only required jobs',
         'release-target npm onboarding and pinned engine contract: routed CI-only jobs',
         'performance baseline and real mount probe: CI informational/post-merge jobs',
-        'browser provisioning and distro/bootstrap contracts: separate B2/B3 capabilities, not established by this tier',
+        'browser provisioning: separate B2 capability; fresh Debian/Ubuntu bootstrap matrix: routed CI-only, or scripts/bootstrap-contract/runner.py',
         'protected-main PR gate: CI-only final merge authority; local success is not CI acceptance',
     ])
     return checks, skips

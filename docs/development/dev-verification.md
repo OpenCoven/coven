@@ -100,8 +100,12 @@ returns 130. The summary explicitly retains unverified CI-only checks.
 
 Missing applicable tools never become not-applicable. Non-selected packages,
 out-of-tier checks, and unsupported host feature suites have explicit skip
-reasons. Browser provisioning and bootstrap/distro contracts are separate
-capabilities under #1449 and #1450; this entry point does not establish them.
+reasons. Browser provisioning remains separate under #1449. The fresh Debian/
+Ubuntu bootstrap matrix is a routed required CI job; run its explicit
+[safe container runner](../../scripts/bootstrap-contract/README.md) locally
+when Docker is available. PR/full includes its host contract tests and the A2
+Cloud fixture suites, not actual container execution. These fixture suites
+require maintained Python 3.11+ as documented by the Cloud setup scripts.
 
 ## CI remains final merge authority
 
@@ -115,6 +119,7 @@ prove their results:
   unit tests do not prove artifact delivery.
 - Release-target npm onboarding matrix and the pinned engine contract job.
 - Informational/post-merge performance collection and the real mount probe.
+- Fresh Debian/Ubuntu bootstrap execution on routed setup, dependency and workflow changes.
 - GitHub's required `PR gate`, merge-queue evaluation, and protected-main review.
 
 Record exact failed commands and environment differences in the issue/PR.
