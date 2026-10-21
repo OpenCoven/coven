@@ -72,7 +72,7 @@ def native_diagnostic(stderr):
 
 def smoke_diagnostic(repo, stdout, stderr):
     """Export only source-known identifiers and bounded source line numbers."""
-    summary = {"failed_tests": [], "panic_lines": []}
+    summary = {"failed_tests": [], "panic_lines": [], "failed_waits": []}
     try:
         source = (Path(repo) / "crates/coven-cli/tests/smoke.rs").read_text()
     except (OSError, UnicodeError):
@@ -81,6 +81,10 @@ def smoke_diagnostic(repo, stdout, stderr):
     failed = set(re.findall(r"^test ([a-z][a-z0-9_]{0,127}) \.\.\. FAILED$", stdout, re.MULTILINE))
     failed.update(re.findall(r"^thread '([a-z][a-z0-9_]{0,127})'(?: \([0-9]+\))? panicked at ", stderr, re.MULTILINE))
     summary["failed_tests"] = sorted(failed & names)
+    waits = set(re.findall(r'wait_until\(\s*"([a-zA-Z0-9 _-]{1,120})"', source))
+    timed_out = set(re.findall(r"^Error: timed out waiting for ([a-zA-Z0-9 _-]{1,120})(?:; last error:.*)?$",
+                               stderr, re.MULTILINE))
+    summary["failed_waits"] = sorted(timed_out & waits)
     lines = re.findall(r"^thread '[a-z][a-z0-9_]{0,127}'(?: \([0-9]+\))? panicked at crates/coven-cli/tests/smoke\.rs:([0-9]{1,6}):[0-9]{1,6}:$",
                        stderr, re.MULTILINE)
     summary["panic_lines"] = sorted({int(line) for line in lines if 0 < int(line) <= len(source.splitlines())})

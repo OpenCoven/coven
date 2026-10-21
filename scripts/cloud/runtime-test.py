@@ -72,14 +72,14 @@ class RuntimeTests(unittest.TestCase):
             root = Path(folder)
             source = root / "crates/coven-cli/tests/smoke.rs"
             source.parent.mkdir(parents=True)
-            source.write_text("#[test]\nfn known_case() {}\n")
+            source.write_text('#[test]\nfn known_case() { wait_until("child cleanup", || true); }\n')
             stdout = "test known_case ... FAILED\ntest private_marker ... FAILED\nprivate-marker\n"
-            stderr = "thread 'known_case' panicked at crates/coven-cli/tests/smoke.rs:2:3:\nprivate-marker\n"
+            stderr = "thread 'known_case' panicked at crates/coven-cli/tests/smoke.rs:2:3:\nprivate-marker\nError: timed out waiting for child cleanup\nError: timed out waiting for private-marker\n"
             diagnostic = runtime.smoke_diagnostic(root, stdout, stderr)
-            self.assertEqual(diagnostic, {"failed_tests": ["known_case"], "panic_lines": [2]})
+            self.assertEqual(diagnostic, {"failed_tests": ["known_case"], "panic_lines": [2], "failed_waits": ["child cleanup"]})
             self.assertNotIn("private", json.dumps(diagnostic))
             self.assertEqual(runtime.smoke_diagnostic(root, "", ""),
-                             {"failed_tests": [], "panic_lines": []})
+                             {"failed_tests": [], "panic_lines": [], "failed_waits": []})
 
     def test_real_rust_smoke_failure_reports_safe_source_evidence(self):
         rustc = shutil.which("rustc")
@@ -97,7 +97,7 @@ class RuntimeTests(unittest.TestCase):
             result = runtime.run_command([str(binary), "--test", "smoke", "--nocapture"],
                                          cwd=root, env={}, timeout=30)
             self.assertEqual(result["exit_code"], 101)
-            self.assertEqual(result["smoke_diagnostic"], {"failed_tests": ["smoke_case"], "panic_lines": [2]})
+            self.assertEqual(result["smoke_diagnostic"], {"failed_tests": ["smoke_case"], "panic_lines": [2], "failed_waits": []})
             self.assertNotIn("private-fixture-marker", json.dumps(result["smoke_diagnostic"]))
 
     def test_timeout_terminates_owned_command(self):
