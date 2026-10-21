@@ -2,6 +2,7 @@
 """Run exact-source bootstrap contracts in disposable containers, not Cloud VMs."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -48,8 +49,29 @@ def container_command(image, source, output, sha, name):
             image['image'], 'bash', '/source/scripts/bootstrap-contract/container.sh']
 
 
+def git_environment():
+    return {'PATH': os.environ.get('PATH', os.defpath), 'GIT_CONFIG_NOSYSTEM': '1',
+            'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0'}
+
+
 def git(repo, *args):
-    return subprocess.check_output(['git', '-C', str(repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
+    return subprocess.check_output(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=' + os.devnull,
+                                    '-C', str(repo), *args], env=git_environment(),
+                                   text=True, stderr=subprocess.DEVNULL).strip()
+
+
+def remove_container(name):
+    try:
+        removed = subprocess.run(['docker', 'rm', '-f', name], capture_output=True, timeout=30, check=False)
+        if removed.returncode == 0:
+            return True
+        # --rm may already have removed it. A failed inspect/list is not evidence
+        # of absence; require a successful exact-name query with no matching IDs.
+        remaining = subprocess.run(['docker', 'ps', '-aq', '--filter', 'name=^/' + name + '$'],
+                                   capture_output=True, text=True, timeout=30, check=False)
+        return remaining.returncode == 0 and not remaining.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def execute(repo, image, output):
@@ -60,6 +82,8 @@ def execute(repo, image, output):
         return {**report, 'code': 'docker-unavailable'}
     if git(repo, 'status', '--porcelain', '--untracked-files=no'):
         return {**report, 'code': 'dirty-source'}
+    if Path(git(repo, 'rev-parse', '--show-toplevel')).resolve() != Path(repo).resolve():
+        return {**report, 'code': 'repository-root-required'}
     sha = git(repo, 'rev-parse', 'HEAD')
     report['source_sha'] = sha
     for filename in ('scripts/cloud/bootstrap.sh', 'scripts/cloud/readiness.sh',
@@ -73,13 +97,14 @@ def execute(repo, image, output):
     try:
         with tempfile.TemporaryDirectory(prefix='coven-contract-source-') as temporary:
             source = Path(temporary) / 'repo'
-            subprocess.run(['git', 'init', '-q', str(source)], check=True, capture_output=True)
+            source.mkdir()
+            git(source, 'init', '-q')
             # Fetch only the exact commit into a self-contained .git directory;
             # worktree .git pointer files cannot be mounted across hosts safely.
-            subprocess.run(['git', '-C', str(source), 'fetch', '-q', '--depth=1',
-                            Path(repo).resolve().as_uri(), sha], check=True, capture_output=True)
-            subprocess.run(['git', '-C', str(source), 'checkout', '-q', '--detach', 'FETCH_HEAD'], check=True, capture_output=True)
-            if git(source, 'rev-parse', 'HEAD') != sha:
+            git(source, 'fetch', '-q', '--depth=1', Path(repo).resolve().as_uri(), sha)
+            git(source, 'checkout', '-q', '--detach', 'FETCH_HEAD')
+            if (git(source, 'rev-parse', 'HEAD') != sha
+                    or Path(git(source, 'rev-parse', '--show-toplevel')).resolve() != source.resolve()):
                 raise ValueError('source checkout mismatch')
             command = container_command(image, source, output, sha, name)
             print(json.dumps({'status': 'run', 'command': command}), flush=True)
@@ -102,9 +127,7 @@ def execute(repo, image, output):
         report['code'] = 'container-or-source-error'
     finally:
         # Remove only our unpredictable owned container, including after client timeout.
-        try:
-            subprocess.run(['docker', 'rm', '-f', name], capture_output=True, timeout=30, check=False)
-        except (OSError, subprocess.SubprocessError):
+        if not remove_container(name):
             report.update(status='failed', code='container-cleanup-failed')
         (output / 'runner.json').write_text(json.dumps(report, indent=2) + '\n')
     return report

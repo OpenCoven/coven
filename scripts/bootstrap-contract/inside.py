@@ -16,6 +16,33 @@ def source_hashes(root):
             for path in sorted(Path(root).rglob('*')) if path.is_file() and path.suffix in ('.list', '.sources')}
 
 
+def run_case(name, command, *, report, output, diagnostic, expected_code=None, env=None, evidence='real-container', timeout=1200, report_file=None):
+    try:
+        result = subprocess.run(command, cwd=REPO, env=env, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        report['cases'].append({'name': name, 'status': 'failed', 'code': 'timeout', 'evidence': evidence})
+        raise RuntimeError('case-failed') from None
+    if report_file is not None:
+        try:
+            structured = json.loads(result.stdout)
+            if not isinstance(structured, dict):
+                raise ValueError
+            (output / report_file).write_text(json.dumps(structured, indent=2) + '\n')
+        except ValueError:
+            report['cases'].append({'name': name, 'status': 'failed', 'code': 'invalid-json-report', 'evidence': evidence})
+            raise RuntimeError('case-failed') from None
+    safe_diagnostic = diagnostic(result.stderr)
+    passed = result.returncode == 0 if expected_code is None else (
+        result.returncode != 0 and safe_diagnostic is not None and safe_diagnostic['code'] == expected_code)
+    report['cases'].append({'name': name, 'status': 'passed' if passed else 'failed',
+                            'exit_code': result.returncode, 'evidence': evidence,
+                            **({'diagnostic': safe_diagnostic} if safe_diagnostic else {})})
+    if not passed:
+        raise RuntimeError('case-failed')
+    return result.stdout
+
+
 def execute(output):
     sys.path.insert(0, str(REPO / 'scripts/cloud'))
     from runtime import native_diagnostic
@@ -35,31 +62,9 @@ def execute(output):
             report['codename'] != os.environ['COVEN_CONTRACT_CODENAME']):
         return {**report, 'code': 'distribution-mismatch'}
 
-    def run(name, command, *, expected_code=None, env=None, evidence='real-container', timeout=1200, report_file=None):
-        try:
-            result = subprocess.run(command, cwd=REPO, env=env, capture_output=True, text=True,
-                                    stdin=subprocess.DEVNULL, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            report['cases'].append({'name': name, 'status': 'failed', 'code': 'timeout', 'evidence': evidence})
-            raise RuntimeError('case-failed') from None
-        if report_file is not None:
-            try:
-                structured = json.loads(result.stdout)
-                if not isinstance(structured, dict):
-                    raise ValueError
-                (output / report_file).write_text(json.dumps(structured, indent=2) + '\n')
-            except ValueError:
-                report['cases'].append({'name': name, 'status': 'failed', 'code': 'invalid-json-report', 'evidence': evidence})
-                raise RuntimeError('case-failed') from None
-        diagnostic = native_diagnostic(result.stderr)
-        passed = result.returncode == 0 if expected_code is None else (
-            result.returncode != 0 and diagnostic is not None and diagnostic['code'] == expected_code)
-        report['cases'].append({'name': name, 'status': 'passed' if passed else 'failed',
-                                'exit_code': result.returncode, 'evidence': evidence,
-                                **({'diagnostic': diagnostic} if diagnostic else {})})
-        if not passed:
-            raise RuntimeError('case-failed')
-        return result.stdout
+    def run(name, command, **options):
+        return run_case(name, command, report=report, output=output,
+                        diagnostic=native_diagnostic, **options)
 
     try:
         helper = ['bash', 'scripts/install-native-link-dependencies.sh', 'libopenblas-dev']
