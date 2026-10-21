@@ -7,7 +7,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, serde::Deserialize)]
 struct EngineLock {
@@ -158,17 +158,128 @@ pub fn require() -> Result<ResolvedEngine> {
     })
 }
 
+// Cold native process loading occurs before Rust can start its clock. Reserve
+// headroom for that work and rendering within Cave's six-second command limit.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub fn engine_version(binary: &Path) -> Result<(u64, u64, u64)> {
-    let out = Command::new(binary)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("failed to run {} --version", binary.display()))?;
-    if !out.status.success() {
-        bail!("{} --version exited nonzero", binary.display());
+    engine_version_until(binary, Instant::now() + PROBE_TIMEOUT)
+}
+
+pub(crate) fn engine_version_until(binary: &Path, deadline: Instant) -> Result<(u64, u64, u64)> {
+    let (status, stdout) = probe_stdout(binary, &["--version"], deadline, 16 * 1024)
+        .ok_or_else(|| anyhow!("engine version probe unavailable"))?;
+    if !status.success() {
+        bail!("engine version probe exited nonzero");
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_version_output(&text)
-        .ok_or_else(|| anyhow!("unparseable engine version output: {text:?}"))
+    let text = std::str::from_utf8(&stdout).context("engine version response is not UTF-8")?;
+    parse_version_output(text)
+        .ok_or_else(|| anyhow!("engine version response is not a supported version"))
+}
+
+/// Observe only an owned local engine process, including stdout EOF and cleanup.
+/// The caller supplies an absolute deadline so sequential probes share a budget.
+pub(crate) fn probe_stdout(
+    binary: &Path,
+    args: &[&str],
+    total_deadline: Instant,
+    output_limit: usize,
+) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::time::{Duration, Instant};
+
+    const CLEANUP_BUDGET: Duration = Duration::from_millis(500);
+    let probe_deadline = total_deadline.checked_sub(CLEANUP_BUDGET)?;
+    if Instant::now() >= probe_deadline {
+        return None;
+    }
+
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let (mut child, mut process_tree) =
+        crate::pty_runner::spawn_strict_child_process_tree(&mut command).ok()?;
+    let terminate_and_reap = |process_tree: &mut crate::pty_runner::StrictChildProcessTree,
+                              child: &mut std::process::Child| {
+        process_tree.terminate(child);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            let remaining = total_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10).min(remaining));
+        }
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_and_reap(&mut process_tree, &mut child);
+            return None;
+        }
+    };
+    let (sender, receiver) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((output_limit + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+
+    let mut status = None;
+    let mut output = None;
+    loop {
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(bytes)) if bytes.len() <= output_limit => output = Some(bytes),
+                Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    terminate_and_reap(&mut process_tree, &mut child);
+                    return None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    status = Some(exit_status);
+                    // The direct engine has exited. Terminate anything it left
+                    // behind before waiting for pipe EOF; a descendant that
+                    // inherited stdout must not extend Doctor's deadline.
+                    terminate_and_reap(&mut process_tree, &mut child);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    terminate_and_reap(&mut process_tree, &mut child);
+                    return None;
+                }
+            }
+        }
+
+        if status.is_some() && output.is_some() {
+            return Some((status?, output?));
+        }
+
+        if Instant::now() >= probe_deadline {
+            terminate_and_reap(&mut process_tree, &mut child);
+            return None;
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(probe_deadline.saturating_duration_since(Instant::now())),
+        );
+    }
 }
 
 pub fn parse_version_output(text: &str) -> Option<(u64, u64, u64)> {
