@@ -236,6 +236,7 @@ The checked-in
 [`occurrence-recovery-process-crash-recovery.vectors.json`](occurrence-recovery-process-crash-recovery.vectors.json),
 [`run-cancellation-process-crash-recovery.vectors.json`](run-cancellation-process-crash-recovery.vectors.json),
 [`flat-cancellation-process-crash-recovery.vectors.json`](flat-cancellation-process-crash-recovery.vectors.json),
+[`timeout-enforcement-process-crash-recovery.vectors.json`](timeout-enforcement-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -299,7 +300,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, twenty-three
+The native Coven target implements twelve structural suites, twenty-five
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -790,8 +791,9 @@ handshakes or output. As with delivery, these cases do not require uncommitted
 frames in the WAL. This is `audit_only` evidence for a daemon killed while it
 launches one scheduled occurrence with no no-process containment receipt. It
 does not cover a real runtime process, receipt-proven no-process retry, which
-relaunches by design, Runtime Authority launches, manual
-occurrences, kills during held-for-retry, timeout or cancellation, power loss,
+relaunches by design, Runtime Authority launches, manual occurrences, kills
+during held-for-retry, timeout (see
+`timeout-enforcement-process-crash-recovery`) or cancellation, power loss,
 load, complete profiles or release eligibility.
 
 ## Operator retry process-crash audit boundary
@@ -1096,3 +1098,66 @@ an `occurrence.cancel.v1` request that delegates a running attempt's stop
 runtime ownership, Runtime Authority runs, a stop the runtime fails to confirm,
 a graceful daemon restart, a real runtime process, power loss, load, complete
 profiles or release eligibility.
+
+## Timeout enforcement process-crash audit boundary
+
+The `timeout-enforcement-process-crash-recovery` suite kills a daemon worker
+while its scheduler enforces a scheduled run's deadline. The parent then
+restarts the daemon's scheduler inside the timeout's stop lease and runs passes
+after it. Each of ten cases starts the exact audited binary as a hidden worker,
+with the same harness, daemon restart and stop-recording runtime as
+`run-cancellation-process-crash-recovery`. The worker stores a fixed synthetic
+active daily definition with a one-minute deadline and no automatic retry,
+claims and launches its 09:00 slot through a no-op runtime, and calls the
+production enforcement the daemon's pass runs, 10 seconds after the deadline.
+Vectors cannot choose a path, run, definition, deadline, clock or pause
+mechanics, and every expected outcome is fixed per boundary.
+
+The enforcement claims the run's `timeout` stop fence in one transaction, asks
+the runtime to stop the session, and then, in a second transaction, ends the
+session `killed`, settles the attempt `timed_out` and the run and occurrence
+`failed`, and releases the fence. A fixture TEMP trigger pauses the worker
+after the fence's write and after each of the settlement's five writes, the WAL
+hook after each commit, and its runtime right after it records the stop. The
+control has no pause. While the worker is paused, the parent must find the
+write transaction open exactly when the pause is inside one, and read what the
+last commit left. The parent then kills and reaps the worker, and the store's
+raw integrity check must pass.
+
+The parent restarts in the daemon's startup order 10 seconds after the
+enforcement, inside the fence's 30-second lease, runs a pass after the lease, a
+second pass after that and a further pass. One runtime confirms and counts
+every stop and launch they make. What each case requires depends on how far
+the enforcement got:
+
+- **No fence committed:** the restart's containment marks the session `killed`
+  after the deadline, and its startup pass settles the attempt `timed_out` and
+  the run and occurrence `failed`.
+- **The fence committed, with or without the stop, or the settlement
+  uncommitted:** the restart's containment marks the session `killed` and
+  leaves the run behind the fence. The pass after the lease takes the expired
+  fence as a stop whose outcome is unknown: the attempt settles `ambiguous` and
+  the occurrence `recovery_required`, and the fence stays. The next pass
+  settles the run and occurrence `failed` on the ended session and releases
+  the fence. That exit from `recovery_required` is the one #1461 asks about,
+  and #1489 asks whether an expired `timeout` fence should settle by the
+  deadline instead.
+- **The settlement committed,** and the control: the restart and every pass
+  change no row.
+
+The worker must have recorded exactly one stop once it reached the stop, and
+none before it. The restart and the passes must issue no stop and launch
+nothing, and every case must end with the run terminal and no stop fence. The
+further pass must change no occurrence, run, attempt, event, session or
+stop-fence row, and issue no stop or launch.
+
+Observations carry boundary and run classes, counts and booleans. They never
+carry occurrence, run, attempt or session ids, paths, handshakes or output.
+This is `audit_only` evidence for a daemon killed while it enforces one
+scheduled run's deadline. It does not cover a kill inside the scheduler's own
+settlement of a run that ended after its deadline with no fence, a deadline
+that passes while a retry attempt waits, a deadline that passes while a run is
+held for an operator retry, a timeout racing an owner cancellation, a stop the
+runtime fails to confirm, Runtime Authority runs, a graceful daemon restart, a
+real runtime process, power loss, load, complete profiles or release
+eligibility.
