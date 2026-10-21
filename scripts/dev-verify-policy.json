@@ -1,5 +1,5 @@
 {
-  "policy_sha256": "6fbc6d36a51a5f192e8a0f88ab9d7fd2d75d042475542a5736e6b116fc4b3781",
+  "policy_sha256": "a349460d67c8fd0bdcba7dddafc16d0351fe52e913c8f42e006973413ce297f9",
   "commands": [
     [
       "python3",
@@ -64,6 +64,32 @@
     [
       "python3",
       "scripts/install-native-link-dependencies-test.py"
+    ],
+    [
+      "python3",
+      "scripts/cloud/config-test.py"
+    ],
+    [
+      "python3",
+      "scripts/cloud/runtime-test.py"
+    ],
+    [
+      "python3",
+      "scripts/cloud/provision-test.py"
+    ],
+    [
+      "python3",
+      "scripts/cloud/bootstrap-test.py"
+    ],
+    [
+      "python3",
+      "scripts/cloud/readiness-test.py"
+    ],
+    [
+      "bash",
+      "-n",
+      "scripts/cloud/bootstrap.sh",
+      "scripts/cloud/readiness.sh"
     ],
     [
       "python3",
