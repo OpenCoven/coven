@@ -295,10 +295,10 @@ fn launched(home: &Path, base: DateTime<Utc>) -> Result<SchedulerLeadership, &'s
     Ok(leadership)
 }
 
-/// Stores a daily 09:00 `definition` defined the day before, then claims and
-/// launches that slot at `claim_at` under `home`'s scheduler leadership,
-/// through a no-op runtime. Returns the leadership.
-pub(super) fn launch_slot(
+/// Stores a daily 09:00 `definition` defined the day before, then claims
+/// that slot at `claim_at` under `home`'s scheduler leadership. Returns the
+/// leadership.
+pub(super) fn claim_slot(
     home: &Path,
     definition: &Value,
     claim_at: DateTime<Utc>,
@@ -311,7 +311,7 @@ pub(super) fn launch_slot(
         [DEFINED_AT, definition.id.as_str()],
     )
     .map_err(|_| FAILED)?;
-    // The daemon's scheduler claims and dispatches under its leadership fence.
+    // The daemon's scheduler claims under its leadership fence.
     let leadership = SchedulerLeadership::acquire(home, conn, claim_at).map_err(|_| FAILED)?;
     let fence = leadership.fence();
     let tick = crate::automations::occurrences::tick_with_scheduler_fence(conn, claim_at, &fence)
@@ -319,6 +319,18 @@ pub(super) fn launch_slot(
     if tick.planned.len() != 1 || tick.claimed.len() != 1 || !tick.failed.is_empty() {
         return Err(FAILED);
     }
+    Ok(leadership)
+}
+
+/// Claims the slot as `claim_slot` does, then launches it at `claim_at`
+/// through a no-op runtime. Returns the leadership.
+pub(super) fn launch_slot(
+    home: &Path,
+    definition: &Value,
+    claim_at: DateTime<Utc>,
+) -> Result<SchedulerLeadership, &'static str> {
+    let leadership = claim_slot(home, definition, claim_at)?;
+    let conn = &crate::store::open_store(&crate::api::store_path(home)).map_err(|_| FAILED)?;
     let report =
         crate::automations::runner::dispatch_claimed_occurrences_with_clock_and_cancel_and_scheduler(
             conn,
@@ -326,7 +338,7 @@ pub(super) fn launch_slot(
             claim_at,
             || claim_at,
             || false,
-            &fence,
+            &leadership.fence(),
         )
         .map_err(|_| FAILED)?;
     if report.dispatched.len() != 1 || !report.failed.is_empty() {

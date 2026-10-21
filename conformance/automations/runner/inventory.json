@@ -40,6 +40,7 @@
     { "profile": "scheduler_reliability", "suiteId": "flat-cancellation-process-crash-recovery", "vectorFile": "flat-cancellation-process-crash-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "timeout-enforcement-process-crash-recovery", "vectorFile": "timeout-enforcement-process-crash-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "held-settlement-process-crash-recovery", "vectorFile": "held-settlement-process-crash-recovery.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "automatic-retry-process-crash-recovery", "vectorFile": "automatic-retry-process-crash-recovery.vectors.json" },
     { "profile": "runtime_authority", "suiteId": "runtime-authority-terminal-recovery", "vectorFile": "runtime-authority-terminal-recovery.vectors.json" }
   ]
 }

@@ -29,6 +29,7 @@ use super::runs::{
 };
 
 mod attempt_retry_process_crash;
+mod automatic_retry_process_crash;
 mod command_envelope_outcomes;
 mod command_process_crash_recovery;
 mod command_storage_capacity_recovery;
@@ -100,6 +101,11 @@ pub fn timeout_enforcement_crash_worker(request: &Value) -> Result<(), &'static 
 /// Execute the disposable hidden held-settlement crash conformance worker.
 pub fn held_settlement_crash_worker(request: &Value) -> Result<(), &'static str> {
     held_settlement_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden automatic-retry crash conformance worker.
+pub fn automatic_retry_crash_worker(request: &Value) -> Result<(), &'static str> {
+    automatic_retry_process_crash::worker(request)
 }
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -198,6 +204,8 @@ pub const TIMEOUT_ENFORCEMENT_PROCESS_CRASH_RECOVERY_SUITE: &str =
     "timeout-enforcement-process-crash-recovery";
 pub const HELD_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE: &str =
     "held-settlement-process-crash-recovery";
+pub const AUTOMATIC_RETRY_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "automatic-retry-process-crash-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -1674,6 +1682,7 @@ pub fn capability() -> TargetCapability {
                     FLAT_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
                     TIMEOUT_ENFORCEMENT_PROCESS_CRASH_RECOVERY_SUITE,
                     HELD_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE,
+                    AUTOMATIC_RETRY_PROCESS_CRASH_RECOVERY_SUITE,
                 ],
             },
             TargetProfileCapability {
@@ -1829,6 +1838,14 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, HELD_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE) => {
             let (passed, observations) = held_settlement_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, AUTOMATIC_RETRY_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = automatic_retry_process_crash::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);

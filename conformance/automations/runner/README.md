@@ -238,6 +238,7 @@ The checked-in
 [`flat-cancellation-process-crash-recovery.vectors.json`](flat-cancellation-process-crash-recovery.vectors.json),
 [`timeout-enforcement-process-crash-recovery.vectors.json`](timeout-enforcement-process-crash-recovery.vectors.json),
 [`held-settlement-process-crash-recovery.vectors.json`](held-settlement-process-crash-recovery.vectors.json),
+[`automatic-retry-process-crash-recovery.vectors.json`](automatic-retry-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -301,7 +302,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, twenty-six
+The native Coven target implements twelve structural suites, twenty-seven
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -793,8 +794,10 @@ handshakes or output. As with delivery, these cases do not require uncommitted
 frames in the WAL. This is `audit_only` evidence for a daemon killed while it
 launches one scheduled occurrence with no no-process containment receipt. It
 does not cover a real runtime process, receipt-proven no-process retry, which
-relaunches by design, Runtime Authority launches, manual occurrences, kills
-during held-for-retry (see `held-settlement-process-crash-recovery`), timeout
+relaunches by design, an automatic retry after a launch fails before ownership
+(see `automatic-retry-process-crash-recovery`), Runtime Authority launches,
+manual occurrences, kills during held-for-retry (see
+`held-settlement-process-crash-recovery`), timeout
 (see `timeout-enforcement-process-crash-recovery`) or cancellation, power loss,
 load, complete profiles or release eligibility.
 
@@ -1223,4 +1226,86 @@ run held after its launch failed before ownership, whose occurrence waits
 kill inside an operator retry of a held run (see
 `attempt-retry-process-crash-recovery`), an owner cancellation of a held run, a
 graceful daemon restart (#1433), Runtime Authority runs, a real runtime
+process, power loss, load, complete profiles or release eligibility.
+
+## Automatic retry process-crash audit boundary
+
+The `automatic-retry-process-crash-recovery` suite kills a daemon worker while
+its scheduler schedules the retry a definition's policy allows after a launch
+fails before ownership, or while it re-claims and relaunches that retry. The
+parent then restarts the daemon's scheduler and runs passes after the retry's
+backoff. Each of eleven cases starts the exact audited binary as a hidden
+worker, with the same harness and daemon restart as
+`run-launch-process-crash-recovery`. The worker stores a fixed synthetic active
+daily definition whose policy retries an unavailable runtime once, 60 seconds
+after the failure, within a 30-minute deadline. It claims the 09:00 slot and
+dispatches it through a no-op runtime that is unavailable for its first launch
+and accepts every later one. Once the backoff ends, it runs the fenced tick and
+dispatch again. Vectors cannot choose a path, run, definition, policy, clock or
+pause mechanics, and every expected outcome is fixed per boundary.
+
+The slot's launch commits first. One transaction then ends its session
+`failed`, settles the first attempt `failed` as `runtime_unavailable`, records
+the retry `adopted` until the backoff ends, returns the occurrence to `planned`
+with no lease, and releases the run's session. At the retry, the tick advances
+its planning cursor, then re-claims the occurrence and binds the retry to that
+claim in one transaction. The retry's launch and its ownership follow, as in
+the launch suite, under the same run.
+
+- **Inside the rejection:** a fixture TEMP trigger pauses the worker after its
+  first write (the session), the retry's insert and its last write (the run's
+  session).
+- **After the rejection commits:** the WAL hook pauses it after the second
+  commit.
+- **Inside the re-claim and after it commits:** a TEMP trigger on the
+  occurrence's `claimed` update, and the WAL hook after the fourth commit.
+- **Inside the retry's launch and after it commits:** a TEMP trigger on the
+  retry's `dispatching` update, and the WAL hook after the fifth commit.
+- **Inside the retry's ownership and after it commits:** a TEMP trigger on the
+  occurrence's `running` update, and the WAL hook after the sixth commit.
+- **Control:** no pause. The worker relaunches and exits without the graceful
+  shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check
+must pass. It restarts in the daemon's startup order before the backoff ends
+when the worker died at the slot, and after it when the worker died at the
+retry. It then runs a pass after the backoff and a further pass. One runtime
+counts every stop and launch they make. What each case requires depends on how
+far the worker got:
+
+- **The slot's launch committed, with the rejection uncommitted:** the store
+  cannot show that the runtime refused, so the restart holds the run for an
+  operator retry, as the launch suite does. The policy's retry is not
+  scheduled, and nothing launches.
+- **The retry scheduled, with the worker killed before the backoff ended:** the
+  restart changes no row and launches nothing. The pass after the backoff
+  re-claims the occurrence and launches the retry once.
+- **The retry scheduled or re-claimed, with the worker killed at the retry:**
+  the restart re-claims the occurrence under its own leadership and launches
+  the retry once.
+- **The retry's launch committed or owned,** and the control: the restart
+  holds the retry for an operator retry, and nothing launches again.
+
+Every class pins the whole store: one occurrence and one `running`, unfinished
+run with no stop fence; at most two attempts and two sessions; the first
+attempt never bound to a session; the retry's classification, prior attempt,
+`not_before` and claim binding; the run's session; and both settlement reasons.
+No case may launch the retry more than once, launch it before its backoff ends,
+or open a third attempt or session. The restart and the passes must issue no
+stop. Once the run is held or its retry has launched, the pass after the
+backoff must change no row. The further pass must change no occurrence, run,
+attempt, event, session or stop-fence row, and issue no stop or launch.
+
+Observations carry boundary and retry classes, counts and booleans. They never
+carry occurrence, run, attempt or session ids, paths, handshakes or output.
+This is `audit_only` evidence for a daemon killed while it schedules or
+relaunches one automatic retry after a launch failed before ownership. It does
+not cover a kill inside the pass's reconciliation between the backoff and the
+re-claim, a retry after an expired claim lease, an exponential backoff's
+jitter, retry exhaustion or quarantine (see `retry-quarantine-recovery`), a
+retry whose wait outlasts the run's deadline, a kill inside an operator retry
+(see `attempt-retry-process-crash-recovery`), cancellation of a waiting retry,
+a graceful daemon restart (#1433), Runtime Authority launches, a real runtime
 process, power loss, load, complete profiles or release eligibility.
