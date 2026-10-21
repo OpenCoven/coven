@@ -235,6 +235,7 @@ The checked-in
 [`attempt-retry-process-crash-recovery.vectors.json`](attempt-retry-process-crash-recovery.vectors.json),
 [`occurrence-recovery-process-crash-recovery.vectors.json`](occurrence-recovery-process-crash-recovery.vectors.json),
 [`run-cancellation-process-crash-recovery.vectors.json`](run-cancellation-process-crash-recovery.vectors.json),
+[`flat-cancellation-process-crash-recovery.vectors.json`](flat-cancellation-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -1007,7 +1008,91 @@ booleans. They never carry run, attempt, occurrence or session ids, adoption
 keys, responses, paths, handshakes or output. This is `audit_only` evidence
 for a daemon killed while it handles one owner cancellation of a running
 scheduled run. It does not cover Runtime Authority runs, the flat
-`occurrence.cancel.v1` and `attempt.cancel.v1` commands beyond the run
-cancellation they hand a running attempt to, a cancellation racing a timeout,
+`occurrence.cancel.v1` and `attempt.cancel.v1` commands (see
+`flat-cancellation-process-crash-recovery`), a cancellation racing a timeout,
 a stop the runtime fails to confirm, a graceful daemon restart, a real runtime
 process, power loss, load, complete profiles or release eligibility.
+
+## Owner occurrence and attempt cancellation process-crash audit boundary
+
+The `flat-cancellation-process-crash-recovery` suite kills a daemon worker
+while it handles the owner's `occurrence.cancel.v1` or `attempt.cancel.v1`
+request. The parent then restarts the daemon's scheduler and sends the
+identical request again, with the same adoption key, as an owner who never saw
+an answer would. Each of twelve cases starts the exact audited binary as a
+hidden worker, with the same harness, daemon restart and stop-recording
+runtime as `run-cancellation-process-crash-recovery`. The worker stores a
+fixed synthetic active daily definition with no automatic retry, establishes
+the owner principal, and claims its 09:00 slot. The daemon's API fences a
+delegated stop on the wall clock; the worker fences it on the fixture's fixed
+clock. Vectors cannot choose a path, occurrence, attempt, definition, reason,
+adoption key, clock or pause mechanics, and every expected outcome is fixed
+per boundary.
+
+The two commands answer in one of two ways:
+
+- **Nothing dispatched.** `occurrence.cancel.v1` for the claimed slot settles
+  the occurrence `cancelled` and stores the answer under the owner's key in one
+  transaction. A fixture TEMP trigger pauses the worker after the occurrence
+  write and after the answer's write, and the WAL hook after the commit. The
+  control has no pause.
+- **A running attempt.** The worker launches the slot through a no-op runtime,
+  and `attempt.cancel.v1` stores, as its answer, a delegation to a
+  `run.cancel.v1` request under a key derived from the owner's. It then sends
+  that run cancellation, which keeps its own reservation, stop fence and
+  answer. The worker pauses after the delegation's write and after its
+  commit, after each of the run cancellation's four commits, and right after
+  its runtime records the stop. The control has no pause.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check
+must pass.
+
+The parent restarts in the daemon's startup order 10 seconds after the
+request, inside a run cancellation's lease, and the owner re-sends the request
+10 seconds later. A pass after the lease reconciles any run cancellation, and
+the owner sends the request once more. One runtime confirms and counts every
+stop and launch that the restart, the passes and the re-sent requests make.
+What each case requires depends on how far the request got:
+
+- **A claimed slot, nothing committed:** the restart launches the slot. The
+  re-sent request is then a new one: it delegates the launched run's stop,
+  which settles the run `cancelled`, and later requests replay that answer.
+  This is the only case with a launch and a later stop, one of each.
+- **A claimed slot, withdrawn,** and its control: the restart changes no row
+  and launches nothing, and every request replays the withdrawal.
+- **A running attempt, nothing committed:** the restart's containment marks
+  the session `killed` and its startup pass fails the attempt, holding the run
+  for an operator retry. The re-sent request stores its own
+  `ILLEGAL_TRANSITION` refusal, which later requests replay.
+- **Delegated, not sent:** the same hold. The re-sent request replays the
+  delegation and sends its run cancellation, which refuses the failed attempt
+  and stores that refusal under the derived key. Later requests replay it.
+- **The run cancellation reserved, fenced, stopped, settled or answered:**
+  every re-sent request replays the delegation into the same run cancellation,
+  which answers exactly as it does when the owner sends it directly: a
+  reservation is rejected; an unconfirmed stop answers `recovery_required`
+  and its run settles `failed`; a settled stop answers `cancelled`.
+
+The worker must have recorded exactly one stop once it reached the stop, and
+none before it. Except for the claimed slot nobody withdrew, the restart, the
+passes and the re-sent requests must issue no stop and launch nothing. A
+pending or replayed answer must write nothing. A success must name the store's
+occurrence, or the store's run, attempt and session with the time its run
+cancellation was requested. A request that errors fails the case. The same
+request and a further pass must then change no occurrence, run, attempt,
+event, session, reservation, adoption, cancellation or stop-fence row, and
+issue no stop or launch.
+
+Observations carry boundary, run, cancellation and answer classes, counts and
+booleans. They never carry occurrence, run, attempt or session ids, adoption
+keys, responses, paths, handshakes or output. This is `audit_only` evidence for
+a daemon killed while it handles one owner occurrence or attempt cancellation.
+It does not cover an eligible or planned slot, a waiting retry attempt, a
+request first sent to a run already held for an operator retry, a kill inside
+an `occurrence.cancel.v1` request that delegates a running attempt's stop
+(tracked in #1486), the run-cancellation envelope, a delegation waiting on
+runtime ownership, Runtime Authority runs, a stop the runtime fails to confirm,
+a graceful daemon restart, a real runtime process, power loss, load, complete
+profiles or release eligibility.

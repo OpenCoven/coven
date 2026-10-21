@@ -36,6 +36,7 @@ mod command_storage_corruption_recovery;
 mod command_storage_lock_recovery;
 mod command_storage_readonly_recovery;
 mod command_transaction_rollback;
+mod flat_cancellation_process_crash;
 mod legacy_import_source_preservation;
 mod mission_commands;
 mod occurrence_recovery_process_crash;
@@ -82,6 +83,11 @@ pub fn occurrence_recovery_crash_worker(request: &Value) -> Result<(), &'static 
 /// Execute the disposable hidden run-cancellation crash conformance worker.
 pub fn run_cancellation_crash_worker(request: &Value) -> Result<(), &'static str> {
     run_cancellation_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden flat-cancellation crash conformance worker.
+pub fn flat_cancellation_crash_worker(request: &Value) -> Result<(), &'static str> {
+    flat_cancellation_process_crash::worker(request)
 }
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -174,6 +180,8 @@ pub const OCCURRENCE_RECOVERY_PROCESS_CRASH_RECOVERY_SUITE: &str =
     "occurrence-recovery-process-crash-recovery";
 pub const RUN_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE: &str =
     "run-cancellation-process-crash-recovery";
+pub const FLAT_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "flat-cancellation-process-crash-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -1647,6 +1655,7 @@ pub fn capability() -> TargetCapability {
                     ATTEMPT_RETRY_PROCESS_CRASH_RECOVERY_SUITE,
                     OCCURRENCE_RECOVERY_PROCESS_CRASH_RECOVERY_SUITE,
                     RUN_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
+                    FLAT_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
                 ],
             },
             TargetProfileCapability {
@@ -1776,6 +1785,15 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, RUN_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE) => {
             let (passed, observations) = run_cancellation_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, FLAT_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                flat_cancellation_process_crash::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);

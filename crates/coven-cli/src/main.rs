@@ -1215,6 +1215,8 @@ enum AutomationsConformanceCommand {
     OccurrenceRecoveryCrashWorker,
     #[command(hide = true, name = "run-cancellation-crash-worker")]
     RunCancellationCrashWorker,
+    #[command(hide = true, name = "flat-cancellation-crash-worker")]
+    FlatCancellationCrashWorker,
     #[command(about = "Print the native conformance suites supported by this binary")]
     Capability,
     #[command(about = "Evaluate one conformance suite request from standard input")]
@@ -4217,6 +4219,13 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
                 let request = serde_json::from_str(&payload)
                     .map_err(|_| anyhow!("conformance request is invalid"))?;
                 automations::conformance_target::run_cancellation_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::FlatCancellationCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::flat_cancellation_crash_worker(&request)
                     .map_err(|message| anyhow!(message))
             }
             AutomationsConformanceCommand::Capability => {

@@ -44,7 +44,7 @@ const REASON: &str = "not needed today";
 const PRINCIPAL: &str = "conformance:owner";
 /// Where the worker's runtime records each stop it is asked for, inside the
 /// worker's private home, so the parent can count stops a killed worker made.
-const STOP_LOG: &str = "conformance-stops";
+pub(super) const STOP_LOG: &str = "conformance-stops";
 /// Seconds after `BASE`: the worker claims and launches the 09:00 slot and
 /// handles the owner's cancellation, whose execution lease ends 30 seconds
 /// later. The parent restarts the daemon and the owner re-sends the request
@@ -474,9 +474,9 @@ fn payload(target: &Target, status: &str, base: DateTime<Utc>) -> Value {
 /// The worker's runtime: launches nothing, confirms every stop, and records
 /// each stop in the home's stop log before it returns. With a handshake, it
 /// announces it and parks once the stop is recorded.
-struct RecordingStops {
-    log: std::path::PathBuf,
-    park: Option<Value>,
+pub(super) struct RecordingStops {
+    pub(super) log: std::path::PathBuf,
+    pub(super) park: Option<Value>,
 }
 
 impl crate::api::SessionRuntime for RecordingStops {
@@ -502,7 +502,7 @@ impl crate::api::SessionRuntime for RecordingStops {
 }
 
 /// Stops the worker asked its runtime for, killed or not.
-fn worker_stops(home: &Path) -> Result<u64, &'static str> {
+pub(super) fn worker_stops(home: &Path) -> Result<u64, &'static str> {
     match std::fs::read(home.join(STOP_LOG)) {
         Ok(log) => {
             u64::try_from(log.iter().filter(|byte| **byte == b'\n').count()).map_err(|_| FAILED)
