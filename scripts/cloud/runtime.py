@@ -21,8 +21,11 @@ def execution_environment(cache, home, *, node_bin=None):
         "GIT_TERMINAL_PROMPT": "0", "CI": "true", "TERM": "dumb",
         "NO_COLOR": "1", "LANG": "C.UTF-8",
         "npm_config_cache": str(cache / "npm"),
-        "npm_config_userconfig": os.devnull,
-        "npm_config_globalconfig": os.devnull,
+        # npm rejects loading one path in both config roles (including /dev/null).
+        # These distinct absent files in the owned temporary home are empty
+        # configurations; neither the real user nor system npmrc is consulted.
+        "npm_config_userconfig": str(home / "npm-user.npmrc"),
+        "npm_config_globalconfig": str(home / "npm-global.npmrc"),
     }
     # Preserve managed routing and CA policy; do not add destinations, bypass
     # proxies or forward provider credentials / arbitrary process overrides.

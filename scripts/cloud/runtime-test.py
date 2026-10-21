@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,20 @@ import runtime
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_real_npm_reads_isolated_configuration_without_double_loading(self):
+        node, npm = shutil.which('node'), shutil.which('npm')
+        if not node or not npm:
+            self.skipTest('real npm check requires the repository Node toolchain')
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / 'home'
+            home.mkdir()
+            (home / '.npmrc').write_text('registry=https://ambient.invalid/\n')
+            env = runtime.execution_environment(root / 'cache', home, node_bin=Path(node).parent)
+            result = runtime.run_command([npm, 'config', 'get', 'registry'], cwd=folder, env=env, timeout=30)
+            self.assertEqual(result['exit_code'], 0)
+            self.assertEqual(result['stdout'].strip(), 'https://registry.npmjs.org/')
+
     def test_child_environment_does_not_inherit_credentials_or_overrides(self):
         with tempfile.TemporaryDirectory() as folder:
             prior = os.environ.get("COVEN_TEST_PRIVATE_VALUE")
