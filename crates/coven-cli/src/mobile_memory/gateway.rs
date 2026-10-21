@@ -337,7 +337,8 @@ fn start_mobile_gateway_with_config(
     coven_home: &Path,
     config: &MobileGatewayConfig,
 ) -> Result<MobileGatewayHandle> {
-    super::config::validate_mobile_config(config)?;
+    super::config::validate_mobile_config(config)
+        .context(super::config::MobileConfigValidationFailure)?;
     let endpoint = url::Url::parse(&config.advertised_endpoint)?;
     let identity = load_or_create_host_identity(
         coven_home,
