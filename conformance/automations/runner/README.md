@@ -241,6 +241,7 @@ The checked-in
 [`automatic-retry-process-crash-recovery.vectors.json`](automatic-retry-process-crash-recovery.vectors.json),
 [`retry-timeout-process-crash-recovery.vectors.json`](retry-timeout-process-crash-recovery.vectors.json),
 [`waiting-retry-cancellation-process-crash-recovery.vectors.json`](waiting-retry-cancellation-process-crash-recovery.vectors.json),
+[`run-now-process-crash-recovery.vectors.json`](run-now-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -304,7 +305,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, twenty-nine
+The native Coven target implements twelve structural suites, thirty
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -798,7 +799,8 @@ launches one scheduled occurrence with no no-process containment receipt. It
 does not cover a real runtime process, receipt-proven no-process retry, which
 relaunches by design, an automatic retry after a launch fails before ownership
 (see `automatic-retry-process-crash-recovery`), Runtime Authority launches,
-manual occurrences, kills during held-for-retry (see
+manual occurrences (see `run-now-process-crash-recovery`), kills during
+held-for-retry (see
 `held-settlement-process-crash-recovery`), timeout
 (see `timeout-enforcement-process-crash-recovery`) or cancellation, power loss,
 load, complete profiles or release eligibility.
@@ -1457,3 +1459,91 @@ settlement branch; an operator retry's waiting attempt, which takes it too; a
 retry the scheduler has re-claimed but not yet launched; the run-cancellation
 envelope; a graceful daemon restart (#1433); Runtime Authority runs, a real
 runtime process, power loss, load, complete profiles or release eligibility.
+
+## Run-now process-crash audit boundary
+
+The `run-now-process-crash-recovery` suite kills a daemon worker while it
+handles the owner's `occurrence.runNow.v1` request. The parent then restarts
+the daemon's scheduler, the owner sends the same request again, and passes after
+the run's deadline and after the manual claim's lease must not launch it again.
+Each of nine cases starts the exact audited binary as a hidden worker, with the
+same harness and daemon restart as `run-launch-process-crash-recovery`. The
+worker stores a fixed synthetic active daily definition with a working
+directory and a 30-minute deadline, whose next slot falls after every pass, and
+takes scheduler leadership as the serving daemon does. It sends the flat
+request, with a fixed adoption key, 30 seconds after the base time, through a
+no-op runtime. Vectors cannot choose a path, run, definition, adoption key,
+clock or pause mechanics, and every expected outcome is fixed per boundary.
+
+The command has three durable steps, each one transaction:
+
+- **Claim.** It inserts a `manual` occurrence, the one the owner's key names,
+  claimed under a 60-minute manual lease, and stores the owner's answer naming
+  that occurrence.
+- **Launch.** As for a scheduled slot, though without a scheduler fence, it
+  writes the session `created`, starts the run and marks its first attempt
+  `dispatching`.
+- **Ownership.** The runtime launch publishes ownership: the session, the
+  attempt and the occurrence become `running`, `started` and `running`.
+
+A fixture TEMP trigger pauses the worker after the claim's first and last
+writes, the occurrence and the answer; after the launch's first and last
+writes, the session and the attempt's `dispatching` update; and after the
+occurrence's `running` update. The WAL hook pauses it after each of the three
+commits. A control with no pause exits after the answer without the graceful
+shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check must
+pass. It restarts in the daemon's startup order 30 seconds after the request,
+and the owner re-sends the request 10 seconds later. If that request launches,
+its session ends with exit code 0 at 90 seconds. Passes follow before the run's
+deadline, after it, and after the claim's lease, then the request once more,
+and then the request and a pass again. One runtime counts every stop and launch
+they make. What each case requires depends on what the worker committed:
+
+- **Nothing:** the restart changes no row. The re-sent request claims and
+  launches the routine once, the passes settle that run `succeeded`, and later
+  requests replay the claim.
+- **The claim, killed after it commits or inside the launch:** the restart
+  changes no row. Startup restores only daemon claims, and the scheduler never
+  dispatches a manual one. Every request replays the stored claim without a
+  launch. The occurrence stays claimed until the pass after its lease fails it
+  `lease expired`, with no run, attempt or session.
+- **The launch, killed after it commits or inside ownership:** the restart
+  changes no row. Restart containment treats a missing receipt as the previous
+  daemon's containment only for a daemon-owned scheduled launch, so the manual
+  launch's `created` session stays ambiguous and is never relaunched: it stays
+  until the run's deadline. Every request replays the claim. The pass after
+  the deadline stops the session once and settles the run timed out.
+- **Ownership,** killed after it commits, and the control: the restart orphans
+  the `running` session and leaves the run, attempt and occurrence as they
+  were. Every request replays the claim, and the pass after the run's deadline
+  stops the session once and settles the run timed out.
+
+A run settled timed out has its attempt `timed_out` with the `timeout` class,
+its run `failed`, its occurrence `failed` with no lease, the deadline's reason
+on the attempt and the occurrence, and its session `killed`.
+
+Every class pins the whole store: the counts, the one occurrence the owner's key
+names, of the `manual` kind and claimed once, with its lease and reason, and
+the run, first attempt and session that belong to it. The store's only command
+adoption must carry the owner's key, command and routine, committed with that
+occurrence, and the store must hold no result reservation. A fresh answer must launch exactly once and be what the store now
+projects. A replay must write nothing and launch nothing. No case may launch
+more than once in all, and the request and a pass after the lease must change
+no occurrence, run, attempt, event, session, reservation, adoption,
+cancellation or stop-fence row.
+
+Observations carry boundary, launch, stored-answer and answer classes, counts
+and booleans. They never carry occurrence, run, attempt or session ids,
+adoption keys, responses, paths, handshakes or output. This is `audit_only`
+evidence for a daemon killed while it handles one flat run-now request. It does
+not cover the command envelope, whose claim also reserves a result key and
+whose result is retained in a further transaction; a manual launch with a
+containment receipt; a manual launch left before ownership whose claim's lease
+expires before the run's deadline, which abandoned-launch recovery stops
+instead; the command's refusals; a graceful daemon restart (#1433);
+Runtime Authority runs, a real runtime process, power loss, load, complete
+profiles or release eligibility.

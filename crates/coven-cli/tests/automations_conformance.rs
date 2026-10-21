@@ -178,7 +178,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "held-settlement-process-crash-recovery",
                         "automatic-retry-process-crash-recovery",
                         "retry-timeout-process-crash-recovery",
-                        "waiting-retry-cancellation-process-crash-recovery"
+                        "waiting-retry-cancellation-process-crash-recovery",
+                        "run-now-process-crash-recovery"
                     ]
                 },
                 {
@@ -3321,6 +3322,148 @@ fn native_target_evaluates_checked_in_waiting_retry_cancellation_process_crash_v
     assert!(!error.contains("private-must-not-be-read"));
     let text = String::from_utf8(output.stdout)?;
     assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_run_now_process_crash_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/run-now-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "run-now-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "run-now-process-crash-recovery");
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 9);
+    assert_eq!(response["evidence"]["passedCases"], 9);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("run-now crash observations");
+    assert_eq!(observations.len(), 9);
+    // What the store had committed when the worker was gone, and whether a
+    // write was open there.
+    for (observation, (boundary, committed, open)) in observations.iter().zip([
+        ("after_claim", "absent", true),
+        ("after_adoption", "absent", true),
+        ("after_claim_commit", "claimed", false),
+        ("after_session", "claimed", true),
+        ("after_dispatching", "claimed", true),
+        ("after_launch_commit", "launching", false),
+        ("after_ownership", "launching", true),
+        ("after_ownership_commit", "owned", false),
+        ("none", "owned", false),
+    ]) {
+        let killed = boundary != "none";
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(
+            observation["transactionOpenAtPause"],
+            if killed { json!(open) } else { json!(null) }
+        );
+        assert_eq!(
+            observation["launchAtPause"],
+            if killed {
+                json!(committed)
+            } else {
+                json!(null)
+            }
+        );
+        let stored = if committed == "absent" {
+            "none"
+        } else {
+            "claimed"
+        };
+        assert_eq!(
+            observation["storedAtPause"],
+            if killed { json!(stored) } else { json!(null) }
+        );
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["launchAfterExit"], committed);
+        assert_eq!(observation["storedAfterExit"], stored);
+        assert_eq!(observation["recoveryRefused"], false);
+        assert_eq!(observation["resend"], "replayed");
+        assert_eq!(observation["replayIsNoop"], true);
+        // Only a request that found nothing launches, once; every stored
+        // claim replays.
+        assert_eq!(
+            observation["reissue"],
+            if committed == "absent" {
+                "launched"
+            } else {
+                "replayed"
+            }
+        );
+        assert_eq!(
+            observation["launches"],
+            if committed == "absent" { 1 } else { 0 }
+        );
+        let (after_restart, after_pass, after_deadline, after_lease, stops) = match committed {
+            "absent" => ("absent", "succeeded", "succeeded", "succeeded", 0),
+            // The scheduler never dispatches a manual claim: it expires.
+            "claimed" => ("claimed", "claimed", "claimed", "expired", 0),
+            // A manual launch is not contained at restart; its deadline
+            // stops it once.
+            "launching" => ("launching", "launching", "timed_out", "timed_out", 1),
+            _ => ("orphaned", "orphaned", "timed_out", "timed_out", 1),
+        };
+        // Only ownership's restart writes: it orphans the session.
+        assert_eq!(observation["restartIsNoop"], committed != "owned");
+        assert_eq!(observation["launchAfterRestart"], after_restart);
+        assert_eq!(observation["launchAfterPass"], after_pass);
+        assert_eq!(observation["launchAfterDeadline"], after_deadline);
+        assert_eq!(observation["launchAfterLease"], after_lease);
+        assert_eq!(observation["stops"], stops);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "run-now-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    assert!(!text.contains("occ-manual-"));
+    assert!(!text.contains("adopt:"));
     assert!(!coven_home.exists());
     Ok(())
 }
