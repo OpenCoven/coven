@@ -233,6 +233,7 @@ The checked-in
 [`run-settlement-process-crash-recovery.vectors.json`](run-settlement-process-crash-recovery.vectors.json),
 [`run-launch-process-crash-recovery.vectors.json`](run-launch-process-crash-recovery.vectors.json),
 [`attempt-retry-process-crash-recovery.vectors.json`](attempt-retry-process-crash-recovery.vectors.json),
+[`occurrence-recovery-process-crash-recovery.vectors.json`](occurrence-recovery-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -296,7 +297,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, twenty-one
+The native Coven target implements twelve structural suites, twenty-two
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -841,3 +842,79 @@ It does not cover Runtime Authority runs, which this command refuses,
 `occurrence.recover.v1`, cancellation, retries of a timed-out or cancelled
 attempt, a graceful daemon restart, a real runtime process, power loss, load,
 complete profiles or release eligibility.
+
+## Owner recovery process-crash audit boundary
+
+The `occurrence-recovery-process-crash-recovery` suite kills a daemon worker
+while it handles the owner's `occurrence.recover.v1` request for an occurrence
+whose stop could not be confirmed. The parent then restarts the daemon's
+scheduler and sends the identical request again, with the same adoption key,
+as an owner who never saw an answer would. Each of thirteen cases starts the
+exact audited binary as a hidden worker, with the same harness and daemon
+restart as `run-launch-process-crash-recovery`. The worker stores a fixed
+synthetic active daily definition with no automatic retry, and claims and
+launches its 09:00 slot through a no-op runtime. The owner's `run.cancel.v1`
+then runs through a runtime that never confirms the stop. The daemon's API
+fences a stop on the wall clock; the worker fences it on the fixture's fixed
+clock, so its times agree with the scheduler's. The attempt becomes
+`ambiguous`, the occurrence `recovery_required`, and the cancellation's stop
+fence stays on the run. A daemon restart then marks the session `orphaned` and
+launches nothing. Vectors cannot choose a path, run, definition, determination
+statement, adoption key, clock or pause mechanics, and every expected outcome
+is fixed per determination and boundary.
+
+Each determination is one transaction that releases the run's stop fence and
+stores the response under the request's adoption key last:
+
+- **`retry_with_new_attempt`** opens attempt 2 as `adopted`, an operator
+  recovery of attempt 1's ambiguity. It returns the occurrence to `planned` and
+  releases the run's session.
+- **`failed_deterministic`** settles the occurrence `failed`, then finishes the
+  run `failed`. It launches nothing.
+
+For each determination:
+
+- **After each write:** a fixture TEMP trigger pauses the worker after each
+  of the transaction's writes, in order. That is the attempt insert, the
+  occurrence replan, the session release, the fence release and the adoption
+  insert for a retry. For a failed determination it is the occurrence
+  settlement, the run finish, the fence release and the adoption insert.
+- **After commit:** the WAL hook pauses it once SQLite has committed the
+  determination.
+- **Control:** no pause. The worker answers the request and exits without the
+  graceful shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one. Inside it, the parent must read the
+occurrence still waiting for the owner under the cancellation's fence, with no
+attempt 2 or stored answer. After the commit it must read the whole
+determination, with no fence. The parent then kills and reaps the worker. The
+store's raw integrity check must pass, and the store must hold what the parent
+read while the worker was paused.
+
+After the restart's startup pass, a committed retry must have dispatched
+attempt 2 once. For a committed failed determination and an unresolved
+occurrence, the restart must change no occurrence, run, attempt, event,
+session, adoption, cancellation or stop-fence row. The re-sent request must
+then commit the determination if
+it was lost. If it had committed, the request must replay the stored response,
+which names the store's run and, for a retry, the attempt 2 it opened earlier,
+even though that attempt has since started. For a retry, the next pass
+dispatches an attempt that has not yet launched. Its session ends with exit
+code 0, and a pass settles the run `succeeded`, which needs the run's fence
+released. A retry case ends with one launch since the restart and two
+sessions. A failed case ends with no launch, one session, and a `failed` run
+and occurrence. Every case ends with the request's one stored answer. A store
+that recovery refuses, or a request that errors, fails the case. The same
+request and a further pass must then change no occurrence, run, attempt,
+event, session, adoption, cancellation or stop-fence row.
+
+Observations carry determination, boundary, occurrence, answer and state
+classes, counts and booleans. They never carry run, attempt, occurrence or
+session ids, adoption keys, responses, paths, handshakes or output. This is
+`audit_only` evidence for a daemon killed while it handles one owner recovery
+after an unconfirmed cancellation of a scheduled run. It does not cover
+Runtime Authority runs, which this command refuses, a recovery after a
+timeout's or an abandoned launch's unconfirmed stop, a daemon killed inside
+the cancellation itself, a graceful daemon restart, a real runtime process,
+power loss, load, complete profiles or release eligibility.

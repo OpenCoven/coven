@@ -35,6 +35,7 @@
     { "profile": "scheduler_reliability", "suiteId": "run-settlement-process-crash-recovery", "vectorFile": "run-settlement-process-crash-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "run-launch-process-crash-recovery", "vectorFile": "run-launch-process-crash-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "attempt-retry-process-crash-recovery", "vectorFile": "attempt-retry-process-crash-recovery.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "occurrence-recovery-process-crash-recovery", "vectorFile": "occurrence-recovery-process-crash-recovery.vectors.json" },
     { "profile": "runtime_authority", "suiteId": "runtime-authority-terminal-recovery", "vectorFile": "runtime-authority-terminal-recovery.vectors.json" }
   ]
 }
