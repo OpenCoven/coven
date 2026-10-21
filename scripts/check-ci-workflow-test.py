@@ -96,7 +96,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_bootstrap_matrix_is_required_when_routed_and_preserves_safe_evidence(self) -> None:
         job = ci_job_block('bootstrap-contract')
         self.assertIn("needs.changes.outputs.bootstrap == 'true'", job)
-        self.assertIn('image: [debian12, ubuntu24]', job)
+        self.assertIn('image: [debian12, debian13, ubuntu24]', job)
         self.assertIn('fail-fast: false', job)
         self.assertIn('scripts/bootstrap-contract/runner.py', job)
         self.assertIn('if: ${{ always() }}', job)

@@ -841,7 +841,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [debian12, ubuntu24]
+        image: [debian12, debian13, ubuntu24]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

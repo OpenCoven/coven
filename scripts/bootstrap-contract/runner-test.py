@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 from unittest import mock
 from pathlib import Path
 import tempfile
@@ -19,7 +20,10 @@ class RunnerTests(unittest.TestCase):
 
     def test_only_digest_pinned_official_images_are_accepted(self):
         inventory = self.runner.load_images()
-        self.assertEqual(set(inventory), {'debian12', 'ubuntu24'})
+        self.assertEqual(set(inventory), {'debian12', 'debian13', 'ubuntu24'})
+        self.assertEqual(inventory['debian12']['contract'], 'native-and-python-rejection')
+        self.assertEqual(inventory['debian13']['contract'], 'full-bootstrap')
+        self.assertEqual(inventory['ubuntu24']['contract'], 'full-bootstrap')
         for entry in inventory.values():
             self.assertRegex(entry['image'], r'^docker.io/library/(debian|ubuntu)@sha256:[0-9a-f]{64}$')
             self.assertEqual(entry['platform'], 'linux/amd64')
@@ -28,6 +32,11 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / 'images.json'
             target.write_text(json.dumps({'debian12': {'image': 'debian:latest', 'platform': 'linux/amd64'}}))
+            with self.assertRaisesRegex(ValueError, 'inventory'):
+                self.runner.load_images(target)
+            inventory = self.runner.load_images()
+            inventory['debian13']['contract'] = 'native-and-python-rejection'
+            target.write_text(json.dumps(inventory))
             with self.assertRaisesRegex(ValueError, 'inventory'):
                 self.runner.load_images(target)
 
@@ -93,6 +102,7 @@ class RunnerTests(unittest.TestCase):
             sha = self.runner.git(source, 'rev-parse', 'HEAD')
             original_run = subprocess.run
             for case, expected in [('pass', 'contract-passed'), ('provenance', 'container-or-source-error'),
+                                   ('profile', 'container-or-source-error'),
                                    ('timeout', 'container-timeout'), ('cleanup', 'container-cleanup-failed')]:
                 output = root / case
                 def run(command, **kwargs):
@@ -102,6 +112,7 @@ class RunnerTests(unittest.TestCase):
                         if case == 'timeout':
                             raise subprocess.TimeoutExpired(command, 5400)
                         (output / 'result.json').write_text(json.dumps({'status': 'passed', 'distribution': 'debian',
+                                                                    'contract': 'wrong' if case == 'profile' else 'native-and-python-rejection',
                                                                     'source_sha': 'wrong' if case == 'provenance' else sha}))
                         return subprocess.CompletedProcess(command, 0)
                     return subprocess.CompletedProcess(command, 1 if case == 'cleanup' else 0, stdout='')
@@ -133,6 +144,62 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(json.loads((output / 'bootstrap-first.json').read_text()), body)
             self.assertEqual(report['cases'][0]['status'], 'failed')
             self.assertNotIn('private diagnostic', json.dumps(report))
+
+    def test_python_capability_cannot_turn_missing_security_into_full_success(self):
+        spec = importlib.util.spec_from_file_location('inside_contract', Path(__file__).with_name('inside.py'))
+        inside = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inside)
+        class RejectedArchive(ValueError):
+            pass
+        extractor = mock.Mock(side_effect=RejectedArchive('Python needs the maintained tarfile extraction security filters'))
+        provision = mock.Mock(ProvisionError=RejectedArchive, extract_node=extractor)
+        result = inside.python_contract('native-and-python-rejection', False, provision)
+        self.assertFalse(result['bootstrap_supported'])
+        self.assertEqual(result['code'], 'python-security-filters-rejected')
+        extractor.assert_called_once()
+        for profile, available in [('full-bootstrap', False), ('native-and-python-rejection', True), ('unknown', True)]:
+            with self.subTest(profile=profile, available=available), self.assertRaises(RuntimeError):
+                inside.python_contract(profile, available, provision)
+        self.assertTrue(inside.python_contract('full-bootstrap', True, provision)['bootstrap_supported'])
+        extractor.side_effect = None
+        with self.assertRaises(RuntimeError):
+            inside.python_contract('native-and-python-rejection', False, provision)
+
+    def test_native_rejection_report_never_runs_bootstrap_or_claims_readiness(self):
+        spec = importlib.util.spec_from_file_location('inside_contract', Path(__file__).with_name('inside.py'))
+        inside = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inside)
+        class RejectedArchive(ValueError):
+            pass
+        provision = mock.Mock(ProvisionError=RejectedArchive,
+                              extract_node=mock.Mock(side_effect=RejectedArchive(
+                                  'Python needs the maintained tarfile extraction security filters')))
+        environment = {'COVEN_CONTRACT_PROFILE': 'native-and-python-rejection',
+                       'COVEN_CONTRACT_SOURCE_SHA': 'a' * 40, 'COVEN_CONTRACT_DISTRO': 'debian',
+                       'COVEN_CONTRACT_CODENAME': 'bookworm'}
+        os_release = mock.Mock()
+        os_release.read_text.return_value = 'ID=debian\nVERSION_CODENAME=bookworm\n'
+        def path(value):
+            return os_release if value == '/etc/os-release' else Path(value)
+        def git(command, **kwargs):
+            return 'a' * 40 if command[1] == 'rev-parse' else b''
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, environment), \
+                mock.patch.dict(sys.modules, {'provision': provision, 'runtime': mock.Mock()}), \
+                mock.patch.object(inside, 'Path', side_effect=path), \
+                mock.patch.object(inside, 'tarfile', mock.Mock(spec=[])), \
+                mock.patch.object(inside, 'source_hashes', return_value={}), \
+                mock.patch.object(inside.subprocess, 'check_output', side_effect=git), \
+                mock.patch.object(inside, 'run_case', return_value='') as run:
+            report = inside.execute(Path(directory))
+        self.assertEqual(report['status'], 'passed')
+        self.assertFalse(report['development_ready'])
+        self.assertFalse(report['python']['bootstrap_supported'])
+        self.assertEqual({item['name'] for item in report['skipped']},
+                         {'mock-suites', 'bootstrap-first', 'bootstrap-second', 'fresh-readiness'})
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         ['native-root-first', 'native-root-second', 'native-nonroot',
+                          'unsupported-os-fixture', 'foreign-source-fixture', 'malformed-source-fixture'])
 
 
 if __name__ == '__main__':

@@ -16,13 +16,15 @@ HERE = Path(__file__).resolve().parent
 def load_images(source=HERE / 'images.json'):
     try:
         entries = json.loads(Path(source).read_text())
-        if set(entries) != {'debian12', 'ubuntu24'}:
+        expected = {'debian12': ('debian', 'bookworm', 'native-and-python-rejection'),
+                    'debian13': ('debian', 'trixie', 'full-bootstrap'),
+                    'ubuntu24': ('ubuntu', 'noble', 'full-bootstrap')}
+        if set(entries) != set(expected):
             raise ValueError
-        for entry in entries.values():
+        for key, entry in entries.items():
             if (not re.fullmatch(r'docker.io/library/(debian|ubuntu)@sha256:[0-9a-f]{64}', entry['image'])
                     or entry['platform'] != 'linux/amd64'
-                    or entry['distribution'] not in ('debian', 'ubuntu')
-                    or entry['codename'] not in ('bookworm', 'noble')):
+                    or (entry['distribution'], entry['codename'], entry['contract']) != expected[key]):
                 raise ValueError
     except (OSError, ValueError, TypeError, KeyError):
         raise ValueError('invalid pinned container inventory') from None
@@ -46,6 +48,7 @@ def container_command(image, source, output, sha, name):
             '--env', 'DEBIAN_FRONTEND=noninteractive', '--env', 'COVEN_CONTRACT_SOURCE_SHA=' + sha,
             '--env', 'COVEN_CONTRACT_DISTRO=' + image['distribution'],
             '--env', 'COVEN_CONTRACT_CODENAME=' + image['codename'],
+            '--env', 'COVEN_CONTRACT_PROFILE=' + image['contract'],
             image['image'], 'bash', '/source/scripts/bootstrap-contract/container.sh']
 
 
@@ -118,7 +121,8 @@ def execute(repo, image, output):
             else:
                 result_report = json.loads((output / 'result.json').read_text())
                 if (result_report.get('status') != 'passed' or result_report.get('source_sha') != sha
-                        or result_report.get('distribution') != image['distribution']):
+                        or result_report.get('distribution') != image['distribution']
+                        or result_report.get('contract') != image['contract']):
                     raise ValueError('container evidence does not match requested source and distribution')
                 report.update(status='passed', code='contract-passed')
     except subprocess.TimeoutExpired:
@@ -135,7 +139,7 @@ def execute(repo, image, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--image', choices=['debian12', 'ubuntu24'], required=True)
+    parser.add_argument('--image', choices=['debian12', 'debian13', 'ubuntu24'], required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--repo', type=Path, default=HERE.parents[1])
     parser.add_argument('--plan', action='store_true')

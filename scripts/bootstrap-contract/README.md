@@ -5,17 +5,28 @@ A2 Cloud setup scripts, and reviewed CI integration before the matrix can pass.
 It does not emulate a managed Cloud VM and never establishes provider access or
 human environment publication.
 
-`images.json` pins official Docker Library Debian12 (`bookworm-slim`) and
-Ubuntu24.04 (`noble`) manifest-index digests resolved from Docker Registry v2 on
-2026-10-20. The test platform is explicitly `linux/amd64`; no ARM execution is
+`images.json` pins official Docker Library Debian12 (`bookworm-slim`), Debian13
+(`trixie-slim`), and Ubuntu24.04 (`noble`) manifest-index digests resolved from
+Docker Registry v2 on 2026-10-20 (Debian13 on 2026-10-21).
+The test platform is explicitly `linux/amd64`; no ARM execution is
 claimed. Tags are recorded only for maintainers; execution uses the digest.
 To update, resolve the official tag's manifest digest, review the distro and
-Python compatibility, update the inventory, and rerun both fresh contracts.
+Python compatibility, update the inventory, and rerun all fresh contracts.
+
+Debian13 and Ubuntu24 run the full bootstrap, repeat bootstrap, and readiness
+contract. Debian12 retains native-install/source/privilege coverage and verifies
+the production refusal to extract archives without Python's `tarfile.data_filter`.
+Its current official Python package lacks that capability. This job reports
+`bootstrap_supported: false`, `development_ready: false`, and explicit skipped
+bootstrap/readiness checks; a passing rejection contract is not bootstrap success.
+If that capability changes, the job fails until its expected contract is reviewed.
+No archive-security fallback is used.
 
 ```sh
 python3 scripts/bootstrap-contract/runner-test.py
 python3 scripts/bootstrap-contract/runner.py --image debian12 --output /tmp/coven-debian-contract --plan
 python3 scripts/bootstrap-contract/runner.py --image debian12 --output /tmp/coven-debian-contract
+python3 scripts/bootstrap-contract/runner.py --image debian13 --output /tmp/coven-debian13-contract
 python3 scripts/bootstrap-contract/runner.py --image ubuntu24 --output /tmp/coven-ubuntu-contract
 ```
 
@@ -33,7 +44,7 @@ The initial image setup installs Python, Git, certificates, Bash and util-linux
 through the image's signed APT configuration. Contract cases then cover actual
 native root install, repeated install, unchanged source metadata, and actual
 non-root privilege refusal. Unsupported OS, cross-distro and malformed APT cases
-use injected metadata and are labelled accordingly. A2 mock tests cover pinned
+use injected metadata and are labelled accordingly. On full-bootstrap images, A2 mock tests cover pinned
 version/network/build failures; they remain labelled mock evidence even inside
 a real container. Full A2 bootstrap runs twice with a shared container-local
 cache, followed by readiness, retaining each report. Operational readiness and
@@ -48,7 +59,7 @@ failure, or substitutes local fixtures for real Cloud evidence.
 
 The CI matrix is routed by the `bootstrap` change category: bootstrap/cloud
 scripts, Cargo metadata, package manifests/locks, and workflow/toolchain changes.
-The matrix uses two independent jobs (`fail-fast: false`), no cross-run cache,
+The matrix uses three independent jobs (`fail-fast: false`), no cross-run cache,
 and a 95-minute job limit around the runner's 90-minute container limit. Its
 result is a dependency of `PR gate`; routed failures are not optional. Ordinary
 unrelated documentation/package-source edits do not enable a fresh tool install.

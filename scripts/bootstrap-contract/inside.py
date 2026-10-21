@@ -6,9 +6,25 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def python_contract(profile, filter_available, provision):
+    if profile == 'full-bootstrap' and filter_available:
+        return {'bootstrap_supported': True, 'code': 'python-security-filters-available'}
+    if profile == 'native-and-python-rejection' and not filter_available:
+        # Exercise the production refusal, not merely our interpretation of an
+        # attribute. The guard must run before opening any archive or writing.
+        try:
+            provision.extract_node('/nonexistent/contract-archive', '/nonexistent/contract-output', 'contract')
+        except provision.ProvisionError as error:
+            if str(error) == 'Python needs the maintained tarfile extraction security filters':
+                return {'bootstrap_supported': False, 'code': 'python-security-filters-rejected'}
+        raise RuntimeError('unsafe-python-was-not-rejected')
+    raise RuntimeError('python-capability-does-not-match-contract')
 
 
 def source_hashes(root):
@@ -46,7 +62,9 @@ def run_case(name, command, *, report, output, diagnostic, expected_code=None, e
 def execute(output):
     sys.path.insert(0, str(REPO / 'scripts/cloud'))
     from runtime import native_diagnostic
-    report = {'schema_version': 1, 'status': 'failed', 'cloud_parity': False, 'cases': []}
+    import provision
+    profile = os.environ['COVEN_CONTRACT_PROFILE']
+    report = {'schema_version': 1, 'status': 'failed', 'cloud_parity': False, 'cases': [], 'contract': profile}
     source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip()
     report['source_sha'] = source
     if source != os.environ['COVEN_CONTRACT_SOURCE_SHA']:
@@ -89,6 +107,25 @@ def execute(output):
             (fixture / 'sources.list.d' / (report['distribution'] + '.sources')).write_text('Types: deb\nTypes: deb\n')
             run('malformed-source-fixture', helper, expected_code='native_source_validation',
                 env={**os.environ, 'COVEN_APT_ETC_DIR': str(fixture)}, evidence='injected-metadata')
+        try:
+            report['python'] = python_contract(profile, hasattr(tarfile, 'data_filter'), provision)
+        except RuntimeError as error:
+            report['cases'].append({'name': 'python-security-capability', 'status': 'failed',
+                                    'evidence': 'real-container', 'code': str(error)})
+            raise
+        report['cases'].append({'name': 'python-security-capability', 'status': 'passed',
+                                'evidence': 'real-container', **report['python']})
+        if profile == 'native-and-python-rejection':
+            report['skipped'] = [{'name': name, 'reason': 'python-security-filters-unavailable'}
+                                 for name in ('mock-suites', 'bootstrap-first', 'bootstrap-second', 'fresh-readiness')]
+            report['development_ready'] = False
+            if source_hashes(Path('/etc/apt')) != original_sources:
+                raise RuntimeError('apt-source-mutated')
+            if subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=REPO).strip():
+                raise RuntimeError('tracked-source-mutated')
+            report.update(status='passed', code='native-and-rejection-contract-passed',
+                          tracked_source_unchanged=True, apt_sources_unchanged=True)
+            return report
         # These tests inject command/network/toolchain outcomes. Running them in
         # a distro does not turn their mock outcomes into real network denials.
         for name in ('config', 'runtime', 'provision', 'bootstrap', 'readiness'):
