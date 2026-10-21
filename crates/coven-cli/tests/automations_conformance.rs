@@ -170,7 +170,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "result-delivery-process-crash-recovery",
                         "run-settlement-process-crash-recovery",
                         "run-launch-process-crash-recovery",
-                        "attempt-retry-process-crash-recovery"
+                        "attempt-retry-process-crash-recovery",
+                        "occurrence-recovery-process-crash-recovery"
                     ]
                 },
                 {
@@ -2182,6 +2183,142 @@ fn native_target_evaluates_checked_in_attempt_retry_process_crash_vectors() -> a
     let rejected = run_target(
         &coven_home,
         "attempt-retry-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_occurrence_recovery_process_crash_vectors(
+) -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/occurrence-recovery-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "occurrence-recovery-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        response["suiteId"],
+        "occurrence-recovery-process-crash-recovery"
+    );
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 13);
+    assert_eq!(response["evidence"]["passedCases"], 13);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("recovery crash observations");
+    assert_eq!(observations.len(), 13);
+    let retry = "retry_with_new_attempt";
+    let failed = "failed_deterministic";
+    for (observation, (determination, boundary, committed)) in observations.iter().zip([
+        (retry, "after_attempt", false),
+        (retry, "after_replan", false),
+        (retry, "after_release", false),
+        (retry, "after_fence_release", false),
+        (retry, "after_adoption", false),
+        (retry, "after_commit", true),
+        (retry, "none", true),
+        (failed, "after_settle", false),
+        (failed, "after_finish", false),
+        (failed, "after_fence_release", false),
+        (failed, "after_adoption", false),
+        (failed, "after_commit", true),
+        (failed, "none", true),
+    ]) {
+        let killed = boundary != "none";
+        let retries = determination == retry;
+        assert_eq!(observation["determination"], determination);
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(
+            observation["transactionOpenAtPause"],
+            if killed {
+                json!(!committed)
+            } else {
+                json!(null)
+            }
+        );
+        let determined = if retries { "retried" } else { "failed" };
+        let at_exit = if committed { determined } else { "unresolved" };
+        assert_eq!(
+            observation["occurrenceAtPause"],
+            if killed { json!(at_exit) } else { json!(null) }
+        );
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["occurrenceAfterExit"], at_exit);
+        assert_eq!(observation["sessionsAfterExit"], 1);
+        assert_eq!(observation["recoveryRefused"], false);
+        assert_eq!(
+            observation["restartLaunches"],
+            u64::from(retries && committed)
+        );
+        let relaunched = if retries { "relaunched" } else { "failed" };
+        assert_eq!(
+            observation["occurrenceAfterRestart"],
+            if committed { relaunched } else { "unresolved" }
+        );
+        assert_eq!(observation["restartIsNoop"], !(retries && committed));
+        assert_eq!(
+            observation["reissue"],
+            if committed { "replayed" } else { "committed" }
+        );
+        assert_eq!(
+            observation["occurrenceAfterReissue"],
+            if committed { relaunched } else { determined }
+        );
+        assert_eq!(observation["launches"], u64::from(retries));
+        assert_eq!(
+            observation["finalOccurrence"],
+            if retries { "succeeded" } else { "failed" }
+        );
+        assert_eq!(observation["finalSessions"], if retries { 2 } else { 1 });
+        assert_eq!(observation["replayIsNoop"], true);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "occurrence-recovery-crash-worker",
         Some(&invalid["vector"]["cases"][0]),
     )?;
     assert!(!rejected.status.success());

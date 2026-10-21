@@ -465,8 +465,8 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_cloud_setup_fixtures_run_in_required_policy_guard(self) -> None:
         policy = ci_job_block("policy-guard")
         for suite in ("config", "runtime", "provision", "bootstrap", "readiness"):
-            self.assertIn(f"python3 scripts/cloud/{suite}-test.py", policy)
-        self.assertIn("bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh", policy)
+            self.assertIn(f"- run: python3 scripts/cloud/{suite}-test.py", policy)
+        self.assertIn("- run: bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh", policy)
 
     def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
         release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')

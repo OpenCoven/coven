@@ -38,6 +38,7 @@ mod command_storage_readonly_recovery;
 mod command_transaction_rollback;
 mod legacy_import_source_preservation;
 mod mission_commands;
+mod occurrence_recovery_process_crash;
 mod process_crash_fixture;
 mod result_delivery_process_crash;
 mod result_delivery_recovery;
@@ -70,6 +71,11 @@ pub fn run_launch_crash_worker(request: &Value) -> Result<(), &'static str> {
 /// Execute the disposable hidden attempt-retry crash conformance worker.
 pub fn attempt_retry_crash_worker(request: &Value) -> Result<(), &'static str> {
     attempt_retry_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden occurrence-recovery crash conformance worker.
+pub fn occurrence_recovery_crash_worker(request: &Value) -> Result<(), &'static str> {
+    occurrence_recovery_process_crash::worker(request)
 }
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -158,6 +164,8 @@ pub const RUN_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE: &str =
     "run-settlement-process-crash-recovery";
 pub const RUN_LAUNCH_PROCESS_CRASH_RECOVERY_SUITE: &str = "run-launch-process-crash-recovery";
 pub const ATTEMPT_RETRY_PROCESS_CRASH_RECOVERY_SUITE: &str = "attempt-retry-process-crash-recovery";
+pub const OCCURRENCE_RECOVERY_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "occurrence-recovery-process-crash-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -1629,6 +1637,7 @@ pub fn capability() -> TargetCapability {
                     RUN_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE,
                     RUN_LAUNCH_PROCESS_CRASH_RECOVERY_SUITE,
                     ATTEMPT_RETRY_PROCESS_CRASH_RECOVERY_SUITE,
+                    OCCURRENCE_RECOVERY_PROCESS_CRASH_RECOVERY_SUITE,
                 ],
             },
             TargetProfileCapability {
@@ -1741,6 +1750,15 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, ATTEMPT_RETRY_PROCESS_CRASH_RECOVERY_SUITE) => {
             let (passed, observations) = attempt_retry_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, OCCURRENCE_RECOVERY_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                occurrence_recovery_process_crash::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);
