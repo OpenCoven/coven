@@ -327,6 +327,12 @@ fn doctor_combined_engine_faults_share_one_deadline() -> Result<()> {
     assert_doctor_deadline(&run);
     let document = parse_json("combined slow engine probes", &run.output)?;
     match check(&document, "engine")["status"].as_str() {
+        // The version may answer just as the shared budget runs out. Doctor
+        // then reports authentication unavailable, and the auth probe either
+        // never starts or is stopped before it records its invocation.
+        Some("pass") if run.invocations.len() == 1 => {
+            assert_eq!(run.invocations[0].args, ["--version"]);
+        }
         Some("pass") => assert_only_local_engine_probes(&run.invocations),
         Some("warn") => {
             // Cold engine loading plus the two-second response delay may use
