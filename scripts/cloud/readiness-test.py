@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import readiness
 
@@ -53,6 +54,15 @@ class ReadinessTests(fixtures.ConfigTests):
         self.assertIn("--locked", smoke)
         self.assertIn("--nocapture", smoke)
         self.assertNotIn("ready", report)
+
+    @patch("readiness.platform.system", return_value="Linux")
+    def test_missing_openssl_blocks_build_with_explicit_stage(self, *_):
+        report = readiness.verify(self.root, Path(self.temp.name) / "cache", run=self.runner("openssl"))
+        self.assertFalse(report["development_ready"])
+        self.assertEqual(report["blocked_stage"], "native_openssl")
+        self.assertEqual(report["stages"][-1]["exit_code"], 19)
+        self.assertIn(["pkg-config", "--exists", "openssl"], self.commands)
+        self.assertFalse(any("build" in argv or "doctor" in argv for argv in self.commands))
 
     def test_failed_build_stops_before_smoke_and_does_not_report_ready(self):
         report = readiness.verify(self.root, Path(self.temp.name) / "cache", run=self.runner("build"))

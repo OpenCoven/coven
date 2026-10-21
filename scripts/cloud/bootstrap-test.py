@@ -48,6 +48,9 @@ class BootstrapTests(fixtures.ConfigTests):
             self.assertTrue(report["development_ready"], report)
         commands = [argv for argv, _ in self.commands]
         self.assertFalse(any("curl" == argv[0] for argv in commands))
+        native = next(argv for argv in commands if any(arg.endswith("install-native-link-dependencies.sh") for arg in argv))
+        self.assertIn("libssl-dev", native)
+        self.assertIn("pkg-config", native)
         install = next(argv for argv in commands if "toolchain" in argv)
         self.assertEqual(install[1:6], ["toolchain", "install", "1.2.3", "--profile", "minimal"])
         self.assertIn("clippy", install)

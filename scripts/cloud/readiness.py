@@ -63,6 +63,10 @@ def verify(repo, cache, *, run=run_command):
                 executable = cache / "managers" / pin / "bin" / name
                 command("package_manager:" + package, [str(executable), "--version"],
                         expected=lambda text, version=version: text == version)
+            # The locked Linux graph uses openssl-sys through coven-memory.
+            # Fail at the missing native prerequisite before an opaque Cargo error.
+            if platform.system() == "Linux":
+                command("native_openssl", ["pkg-config", "--exists", "openssl"])
             command("workspace_build", [*cargo, "build", "--workspace", "--locked"], timeout=1800)
             doctor = command("doctor", [str(cache / "target/debug/coven"), "doctor", "--json"],
                              timeout=60, permit_doctor=True)

@@ -81,7 +81,7 @@ def prepare(repo, cache, *, run=run_command, verify=verify_readiness):
                                "--output", destination, url], timeout=660)
 
             command("native_dependencies", ["bash", repo / "scripts/install-native-link-dependencies.sh",
-                    "libopenblas-dev", "build-essential", "pkg-config", "curl", "ca-certificates"], timeout=1200)
+                    "libopenblas-dev", "libssl-dev", "build-essential", "pkg-config", "curl", "ca-certificates"], timeout=1200)
             rustup = cache / "cargo/bin/rustup"
             if not rustup.is_file():
                 base = f"https://static.rust-lang.org/rustup/dist/{rust_arch}-unknown-linux-gnu"
