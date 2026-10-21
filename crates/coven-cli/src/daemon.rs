@@ -29,6 +29,8 @@ use crate::{
     pty_runner,
 };
 
+mod startup_failure;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonStatus {
@@ -3646,42 +3648,49 @@ impl DaemonStartController for SystemDaemonStartController {
         status: &DaemonStatus,
         deadline: LifecycleDeadline,
     ) -> Result<Option<DaemonStatus>> {
-        #[cfg(unix)]
-        {
-            if !unix_status_matches_selected_home(coven_home, status) {
-                return Ok(None);
-            }
-            loop {
-                let remaining = deadline.remaining("waiting for Coven daemon startup health")?;
-                if let Some(live) = unix_authenticated_daemon_status(coven_home, status, remaining)?
-                {
-                    return Ok(Some(live));
+        let diagnostics = startup_failure::Observer::start(coven_home, status, deadline);
+        let result = (|| {
+            #[cfg(unix)]
+            {
+                if !unix_status_matches_selected_home(coven_home, status) {
+                    return Ok(None);
                 }
-                let remaining = deadline.remaining("waiting for Coven daemon startup health")?;
-                std::thread::sleep(remaining.min(Duration::from_millis(50)));
+                loop {
+                    let remaining =
+                        deadline.remaining("waiting for Coven daemon startup health")?;
+                    if let Some(live) =
+                        unix_authenticated_daemon_status(coven_home, status, remaining)?
+                    {
+                        return Ok(Some(live));
+                    }
+                    let remaining =
+                        deadline.remaining("waiting for Coven daemon startup health")?;
+                    std::thread::sleep(remaining.min(Duration::from_millis(50)));
+                }
             }
-        }
-        #[cfg(windows)]
-        {
-            let _ = coven_home;
-            wait_for_windows_running_daemon_with_identity_probe_until(
-                status,
-                deadline,
-                |pipe_name, deadline| {
-                    Ok(daemon_status_from_windows_pipe_until(pipe_name, deadline)?
-                        .and_then(|live| resolved_windows_daemon_status(status, &live)))
-                },
-            )
-            .map(Some)
-            .with_context(|| self.child_observation())
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = coven_home;
-            let _ = status;
-            let _ = deadline;
-            Ok(Some(status.clone()))
-        }
+            #[cfg(windows)]
+            {
+                let _ = coven_home;
+                wait_for_windows_running_daemon_with_identity_probe_until(
+                    status,
+                    deadline,
+                    |pipe_name, deadline| {
+                        Ok(daemon_status_from_windows_pipe_until(pipe_name, deadline)?
+                            .and_then(|live| resolved_windows_daemon_status(status, &live)))
+                    },
+                )
+                .map(Some)
+                .with_context(|| self.child_observation())
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = coven_home;
+                let _ = status;
+                let _ = deadline;
+                Ok(Some(status.clone()))
+            }
+        })();
+        diagnostics.enrich(result, deadline)
     }
 }
 
@@ -5903,8 +5912,8 @@ pub fn serve_forever(
     let automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
-    let mobile_gateway =
-        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
+    let mobile_gateway = crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)
+        .inspect_err(|error| startup_failure::record(coven_home, &status, error))?;
     startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     let (tcp_thread, active_tcp_connection) = if let Some(tcp_listener) = tcp_listener {
@@ -7097,7 +7106,8 @@ fn serve_forever_with_lifetime_job_installer(
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
     let _mobile_gateway =
-        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
+        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)
+            .inspect_err(|error| startup_failure::record(coven_home, &status, error))?;
     startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     const MAX_INFLIGHT: usize = 64;

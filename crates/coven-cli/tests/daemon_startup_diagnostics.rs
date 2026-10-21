@@ -270,6 +270,100 @@ fn native_startup_checkpoints_remain_advisory_when_log_is_unavailable() -> Resul
     exercise_startup(false, true)
 }
 
+struct BackgroundCleanup<'a>(&'a Path);
+
+impl Drop for BackgroundCleanup<'_> {
+    fn drop(&mut self) {
+        // The normal stop command authenticates the instance in this isolated
+        // home; never signal a PID obtained from unauthenticated metadata.
+        if let Ok(child) = command(self.0, &["daemon", "stop"]).spawn() {
+            let _ = wait_exit(
+                &mut OwnedChild(child),
+                Instant::now() + Duration::from_secs(30),
+            );
+        }
+    }
+}
+
+fn exercise_background_failure(action: &str) -> Result<()> {
+    let base = if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let temp = tempfile::Builder::new()
+        .prefix("coven-start-fail-")
+        .tempdir_in(base)?;
+    let root = temp.path().canonicalize()?;
+    let home = root.join("coven");
+    for directory in [&home, &root.join("user"), &root.join("tmp")] {
+        fs::create_dir(directory)?;
+    }
+    let mobile = home.join("mobile");
+    fs::create_dir(&mobile)?;
+    let config = mobile.join("gateway.json");
+    let original =
+        br#"{"enabled":true,"bind":"192.168.1.10:0","advertisedEndpoint":"https://192.168.1.10"}"#;
+    fs::write(&config, original)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&mobile, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    }
+    let cleanup = BackgroundCleanup(&root);
+    let stderr = root.join("start.stderr");
+    let mut launch = OwnedChild(
+        command(&root, &["daemon", action])
+            .stderr(File::create(&stderr)?)
+            .spawn()?,
+    );
+    let exit = wait_exit(&mut launch, Instant::now() + Duration::from_secs(30))?;
+    assert!(!exit.success(), "invalid enabled gateway must fail startup");
+    assert_eq!(fs::read(&config)?, original);
+    let message = read_bounded(&stderr)?;
+    for expected in [
+        "mobile gateway configuration",
+        "mobile/gateway.json",
+        "non-zero",
+        "coven daemon restart",
+    ] {
+        assert!(message.contains(expected), "missing {expected}: {message}");
+    }
+    assert!(!message.contains("192.168.1.10"), "{message}");
+
+    // Explicit operator correction, retaining the rejected file for recovery.
+    let rejected = mobile.join("gateway.rejected.json");
+    fs::rename(&config, &rejected)?;
+    let mut launch = OwnedChild(command(&root, &["daemon", action]).spawn()?);
+    assert!(wait_exit(&mut launch, Instant::now() + Duration::from_secs(30))?.success());
+    let output = root.join("status.json");
+    let mut probe = OwnedChild(
+        command(&root, &["daemon", "status", "--json"])
+            .stdout(File::create(&output)?)
+            .spawn()?,
+    );
+    assert!(wait_exit(&mut probe, Instant::now() + Duration::from_secs(30))?.success());
+    let status: serde_json::Value = serde_json::from_str(&read_bounded(&output)?)?;
+    assert_eq!(status["status"], "running");
+    assert!(status["pid"].as_u64().is_some_and(|pid| pid > 0));
+    assert_eq!(fs::read(rejected)?, original);
+    drop(cleanup);
+    #[cfg(unix)]
+    assert!(!home.join("coven.sock").exists());
+    Ok(())
+}
+
+#[test]
+fn background_start_reports_configuration_correction_and_recovers() -> Result<()> {
+    exercise_background_failure("start")
+}
+
+#[test]
+fn background_restart_reports_configuration_correction_and_recovers() -> Result<()> {
+    exercise_background_failure("restart")
+}
+
 // Invoked in a child test process so the parent can inspect the exact failure
 // report produced by both Result propagation and assertion unwinding.
 #[test]
