@@ -639,9 +639,15 @@ fn recover_settled_result(
         "succeeded" | "failed" | "timed_out" | "recovery_required"
     ) && terminal_session;
     if held_failure || terminal_completion {
+        // Only a success completed the run. An attempt that failed, timed out
+        // or ended ambiguous is answered as a fresh request for it would be.
         let error = typed_error(
             ErrorCode::IllegalTransition,
-            "automation completion already won the cancellation race",
+            if attempt_state == "succeeded" {
+                "automation completion already won the cancellation race"
+            } else {
+                "the targeted automation attempt is no longer cancellable"
+            },
         );
         if !finalize_rejection(conn, reservation, &error, now)? {
             if let Some(replay) =

@@ -4212,6 +4212,16 @@ pub(crate) fn settle_finished_runs_with(
                 .map_err(|error| format!("failed to commit held run: {error}"))?;
             continue;
         }
+        if ambiguous {
+            // Terminal evidence settles the stop whose outcome was unknown. A
+            // finished run keeps no stop ownership, whoever claimed it.
+            transaction
+                .execute(
+                    "DELETE FROM automation_stop_fences WHERE run_id = ?1",
+                    [&run_id],
+                )
+                .map_err(|error| format!("failed to release settled stop ownership: {error}"))?;
+        }
         if !record_run_finish(
             &transaction,
             &run_id,
@@ -9800,6 +9810,14 @@ mod tests {
                 )
                 .unwrap()
             };
+            let fences = || -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = ?1",
+                    [&outcome.run_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
             assert_eq!(
                 read_states(),
                 (
@@ -9809,11 +9827,13 @@ mod tests {
                 ),
                 "{owner}"
             );
+            assert_eq!(fences(), 1, "{owner}: the unknown stop keeps its fence");
             assert_eq!(settle_finished_runs(&conn, expired).unwrap().failed, 1);
             assert_eq!(
                 read_states(),
                 ("failed".into(), "failed".into(), "ambiguous".into())
             );
+            assert_eq!(fences(), 0, "{owner}: settlement releases the fence");
         }
     }
 

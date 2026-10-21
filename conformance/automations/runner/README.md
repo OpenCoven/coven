@@ -983,10 +983,10 @@ each case requires depends on how far the cancellation got:
   leaves the attempt to the cancellation. The request inside the lease is
   answered `CANCEL_PENDING`. The pass answers the cancellation
   `recovery_required`, because the stop's outcome was never recorded. The
-  same pass then settles the ambiguous run and occurrence `failed`, and the
-  cancellation's fence stays on the finished run. Later requests replay that
-  answer. The suite records this behaviour as it is today; coven#1457 tracks
-  the leftover fence and the answer the same pass overtakes.
+  same pass then settles the ambiguous run and occurrence `failed` on its
+  ended session and releases the cancellation's fence. Later requests replay
+  the stored `recovery_required` answer: it records that the stop was never
+  confirmed, and the run's history shows how it settled.
 - **Settled, without the answer:** the restart changes no row. The request
   inside the lease is answered `CANCEL_PENDING`. The pass answers `cancelled`,
   acknowledged and reconciled when the stop was settled, and later requests

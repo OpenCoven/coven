@@ -216,9 +216,8 @@ enum Run {
     /// occurrence with no lease, and no stop fence.
     Cancelled,
     /// The attempt settled `ambiguous` on its `killed` session, and the run
-    /// and occurrence `failed`, the occurrence with no lease. The
-    /// cancellation's stop fence stays on the finished run. This records
-    /// current behaviour, which coven#1457 tracks.
+    /// and occurrence `failed`, the occurrence with no lease, and no stop
+    /// fence: the settlement released the cancellation's.
     Failed,
     /// Anything else, including a partial transaction.
     Mixed,
@@ -299,7 +298,7 @@ fn expected_for(boundary: Boundary) -> Expected {
     };
     // The pass after the lease reconciles it. An unconfirmed stop needs
     // recovery, and the same pass then settles the ambiguous run on its ended
-    // session.
+    // session and releases the cancellation's fence.
     let (run_after_pass, cancellation_after_pass, resend) = match stage {
         Stage::Untouched => (Run::Held, Cancellation::Refused, Answer::Rejected),
         Stage::Reserved => (Run::Held, Cancellation::Rejected, Answer::Rejected),
@@ -695,9 +694,7 @@ fn run(conn: &Connection) -> Result<Run, &'static str> {
             ("cancelled", "none", "cancelled", "cancelled", true, "cancelled", "none") => {
                 Run::Cancelled
             }
-            ("failed", "none", "failed", "ambiguous", true, "killed", "cancellation") => {
-                Run::Failed
-            }
+            ("failed", "none", "failed", "ambiguous", true, "killed", "none") => Run::Failed,
             _ => Run::Mixed,
         },
     )
