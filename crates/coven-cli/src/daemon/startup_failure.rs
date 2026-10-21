@@ -64,9 +64,10 @@ pub(super) fn record(home: &Path, status: &DaemonStatus, error: &anyhow::Error) 
 
 pub(super) struct Observer {
     failure: Option<Receiver<Failure>>,
-    // Dropping the sender wakes the worker's idle wait immediately. A stalled
-    // OS read cannot be cancelled, but never delays the foreground command.
-    _cancel: Option<Sender<()>>,
+    // Requests wake the worker for a fresh read after failed health. Dropping
+    // the sender cancels its idle wait. A stalled OS read cannot be cancelled,
+    // but never extends the foreground diagnostic budget.
+    wake: Option<Sender<()>>,
 }
 
 impl Observer {
@@ -84,12 +85,12 @@ impl Observer {
         deadline: LifecycleDeadline,
     ) -> Self {
         let (failure_tx, failure_rx) = mpsc::sync_channel(1);
-        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("coven-startup-failure".to_owned())
             .spawn(move || {
                 while Instant::now() < deadline.instant {
-                    if !matches!(cancel_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                    if matches!(wake_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
                         return;
                     }
                     if let Some(failure) = read() {
@@ -97,9 +98,10 @@ impl Observer {
                         return;
                     }
                     let remaining = deadline.instant.saturating_duration_since(Instant::now());
-                    if cancel_rx.recv_timeout(remaining.min(OBSERVATION_INTERVAL))
-                        != Err(mpsc::RecvTimeoutError::Timeout)
-                    {
+                    if matches!(
+                        wake_rx.recv_timeout(remaining.min(OBSERVATION_INTERVAL)),
+                        Err(mpsc::RecvTimeoutError::Disconnected)
+                    ) {
                         return;
                     }
                 }
@@ -107,12 +109,12 @@ impl Observer {
         if worker.is_err() {
             return Self {
                 failure: None,
-                _cancel: None,
+                wake: None,
             };
         }
         Self {
             failure: Some(failure_rx),
-            _cancel: Some(cancel_tx),
+            wake: Some(wake_tx),
         }
     }
 
@@ -125,6 +127,15 @@ impl Observer {
             // entire budget. Never add a diagnostic grace period after it.
             let failure = receiver.try_recv().ok().or_else(|| {
                 let remaining = deadline.instant.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                // Do not spend the entire collection budget waiting for the
+                // worker's equally long polling interval to elapse. The failure
+                // record precedes startup error unwinding; request a fresh read.
+                if let Some(wake) = &self.wake {
+                    let _ = wake.send(());
+                }
                 receiver
                     .recv_timeout(remaining.min(OBSERVATION_INTERVAL))
                     .ok()
@@ -333,7 +344,7 @@ mod tests {
             tx.send(Failure::MobileConfiguration)?;
             let observer = Observer {
                 failure: Some(rx),
-                _cancel: None,
+                wake: None,
             };
             let result = if healthy {
                 Ok(42)
@@ -349,6 +360,73 @@ mod tests {
                 assert_eq!(error.root_cause().to_string(), "original failure");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_failure_requests_observation_only_after_failed_health() {
+        for healthy in [true, false] {
+            let (_failure_tx, failure_rx) = mpsc::sync_channel(1);
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let observer = Observer {
+                failure: Some(failure_rx),
+                wake: Some(wake_tx),
+            };
+            let result = if healthy {
+                Ok(42)
+            } else {
+                Err(anyhow::anyhow!("original failure"))
+            };
+            let result = observer.enrich(
+                result,
+                LifecycleDeadline::after(Duration::from_secs(30)).unwrap(),
+            );
+            // Inspect the request after the foreground call releases its sender;
+            // no scheduling or elapsed-time threshold selects the outcome.
+            if healthy {
+                assert_eq!(result.unwrap(), 42);
+                assert_eq!(wake_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), "original failure");
+                assert_eq!(wake_rx.try_recv(), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn startup_failure_wake_requests_another_read_instead_of_cancelling() -> Result<()> {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let mut first = true;
+        let observer = Observer::with_reader(
+            move || {
+                if first {
+                    first = false;
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    None
+                } else {
+                    observed_tx.send(()).unwrap();
+                    Some(Failure::MobileConfiguration)
+                }
+            },
+            LifecycleDeadline::after(Duration::from_secs(30))?,
+        );
+        entered_rx.recv_timeout(Duration::from_secs(30))?;
+        // Queue the request during the first read. It must trigger a new read
+        // when the worker reaches its idle wait, rather than terminate it.
+        observer.wake.as_ref().expect("observer worker").send(())?;
+        release_tx.send(())?;
+        observed_rx.recv_timeout(Duration::from_secs(30))?;
+        assert_eq!(
+            observer
+                .failure
+                .as_ref()
+                .expect("observation receiver")
+                .recv_timeout(Duration::from_secs(30))?,
+            Failure::MobileConfiguration
+        );
         Ok(())
     }
 
