@@ -48,7 +48,7 @@ const PASS: i64 = 150;
 const REPLAY: i64 = 210;
 /// What the runtime answers the slot's launch. The scheduler records it as the
 /// first attempt's reason and the waiting occurrence's.
-const UNAVAILABLE: &str = "the conformance runtime is unavailable";
+pub(super) const UNAVAILABLE: &str = "the conformance runtime is unavailable";
 /// An attempt's reason once a restart has held it after its session was
 /// killed.
 const HELD: &str = "session killed; held for an operator retry until the run's deadline";
@@ -344,8 +344,15 @@ fn pause_at(boundary: Boundary) -> Option<Pause<'static>> {
 /// A no-op runtime that is unavailable for its first launch and accepts
 /// every later one. It counts the launches it is asked for.
 #[derive(Default)]
-struct UnavailableOnceRuntime {
+pub(super) struct UnavailableOnceRuntime {
     launches: AtomicUsize,
+}
+
+impl UnavailableOnceRuntime {
+    /// The launches it was asked for, the refused first one included.
+    pub(super) fn launches(&self) -> usize {
+        self.launches.load(Ordering::SeqCst)
+    }
 }
 
 impl crate::api::SessionRuntime for UnavailableOnceRuntime {
@@ -366,7 +373,7 @@ impl crate::api::SessionRuntime for UnavailableOnceRuntime {
 }
 
 /// The daemon's dispatch of its claimed occurrences at `now`.
-fn dispatch(
+pub(super) fn dispatch(
     conn: &Connection,
     runtime: &UnavailableOnceRuntime,
     now: DateTime<Utc>,
@@ -427,7 +434,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         || !tick.failed.is_empty()
         || relaunched.dispatched.len() != 1
         || !relaunched.failed.is_empty()
-        || runtime.launches.load(Ordering::SeqCst) != 2
+        || runtime.launches() != 2
     {
         return Err(FAILED);
     }
@@ -1023,7 +1030,7 @@ mod tests {
             DispatchReport::default()
         );
         assert_eq!(retry(&conn).unwrap(), Retry::Retried);
-        assert_eq!(runtime.launches.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.launches(), 2);
     }
 
     #[test]

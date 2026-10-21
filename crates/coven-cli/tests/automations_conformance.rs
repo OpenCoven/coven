@@ -176,7 +176,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "flat-cancellation-process-crash-recovery",
                         "timeout-enforcement-process-crash-recovery",
                         "held-settlement-process-crash-recovery",
-                        "automatic-retry-process-crash-recovery"
+                        "automatic-retry-process-crash-recovery",
+                        "retry-timeout-process-crash-recovery"
                     ]
                 },
                 {
@@ -3043,6 +3044,110 @@ fn native_target_evaluates_checked_in_automatic_retry_process_crash_vectors() ->
     let rejected = run_target(
         &coven_home,
         "automatic-retry-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_retry_timeout_process_crash_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/retry-timeout-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "retry-timeout-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "retry-timeout-process-crash-recovery");
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 6);
+    assert_eq!(response["evidence"]["passedCases"], 6);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("retry timeout crash observations");
+    assert_eq!(observations.len(), 6);
+    // Whether the timeout settlement had committed before the worker died,
+    // and whether a write was open there.
+    for (observation, (boundary, settled, open)) in observations.iter().zip([
+        ("after_retry_commit", false, false),
+        ("after_retry_timed_out", false, true),
+        ("after_occurrence_failed", false, true),
+        ("after_run_failed", false, true),
+        ("after_settlement_commit", true, false),
+        ("none", true, false),
+    ]) {
+        let killed = boundary != "none";
+        let retry_at_exit = if settled { "timed_out" } else { "scheduled" };
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(
+            observation["transactionOpenAtPause"],
+            if killed { json!(open) } else { json!(null) }
+        );
+        assert_eq!(
+            observation["retryAtPause"],
+            if killed {
+                json!(retry_at_exit)
+            } else {
+                json!(null)
+            }
+        );
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["retryAfterExit"], retry_at_exit);
+        assert_eq!(observation["recoveryRefused"], false);
+        // A restart after the deadline and the backoff settles a waiting
+        // retry instead of launching it.
+        assert_eq!(observation["retryAfterRestart"], "timed_out");
+        assert_eq!(observation["restartIsNoop"], settled);
+        assert_eq!(observation["retryAfterPass"], "timed_out");
+        assert_eq!(observation["passIsNoop"], true);
+        assert_eq!(observation["launches"], 0);
+        assert_eq!(observation["stops"], 0);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "retry-timeout-crash-worker",
         Some(&invalid["vector"]["cases"][0]),
     )?;
     assert!(!rejected.status.success());
