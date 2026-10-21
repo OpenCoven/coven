@@ -237,6 +237,7 @@ The checked-in
 [`run-cancellation-process-crash-recovery.vectors.json`](run-cancellation-process-crash-recovery.vectors.json),
 [`flat-cancellation-process-crash-recovery.vectors.json`](flat-cancellation-process-crash-recovery.vectors.json),
 [`timeout-enforcement-process-crash-recovery.vectors.json`](timeout-enforcement-process-crash-recovery.vectors.json),
+[`held-settlement-process-crash-recovery.vectors.json`](held-settlement-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -300,7 +301,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, twenty-five
+The native Coven target implements twelve structural suites, twenty-six
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -729,7 +730,8 @@ booleans. They never carry run, attempt, occurrence, session or notice ids,
 notice text, paths, handshakes or output. As with delivery, these cases do not
 require uncommitted frames in the WAL. This is `audit_only` evidence for a
 process kill inside one plain successful settlement. It does not cover kills
-during dispatch or launch, held-for-retry, timeout, cancellation or Runtime
+during dispatch or launch, held-for-retry (see
+`held-settlement-process-crash-recovery`), timeout, cancellation or Runtime
 Authority settlement, power loss, load, complete profiles or release
 eligibility.
 
@@ -792,8 +794,8 @@ frames in the WAL. This is `audit_only` evidence for a daemon killed while it
 launches one scheduled occurrence with no no-process containment receipt. It
 does not cover a real runtime process, receipt-proven no-process retry, which
 relaunches by design, Runtime Authority launches, manual occurrences, kills
-during held-for-retry, timeout (see
-`timeout-enforcement-process-crash-recovery`) or cancellation, power loss,
+during held-for-retry (see `held-settlement-process-crash-recovery`), timeout
+(see `timeout-enforcement-process-crash-recovery`) or cancellation, power loss,
 load, complete profiles or release eligibility.
 
 ## Operator retry process-crash audit boundary
@@ -1142,8 +1144,8 @@ the enforcement got:
   the fence. That exit from `recovery_required` is the one #1461 asks about,
   and #1489 asks whether an expired `timeout` fence should settle by the
   deadline instead.
-- **The settlement committed,** and the control: the restart and every pass
-  change no row.
+- **The settlement committed,** and the control: the restart changes no row,
+  and every pass leaves the run timed out.
 
 The worker must have recorded exactly one stop once it reached the stop, and
 none before it. The restart and the passes must issue no stop and launch
@@ -1157,7 +1159,68 @@ This is `audit_only` evidence for a daemon killed while it enforces one
 scheduled run's deadline. It does not cover a kill inside the scheduler's own
 settlement of a run that ended after its deadline with no fence, a deadline
 that passes while a retry attempt waits, a deadline that passes while a run is
-held for an operator retry, a timeout racing an owner cancellation, a stop the
-runtime fails to confirm, Runtime Authority runs, a graceful daemon restart, a
-real runtime process, power loss, load, complete profiles or release
-eligibility.
+held for an operator retry (see `held-settlement-process-crash-recovery`), a
+timeout racing an owner cancellation, a stop the runtime fails to confirm,
+Runtime Authority runs, a graceful daemon restart, a real runtime process,
+power loss, load, complete profiles or release eligibility.
+
+## Held-for-retry settlement process-crash audit boundary
+
+The `held-settlement-process-crash-recovery` suite kills a daemon worker while
+its scheduler holds a scheduled run for an operator retry, or while it settles
+that held run once the deadline passes. The parent then restarts the daemon's
+scheduler and runs passes after the deadline. Each of seven cases starts the
+exact audited binary as a hidden worker, with the same harness and daemon
+restart as `timeout-enforcement-process-crash-recovery`. The worker stores a
+fixed synthetic active daily definition with a one-minute deadline and no
+automatic retry, and claims and launches its 09:00 slot through a no-op
+runtime. The runtime's write then ends the session `failed` (exit code 1)
+before the deadline. The worker runs the production settlement the daemon's
+pass runs twice: inside the hold window, and 10 seconds after the deadline.
+Vectors cannot choose a path, run, definition, deadline, clock or pause
+mechanics, and every expected outcome is fixed per boundary.
+
+The hold settles the attempt `failed` in one transaction and leaves the run and
+the occurrence `running` under the daemon's lease. Once the deadline passes
+with no retry opened, a second transaction settles the occurrence and the run
+`failed`. A fixture TEMP trigger pauses the worker after the hold's write and
+after each of the settlement's two writes, and the WAL hook after the session's
+failure commits, after the hold commits and after the settlement commits. The
+control has no pause. While the worker is paused, the parent must find the
+write transaction open exactly when the pause is inside one, and read what the
+last commit left. The parent then kills and reaps the worker, and the store's
+raw integrity check must pass.
+
+The parent restarts in the daemon's startup order inside the hold window, 10
+seconds after the hold, when the worker died before the deadline's settlement
+began, and 10 seconds after that settlement otherwise. It then runs a pass 30
+seconds after the deadline and a further pass. One runtime counts every stop
+and launch they make. What each case requires depends on how far the worker
+got:
+
+- **The session ended, with the hold uncommitted:** the restart, inside the
+  hold window, holds the run, and the pass after the deadline settles it.
+- **The hold committed, before the deadline:** the restart, inside the hold
+  window, changes no row, and the pass after the deadline settles the run.
+- **The hold committed, with the deadline's settlement uncommitted:** the
+  restart, after the deadline, settles the run.
+- **The settlement committed,** and the control: the restart and every pass
+  change no row.
+
+Every case must end with the attempt as the hold settled it, before the
+deadline, and the run and the occurrence `failed` at or after the deadline
+because no retry was opened. The pass after the deadline must change no row
+once the restart has settled the run. The restart and the passes must issue no
+stop and launch nothing. The further pass must change no occurrence, run,
+attempt, event, session or stop-fence row, and issue no stop or launch.
+
+Observations carry boundary and run classes, counts and booleans. They never
+carry occurrence, run, attempt or session ids, paths, handshakes or output.
+This is `audit_only` evidence for a daemon killed while it holds one scheduled
+run for an operator retry or settles it after its deadline. It does not cover a
+run held after its launch failed before ownership, whose occurrence waits
+`claimed`, a daemon that stays down past the deadline of a run it never held, a
+kill inside an operator retry of a held run (see
+`attempt-retry-process-crash-recovery`), an owner cancellation of a held run, a
+graceful daemon restart (#1433), Runtime Authority runs, a real runtime
+process, power loss, load, complete profiles or release eligibility.

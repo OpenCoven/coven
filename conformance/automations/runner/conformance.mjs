@@ -84,6 +84,12 @@ const FLAT_CANCELLATION_PROCESS_CRASH_TARGET_TIMEOUT_MS = 360_000;
 // hosts. Fixture hang guard only: this is not a recovery SLO or a production
 // deadline.
 const TIMEOUT_ENFORCEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 300_000;
+// Each of seven held-settlement workers has a 10-second handshake guard, the
+// control also a 10-second exit guard, and each parent restart a 10-second
+// leadership wait; the store's busy waits and cleanup need room on loaded
+// hosts. Fixture hang guard only: this is not a recovery SLO or a production
+// deadline.
+const HELD_SETTLEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 240_000;
 const TARGET_KILL_GRACE_MS = 100;
 const TARGET_OUTPUT_LIMIT = 1024 * 1024;
 const MAX_JCS_DEPTH = 128;
@@ -505,6 +511,9 @@ async function invokeTarget(subject, operation, input) {
           : operation === "evaluate" &&
               input?.suiteId === "timeout-enforcement-process-crash-recovery"
             ? TIMEOUT_ENFORCEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "held-settlement-process-crash-recovery"
+            ? HELD_SETTLEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS
         : operation === "evaluate" &&
       input?.suiteId === "startup-reconciliation-wake"
         ? STARTUP_WAKE_TARGET_TIMEOUT_MS
