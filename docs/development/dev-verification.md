@@ -39,6 +39,7 @@ checkouts, fetch the base/history rather than substituting a narrower range.
 | Entire Policy guard command inventory and drift check | No | Yes | Yes |
 | `cargo deny --all-features check advisories licenses bans sources` | No | Yes | Yes |
 | Channels and OpenClaw install/build/test | No | CI path classification | Both |
+| Optional browser readiness (no download) | No | Declared packages only | Declared packages only |
 | Exact-checkout native Automations audit | No | CI-only | Before other checks |
 | Threads clock and daemon feature suites | No | CI-only | Yes |
 | AFS mount feature lint/tests | No | CI-only | Linux/macOS |
@@ -100,12 +101,21 @@ returns 130. The summary explicitly retains unverified CI-only checks.
 
 Missing applicable tools never become not-applicable. Non-selected packages,
 out-of-tier checks, and unsupported host feature suites have explicit skip
-reasons. Browser provisioning remains separate under #1449. The fresh Debian/
-Ubuntu bootstrap matrix is a routed required CI job; run its explicit
-[safe container runner](../../scripts/bootstrap-contract/README.md) locally
-when Docker is available. PR/full includes its host contract tests and the A2
-Cloud fixture suites, not actual container execution. These fixture suites
-require maintained Python 3.11+ as documented by the Cloud setup scripts.
+reasons. PR/full runs `node scripts/browser-capability.mjs --check` after
+package checks. With no declared browser tests this reports `not-applicable`;
+otherwise a lock-matched installed package and a working browser are required.
+The runner never downloads browsers. Use the optional `--install` command during
+setup and keep `PLAYWRIGHT_BROWSERS_PATH` consistent; see
+[optional browser verification](../../scripts/browser/README.md). The smoke
+checks one selected browser, not the package's whole browser test suite.
+Policy guard installs the locked parser tools and runs browser contract tests;
+it does not download or launch browser artifacts.
+
+The fresh Debian/Ubuntu bootstrap matrix is a routed required CI job; run its
+explicit [safe container runner](../../scripts/bootstrap-contract/README.md)
+locally when Docker is available. PR/full includes its host contract tests and
+the A2 Cloud fixture suites, not actual container execution. These fixture
+suites require maintained Python 3.11+ as documented by the Cloud setup scripts.
 
 ## CI remains final merge authority
 
