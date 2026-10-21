@@ -32,6 +32,7 @@ jobs:
       restricted_runtime: ${{ steps.classify.outputs.restricted_runtime }}
       workflow: ${{ steps.classify.outputs.workflow }}
       cargo_metadata: ${{ steps.classify.outputs.cargo_metadata }}
+      bootstrap: ${{ steps.classify.outputs.bootstrap }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,6 +127,7 @@ jobs:
       - run: python3 scripts/check-workflows-test.py
       - run: python3 scripts/check-ci-workflow-test.py
       - run: python3 scripts/install-native-link-dependencies-test.py
+      - run: python3 scripts/bootstrap-contract/runner-test.py
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/release-governance.test.mjs
       - run: node --test scripts/authorize-release-publication.test.mjs
@@ -823,6 +825,37 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
+  bootstrap-contract:
+    name: Bootstrap contract (${{ matrix.image }})
+    needs: changes
+    if: ${{ needs.changes.outputs.bootstrap == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian12, ubuntu24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+      - name: Run exact-source fresh distro contract
+        env:
+          CONTRACT_IMAGE: ${{ matrix.image }}
+          CONTRACT_OUTPUT: ${{ runner.temp }}/bootstrap-${{ matrix.image }}
+        run: python3 scripts/bootstrap-contract/runner.py --image "$CONTRACT_IMAGE" --output "$CONTRACT_OUTPUT"
+      - name: Retain structured contract evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bootstrap-contract-${{ matrix.image }}
+          path: ${{ runner.temp }}/bootstrap-${{ matrix.image }}/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
   pr-gate:
     name: PR gate
     # Keep the branch-protection context stable while also producing an
@@ -852,6 +885,7 @@ jobs:
       - npm-onboarding-main
       - engine-contract
       - cargo-deny
+      - bootstrap-contract
     env:
       JOB_RESULTS: ${{ toJSON(needs) }}
     steps:

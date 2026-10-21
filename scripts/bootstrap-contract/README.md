@@ -45,3 +45,10 @@ or printed because client proxy/registry diagnostics may contain sensitive data.
 Failed bootstrap/readiness JSON reports are retained as well as passing reports.
 No code broadens network policy, repairs source configuration, suppresses a
 failure, or substitutes local fixtures for real Cloud evidence.
+
+The CI matrix is routed by the `bootstrap` change category: bootstrap/cloud
+scripts, Cargo metadata, package manifests/locks, and workflow/toolchain changes.
+The matrix uses two independent jobs (`fail-fast: false`), no cross-run cache,
+and a 95-minute job limit around the runner's 90-minute container limit. Its
+result is a dependency of `PR gate`; routed failures are not optional. Ordinary
+unrelated documentation/package-source edits do not enable a fresh tool install.

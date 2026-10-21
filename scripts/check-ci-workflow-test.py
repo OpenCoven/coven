@@ -93,6 +93,19 @@ class CheckCiWorkflowTests(unittest.TestCase):
             ci_job_block('changes'),
         )
 
+    def test_bootstrap_matrix_is_required_when_routed_and_preserves_safe_evidence(self) -> None:
+        job = ci_job_block('bootstrap-contract')
+        self.assertIn("needs.changes.outputs.bootstrap == 'true'", job)
+        self.assertIn('image: [debian12, ubuntu24]', job)
+        self.assertIn('fail-fast: false', job)
+        self.assertIn('scripts/bootstrap-contract/runner.py', job)
+        self.assertIn('if: ${{ always() }}', job)
+        self.assertIn('/*.json', job)
+        self.assertNotIn('continue-on-error:', job)
+        self.assertNotIn('actions/cache', job)
+        self.assertIn('\n      - bootstrap-contract\n', ci_job_block('pr-gate'))
+        self.assertIn('bootstrap: ${{ steps.classify.outputs.bootstrap }}', ci_job_block('changes'))
+
     def test_full_macos_workspace_suite_stays_push_only(self) -> None:
         # macOS runners bill at ~10x Linux; the workspace suite is push-only by
         # design and the PR-scoped job above exists so that split can hold.
