@@ -1,5 +1,5 @@
 {
-  "policy_sha256": "bb5f0b1a2002e940c4dd9d492443d2fddce2e094744eb6d251f3d197dff8e48d",
+  "policy_sha256": "a349460d67c8fd0bdcba7dddafc16d0351fe52e913c8f42e006973413ce297f9",
   "commands": [
     [
       "python3",
@@ -94,6 +94,20 @@
     [
       "python3",
       "scripts/dev-verify-test.py"
+    ],
+    [
+      "npm",
+      "ci",
+      "--prefix",
+      "scripts/browser",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund"
+    ],
+    [
+      "node",
+      "--test",
+      "scripts/browser-capability.test.mjs"
     ],
     [
       "node",

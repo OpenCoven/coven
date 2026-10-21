@@ -133,6 +133,8 @@ jobs:
       - run: python3 scripts/cloud/readiness-test.py
       - run: bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh
       - run: python3 scripts/dev-verify-test.py
+      - run: npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund
+      - run: node --test scripts/browser-capability.test.mjs
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/release-governance.test.mjs
       - run: node --test scripts/authorize-release-publication.test.mjs

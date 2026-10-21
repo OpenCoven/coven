@@ -131,6 +131,32 @@ class TierTests(unittest.TestCase):
         self.assertNotIn(['pnpm', 'test'], commands)
         self.assertTrue(any('openclaw' in skip for skip in skips))
 
+    def test_browser_contract_setup_precedes_tests_and_readiness_is_conditional(self):
+        checks, skips = self.runner.plan('pr', 'base...HEAD', [], Path(__file__).resolve().parents[1], 'Darwin')
+        setup = next(check for check in checks if check['argv'][:4] == ['npm', 'ci', '--prefix', 'scripts/browser'])
+        contract = next(check for check in checks if check['argv'] == ['node', '--test', 'scripts/browser-capability.test.mjs'])
+        self.assertIn(setup['name'], contract['needs'])
+        self.assertIn('node-pin', setup['needs'])
+        readiness = next(check for check in checks if check['name'] == 'browser-readiness')
+        self.assertEqual(readiness['argv'], ['node', 'scripts/browser-capability.mjs', '--check'])
+        self.assertIn('node-pin', readiness['needs'])
+        self.assertFalse(any('--install' in check['argv'] for check in checks))
+
+    def test_failed_package_install_skips_browser_readiness(self):
+        checks, _ = self.runner.plan('pr', 'base...HEAD', ['packages/channels/package.json'], Path(__file__).resolve().parents[1], 'Darwin')
+        readiness = next(check for check in checks if check['name'] == 'browser-readiness')
+        self.assertIn('channels-install', readiness['needs'])
+        self.assertNotIn('openclaw-coven-install', readiness['needs'])
+        marker = self.root / 'browser incorrectly ran'
+        simulated = [dict(name=name, argv=[sys.executable, '-c', 'raise SystemExit(9)' if name == 'channels-install' else 'pass'], cwd='.', needs=[]) for name in readiness['needs']]
+        simulated.append({**readiness, 'argv': [sys.executable, '-c', "from pathlib import Path; Path('browser incorrectly ran').touch()"]})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = self.runner.run_checks(simulated, self.root)
+        self.assertEqual(status, 9)
+        self.assertFalse(marker.exists())
+        self.assertIn('SKIP browser-readiness', output.getvalue())
+
     def test_full_includes_features_and_all_packages(self):
         checks, skips = self.runner.plan('full', 'base...HEAD', [], Path(__file__).resolve().parents[1], 'Darwin')
         commands = [check['argv'] for check in checks]
