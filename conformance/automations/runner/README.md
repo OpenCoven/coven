@@ -234,6 +234,7 @@ The checked-in
 [`run-launch-process-crash-recovery.vectors.json`](run-launch-process-crash-recovery.vectors.json),
 [`attempt-retry-process-crash-recovery.vectors.json`](attempt-retry-process-crash-recovery.vectors.json),
 [`occurrence-recovery-process-crash-recovery.vectors.json`](occurrence-recovery-process-crash-recovery.vectors.json),
+[`run-cancellation-process-crash-recovery.vectors.json`](run-cancellation-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -297,7 +298,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, twenty-two
+The native Coven target implements twelve structural suites, twenty-three
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -918,3 +919,95 @@ Runtime Authority runs, which this command refuses, a recovery after a
 timeout's or an abandoned launch's unconfirmed stop, a daemon killed inside
 the cancellation itself, a graceful daemon restart, a real runtime process,
 power loss, load, complete profiles or release eligibility.
+
+## Owner cancellation process-crash audit boundary
+
+The `run-cancellation-process-crash-recovery` suite kills a daemon worker
+while it handles the owner's `run.cancel.v1` request for a running scheduled
+run. The parent then restarts the daemon's scheduler and sends the identical
+request again, with the same adoption key, as an owner who never saw an
+answer would. Each of eighteen cases starts the exact audited binary as a
+hidden worker, with the same harness and daemon restart as
+`run-launch-process-crash-recovery`. The worker stores a fixed synthetic
+active daily definition with no automatic retry, and claims and launches its
+09:00 slot through a no-op runtime. It then handles the cancellation as the
+daemon's API does, through a runtime that confirms every stop and records it
+in the worker's private home, so the parent can count the stops of a worker
+it killed. The daemon's API fences a stop on the wall clock; the worker fences
+it on the fixture's fixed clock, so its times agree with the scheduler's.
+Vectors cannot choose a path, run, definition, reason, principal, adoption
+key, clock or pause mechanics, and every expected outcome is fixed per
+boundary.
+
+The cancellation runs four transactions, with the stop between the second
+and the third:
+
+1. **Reservation:** the global adoption-key reservation, then the
+   cancellation `requested` with a 30-second execution lease.
+2. **Stop ownership:** the run's `cancellation` stop fence, then the
+   cancellation `stopping`.
+3. **Settlement:** once the runtime confirms the stop, the session
+   `cancelled`, then the attempt, the run and the occurrence `cancelled`, then
+   the fence released.
+4. **Answer:** the cancellation `cancelled`, then the reservation released,
+   then the response stored under the request's adoption key.
+
+A fixture TEMP trigger pauses the worker after each of those twelve writes,
+and the WAL hook after each of the four commits. The worker's runtime pauses
+right after it records the stop. The control has no pause: the worker answers
+`cancelled` and exits without the graceful shutdown's reconciliation or the
+release of its scheduler authority.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker. The store's raw integrity check must
+pass, and the store must still hold what the parent read.
+
+The parent restarts in the daemon's startup order 10 seconds after the
+request, inside the cancellation's lease, and the owner re-sends the request
+10 seconds later. A pass after the lease reconciles the cancellation, and the
+owner sends the request once more. One runtime confirms and counts every stop
+and launch that the restart, the passes and the re-sent requests make. What
+each case requires depends on how far the cancellation got:
+
+- **Nothing committed:** the restart's containment marks the lost session
+  `killed`, and its startup pass settles the attempt `failed`, which holds the
+  run for an operator retry. The re-sent request stores an
+  `ILLEGAL_TRANSITION` refusal, and later requests replay it.
+- **Reserved, without the fence:** the same containment and hold. The request
+  inside the lease is answered `CANCEL_PENDING` and writes nothing. The pass
+  rejects the cancellation with `ILLEGAL_TRANSITION`, which later requests
+  replay.
+- **Fenced, stopped, or inside the settlement:** behind the fence, the
+  restart's containment marks the session `killed`, and its startup pass
+  leaves the attempt to the cancellation. The request inside the lease is
+  answered `CANCEL_PENDING`. The pass answers the cancellation
+  `recovery_required`, because the stop's outcome was never recorded. The
+  same pass then settles the ambiguous run and occurrence `failed`, and the
+  cancellation's fence stays on the finished run. Later requests replay that
+  answer. The suite records this behaviour as it is today; coven#1457 tracks
+  the leftover fence and the answer the same pass overtakes.
+- **Settled, without the answer:** the restart changes no row. The request
+  inside the lease is answered `CANCEL_PENDING`. The pass answers `cancelled`,
+  acknowledged and reconciled when the stop was settled, and later requests
+  replay that answer.
+- **Answered,** and the control: the restart changes no row, and every
+  request replays `cancelled`.
+
+The worker must have recorded exactly one stop once it reached the stop, and
+none before it. The restart, the passes and the re-sent requests must issue
+no stop and launch nothing. A pending or replayed answer must write nothing,
+and a success must name the store's run, attempt and session. A request that
+errors fails the case. The same request and a further pass must then change
+no occurrence, run, attempt, event, session, reservation, adoption,
+cancellation or stop-fence row, and issue no stop or launch.
+
+Observations carry boundary, run, cancellation and answer classes, counts and
+booleans. They never carry run, attempt, occurrence or session ids, adoption
+keys, responses, paths, handshakes or output. This is `audit_only` evidence
+for a daemon killed while it handles one owner cancellation of a running
+scheduled run. It does not cover Runtime Authority runs, the flat
+`occurrence.cancel.v1` and `attempt.cancel.v1` commands beyond the run
+cancellation they hand a running attempt to, a cancellation racing a timeout,
+a stop the runtime fails to confirm, a graceful daemon restart, a real runtime
+process, power loss, load, complete profiles or release eligibility.

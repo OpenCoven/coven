@@ -171,7 +171,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "run-settlement-process-crash-recovery",
                         "run-launch-process-crash-recovery",
                         "attempt-retry-process-crash-recovery",
-                        "occurrence-recovery-process-crash-recovery"
+                        "occurrence-recovery-process-crash-recovery",
+                        "run-cancellation-process-crash-recovery"
                     ]
                 },
                 {
@@ -2319,6 +2320,172 @@ fn native_target_evaluates_checked_in_occurrence_recovery_process_crash_vectors(
     let rejected = run_target(
         &coven_home,
         "occurrence-recovery-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_run_cancellation_process_crash_vectors() -> anyhow::Result<()>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/run-cancellation-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "run-cancellation-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        response["suiteId"],
+        "run-cancellation-process-crash-recovery"
+    );
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 18);
+    assert_eq!(response["evidence"]["passedCases"], 18);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("cancellation crash observations");
+    assert_eq!(observations.len(), 18);
+    // How far the cancellation got before the worker died, and whether a
+    // write was open there.
+    for (observation, (boundary, stage, open)) in observations.iter().zip([
+        ("after_reservation_insert", "untouched", true),
+        ("after_cancellation_insert", "untouched", true),
+        ("after_reservation_commit", "reserved", false),
+        ("after_fence_insert", "reserved", true),
+        ("after_stopping", "reserved", true),
+        ("after_fence_commit", "fenced", false),
+        ("after_stop", "stopped", false),
+        ("after_session_end", "stopped", true),
+        ("after_attempt_settle", "stopped", true),
+        ("after_run_finish", "stopped", true),
+        ("after_occurrence_settle", "stopped", true),
+        ("after_fence_release", "stopped", true),
+        ("after_settle_commit", "settled", false),
+        ("after_cancelled", "settled", true),
+        ("after_reservation_release", "settled", true),
+        ("after_adoption", "settled", true),
+        ("after_answer_commit", "answered", false),
+        ("none", "answered", false),
+    ]) {
+        let killed = boundary != "none";
+        let (run_at_exit, cancellation_at_exit) = match stage {
+            "untouched" => ("running", "none"),
+            "reserved" => ("running", "requested"),
+            "fenced" | "stopped" => ("fenced", "stopping"),
+            "settled" => ("cancelled", "stopping"),
+            _ => ("cancelled", "cancelled"),
+        };
+        let run_after_restart = match stage {
+            "untouched" | "reserved" => "held",
+            "fenced" | "stopped" => "contained",
+            _ => "cancelled",
+        };
+        let reissue = match stage {
+            "untouched" => "refused",
+            "answered" => "cancelled",
+            _ => "pending",
+        };
+        let (run_after_pass, cancellation_after_pass, resend) = match stage {
+            "untouched" => ("held", "refused", "rejected"),
+            "reserved" => ("held", "rejected", "rejected"),
+            "fenced" | "stopped" => ("failed", "recovery_required", "recovery_required"),
+            _ => ("cancelled", "cancelled", "cancelled"),
+        };
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(
+            observation["transactionOpenAtPause"],
+            if killed { json!(open) } else { json!(null) }
+        );
+        assert_eq!(
+            observation["runAtPause"],
+            if killed {
+                json!(run_at_exit)
+            } else {
+                json!(null)
+            }
+        );
+        assert_eq!(
+            observation["cancellationAtPause"],
+            if killed {
+                json!(cancellation_at_exit)
+            } else {
+                json!(null)
+            }
+        );
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["runAfterExit"], run_at_exit);
+        assert_eq!(observation["cancellationAfterExit"], cancellation_at_exit);
+        assert_eq!(
+            observation["workerStops"],
+            u64::from(matches!(stage, "stopped" | "settled" | "answered"))
+        );
+        assert_eq!(observation["recoveryRefused"], false);
+        assert_eq!(observation["runAfterRestart"], run_after_restart);
+        assert_eq!(
+            observation["cancellationAfterRestart"],
+            cancellation_at_exit
+        );
+        assert_eq!(
+            observation["restartIsNoop"],
+            matches!(stage, "settled" | "answered")
+        );
+        assert_eq!(observation["reissue"], reissue);
+        assert_eq!(observation["runAfterPass"], run_after_pass);
+        assert_eq!(
+            observation["cancellationAfterPass"],
+            cancellation_after_pass
+        );
+        assert_eq!(observation["resend"], resend);
+        assert_eq!(observation["laterStops"], 0);
+        assert_eq!(observation["launches"], 0);
+        assert_eq!(observation["replayIsNoop"], true);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "run-cancellation-crash-worker",
         Some(&invalid["vector"]["cases"][0]),
     )?;
     assert!(!rejected.status.success());
