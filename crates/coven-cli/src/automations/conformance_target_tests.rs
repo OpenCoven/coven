@@ -147,7 +147,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "run-cancellation-process-crash-recovery",
                         "flat-cancellation-process-crash-recovery",
                         "timeout-enforcement-process-crash-recovery",
-                        "held-settlement-process-crash-recovery"
+                        "held-settlement-process-crash-recovery",
+                        "automatic-retry-process-crash-recovery"
                     ]
                 },
                 {
