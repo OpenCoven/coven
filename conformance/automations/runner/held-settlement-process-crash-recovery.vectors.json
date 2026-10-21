@@ -1,0 +1,215 @@
+{
+  "schemaVersion": "coven.automations.held-settlement-process-crash-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "held-killed-after-session-end",
+      "boundary": "after_session_end",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-held-crash",
+        "name": "Conformance held crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native held settlement crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "ended",
+        "runAfterRestart": "held",
+        "restartIsNoop": false,
+        "runAfterPass": "failed",
+        "passIsNoop": false,
+        "stops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "held-killed-inside-hold",
+      "boundary": "after_hold_write",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-held-crash",
+        "name": "Conformance held crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native held settlement crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "ended",
+        "runAfterRestart": "held",
+        "restartIsNoop": false,
+        "runAfterPass": "failed",
+        "passIsNoop": false,
+        "stops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "held-killed-after-hold-commit",
+      "boundary": "after_hold_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-held-crash",
+        "name": "Conformance held crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native held settlement crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "held",
+        "runAfterRestart": "held",
+        "restartIsNoop": true,
+        "runAfterPass": "failed",
+        "passIsNoop": false,
+        "stops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "held-killed-after-occurrence-settle",
+      "boundary": "after_occurrence_settle",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-held-crash",
+        "name": "Conformance held crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native held settlement crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "held",
+        "runAfterRestart": "failed",
+        "restartIsNoop": false,
+        "runAfterPass": "failed",
+        "passIsNoop": true,
+        "stops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "held-killed-after-run-finish",
+      "boundary": "after_run_finish",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-held-crash",
+        "name": "Conformance held crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native held settlement crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "held",
+        "runAfterRestart": "failed",
+        "restartIsNoop": false,
+        "runAfterPass": "failed",
+        "passIsNoop": true,
+        "stops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "held-killed-after-settle-commit",
+      "boundary": "after_settle_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-held-crash",
+        "name": "Conformance held crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native held settlement crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "failed",
+        "runAfterRestart": "failed",
+        "restartIsNoop": true,
+        "runAfterPass": "failed",
+        "passIsNoop": true,
+        "stops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "uninterrupted-held-control",
+      "boundary": "none",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-held-crash",
+        "name": "Conformance held crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native held settlement crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "responded",
+        "runAfterExit": "failed",
+        "runAfterRestart": "failed",
+        "restartIsNoop": true,
+        "runAfterPass": "failed",
+        "passIsNoop": true,
+        "stops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    }
+  ]
+}

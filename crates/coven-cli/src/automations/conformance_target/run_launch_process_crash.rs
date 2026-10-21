@@ -31,7 +31,7 @@ use crate::automations::leadership::SchedulerLeadership;
 const INVALID: &str = "conformance vector is invalid";
 const FAILED: &str = "conformance suite execution failed";
 /// A production recovery step returned an error; the case fails.
-const REFUSED: &str = "recovery refused";
+pub(super) const REFUSED: &str = "recovery refused";
 const SCHEMA_VERSION: &str = "coven.automations.run-launch-process-crash-recovery-vectors.v1";
 const WORKER: &str = "run-launch-crash-worker";
 const HOME_PREFIX: &str = "launch-crash-";

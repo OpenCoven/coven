@@ -19,7 +19,7 @@ use super::process_crash_fixture::{
 };
 use super::result_delivery_recovery::{at, BASE};
 use super::run_cancellation_process_crash::{worker_stops, RecordingStops, STOP_LOG};
-use super::run_launch_process_crash::{pass, restart, snapshot_tables, CountingRuntime};
+use super::run_launch_process_crash::{pass, restart, snapshot_tables, CountingRuntime, REFUSED};
 use super::valid_case_id;
 use crate::automations::definition::RoutineDefinition;
 use crate::automations::leadership::SchedulerLeadership;
@@ -27,8 +27,6 @@ use crate::automations::runner::enforce_run_timeouts;
 
 const INVALID: &str = "conformance vector is invalid";
 const FAILED: &str = "conformance suite execution failed";
-/// A production recovery step returned an error; the case fails.
-const REFUSED: &str = "timeout recovery refused";
 const SCHEMA_VERSION: &str =
     "coven.automations.timeout-enforcement-process-crash-recovery-vectors.v1";
 const WORKER: &str = "timeout-enforcement-crash-worker";
@@ -289,9 +287,24 @@ fn pause_at(boundary: Boundary) -> Option<Pause<'static>> {
 /// Claims and launches the routine's 09:00 slot under `home`'s scheduler
 /// leadership, through a no-op runtime. Returns the leadership.
 fn launched(home: &Path, base: DateTime<Utc>) -> Result<SchedulerLeadership, &'static str> {
+    let leadership = launch_slot(home, &synthetic_definition(), at(base, CLAIM))?;
+    let conn = crate::store::open_store(&crate::api::store_path(home)).map_err(|_| FAILED)?;
+    if run(&conn)? != Run::Running {
+        return Err(FAILED);
+    }
+    Ok(leadership)
+}
+
+/// Stores a daily 09:00 `definition` defined the day before, then claims and
+/// launches that slot at `claim_at` under `home`'s scheduler leadership,
+/// through a no-op runtime. Returns the leadership.
+pub(super) fn launch_slot(
+    home: &Path,
+    definition: &Value,
+    claim_at: DateTime<Utc>,
+) -> Result<SchedulerLeadership, &'static str> {
     let conn = &crate::store::open_store(&crate::api::store_path(home)).map_err(|_| FAILED)?;
-    let claim_at = at(base, CLAIM);
-    let definition = RoutineDefinition::from_json(&synthetic_definition()).map_err(|_| INVALID)?;
+    let definition = RoutineDefinition::from_json(definition).map_err(|_| INVALID)?;
     crate::automations::store::insert_definition(conn, &definition).map_err(|_| FAILED)?;
     conn.execute(
         "UPDATE automation_definitions SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
@@ -316,7 +329,7 @@ fn launched(home: &Path, base: DateTime<Utc>) -> Result<SchedulerLeadership, &'s
             &fence,
         )
         .map_err(|_| FAILED)?;
-    if report.dispatched.len() != 1 || !report.failed.is_empty() || run(conn)? != Run::Running {
+    if report.dispatched.len() != 1 || !report.failed.is_empty() {
         return Err(FAILED);
     }
     Ok(leadership)
