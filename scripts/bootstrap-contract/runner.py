@@ -41,7 +41,8 @@ def validate_output(repo, output):
 
 
 def container_command(image, source, output, sha, name):
-    return ['docker', 'run', '--rm', '--name', name, '--platform', image['platform'],
+    # Reap orphaned daemon descendants; the Python runner is not an init system.
+    return ['docker', 'run', '--rm', '--init', '--name', name, '--platform', image['platform'],
             '--security-opt', 'no-new-privileges',
             '--mount', f'type=bind,source={source},target=/source,readonly',
             '--mount', f'type=bind,source={output},target=/evidence',

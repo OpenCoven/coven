@@ -51,6 +51,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn(image['image'], command)
         self.assertFalse(any('docker.sock' in part for part in command))
 
+    def test_container_uses_init_to_reap_orphaned_smoke_descendants(self):
+        for image in self.runner.load_images().values():
+            command = self.runner.container_command(image, Path('/tmp/source'), Path('/tmp/output'), 'a' * 40, 'contract-test')
+            # Python's contract runner is not a PID 1 orphan reaper. The daemon
+            # smoke tests require killed orphan descendants to disappear.
+            self.assertIn('--init', command[:command.index(image['image'])])
+
     def test_report_path_cannot_overlap_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / 'repo'

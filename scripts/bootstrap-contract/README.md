@@ -36,6 +36,9 @@ for the container runner. Missing Docker is a nonzero `docker-unavailable`
 result. Plans say `planned`; they do not prove image pulls or test execution.
 The runner fetches the exact source commit into a self-contained shallow checkout
 and mounts it read-only. The container copies it into disposable writable storage.
+Docker `--init` supplies PID 1 orphan reaping for daemon smoke descendants; the
+Python contract runner does not implement an init system. Smoke assertions and
+production deadlines remain unchanged.
 No host home or Docker socket is mounted; privileged/host-network mode is unused.
 No tool caches are reused across matrix runs. The owned container is removed on
 completion or timeout, while requested evidence remains outside the source.
