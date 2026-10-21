@@ -1320,6 +1320,26 @@ enum AutomationsCommand {
     /// launches it from the daemon's MCP configuration; it is not run by hand.
     #[command(hide = true, name = "scoped-read-relay")]
     ScopedReadRelay,
+    /// The owner's Anthropic API key for Runtime Authority runs. Hidden until
+    /// those runs ship.
+    #[command(hide = true, name = "api-key")]
+    ApiKey {
+        #[command(subcommand)]
+        command: ApiKeyCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApiKeyCommand {
+    /// Save the key read from standard input, replacing any saved key.
+    Set,
+    /// Say whether a key is saved, without showing it.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the saved key.
+    Remove,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1822,6 +1842,7 @@ fn main() -> Result<()> {
             command: AutomationsCommand::Doctor { .. }
                 | AutomationsCommand::Conformance { .. }
                 | AutomationsCommand::ScopedReadRelay
+                | AutomationsCommand::ApiKey { .. }
                 | AutomationsCommand::Leases { .. }
                 | AutomationsCommand::Status { .. }
                 | AutomationsCommand::Occurrence { .. }
@@ -4341,6 +4362,44 @@ fn run_scoped_read_relay() -> Result<()> {
     anyhow::bail!("the scoped read service is not available on this platform")
 }
 
+fn run_api_key_command(command: ApiKeyCommand) -> Result<()> {
+    use automations::scoped_read::credential;
+    let home = paths::coven_home_dir()?;
+    match command {
+        ApiKeyCommand::Set => {
+            if io::stdin().is_terminal() {
+                anyhow::bail!("pipe the key on standard input; it is never read from the terminal, so it cannot be echoed");
+            }
+            let mut text = zeroize::Zeroizing::new(String::new());
+            io::stdin()
+                .lock()
+                .take(4096)
+                .read_to_string(&mut text)
+                .context("reading the key from standard input")?;
+            credential::store(&home, &text)?;
+            println!("Saved the Anthropic API key for Runtime Authority runs.");
+        }
+        ApiKeyCommand::Status { json } => {
+            let saved = credential::load(&home)?.is_some();
+            if json {
+                println!("{}", serde_json::json!({ "saved": saved }));
+            } else if saved {
+                println!("An Anthropic API key is saved for Runtime Authority runs.");
+            } else {
+                println!("No Anthropic API key is saved for Runtime Authority runs.");
+            }
+        }
+        ApiKeyCommand::Remove => {
+            if credential::remove(&home)? {
+                println!("Removed the Anthropic API key.");
+            } else {
+                println!("No Anthropic API key was saved.");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_automations_command(command: AutomationsCommand) -> Result<()> {
     use automations::operator_cli::{run, View};
     match command {
@@ -4360,6 +4419,7 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
             json,
         } => automations::lease_cli::run(automation_id.as_deref(), limit, cursor.as_deref(), json),
         AutomationsCommand::ScopedReadRelay => run_scoped_read_relay(),
+        AutomationsCommand::ApiKey { command } => run_api_key_command(command),
         AutomationsCommand::Conformance { command } => match command {
             AutomationsConformanceCommand::CommandCrashWorker => {
                 let payload = read_conformance_request(io::stdin().lock())?;
@@ -7209,6 +7269,40 @@ mod tests {
             other => panic!("expected scheduler loop command, got {other:?}"),
         }
         assert!(Cli::try_parse_from(["coven", "scheduler", "decision"]).is_err());
+    }
+
+    #[test]
+    fn the_runtime_authority_commands_parse_but_stay_hidden() {
+        assert!(matches!(
+            Cli::parse_from(["coven", "automations", "api-key", "set"]).command,
+            Some(Command::Automations {
+                command: AutomationsCommand::ApiKey {
+                    command: ApiKeyCommand::Set
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "automations", "api-key", "status", "--json"]).command,
+            Some(Command::Automations {
+                command: AutomationsCommand::ApiKey {
+                    command: ApiKeyCommand::Status { json: true }
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "automations", "scoped-read-relay"]).command,
+            Some(Command::Automations {
+                command: AutomationsCommand::ScopedReadRelay
+            })
+        ));
+        let mut command = Cli::command();
+        let automations = command
+            .find_subcommand_mut("automations")
+            .expect("automations")
+            .render_long_help()
+            .to_string();
+        assert!(!automations.contains("api-key"), "{automations}");
+        assert!(!automations.contains("scoped-read-relay"), "{automations}");
     }
 
     #[test]
