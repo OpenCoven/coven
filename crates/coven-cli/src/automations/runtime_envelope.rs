@@ -13,12 +13,25 @@
 //! `analysis.read` grant on claude. It is launched with only the read tools,
 //! in plan (read-only) permission mode, in restricted mode with no MCP
 //! servers, emitting stream-json.
+//!
+//! `r0-read.2` replaces it for scoped reads (coven#857): claude in bare mode
+//! with no native tools at all, whose only MCP server is the daemon's scoped
+//! read service. Its descriptor also binds the exact Claude Code versions it
+//! was proven against, the service's tools and policy, and how the launch is
+//! isolated. It is described here so its stream can be classified, but it is
+//! not launchable until the daemon's admission for it lands; `r0-read.1`
+//! stays launchable until missions move to `r0-read.2`. A descriptor never
+//! changes once signed, so `r0-read.1`'s stays byte for byte what it was.
+
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use super::authority_projection::AutomationAuthorityConsumerProjection;
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::types::SideEffectClass;
+use super::scoped_read::service::{R0_OPERATION_TIME, SERVER_NAME, TOOLS_VERSION};
+use super::scoped_read::{ReadPolicy, R0_READ_POLICY};
 
 /// How an envelope's session reports what it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +64,24 @@ pub(crate) struct RuntimeEnvelope {
     /// The capabilities a grant must hold for this envelope, and the most it
     /// can exercise.
     pub capabilities: &'static [&'static str],
+    /// The harness versions the envelope was proven against. The init event
+    /// must report one of them. Empty for an envelope from before the check.
+    pub harness_versions: &'static [&'static str],
+    /// The scoped read service, when the session's only MCP server is it.
+    pub service: Option<ServiceBinding>,
+}
+
+/// The scoped read service an envelope's session reaches, and how its launch
+/// is isolated.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ServiceBinding {
+    /// The MCP server's name. The init event must list exactly this server.
+    pub server: &'static str,
+    pub tools_version: &'static str,
+    pub policy: ReadPolicy,
+    pub operation_time: Duration,
+    /// The only environment variables the harness is launched with.
+    pub environment: &'static [&'static str],
 }
 
 const READ_TOOLS: &[EnvelopeTool] = &[
@@ -91,15 +122,86 @@ pub(crate) const CLAUDE_R0_READ: RuntimeEnvelope = RuntimeEnvelope {
     tools: READ_TOOLS,
     permission_mode: "plan",
     capabilities: &["analysis.read"],
+    harness_versions: &[],
+    service: None,
 };
 
-const ENVELOPES: &[&RuntimeEnvelope] = &[&CLAUDE_R0_READ];
+const SCOPED_READ_TOOLS: &[EnvelopeTool] = &[
+    EnvelopeTool {
+        name: "mcp__coven__read_file",
+        capability: "analysis.read",
+        side_effect: SideEffectClass::LocalRead,
+    },
+    EnvelopeTool {
+        name: "mcp__coven__list_directory",
+        capability: "analysis.read",
+        side_effect: SideEffectClass::LocalRead,
+    },
+    EnvelopeTool {
+        name: "mcp__coven__search",
+        capability: "analysis.read",
+        side_effect: SideEffectClass::LocalRead,
+    },
+];
+
+/// R0 `analysis.read` on claude through the scoped read service. The launch
+/// adds `--mcp-config` with the attempt's channel configuration after these
+/// arguments.
+pub(crate) const CLAUDE_R0_SCOPED_READ: RuntimeEnvelope = RuntimeEnvelope {
+    harness: "claude",
+    descriptor_version: "r0-read.2",
+    args: &[
+        "--bare",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--setting-sources",
+        "",
+        "--allowedTools",
+        "mcp__coven__read_file,mcp__coven__list_directory,mcp__coven__search",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+    ],
+    stream: StreamFormat::ClaudeStreamJson,
+    tools: SCOPED_READ_TOOLS,
+    permission_mode: "default",
+    capabilities: &["analysis.read"],
+    // Each was proven with the scoped read service's opt-in claude tests: the
+    // init event and every model request carried only the service's tools,
+    // and no ambient memory reached the model. Maintainer decision,
+    // 2026-10-20 (#857): any other version refuses.
+    harness_versions: &["2.1.305"],
+    service: Some(ServiceBinding {
+        server: SERVER_NAME,
+        tools_version: TOOLS_VERSION,
+        policy: R0_READ_POLICY,
+        operation_time: R0_OPERATION_TIME,
+        environment: &[
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "DISABLE_AUTOUPDATER",
+            "HOME",
+            "PATH",
+        ],
+    }),
+};
+
+/// Every envelope a binding may pin, for classifying its stream.
+const ENVELOPES: &[&RuntimeEnvelope] = &[&CLAUDE_R0_READ, &CLAUDE_R0_SCOPED_READ];
+/// The envelopes the daemon launches.
+const LAUNCHABLE: &[&RuntimeEnvelope] = &[&CLAUDE_R0_READ];
 
 impl RuntimeEnvelope {
     /// The descriptor the binding's digest covers: everything that decides
-    /// what the session can do and how it reports it.
+    /// what the session can do and how it reports it. An envelope with a
+    /// service is described by the v2 profile, which adds the versions, the
+    /// service and the launch; v1's shape is unchanged.
     pub(crate) fn descriptor(&self) -> Value {
-        json!({
+        let mut descriptor = json!({
             "profile": "coven.automations.runtime-envelope.v1",
             "harness": self.harness,
             "descriptorVersion": self.descriptor_version,
@@ -115,7 +217,38 @@ impl RuntimeEnvelope {
             })).collect::<Vec<_>>(),
             "permissionMode": self.permission_mode,
             "capabilities": self.capabilities,
-        })
+        });
+        if let Some(service) = &self.service {
+            let policy = &service.policy;
+            descriptor["profile"] = json!("coven.automations.runtime-envelope.v2");
+            descriptor["harnessVersions"] = json!(self.harness_versions);
+            descriptor["service"] = json!({
+                "server": service.server,
+                "transport": "coven.scoped-read.channel.v1",
+                "tools": service.tools_version,
+                "policy": {
+                    "fileBytes": policy.file_bytes,
+                    "attemptBytes": policy.attempt_bytes,
+                    "scanBytes": policy.scan_bytes,
+                    "calls": policy.calls,
+                    "depth": policy.depth,
+                    "pathBytes": policy.path_bytes,
+                    "pageEntries": policy.page_entries,
+                    "pageMatches": policy.page_matches,
+                    "patternBytes": policy.pattern_bytes,
+                    "matchBytes": policy.match_bytes,
+                    "operationMillis": u64::try_from(service.operation_time.as_millis())
+                        .expect("an operation limit fits in u64 milliseconds"),
+                },
+            });
+            descriptor["launch"] = json!({
+                "cwd": "empty",
+                "home": "isolated",
+                "environment": service.environment,
+                "credential": "owner-api-key",
+            });
+        }
+        descriptor
     }
 
     /// The lowercase SHA-256 of the descriptor's JCS text.
@@ -137,14 +270,18 @@ pub(crate) fn by_descriptor_digest(digest: &str) -> Option<&'static RuntimeEnvel
 }
 
 /// The envelope a launch on `harness` may run under for `projection`. That is
-/// the envelope the projection's runtime binding pins, by descriptor digest and
-/// version, for the same harness, holding every capability the projection
-/// grants.
+/// the launchable envelope the projection's runtime binding pins, by
+/// descriptor digest and version, for the same harness, holding every
+/// capability the projection grants.
 pub(crate) fn for_projection(
     projection: &AutomationAuthorityConsumerProjection,
     harness: &str,
 ) -> Option<&'static RuntimeEnvelope> {
-    let envelope = by_descriptor_digest(projection.runtime.descriptor_digest.value.as_str())?;
+    let digest = projection.runtime.descriptor_digest.value.as_str();
+    let envelope = LAUNCHABLE
+        .iter()
+        .copied()
+        .find(|envelope| envelope.descriptor_digest() == digest)?;
     let granted = projection.granted_capabilities.as_slice();
     let grant_matches = granted.len() == envelope.capabilities.len()
         && granted
@@ -164,7 +301,7 @@ pub(crate) fn for_grant(harness: &str, capabilities: &[&str]) -> Option<&'static
     let mut wanted: Vec<&str> = capabilities.to_vec();
     wanted.sort_unstable();
     wanted.dedup();
-    ENVELOPES.iter().copied().find(|envelope| {
+    LAUNCHABLE.iter().copied().find(|envelope| {
         let mut held: Vec<&str> = envelope.capabilities.to_vec();
         held.sort_unstable();
         envelope.harness == harness && held == wanted
@@ -212,6 +349,86 @@ mod tests {
             .tools
             .iter()
             .all(|tool| tool.side_effect == SideEffectClass::LocalRead));
+    }
+
+    #[test]
+    fn the_r0_read_1_descriptor_is_unchanged() {
+        // The mission-commands conformance vectors and every signed binding
+        // that pins `r0-read.1` carry this digest.
+        assert_eq!(
+            CLAUDE_R0_READ.descriptor_digest(),
+            "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+        );
+        assert_eq!(
+            CLAUDE_R0_READ.descriptor()["profile"],
+            "coven.automations.runtime-envelope.v1"
+        );
+    }
+
+    #[test]
+    fn the_scoped_read_envelope_reaches_only_the_service() {
+        use crate::automations::scoped_read::service::TOOL_NAMES;
+
+        let envelope = &CLAUDE_R0_SCOPED_READ;
+        assert!(envelope.args.contains(&"--bare"));
+        assert!(envelope.args.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(envelope
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--setting-sources", ""]));
+        assert!(envelope.args.contains(&"--strict-mcp-config"));
+        assert!(envelope.args.contains(&"--disable-slash-commands"));
+        assert!(envelope.args.contains(&"--no-session-persistence"));
+        // The launch adds the attempt's own MCP configuration.
+        assert!(!envelope.args.contains(&"--mcp-config"));
+        let names: Vec<String> = TOOL_NAMES
+            .iter()
+            .map(|tool| format!("mcp__coven__{tool}"))
+            .collect();
+        let listed: Vec<&str> = envelope.tools.iter().map(|tool| tool.name).collect();
+        assert_eq!(listed, names);
+        assert!(envelope
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--allowedTools", names.join(",").as_str()]));
+        assert!(envelope
+            .tools
+            .iter()
+            .all(|tool| tool.capability == "analysis.read"
+                && tool.side_effect == SideEffectClass::LocalRead));
+
+        let descriptor = envelope.descriptor();
+        assert_eq!(
+            descriptor["profile"],
+            "coven.automations.runtime-envelope.v2"
+        );
+        assert_eq!(descriptor["descriptorVersion"], "r0-read.2");
+        assert_eq!(descriptor["harnessVersions"], json!(["2.1.305"]));
+        assert_eq!(descriptor["service"]["server"], "coven");
+        assert_eq!(descriptor["service"]["tools"], "coven.scoped-read.tools.v1");
+        assert_eq!(descriptor["service"]["policy"]["operationMillis"], 5000);
+        assert_eq!(descriptor["service"]["policy"]["calls"], 1024);
+        assert_eq!(descriptor["launch"]["credential"], "owner-api-key");
+        assert_ne!(
+            envelope.descriptor_digest(),
+            CLAUDE_R0_READ.descriptor_digest()
+        );
+    }
+
+    #[test]
+    fn the_scoped_read_envelope_is_described_but_not_yet_launched() {
+        let digest = CLAUDE_R0_SCOPED_READ.descriptor_digest();
+        assert_eq!(by_descriptor_digest(&digest), Some(&CLAUDE_R0_SCOPED_READ));
+        assert_eq!(
+            for_grant("claude", &["analysis.read"]),
+            Some(&CLAUDE_R0_READ),
+            "missions move to r0-read.2 in their own change"
+        );
+        let pinned = projection(|binding| {
+            binding["runtime"]["descriptorDigest"]["value"] = json!(digest);
+            binding["runtime"]["descriptorVersion"] = json!("r0-read.2");
+        });
+        assert_eq!(for_projection(&pinned, "claude"), None);
     }
 
     fn projection(

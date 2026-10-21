@@ -467,7 +467,10 @@ mod over_the_channel {
     use super::super::service::{Gate, Open, Outcome, Service};
     use super::super::{Refusal, R0_READ_POLICY};
     use super::{file, initialize, read, tool_text, LIMITS};
+    use crate::automations::contract::types::SideEffectClass;
+    use crate::automations::runtime_envelope::CLAUDE_R0_SCOPED_READ;
     use crate::automations::scoped_read::scope::RootKind;
+    use crate::automations::stream_observation::{classify_claude_stream, StreamResult};
 
     /// A short scratch base: the channel's socket path has to fit in about
     /// 100 bytes.
@@ -866,8 +869,10 @@ mod over_the_channel {
             .unwrap()
         }
 
-        /// Runs claude to completion and returns its stream's events.
-        fn run(&self, channel: &Channel, port: u16) -> Vec<Value> {
+        /// Runs claude to completion with `r0-read.2`'s own arguments and
+        /// returns its stream, raw and as events. Only `ANTHROPIC_BASE_URL`
+        /// is added to the envelope's environment, to reach the stand-in.
+        fn run(&self, channel: &Channel, port: u16) -> (String, Vec<Value>) {
             use std::io::Read;
             use std::process::{Command, Stdio};
             use std::time::Instant;
@@ -880,26 +885,9 @@ mod over_the_channel {
                 .env("ANTHROPIC_API_KEY", "sk-ant-test-capture-only")
                 .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"))
                 .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                .env("DISABLE_AUTOUPDATER", "1")
                 .current_dir(base.join("launch"))
-                .args([
-                    "--bare",
-                    "--print",
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                ])
-                .args([
-                    "--tools",
-                    "",
-                    "--strict-mcp-config",
-                    "--setting-sources",
-                    "",
-                ])
-                .args([
-                    "--allowedTools",
-                    "mcp__coven__read_file,mcp__coven__list_directory,mcp__coven__search",
-                ])
-                .args(["--no-session-persistence", "--disable-slash-commands"])
+                .args(CLAUDE_R0_SCOPED_READ.args)
                 .arg("--mcp-config")
                 .arg(channel.config_path())
                 .args(["--", "Read notes/today.md and tell me what it says."])
@@ -922,12 +910,12 @@ mod over_the_channel {
                 }
                 thread::sleep(Duration::from_millis(100));
             }
-            reading
-                .join()
-                .unwrap()
+            let raw = reading.join().unwrap();
+            let events = raw
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
-                .collect()
+                .collect();
+            (raw, events)
         }
     }
 
@@ -1018,7 +1006,7 @@ mod over_the_channel {
         let harness = Harness::new();
         let channel = harness.channel();
         let (port, requests) = model_server(vec![Reply::Reject]);
-        let events = harness.run(&channel, port);
+        let (_, events) = harness.run(&channel, port);
         assert_eq!(init_tools(&events), SERVICE_TOOLS);
         model_requests(&requests);
         assert!(channel.close().is_empty());
@@ -1044,8 +1032,24 @@ mod over_the_channel {
             },
             Reply::Text("done"),
         ]);
-        let events = harness.run(&channel, port);
+        let (raw, events) = harness.run(&channel, port);
         assert_eq!(init_tools(&events), SERVICE_TOOLS);
+
+        // The observer reads the real stream as complete evidence of reads
+        // under `r0-read.2`.
+        let observed = classify_claude_stream(&CLAUDE_R0_SCOPED_READ, &raw, false);
+        let kinds: std::collections::BTreeSet<String> = events
+            .iter()
+            .map(|event| format!("{}/{}", event["type"], event["subtype"]))
+            .collect();
+        eprintln!("stream events: {kinds:?}; observed {observed:?}");
+        assert!(observed.complete, "{raw}");
+        assert_eq!(
+            observed.capabilities.into_iter().collect::<Vec<_>>(),
+            ["analysis.read"]
+        );
+        assert_eq!(observed.side_effects, SideEffectClass::LocalRead);
+        assert_eq!(observed.result, StreamResult::Produced("done".to_owned()));
 
         let model = model_requests(&requests);
         assert_eq!(model.len(), 3, "one request per scripted reply");
