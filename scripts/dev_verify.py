@@ -117,16 +117,24 @@ def plan(tier, revision_range, changed, root, system):
     add('workspace-tests', ['cargo', 'test', '--workspace', '--locked'], needs=['rust-pins'])
     add('docs-range', ['python3', 'scripts/check-docs-ownership.py', '--range', revision_range])
     # Validate at plan construction as well as in the visible execution plan.
+    browser_tools_setup = None
     for index, argv in enumerate(validate_inventory(root)):
         if argv == ['python3', 'scripts/check-secrets.py']:
             continue  # Already mandatory in every tier.
         needs = ['policy-inventory']
-        if argv[0] == 'node':
+        if argv[0] in ('node', 'npm'):
             needs.append('node-pin')
+        if argv[:4] == ['npm', 'ci', '--prefix', 'scripts/browser']:
+            browser_tools_setup = f'policy-{index + 1}'
+        if argv == ['node', '--test', 'scripts/browser-capability.test.mjs']:
+            if browser_tools_setup is None:
+                raise ValueError('browser contract tests require preceding locked tooling setup')
+            needs.append(browser_tools_setup)
         add(f'policy-{index + 1}', argv, needs=needs)
     add('dependency-audit', ['cargo', 'deny', '--all-features', 'check', 'advisories', 'licenses', 'bans', 'sources'], needs=['rust-pins'])
 
     categories = load_script(root, 'classify-ci-changes').classify(changed) if changed else {}
+    package_installs = []
     for package, category, manager in [('channels', 'channels', 'npm'), ('openclaw-coven', 'openclaw', 'pnpm')]:
         if tier != 'full' and not categories.get(category, False):
             skips.append(f'{package}: not applicable to changed paths under CI classification')
@@ -138,8 +146,11 @@ def plan(tier, revision_range, changed, root, system):
             needs = ['pnpm-pin']
         install = [manager, 'ci'] if manager == 'npm' else [manager, 'install', '--frozen-lockfile', '--ignore-scripts']
         add(f'{package}-install', install, cwd, needs)
+        package_installs.append(f'{package}-install')
         add(f'{package}-build', [manager, 'run', 'build'], cwd, [f'{package}-install'])
         add(f'{package}-test', [manager, 'test'], cwd, [f'{package}-install'])
+
+    add('browser-readiness', ['node', 'scripts/browser-capability.mjs', '--check'], needs=['node-pin', browser_tools_setup, *package_installs])
 
     if tier == 'full':
         add('threads-unit', ['cargo', 'test', '--locked', '-p', 'coven-cli', '--bin', 'coven', '--features', 'threads-test-clock', 'threads_'], needs=['rust-pins'])
@@ -161,7 +172,7 @@ def plan(tier, revision_range, changed, root, system):
         'exact-commit protocol and authority artifact packaging/upload: CI-only required jobs',
         'release-target npm onboarding and pinned engine contract: routed CI-only jobs',
         'performance baseline and real mount probe: CI informational/post-merge jobs',
-        'browser provisioning and distro/bootstrap contracts: separate B2/B3 capabilities, not established by this tier',
+        'browser downloads are opt-in; distro/bootstrap contracts remain separate B3 capability',
         'protected-main PR gate: CI-only final merge authority; local success is not CI acceptance',
     ])
     return checks, skips
