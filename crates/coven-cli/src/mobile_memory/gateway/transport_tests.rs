@@ -63,9 +63,14 @@ impl Fixture {
             pairing,
         }
     }
-    fn request(&self, method: &str, path: &str, id: Uuid, nonce: u8) -> Vec<u8> {
+    fn request(&self, method: &str, path: &str, id: Uuid) -> Vec<u8> {
+        use ring::rand::SecureRandom;
         let timestamp = Utc::now().timestamp();
-        let nonce = URL_SAFE_NO_PAD.encode([nonce; 32]);
+        let mut request_nonce = [0_u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut request_nonce)
+            .unwrap();
+        let nonce = URL_SAFE_NO_PAD.encode(request_nonce);
         let digest = URL_SAFE_NO_PAD.encode(Sha256::digest([]));
         let canonical =
             crate::mobile_memory::auth::canonical_request(method, path, timestamp, &nonce, &digest)
@@ -234,12 +239,7 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         let deadline = Instant::now() + Duration::from_secs(30);
         channel
             .send_message(
-                &fixture.request(
-                    "GET",
-                    "/api/v1/mobile/device",
-                    fixture.pairing.device_id,
-                    90,
-                ),
+                &fixture.request("GET", "/api/v1/mobile/device", fixture.pairing.device_id),
                 MAX_MOBILE_REQUEST_BYTES,
                 deadline,
             )
@@ -298,7 +298,7 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
 fn encrypted_gateway_keeps_per_request_signatures_and_shared_replay_state() {
     let fixture = Fixture::new();
     let path = "/api/v1/mobile/device";
-    let wire = fixture.request("GET", path, fixture.pairing.device_id, 11);
+    let wire = fixture.request("GET", path, fixture.pairing.device_id);
     let request = read_mobile_request(&mut wire.as_slice()).unwrap();
     assert_eq!(
         handle_protected_route(&fixture.state, MobileRoute::DeviceRead, path, request).status,
@@ -309,13 +309,13 @@ fn encrypted_gateway_keeps_per_request_signatures_and_shared_replay_state() {
     assert_eq!(replay.status, 409);
     let replay_body: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
     assert_eq!(replay_body["error"]["code"], "request_replayed");
-    let wire = fixture.request("GET", path, fixture.pairing.device_id, 12);
+    let wire = fixture.request("GET", path, fixture.pairing.device_id);
     let (response, _) =
         handle_transport_message(&fixture.state, &fixture.pairing, false, &wire).unwrap();
     assert_eq!(response.status, 200);
-    let wrong_id = fixture.request("GET", path, Uuid::new_v4(), 13);
+    let wrong_id = fixture.request("GET", path, Uuid::new_v4());
     assert!(handle_transport_message(&fixture.state, &fixture.pairing, false, &wrong_id).is_err());
-    let mut trailing = fixture.request("GET", path, fixture.pairing.device_id, 14);
+    let mut trailing = fixture.request("GET", path, fixture.pairing.device_id);
     trailing.extend_from_slice(b"GET /api/v1/mobile/device HTTP/1.1\r\n\r\n");
     assert!(handle_transport_message(&fixture.state, &fixture.pairing, false, &trailing).is_err());
     fixture
@@ -380,7 +380,6 @@ fn authenticated_bootstrap_reuses_identity_and_persists_routing_without_qr() {
         "POST",
         "/api/v1/mobile/transport/bootstrap",
         fixture.pairing.device_id,
-        21,
     );
     let (response, _) =
         handle_transport_message(&fixture.state, &fixture.pairing, false, &wire).unwrap();
@@ -413,7 +412,6 @@ fn authenticated_bootstrap_reuses_identity_and_persists_routing_without_qr() {
         "POST",
         "/api/v1/mobile/transport/bootstrap",
         fixture.pairing.device_id,
-        22,
     );
     let (again, _) =
         handle_transport_message(&fixture.state, &fixture.pairing, false, &wire).unwrap();
@@ -510,12 +508,7 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
                 }
             }
         };
-        let wire = fixture.request(
-            "GET",
-            "/api/v1/mobile/device",
-            fixture.pairing.device_id,
-            50 + round,
-        );
+        let wire = fixture.request("GET", "/api/v1/mobile/device", fixture.pairing.device_id);
         let deadline = Instant::now() + Duration::from_secs(30);
         channel
             .send_message(&wire, MAX_MOBILE_REQUEST_BYTES, deadline)
@@ -548,12 +541,8 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
                 .registry
                 .revoke(fixture.pairing.device_id, Utc::now())
                 .unwrap();
-            let revoked = fixture.request(
-                "GET",
-                "/api/v1/mobile/device",
-                fixture.pairing.device_id,
-                60,
-            );
+            let revoked =
+                fixture.request("GET", "/api/v1/mobile/device", fixture.pairing.device_id);
             if channel
                 .send_message(&revoked, MAX_MOBILE_REQUEST_BYTES, deadline)
                 .is_ok()
