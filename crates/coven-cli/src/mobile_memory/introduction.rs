@@ -21,7 +21,7 @@ use super::grant::{
     GrantTransportConstraint, DEVICE_ACTION_VERSION,
 };
 use super::owner_policy::OwnerPolicyStore;
-use super::registry::{DeviceAuthorizationRecord, DeviceRecord, DeviceRegistry};
+use super::registry::{DeviceAuthorizationRecord, DeviceRecord, DeviceRegistry, PendingEnrollment};
 
 pub(super) const MAX_INTRODUCTIONS: usize = 128;
 /// Upper bound on N for threshold approval; each approver is a separate lock
@@ -335,30 +335,50 @@ impl IntroductionTerms<'_> {
                     || approver.grant_id.is_nil()
                     || approver.device_id == self.destination_id
             })
-            || self.grant.id.is_nil()
-            || self.grant.revocation_epoch != 0
-            || self.grant.issued_at != self.issued_at
         {
             bail!("invalid introduction request");
         }
         validate_digest(self.policy_digest)?;
         validate_public_key(self.destination_public_key)?;
-        self.grant.validate(self.destination_public_key)?;
-        for (text, limit) in [(self.device_name, 80), (self.device_context, 512)] {
-            if text.is_empty()
-                || text.trim() != text
-                || text.chars().count() > limit
-                || text.chars().any(char::is_control)
-            {
-                bail!("invalid introduction presentation");
-            }
-        }
-        let lifetime = self.expires_at - self.issued_at;
-        if lifetime <= chrono::Duration::zero() || lifetime > chrono::Duration::seconds(300) {
-            bail!("invalid introduction lifetime");
-        }
-        Ok(())
+        validate_destination(
+            self.grant,
+            self.destination_public_key,
+            self.device_name,
+            self.device_context,
+            self.issued_at,
+            self.expires_at,
+        )
     }
+}
+
+/// Destination checks shared by introduction and access recovery: a fresh,
+/// unrevoked grant for this key, bounded presentation, and a short lifetime.
+pub(super) fn validate_destination(
+    grant: &DeviceGrant,
+    destination_public_key: &str,
+    device_name: &str,
+    device_context: &str,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<()> {
+    if grant.id.is_nil() || grant.revocation_epoch != 0 || grant.issued_at != issued_at {
+        bail!("invalid introduction request");
+    }
+    grant.validate(destination_public_key)?;
+    for (text, limit) in [(device_name, 80), (device_context, 512)] {
+        if text.is_empty()
+            || text.trim() != text
+            || text.chars().count() > limit
+            || text.chars().any(char::is_control)
+        {
+            bail!("invalid introduction presentation");
+        }
+    }
+    let lifetime = expires_at - issued_at;
+    if lifetime <= chrono::Duration::zero() || lifetime > chrono::Duration::seconds(300) {
+        bail!("invalid introduction lifetime");
+    }
+    Ok(())
 }
 
 fn exact_action(
@@ -676,9 +696,12 @@ impl IntroductionAuthority {
         let commit = || {
             self.registry.commit_introduction(
                 &approver_ids,
-                record,
-                terms.grant.clone(),
-                nonce_digest,
+                PendingEnrollment {
+                    device: record,
+                    grant: terms.grant.clone(),
+                    nonce_digest,
+                    kind: TransitionKind::Introduction,
+                },
                 now,
                 |sources| {
                     self.validate_request(terms, now)?;
@@ -867,9 +890,28 @@ impl IntroductionAuthority {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct IntroductionTransition {
     pub transition_id: Uuid,
+    /// Omitted for introductions so existing records serialize unchanged.
+    #[serde(default, skip_serializing_if = "TransitionKind::is_introduction")]
+    pub kind: TransitionKind,
     pub nonce_digest: String,
     pub occurred_at: DateTime<Utc>,
     pub audited_at: Option<DateTime<Utc>>,
+}
+
+/// Which operation consumed a nonce. Both share one ledger, so a recovery
+/// and an introduction can never reuse each other's nonce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TransitionKind {
+    #[default]
+    Introduction,
+    AccessRecovery,
+}
+
+impl TransitionKind {
+    fn is_introduction(&self) -> bool {
+        *self == Self::Introduction
+    }
 }
 
 pub(super) fn validate_transitions(transitions: &[IntroductionTransition]) -> Result<()> {
