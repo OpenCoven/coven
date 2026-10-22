@@ -652,8 +652,11 @@ every owner-local action does. An unknown id or a mission returns
 `404 NOT_FOUND`; a tombstoned routine returns `410 GONE_TOMBSTONED`.
 
 The explanation carries `automationId`, `revision`, `lifecycleState`,
-`observedAt` and a non-empty, ordered `conditions` list. Each condition has a
-`code` and a `nextStep`, and some have `at` or `failureClass`:
+`observedAt`, a non-empty, ordered `conditions` list, and a `work` list with
+`workTruncated`. `conditions` say whether planning creates the routine's next
+occurrence; `work` says what holds the occurrences that already exist. Each
+condition has a `code` and a `nextStep`, and some have `at` or
+`failureClass`:
 
 | `code` | Holds when | `nextStep` |
 | --- | --- | --- |
@@ -671,6 +674,52 @@ appears only when none holds. It states what the schedule produces next, not
 that a pass will plan or launch it: overlap and misfire policy, slots already
 due, and the scheduler's liveness are outside this read. Prompts, quarantine
 reasons, validation text and lease owners are never returned.
+
+`work` lists what the scheduler's claim gate counts against the routine: its
+claimed, running and recovery-required occurrences, and every running run keyed
+to the routine whose occurrence is not one of those. It holds at most 20
+items: those that hold claims first, then by code in the order below, then by
+stored scheduled time and ids. `workTruncated` is `true` when more exist. All
+reads, `conditions` included, come from one read transaction. Each item has a
+`code`, `holdsClaims` and a `nextStep`, and `occurrenceId`, `runId` and `at`
+(the occurrence's scheduled time, in canonical millisecond form) when each
+exists and is readable. An id is omitted when it is empty, longer than 512
+bytes, not valid UTF-8, has leading or trailing whitespace, or contains a
+control character. A stored time is omitted when it is longer than 64 bytes or
+is not a readable timestamp.
+
+| `code` | What it is | `holdsClaims` | `nextStep` |
+| --- | --- | --- | --- |
+| `in_flight` | a `claimed` or `running` occurrence, given as `state`; `runId` is its running run, the lowest id if several | always | `inspect_occurrence` |
+| `running_run` | a running run keyed to the routine whose occurrence is not listed above: a retry on a still-planned occurrence, or a run whose occurrence is settled, another routine's, or missing | always | `inspect_run` |
+| `recovery_required` | a `recovery_required` occurrence; `runId` is its running run, if any | while a running run keyed to the routine is on it | the step recovery takes, below |
+
+A `recovery_required` item's `nextStep` is the step
+`coven.automations.occurrence.recover.v1` takes, checked in recovery's order
+against the occurrence's running runs:
+
+1. `await_runtime_authority` when one is a Runtime Authority run. Recovery
+   refuses it with `AUTHORITY_REQUIRED` until an adapter can produce
+   authority-evidenced receipts.
+2. `await_cancellation` while a cancellation of one is `requested` or
+   `stopping`. Recovery refuses with `CANCEL_PENDING`.
+3. `cancel_run` while one's latest attempt may still be live: `dispatching`,
+   `started` or `observing`, or its session `created` or `running`. Recovery
+   refuses with `ILLEGAL_TRANSITION` until the run is cancelled.
+4. `recover_occurrence` otherwise.
+
+`holdsClaims` mirrors the claim gate: while an item holds claims, the scheduler
+claims no other occurrence of the routine. A `running_run` item's own
+occurrence can still be claimed, as a ready retry's is. Because items that hold
+claims come first, the first item answers whether any does, even when the list
+is truncated. An adopted retry that is waiting for its next attempt, or is past
+its deadline, also keeps its own occurrence from being claimed; its run, keyed
+to the routine, is listed as `running_run`, and its timing is reported by a
+later slice (#1518).
+`work` is read whatever `conditions` say, so a paused or quarantined routine
+still shows its work. Leases are read with
+`coven.automations.occurrence.leases.v1` and runs with
+`coven.automations.run.get.v1`.
 
 Other unknown action ids return `400` and fail closed:
 
