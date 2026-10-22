@@ -1896,3 +1896,393 @@ fn retry_timing_is_read_only_as_reconciliation_and_the_queue_read_it() {
         assert_eq!(actual, reconciled, "{shape}");
     }
 }
+
+/// (routine, lease owner, kind, scheduler generation, lease, its run's status,
+/// code, leaseExpiresAt, state after the daemon's fenced pass)
+type ClaimShape<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    Option<i64>,
+    Option<&'a str>,
+    Option<&'a str>,
+    WorkCode,
+    Option<&'a str>,
+    &'a str,
+);
+
+#[test]
+fn each_claim_names_what_the_fenced_pass_releases() {
+    let (temp, conn) = store();
+    // Two takeovers make generation 1 stale and generation 2 current.
+    let first =
+        crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now())
+            .unwrap();
+    let old = first.fence().generation();
+    drop(first);
+    let current =
+        crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now())
+            .unwrap();
+    let generation = current.fence().generation();
+    assert!(generation > old);
+    let (past, future) = ("2026-10-22T09:45:00.000Z", "2026-10-22T10:30:00.000Z");
+    let shapes: [ClaimShape<'_>; 16] = [
+        (
+            "stale",
+            "daemon",
+            "scheduled",
+            Some(old),
+            Some(future),
+            None,
+            WorkCode::ClaimStale,
+            Some(future),
+            "planned",
+        ),
+        (
+            "stale-expired",
+            "daemon",
+            "scheduled",
+            Some(old),
+            Some(past),
+            None,
+            WorkCode::ClaimStale,
+            Some(past),
+            "planned",
+        ),
+        (
+            "stale-unfenced",
+            "daemon",
+            "scheduled",
+            None,
+            Some(future),
+            None,
+            WorkCode::ClaimStale,
+            Some(future),
+            "planned",
+        ),
+        // Any run at all keeps a stale claim, and only this generation's
+        // expired leases fail.
+        (
+            "stale-with-run",
+            "daemon",
+            "scheduled",
+            Some(old),
+            Some(past),
+            Some("failed"),
+            WorkCode::InFlight,
+            Some(past),
+            "claimed",
+        ),
+        (
+            "expired",
+            "daemon",
+            "scheduled",
+            Some(generation),
+            Some(past),
+            None,
+            WorkCode::LeaseExpired,
+            Some(past),
+            "failed",
+        ),
+        (
+            "expired-at-now",
+            "daemon",
+            "scheduled",
+            Some(generation),
+            Some("2026-10-22T10:00:00.000Z"),
+            None,
+            WorkCode::LeaseExpired,
+            Some("2026-10-22T10:00:00.000Z"),
+            "failed",
+        ),
+        (
+            "expired-settled-run",
+            "daemon",
+            "scheduled",
+            Some(generation),
+            Some(past),
+            Some("failed"),
+            WorkCode::LeaseExpired,
+            Some(past),
+            "failed",
+        ),
+        (
+            "expired-running-run",
+            "daemon",
+            "scheduled",
+            Some(generation),
+            Some(past),
+            Some("running"),
+            WorkCode::InFlight,
+            Some(past),
+            "claimed",
+        ),
+        (
+            "manual-expired",
+            "operator",
+            "manual",
+            None,
+            Some(past),
+            None,
+            WorkCode::LeaseExpired,
+            Some(past),
+            "failed",
+        ),
+        (
+            "manual-live",
+            "operator",
+            "manual",
+            None,
+            Some(future),
+            None,
+            WorkCode::InFlight,
+            Some(future),
+            "claimed",
+        ),
+        (
+            "foreign-owner",
+            "operator",
+            "scheduled",
+            Some(generation),
+            Some(past),
+            None,
+            WorkCode::InFlight,
+            Some(past),
+            "claimed",
+        ),
+        (
+            "no-lease",
+            "daemon",
+            "scheduled",
+            Some(generation),
+            None,
+            None,
+            WorkCode::InFlight,
+            None,
+            "claimed",
+        ),
+        // Only the daemon's own claims of this generation, or manual claims
+        // with none, lose an expired lease; a stale claim returns first.
+        (
+            "unfenced-operator",
+            "operator",
+            "scheduled",
+            None,
+            Some(past),
+            None,
+            WorkCode::InFlight,
+            Some(past),
+            "claimed",
+        ),
+        (
+            "manual-generation",
+            "operator",
+            "manual",
+            Some(generation),
+            Some(past),
+            None,
+            WorkCode::InFlight,
+            Some(past),
+            "claimed",
+        ),
+        (
+            "manual-daemon-expired",
+            "daemon",
+            "manual",
+            None,
+            Some(past),
+            None,
+            WorkCode::ClaimStale,
+            Some(past),
+            "planned",
+        ),
+        // The pass compares the lease as stored text: this 09:45Z lease reads
+        // as later than 10:00Z, and is not shown.
+        (
+            "offset-lease",
+            "daemon",
+            "scheduled",
+            Some(generation),
+            Some("2026-10-22T11:45:00+02:00"),
+            None,
+            WorkCode::InFlight,
+            None,
+            "claimed",
+        ),
+    ];
+    for (id, owner, kind, claim_generation, lease, run_status, _, _, _) in shapes {
+        // Paused, so the pass neither plans nor reclaims what it releases.
+        insert_definition_at(&conn, &definition(id, "PAUSED"), "2026-10-01T00:00:00.000Z").unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 lease_expires_at, scheduler_generation, created_at, updated_at)
+             VALUES ('o-' || ?1, ?1, '2026-10-21T09:00:00.000Z', ?2, 'claimed', 1, ?3, ?4,
+                     ?5, '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z')",
+            rusqlite::params![id, kind, owner, lease, claim_generation],
+        )
+        .unwrap();
+        if let Some(status) = run_status {
+            run(&conn, &format!("r-{id}"), &format!("o-{id}"), status);
+        }
+    }
+    for (id, _, _, _, _, _, code, lease, _) in &shapes {
+        let item = found(&conn, id).work.into_iter().next().unwrap();
+        let (state, next_step) = match code {
+            WorkCode::InFlight => (Some("claimed"), NextStep::InspectOccurrence),
+            WorkCode::ClaimStale => (None, NextStep::AwaitSchedulerPass),
+            WorkCode::LeaseExpired => (None, NextStep::AwaitSettlement),
+            other => panic!("{id}: unexpected {other:?}"),
+        };
+        assert_eq!(
+            (
+                item.code,
+                item.state,
+                item.next_step,
+                item.lease_expires_at.as_deref(),
+                item.holds_claims
+            ),
+            (*code, state, next_step, *lease, true),
+            "{id}"
+        );
+    }
+
+    // TEMP tables cannot add the runs these releases read.
+    let explained: Vec<_> = shapes.iter().map(|(id, ..)| work_of(&conn, id)).collect();
+    conn.execute_batch(
+        "CREATE TEMP TABLE automation_runs AS SELECT * FROM main.automation_runs WHERE 0;
+         INSERT INTO temp.automation_runs (id, automation_id, occurrence_id, status)
+             SELECT 'r-shadow-' || id, automation_id, id, 'running'
+             FROM main.automation_occurrences;",
+    )
+    .unwrap();
+    for ((id, ..), expected) in shapes.iter().zip(&explained) {
+        assert_eq!(&work_of(&conn, id), expected, "{id}");
+    }
+    conn.execute_batch("DROP TABLE temp.automation_runs;")
+        .unwrap();
+
+    // The daemon's pass: reconciliation, then the fenced tick.
+    crate::automations::daemon_tick::reconcile_automation_runs(
+        temp.path(),
+        &conn,
+        &crate::api::NoopSessionRuntime,
+        now(),
+        None,
+    )
+    .unwrap();
+    crate::automations::occurrences::tick_with_scheduler_fence(&conn, now(), &current.fence())
+        .unwrap();
+    for (id, _, _, _, _, _, _, _, after) in &shapes {
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'o-' || ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, *after, "{id}");
+    }
+}
+
+#[test]
+fn without_a_held_scheduler_authority_no_claim_is_named_released() {
+    let (temp, conn) = store();
+    insert_definition_at(
+        &conn,
+        &definition("daily", "PAUSED"),
+        "2026-10-01T00:00:00.000Z",
+    )
+    .unwrap();
+    // An expired manual lease and a claim of no generation, either of which a
+    // held authority would release.
+    conn.execute_batch(
+        "INSERT INTO automation_occurrences
+            (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+             lease_expires_at, scheduler_generation, created_at, updated_at)
+         VALUES ('o-manual', 'daily', '2026-10-20T09:00:00.000Z', 'manual', 'claimed', 1,
+                 'operator', '2026-10-22T09:45:00.000Z', NULL, '2026-10-20T09:00:00.000Z',
+                 '2026-10-20T09:00:00.000Z'),
+                ('o-daemon', 'daily', '2026-10-21T09:00:00.000Z', 'scheduled', 'claimed', 1,
+                 'daemon', NULL, NULL, '2026-10-21T09:00:00.000Z',
+                 '2026-10-21T09:00:00.000Z');",
+    )
+    .unwrap();
+    let in_flight = |conn: &Connection| {
+        found(conn, "daily")
+            .work
+            .into_iter()
+            .map(|item| (item.code, item.state, item.lease_expires_at))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        (
+            WorkCode::InFlight,
+            Some("claimed"),
+            Some("2026-10-22T09:45:00.000Z".to_string()),
+        ),
+        (WorkCode::InFlight, Some("claimed"), None),
+    ];
+    assert_eq!(in_flight(&conn), expected, "none recorded");
+    let mut leadership =
+        crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now())
+            .unwrap();
+    assert!(leadership.release(&conn).unwrap());
+    assert_eq!(in_flight(&conn), expected, "released");
+    conn.execute_batch(
+        "UPDATE automation_scheduler_authority SET owner_id = ' padded', generation = 7;",
+    )
+    .unwrap();
+    assert_eq!(in_flight(&conn), expected, "invalid");
+    conn.execute_batch("DELETE FROM automation_scheduler_authority;")
+        .unwrap();
+    assert_eq!(in_flight(&conn), expected, "missing");
+    // Claimed, the lease is shown; running, it no longer applies.
+    conn.execute_batch(
+        "UPDATE automation_occurrences SET state = 'running' WHERE id = 'o-manual';",
+    )
+    .unwrap();
+    assert_eq!(
+        in_flight(&conn)[0],
+        (WorkCode::InFlight, Some("running"), None)
+    );
+}
+
+#[test]
+fn a_claimed_retry_past_its_deadline_carries_its_lease() {
+    let (_temp, conn) = store();
+    insert_definition_at(
+        &conn,
+        &definition("daily", "PAUSED"),
+        "2026-10-01T00:00:00.000Z",
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO automation_occurrences
+            (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+             lease_expires_at, created_at, updated_at)
+         VALUES ('o-held', 'daily', '2026-10-21T09:00:00.000Z', 'manual', 'claimed', 1,
+                 'operator', '2026-10-22T09:30:00.000Z', '2026-10-21T09:00:00.000Z',
+                 '2026-10-21T09:00:00.000Z');
+         INSERT INTO automation_runs
+            (id, automation_id, occurrence_id, runtime, status, started_at, timeout_at)
+         VALUES ('r-held', 'daily', 'o-held', 'coven-code', 'running',
+                 '2026-10-21T09:00:00.000Z', '2026-10-22T09:45:00.000Z');
+         INSERT INTO automation_attempts
+            (id, run_id, occurrence_id, attempt_number, adoption_key,
+             occurrence_fence_generation, state, retry_classification, not_before,
+             opened_at)
+         VALUES ('a-held', 'r-held', 'o-held', 1, 'r-held-key', 1, 'adopted', 'initial',
+                 '2026-10-22T11:00:00.000Z', '2026-10-21T09:00:00.000Z');",
+    )
+    .unwrap();
+    assert_eq!(
+        work_of(&conn, "daily"),
+        json!([{
+            "code": "retry_expired", "occurrenceId": "o-held", "runId": "r-held",
+            "at": "2026-10-21T09:00:00.000Z", "deadlineAt": "2026-10-22T09:45:00.000Z",
+            "leaseExpiresAt": "2026-10-22T09:30:00.000Z", "holdsClaims": true,
+            "nextStep": "await_settlement"
+        }])
+    );
+}

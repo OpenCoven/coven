@@ -292,6 +292,8 @@ struct WorkItem {
     not_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     deadline_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_expires_at: Option<String>,
     holds_claims: bool,
     next_step: String,
 }
@@ -454,7 +456,8 @@ mod tests {
         }))
         .unwrap();
         crate::automations::store::insert_definition(&conn, &definition).unwrap();
-        // A retry waiting until far beyond the real clock this test reads.
+        // A retry waiting, and a lease running, until far beyond the real
+        // clock this test reads; a stale claim, and a lease long expired.
         conn.execute_batch(
             "INSERT INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
@@ -469,7 +472,28 @@ mod tests {
                  occurrence_fence_generation, state, retry_classification, not_before,
                  opened_at)
              VALUES ('a-retry', 'r-retry', 'o-retry', 1, 'r-retry-key', 1, 'adopted',
-                     'initial', '2099-01-01T00:00:00.000Z', '2026-10-21T09:00:00.000Z');",
+                     'initial', '2099-01-01T00:00:00.000Z', '2026-10-21T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 lease_expires_at, created_at, updated_at)
+             VALUES ('o-claimed', 'daily', '2026-10-20T09:00:00.000Z', 'manual', 'claimed', 1,
+                     'operator', '2099-01-01T02:00:00.000Z', '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 lease_expires_at, created_at, updated_at)
+             VALUES ('o-stale', 'daily', '2026-10-18T09:00:00.000Z', 'scheduled', 'claimed', 1,
+                     'daemon', NULL, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z'),
+                    ('o-lapsed', 'daily', '2026-10-19T09:00:00.000Z', 'manual', 'claimed', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z');",
+        )
+        .unwrap();
+        // A held authority names the claims its next pass releases.
+        let _leadership = crate::automations::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            chrono::Utc::now(),
         )
         .unwrap();
         let view = View::Explain("daily");
@@ -490,6 +514,18 @@ mod tests {
         assert_eq!(
             output["explanation"]["work"],
             json!([{
+                "code": "claim_stale", "occurrenceId": "o-stale",
+                "at": "2026-10-18T09:00:00.000Z", "holdsClaims": true,
+                "nextStep": "await_scheduler_pass"
+            }, {
+                "code": "lease_expired", "occurrenceId": "o-lapsed",
+                "at": "2026-10-19T09:00:00.000Z", "leaseExpiresAt": "2026-10-01T00:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
+                "code": "in_flight", "occurrenceId": "o-claimed", "state": "claimed",
+                "at": "2026-10-20T09:00:00.000Z", "leaseExpiresAt": "2099-01-01T02:00:00.000Z",
+                "holdsClaims": true, "nextStep": "inspect_occurrence"
+            }, {
                 "code": "retry_waiting", "occurrenceId": "o-retry", "runId": "r-retry",
                 "at": "2026-10-21T09:00:00.000Z", "notBefore": "2099-01-01T00:00:00.000Z",
                 "deadlineAt": "2099-01-01T01:00:00.000Z", "holdsClaims": true,
