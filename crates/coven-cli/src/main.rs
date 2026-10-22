@@ -1057,6 +1057,26 @@ enum DeviceCommand {
         #[arg(long, help = "Skip the typed confirmation after the review is printed")]
         yes: bool,
     },
+    #[command(
+        about = "Recover access with the owner-root key when no trusted device remains",
+        long_about = "Recover access with the owner-root key when no trusted device remains.\n\n\
+                      Reads the recovering device's signed envelope, prints every signed field \
+                      and what recovery will not do, and signs only after you type `recover`. \
+                      Recovery enrolls one device within the installed policy. It never rotates \
+                      the owner root, revokes other devices or changes familiar identity."
+    )]
+    Recover {
+        #[arg(long, value_name = "ENVELOPE_JSON")]
+        request: PathBuf,
+        #[arg(
+            long,
+            value_name = "PEM",
+            help = "Owner-root private key file (outside COVEN_HOME)"
+        )]
+        root_key: PathBuf,
+        #[arg(long, help = "Skip the typed confirmation after the review is printed")]
+        yes: bool,
+    },
     #[command(about = "Manage the offline owner-root credential")]
     OwnerRoot {
         #[command(subcommand)]
@@ -2158,6 +2178,11 @@ fn run_cli(cli: Cli) -> Result<()> {
             DeviceCommand::Introduce { request, yes } => {
                 mobile_memory::enrollment::run_introduce(&request, yes)
             }
+            DeviceCommand::Recover {
+                request,
+                root_key,
+                yes,
+            } => mobile_memory::recovery::run_recover(&request, &root_key, yes),
             DeviceCommand::OwnerRoot {
                 command: OwnerRootCommand::Generate { out },
             } => mobile_memory::policy_cli::run_generate_owner_root(&out),
