@@ -8,10 +8,11 @@ fn fixture() -> (tempfile::TempDir, Connection) {
     (root, conn)
 }
 
-const RUN_FACTS: [Fact; 3] = [
+const RUN_FACTS: [Fact; 4] = [
     Fact::RunningRuns,
     Fact::RunningRunsWithEndedSessions,
     Fact::RunningRunsWithFailedLatestAttempt,
+    Fact::RunningRunsWithAmbiguousLatestAttempt,
 ];
 
 /// Running runs are counted from their own tables, apart from occurrences.
@@ -6492,9 +6493,11 @@ fn running_runs_separate_ended_sessions_and_retry_holds_without_identities() {
          ('PRIVATE-RUN-LIVE', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-LIVE', 'running', '2026-10-22T09:00:00Z'),
          ('PRIVATE-RUN-CONTAINED', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-KILLED', 'running', '2026-10-22T09:00:00Z'),
          ('PRIVATE-RUN-HELD', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-FAILED', 'running', '2026-10-22T09:00:00Z'),
-         ('PRIVATE-RUN-FINISHED', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-KILLED', 'failed', '2026-10-22T09:00:00Z');
+         ('PRIVATE-RUN-FINISHED', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-KILLED', 'failed', '2026-10-22T09:00:00Z'),
+         ('PRIVATE-RUN-AMBIGUOUS', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-KILLED', 'running', '2026-10-22T09:00:00Z');
          INSERT INTO automation_attempts(id, run_id, occurrence_id, attempt_number, adoption_key, occurrence_fence_generation, state, failure_class, retry_classification, not_before, opened_at, settled_at, state_reason) VALUES
-         ('PRIVATE-ATTEMPT', 'PRIVATE-RUN-HELD', 'PRIVATE-OCCURRENCE', 1, 'PRIVATE-ADOPTION', 1, 'failed', 'launch_refused', 'initial', '2026-10-22T09:00:00Z', '2026-10-22T09:00:00Z', '2026-10-22T09:00:01Z', 'PRIVATE-REASON');
+         ('PRIVATE-ATTEMPT', 'PRIVATE-RUN-HELD', 'PRIVATE-OCCURRENCE', 1, 'PRIVATE-ADOPTION', 1, 'failed', 'launch_refused', 'initial', '2026-10-22T09:00:00Z', '2026-10-22T09:00:00Z', '2026-10-22T09:00:01Z', 'PRIVATE-REASON'),
+         ('PRIVATE-ATTEMPT-AMBIGUOUS', 'PRIVATE-RUN-AMBIGUOUS', 'PRIVATE-OCCURRENCE', 1, 'PRIVATE-ADOPTION-AMBIGUOUS', 1, 'ambiguous', NULL, 'initial', '2026-10-22T09:00:00Z', '2026-10-22T09:00:00Z', '2026-10-22T09:00:01Z', 'PRIVATE-REASON');
          PRAGMA foreign_keys=ON;",
     )
     .unwrap();
@@ -6504,11 +6507,12 @@ fn running_runs_separate_ended_sessions_and_retry_holds_without_identities() {
     assert_eq!(conn.total_changes(), before);
     report.validate().unwrap();
     let queue = queue_of(&mut report);
-    // The held run's session has ended too.
+    // The held and the ambiguous runs' sessions have ended too.
     for (fact, count) in [
-        (Fact::RunningRuns, 3),
-        (Fact::RunningRunsWithEndedSessions, 2),
+        (Fact::RunningRuns, 4),
+        (Fact::RunningRunsWithEndedSessions, 3),
         (Fact::RunningRunsWithFailedLatestAttempt, 1),
+        (Fact::RunningRunsWithAmbiguousLatestAttempt, 1),
     ] {
         assert_eq!(queue.facts[&fact], count, "{fact:?}");
     }
@@ -6598,5 +6602,181 @@ fn running_run_facts_are_bounded_subsets_or_replaced_by_their_gap() {
         queue.gaps = occurrence_gaps;
         queue.gaps.push(Gap::RunningRunStoreUnavailable);
         report.validate().unwrap();
+    }
+}
+
+const CANCELLATION_FACTS: [Fact; 4] = [
+    Fact::PendingCancellations,
+    Fact::ActivePendingCancellations,
+    Fact::ExpiredPendingCancellations,
+    Fact::InvalidPendingCancellationExpiries,
+];
+
+#[test]
+fn pending_cancellations_are_counted_by_lease_without_their_identities() {
+    let (_root, conn) = fixture();
+    let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 10, 22, 9, 0, 0).unwrap();
+    for (n, state, expires) in [
+        (1, "requested", "2026-10-22T09:00:30Z"),
+        (2, "stopping", "2026-10-22T09:00:00Z"),
+        (3, "stopping", "PRIVATE-LEASE"),
+        (4, "cancelled", "2026-10-22T08:00:00Z"),
+        (5, "recovery_required", "2026-10-22T08:00:00Z"),
+    ] {
+        conn.execute(
+            "INSERT INTO automation_cancellations
+                (adoption_key, request_digest, automation_id, run_id, attempt_id, session_id,
+                 scope, requested_by_json, reason, state, requested_at, execution_expires_at)
+             VALUES ('PRIVATE-KEY-' || ?1, 'PRIVATE-DIGEST', 'PRIVATE-ROUTINE', 'PRIVATE-RUN-' || ?1,
+                     'PRIVATE-ATTEMPT-' || ?1, 'PRIVATE-SESSION', 'run', '{\"PRIVATE\":1}',
+                     'PRIVATE-REASON', ?2, '2026-10-22T08:59:30Z', ?3)",
+            rusqlite::params![n, state, expires],
+        )
+        .unwrap();
+    }
+    let before = conn.total_changes();
+    let mut report = inspect(&conn, now).unwrap();
+    assert!(!serde_json::to_string(&report).unwrap().contains("PRIVATE"));
+    assert_eq!(conn.total_changes(), before);
+    report.validate().unwrap();
+    let leases = leases_fences(&mut report);
+    // Settled cancellations are not pending, whatever their lease.
+    for (fact, count) in CANCELLATION_FACTS.into_iter().zip([3, 1, 1, 1]) {
+        assert_eq!(leases.facts[&fact], count, "{fact:?}");
+    }
+
+    // Without the table, its gap follows every other lease gap, and the stop
+    // fences are still read.
+    conn.execute_batch("DROP TABLE automation_cancellations")
+        .unwrap();
+    let mut report = inspect(&conn, now).unwrap();
+    report.validate().unwrap();
+    let leases = leases_fences(&mut report);
+    assert!(CANCELLATION_FACTS
+        .iter()
+        .all(|fact| !leases.facts.contains_key(fact)));
+    assert_eq!(leases.facts[&Fact::StopFences], 0);
+    assert_eq!(
+        leases.gaps,
+        [
+            Gap::FenceConsistencyNotMeasured,
+            Gap::CancellationStoreUnavailable
+        ]
+    );
+    conn.execute_batch("DROP TABLE automation_stop_fences")
+        .unwrap();
+    let mut report = inspect(&conn, now).unwrap();
+    report.validate().unwrap();
+    assert_eq!(
+        leases_fences(&mut report).gaps,
+        [
+            Gap::FenceConsistencyNotMeasured,
+            Gap::StopFenceStoreUnavailable,
+            Gap::CancellationStoreUnavailable
+        ]
+    );
+}
+
+#[test]
+fn both_stop_ownership_gaps_keep_their_order() {
+    let (_root, conn) = fixture();
+    let original = inspect(&conn, Utc::now()).unwrap();
+    let stop_facts = [
+        Fact::StopFences,
+        Fact::ActiveStopFences,
+        Fact::ExpiredStopFences,
+        Fact::InvalidStopFenceExpiries,
+    ];
+    let without = |gaps: Vec<Gap>| {
+        let mut report = original.clone();
+        let leases = leases_fences(&mut report);
+        for fact in stop_facts.into_iter().chain(CANCELLATION_FACTS) {
+            leases.facts.remove(&fact);
+        }
+        leases.gaps = gaps;
+        report
+    };
+    without(vec![
+        Gap::FenceConsistencyNotMeasured,
+        Gap::StopFenceStoreUnavailable,
+        Gap::CancellationStoreUnavailable,
+    ])
+    .validate()
+    .unwrap();
+    for gaps in [
+        vec![
+            Gap::FenceConsistencyNotMeasured,
+            Gap::CancellationStoreUnavailable,
+            Gap::StopFenceStoreUnavailable,
+        ],
+        vec![
+            Gap::FenceConsistencyNotMeasured,
+            Gap::CancellationStoreUnavailable,
+            Gap::CancellationStoreUnavailable,
+        ],
+    ] {
+        assert!(without(gaps.clone()).validate().is_err(), "{gaps:?}");
+    }
+    // Cancellation facts are whole, and absent only beside their gap.
+    for variant in 0..3 {
+        let mut report = original.clone();
+        let leases = leases_fences(&mut report);
+        match variant {
+            0 => {
+                leases.facts.remove(&Fact::PendingCancellations);
+            }
+            1 => {
+                leases.facts.insert(Fact::ExpiredPendingCancellations, 1);
+            }
+            _ => leases.gaps.push(Gap::CancellationStoreUnavailable),
+        }
+        assert!(report.validate().is_err(), "forged cancellations {variant}");
+    }
+}
+
+#[test]
+fn stop_ownership_gaps_follow_every_lease_scope() {
+    for (occurrences, authority) in [(true, false), (false, true), (true, true)] {
+        let (_root, conn) = fixture();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        if occurrences {
+            conn.execute_batch("DROP TABLE main.automation_occurrences")
+                .unwrap();
+        }
+        if authority {
+            conn.execute_batch("DROP TABLE main.automation_scheduler_authority")
+                .unwrap();
+        }
+        conn.execute_batch(
+            "DROP TABLE main.automation_stop_fences;
+             DROP TABLE main.automation_cancellations;
+             PRAGMA foreign_keys=ON",
+        )
+        .unwrap();
+        let mut report = inspect(&conn, Utc::now()).unwrap();
+        report
+            .validate()
+            .unwrap_or_else(|error| panic!("{occurrences} {authority}: {error}"));
+        let leases = leases_fences(&mut report);
+        let (scope, ownership) = leases.gaps.split_at(leases.gaps.len() - 2);
+        assert_eq!(
+            ownership,
+            [
+                Gap::StopFenceStoreUnavailable,
+                Gap::CancellationStoreUnavailable
+            ]
+        );
+        assert_ne!(scope, [Gap::FenceConsistencyNotMeasured], "{scope:?}");
+        assert!(leases
+            .facts
+            .keys()
+            .all(|fact| !CANCELLATION_FACTS.contains(fact)
+                && !matches!(
+                    fact,
+                    Fact::StopFences
+                        | Fact::ActiveStopFences
+                        | Fact::ExpiredStopFences
+                        | Fact::InvalidStopFenceExpiries
+                )));
     }
 }
