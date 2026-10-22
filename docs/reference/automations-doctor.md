@@ -59,7 +59,7 @@ incomplete.
 | `last_successful_pass` | Latest pass success and retained successful completion time, when observed | Success before instrumentation when no successful observation survives |
 | `store` | Automations table count, required-object presence/form counts, and recorded contract-migration timestamp/counters, when valid | Expected schema, other migrations, current row verifiability and integrity verification |
 | `queue` | Stored states, due planned rows and scheduler-eligible candidates at the observation cutoff | Runtime authority admission is not proven by scheduler eligibility |
-| `leases_fences` | Lease-bearing total, active/expired/missing/invalid expiry counts, leases outside claimed/running states, recorded authority presence, and mismatched unlaunched scheduler claims | Process liveness and complete attempt-fence consistency |
+| `leases_fences` | Lease-bearing total, active/expired/missing/invalid expiry counts, leases outside claimed/running states, recorded authority presence, mismatched unlaunched scheduler claims, and run stop fences by lease | Process liveness, complete attempt-fence consistency and each stop's outcome |
 | `planning_start_lag` | Latest pass duration/start lag and bounded retained scheduled-occurrence planning delay, when observed | Actual runtime-start lag, full recovery/history evidence and ratified SLO comparisons |
 | `repeated_failures` | Quarantine, failed attempts, retry exhaustion and retained failed occurrences since latest retained success | Strict consecutive-occurrence streaks, full history and historical classification |
 | `authority_refusals` | Launch-refused and unsupported-authority attempt counts | Complete identity, authority and approval refusal evidence |
@@ -182,6 +182,34 @@ do not establish full storage integrity or bounded whole-read resource use.
 A measured zero does not grant recovery permission or prove scheduler liveness.
 An expired lease on a running occurrence does not authorize settlement or a
 repeat launch. Inspect correlated run and attempt evidence first.
+
+Run stop fences are counted from the main `automation_stop_fences` table, which
+holds one row for each run whose stop a cancellation, a timeout or a recovery
+owns. `stop_fences` is partitioned by each fence's lease, with the same bounded
+timestamp classifier, into `active_stop_fences`, `expired_stop_fences` (a lease
+at or before the observation instant) and `invalid_stop_fence_expiries` (a
+missing, malformed, oversized or non-text lease). Only the lease is read; run,
+session, owner and operation key are not. A missing table or lease column, or a
+view in the table's place, reports `stop_fence_store_unavailable` after every
+other lease gap and omits all four counts; a TEMP object cannot supply them.
+The CLI rejects a partition that does not sum to the total or exceeds the
+safe-integer range, a report that omits the four without that gap, any of them
+beside it, or the gap anywhere but last.
+
+Settlement skips a run that holds a fence while its attempt is not `ambiguous`,
+so a run whose session has already ended can still count as running in `queue`.
+One case moves: once a `timeout` or `recovery` fence's lease has expired over a
+session that has ended, the next pass marks the attempt `ambiguous` and the
+occurrence `recovery_required`. That records an unknown stop outcome, not a
+confirmed one. An expired `cancellation` fence is left to the cancellation
+reconciler instead. A fence is released when its owner settles the run, when a
+later settlement finishes the run's `ambiguous` attempt, whoever owns the
+fence, or when `occurrence.recover.v1` records a determination for that run. An
+expired fence can therefore still be counted beside an occurrence that already
+needs recovery. A lease the scheduler cannot read fails its settlement step
+when it reaches that run's fence, which leaves later runs unsettled and that
+pass's results undelivered. None of these counts authorizes clearing a fence or
+stopping a session again.
 
 Receipt counting independently requires the main `automation_receipts` table.
 If that table is missing or replaced by a view, `delivery_receipts` reports
@@ -649,6 +677,7 @@ categories can still help investigate, but cannot fill the missing category.
 | --- | --- |
 | Assigned leader, no recent successful pass, or growing eligible work | Run `coven automations status --json` and compare pass timestamps and gaps. Assigned metadata does not prove the process is live; a failed latest pass does not erase a retained earlier success. Do not infer a ratified lag violation from these observations alone. |
 | Expired leases, missing/invalid expiry, or mismatched unlaunched claims | Check `coven automations leases --help` and inspect supported pages. For an already known occurrence ID, run `coven automations occurrence <occurrence-id> --json`, then inspect its run and attempts. Expiry or generation mismatch alone does not authorize takeover, settlement or another external effect. |
+| Held, expired or unreadable stop fences | Inspect the known run and its attempts. A held fence means a cancellation, a timeout or a recovery owns that run's stop. An expired one means its owner did not finish; check whether the occurrence already needs recovery. An unreadable lease blocks the scheduler's settlement step; preserve the report and the daemon's diagnostics. Do not delete a fence or stop the session again; follow the supported cancellation or `occurrence.recover.v1` path. |
 | Failed attempts, quarantine, or retry exhaustion | Inspect the known occurrence, run and attempts. A retained failure total is not a consecutive failure streak; exhaustion counters are not occurrence-failure counters. Preserve that distinction before assessing repetition or a retry policy. |
 | Pending/failed delivery or inconsistent receipt links | Inspect the known run and attempts, preserving their terminal states and correlation. A reciprocal index link is not authenticated receipt content or proof of the external effect. If delivery outcome is ambiguous, require the supported reconciliation path before another dispatch. |
 | Authority refusal, unsupported authority, or absent identity/approval evidence | Retain the refusal codes and compare the approved authority contract. No recorded refusal does not prove approval-service availability. Permission or provider changes require their existing approval gate. |

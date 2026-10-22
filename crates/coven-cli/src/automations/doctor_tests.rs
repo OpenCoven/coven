@@ -6308,3 +6308,127 @@ fn failed_history_and_claimed_subsets_share_the_total_occurrence_cap() {
             .expect("incomplete failure scan cannot invent a disjoint failed cohort");
     }
 }
+
+fn leases_fences(report: &mut Report) -> &mut Observation {
+    report
+        .observations
+        .iter_mut()
+        .find(|o| o.category == Category::LeasesFences)
+        .unwrap()
+}
+
+#[test]
+fn stop_fences_are_counted_by_lease_without_their_identities() {
+    let (_root, conn) = fixture();
+    let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 10, 22, 9, 0, 0).unwrap();
+    conn.execute_batch(
+        "INSERT INTO automation_stop_fences
+            (run_id, session_id, owner, operation_key, acquired_at, execution_expires_at) VALUES
+         ('PRIVATE-RUN-A', 'PRIVATE-SESSION-A', 'cancellation', 'PRIVATE-KEY',
+          '2026-10-22T08:59:00Z', '2026-10-22T09:00:30Z'),
+         ('PRIVATE-RUN-B', 'PRIVATE-SESSION-B', 'timeout', NULL,
+          '2026-10-22T08:59:00Z', '2026-10-22T09:00:00Z'),
+         ('PRIVATE-RUN-C', 'PRIVATE-SESSION-C', 'recovery', NULL,
+          '2026-10-22T08:59:00Z', 'PRIVATE-LEASE'),
+         ('PRIVATE-RUN-D', 'PRIVATE-SESSION-D', 'timeout', NULL,
+          '2026-10-22T08:59:00Z', CAST('2026-10-22T09:00:30Z' AS BLOB))",
+    )
+    .unwrap();
+    let before = conn.total_changes();
+    let mut report = inspect(&conn, now).unwrap();
+    let text = serde_json::to_string(&report).unwrap();
+    assert!(!text.contains("PRIVATE"));
+    assert_eq!(conn.total_changes(), before);
+    let leases = leases_fences(&mut report);
+    // Held at the instant its lease ends, a fence has expired.
+    for (fact, count) in [
+        (Fact::StopFences, 4),
+        (Fact::ActiveStopFences, 1),
+        (Fact::ExpiredStopFences, 1),
+        (Fact::InvalidStopFenceExpiries, 2),
+    ] {
+        assert_eq!(leases.facts[&fact], count, "{fact:?}");
+    }
+    assert_eq!(leases.gaps, [Gap::FenceConsistencyNotMeasured]);
+
+    // Without the main table, the gap stands in for every stop-fence fact,
+    // and the occurrence leases are still read.
+    conn.execute_batch("DROP TABLE automation_stop_fences")
+        .unwrap();
+    let mut report = inspect(&conn, now).unwrap();
+    let leases = leases_fences(&mut report);
+    assert!(!leases.facts.contains_key(&Fact::StopFences));
+    assert_eq!(leases.facts[&Fact::LeaseBearingOccurrences], 0);
+    assert_eq!(
+        leases.gaps,
+        [
+            Gap::FenceConsistencyNotMeasured,
+            Gap::StopFenceStoreUnavailable
+        ]
+    );
+}
+
+#[test]
+fn stop_fence_facts_are_whole_or_replaced_by_their_gap() {
+    let (_root, conn) = fixture();
+    let original = inspect(&conn, Utc::now()).unwrap();
+    let stop_facts = [
+        Fact::StopFences,
+        Fact::ActiveStopFences,
+        Fact::ExpiredStopFences,
+        Fact::InvalidStopFenceExpiries,
+    ];
+    for variant in 0..7 {
+        let mut report = original.clone();
+        let leases = leases_fences(&mut report);
+        match variant {
+            0 => {
+                leases.facts.remove(&Fact::StopFences);
+            }
+            1 => {
+                leases.facts.insert(Fact::ActiveStopFences, 1);
+            }
+            2 => {
+                leases.facts.insert(Fact::StopFences, 1);
+            }
+            3 => leases.gaps.push(Gap::StopFenceStoreUnavailable),
+            // Facts beyond the safe-integer range that still add up.
+            6 => {
+                leases.facts.insert(Fact::StopFences, MAX_SAFE + 1);
+                leases.facts.insert(Fact::ActiveStopFences, MAX_SAFE + 1);
+            }
+            // No report omits them silently: no release predates them.
+            4 => {
+                for fact in stop_facts {
+                    leases.facts.remove(&fact);
+                }
+            }
+            _ => {
+                for fact in stop_facts {
+                    leases.facts.remove(&fact);
+                }
+                leases.gaps.insert(0, Gap::StopFenceStoreUnavailable);
+            }
+        }
+        assert!(report.validate().is_err(), "forged stop fences {variant}");
+    }
+    // The gap alone, after the lease gaps, is a whole report.
+    for lease_gaps in [
+        vec![Gap::FenceConsistencyNotMeasured],
+        vec![Gap::LeaseStateUnavailable],
+    ] {
+        let mut report = original.clone();
+        let leases = leases_fences(&mut report);
+        for fact in stop_facts {
+            leases.facts.remove(&fact);
+        }
+        if lease_gaps == [Gap::LeaseStateUnavailable] {
+            leases
+                .facts
+                .remove(&Fact::LeaseOutsideActiveStateOccurrences);
+        }
+        leases.gaps = lease_gaps;
+        leases.gaps.push(Gap::StopFenceStoreUnavailable);
+        report.validate().unwrap();
+    }
+}

@@ -609,6 +609,14 @@ A temporary SQLite string/BLOB/record limit of at most 256 KiB is restored on
 all return paths and never raises a stricter caller limit. Older reports with
 `receipt_integrity_not_verified` remain incomplete and cannot claim these facts.
 
+`leases_fences` also counts run stop fences by lease: `stop_fences`,
+`active_stop_fences`, `expired_stop_fences` and `invalid_stop_fence_expiries`.
+Only each fence's bounded text lease timestamp is read from the main table. A
+missing table or lease column, or a view in the table's place, reports
+`stop_fence_store_unavailable` as the last lease gap and omits all four counts.
+Otherwise all four are required, and the three lease counts must sum to a
+total within the safe-integer range.
+
 This initial diagnostic contract explicitly reports incomplete evidence. It has
 no aggregate health or certification bit. See the [doctor runbook](reference/automations-doctor.md)
 for each category's scope and remaining checks. The complete doctor outcome in
