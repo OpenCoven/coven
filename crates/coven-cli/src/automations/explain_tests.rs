@@ -83,6 +83,10 @@ fn seed(conn: &Connection) -> Vec<(&'static str, Vec<Code>)> {
         ("foreign-id", "ACTIVE"),
         ("unreadable-created", "ACTIVE"),
         ("unreadable-updated", "ACTIVE"),
+        ("unreadable-history", "ACTIVE"),
+        ("paused-unreadable-history", "PAUSED"),
+        ("unreadable-created-and-history", "ACTIVE"),
+        ("quarantined-unreadable-history", "ACTIVE"),
     ] {
         insert_definition_at(conn, &definition(id, status), "2026-10-01T00:00:00.000Z").unwrap();
     }
@@ -104,13 +108,26 @@ fn seed(conn: &Connection) -> Vec<(&'static str, Vec<Code>)> {
               WHERE id = 'active')
              WHERE id = 'foreign-id';
          UPDATE automation_definitions SET created_at = 'PRIVATE' WHERE id = 'unreadable-created';
-         UPDATE automation_definitions SET updated_at = 'PRIVATE' WHERE id = 'unreadable-updated';",
+         UPDATE automation_definitions SET updated_at = 'PRIVATE' WHERE id = 'unreadable-updated';
+         -- The latest scheduled slot of the current revision, which planning
+         -- reads before it plans, is unreadable.
+         INSERT INTO automation_occurrences
+             (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+              state, attempt, created_at, updated_at)
+         SELECT id || '-history', id, revision, definition_digest, 'PRIVATE', 'scheduled',
+                'skipped', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z'
+         FROM automation_definitions
+         WHERE id IN ('unreadable-history', 'paused-unreadable-history',
+                      'unreadable-created-and-history', 'quarantined-unreadable-history');
+         UPDATE automation_definitions SET created_at = 'PRIVATE'
+             WHERE id = 'unreadable-created-and-history';",
     )
     .unwrap();
     for id in [
         "quarantined",
         "paused-quarantined",
         "unreadable-paused-quarantined",
+        "quarantined-unreadable-history",
     ] {
         quarantine(conn, id);
     }
@@ -136,6 +153,18 @@ fn seed(conn: &Connection) -> Vec<(&'static str, Vec<Code>)> {
         ("foreign-id", vec![DefinitionUnavailable]),
         ("unreadable-created", vec![DefinitionUnavailable]),
         ("unreadable-updated", vec![DefinitionUnavailable]),
+        ("unreadable-history", vec![ScheduleHistoryUnreadable]),
+        // Nor its schedule history.
+        ("paused-unreadable-history", vec![NotActive]),
+        // An unreadable creation time does not keep planning from the history.
+        (
+            "unreadable-created-and-history",
+            vec![DefinitionUnavailable, ScheduleHistoryUnreadable],
+        ),
+        (
+            "quarantined-unreadable-history",
+            vec![Quarantined, ScheduleHistoryUnreadable],
+        ),
     ]
 }
 
@@ -177,7 +206,9 @@ fn every_blocking_condition_is_listed_in_order_and_hides_the_slot() {
                     NextStep::ReviewFailureThenUnquarantine,
                     Some("2026-10-21T09:00:00.000Z"),
                 ),
-                Code::DefinitionUnavailable => (NextStep::ReviseDefinition, None),
+                Code::DefinitionUnavailable | Code::ScheduleHistoryUnreadable => {
+                    (NextStep::ReviseDefinition, None)
+                }
                 Code::NextSlot => (NextStep::None, Some("2026-10-23T09:00:00.000Z")),
             };
             assert_eq!(condition.next_step, step, "{id}");
@@ -217,7 +248,7 @@ fn planning_at_each_reported_slot_schedules_exactly_the_explained_routines() {
     let mut statement = conn
         .prepare(
             "SELECT automation_id, scheduled_for FROM automation_occurrences
-             WHERE kind = 'scheduled' ORDER BY automation_id",
+             WHERE kind = 'scheduled' AND state = 'planned' ORDER BY automation_id",
         )
         .unwrap();
     let planned = statement
@@ -277,6 +308,26 @@ fn quarantine_failure_classes_are_bounded_tokens() {
 fn temporary_tables_cannot_shadow_the_explained_routine() {
     let (_temp, conn) = store();
     insert_definition(&conn, &definition("daily", "ACTIVE")).unwrap();
+    insert_definition(&conn, &definition("broken", "ACTIVE")).unwrap();
+    let unreadable_history = |table: &str, id: &str| {
+        format!(
+            "INSERT INTO {table}
+                 (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                  kind, state, attempt, created_at, updated_at)
+             SELECT id || '-history', id, revision, definition_digest, 'PRIVATE',
+                    'scheduled', 'skipped', 1, created_at, created_at
+             FROM main.automation_definitions WHERE id = '{id}';"
+        )
+    };
+    conn.execute_batch(&unreadable_history("main.automation_occurrences", "broken"))
+        .unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE automation_occurrences AS SELECT * FROM main.automation_occurrences;
+         DELETE FROM temp.automation_occurrences;
+         {}",
+        unreadable_history("temp.automation_occurrences", "daily")
+    ))
+    .unwrap();
     conn.execute_batch(
         "CREATE TEMP TABLE automation_definitions AS SELECT * FROM main.automation_definitions;
          UPDATE temp.automation_definitions SET status = 'PAUSED';
@@ -289,6 +340,10 @@ fn temporary_tables_cannot_shadow_the_explained_routine() {
     )
     .unwrap();
     assert_eq!(codes(&found(&conn, "daily")), [Code::NextSlot]);
+    assert_eq!(
+        codes(&found(&conn, "broken")),
+        [Code::ScheduleHistoryUnreadable]
+    );
 }
 
 #[test]
@@ -461,6 +516,7 @@ fn work_lists_the_occurrences_the_claim_gate_counts_and_no_others() {
     let (_temp, conn) = store();
     for id in ["daily", "other"] {
         insert_definition_at(&conn, &definition(id, "ACTIVE"), "2026-10-01T00:00:00.000Z").unwrap();
+        fence_due_slot(&conn, id);
     }
     for (id, day, state) in [
         ("o-planned", 21, "planned"),
@@ -743,6 +799,248 @@ fn work_holds_claims_exactly_when_the_scheduler_will_not_claim_a_due_occurrence(
     }
 }
 
+/// Records today's slot as already scheduled, so no slot is due unplanned.
+fn fence_due_slot(conn: &Connection, routine: &str) {
+    conn.execute(
+        "INSERT INTO automation_occurrences
+            (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+             state, attempt, created_at, updated_at)
+         SELECT id || '-fenced', id, revision, definition_digest, '2026-10-22T09:00:00.000Z',
+                'scheduled', 'succeeded', 1, created_at, created_at
+         FROM automation_definitions WHERE id = ?1",
+        [routine],
+    )
+    .unwrap();
+}
+
+fn planned_occurrence(conn: &Connection, routine: &str) -> String {
+    conn.query_row(
+        "SELECT id FROM automation_occurrences WHERE automation_id = ?1 AND state = 'planned'",
+        [routine],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn adopted_attempt(conn: &Connection, run: &str, not_before: &str) {
+    conn.execute(
+        "INSERT INTO automation_attempts
+            (id, run_id, occurrence_id, attempt_number, adoption_key,
+             occurrence_fence_generation, state, retry_classification, not_before, opened_at)
+         SELECT ?1 || '-attempt', ?1, occurrence_id, 1, ?1 || '-key', 1, 'adopted', 'initial',
+                ?2, '2026-10-21T09:00:00.000Z'
+         FROM automation_runs WHERE id = ?1",
+        rusqlite::params![run, not_before],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_scheduler_pass_claims_exactly_the_occurrences_explained_as_eligible_now() {
+    let (_temp, conn) = store();
+    let routines = [
+        "ready",
+        "paused-after",
+        "quarantined-after",
+        "stale-after",
+        "unreadable-created-after",
+        "unreadable-history-after",
+        "held",
+        "ready-retry-paused",
+        "ready-retry",
+        "waiting-retry",
+        "divergent-after",
+        "foreign-after",
+        "revised-after",
+        "manual-after",
+        "future-after",
+        "settled-after",
+        "fenced-after",
+        "taken-after",
+    ];
+    for id in routines {
+        insert_definition_at(&conn, &definition(id, "ACTIVE"), "2026-10-01T00:00:00.000Z").unwrap();
+    }
+    // The production planner plans each routine's latest due slot a day
+    // before the pass, so the pass fences a newer slot; the store then changes
+    // under the planned occurrences.
+    crate::automations::occurrences::tick_planning(&conn, now() - chrono::Duration::days(1))
+        .unwrap();
+    for id in routines {
+        assert_eq!(found(&conn, id).work.len(), 1, "{id}");
+    }
+    conn.execute_batch(
+        "UPDATE automation_definitions SET status = 'PAUSED'
+             WHERE id IN ('paused-after', 'ready-retry-paused');
+         UPDATE automation_definitions SET definition_digest = printf('%064d', 0)
+             WHERE id = 'stale-after';
+         UPDATE automation_definitions SET created_at = 'PRIVATE'
+             WHERE id = 'unreadable-created-after';
+         -- Planning's cursor starts at the revision time, after today's slot.
+         UPDATE automation_definitions SET updated_at = '2026-10-22T09:30:00.000Z'
+             WHERE id = 'revised-after';
+         INSERT INTO automation_occurrences
+             (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+              state, attempt, created_at, updated_at)
+         SELECT id || '-history', id, revision, definition_digest, 'PRIVATE', 'scheduled',
+                'skipped', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z'
+         FROM automation_definitions WHERE id = 'unreadable-history-after';
+         -- Planning loads a definition whose own id names another routine.
+         UPDATE automation_definitions SET (definition_json, definition_digest) =
+             (SELECT definition_json, definition_digest FROM automation_definitions
+              WHERE id = 'ready')
+             WHERE id = 'foreign-after';
+         -- A recovered manual occurrence, due after today's slot, supersedes it.
+         INSERT INTO automation_occurrences
+             (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+              state, attempt, created_at, updated_at)
+         SELECT 'o-manual', id, revision, definition_digest,
+                '2026-10-22T09:30:00.000000000Z', 'manual', 'planned', 1,
+                '2026-10-22T09:30:00.000Z', '2026-10-22T09:30:00.000Z'
+         FROM automation_definitions WHERE id = 'manual-after';
+         -- Neither an occurrence not yet due nor a settled one supersedes it.
+         INSERT INTO automation_occurrences
+             (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+              state, attempt, created_at, updated_at)
+         SELECT 'o-' || id, id, revision, definition_digest,
+                CASE id WHEN 'future-after' THEN '2026-10-22T11:00:00.000000000Z'
+                        ELSE '2026-10-22T09:30:00.000000000Z' END,
+                'manual', CASE id WHEN 'future-after' THEN 'planned' ELSE 'failed' END, 1,
+                '2026-10-22T09:30:00.000Z', '2026-10-22T09:30:00.000Z'
+         FROM automation_definitions WHERE id IN ('future-after', 'settled-after');",
+    )
+    .unwrap();
+    // A row of another digest already holds today's slot: under the id
+    // planning derives, which fences it, or under another id, which fails
+    // planning for the routine.
+    let today_millis = Utc
+        .with_ymd_and_hms(2026, 10, 22, 9, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    for (routine, id) in [
+        ("fenced-after", format!("fenced-after-{today_millis}")),
+        ("taken-after", "o-taken".to_string()),
+    ] {
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             VALUES (?1, ?2, 1, printf('%064d', 1), '2026-10-22T09:00:00.000Z',
+                     'scheduled', 'skipped', 1, '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z')",
+            [id.as_str(), routine],
+        )
+        .unwrap();
+    }
+    // The stored status stays ACTIVE; the definition itself says PAUSED.
+    let paused = definition("divergent-after", "PAUSED");
+    crate::automations::store::update_definition(&conn, &paused).unwrap();
+    conn.execute(
+        "UPDATE automation_definitions SET status = 'ACTIVE' WHERE id = 'divergent-after'",
+        [],
+    )
+    .unwrap();
+    quarantine(&conn, "quarantined-after");
+    occurrence(&conn, "o-held", "held", 20, "claimed");
+    for (routine, not_before) in [
+        ("ready-retry-paused", "2026-10-22T09:30:00.000Z"),
+        ("ready-retry", "2026-10-22T09:30:00.000Z"),
+        ("waiting-retry", "2026-10-22T11:00:00.000Z"),
+    ] {
+        let planned = planned_occurrence(&conn, routine);
+        let run = format!("r-{routine}");
+        run_keyed(&conn, &run, routine, Some(&planned), "running", false);
+        adopted_attempt(&conn, &run, not_before);
+    }
+
+    // A pass claims each eligible occurrence, and the slot it plans unless
+    // something holds the routine's claims.
+    let planned = Utc.with_ymd_and_hms(2026, 10, 22, 9, 0, 0).unwrap();
+    let (mut predicted, mut listed) = (Vec::new(), Vec::new());
+    for id in routines {
+        let work = found(&conn, id).work;
+        let holds = work.iter().any(|item| item.holds_claims);
+        for item in &work {
+            match item.code {
+                WorkCode::EligibleNow => {
+                    predicted.push(item.occurrence_id.clone().unwrap());
+                }
+                WorkCode::DueUnplanned if !holds => {
+                    predicted.push(format!("{id}-{}", planned.timestamp_millis()));
+                }
+                WorkCode::DueUnplanned => {}
+                _ => continue,
+            }
+            assert!(!item.holds_claims, "{id}");
+            assert_eq!(item.next_step, NextStep::AwaitSchedulerPass, "{id}");
+            listed.push((id, item.code, item.at.clone().unwrap()));
+        }
+    }
+    // The superseded slot of `ready` is not listed, nor the slot `o-manual`
+    // supersedes; a retry's slot is, and its run keeps the planned slot from
+    // being claimed.
+    let (yesterday, today) = ("2026-10-21T09:00:00.000Z", "2026-10-22T09:00:00.000Z");
+    assert_eq!(
+        listed,
+        [
+            ("ready", WorkCode::DueUnplanned, today),
+            ("unreadable-created-after", WorkCode::EligibleNow, yesterday),
+            ("held", WorkCode::DueUnplanned, today),
+            ("ready-retry-paused", WorkCode::EligibleNow, yesterday),
+            ("ready-retry", WorkCode::EligibleNow, yesterday),
+            ("ready-retry", WorkCode::DueUnplanned, today),
+            ("waiting-retry", WorkCode::DueUnplanned, today),
+            ("revised-after", WorkCode::EligibleNow, yesterday),
+            (
+                "manual-after",
+                WorkCode::EligibleNow,
+                "2026-10-22T09:30:00.000Z"
+            ),
+            ("future-after", WorkCode::DueUnplanned, today),
+            ("settled-after", WorkCode::DueUnplanned, today),
+            ("fenced-after", WorkCode::EligibleNow, yesterday),
+        ]
+        .map(|(id, code, at)| (id, code, at.to_string()))
+    );
+    assert_eq!(codes(&found(&conn, "divergent-after")), [Code::NotActive]);
+    assert_eq!(
+        codes(&found(&conn, "unreadable-history-after")),
+        [Code::ScheduleHistoryUnreadable]
+    );
+    predicted.sort();
+
+    let mut claimed = crate::automations::occurrences::tick(&conn, now())
+        .unwrap()
+        .claimed;
+    claimed.sort();
+    assert_eq!(claimed, predicted);
+}
+
+#[test]
+fn an_eligible_occurrence_precedes_recovery_that_holds_nothing() {
+    let (_temp, conn) = store();
+    insert_definition_at(
+        &conn,
+        &definition("daily", "ACTIVE"),
+        "2026-10-01T00:00:00.000Z",
+    )
+    .unwrap();
+    fence_due_slot(&conn, "daily");
+    occurrence(&conn, "o-recovery", "daily", 1, "recovery_required");
+    occurrence(&conn, "o-due", "daily", 21, "planned");
+    let work = work_of(&conn, "daily");
+    assert_eq!(
+        work,
+        json!([
+            {"code": "eligible_now", "occurrenceId": "o-due", "at": "2026-10-21T09:00:00.000Z",
+             "holdsClaims": false, "nextStep": "await_scheduler_pass"},
+            {"code": "recovery_required", "occurrenceId": "o-recovery",
+             "at": "2026-10-01T09:00:00.000Z", "holdsClaims": false,
+             "nextStep": "recover_occurrence"}
+        ])
+    );
+}
+
 #[test]
 fn each_recovery_item_names_the_step_recovery_takes() {
     let (_temp, conn) = store();
@@ -867,6 +1165,7 @@ fn unreadable_scheduled_times_are_omitted_without_failing_the_explanation() {
         "2026-10-01T00:00:00.000Z",
     )
     .unwrap();
+    fence_due_slot(&conn, "daily");
     for (id, day) in [
         ("o-not-utf8", 1),
         ("o-blob", 2),
@@ -931,6 +1230,7 @@ fn work_that_holds_claims_comes_first_even_when_truncated() {
         "2026-10-01T00:00:00.000Z",
     )
     .unwrap();
+    fence_due_slot(&conn, "daily");
     for day in 1..=21 {
         occurrence(
             &conn,
@@ -980,6 +1280,7 @@ fn work_is_bounded_and_unreadable_ids_are_omitted() {
         "2026-10-01T00:00:00.000Z",
     )
     .unwrap();
+    fence_due_slot(&conn, "daily");
     for day in 1..=MAX_WORK as u32 {
         occurrence(
             &conn,
@@ -1004,6 +1305,7 @@ fn work_is_bounded_and_unreadable_ids_are_omitted() {
         "2026-10-01T00:00:00.000Z",
     )
     .unwrap();
+    fence_due_slot(&conn, "daily");
     occurrence(&conn, "PRIVATE\u{7}", "daily", 1, "claimed");
     occurrence(
         &conn,
@@ -1070,12 +1372,34 @@ fn temporary_tables_cannot_add_or_hide_work() {
         "2026-10-01T00:00:00.000Z",
     )
     .unwrap();
+    fence_due_slot(&conn, "daily");
     occurrence(&conn, "o-running", "daily", 19, "running");
     run(&conn, "r-running", "o-running", "running");
     // Its claim hold rests only on the run, so a shadowed run read would show.
     occurrence(&conn, "o-recovery", "daily", 18, "recovery_required");
     run(&conn, "r-recovery", "o-recovery", "running");
     run_keyed(&conn, "r-orphan", "daily", None, "running", false);
+    // A ready retry on an older planned occurrence stays eligible beside the
+    // slot a pass fences first, which rests on its running run.
+    insert_definition_at(
+        &conn,
+        &definition("retrying", "ACTIVE"),
+        "2026-10-01T00:00:00.000Z",
+    )
+    .unwrap();
+    occurrence(&conn, "o-retrying", "retrying", 21, "planned");
+    run(&conn, "r-retrying", "o-retrying", "running");
+    adopted_attempt(&conn, "r-retrying", "2026-10-22T09:30:00.000Z");
+    let retrying = work_of(&conn, "retrying");
+    assert_eq!(
+        retrying
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["code"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["running_run", "eligible_now", "due_unplanned"]
+    );
     // Recovery's refusals are read from three more tables.
     occurrence(&conn, "o-cancelling", "daily", 16, "recovery_required");
     run(&conn, "r-cancelling", "o-cancelling", "running");
@@ -1103,7 +1427,9 @@ fn temporary_tables_cannot_add_or_hide_work() {
         "CREATE TEMP TABLE automation_occurrences AS SELECT * FROM main.automation_occurrences;
          UPDATE temp.automation_occurrences SET state = 'succeeded';
          INSERT INTO temp.automation_occurrences (id, automation_id, scheduled_for, state)
-             VALUES ('o-shadow', 'daily', '2026-10-20T09:00:00.000Z', 'claimed');
+             VALUES ('o-shadow', 'daily', '2026-10-20T09:00:00.000Z', 'claimed'),
+                    ('o-shadow-later', 'retrying', '2026-10-22T09:30:00.000Z', 'planned'),
+                    ('retrying-1792659600000', 'retrying', '2026-10-22T09:00:00.000Z', 'skipped');
          CREATE TEMP TABLE automation_runs AS SELECT * FROM main.automation_runs;
          UPDATE temp.automation_runs SET status = 'failed', id = 'r-shadow';
          CREATE TEMP TABLE automation_cancellations AS
@@ -1114,4 +1440,5 @@ fn temporary_tables_cannot_add_or_hide_work() {
     )
     .unwrap();
     assert_eq!(work_of(&conn, "daily"), expected);
+    assert_eq!(work_of(&conn, "retrying"), retrying);
 }
