@@ -60,6 +60,9 @@ pub enum MobileAuditEvent {
     IntroductionPolicyReplaced,
     IntroductionPolicyRejected,
     IntroductionPolicyUncertain,
+    AccessRecovered,
+    AccessRecoveryRejected,
+    AccessRecoveryUncertain,
     DeviceRenamed,
     DeviceSuspended,
     DeviceResumed,
@@ -218,7 +221,14 @@ pub(super) fn append_introduction_event(
         transition.transition_id,
         &MobileAuditRecord {
             timestamp: transition.occurred_at,
-            event: MobileAuditEvent::DeviceIntroduced,
+            event: match transition.kind {
+                super::introduction::TransitionKind::Introduction => {
+                    MobileAuditEvent::DeviceIntroduced
+                }
+                super::introduction::TransitionKind::AccessRecovery => {
+                    MobileAuditEvent::AccessRecovered
+                }
+            },
             device_id: None,
             transition_id: Some(transition.transition_id),
             source_device_id: None,
