@@ -1,0 +1,412 @@
+{
+  "schemaVersion": "coven.automations.event-feed-process-crash-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "killed-inside-second-claim",
+      "boundary": "inside_claim",
+      "definitions": [
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-first",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        },
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-second",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        }
+      ],
+      "expected": {
+        "initialOutcome": "terminated",
+        "feedAfterExit": [
+          "first:occurrence:planned",
+          "first:occurrence:claimed",
+          "second:occurrence:planned"
+        ],
+        "checkpointsAfterExit": 1,
+        "deliveredPages": 1,
+        "deliveredEvents": 2,
+        "deliveredCheckpointsDurable": true,
+        "resumedEvents": 14,
+        "feedEvents": 16,
+        "firstOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "secondOccurrencePath": [
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "firstRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "secondRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "exactlyOnce": true,
+        "resumePathsAgree": true,
+        "resumeRefused": false,
+        "streamsContiguous": true,
+        "finalResumeEmpty": true,
+        "launches": 2,
+        "integrityOk": true
+      }
+    },
+    {
+      "caseId": "killed-after-second-claim-commit",
+      "boundary": "after_claim_commit",
+      "definitions": [
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-first",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        },
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-second",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        }
+      ],
+      "expected": {
+        "initialOutcome": "terminated",
+        "feedAfterExit": [
+          "first:occurrence:planned",
+          "first:occurrence:claimed",
+          "second:occurrence:planned",
+          "second:occurrence:claimed"
+        ],
+        "checkpointsAfterExit": 1,
+        "deliveredPages": 1,
+        "deliveredEvents": 2,
+        "deliveredCheckpointsDurable": true,
+        "resumedEvents": 16,
+        "feedEvents": 18,
+        "firstOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "secondOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "firstRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "secondRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "exactlyOnce": true,
+        "resumePathsAgree": true,
+        "resumeRefused": false,
+        "streamsContiguous": true,
+        "finalResumeEmpty": true,
+        "launches": 2,
+        "integrityOk": true
+      }
+    },
+    {
+      "caseId": "killed-inside-checkpoint-read",
+      "boundary": "inside_checkpoint",
+      "definitions": [
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-first",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        },
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-second",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        }
+      ],
+      "expected": {
+        "initialOutcome": "terminated",
+        "feedAfterExit": [
+          "first:occurrence:planned",
+          "first:occurrence:claimed",
+          "second:occurrence:planned",
+          "second:occurrence:claimed"
+        ],
+        "checkpointsAfterExit": 1,
+        "deliveredPages": 1,
+        "deliveredEvents": 2,
+        "deliveredCheckpointsDurable": true,
+        "resumedEvents": 16,
+        "feedEvents": 18,
+        "firstOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "secondOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "firstRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "secondRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "exactlyOnce": true,
+        "resumePathsAgree": true,
+        "resumeRefused": false,
+        "streamsContiguous": true,
+        "finalResumeEmpty": true,
+        "launches": 2,
+        "integrityOk": true
+      }
+    },
+    {
+      "caseId": "killed-after-checkpoint-commit",
+      "boundary": "after_checkpoint_commit",
+      "definitions": [
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-first",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        },
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-second",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        }
+      ],
+      "expected": {
+        "initialOutcome": "terminated",
+        "feedAfterExit": [
+          "first:occurrence:planned",
+          "first:occurrence:claimed",
+          "second:occurrence:planned",
+          "second:occurrence:claimed"
+        ],
+        "checkpointsAfterExit": 2,
+        "deliveredPages": 1,
+        "deliveredEvents": 2,
+        "deliveredCheckpointsDurable": true,
+        "resumedEvents": 16,
+        "feedEvents": 18,
+        "firstOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "secondOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "firstRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "secondRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "exactlyOnce": true,
+        "resumePathsAgree": true,
+        "resumeRefused": false,
+        "streamsContiguous": true,
+        "finalResumeEmpty": true,
+        "launches": 2,
+        "integrityOk": true
+      }
+    },
+    {
+      "caseId": "uninterrupted-control",
+      "boundary": "none",
+      "definitions": [
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-first",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        },
+        {
+          "schemaVersion": 1,
+          "id": "conformance-feed-crash-second",
+          "name": "Conformance event feed crash",
+          "status": "ACTIVE",
+          "rrule": "FREQ=DAILY;BYHOUR=9",
+          "timezone": "utc",
+          "misfire": "latest",
+          "overlap": "forbid",
+          "timeoutMinutes": 30,
+          "runtime": "coven-code",
+          "prompt": "Run the native event feed crash conformance probe.",
+          "cwd": "/work/project"
+        }
+      ],
+      "expected": {
+        "initialOutcome": "served",
+        "feedAfterExit": [
+          "first:occurrence:planned",
+          "first:occurrence:claimed",
+          "second:occurrence:planned",
+          "second:occurrence:claimed"
+        ],
+        "checkpointsAfterExit": 2,
+        "deliveredPages": 2,
+        "deliveredEvents": 4,
+        "deliveredCheckpointsDurable": true,
+        "resumedEvents": 14,
+        "feedEvents": 18,
+        "firstOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "secondOccurrencePath": [
+          "planned",
+          "claimed",
+          "planned",
+          "claimed",
+          "running"
+        ],
+        "firstRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "secondRunPath": [
+          "run:running",
+          "attempt:adopted",
+          "attempt:dispatching",
+          "attempt:started"
+        ],
+        "exactlyOnce": true,
+        "resumePathsAgree": true,
+        "resumeRefused": false,
+        "streamsContiguous": true,
+        "finalResumeEmpty": true,
+        "launches": 2,
+        "integrityOk": true
+      }
+    }
+  ]
+}

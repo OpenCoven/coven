@@ -154,7 +154,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "run-now-process-crash-recovery",
                         "run-now-envelope-process-crash-recovery",
                         "tick-process-crash-recovery",
-                        "no-process-receipt-process-crash-recovery"
+                        "no-process-receipt-process-crash-recovery",
+                        "event-feed-process-crash-recovery"
                     ]
                 },
                 {

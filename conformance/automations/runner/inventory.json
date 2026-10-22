@@ -47,6 +47,7 @@
     { "profile": "scheduler_reliability", "suiteId": "run-now-envelope-process-crash-recovery", "vectorFile": "run-now-envelope-process-crash-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "tick-process-crash-recovery", "vectorFile": "tick-process-crash-recovery.vectors.json" },
     { "profile": "scheduler_reliability", "suiteId": "no-process-receipt-process-crash-recovery", "vectorFile": "no-process-receipt-process-crash-recovery.vectors.json" },
+    { "profile": "scheduler_reliability", "suiteId": "event-feed-process-crash-recovery", "vectorFile": "event-feed-process-crash-recovery.vectors.json" },
     { "profile": "runtime_authority", "suiteId": "runtime-authority-terminal-recovery", "vectorFile": "runtime-authority-terminal-recovery.vectors.json" }
   ]
 }
