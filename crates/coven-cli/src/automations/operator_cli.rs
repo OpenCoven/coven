@@ -457,7 +457,8 @@ mod tests {
         .unwrap();
         crate::automations::store::insert_definition(&conn, &definition).unwrap();
         // A retry waiting, and a lease running, until far beyond the real
-        // clock this test reads; a stale claim, and a lease long expired.
+        // clock this test reads; a stale claim, a lease long expired, and a
+        // failed attempt held for an operator retry.
         conn.execute_batch(
             "INSERT INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
@@ -486,7 +487,19 @@ mod tests {
                      'daemon', NULL, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z'),
                     ('o-lapsed', 'daily', '2026-10-19T09:00:00.000Z', 'manual', 'claimed', 1,
                      'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z',
-                     '2026-10-01T00:00:00.000Z');",
+                     '2026-10-01T00:00:00.000Z'),
+                    ('o-hold', 'daily', '2026-10-17T09:00:00.000Z', 'manual', 'claimed', 1,
+                     'operator', NULL, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at, timeout_at)
+             VALUES ('r-hold', 'daily', 'o-hold', 'coven-code', 'running',
+                     '2026-10-17T09:00:00.000Z', '2099-01-01T03:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 opened_at)
+             VALUES ('a-hold', 'r-hold', 'o-hold', 1, 'r-hold-key', 1, 'failed', 'initial',
+                     '2026-10-17T09:00:00.000Z', '2026-10-17T09:00:00.000Z');",
         )
         .unwrap();
         // A held authority names the claims its next pass releases.
@@ -514,6 +527,10 @@ mod tests {
         assert_eq!(
             output["explanation"]["work"],
             json!([{
+                "code": "retry_held", "occurrenceId": "o-hold", "runId": "r-hold",
+                "at": "2026-10-17T09:00:00.000Z", "deadlineAt": "2099-01-01T03:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
                 "code": "claim_stale", "occurrenceId": "o-stale",
                 "at": "2026-10-18T09:00:00.000Z", "holdsClaims": true,
                 "nextStep": "await_scheduler_pass"

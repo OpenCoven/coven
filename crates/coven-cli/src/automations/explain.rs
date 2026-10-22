@@ -94,6 +94,7 @@ pub(crate) enum WorkCode {
     RunningRun,
     RetryWaiting,
     RetryExpired,
+    RetryHeld,
     EligibleNow,
     DueUnplanned,
     RecoveryRequired,
@@ -215,15 +216,17 @@ fn work_select() -> String {
                    SELECT 1 FROM main.automation_attempts AS attempt
                    WHERE attempt.run_id = held.id AND attempt.state = 'adopted'
                ) AS retry,
-           CAST(held.timeout_at AS BLOB) AS deadline,
+           CASE WHEN typeof(held.timeout_at) IN ('text', 'null')
+               THEN CAST(held.timeout_at AS BLOB) ELSE X''
+           END AS deadline,
            NULL AS not_before,
            -- A running occurrence keeps its lease, which no longer applies.
            CASE WHEN occurrence.state = 'claimed'
                THEN substr(CAST(occurrence.lease_expires_at AS BLOB), 1, 65)
            END AS lease,
            -- The claim releases a fenced pass makes before claiming: stale
-           -- claims of an earlier generation return to planned, then expired
-           -- leases of this generation, or of manual claims, fail.
+           -- claims of another generation, or none, return to planned, then
+           -- expired leases of this generation, or of manual claims, fail.
            CASE
                WHEN ?6 IS NULL THEN 0
                WHEN occurrence.lease_owner = 'daemon'
@@ -244,7 +247,38 @@ fn work_select() -> String {
                         WHERE live.occurrence_id = occurrence.id AND live.status = 'running'
                     ) THEN 2
                ELSE 0
-           END AS lease_release
+           END AS lease_release,
+           -- A failed attempt held for an operator retry, which only
+           -- settlement acts on: timeout enforcement and abandoned-launch
+           -- recovery stop a live attempt, reconciling a stopping
+           -- cancellation can fail the pass, settlement skips a fenced run,
+           -- and another running run can settle the occurrence first.
+           held.authority_profile IS NULL
+               AND COALESCE((
+                   SELECT latest.state FROM main.automation_attempts AS latest
+                   WHERE latest.run_id = held.id
+                   ORDER BY latest.attempt_number DESC
+                   LIMIT 1
+               ) = 'failed', 0)
+               AND NOT EXISTS (
+                   SELECT 1 FROM main.automation_attempts AS live
+                   WHERE live.run_id = held.id
+                     AND live.state IN ('dispatching', 'started', 'observing')
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM main.automation_stop_fences AS fence
+                   WHERE fence.run_id = held.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM main.automation_cancellations AS cancellation
+                   WHERE cancellation.run_id = held.id AND cancellation.state = 'stopping'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM main.automation_runs AS rival
+                   WHERE rival.occurrence_id = occurrence.id
+                     AND rival.status = 'running'
+                     AND rival.id <> held.id
+               ) AS held_retry
     FROM main.automation_occurrences AS occurrence
     LEFT JOIN main.automation_runs AS held
       ON held.id = (
@@ -278,13 +312,16 @@ fn work_select() -> String {
                    WHERE occurrence.id = run.occurrence_id
                      AND occurrence.state = 'planned'
                ),
-           CAST(run.timeout_at AS BLOB),
+           CASE WHEN typeof(run.timeout_at) IN ('text', 'null')
+               THEN CAST(run.timeout_at AS BLOB) ELSE X''
+           END,
            (SELECT substr(CAST(MAX(attempt.not_before) AS BLOB), 1, 65)
             FROM main.automation_attempts AS attempt
             WHERE attempt.run_id = run.id
               AND attempt.state = 'adopted'
               AND attempt.not_before > ?1),
            NULL,
+           0,
            0
     FROM main.automation_runs AS run
     WHERE run.automation_id = ?3
@@ -307,6 +344,7 @@ fn work_select() -> String {
            NULL,
            NULL,
            NULL,
+           0,
            0
     FROM ({ELIGIBLE_OCCURRENCES_SQL}) AS eligible
     WHERE ?5 IS NULL
@@ -316,7 +354,7 @@ fn work_select() -> String {
            WHERE run.occurrence_id = eligible.id AND run.status = 'running'
        )
     UNION ALL
-    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL, NULL, 0
+    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL, NULL, 0, 0
     WHERE ?5 IS NOT NULL
       AND NOT EXISTS (
           SELECT 1 FROM main.automation_occurrences AS later
@@ -514,6 +552,7 @@ fn work(
                     row.get::<_, Option<Vec<u8>>>(9)?,
                     row.get::<_, Option<Vec<u8>>>(10)?,
                     row.get::<_, i64>(11)?,
+                    row.get::<_, bool>(12)?,
                 ))
             },
         )
@@ -533,6 +572,7 @@ fn work(
             not_before,
             lease,
             lease_release,
+            held_retry,
         ) = row.context("failed to read the routine's work")?;
         // Reconciliation parses the whole stored deadline and settles the
         // retry once it has passed. The eligible queue compares the deadline
@@ -547,6 +587,8 @@ fn work(
             })
         });
         let expired = matches!(&deadline, Some(Some((deadline, _))) if *deadline <= now);
+        let unreadable = matches!(&deadline, Some(None));
+        let dated = deadline.is_some();
         // Expiry is matched first, so an open deadline must also read as
         // open as text.
         let open = match &deadline {
@@ -564,6 +606,16 @@ fn work(
             (0 | 1, Some("claimed") | None) if retry && expired => {
                 timing.1 = deadline_at;
                 (WorkCode::RetryExpired, None, NextStep::AwaitSettlement)
+            }
+            // Settlement then settles a held failed attempt at the run's
+            // deadline, or at once with none; a deadline it cannot parse
+            // fails the pass instead. Timeout enforcement takes a dated
+            // adopted retry first, and fails on a running occurrence.
+            (0, Some(state @ ("claimed" | "running")))
+                if held_retry && !unreadable && !(retry && dated && state == "running") =>
+            {
+                timing.1 = deadline_at;
+                (WorkCode::RetryHeld, None, NextStep::AwaitSettlement)
             }
             (0, Some("claimed")) => match lease_release {
                 0 => (
