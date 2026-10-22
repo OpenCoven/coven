@@ -32,9 +32,9 @@ const FAILED: &str = "conformance suite execution failed";
 const SCHEMA_VERSION: &str = "coven.automations.run-now-process-crash-recovery-vectors.v1";
 const WORKER: &str = "run-now-crash-worker";
 const HOME_PREFIX: &str = "run-now-crash-";
-const AUTOMATION_ID: &str = "conformance-run-now-crash";
+pub(super) const AUTOMATION_ID: &str = "conformance-run-now-crash";
 /// The one adoption key the owner's request carries, sent and re-sent.
-const ADOPTION_KEY: &str = "adopt:conformance:run-now-crash";
+pub(super) const ADOPTION_KEY: &str = "adopt:conformance:run-now-crash";
 /// The definition is stored after the last slot its schedule had before the
 /// request, and its next slot falls after every pass, so no pass claims a
 /// scheduled slot beside the manual one.
@@ -45,15 +45,15 @@ const DEFINED_AT: &str = "2099-10-20T08:00:00.000Z";
 /// request, and the owner sends it again 10 seconds later. A run that request
 /// launches ends cleanly at 90. Passes follow before the deadline, after it,
 /// and after the lease, then the request once more and a replay.
-const RUN_NOW: i64 = 30;
-const RESTART: i64 = 60;
-const REISSUE: i64 = 70;
-const SESSION_END: i64 = 90;
-const PASS: i64 = 120;
-const DEADLINE_PASS: i64 = 1_900;
-const LEASE_PASS: i64 = 3_700;
-const RESEND: i64 = 3_710;
-const REPLAY: i64 = 3_800;
+pub(super) const RUN_NOW: i64 = 30;
+pub(super) const RESTART: i64 = 60;
+pub(super) const REISSUE: i64 = 70;
+pub(super) const SESSION_END: i64 = 90;
+pub(super) const PASS: i64 = 120;
+pub(super) const DEADLINE_PASS: i64 = 1_900;
+pub(super) const LEASE_PASS: i64 = 3_700;
+pub(super) const RESEND: i64 = 3_710;
+pub(super) const REPLAY: i64 = 3_800;
 /// The occurrence's reason once a pass recovers its expired claim.
 const LEASE_EXPIRED: &str = "lease expired";
 /// The attempt's and the occurrence's reason once the deadline settles a run.
@@ -144,7 +144,7 @@ struct Expected {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
-enum InitialOutcome {
+pub(super) enum InitialOutcome {
     Terminated,
     Answered,
 }
@@ -155,7 +155,7 @@ enum InitialOutcome {
 /// and at most one run, attempt and session, which belong together.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
-enum Launch {
+pub(super) enum Launch {
     /// No occurrence, run, attempt, session or stop fence.
     Absent,
     /// The occurrence claimed under the manual lease, with no run, attempt or
@@ -212,16 +212,15 @@ enum Answer {
     Mismatched,
 }
 
-/// What each boundary must produce. A vector restates it, so it cannot weaken
-/// it.
-fn expected_for(boundary: Boundary) -> Expected {
-    let committed = boundary.committed();
-    // A request that finds nothing claims and launches afresh, and that run
-    // ends cleanly. A stored claim that never launched stays claimed until
-    // its lease expires: the scheduler never dispatches a manual claim. A
-    // manual launch has no containment receipt here, so a restart leaves it
-    // running, orphaning an owned session, until its deadline stops it.
-    let (after_restart, after_reissue, after_pass, after_deadline, after_lease) = match committed {
+/// What the restart, the re-sent request, the pass before the deadline, the
+/// pass after it and the pass after the lease leave of what the worker
+/// committed. A request that finds nothing claims and launches afresh, and that
+/// run ends cleanly. A stored claim that never launched stays claimed until
+/// its lease expires: the scheduler never dispatches a manual claim. A manual
+/// launch has no containment receipt here, so a restart leaves it running,
+/// orphaning an owned session, until its deadline stops it.
+pub(super) fn launch_path(committed: Launch) -> (Launch, Launch, Launch, Launch, Launch) {
+    match committed {
         Launch::Absent => (
             Launch::Absent,
             Launch::Owned,
@@ -250,7 +249,15 @@ fn expected_for(boundary: Boundary) -> Expected {
             Launch::TimedOut,
             Launch::TimedOut,
         ),
-    };
+    }
+}
+
+/// What each boundary must produce. A vector restates it, so it cannot weaken
+/// it.
+fn expected_for(boundary: Boundary) -> Expected {
+    let committed = boundary.committed();
+    let (after_restart, after_reissue, after_pass, after_deadline, after_lease) =
+        launch_path(committed);
     Expected {
         initial_outcome: if boundary == Boundary::None {
             InitialOutcome::Answered
@@ -285,7 +292,7 @@ fn expected_for(boundary: Boundary) -> Expected {
 /// A routine with a working directory and a 30-minute deadline. The runner
 /// launches only a routine with a working directory; a no-op runtime never
 /// touches it.
-fn synthetic_definition() -> Value {
+pub(super) fn synthetic_definition() -> Value {
     json!({"schemaVersion":1,"id":AUTOMATION_ID,
         "name":"Conformance run-now crash","status":"ACTIVE",
         "rrule":"FREQ=DAILY;BYHOUR=21","timezone":"utc","misfire":"latest",
@@ -304,14 +311,14 @@ fn validate(case: &Case) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn base() -> Result<DateTime<Utc>, &'static str> {
+pub(super) fn base() -> Result<DateTime<Utc>, &'static str> {
     Ok(DateTime::parse_from_rfc3339(BASE)
         .map_err(|_| FAILED)?
         .with_timezone(&Utc))
 }
 
 /// The manual occurrence the owner's key names.
-fn occurrence_id() -> String {
+pub(super) fn occurrence_id() -> String {
     format!("occ-manual-{}", &sha256_hex(ADOPTION_KEY.as_bytes())[..32])
 }
 
@@ -349,7 +356,7 @@ fn request() -> Value {
 }
 
 /// Stores the synthetic routine, defined before the request.
-fn store_definition(conn: &Connection, definition: &Value) -> Result<(), &'static str> {
+pub(super) fn store_definition(conn: &Connection, definition: &Value) -> Result<(), &'static str> {
     let definition = RoutineDefinition::from_json(definition).map_err(|_| INVALID)?;
     crate::automations::store::insert_definition(conn, &definition).map_err(|_| FAILED)?;
     conn.execute(
@@ -456,7 +463,7 @@ struct RunRow {
 }
 
 /// Classifies the store's manual occurrence with its run, attempt and session.
-fn launch(conn: &Connection) -> Result<Launch, &'static str> {
+pub(super) fn launch(conn: &Connection) -> Result<Launch, &'static str> {
     let counts: [i64; 5] = conn
         .query_row(
             "SELECT
@@ -674,7 +681,9 @@ fn stored(conn: &Connection) -> Result<Stored, &'static str> {
 
 /// Every row the command, a restart or a pass can write, for an exact
 /// before/after comparison.
-fn snapshot(conn: &Connection) -> Result<Vec<Vec<rusqlite::types::Value>>, &'static str> {
+pub(super) fn snapshot(
+    conn: &Connection,
+) -> Result<Vec<Vec<rusqlite::types::Value>>, &'static str> {
     snapshot_tables(
         conn,
         &[
@@ -724,7 +733,10 @@ fn reissue(
 
 /// Ends the session the re-sent request launched, the way a runtime reports a
 /// clean exit.
-fn end_relaunched_session(conn: &Connection, now: DateTime<Utc>) -> Result<(), &'static str> {
+pub(super) fn end_relaunched_session(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<(), &'static str> {
     let session_id: String = conn
         .query_row("SELECT id FROM sessions", [], |row| row.get(0))
         .map_err(|_| FAILED)?;

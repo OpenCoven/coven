@@ -242,6 +242,7 @@ The checked-in
 [`retry-timeout-process-crash-recovery.vectors.json`](retry-timeout-process-crash-recovery.vectors.json),
 [`waiting-retry-cancellation-process-crash-recovery.vectors.json`](waiting-retry-cancellation-process-crash-recovery.vectors.json),
 [`run-now-process-crash-recovery.vectors.json`](run-now-process-crash-recovery.vectors.json),
+[`run-now-envelope-process-crash-recovery.vectors.json`](run-now-envelope-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -305,7 +306,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, thirty
+The native Coven target implements twelve structural suites, thirty-one
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -1541,9 +1542,71 @@ and booleans. They never carry occurrence, run, attempt or session ids,
 adoption keys, responses, paths, handshakes or output. This is `audit_only`
 evidence for a daemon killed while it handles one flat run-now request. It does
 not cover the command envelope, whose claim also reserves a result key and
-whose result is retained in a further transaction; a manual launch with a
+whose result is retained in a further transaction (see
+`run-now-envelope-process-crash-recovery`); a manual launch with a
 containment receipt; a manual launch left before ownership whose claim's lease
 expires before the run's deadline, which abandoned-launch recovery stops
 instead; the command's refusals; a graceful daemon restart (#1433);
 Runtime Authority runs, a real runtime process, power loss, load, complete
 profiles or release eligibility.
+
+## Run-now envelope process-crash audit boundary
+
+The `run-now-envelope-process-crash-recovery` suite kills a daemon worker while
+it handles the owner's `occurrence.runNow.v1` request through the command
+envelope. The envelope's claim also reserves a result key for the request, and
+once the launch returns, a fourth transaction consumes that reservation and
+retains the dispatch result as a second immutable adoption. A replay that finds
+the result answers it; a replay that finds a claim and no result is refused
+with `AMBIGUOUS_RETRY_FORBIDDEN`, because the launch may have happened. Each of
+nine cases runs as `run-now-process-crash-recovery` does, with the same harness,
+definition, adoption key, clocks, restart, passes and requests, but sends the
+request through the envelope's executor. As in production, the result's
+adoption time is the wall clock; no class reads it.
+
+A fixture TEMP trigger pauses the worker inside the claim, after the
+reservation's write and after the owner's answer; inside the retention, after
+the reservation is consumed and after the result's write. The WAL hook pauses
+it after the claim's, the launch's, ownership's and the retention's commits. A
+control with no pause exits after the answer without the graceful shutdown's
+reconciliation or leadership release.
+
+The launch's recovery is the flat request's: a restart changes no row except
+to orphan an owned session, the scheduler never dispatches the manual claim,
+the pass after the lease fails a claim that never launched `lease expired`,
+and the pass after the run's deadline stops a launch once and settles it timed
+out. What the owner is answered depends on what the worker retained:
+
+- **Nothing committed:** the re-sent request claims, launches once and retains
+  its result, and later requests replay that result.
+- **The claim, with or without its launch, and no result:** every request is
+  refused as ambiguous, without a write or a launch, and the reservation stays.
+- **The result,** killed after the retention commits, and the control: every
+  request replays the retained result, which still names the run `running`
+  after its deadline has settled it.
+
+The launch classes are the flat suite's. The stored-answer class pins the
+store's command adoptions and reservations: the owner's claim with its key,
+command, routine and result key; then either that result key reserved for the
+same request and no result, or the result retained for the same request with
+no reservation. A retained result must be exactly the launch the store holds:
+the occurrence and run `running`, with the run's id and the first attempt's
+session. The claim must carry the digest the envelope gives the request, under
+its own domain. A fresh answer must launch once and be the result it retained, a
+replay must be that result, and a refusal must be the exact ambiguous refusal
+of a pending claim. None may write or launch except the first fresh answer,
+and the request and a pass after the lease must change no occurrence, run,
+attempt, event, session, reservation, adoption, cancellation or stop-fence row.
+
+Observations carry boundary, launch, stored-answer and answer classes, counts
+and booleans. They never carry occurrence, run, attempt or session ids,
+adoption keys, responses, paths, handshakes or output. This is `audit_only`
+evidence for a daemon killed while it handles one run-now request through the
+envelope's executor. It does not cover the envelope's own request parsing,
+authority and routing; pauses inside the launch and ownership transactions,
+which leave the previous commit's state and which the flat suite covers; a
+retained dispatch refusal; a manual launch with a
+containment receipt, or one whose lease expires before its deadline; the
+command's refusals; a graceful daemon restart (#1433); Runtime Authority runs,
+a real runtime process, power loss, load, complete profiles or release
+eligibility.

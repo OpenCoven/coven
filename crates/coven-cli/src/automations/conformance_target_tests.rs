@@ -151,7 +151,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "automatic-retry-process-crash-recovery",
                         "retry-timeout-process-crash-recovery",
                         "waiting-retry-cancellation-process-crash-recovery",
-                        "run-now-process-crash-recovery"
+                        "run-now-process-crash-recovery",
+                        "run-now-envelope-process-crash-recovery"
                     ]
                 },
                 {
