@@ -240,6 +240,7 @@ The checked-in
 [`held-settlement-process-crash-recovery.vectors.json`](held-settlement-process-crash-recovery.vectors.json),
 [`automatic-retry-process-crash-recovery.vectors.json`](automatic-retry-process-crash-recovery.vectors.json),
 [`retry-timeout-process-crash-recovery.vectors.json`](retry-timeout-process-crash-recovery.vectors.json),
+[`waiting-retry-cancellation-process-crash-recovery.vectors.json`](waiting-retry-cancellation-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -303,7 +304,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, twenty-eight
+The native Coven target implements twelve structural suites, twenty-nine
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -1097,7 +1098,8 @@ Observations carry boundary, run, cancellation and answer classes, counts and
 booleans. They never carry occurrence, run, attempt or session ids, adoption
 keys, responses, paths, handshakes or output. This is `audit_only` evidence for
 a daemon killed while it handles one owner occurrence or attempt cancellation.
-It does not cover an eligible or planned slot, a waiting retry attempt, a
+It does not cover an eligible or planned slot, a waiting retry attempt (see
+`waiting-retry-cancellation-process-crash-recovery` for an automatic one), a
 request first sent to a run already held for an operator retry, a kill inside
 an `occurrence.cancel.v1` request that delegates a running attempt's stop
 (tracked in #1486), the run-cancellation envelope, a delegation waiting on
@@ -1309,9 +1311,10 @@ retry after an expired claim lease, an exponential backoff's jitter, retry
 exhaustion or quarantine (see `retry-quarantine-recovery`), a retry whose wait
 outlasts the run's deadline (see `retry-timeout-process-crash-recovery`), a kill
 inside an operator retry (see `attempt-retry-process-crash-recovery`),
-cancellation of a waiting retry, a graceful daemon restart (#1433), Runtime
-Authority launches, a real runtime process, power loss, load, complete profiles
-or release eligibility.
+cancellation of a waiting retry (see
+`waiting-retry-cancellation-process-crash-recovery`), a graceful daemon restart
+(#1433), Runtime Authority launches, a real runtime process, power loss, load,
+complete profiles or release eligibility.
 
 ## Retry timeout process-crash audit boundary
 
@@ -1370,9 +1373,87 @@ carry occurrence, run, attempt or session ids, paths, handshakes or output. This
 is `audit_only` evidence for a daemon killed while one automatic retry waits
 past its run's deadline or while its timeout settles it. It does not cover the
 owner cancelling a waiting retry, including that cancellation's own timeout
-settlement once the deadline has passed; the dispatcher's and the launch's own
-timeout settlement, which a pass reaches only when the deadline falls between
-its claim and its dispatch; a retry re-claimed before its deadline whose
-deadline passes while the daemon is down; a graceful daemon restart (#1433);
-Runtime Authority runs, a real runtime process, power loss, load, complete
-profiles or release eligibility.
+settlement once the deadline has passed (see
+`waiting-retry-cancellation-process-crash-recovery`); the dispatcher's and the
+launch's own timeout settlement, which a pass reaches only when the deadline
+falls between its claim and its dispatch; a retry re-claimed before its deadline
+whose deadline passes while the daemon is down; a graceful daemon restart
+(#1433); Runtime Authority runs, a real runtime process, power loss, load,
+complete profiles or release eligibility.
+
+## Waiting retry cancellation process-crash audit boundary
+
+The `waiting-retry-cancellation-process-crash-recovery` suite kills a daemon
+worker while it handles the owner's cancellation of an automatic retry that
+waits for its backoff. The parent then restarts the daemon's scheduler, the
+owner sends the same request again, and passes after the backoff must launch
+nothing. Each of twelve cases starts the exact audited binary as a hidden
+worker, with the same harness and daemon restart as
+`run-launch-process-crash-recovery`. The worker stores a fixed synthetic active
+daily definition whose policy retries an unavailable runtime once, 120 seconds
+after the failure, within a one-minute deadline, as in
+`retry-timeout-process-crash-recovery`. It claims the 09:00 slot and dispatches
+it through a no-op runtime that is unavailable for its first launch, so the
+retry waits. Vectors cannot choose a path, run, definition, policy, adoption
+key, reason, clock or pause mechanics, and every expected outcome is fixed per
+boundary.
+
+The command settles the waiting retry and stores its answer under the owner's
+key in one transaction, in one of two ways:
+
+- **Before the deadline.** `occurrence.cancel.v1`, 30 seconds after the claim,
+  withdraws the retry: the retry `cancelled` with the `cancelled` class, the run
+  `cancelled`, and the occurrence `cancelled` with no lease, each with the
+  owner's reason where it has one. The answer is the withdrawal.
+- **After the deadline.** `attempt.cancel.v1` for the retry, 30 seconds after
+  the deadline and before any pass has enforced it, settles the retry as the
+  pass's timeout enforcement does: the retry `timed_out`, the occurrence
+  `failed` and the run `failed`. The answer is an `ILLEGAL_TRANSITION` refusal,
+  because the run reached its timeout before cancellation.
+
+A fixture TEMP trigger pauses the worker after each of the command's three
+settlement writes and after the answer's write, and the WAL hook after the
+commit. Each scene has a control with no pause, which exits after the answer
+without the graceful shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check must
+pass. It restarts in the daemon's startup order 10 seconds after the request,
+and the owner re-sends the request 10 seconds later. A pass after the backoff
+follows, then the request once more, and then the request and a pass again. One
+runtime counts every stop and launch they make. What each case requires depends
+on the scene and on whether the command committed:
+
+- **Before the deadline, nothing committed:** the restart changes no row and
+  leaves the retry waiting. The re-sent request withdraws it, and later
+  requests replay that withdrawal.
+- **Before the deadline, committed,** and its control: the restart changes no
+  row, and every request replays the withdrawal the worker answered.
+- **After the deadline, nothing committed:** the restart settles the waiting
+  retry timed out, as in `retry-timeout-process-crash-recovery`. The re-sent
+  request finds the run ended and stores its own `ILLEGAL_TRANSITION` refusal,
+  that only a running run's current attempt can be cancelled. Later requests
+  replay it.
+- **After the deadline, committed,** and its control: the restart changes no
+  row, and every request replays the stored timeout refusal.
+
+Every class pins the whole store as `retry-timeout-process-crash-recovery`
+does, and the store's only command adoption: the owner's key and command, with
+an outcome that matches its response. A fresh answer must be the one the store
+now holds, and a withdrawal must name the store's occurrence, run and retry at
+the request's time. A replay must write nothing and repeat the answer first
+given. No case may re-claim the occurrence, launch the retry or issue a stop,
+and the passes after the backoff must change no occurrence, run, attempt,
+event, session, reservation, adoption, cancellation or stop-fence row.
+
+Observations carry boundary, retry, stored-answer and answer classes, counts
+and booleans. They never carry occurrence, run, attempt or session ids,
+adoption keys, responses, paths, handshakes or output. This is `audit_only`
+evidence for a daemon killed while it handles one owner cancellation of a
+waiting automatic retry. It does not cover `attempt.cancel.v1` before the
+deadline or `occurrence.cancel.v1` after it, whose first request takes the same
+settlement branch; an operator retry's waiting attempt, which takes it too; a
+retry the scheduler has re-claimed but not yet launched; the run-cancellation
+envelope; a graceful daemon restart (#1433); Runtime Authority runs, a real
+runtime process, power loss, load, complete profiles or release eligibility.

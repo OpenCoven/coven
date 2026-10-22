@@ -177,7 +177,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "timeout-enforcement-process-crash-recovery",
                         "held-settlement-process-crash-recovery",
                         "automatic-retry-process-crash-recovery",
-                        "retry-timeout-process-crash-recovery"
+                        "retry-timeout-process-crash-recovery",
+                        "waiting-retry-cancellation-process-crash-recovery"
                     ]
                 },
                 {
@@ -3148,6 +3149,169 @@ fn native_target_evaluates_checked_in_retry_timeout_process_crash_vectors() -> a
     let rejected = run_target(
         &coven_home,
         "retry-timeout-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_waiting_retry_cancellation_process_crash_vectors(
+) -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/waiting-retry-cancellation-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "waiting-retry-cancellation-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        response["suiteId"],
+        "waiting-retry-cancellation-process-crash-recovery"
+    );
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 12);
+    assert_eq!(response["evidence"]["passedCases"], 12);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("waiting retry cancellation crash observations");
+    assert_eq!(observations.len(), 12);
+    // Whether the command's transaction had committed before the worker was
+    // gone, and whether the owner cancelled before the run's deadline.
+    for (observation, (boundary, committed, waiting)) in observations.iter().zip([
+        ("after_retry_cancelled", false, true),
+        ("after_run_cancelled", false, true),
+        ("after_occurrence_cancelled", false, true),
+        ("after_withdrawal_adoption", false, true),
+        ("after_withdrawal_commit", true, true),
+        ("waiting_control", true, true),
+        ("after_retry_timed_out", false, false),
+        ("after_occurrence_failed", false, false),
+        ("after_run_failed", false, false),
+        ("after_refusal_adoption", false, false),
+        ("after_refusal_commit", true, false),
+        ("expired_control", true, false),
+    ]) {
+        let killed = !boundary.ends_with("_control");
+        let (retry_at_exit, stored_at_exit) = match (committed, waiting) {
+            (false, _) => ("scheduled", "none"),
+            (true, true) => ("cancelled", "withdrawn"),
+            (true, false) => ("timed_out", "timeout_refusal"),
+        };
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(
+            observation["transactionOpenAtPause"],
+            if killed {
+                json!(!committed)
+            } else {
+                json!(null)
+            }
+        );
+        assert_eq!(
+            observation["retryAtPause"],
+            if killed {
+                json!(retry_at_exit)
+            } else {
+                json!(null)
+            }
+        );
+        assert_eq!(
+            observation["storedAtPause"],
+            if killed {
+                json!(stored_at_exit)
+            } else {
+                json!(null)
+            }
+        );
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["retryAfterExit"], retry_at_exit);
+        assert_eq!(observation["storedAfterExit"], stored_at_exit);
+        assert_eq!(observation["recoveryRefused"], false);
+        if waiting {
+            // Before the deadline, the re-sent request withdraws the retry
+            // once, or replays the withdrawal the worker committed.
+            assert_eq!(observation["retryAfterRestart"], retry_at_exit);
+            assert_eq!(observation["restartIsNoop"], true);
+            assert_eq!(
+                observation["reissue"],
+                if committed { "replayed" } else { "withdrawn" }
+            );
+            assert_eq!(observation["retryAfterReissue"], "cancelled");
+            assert_eq!(observation["storedAfterReissue"], "withdrawn");
+            assert_eq!(observation["resend"], "replayed");
+        } else {
+            // After it, the restart settles a waiting retry timed out, and the
+            // re-sent request replays the stored refusal or is refused afresh.
+            assert_eq!(observation["retryAfterRestart"], "timed_out");
+            assert_eq!(observation["restartIsNoop"], committed);
+            assert_eq!(
+                observation["reissue"],
+                if committed {
+                    "refusal_replayed"
+                } else {
+                    "refused"
+                }
+            );
+            assert_eq!(observation["retryAfterReissue"], "timed_out");
+            assert_eq!(
+                observation["storedAfterReissue"],
+                if committed {
+                    "timeout_refusal"
+                } else {
+                    "attempt_refusal"
+                }
+            );
+            assert_eq!(observation["resend"], "refusal_replayed");
+        }
+        assert_eq!(observation["passIsNoop"], true);
+        assert_eq!(observation["launches"], 0);
+        assert_eq!(observation["stops"], 0);
+        assert_eq!(observation["replayIsNoop"], true);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "waiting-retry-cancellation-crash-worker",
         Some(&invalid["vector"]["cases"][0]),
     )?;
     assert!(!rejected.status.success());
