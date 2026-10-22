@@ -150,7 +150,8 @@ fn capability_advertises_the_native_structural_suites() {
                         "held-settlement-process-crash-recovery",
                         "automatic-retry-process-crash-recovery",
                         "retry-timeout-process-crash-recovery",
-                        "waiting-retry-cancellation-process-crash-recovery"
+                        "waiting-retry-cancellation-process-crash-recovery",
+                        "run-now-process-crash-recovery"
                     ]
                 },
                 {
