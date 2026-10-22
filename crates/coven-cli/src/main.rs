@@ -1068,6 +1068,30 @@ enum OwnerRootCommand {
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
+    #[command(
+        about = "Rotate the owner-root key (owner identity rotation)",
+        long_about = "Rotate the owner-root key: an explicit, audited owner identity rotation.\n\n\
+                      Both the installed key and the new key sign one exact action after you \
+                      review it and type `rotate`. Policy, devices, grants and familiars are \
+                      unchanged. A lost root key cannot be rotated; that requires a trust-domain \
+                      reset."
+    )]
+    Rotate {
+        #[arg(
+            long,
+            value_name = "PEM",
+            help = "Installed owner-root key (outside COVEN_HOME)"
+        )]
+        root_key: PathBuf,
+        #[arg(
+            long,
+            value_name = "PEM",
+            help = "New owner-root key from `owner-root generate`"
+        )]
+        new_root_key: PathBuf,
+        #[arg(long, help = "Skip the typed confirmation after the review is printed")]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2133,9 +2157,16 @@ fn run_cli(cli: Cli) -> Result<()> {
                 root_key,
                 yes,
             } => mobile_memory::recovery::run_recover(&request, &root_key, yes),
-            DeviceCommand::OwnerRoot {
-                command: OwnerRootCommand::Generate { out },
-            } => mobile_memory::policy_cli::run_generate_owner_root(&out),
+            DeviceCommand::OwnerRoot { command } => match command {
+                OwnerRootCommand::Generate { out } => {
+                    mobile_memory::policy_cli::run_generate_owner_root(&out)
+                }
+                OwnerRootCommand::Rotate {
+                    root_key,
+                    new_root_key,
+                    yes,
+                } => mobile_memory::policy_cli::run_rotate_root(&root_key, &new_root_key, yes),
+            },
             DeviceCommand::IntroductionPolicy { command } => match command {
                 IntroductionPolicyCommand::Show { json } => {
                     mobile_memory::policy_cli::run_show(json)
