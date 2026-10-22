@@ -136,6 +136,26 @@ Record exact failed commands and environment differences in the issue/PR.
 Do not equate a macOS run with Linux or Windows CI, container results with a
 managed Cloud VM, or a plan/fixture run with actual Rust/package execution.
 
+### Observed environment-only differences
+
+A representative macOS `--pr` run against the hosted queue run of the same
+tree matched every shared check once the host met CI's pins. The failures seen
+before that were caused by the host, not the code, and each still fails the
+local run instead of skipping:
+
+| Host condition | Local symptom | CI equivalent |
+| --- | --- | --- |
+| `python3` resolves to Python older than 3.11 (for example Xcode's 3.9) | `scripts/cloud/*-test.py` fail with `No module named 'tomllib'` or the tarfile security-filter `ProvisionError` | `actions/setup-python` provides current 3.x |
+| `cargo-deny` not installed | `dependency-audit` fails: `no such command: deny` | `cargo-deny-action` provisions it |
+| pnpm differs from the `packageManager` pin | `pnpm-pin` fails; OpenClaw install/build/test and browser readiness `SKIP` on that prerequisite | the OpenClaw job installs the pinned pnpm |
+| Heavily loaded shared host | daemon smoke tests can exceed the per-request `lifecycle-health` budget | dedicated runners; never widen the budget to compensate |
+
+Provision the tools without changing the repository pins, for example by putting
+a supported `python3`, the pinned pnpm, and `cargo install --locked
+--root <dir> cargo-deny` first on `PATH` for the run. When a load-sensitive
+failure does not reproduce on an idle rerun, record both runs. Do not retry
+until green without recording them.
+
 ## Keeping the inventory current
 
 `scripts/dev-verify-policy.json` explicitly lists the Policy guard's single-line
