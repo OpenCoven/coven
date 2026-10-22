@@ -490,6 +490,12 @@ async fn child_limit_refuses_a_concurrent_sibling_until_the_slot_is_released() {
         .unwrap()
         .iter()
         .filter(|event| event.invocation == sibling_invocation)
+        .inspect(|event| {
+            assert_eq!(
+                serde_json::to_value(event).unwrap()["delegation"],
+                serde_json::to_value(&refused.digests).unwrap()
+            );
+        })
         .map(|event| event.event.clone())
         .collect();
     assert_eq!(
@@ -714,4 +720,43 @@ async fn unknown_child_termination_makes_the_parent_require_recovery() {
 #[tokio::test]
 async fn recovery_required_survives_wrapping_that_reports_its_source() {
     parent_over_unknown_child(true).await;
+}
+
+#[tokio::test]
+async fn cancelled_child_carries_digests_on_every_event() {
+    let events = Arc::new(Events::default());
+    let runner = Runner::new([Agent::new(
+        "worker",
+        "Worker",
+        "work",
+        ScriptedModel::new([ModelResponse::final_output("must not run")]),
+    )])
+    .unwrap()
+    .with_invocation_observer(events.clone());
+    let prepared = prepare(&root(), DelegationBudget::new(2, 0).unwrap());
+    let digests = prepared.digests().clone();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let failure = runner
+        .run_delegation_controlled(
+            prepared,
+            &NoContext,
+            &(),
+            RunControls::new().with_cancellation(cancellation),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.disposition(), DelegationDisposition::Cancelled);
+    let events = events.invocations.lock().unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(events.iter().any(|event| matches!(
+        event.event,
+        InvocationEventKind::CancellationRequested { .. }
+    )));
+    for event in events.iter() {
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["delegation"],
+            serde_json::to_value(&digests).unwrap()
+        );
+    }
 }

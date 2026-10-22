@@ -561,6 +561,32 @@ async fn delegated_child_sees_selected_context_and_task_but_never_the_parent_tra
         .filter(|event| event.invocation == child_invocation)
         .collect();
     assert_eq!(child_events.len(), 2);
+    for event in &child_events {
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["delegation"],
+            serde_json::to_value(&expected_digests).unwrap()
+        );
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(
+            serde_json::from_value::<InvocationEvent>(value.clone()).unwrap(),
+            **event
+        );
+        let mut invalid = value;
+        invalid["delegation"]["authority"] = json!("not-a-digest");
+        assert!(serde_json::from_value::<InvocationEvent>(invalid).is_err());
+        let encoded = serde_json::to_string(event).unwrap();
+        assert!(!encoded.contains("summarize the plan"));
+        assert!(!encoded.contains("SELECTED_CONTEXT"));
+    }
+    for event in invocations
+        .iter()
+        .filter(|event| event.invocation != child_invocation)
+    {
+        assert!(serde_json::to_value(event)
+            .unwrap()
+            .get("delegation")
+            .is_none());
+    }
     assert_eq!(
         child_events[0].source,
         InvocationSource::Agent {
@@ -643,6 +669,12 @@ async fn child_tool_call_outside_attenuated_authority_fails_closed_without_dispa
     ));
     let invocations = events.invocations.lock().unwrap().clone();
     assert_eq!(invocations.len(), 2);
+    for event in &invocations {
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["delegation"],
+            serde_json::to_value(&failure.digests).unwrap()
+        );
+    }
     assert_eq!(
         invocations[1].event,
         InvocationEventKind::Failed {
@@ -660,6 +692,7 @@ async fn authority_binds_the_whole_child_invocation_across_control_transfer() {
     let helper_model = ScriptedModel::new([ModelResponse::actions(vec![ModelAction::ToolCall(
         ToolCall::new("call-1", "write", json!({})),
     )])]);
+    let events = Arc::new(Events::default());
     let runner = Runner::new([
         Agent::new("planner", "Planner", "plan", ScriptedModel::new([])),
         Agent::new("worker", "Worker", "work", worker_model).with_handoff(Handoff::new(
@@ -671,7 +704,8 @@ async fn authority_binds_the_whole_child_invocation_across_control_transfer() {
             .with_tool(Arc::new(EffectTool("read")))
             .with_tool(Arc::new(EffectTool("write"))),
     ])
-    .unwrap();
+    .unwrap()
+    .with_invocation_observer(events.clone());
     let host = Host::default();
 
     let grant = root_grant(full_authority(), ContextManifest::default());
@@ -702,6 +736,17 @@ async fn authority_binds_the_whole_child_invocation_across_control_transfer() {
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(advertised, ["read"]);
+    let events = events.invocations.lock().unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.event, InvocationEventKind::ControlTransferred { .. })));
+    for event in events.iter() {
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["delegation"],
+            serde_json::to_value(&failure.digests).unwrap()
+        );
+    }
 }
 
 #[tokio::test]
@@ -756,6 +801,12 @@ async fn context_digest_mismatch_fails_before_any_model_turn() {
     ));
     let invocations = events.invocations.lock().unwrap().clone();
     assert_eq!(invocations.len(), 2);
+    for event in &invocations {
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["delegation"],
+            serde_json::to_value(&failure.digests).unwrap()
+        );
+    }
     assert_eq!(
         invocations[1].event,
         InvocationEventKind::Failed {

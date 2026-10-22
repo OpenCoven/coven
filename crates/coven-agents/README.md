@@ -233,17 +233,7 @@ exact revision or the run fails before model execution. The compatibility
 `Runner::run` and `Runner::run_with_invocation` entry points resolve the
 currently registered revision automatically.
 
-`InvocationObserver` receives a separate canonical metadata stream without
-changing the existing `RunObserver` event shapes. Every admitted request emits
-one versioned `started` event and one terminal `completed` or `failed` event.
-Legacy handoffs inside the same run are emitted as `control_transferred`, not as
-durable delegation. A run that observes a stop emits one
-`cancellation_requested` event immediately before its terminal `failed`. Every event carries the original requested target and
-source; failures separately identify `failed_at`, so a target-resolution
-failure is not mislabeled as execution by that target. The
-`coven.agent-invocation-event.v1` wire schema rejects unknown fields. Attempt
-and executor bindings remain absent until Coven has an executor contract that
-can supply them truthfully.
+`InvocationObserver` receives a separate canonical metadata stream without changing the existing `RunObserver` event shapes. Every admitted request emits one versioned `started` event and one terminal `completed` or `failed` event. Legacy handoffs inside the same run are emitted as `control_transferred`, not as durable delegation. A run that observes a stop emits one `cancellation_requested` event immediately before its terminal `failed`. Every event carries the original requested target and source; failures separately identify `failed_at`, so a target-resolution failure is not mislabeled as execution by that target. The `coven.agent-invocation-event.v1` wire schema rejects unknown fields. Events for prepared delegated children also carry `delegation` with the spec, authority and selected-context digests. The same digests accompany start, cancellation, control transfer and terminal events, including refusals before the target runs. They are correlation evidence, not portable authority or context payloads. Direct and legacy events omit the optional field; old events still decode. Older readers that reject unknown fields reject delegated events with this new metadata instead of silently losing it. Attempt and executor bindings remain absent until Coven has an executor contract that can supply them truthfully.
 
 This pre-1.0 API adds an `invocation` field to event and outcome shapes.
 `RunFailure::invocation` is boxed, and `RunFailure::new_items` is an owned boxed
