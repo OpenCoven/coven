@@ -95,6 +95,7 @@ pub(crate) enum WorkCode {
     RetryWaiting,
     RetryExpired,
     RetryHeld,
+    SessionFinished,
     EligibleNow,
     DueUnplanned,
     RecoveryRequired,
@@ -157,8 +158,8 @@ const MAX_WORK: usize = 20;
 /// the pass instant, `?2` the routines planning admits, `?3` this routine,
 /// `?4` the limit, `?5` the due slot, if any, and `?6` the generation of the
 /// scheduler authority on record, if a daemon holds it. Ids and times are read as
-/// bounded bytes; lease owners, sessions, authority profiles and reasons are
-/// never returned.
+/// bounded bytes; lease owners, sessions, events, authority profiles and
+/// reasons are never returned.
 fn work_select() -> String {
     format!(
         "
@@ -278,13 +279,102 @@ fn work_select() -> String {
                    WHERE rival.occurrence_id = occurrence.id
                      AND rival.status = 'running'
                      AND rival.id <> held.id
-               ) AS held_retry
+               ) AS held_retry,
+           -- A run whose session has finished, which settlement settles from
+           -- that evidence: 1 for a plain run, and 2 for a Runtime Authority
+           -- run, which it holds for recovery instead. Expired cancellations
+           -- are reconciled first, and another running run can settle the
+           -- occurrence first. Settlement skips a fenced plain run, or holds it
+           -- for recovery, and skips an ambiguous one whose cancellation is
+           -- pending; it fails on a latest attempt it cannot settle.
+           CASE
+               WHEN session.status IS NULL
+                    OR session.status NOT IN ('completed', 'failed', 'cancelled', 'killed', 'idle')
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_cancellations AS cancellation
+                        WHERE cancellation.run_id = held.id
+                          AND cancellation.state IN ('requested', 'stopping')
+                          AND cancellation.execution_expires_at <= ?1
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_runs AS rival
+                        WHERE rival.occurrence_id = occurrence.id
+                          AND rival.status = 'running'
+                          AND rival.id <> held.id
+                    ) THEN 0
+               WHEN held.authority_profile IS NOT NULL THEN
+                   CASE WHEN (
+                       SELECT COUNT(*) FROM main.automation_attempts AS unresolved
+                       WHERE unresolved.run_id = held.id
+                         AND unresolved.state IN (
+                             'dispatching', 'started', 'observing', 'ambiguous'
+                         )
+                   ) = 1 THEN 2 ELSE 0 END
+               WHEN latest.state NOT IN ('dispatching', 'started', 'observing', 'ambiguous')
+                   THEN 0
+               WHEN latest.state IS NOT 'ambiguous' AND EXISTS (
+                   SELECT 1 FROM main.automation_stop_fences AS fence
+                   WHERE fence.run_id = held.id
+               ) THEN 0
+               WHEN latest.state = 'ambiguous' AND EXISTS (
+                   SELECT 1 FROM main.automation_cancellations AS pending
+                   WHERE pending.run_id = held.id
+                     AND pending.attempt_id = latest.id
+                     AND pending.session_id IS held.session_id
+                     AND pending.state IN ('requested', 'stopping')
+               ) THEN 0
+               ELSE 1
+           END AS finished,
+           -- The time settlement parses: an ambiguous attempt's settlement
+           -- time, or, with a deadline, the session's last exit or update. A
+           -- value settlement cannot decode reads as unparseable.
+           CASE
+               WHEN typeof(held.timeout_at) NOT IN ('text', 'null')
+                    OR (held.authority_profile IS NULL
+                        AND typeof(held.definition_json) NOT IN ('text', 'null'))
+                    OR typeof(session.exit_code) NOT IN ('integer', 'null')
+                    OR typeof(latest.settled_at) NOT IN ('text', 'null')
+                    OR typeof(COALESCE(ending.created_at, session.updated_at))
+                        NOT IN ('text', 'null') THEN X''
+               WHEN held.authority_profile IS NOT NULL THEN NULL
+               WHEN latest.state = 'ambiguous'
+                   THEN COALESCE(CAST(latest.settled_at AS BLOB), X'')
+               WHEN held.timeout_at IS NOT NULL
+                   THEN CAST(COALESCE(ending.created_at, session.updated_at) AS BLOB)
+           END AS evidence,
+           -- Every value settlement decodes as text for this run, joined by
+           -- line feeds so that one not valid UTF-8 keeps the whole from
+           -- decoding. Recording a plain run's finish reads its definition.
+           CAST(
+               COALESCE(CAST(held.timeout_at AS BLOB), X'') || X'0A'
+               || COALESCE(CAST(COALESCE(ending.created_at, session.updated_at) AS BLOB), X'')
+               || X'0A' || COALESCE(CAST(latest.settled_at AS BLOB), X'') || X'0A'
+               || CASE WHEN held.authority_profile IS NULL
+                      THEN COALESCE(CAST(held.definition_json AS BLOB), X'')
+                      ELSE X''
+                  END
+           AS BLOB) AS decoded
     FROM main.automation_occurrences AS occurrence
     LEFT JOIN main.automation_runs AS held
       ON held.id = (
           SELECT first.id FROM main.automation_runs AS first
           WHERE first.occurrence_id = occurrence.id AND first.status = 'running'
           ORDER BY first.id
+          LIMIT 1
+      )
+    LEFT JOIN main.sessions AS session ON session.id = held.session_id
+    LEFT JOIN main.events AS ending
+      ON ending.id = (
+          SELECT exited.id FROM main.events AS exited
+          WHERE exited.session_id = session.id AND exited.kind = 'exit'
+          ORDER BY exited.created_at DESC, exited.id DESC
+          LIMIT 1
+      )
+    LEFT JOIN main.automation_attempts AS latest
+      ON latest.id = (
+          SELECT newest.id FROM main.automation_attempts AS newest
+          WHERE newest.run_id = held.id
+          ORDER BY newest.attempt_number DESC
           LIMIT 1
       )
     WHERE occurrence.automation_id = ?3
@@ -322,7 +412,10 @@ fn work_select() -> String {
               AND attempt.not_before > ?1),
            NULL,
            0,
-           0
+           0,
+           0,
+           NULL,
+           NULL
     FROM main.automation_runs AS run
     WHERE run.automation_id = ?3
       AND run.status = 'running'
@@ -345,7 +438,10 @@ fn work_select() -> String {
            NULL,
            NULL,
            0,
-           0
+           0,
+           0,
+           NULL,
+           NULL
     FROM ({ELIGIBLE_OCCURRENCES_SQL}) AS eligible
     WHERE ?5 IS NULL
        OR eligible.scheduled_for >= ?5
@@ -354,7 +450,8 @@ fn work_select() -> String {
            WHERE run.occurrence_id = eligible.id AND run.status = 'running'
        )
     UNION ALL
-    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL, NULL, 0, 0
+    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0,
+           NULL, NULL
     WHERE ?5 IS NOT NULL
       AND NOT EXISTS (
           SELECT 1 FROM main.automation_occurrences AS later
@@ -553,6 +650,9 @@ fn work(
                     row.get::<_, Option<Vec<u8>>>(10)?,
                     row.get::<_, i64>(11)?,
                     row.get::<_, bool>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, Option<Vec<u8>>>(14)?,
+                    row.get::<_, Option<Vec<u8>>>(15)?,
                 ))
             },
         )
@@ -573,6 +673,9 @@ fn work(
             lease,
             lease_release,
             held_retry,
+            finished,
+            evidence,
+            decoded,
         ) = row.context("failed to read the routine's work")?;
         // Reconciliation parses the whole stored deadline and settles the
         // retry once it has passed. The eligible queue compares the deadline
@@ -596,6 +699,10 @@ fn work(
             Some(Some((_, stored))) => stored.as_str() > iso(now).as_str(),
             Some(None) => false,
         };
+        let readable = evidence.is_none_or(|stored| {
+            String::from_utf8(stored)
+                .is_ok_and(|stored| DateTime::parse_from_rfc3339(&stored).is_ok())
+        }) && decoded.is_none_or(|stored| std::str::from_utf8(&stored).is_ok());
         let deadline_at = deadline
             .flatten()
             .map(|(deadline, _)| deadline.to_rfc3339_opts(SecondsFormat::Millis, true));
@@ -616,6 +723,20 @@ fn work(
             {
                 timing.1 = deadline_at;
                 (WorkCode::RetryHeld, None, NextStep::AwaitSettlement)
+            }
+            // Settlement settles a plain run whose session has finished, and
+            // holds a Runtime Authority one for recovery, which does not parse
+            // its deadline; evidence or a deadline it cannot read fails the
+            // pass instead.
+            (0, Some("claimed" | "running"))
+                if readable && (finished == 2 || (finished == 1 && !unreadable)) =>
+            {
+                let next_step = if finished == 2 {
+                    NextStep::AwaitRuntimeAuthority
+                } else {
+                    NextStep::AwaitSettlement
+                };
+                (WorkCode::SessionFinished, None, next_step)
             }
             (0, Some("claimed")) => match lease_release {
                 0 => (

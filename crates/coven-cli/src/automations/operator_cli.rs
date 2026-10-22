@@ -457,8 +457,9 @@ mod tests {
         .unwrap();
         crate::automations::store::insert_definition(&conn, &definition).unwrap();
         // A retry waiting, and a lease running, until far beyond the real
-        // clock this test reads; a stale claim, a lease long expired, and a
-        // failed attempt held for an operator retry.
+        // clock this test reads; a stale claim, a lease long expired, a
+        // failed attempt held for an operator retry, and a run whose session
+        // has finished.
         conn.execute_batch(
             "INSERT INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
@@ -499,7 +500,26 @@ mod tests {
                  occurrence_fence_generation, state, retry_classification, not_before,
                  opened_at)
              VALUES ('a-hold', 'r-hold', 'o-hold', 1, 'r-hold-key', 1, 'failed', 'initial',
-                     '2026-10-17T09:00:00.000Z', '2026-10-17T09:00:00.000Z');",
+                     '2026-10-17T09:00:00.000Z', '2026-10-17T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 created_at, updated_at)
+             VALUES ('o-done', 'daily', '2026-10-16T09:00:00.000Z', 'manual', 'running', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, exit_code, created_at, updated_at)
+             VALUES ('s-done', '/work/project', 'codex', 'private sentinel', 'completed', 0,
+                     '2026-10-16T09:00:00.000Z', '2026-10-16T09:30:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+             VALUES ('r-done', 'daily', 'o-done', 's-done', 'coven-code', 'running',
+                     '2026-10-16T09:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-done', 'r-done', 'o-done', 1, 'r-done-key', 1, 'started', 'initial',
+                     '2026-10-16T09:00:00.000Z', 's-done', '2026-10-16T09:00:00.000Z');",
         )
         .unwrap();
         // A held authority names the claims its next pass releases.
@@ -527,6 +547,10 @@ mod tests {
         assert_eq!(
             output["explanation"]["work"],
             json!([{
+                "code": "session_finished", "occurrenceId": "o-done", "runId": "r-done",
+                "at": "2026-10-16T09:00:00.000Z", "holdsClaims": true,
+                "nextStep": "await_settlement"
+            }, {
                 "code": "retry_held", "occurrenceId": "o-hold", "runId": "r-hold",
                 "at": "2026-10-17T09:00:00.000Z", "deadlineAt": "2099-01-01T03:00:00.000Z",
                 "holdsClaims": true, "nextStep": "await_settlement"
