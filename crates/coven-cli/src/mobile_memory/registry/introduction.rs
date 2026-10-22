@@ -16,12 +16,12 @@ impl DeviceRegistry {
 
     pub(in crate::mobile_memory) fn commit_introduction(
         &self,
-        source_id: Uuid,
+        source_ids: &[Uuid],
         device: DeviceRecord,
         grant: DeviceGrant,
         nonce_digest: String,
         now: DateTime<Utc>,
-        verify: impl FnOnce(&DeviceAuthorizationRecord, &DeviceAuthorizationKeyRecord) -> Result<()>,
+        verify: impl FnOnce(&[(DeviceAuthorizationRecord, DeviceAuthorizationKeyRecord)]) -> Result<()>,
     ) -> Result<(DeviceAuthorizationRecord, IntroductionTransition)> {
         let _lock = DeviceRegistryStoreLock::acquire(&self.path)?;
         let mut loaded = read_registry(&self.path)?;
@@ -35,7 +35,10 @@ impl DeviceRegistry {
         if loaded.introduction_transitions.len() >= MAX_INTRODUCTIONS {
             bail!("introduction consumption ledger is full");
         }
-        let source = introduction_source(&loaded, source_id)?;
+        let sources = source_ids
+            .iter()
+            .map(|source_id| introduction_source(&loaded, *source_id))
+            .collect::<Result<Vec<_>>>()?;
         let destination = DeviceAuthorizationRecord {
             device: device.clone(),
             grant: grant.clone(),
@@ -49,34 +52,36 @@ impl DeviceRegistry {
             audited_at: None,
         };
         loaded.introduction_transitions.push(transition.clone());
-        self.authorization_keys.with_active_key(source_id, |key| {
-            verify(&source, key)?;
-            // Challenge spend precedes this atomic registry commit. A failed
-            // commit burns the challenge; it never becomes a success receipt.
-            write_registry_with_introductions(
-                &self.path,
-                &loaded.devices,
-                &loaded.rotation_transitions,
-                &loaded.grant_reissue_transitions,
-                &loaded.introduction_transitions,
-            )
-            .context(IntroductionCommitUncertain)?;
-            #[cfg(test)]
-            if FAIL_AFTER_INTRODUCTION_WRITE
-                .lock()
-                .unwrap()
-                .remove(&self.path)
-            {
-                return Err(anyhow::anyhow!("injected post-replacement failure")
-                    .context(IntroductionCommitUncertain));
-            }
-            *self
-                .devices
-                .write()
-                .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))
-                .context(IntroductionCommitUncertain)? = loaded.devices;
-            Ok((destination, transition))
-        })
+        self.authorization_keys
+            .with_active_keys(source_ids, |keys| {
+                let approvers: Vec<_> = sources.into_iter().zip(keys.iter().cloned()).collect();
+                verify(&approvers)?;
+                // Challenge spend precedes this atomic registry commit. A failed
+                // commit burns the challenge; it never becomes a success receipt.
+                write_registry_with_introductions(
+                    &self.path,
+                    &loaded.devices,
+                    &loaded.rotation_transitions,
+                    &loaded.grant_reissue_transitions,
+                    &loaded.introduction_transitions,
+                )
+                .context(IntroductionCommitUncertain)?;
+                #[cfg(test)]
+                if FAIL_AFTER_INTRODUCTION_WRITE
+                    .lock()
+                    .unwrap()
+                    .remove(&self.path)
+                {
+                    return Err(anyhow::anyhow!("injected post-replacement failure")
+                        .context(IntroductionCommitUncertain));
+                }
+                *self
+                    .devices
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))
+                    .context(IntroductionCommitUncertain)? = loaded.devices;
+                Ok((destination, transition))
+            })
     }
 
     pub(in crate::mobile_memory) fn pending_introduction_audits(

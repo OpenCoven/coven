@@ -28,9 +28,10 @@ and requests bound to the previous policy.
 There is no default policy or approval threshold. A policy must specify a
 canonical nonempty eligible-introducer list, allowed scopes, maximum grant
 lifetime, fresh user-verification or biometric assurance, and maximum step-up
-age (1–120 seconds). The caller explicitly selects exactly one approval.
-Zero, N-of-M and other thresholds are refused. A requested threshold is never
-silently reduced. Full threshold execution remains part of #788.
+age (1–120 seconds). It must also set an explicit approval threshold N, with
+1 ≤ N ≤ min(eligible introducers, 16). There is no default, and the CLI flag
+`--required-approvals` is mandatory. A requested threshold is never silently
+reduced.
 
 The current source must have `DeviceAdmin`, an active device/grant, and a
 separately enrolled active authorization key. Revocation, suspension, grant
@@ -78,6 +79,51 @@ source scopes. It cannot weaken source minimum assurance or per-scope fresh
 verification requirements. Its revision starts at zero. The destination gets
 no authorization key implicitly; grants requiring step-up cannot satisfy that
 requirement until a separate approved key-enrollment ceremony exists.
+
+## Threshold (N-of-M) introduction
+
+A request names exactly N approvers, and N must equal the policy threshold.
+
+- A **v1** `IntroductionRequest` names one introducer, so it is valid only when
+  N = 1. Its transcript is unchanged.
+- A **v2** `ThresholdIntroductionRequest` names N ≥ 2 approvers. Each is a
+  `{deviceId, grantId, revocationEpoch}`, and the list is strictly sorted by
+  device ID. Every approver must be eligible.
+
+v2 hashes under `COVEN-INTRODUCTION/2\0`, so a v1 signature never verifies as a
+v2 action. Both versions use the same `devices.introduction.approve` and
+`.accept` operations. Both versions are checked by the same
+`IntroductionTerms` validation, so they cannot drift.
+
+Each approver obtains its own challenge
+(`issue_threshold_challenge`). It signs the same exact action with its
+possession key and supplies its own action step-up. `introduce_threshold`
+requires exactly one approval per named approver; a missing, extra, duplicate
+or unnamed approval is refused before any lock is taken. All N approvals are
+checked inside **one** registry commit, and that commit holds every
+approver's device record and current authorization key together
+(`with_active_keys`). For every approver it checks:
+
+- source state, `DeviceAdmin` and transport
+- the possession signature
+- step-up freshness against the policy's maximum age at commit time
+- assurance
+- that the destination grant is no broader than that approver's grant
+
+A single failure aborts the commit. Challenges consumed before the failure are
+burned, but the nonce is not consumed, so fresh genuine approvals can still
+succeed. Because freshness is checked at commit, all N approvers must act
+within the maximum step-up age (at most 120 seconds).
+
+The enrollment ledger collects approvals only from named approvers, once each.
+It hides a request from an approver who has already approved, and reports
+`approvalsReceived`/`approvalsRequired`. It commits on the N-th approval;
+that commit is the request's single, terminal attempt.
+
+Under N > 1, an eligible introducer can still *tighten* the owner policy
+alone. The strictness check never lets that lower N, and loosening requires
+the owner-root key. Fixture:
+`tests/fixtures/trusted-device-introduction/threshold.rs`.
 
 ## Commit, replay and restart
 
@@ -255,7 +301,7 @@ cargo test -p coven-cli --bin coven mobile_memory::introduction --locked
 ```
 
 Remote (relay) transport, the mobile client's rendering/signing of the pending
-request, passkeys, platform attestation, N-of-M, remote recovery and end-to-end
+request, passkeys, platform attestation, remote recovery and end-to-end
 #788 acceptance remain pending. The future
 integration must authenticate its channels, enforce transport restrictions,
 source audience/policy from local authority and expose uncertain outcomes

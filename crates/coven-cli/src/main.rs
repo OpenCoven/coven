@@ -1080,6 +1080,14 @@ struct IntroductionPolicyArgs {
     introducers: Vec<Uuid>,
     #[arg(
         long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u16).range(1..=16),
+        help = "Approvals a new device needs from distinct introducers (1 to the number of \
+                introducers; there is no default)"
+    )]
+    required_approvals: u16,
+    #[arg(
+        long,
         value_enum,
         value_delimiter = ',',
         required = true,
@@ -1121,7 +1129,7 @@ impl IntroductionPolicyArgs {
         }
         let policy = mobile_memory::introduction::IntroductionPolicy {
             eligible_introducers: introducers,
-            required_approvals: 1,
+            required_approvals: self.required_approvals,
             allowed_scopes: canonical_device_scopes(self.scope)?,
             maximum_grant_lifetime_seconds: u32::from(self.max_grant_days) * 86_400,
             required_assurance: match self.assurance {
