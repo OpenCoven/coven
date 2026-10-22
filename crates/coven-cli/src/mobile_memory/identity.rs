@@ -26,6 +26,23 @@ pub struct HostIdentity {
     pub public_key_fingerprint: [u8; 32],
 }
 
+/// Returning-device transports must never create an identity or rotate a LAN
+/// certificate merely because the listener is disabled or the network changed.
+pub fn load_existing_host_identity(coven_home: &Path) -> Result<HostIdentity> {
+    let directory = coven_home.join(super::config::MOBILE_STATE_DIR);
+    super::config::validate_private_directory(&directory)?;
+    let key = load_key_pair(&directory.join(HOST_KEY_FILE))?;
+    let private_key_der = Zeroizing::new(key.serialize_der());
+    let public_key_fingerprint = fingerprint_for_private_key(&private_key_der)?;
+    let (certificate_der, _) =
+        load_stored_certificate(&directory.join(HOST_IDENTITY_FILE), public_key_fingerprint)?;
+    Ok(HostIdentity {
+        certificate_der,
+        private_key_der,
+        public_key_fingerprint,
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredHostIdentity {

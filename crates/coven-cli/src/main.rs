@@ -908,6 +908,11 @@ enum MemoryCommand {
 
 #[derive(Subcommand, Debug)]
 enum MobileMemoryCommand {
+    #[command(about = "Configure outbound relay access for already-paired devices")]
+    Relay {
+        #[command(subcommand)]
+        command: MobileRelayCommand,
+    },
     #[command(about = "Enable the private-network TLS mobile gateway")]
     Enable {
         #[arg(long, value_name = "PRIVATE_ADDRESS:PORT")]
@@ -934,6 +939,35 @@ enum MobileMemoryCommand {
         #[command(subcommand)]
         command: Option<MobileDeviceCommand>,
         #[arg(long, help = "Print devices as JSON (machine-readable)")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MobileRelayCommand {
+    #[command(about = "Add or update one WSS relay endpoint, preserving current enablement")]
+    Add {
+        #[arg(long, value_name = "WSS_URL")]
+        endpoint: String,
+        #[arg(
+            long,
+            value_name = "PEM_FILE",
+            help = "Explicit certificate authorities for this endpoint (replaces public roots)"
+        )]
+        ca_certificate: Vec<PathBuf>,
+    },
+    #[command(about = "Remove a configured relay endpoint")]
+    Remove {
+        #[arg(long, value_name = "WSS_URL")]
+        endpoint: String,
+    },
+    #[command(about = "Enable configured relays using the existing host identity")]
+    Enable,
+    #[command(about = "Disable relay access while retaining paired devices and endpoint settings")]
+    Disable,
+    #[command(about = "Show relay configuration status (not connection status)")]
+    Status {
+        #[arg(long)]
         json: bool,
     },
 }
@@ -1973,6 +2007,18 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Memory { command, json }) => match command {
             Some(MemoryCommand::Open) => memory_dashboard::run_open(),
             Some(MemoryCommand::Mobile { command }) => match command {
+                MobileMemoryCommand::Relay { command } => match command {
+                    MobileRelayCommand::Add {
+                        endpoint,
+                        ca_certificate,
+                    } => mobile_memory::relay::run_add(&endpoint, &ca_certificate),
+                    MobileRelayCommand::Remove { endpoint } => {
+                        mobile_memory::relay::run_remove(&endpoint)
+                    }
+                    MobileRelayCommand::Enable => mobile_memory::relay::run_enable(),
+                    MobileRelayCommand::Disable => mobile_memory::relay::run_disable(),
+                    MobileRelayCommand::Status { json } => mobile_memory::relay::run_status(json),
+                },
                 MobileMemoryCommand::Enable { bind, endpoint } => {
                     mobile_memory::run_enable(bind, &endpoint)
                 }
