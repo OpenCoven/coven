@@ -135,6 +135,101 @@ pub fn run_root_change(
     }
 }
 
+pub fn run_rotate_root(old_key: &Path, new_key: &Path, assume_yes: bool) -> Result<()> {
+    let home = crate::coven_home_dir()?;
+    let store = OwnerPolicyStore::open(&home, installed_host_fingerprint(&home)?)?;
+    let old = load_owner_root(&home, old_key)?;
+    let new = load_owner_root(&home, new_key)?;
+    let mut stdin = std::io::stdin().lock();
+    let mut reader = |prompt: &str| -> Result<String> {
+        if assume_yes {
+            return Ok("rotate".to_owned());
+        }
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        stdin.read_line(&mut line)?;
+        Ok(line.trim().to_owned())
+    };
+    match apply_root_rotation(&store, &old, &new, Utc::now(), rand::random(), &mut reader)? {
+        Some(head) => {
+            println!(
+                "Owner root rotated at policy revision {}; the event is in the mobile audit log.",
+                head.revision
+            );
+            println!("Store the new key offline. The old key no longer approves anything.");
+            Ok(())
+        }
+        None => bail!("owner-root rotation cancelled; nothing was signed"),
+    }
+}
+
+/// Owner identity rotation: both keys sign one exact action after review.
+pub(super) fn apply_root_rotation(
+    store: &OwnerPolicyStore,
+    old: &SigningKey,
+    new: &SigningKey,
+    now: DateTime<Utc>,
+    nonce: [u8; 32],
+    reader: &mut impl FnMut(&str) -> Result<String>,
+) -> Result<Option<InstalledPolicy>> {
+    let head = store
+        .current()?
+        .context("introduction policy is not installed")?;
+    if head.owner_root_key != public_key(old) {
+        bail!("the outgoing key is not the installed owner-root credential");
+    }
+    let incoming = public_key(new);
+    if incoming == head.owner_root_key {
+        bail!("the incoming key must differ from the installed owner root");
+    }
+    let proposal = PolicyProposal {
+        revision: head.revision + 1,
+        previous_digest: Some(head.digest.clone()),
+        policy: head.policy.clone(),
+        nonce,
+        issued_at: now,
+        expires_at: now + chrono::Duration::seconds(ROOT_ACTION_SECONDS),
+    };
+    let action = store.rotation_action(&incoming, &proposal)?;
+    let mut review = String::from("Review the exact owner-root rotation:\n");
+    let mut field = |name: &str, value: String| {
+        review.push_str(&format!("  {name:<28} {value}\n"));
+    };
+    field("operation", action.operation.clone());
+    field("installation (audience)", action.target.clone());
+    field(
+        "outgoing owner-root key",
+        key_fingerprint(&head.owner_root_key),
+    );
+    field("incoming owner-root key", key_fingerprint(&incoming));
+    field("revision", proposal.revision.to_string());
+    field("previous digest", head.digest.clone());
+    field("policy", "unchanged".into());
+    field("nonce", action.nonce.clone());
+    field("issued at", timestamp(action.issued_at));
+    field("expires at", timestamp(action.expires_at));
+    field("effect digest", action.effect_digest.clone());
+    review.push_str(
+        "  Devices, grants and familiars are unchanged. Signatures bound to the current\n  \
+         policy head, such as unused recovery approvals, are retired.\n",
+    );
+    let answer = reader(&format!(
+        "{review}Type `rotate` to sign this exact action with both keys (anything else cancels): "
+    ))?;
+    if answer != "rotate" {
+        return Ok(None);
+    }
+    let bytes = action.canonical_bytes()?;
+    Ok(Some(store.rotate_root(
+        &incoming,
+        &proposal,
+        &sign(old, &bytes),
+        &sign(new, &bytes),
+        now,
+    )?))
+}
+
 /// Builds the exact action, shows every signed field, and signs only after
 /// the owner types the confirmation word. Returns `None` when cancelled.
 pub(super) fn apply_root_change(
