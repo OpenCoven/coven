@@ -2286,3 +2286,479 @@ fn a_claimed_retry_past_its_deadline_carries_its_lease() {
         }])
     );
 }
+
+/// A runtime whose kills are never confirmed, as a real one's can be.
+struct UnconfirmedKill;
+
+impl crate::api::SessionRuntime for UnconfirmedKill {
+    fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn send_input(&self, _session_id: &str, _payload: &Value) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("the kill was not confirmed")
+    }
+}
+
+struct HeldShape {
+    name: &'static str,
+    occurrence: &'static str,
+    deadline: Option<&'static str>,
+    session: Option<&'static str>,
+    lease: Option<&'static str>,
+    /// (number, state, carries the run's session)
+    attempts: &'static [(i64, &'static str, bool)],
+    authority: bool,
+    fenced: bool,
+    /// A cancellation: its state, and when its execution expires.
+    cancelling: Option<(&'static str, &'static str)>,
+    /// Another run on the occurrence, with this status, whose session completed.
+    rival: Option<&'static str>,
+    /// The deadline is stored as a BLOB, which reconciliation cannot read.
+    blob_deadline: bool,
+    code: WorkCode,
+    deadline_at: Option<&'static str>,
+    /// The occurrence after the daemon's reconciliation at 10:00 and then at
+    /// 10:30; `None` when that pass fails.
+    after: [Option<&'static str>; 2],
+}
+
+const HELD: HeldShape = HeldShape {
+    name: "held",
+    occurrence: "claimed",
+    deadline: Some("2026-10-22T10:30:00.000Z"),
+    session: None,
+    lease: None,
+    attempts: &[(1, "failed", false)],
+    authority: false,
+    fenced: false,
+    cancelling: None,
+    rival: None,
+    blob_deadline: false,
+    code: WorkCode::RetryHeld,
+    deadline_at: Some("2026-10-22T10:30:00.000Z"),
+    after: [Some("claimed"), Some("failed")],
+};
+
+/// What the daemon's reconciliation does with a failed attempt held for an
+/// operator retry, one store per shape so that a failing pass hides nothing.
+#[test]
+fn each_held_retry_names_what_reconciliation_does_with_it() {
+    let shapes = [
+        HELD,
+        HeldShape {
+            name: "running",
+            occurrence: "running",
+            session: Some("failed"),
+            attempts: &[(1, "failed", true)],
+            after: [Some("running"), Some("failed")],
+            ..HELD
+        },
+        HeldShape {
+            name: "live-session",
+            session: Some("running"),
+            attempts: &[(1, "failed", true)],
+            ..HELD
+        },
+        HeldShape {
+            name: "no-deadline",
+            deadline: None,
+            deadline_at: None,
+            after: [Some("failed"), Some("failed")],
+            ..HELD
+        },
+        HeldShape {
+            name: "expired",
+            deadline: Some("2026-10-22T09:45:00.000Z"),
+            deadline_at: Some("2026-10-22T09:45:00.000Z"),
+            after: [Some("failed"), Some("failed")],
+            ..HELD
+        },
+        HeldShape {
+            name: "offset",
+            deadline: Some("2026-10-22T12:30:00+02:00"),
+            ..HELD
+        },
+        HeldShape {
+            name: "twice",
+            attempts: &[(1, "failed", false), (2, "failed", false)],
+            ..HELD
+        },
+        // Timeout enforcement settles an adopted retry past its deadline
+        // first.
+        HeldShape {
+            name: "adopted-expired",
+            deadline: Some("2026-10-22T09:45:00.000Z"),
+            attempts: &[(1, "adopted", false), (2, "failed", false)],
+            code: WorkCode::RetryExpired,
+            deadline_at: Some("2026-10-22T09:45:00.000Z"),
+            after: [Some("failed"), Some("failed")],
+            ..HELD
+        },
+        // Timeout enforcement settles a claimed occurrence's adopted retry at
+        // its deadline, as settlement would, but refuses a running one.
+        HeldShape {
+            name: "adopted-waiting",
+            attempts: &[(1, "adopted", false), (2, "failed", false)],
+            ..HELD
+        },
+        HeldShape {
+            name: "running-adopted",
+            occurrence: "running",
+            attempts: &[(1, "adopted", false), (2, "failed", false)],
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("running"), None],
+            ..HELD
+        },
+        HeldShape {
+            name: "running-adopted-undated",
+            occurrence: "running",
+            deadline: None,
+            attempts: &[(1, "adopted", false), (2, "failed", false)],
+            deadline_at: None,
+            after: [Some("failed"), Some("failed")],
+            ..HELD
+        },
+        // Only the latest attempt counts, and nothing settles one that
+        // timed out without a session.
+        HeldShape {
+            name: "timed-out-after",
+            attempts: &[(1, "failed", false), (2, "timed_out", false)],
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("claimed"), Some("claimed")],
+            ..HELD
+        },
+        HeldShape {
+            name: "retrying",
+            attempts: &[(1, "failed", false), (2, "started", false)],
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("claimed"), Some("claimed")],
+            ..HELD
+        },
+        // Abandoned-launch recovery reads this launch, but can stop only a
+        // live attempt.
+        HeldShape {
+            name: "created-session",
+            session: Some("created"),
+            lease: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "failed", true)],
+            ..HELD
+        },
+        // Timeout enforcement stops a live attempt at the deadline instead,
+        // and an unconfirmed stop needs recovery.
+        HeldShape {
+            name: "live-attempt",
+            session: Some("running"),
+            attempts: &[(1, "started", true), (2, "failed", false)],
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("claimed"), Some("recovery_required")],
+            ..HELD
+        },
+        HeldShape {
+            name: "authority",
+            authority: true,
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("claimed"), Some("claimed")],
+            ..HELD
+        },
+        HeldShape {
+            name: "live-dispatching",
+            session: Some("running"),
+            attempts: &[(1, "dispatching", true), (2, "failed", false)],
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("claimed"), Some("recovery_required")],
+            ..HELD
+        },
+        HeldShape {
+            name: "live-observing",
+            session: Some("running"),
+            attempts: &[(1, "observing", true), (2, "failed", false)],
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("claimed"), Some("recovery_required")],
+            ..HELD
+        },
+        // Settlement skips a fenced run on every pass.
+        HeldShape {
+            name: "fenced",
+            session: Some("failed"),
+            attempts: &[(1, "failed", true)],
+            fenced: true,
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("claimed"), Some("claimed")],
+            ..HELD
+        },
+        // Reconciling a requested cancellation leaves the hold to settlement.
+        HeldShape {
+            name: "cancelling",
+            session: Some("failed"),
+            attempts: &[(1, "failed", true)],
+            cancelling: Some(("requested", "2099-01-01T00:00:00.000Z")),
+            ..HELD
+        },
+        HeldShape {
+            name: "cancellation-expired",
+            session: Some("failed"),
+            attempts: &[(1, "failed", true)],
+            cancelling: Some(("requested", "2026-10-22T09:00:00.000Z")),
+            ..HELD
+        },
+        HeldShape {
+            name: "cancellation-rejected",
+            cancelling: Some(("rejected", "2026-10-22T09:00:00.000Z")),
+            ..HELD
+        },
+        // A stopping cancellation that expires before the deadline fails the
+        // pass when its stop cannot be recovered.
+        HeldShape {
+            name: "stopping",
+            session: Some("running"),
+            attempts: &[(1, "failed", true)],
+            cancelling: Some(("stopping", "2026-10-22T10:15:00.000Z")),
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("claimed"), None],
+            ..HELD
+        },
+        // Settlement of the other run settles the occurrence first, and the
+        // hold's settlement then fails the pass.
+        HeldShape {
+            name: "rival",
+            rival: Some("running"),
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [Some("succeeded"), None],
+            ..HELD
+        },
+        // Only a running run settles the occurrence.
+        HeldShape {
+            name: "settled-rival",
+            rival: Some("succeeded"),
+            ..HELD
+        },
+        HeldShape {
+            name: "blob-deadline",
+            blob_deadline: true,
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [None, None],
+            ..HELD
+        },
+        HeldShape {
+            name: "unreadable",
+            deadline: Some("2026-10-22 10:30"),
+            code: WorkCode::InFlight,
+            deadline_at: None,
+            after: [None, None],
+            ..HELD
+        },
+        // Recovery is named first; settlement still settles the hold.
+        HeldShape {
+            name: "recovery",
+            occurrence: "recovery_required",
+            code: WorkCode::RecoveryRequired,
+            deadline_at: None,
+            after: [Some("recovery_required"), Some("failed")],
+            ..HELD
+        },
+        // Settlement cannot settle a planned occurrence, so the pass fails.
+        HeldShape {
+            name: "planned",
+            occurrence: "planned",
+            code: WorkCode::RunningRun,
+            deadline_at: None,
+            after: [Some("planned"), None],
+            ..HELD
+        },
+    ];
+    let at = |minute: u32| Utc.with_ymd_and_hms(2026, 10, 22, 10, minute, 0).unwrap();
+    let mut seen = Vec::new();
+    for shape in &shapes {
+        let (temp, conn) = store();
+        insert_definition_at(
+            &conn,
+            &definition("daily", "PAUSED"),
+            "2026-10-01T00:00:00.000Z",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 lease_expires_at, created_at, updated_at)
+             VALUES ('o-held', 'daily', '2026-10-21T09:00:00.000Z', 'manual', ?1, 1,
+                     'operator', ?2, '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z')",
+            rusqlite::params![shape.occurrence, shape.lease],
+        )
+        .unwrap();
+        if let Some(status) = shape.session {
+            session(&conn, "s-held", status);
+        }
+        run_keyed(
+            &conn,
+            "r-held",
+            "daily",
+            Some("o-held"),
+            "running",
+            shape.authority,
+        );
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?1, session_id = ?2 WHERE id = 'r-held'",
+            rusqlite::params![shape.deadline, shape.session.map(|_| "s-held")],
+        )
+        .unwrap();
+        for (number, state, with_session) in shape.attempts {
+            let id = format!("a-held-{}", 10 - number);
+            attempt(
+                &conn,
+                &id,
+                "r-held",
+                *number,
+                state,
+                with_session.then_some("s-held"),
+            );
+        }
+        if shape.blob_deadline {
+            conn.execute_batch(
+                "UPDATE automation_runs SET timeout_at = CAST(timeout_at AS BLOB)
+                 WHERE id = 'r-held';",
+            )
+            .unwrap();
+        }
+        if let Some(status) = shape.rival {
+            run_keyed(&conn, "r-rival", "daily", Some("o-held"), status, false);
+            session(&conn, "s-rival", "completed");
+            conn.execute_batch(
+                "UPDATE sessions SET exit_code = 0 WHERE id = 's-rival';
+                 UPDATE automation_runs SET session_id = 's-rival' WHERE id = 'r-rival';",
+            )
+            .unwrap();
+            attempt(&conn, "a-rival", "r-rival", 1, "started", Some("s-rival"));
+        }
+        if shape.fenced {
+            conn.execute_batch(
+                "INSERT INTO automation_stop_fences
+                    (run_id, session_id, owner, acquired_at, execution_expires_at)
+                 VALUES ('r-held', 's-held', 'timeout', '2026-10-22T09:00:00.000Z',
+                         '2099-01-01T00:00:00.000Z');",
+            )
+            .unwrap();
+        }
+        if let Some((state, expires)) = shape.cancelling {
+            conn.execute(
+                "INSERT INTO automation_cancellations
+                    (adoption_key, request_digest, automation_id, run_id, attempt_id,
+                     session_id, scope, requested_by_json, reason, state, requested_at,
+                     execution_expires_at)
+                 VALUES ('cancel-held', 'digest', 'daily', 'r-held', 'a-held-9', 's-held',
+                         'run', '{\"principalId\":\"operator\"}', 'stop', ?1,
+                         '2026-10-22T08:00:00.000Z', ?2)",
+                [state, expires],
+            )
+            .unwrap();
+        }
+        let item = found(&conn, "daily").work.into_iter().next().unwrap();
+        // TEMP tables cannot change what the held run reads as.
+        let explained = work_of(&conn, "daily");
+        conn.execute_batch(
+            "CREATE TEMP TABLE automation_attempts AS SELECT * FROM main.automation_attempts;
+             UPDATE temp.automation_attempts
+                 SET state = CASE state WHEN 'failed' THEN 'started' ELSE 'failed' END;
+             CREATE TEMP TABLE automation_runs AS SELECT * FROM main.automation_runs;
+             UPDATE temp.automation_runs SET authority_profile =
+                 CASE WHEN authority_profile IS NULL THEN 'shadow' END;
+             CREATE TEMP TABLE automation_stop_fences AS
+                 SELECT * FROM main.automation_stop_fences WHERE 0;
+             INSERT INTO temp.automation_stop_fences (run_id) VALUES ('r-held');
+             CREATE TEMP TABLE automation_cancellations AS
+                 SELECT * FROM main.automation_cancellations WHERE 0;
+             INSERT INTO temp.automation_cancellations (run_id, state)
+                 VALUES ('r-held', 'requested');",
+        )
+        .unwrap();
+        assert_eq!(work_of(&conn, "daily"), explained, "{}", shape.name);
+        conn.execute_batch(
+            "DROP TABLE temp.automation_attempts;
+             DROP TABLE temp.automation_runs;
+             DROP TABLE temp.automation_stop_fences;
+             DROP TABLE temp.automation_cancellations;",
+        )
+        .unwrap();
+        let after = [at(0), at(30)].map(|instant| {
+            crate::automations::daemon_tick::reconcile_automation_runs(
+                temp.path(),
+                &conn,
+                &UnconfirmedKill,
+                instant,
+                None,
+            )
+            .ok()
+            .map(|()| {
+                conn.query_row(
+                    "SELECT state FROM automation_occurrences WHERE id = 'o-held'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            })
+        });
+        seen.push((shape.name, item.code, item.deadline_at, after));
+    }
+    let expected: Vec<_> = shapes
+        .iter()
+        .map(|shape| {
+            (
+                shape.name,
+                shape.code,
+                shape.deadline_at.map(str::to_string),
+                shape.after.map(|state| state.map(str::to_string)),
+            )
+        })
+        .collect();
+    assert_eq!(seen, expected);
+}
+
+#[test]
+fn a_deadline_reconciliation_cannot_read_as_text_leaves_a_retry_unnamed() {
+    for (stored, code) in [
+        ("'2026-10-22T12:00:00.000Z'", WorkCode::RetryWaiting),
+        (
+            "CAST('2026-10-22T12:00:00.000Z' AS BLOB)",
+            WorkCode::RunningRun,
+        ),
+    ] {
+        let (_temp, conn) = store();
+        insert_definition_at(
+            &conn,
+            &definition("daily", "PAUSED"),
+            "2026-10-01T00:00:00.000Z",
+        )
+        .unwrap();
+        occurrence(&conn, "o-retry", "daily", 21, "planned");
+        run_keyed(&conn, "r-retry", "daily", Some("o-retry"), "running", false);
+        conn.execute_batch(&format!(
+            "UPDATE automation_runs SET timeout_at = {stored} WHERE id = 'r-retry';"
+        ))
+        .unwrap();
+        adopted_attempt(&conn, "r-retry", "2026-10-22T11:00:00.000Z");
+        let item = found(&conn, "daily").work.into_iter().next().unwrap();
+        assert_eq!(item.code, code, "{stored}");
+        // Timeout enforcement reads the deadline as text, or fails the pass.
+        let enforced = crate::automations::runner::enforce_run_timeouts(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            now(),
+        );
+        assert_eq!(enforced.is_ok(), code == WorkCode::RetryWaiting, "{stored}");
+    }
+}
