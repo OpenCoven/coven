@@ -25,6 +25,8 @@ mod receipt_links;
 mod schema;
 #[path = "doctor_sequences.rs"]
 mod sequences;
+#[path = "doctor_stop_fences.rs"]
+mod stop_fences;
 
 pub const ACTION: &str = "coven.automations.doctor.v1";
 pub const SCHEMA: &str = "coven.automations.doctor.v1";
@@ -100,6 +102,10 @@ pub enum Fact {
     LeaseOutsideActiveStateOccurrences,
     RecordedSchedulerFencePresent,
     MismatchedUnlaunchedSchedulerClaims,
+    StopFences,
+    ActiveStopFences,
+    ExpiredStopFences,
+    InvalidStopFenceExpiries,
     QuarantinedRoutines,
     FailedAttempts,
     RetryExhaustionHistories,
@@ -180,7 +186,11 @@ impl Fact {
             | Self::InvalidLeaseExpiryOccurrences
             | Self::LeaseOutsideActiveStateOccurrences
             | Self::RecordedSchedulerFencePresent
-            | Self::MismatchedUnlaunchedSchedulerClaims => Category::LeasesFences,
+            | Self::MismatchedUnlaunchedSchedulerClaims
+            | Self::StopFences
+            | Self::ActiveStopFences
+            | Self::ExpiredStopFences
+            | Self::InvalidStopFenceExpiries => Category::LeasesFences,
             Self::QuarantinedRoutines
             | Self::FailedAttempts
             | Self::RetryExhaustionHistories
@@ -252,6 +262,7 @@ pub enum Gap {
     RecordedClaimStoreUnavailable,
     LeaseStoreUnavailable,
     LeaseStateUnavailable,
+    StopFenceStoreUnavailable,
     LagHistoryNotMeasured,
     OccurrencePlanningStoreUnavailable,
     OccurrencePlanningMetadataInvalid,
@@ -719,6 +730,8 @@ impl Report {
                 planning::validate_and_strip(&mut core)?;
             } else if core.category == Category::RepeatedFailures {
                 failure_history::validate_and_strip(&mut core)?;
+            } else if core.category == Category::LeasesFences {
+                stop_fences::validate_and_strip(&mut core)?;
             }
             let observation = &core;
             ensure!(
@@ -2746,6 +2759,14 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
             .find(|value| value.category == Category::RepeatedFailures)
             .expect("failure category is constructed above"),
         failure_history_measurement,
+    );
+    let stop_fence_measurement = stop_fences::inspect(&transaction, now)?;
+    stop_fences::append(
+        observations
+            .iter_mut()
+            .find(|value| value.category == Category::LeasesFences)
+            .expect("lease category is constructed above"),
+        stop_fence_measurement,
     );
     transaction.commit()?;
     let report = Report {
