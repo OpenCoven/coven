@@ -633,6 +633,38 @@ no aggregate health or certification bit. See the [doctor runbook](reference/aut
 for each category's scope and remaining checks. The complete doctor outcome in
 #1355 and the full certification outcome in #858 remain open.
 
+### Automations explanation
+
+`coven.automations.explain.v1` (`{ "id": "<automation-id>" }`) is an
+owner-local read that names what decides whether one routine runs next. Over
+TCP it returns `403 AUTHORITY_REQUIRED` before store access. It returns
+`{ "explanation": … }` as the response's event payload, as
+`.definition.health.v1` and the occurrence and run reads do. Nothing is
+published, and the read itself writes nothing; the route opens the store as
+every owner-local action does. An unknown id or a mission returns
+`404 NOT_FOUND`; a tombstoned routine returns `410 GONE_TOMBSTONED`.
+
+The explanation carries `automationId`, `revision`, `lifecycleState`,
+`observedAt` and a non-empty, ordered `conditions` list. Each condition has a
+`code` and a `nextStep`, and some have `at` or `failureClass`:
+
+| `code` | Holds when | `nextStep` |
+| --- | --- | --- |
+| `not_active` | the stored `status` is not exactly `ACTIVE`, or the readable definition's own status is not `ACTIVE` | `activate_if_intended` |
+| `quarantined` | retry exhaustion quarantined the routine; `at` is the quarantine time and `failureClass` its class, each omitted unless canonical | `review_failure_then_unquarantine` |
+| `definition_unavailable` | the stored definition is unreadable or fails validation; or, with a stored `status` of `ACTIVE`, planning could not verify its revision: a missing or stale digest, a definition whose own `id` is not the routine's, or an unreadable creation or revision time | `revise_definition` |
+| `next_slot` | none of the above holds; `at` is the schedule's first slot after `observedAt` | `none` |
+
+These are the predicates planning applies, read from the main schema in one
+statement. Every blocking condition that holds is listed in the order above,
+because each alone keeps planning from scheduling the routine. The revision
+checks apply only to a stored `ACTIVE` row, because planning reaches them only
+then. `next_slot`
+appears only when none holds. It states what the schedule produces next, not
+that a pass will plan or launch it: overlap and misfire policy, slots already
+due, and the scheduler's liveness are outside this read. Prompts, quarantine
+reasons, validation text and lease owners are never returned.
+
 Other unknown action ids return `400` and fail closed:
 
 ```json

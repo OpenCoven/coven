@@ -47,16 +47,17 @@ coven automations status --json
 coven automations occurrence <occurrence-id> --json
 coven automations run <run-id> --json
 coven automations attempts <run-id> --json
+coven automations explain <automation-id> --json
 ```
 
 They issue existing read control actions through the identity-bound Rust daemon
 client. They do not start the daemon, initialize local state, repair records,
 or dispatch work. If the daemon is unavailable, check `coven daemon status`.
-A missing occurrence or run exits unsuccessfully; it is not an empty healthy
-result.
+A missing occurrence, run or routine exits unsuccessfully; it is not an empty
+healthy result. A tombstoned routine also exits unsuccessfully, and says so.
 
 Output uses `schemaVersion: "coven.automations.inspection.v1"` and a
-`scheduler`, `occurrence`, `run`, or `runId`/`attempts` field. Both display modes
+`scheduler`, `occurrence`, `run`, `runId`/`attempts`, or `explanation` field. Both display modes
 use the same privacy-minimized projection; omitting `--json` adds a heading.
 Raw logs, adoption keys and free-form failure reasons are omitted. Structured
 states, fences, retry classifications and nullable settlement times remain
@@ -65,8 +66,18 @@ run list is bounded and does not prove complete history.
 
 Scheduler status reports persisted authority, last-pass and queue observations.
 An assigned authority or a previous successful pass is not a current liveness
-or overall health guarantee. Comprehensive `doctor`/`explain`, principal-scoped
-reads and the remaining operator surface are still tracked by #858.
+or overall health guarantee.
+
+`explain` lists every condition that keeps planning from scheduling the routine,
+in this order: `not_active`, `quarantined`, `definition_unavailable`. The last
+also covers stored revision metadata that planning cannot verify.
+Each carries a `nextStep`. Only when none holds does it report `next_slot`, the
+schedule's first slot after `observedAt`. That is not a promise of a launch:
+overlap and misfire policy, slots already due and the scheduler's liveness are
+outside it (see `coven automations doctor`). The codes and next steps are listed
+in the [API contract](../API-CONTRACT.md#automations-explanation). Work in
+flight for the routine is tracked by #1518. Principal-scoped reads and the
+remaining operator surface are still tracked by #858.
 
 ## Color
 
