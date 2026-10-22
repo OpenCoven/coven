@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
 import unittest
 from unittest.mock import patch
 
@@ -155,6 +156,41 @@ class BootstrapTests(fixtures.ConfigTests):
         self.assertFalse(report["development_ready"])
         self.assertEqual(report["blocked_stage"], "cache")
         self.assertEqual(self.commands, [])
+
+
+class NetworkInventoryTests(unittest.TestCase):
+    """Every destination setup references is documented; enforcement needs a real Cloud run."""
+    repo = Path(__file__).resolve().parents[2]
+
+    def documented_hosts(self):
+        readme = (self.repo / "scripts/cloud/README.md").read_text()
+        return set(re.findall(r"^\| `([a-z0-9.-]+)` \|", readme, re.MULTILINE))
+
+    def referenced_hosts(self):
+        hosts = set()
+        sources = [path for path in (self.repo / "scripts/cloud").glob("*.py") if not path.stem.endswith("-test")]
+        for path in sources + [self.repo / "scripts/install-native-link-dependencies.sh"]:
+            hosts |= set(re.findall(r"https://([A-Za-z0-9.-]+)", path.read_text()))
+        for source in re.findall(r'^source = "([^"]+)"', (self.repo / "Cargo.lock").read_text(), re.MULTILINE):
+            if source == "registry+https://github.com/rust-lang/crates.io-index":
+                hosts |= {"index.crates.io", "static.crates.io"}  # sparse protocol, not the git index
+            else:
+                hosts.add(re.match(r"\w+\+https://([^/]+)/", source).group(1))
+        lock = json.loads((self.repo / "packages/channels/package-lock.json").read_text())
+        hosts |= {re.match(r"https://([^/]+)/", entry["resolved"]).group(1)
+                  for entry in lock["packages"].values() if "resolved" in entry}
+        for npmrc in self.repo.glob("packages/*/.npmrc"):
+            self.assertNotRegex(npmrc.read_text(), r"(?m)^\s*(@[^:]+:)?registry\s*=", npmrc)
+        return hosts | {"registry.npmjs.org"}  # npm and pnpm default registry
+
+    def test_referenced_destinations_are_documented(self):
+        missing = self.referenced_hosts() - self.documented_hosts()
+        self.assertFalse(missing, f"document these hosts in scripts/cloud/README.md: {sorted(missing)}")
+
+    def test_inventory_excludes_unscoped_destinations(self):
+        documented = self.documented_hosts()
+        self.assertTrue(documented)
+        self.assertFalse(documented & {"api.github.com", "objects.githubusercontent.com"})
 
 
 if __name__ == "__main__":
