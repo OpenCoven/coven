@@ -21,6 +21,8 @@ pub(crate) use read::ReadBudgetExceeded;
 mod receipt_commitments;
 #[path = "doctor_receipt_links.rs"]
 mod receipt_links;
+#[path = "doctor_running_runs.rs"]
+mod running_runs;
 #[path = "doctor_schema.rs"]
 mod schema;
 #[path = "doctor_sequences.rs"]
@@ -94,6 +96,9 @@ pub enum Fact {
     ClaimedOccurrences,
     RunningOccurrences,
     RecoveryRequiredOccurrences,
+    RunningRuns,
+    RunningRunsWithEndedSessions,
+    RunningRunsWithFailedLatestAttempt,
     LeaseBearingOccurrences,
     ActiveLeaseOccurrences,
     ExpiredLeaseOccurrences,
@@ -178,7 +183,10 @@ impl Fact {
             | Self::EligibleOccurrences
             | Self::ClaimedOccurrences
             | Self::RunningOccurrences
-            | Self::RecoveryRequiredOccurrences => Category::Queue,
+            | Self::RecoveryRequiredOccurrences
+            | Self::RunningRuns
+            | Self::RunningRunsWithEndedSessions
+            | Self::RunningRunsWithFailedLatestAttempt => Category::Queue,
             Self::LeaseBearingOccurrences
             | Self::ActiveLeaseOccurrences
             | Self::ExpiredLeaseOccurrences
@@ -263,6 +271,7 @@ pub enum Gap {
     LeaseStoreUnavailable,
     LeaseStateUnavailable,
     StopFenceStoreUnavailable,
+    RunningRunStoreUnavailable,
     LagHistoryNotMeasured,
     OccurrencePlanningStoreUnavailable,
     OccurrencePlanningMetadataInvalid,
@@ -732,6 +741,8 @@ impl Report {
                 failure_history::validate_and_strip(&mut core)?;
             } else if core.category == Category::LeasesFences {
                 stop_fences::validate_and_strip(&mut core)?;
+            } else if core.category == Category::Queue {
+                running_runs::validate_and_strip(&mut core)?;
             }
             let observation = &core;
             ensure!(
@@ -1360,6 +1371,7 @@ impl Report {
             }
         }
         planning::validate_cohort(&self.observations)?;
+        running_runs::validate_cohort(&self.observations)?;
         Ok(())
     }
 }
@@ -2767,6 +2779,14 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
             .find(|value| value.category == Category::LeasesFences)
             .expect("lease category is constructed above"),
         stop_fence_measurement,
+    );
+    let running_run_measurement = running_runs::inspect(&transaction)?;
+    running_runs::append(
+        observations
+            .iter_mut()
+            .find(|value| value.category == Category::Queue)
+            .expect("queue category is constructed above"),
+        running_run_measurement,
     );
     transaction.commit()?;
     let report = Report {

@@ -243,6 +243,11 @@ pub struct RunOutcome {
 /// The attempts table's bound on attempt numbers.
 pub(crate) const MAX_ATTEMPT_NUMBER: i64 = 10;
 
+/// Session statuses settlement treats as terminal evidence for a running run.
+/// The doctor counts unsettled runs with the same list.
+pub(crate) const FINISHED_SESSION_STATUSES: [&str; 5] =
+    ["completed", "failed", "cancelled", "killed", "idle"];
+
 fn fresh_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
@@ -3883,12 +3888,9 @@ pub(crate) fn settle_finished_runs_with(
         attempt_number,
     ) in rows
     {
-        let terminal_session = session_status.as_deref().is_some_and(|status| {
-            matches!(
-                status,
-                "completed" | "failed" | "cancelled" | "killed" | "idle"
-            )
-        });
+        let terminal_session = session_status
+            .as_deref()
+            .is_some_and(|status| FINISHED_SESSION_STATUSES.contains(&status));
         // A pre-ownership failed attempt is durable even if its provisional
         // session was sacrificed. Its hold must still expire at the run deadline.
         let failed_plain_hold =

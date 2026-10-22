@@ -214,6 +214,10 @@ fn doctor_report_fixture(genuine_receipt: bool) -> anyhow::Result<()> {
         assert_eq!(facts("leases_fences")["expired_stop_fences"], 1);
         assert_eq!(facts("leases_fences")["active_stop_fences"], 0);
         assert_eq!(facts("leases_fences")["invalid_stop_fence_expiries"], 0);
+        // The seeded run has already failed: nothing is left to settle.
+        assert_eq!(facts("queue")["running_runs"], 0);
+        assert_eq!(facts("queue")["running_runs_with_ended_sessions"], 0);
+        assert_eq!(facts("queue")["running_runs_with_failed_latest_attempt"], 0);
         let delivery = report["observations"]
             .as_array()
             .unwrap()

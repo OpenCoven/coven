@@ -8,6 +8,28 @@ fn fixture() -> (tempfile::TempDir, Connection) {
     (root, conn)
 }
 
+const RUN_FACTS: [Fact; 3] = [
+    Fact::RunningRuns,
+    Fact::RunningRunsWithEndedSessions,
+    Fact::RunningRunsWithFailedLatestAttempt,
+];
+
+/// Running runs are counted from their own tables, apart from occurrences.
+fn occurrence_queue_facts(queue: &Observation) -> Vec<Fact> {
+    queue
+        .facts
+        .keys()
+        .filter(|fact| !RUN_FACTS.contains(fact))
+        .copied()
+        .collect()
+}
+
+fn needs_running_runs(table: &str, column: Option<&str>) -> bool {
+    running_runs::PREREQUISITES
+        .iter()
+        .any(|(name, columns)| *name == table && column.is_none_or(|c| columns.contains(&c)))
+}
+
 #[test]
 fn missing_pass_is_not_measured_zero_duration_or_failure() {
     let (_root, conn) = fixture();
@@ -2545,10 +2567,11 @@ fn eligibility_prerequisites_preserve_independent_queue_and_lease_observations()
             assert_eq!(queue.facts[&Fact::DuePlannedOccurrences], 1);
             assert_eq!(queue.facts[&Fact::ClaimedOccurrences], 1);
             assert!(!queue.facts.contains_key(&Fact::EligibleOccurrences));
-            assert_eq!(
-                serde_json::to_value(&queue.gaps).unwrap(),
-                serde_json::json!(["eligibility_store_unavailable"])
-            );
+            let mut gaps = vec![Gap::EligibilityStoreUnavailable];
+            if needs_running_runs(table, missing_column) {
+                gaps.push(Gap::RunningRunStoreUnavailable);
+            }
+            assert_eq!(queue.gaps, gaps, "{table} {missing_column:?}");
             let leases = report
                 .observations
                 .iter()
@@ -2869,7 +2892,14 @@ fn unavailable_quarantine_preserves_attempts_and_exact_concurrent_history_gaps()
                 .find(|o| o.category == Category::Queue)
                 .unwrap();
             assert!(!queue.facts.contains_key(&Fact::EligibleOccurrences));
-            assert_eq!(queue.gaps, vec![Gap::EligibilityStoreUnavailable]);
+            // The rebuilt attempts table has no attempt number to order by.
+            assert_eq!(
+                queue.gaps,
+                vec![
+                    Gap::EligibilityStoreUnavailable,
+                    Gap::RunningRunStoreUnavailable
+                ]
+            );
             assert_eq!(conn.total_changes(), before);
             assert!(!serde_json::to_string(&report).unwrap().contains("PRIVATE"));
             report.validate().unwrap();
@@ -3000,7 +3030,13 @@ fn unavailable_attempt_state_preserves_independent_retry_and_refusal_facts() {
                         .iter()
                         .find(|o| o.category == Category::Queue)
                         .unwrap();
-                    assert_eq!(queue.gaps, vec![Gap::EligibilityStoreUnavailable]);
+                    assert_eq!(
+                        queue.gaps,
+                        vec![
+                            Gap::EligibilityStoreUnavailable,
+                            Gap::RunningRunStoreUnavailable
+                        ]
+                    );
                     assert_eq!(conn.total_changes(), before);
                     assert!(!serde_json::to_string(&report).unwrap().contains("PRIVATE"));
                     report.validate().unwrap();
@@ -3226,7 +3262,8 @@ fn lease_prerequisites_preserve_independent_expiry_state_and_authority_evidence(
                     .find(|o| o.category == Category::Queue)
                     .unwrap();
                 if missing == "state" || missing == "table" {
-                    assert!(queue.facts.is_empty());
+                    assert!(occurrence_queue_facts(queue).is_empty());
+                    assert_eq!(queue.facts[&Fact::RunningRuns], 0);
                     assert_eq!(
                         serde_json::to_value(&queue.gaps).unwrap(),
                         serde_json::json!([
@@ -3649,9 +3686,10 @@ fn invalid_occurrence_states_cannot_be_reported_as_empty_or_partial_queue_counts
                     .find(|o| o.category == Category::Queue)
                     .unwrap();
                 assert!(
-                    queue.facts.is_empty(),
+                    occurrence_queue_facts(queue).is_empty(),
                     "malformed state cannot become a measured empty/partial queue"
                 );
+                assert_eq!(queue.facts[&Fact::RunningRuns], 0);
                 assert_eq!(
                     serde_json::to_value(&queue.gaps).unwrap(),
                     serde_json::json!(["invalid_occurrence_state"])
@@ -6243,7 +6281,7 @@ fn failed_history_and_claimed_subsets_share_the_total_occurrence_cap() {
             .iter_mut()
             .find(|o| o.category == Category::Queue)
             .unwrap();
-        queue.facts.clear();
+        queue.facts.retain(|fact, _| RUN_FACTS.contains(fact));
         queue.gaps = vec![Gap::InvalidOccurrenceState];
         let history = report
             .observations
@@ -6429,6 +6467,136 @@ fn stop_fence_facts_are_whole_or_replaced_by_their_gap() {
         }
         leases.gaps = lease_gaps;
         leases.gaps.push(Gap::StopFenceStoreUnavailable);
+        report.validate().unwrap();
+    }
+}
+
+fn queue_of(report: &mut Report) -> &mut Observation {
+    report
+        .observations
+        .iter_mut()
+        .find(|o| o.category == Category::Queue)
+        .unwrap()
+}
+
+#[test]
+fn running_runs_separate_ended_sessions_and_retry_holds_without_identities() {
+    let (_root, conn) = fixture();
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at) VALUES
+         ('PRIVATE-SESSION-LIVE', '/PRIVATE', 'codex', 'PRIVATE', 'running', '2026-10-22T09:00:00Z', '2026-10-22T09:00:00Z'),
+         ('PRIVATE-SESSION-KILLED', '/PRIVATE', 'codex', 'PRIVATE', 'killed', '2026-10-22T09:00:00Z', '2026-10-22T09:00:00Z'),
+         ('PRIVATE-SESSION-FAILED', '/PRIVATE', 'codex', 'PRIVATE', 'failed', '2026-10-22T09:00:00Z', '2026-10-22T09:00:00Z');
+         INSERT INTO automation_runs(id, automation_id, session_id, status, started_at) VALUES
+         ('PRIVATE-RUN-LIVE', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-LIVE', 'running', '2026-10-22T09:00:00Z'),
+         ('PRIVATE-RUN-CONTAINED', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-KILLED', 'running', '2026-10-22T09:00:00Z'),
+         ('PRIVATE-RUN-HELD', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-FAILED', 'running', '2026-10-22T09:00:00Z'),
+         ('PRIVATE-RUN-FINISHED', 'PRIVATE-ROUTINE', 'PRIVATE-SESSION-KILLED', 'failed', '2026-10-22T09:00:00Z');
+         INSERT INTO automation_attempts(id, run_id, occurrence_id, attempt_number, adoption_key, occurrence_fence_generation, state, failure_class, retry_classification, not_before, opened_at, settled_at, state_reason) VALUES
+         ('PRIVATE-ATTEMPT', 'PRIVATE-RUN-HELD', 'PRIVATE-OCCURRENCE', 1, 'PRIVATE-ADOPTION', 1, 'failed', 'launch_refused', 'initial', '2026-10-22T09:00:00Z', '2026-10-22T09:00:00Z', '2026-10-22T09:00:01Z', 'PRIVATE-REASON');
+         PRAGMA foreign_keys=ON;",
+    )
+    .unwrap();
+    let before = conn.total_changes();
+    let mut report = inspect(&conn, Utc::now()).unwrap();
+    assert!(!serde_json::to_string(&report).unwrap().contains("PRIVATE"));
+    assert_eq!(conn.total_changes(), before);
+    report.validate().unwrap();
+    let queue = queue_of(&mut report);
+    // The held run's session has ended too.
+    for (fact, count) in [
+        (Fact::RunningRuns, 3),
+        (Fact::RunningRunsWithEndedSessions, 2),
+        (Fact::RunningRunsWithFailedLatestAttempt, 1),
+    ] {
+        assert_eq!(queue.facts[&fact], count, "{fact:?}");
+    }
+
+    // Without the sessions table, the gap stands in for every run fact and
+    // the occurrence counts are still read.
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE sessions; PRAGMA foreign_keys=ON")
+        .unwrap();
+    let mut report = inspect(&conn, Utc::now()).unwrap();
+    report.validate().unwrap();
+    let queue = queue_of(&mut report);
+    assert!(RUN_FACTS.iter().all(|fact| !queue.facts.contains_key(fact)));
+    assert_eq!(queue.facts[&Fact::RunningOccurrences], 0);
+    assert_eq!(
+        queue.gaps,
+        [
+            Gap::RuntimeAdmissionNotProven,
+            Gap::RunningRunStoreUnavailable
+        ]
+    );
+}
+
+#[test]
+fn running_run_facts_are_bounded_subsets_or_replaced_by_their_gap() {
+    let (_root, conn) = fixture();
+    let original = inspect(&conn, Utc::now()).unwrap();
+    for variant in 0..8 {
+        let mut report = original.clone();
+        let queue = queue_of(&mut report);
+        match variant {
+            0 => {
+                queue.facts.remove(&Fact::RunningRuns);
+            }
+            1 => {
+                queue.facts.insert(Fact::RunningRunsWithEndedSessions, 1);
+            }
+            2 => {
+                queue
+                    .facts
+                    .insert(Fact::RunningRunsWithFailedLatestAttempt, 1);
+            }
+            3 => queue.gaps.push(Gap::RunningRunStoreUnavailable),
+            // No report omits them silently: no release predates them.
+            4 => {
+                for fact in RUN_FACTS {
+                    queue.facts.remove(&fact);
+                }
+            }
+            5 => {
+                queue.facts.insert(Fact::RunningRuns, MAX_SAFE + 1);
+            }
+            // A failed latest attempt that `failed_attempts` does not count.
+            7 => {
+                queue.facts.insert(Fact::RunningRuns, 1);
+                queue
+                    .facts
+                    .insert(Fact::RunningRunsWithFailedLatestAttempt, 1);
+            }
+            _ => {
+                for fact in RUN_FACTS {
+                    queue.facts.remove(&fact);
+                }
+                queue.gaps = vec![
+                    Gap::RunningRunStoreUnavailable,
+                    Gap::EligibilityStoreUnavailable,
+                ];
+                queue.facts.remove(&Fact::EligibleOccurrences);
+            }
+        }
+        assert!(report.validate().is_err(), "forged running runs {variant}");
+    }
+    // The gap alone, after the occurrence gaps, is a whole report.
+    for occurrence_gaps in [
+        vec![Gap::RuntimeAdmissionNotProven],
+        vec![Gap::EligibilityStoreUnavailable],
+        vec![Gap::EligibilityReadBudgetExceeded],
+        vec![Gap::InvalidPersistedMetadata],
+    ] {
+        let mut report = original.clone();
+        let queue = queue_of(&mut report);
+        for fact in RUN_FACTS {
+            queue.facts.remove(&fact);
+        }
+        if occurrence_gaps != [Gap::RuntimeAdmissionNotProven] {
+            queue.facts.remove(&Fact::EligibleOccurrences);
+        }
+        queue.gaps = occurrence_gaps;
+        queue.gaps.push(Gap::RunningRunStoreUnavailable);
         report.validate().unwrap();
     }
 }

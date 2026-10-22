@@ -58,7 +58,7 @@ incomplete.
 | `leadership` | Recorded owner presence and scheduler generation | Process liveness and current admission ownership |
 | `last_successful_pass` | Latest pass success and retained successful completion time, when observed | Success before instrumentation when no successful observation survives |
 | `store` | Automations table count, required-object presence/form counts, and recorded contract-migration timestamp/counters, when valid | Expected schema, other migrations, current row verifiability and integrity verification |
-| `queue` | Stored states, due planned rows and scheduler-eligible candidates at the observation cutoff | Runtime authority admission is not proven by scheduler eligibility |
+| `queue` | Stored states, due planned rows, scheduler-eligible candidates at the observation cutoff, and running runs whose session has ended or whose latest attempt failed | Runtime authority admission is not proven by scheduler eligibility; what an unsettled run waits on |
 | `leases_fences` | Lease-bearing total, active/expired/missing/invalid expiry counts, leases outside claimed/running states, recorded authority presence, mismatched unlaunched scheduler claims, and run stop fences by lease | Process liveness, complete attempt-fence consistency and each stop's outcome |
 | `planning_start_lag` | Latest pass duration/start lag and bounded retained scheduled-occurrence planning delay, when observed | Actual runtime-start lag, full recovery/history evidence and ratified SLO comparisons |
 | `repeated_failures` | Quarantine, failed attempts, retry exhaustion and retained failed occurrences since latest retained success | Strict consecutive-occurrence streaks, full history and historical classification |
@@ -102,7 +102,7 @@ When counts are present, it also requires due ≤ planned and eligible ≤ due;
 unavailable counts stay omitted rather than being substituted with zero.
 Present occurrence states are decoded from bounded byte projections with the
 canonical occurrence-state enum. A null, non-text, invalid UTF-8, oversized or
-unknown state reports `invalid_occurrence_state` and omits all queue counts;
+unknown state reports `invalid_occurrence_state` and omits all occurrence counts;
 the CLI rejects accompanying fabricated counts. Other categories, including
 readable lease expiry facts, remain available. This avoids reporting an empty
 or partial queue from malformed state data. State decoding does not prove
@@ -110,7 +110,47 @@ transition validity, referential integrity, or a whole-read execution-time bound
 
 Missing occurrence state or the table reports the ordered gaps
 `queue_state_unavailable`, `due_queue_unavailable`, and
-`eligibility_store_unavailable`, with every queue count omitted.
+`eligibility_store_unavailable`, with every occurrence count omitted.
+
+In both cases the running-run counts are still read from their own tables.
+`running_runs` counts runs whose status is `running`, read from the main
+`automation_runs`, `sessions` and `automation_attempts` tables with the
+predicates settlement selects runs by. `running_runs_with_ended_sessions`
+counts those whose session is `completed`, `failed`, `cancelled`, `killed` or
+`idle`, the statuses settlement treats as finished. A run whose session row is
+missing is not counted as ended, and settlement does not finish it either.
+`running_runs_with_failed_latest_attempt` counts runs without an authority
+profile whose latest attempt is `failed`. Settlement holds such a run for
+`attempt.retry.v1` until its deadline, but the count is stored state, not
+retry eligibility. A run past its deadline, without one, behind a stop fence
+or at its last attempt is counted too, and `attempt.retry.v1` refuses it. Both
+comparisons are byte for byte, as settlement's are. The subsets overlap, since
+a run whose attempt failed has usually ended its session too. Only counts are
+read out.
+
+A missing table or required column, or a view in a table's place, reports
+`running_run_store_unavailable` after every other queue gap and omits all three
+counts, while the occurrence counts are read independently. The CLI rejects a
+subset larger than the total, a total beyond the safe-integer range, a report
+that omits the three without that gap, any of them beside it, the gap anywhere
+but last, or more runs with a failed latest attempt than `failed_attempts` in
+`repeated_failures`.
+
+Settlement normally finishes a running run whose session has ended on its next
+pass. One that stays counted is waiting on something:
+
+- a stop fence (see `leases_fences`), or an `ambiguous` attempt whose
+  cancellation is still `requested` or `stopping`;
+- a retry hold, before the run's deadline;
+- Runtime Authority terminal evidence;
+- a settlement step that fails. An error on one run, such as a missing or
+  already terminal occurrence or an unreadable timestamp, leaves every later
+  run unsettled. Check `last_successful_pass` and `coven automations status
+  --json`.
+
+Compare two reports taken across a scheduler pass rather than reading one.
+None of these counts authorizes settling a run, retrying an attempt or stopping
+a session.
 
 The eligibility missing-dependency regression covers 23 relation/column variants
 with and without TEMP shadows. Lease and queue prerequisite combinations have
@@ -677,6 +717,7 @@ categories can still help investigate, but cannot fill the missing category.
 | --- | --- |
 | Assigned leader, no recent successful pass, or growing eligible work | Run `coven automations status --json` and compare pass timestamps and gaps. Assigned metadata does not prove the process is live; a failed latest pass does not erase a retained earlier success. Do not infer a ratified lag violation from these observations alone. |
 | Expired leases, missing/invalid expiry, or mismatched unlaunched claims | Check `coven automations leases --help` and inspect supported pages. For an already known occurrence ID, run `coven automations occurrence <occurrence-id> --json`, then inspect its run and attempts. Expiry or generation mismatch alone does not authorize takeover, settlement or another external effect. |
+| Running runs with ended sessions, or with a failed latest attempt | Compare with a report from after the next scheduler pass. If the count persists, read `last_successful_pass` and `coven automations status --json` for a failing settlement step, and `leases_fences` for a stop fence. Then inspect the known run and its attempts. A run held for retry settles failed at its deadline unless `attempt.retry.v1` opens a retry first, and the command refuses a run past its deadline, behind a fence or at its last attempt; do not retry on this count alone. |
 | Held, expired or unreadable stop fences | Inspect the known run and its attempts. A held fence means a cancellation, a timeout or a recovery owns that run's stop. An expired one means its owner did not finish; check whether the occurrence already needs recovery. An unreadable lease blocks the scheduler's settlement step; preserve the report and the daemon's diagnostics. Do not delete a fence or stop the session again; follow the supported cancellation or `occurrence.recover.v1` path. |
 | Failed attempts, quarantine, or retry exhaustion | Inspect the known occurrence, run and attempts. A retained failure total is not a consecutive failure streak; exhaustion counters are not occurrence-failure counters. Preserve that distinction before assessing repetition or a retry policy. |
 | Pending/failed delivery or inconsistent receipt links | Inspect the known run and attempts, preserving their terminal states and correlation. A reciprocal index link is not authenticated receipt content or proof of the external effect. If delivery outcome is ambiguous, require the supported reconciliation path before another dispatch. |
