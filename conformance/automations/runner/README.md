@@ -245,6 +245,7 @@ The checked-in
 [`run-now-envelope-process-crash-recovery.vectors.json`](run-now-envelope-process-crash-recovery.vectors.json),
 [`tick-process-crash-recovery.vectors.json`](tick-process-crash-recovery.vectors.json),
 [`no-process-receipt-process-crash-recovery.vectors.json`](no-process-receipt-process-crash-recovery.vectors.json),
+[`event-feed-process-crash-recovery.vectors.json`](event-feed-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -308,7 +309,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, thirty-three
+The native Coven target implements twelve structural suites, thirty-four
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -1773,3 +1774,79 @@ after the second; a receipt for a manual occurrence; Runtime Authority
 launches, whose refused launch settles for a transient dispatch retry instead;
 a real runtime process, power loss, load, complete profiles or release
 eligibility.
+
+## Event feed process-crash audit boundary
+
+The `event-feed-process-crash-recovery` suite kills a daemon worker while a
+client follows the global automation event feed. Clients follow the
+append-only `automation_events` table through
+`coven.automations.events.read.v1` and `coven.automations.events.subscribe.v1`.
+The transition triggers write each event inside the state change's own
+transaction, with the next sequence of its occurrence or run stream and the
+next feed position. Each read inserts a checkpoint holding the page's last
+position, valid for 24 hours, after pruning checkpoints that expired more than
+seven days ago; the prune and the insert are separate autocommit statements.
+`subscribe.v1` resumes from a checkpoint and `read.v1` from a cursor.
+
+Each of five cases starts the exact audited binary as a hidden worker with the
+same harness as `run-launch-process-crash-recovery`. The worker plays the
+daemon and the parent plays the client. The worker stores a fixed synthetic
+active daily routine, takes scheduler leadership and runs the fenced tick that
+plans and claims its 09:00 slot. It serves the client's first subscription:
+two events and a checkpoint. It then stores a second routine with the same
+schedule, runs a second tick that plans and claims that routine's slot in
+three commits, and serves the client's resubscription from its checkpoint.
+Vectors cannot choose a path, definition, clock or pause mechanics, must name
+every boundary once, and every expected outcome is fixed per boundary.
+
+- **Inside the claim:** a fixture TEMP trigger pauses the worker after the
+  second claim writes its event.
+- **After the claim commits:** the WAL hook pauses it after the second tick's
+  third commit.
+- **Inside the checkpoint read:** a TEMP trigger pauses the worker before the
+  resubscription inserts its checkpoint.
+- **After the checkpoint commits:** the WAL hook pauses it once the
+  checkpoint has committed, before the page reaches the client.
+- **Control:** no pause. The client receives the second page, and the worker
+  exits without releasing its leadership.
+
+Before any pause, the worker hands the parent the pages the client received:
+each page's checkpoint, cursor and event ids. While the worker is paused, the
+parent must find the write transaction open exactly when the pause is inside
+one, the committed occurrence events the boundary leaves, and one checkpoint
+for each committed read. The parent then kills and reaps a paused worker, or
+reaps the control once it exits. The store's raw integrity check must pass,
+the store must hold what the parent read, and every checkpoint the client
+received must exist for its page's cursor.
+
+The parent restarts in the daemon's startup order, as the run-launch suite
+does. The restart restores each committed claim with no run and launches both
+slots. The client then resumes from the last page it received, by its
+checkpoint and by its cursor, paging until a page carries no event. The cursor
+resume reads three events a page and a whole-feed read one, so those `read.v1`
+pages stop at their limit. Paging is bounded: a resume that stops advancing
+ends, and a read the store refuses as it refuses a client (a missing, expired
+or foreign checkpoint) fails the case instead of the suite.
+
+- Both resumptions return the same events.
+- Every event the client received, followed by every event it resumed, is the
+  whole committed feed, in the store's feed-position order: every committed
+  event exactly once.
+- No event the killed claim wrote appears. A lost page's events arrive again
+  from the previous checkpoint.
+- Every stream's sequences run 0, 1, 2 in feed order, and each stream head
+  names the next.
+- A resume from the last checkpoint returns no event.
+- Each routine's occurrence path and run path are fixed per boundary.
+
+Observations carry boundary, event labels of routine, entity and state,
+counts and booleans. They never carry routine, occurrence, run, attempt or
+event ids, checkpoints, paths, handshakes or output. This is `audit_only`
+evidence for a daemon killed while one client follows the global feed across
+two routines. It does not cover a client following an occurrence or run
+stream, a subscription page that reaches `subscribe.v1`'s 100-event limit,
+checkpoint expiry or pruning, `earliest_sequence` compaction and
+`CURSOR_EXPIRED`, the `from` timestamp cursor, several clients or concurrent
+writers, the control plane's request handling, a kill inside the restart's
+own recovery, a real runtime process, power loss, load, complete profiles or
+release eligibility.

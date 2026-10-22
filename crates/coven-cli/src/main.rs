@@ -1235,6 +1235,8 @@ enum AutomationsConformanceCommand {
     TickCrashWorker,
     #[command(hide = true, name = "no-process-receipt-crash-worker")]
     NoProcessReceiptCrashWorker,
+    #[command(hide = true, name = "event-feed-crash-worker")]
+    EventFeedCrashWorker,
     #[command(about = "Print the native conformance suites supported by this binary")]
     Capability,
     #[command(about = "Evaluate one conformance suite request from standard input")]
@@ -4307,6 +4309,13 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
                 let request = serde_json::from_str(&payload)
                     .map_err(|_| anyhow!("conformance request is invalid"))?;
                 automations::conformance_target::no_process_receipt_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::EventFeedCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::event_feed_crash_worker(&request)
                     .map_err(|message| anyhow!(message))
             }
             AutomationsConformanceCommand::Capability => {

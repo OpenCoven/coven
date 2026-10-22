@@ -182,7 +182,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "run-now-process-crash-recovery",
                         "run-now-envelope-process-crash-recovery",
                         "tick-process-crash-recovery",
-                        "no-process-receipt-process-crash-recovery"
+                        "no-process-receipt-process-crash-recovery",
+                        "event-feed-process-crash-recovery"
                     ]
                 },
                 {
@@ -3851,6 +3852,154 @@ fn native_target_evaluates_checked_in_no_process_receipt_process_crash_vectors(
     assert!(!text.contains("conformance-receipt-crash"));
     assert!(!text.contains("session-"));
     assert!(!text.contains(".receipt"));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_event_feed_process_crash_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/event-feed-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "event-feed-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "event-feed-process-crash-recovery");
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 5);
+    assert_eq!(response["evidence"]["passedCases"], 5);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("event feed crash observations");
+    assert_eq!(observations.len(), 5);
+    // Whether a write was open at the pause, whether the second routine's
+    // claim and the second checkpoint had committed, and whether the client
+    // received the second page.
+    let cases = [
+        ("inside_claim", true, false, false),
+        ("after_claim_commit", false, true, false),
+        ("inside_checkpoint", true, true, false),
+        ("after_checkpoint_commit", false, true, true),
+        ("none", false, true, true),
+    ];
+    for (observation, (boundary, open, claimed, second_checkpoint)) in
+        observations.iter().zip(cases)
+    {
+        let killed = boundary != "none";
+        let at_pause = |value: Value| if killed { value } else { json!(null) };
+        let mut feed = vec![
+            "first:occurrence:planned",
+            "first:occurrence:claimed",
+            "second:occurrence:planned",
+        ];
+        if claimed {
+            feed.push("second:occurrence:claimed");
+        }
+        let checkpoints = if second_checkpoint { 2 } else { 1 };
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(observation["transactionOpenAtPause"], at_pause(json!(open)));
+        assert_eq!(observation["feedAtPause"], at_pause(json!(feed)));
+        assert_eq!(
+            observation["checkpointsAtPause"],
+            at_pause(json!(checkpoints))
+        );
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        // The killed claim's event never commits; a lost page's checkpoint
+        // may.
+        assert_eq!(observation["feedAfterExit"], json!(feed));
+        assert_eq!(observation["checkpointsAfterExit"], checkpoints);
+        // The client received the first page, with two events, and the
+        // second, with two more, only when the worker was not killed.
+        assert_eq!(observation["deliveredPages"], if killed { 1 } else { 2 });
+        assert_eq!(observation["deliveredEvents"], if killed { 2 } else { 4 });
+        assert_eq!(observation["deliveredCheckpointsDurable"], true);
+        assert_eq!(observation["recoveryRefused"], false);
+        // The restart restores a committed claim and launches both slots.
+        let second_path = if claimed {
+            json!(["planned", "claimed", "planned", "claimed", "running"])
+        } else {
+            json!(["planned", "claimed", "running"])
+        };
+        assert_eq!(
+            observation["firstOccurrencePath"],
+            json!(["planned", "claimed", "planned", "claimed", "running"])
+        );
+        assert_eq!(observation["secondOccurrencePath"], second_path);
+        let run_path = json!([
+            "run:running",
+            "attempt:adopted",
+            "attempt:dispatching",
+            "attempt:started"
+        ]);
+        assert_eq!(observation["firstRunPath"], run_path);
+        assert_eq!(observation["secondRunPath"], run_path);
+        let feed_events = if claimed { 18 } else { 16 };
+        assert_eq!(observation["feedEvents"], feed_events);
+        assert_eq!(
+            observation["resumedEvents"],
+            feed_events - if killed { 2 } else { 4 }
+        );
+        assert_eq!(observation["launches"], 2);
+        // Every committed event exactly once, in order, by checkpoint and by
+        // cursor alike, and nothing after the last page.
+        assert_eq!(observation["exactlyOnce"], true);
+        assert_eq!(observation["resumePathsAgree"], true);
+        assert_eq!(observation["resumeRefused"], false);
+        assert_eq!(observation["streamsContiguous"], true);
+        assert_eq!(observation["finalResumeEmpty"], true);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "event-feed-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    // No routine, occurrence, run, event or checkpoint id.
+    assert!(!text.contains("conformance-feed-crash"));
+    assert!(!text.contains("run-"));
+    assert!(!text.contains("\"evt"));
+    assert!(!text.contains("ecp"));
     assert!(!coven_home.exists());
     Ok(())
 }

@@ -37,6 +37,7 @@ mod command_storage_corruption_recovery;
 mod command_storage_lock_recovery;
 mod command_storage_readonly_recovery;
 mod command_transaction_rollback;
+mod event_feed_process_crash;
 mod flat_cancellation_process_crash;
 mod held_settlement_process_crash;
 mod legacy_import_source_preservation;
@@ -143,6 +144,11 @@ pub fn tick_crash_worker(request: &Value) -> Result<(), &'static str> {
 /// Execute the disposable hidden no-process receipt crash conformance worker.
 pub fn no_process_receipt_crash_worker(request: &Value) -> Result<(), &'static str> {
     no_process_receipt_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden event-feed crash conformance worker.
+pub fn event_feed_crash_worker(request: &Value) -> Result<(), &'static str> {
+    event_feed_process_crash::worker(request)
 }
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -252,6 +258,7 @@ pub const RUN_NOW_ENVELOPE_PROCESS_CRASH_RECOVERY_SUITE: &str =
 pub const TICK_PROCESS_CRASH_RECOVERY_SUITE: &str = "tick-process-crash-recovery";
 pub const NO_PROCESS_RECEIPT_PROCESS_CRASH_RECOVERY_SUITE: &str =
     "no-process-receipt-process-crash-recovery";
+pub const EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE: &str = "event-feed-process-crash-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -1735,6 +1742,7 @@ pub fn capability() -> TargetCapability {
                     RUN_NOW_ENVELOPE_PROCESS_CRASH_RECOVERY_SUITE,
                     TICK_PROCESS_CRASH_RECOVERY_SUITE,
                     NO_PROCESS_RECEIPT_PROCESS_CRASH_RECOVERY_SUITE,
+                    EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE,
                 ],
             },
             TargetProfileCapability {
@@ -1951,6 +1959,14 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         (SCHEDULER_RELIABILITY_PROFILE, NO_PROCESS_RECEIPT_PROCESS_CRASH_RECOVERY_SUITE) => {
             let (passed, observations) =
                 no_process_receipt_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = event_feed_process_crash::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);
