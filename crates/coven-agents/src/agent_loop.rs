@@ -10,8 +10,8 @@
 use std::{collections::BTreeSet, sync::OnceLock};
 
 use crate::{
-    Agent, AgentId, AgentRef, AuthorityScope, GuardrailStage, GuardrailVerdict, HandoffCall,
-    HandoffDefinition, InvocationContext, InvocationEvent, InvocationEventKind,
+    Agent, AgentId, AgentRef, AuthorityScope, DelegationDigests, GuardrailStage, GuardrailVerdict,
+    HandoffCall, HandoffDefinition, InvocationContext, InvocationEvent, InvocationEventKind,
     InvocationFailureKind, InvocationObserver, InvocationRequest, ModelAction, ModelRequest,
     NotStarted, ReviewOutcome, ReviewVerdict, RunError, RunEvent, RunFailureKind, RunItem,
     RunObserver, RunSignal, StopReason, ToolCall, ToolProposal,
@@ -53,6 +53,7 @@ pub(crate) struct RunEmitter<'a> {
     observer: &'a dyn RunObserver,
     invocation_observer: &'a dyn InvocationObserver,
     request: &'a InvocationRequest,
+    delegation: Option<&'a DelegationDigests>,
     /// The kind of the run's one terminal failure, as emitted to observers.
     failure_kind: OnceLock<RunFailureKind>,
 }
@@ -62,11 +63,13 @@ impl<'a> RunEmitter<'a> {
         observer: &'a dyn RunObserver,
         invocation_observer: &'a dyn InvocationObserver,
         request: &'a InvocationRequest,
+        delegation: Option<&'a DelegationDigests>,
     ) -> Self {
         Self {
             observer,
             invocation_observer,
             request,
+            delegation,
             failure_kind: OnceLock::new(),
         }
     }
@@ -89,12 +92,14 @@ impl<'a> RunEmitter<'a> {
     }
 
     pub(crate) fn invocation_event(&self, event: InvocationEventKind) {
-        self.invocation_observer.on_event(&InvocationEvent::new(
+        let mut envelope = InvocationEvent::new(
             self.request.invocation.clone(),
             self.request.source.clone(),
             self.request.requested_target.clone(),
             event,
-        ));
+        );
+        envelope.delegation = self.delegation.cloned();
+        self.invocation_observer.on_event(&envelope);
     }
 
     /// Emits the paired terminal failure events and returns `error`.

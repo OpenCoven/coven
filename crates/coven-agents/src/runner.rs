@@ -126,6 +126,7 @@ where
     policy: AgentPolicy<'a>,
     context: Option<(&'a ContextManifest, &'a dyn ContextResolver<C>)>,
     controls: RunControls,
+    delegation: Option<&'a DelegationDigests>,
 }
 
 impl<C> Default for RunScope<'_, C>
@@ -137,6 +138,7 @@ where
             require_revision: false,
             policy: AgentPolicy::default(),
             context: None,
+            delegation: None,
             controls: RunControls::default(),
         }
     }
@@ -519,12 +521,13 @@ where
             Ok(slot) => slot,
             Err(error) => {
                 return Err(DelegationFailure {
-                    digests: Box::new(digests),
                     failure: Box::new(self.refuse_before_start(
                         &request,
                         spec.task.as_str(),
                         error,
+                        &digests,
                     )),
+                    digests: Box::new(digests),
                 });
             }
         };
@@ -554,6 +557,7 @@ where
             },
             context: Some((&spec.context, resolver)),
             controls: child_controls,
+            delegation: Some(&digests),
         };
         match self
             .run_invocation_inner(request, spec.task.as_str(), context, options, scope)
@@ -574,11 +578,13 @@ where
         request: &InvocationRequest,
         input: &str,
         error: RunError,
+        digests: &DelegationDigests,
     ) -> RunFailure {
         let emitter = RunEmitter::new(
             self.observer.as_ref(),
             self.invocation_observer.as_ref(),
             request,
+            Some(digests),
         );
         let target = request.requested_target.id().clone();
         emitter.run_event(RunEvent::RunStarted {
@@ -612,6 +618,7 @@ where
             self.observer.as_ref(),
             self.invocation_observer.as_ref(),
             &request,
+            scope.delegation,
         );
 
         let outcome = self
