@@ -183,7 +183,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "run-now-envelope-process-crash-recovery",
                         "tick-process-crash-recovery",
                         "no-process-receipt-process-crash-recovery",
-                        "event-feed-process-crash-recovery"
+                        "event-feed-process-crash-recovery",
+                        "cancellation-timeout-process-crash-recovery"
                     ]
                 },
                 {
@@ -4000,6 +4001,364 @@ fn native_target_evaluates_checked_in_event_feed_process_crash_vectors() -> anyh
     assert!(!text.contains("run-"));
     assert!(!text.contains("\"evt"));
     assert!(!text.contains("ecp"));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_cancellation_timeout_process_crash_vectors(
+) -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/cancellation-timeout-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "cancellation-timeout-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        response["suiteId"],
+        "cancellation-timeout-process-crash-recovery"
+    );
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 16);
+    assert_eq!(response["evidence"]["passedCases"], 16);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("cancellation timeout crash observations");
+    assert_eq!(observations.len(), 16);
+    // Scene and boundary; a write open at the pause; the run and the
+    // cancellation the kill left; the worker's stops; the run after the
+    // restart; the owner's first request; the run, the cancellation and the
+    // request after the pass; and the run after a second pass.
+    let cases = [
+        (
+            "cancellation",
+            "inside_reservation",
+            true,
+            "running",
+            "none",
+            0,
+            "ended_after_deadline",
+            "refused",
+            "ended_after_deadline",
+            "refused",
+            "rejected",
+            "ended_after_deadline",
+        ),
+        (
+            "cancellation",
+            "after_reservation_commit",
+            false,
+            "running",
+            "requested",
+            0,
+            "ended_after_deadline",
+            "pending",
+            "ended_after_deadline",
+            "rejected",
+            "rejected",
+            "ended_after_deadline",
+        ),
+        (
+            "cancellation",
+            "inside_fence",
+            true,
+            "running",
+            "requested",
+            0,
+            "ended_after_deadline",
+            "pending",
+            "ended_after_deadline",
+            "rejected",
+            "rejected",
+            "ended_after_deadline",
+        ),
+        (
+            "cancellation",
+            "after_fence_commit",
+            false,
+            "cancellation_fenced",
+            "stopping",
+            0,
+            "cancellation_contained",
+            "pending",
+            "failed_after_cancellation",
+            "recovery_required",
+            "recovery_required",
+            "failed_after_cancellation",
+        ),
+        (
+            "cancellation",
+            "after_stop",
+            false,
+            "cancellation_fenced",
+            "stopping",
+            1,
+            "cancellation_contained",
+            "pending",
+            "failed_after_cancellation",
+            "recovery_required",
+            "recovery_required",
+            "failed_after_cancellation",
+        ),
+        (
+            "cancellation",
+            "inside_settlement",
+            true,
+            "cancellation_fenced",
+            "stopping",
+            1,
+            "cancellation_contained",
+            "pending",
+            "failed_after_cancellation",
+            "recovery_required",
+            "recovery_required",
+            "failed_after_cancellation",
+        ),
+        (
+            "cancellation",
+            "after_settle_commit",
+            false,
+            "cancelled",
+            "stopping",
+            1,
+            "cancelled",
+            "pending",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+        ),
+        (
+            "cancellation",
+            "inside_answer",
+            true,
+            "cancelled",
+            "stopping",
+            1,
+            "cancelled",
+            "pending",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+        ),
+        (
+            "cancellation",
+            "after_answer_commit",
+            false,
+            "cancelled",
+            "cancelled",
+            1,
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+        ),
+        (
+            "cancellation",
+            "none",
+            false,
+            "cancelled",
+            "cancelled",
+            1,
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "cancelled",
+        ),
+        (
+            "timeout",
+            "inside_fence",
+            true,
+            "running",
+            "none",
+            0,
+            "ended_after_deadline",
+            "refused",
+            "ended_after_deadline",
+            "refused",
+            "rejected",
+            "ended_after_deadline",
+        ),
+        (
+            "timeout",
+            "after_fence_commit",
+            false,
+            "timeout_fenced",
+            "none",
+            0,
+            "timeout_contained",
+            "refused",
+            "ambiguous",
+            "refused",
+            "rejected",
+            "failed_after_timeout",
+        ),
+        (
+            "timeout",
+            "after_stop",
+            false,
+            "timeout_fenced",
+            "none",
+            1,
+            "timeout_contained",
+            "refused",
+            "ambiguous",
+            "refused",
+            "rejected",
+            "failed_after_timeout",
+        ),
+        (
+            "timeout",
+            "inside_settlement",
+            true,
+            "timeout_fenced",
+            "none",
+            1,
+            "timeout_contained",
+            "refused",
+            "ambiguous",
+            "refused",
+            "rejected",
+            "failed_after_timeout",
+        ),
+        (
+            "timeout",
+            "after_settle_commit",
+            false,
+            "timed_out",
+            "none",
+            1,
+            "timed_out",
+            "refused",
+            "timed_out",
+            "refused",
+            "rejected",
+            "timed_out",
+        ),
+        (
+            "timeout",
+            "none",
+            false,
+            "timed_out",
+            "none",
+            1,
+            "timed_out",
+            "refused",
+            "timed_out",
+            "refused",
+            "rejected",
+            "timed_out",
+        ),
+    ];
+    for (
+        observation,
+        (
+            scene,
+            boundary,
+            open,
+            run_exit,
+            cancellation_exit,
+            stops,
+            run_restart,
+            request_answer,
+            run_pass,
+            cancellation_pass,
+            resend,
+            run_settle,
+        ),
+    ) in observations.iter().zip(cases)
+    {
+        let killed = boundary != "none";
+        let at_pause = |value: Value| if killed { value } else { json!(null) };
+        assert_eq!(observation["scene"], scene);
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(observation["transactionOpenAtPause"], at_pause(json!(open)));
+        assert_eq!(observation["runAtPause"], at_pause(json!(run_exit)));
+        assert_eq!(
+            observation["cancellationAtPause"],
+            at_pause(json!(cancellation_exit))
+        );
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["runAfterExit"], run_exit);
+        assert_eq!(observation["cancellationAfterExit"], cancellation_exit);
+        // At most one stop, the worker's.
+        assert_eq!(observation["workerStops"], stops);
+        assert_eq!(observation["recoveryRefused"], false);
+        assert_eq!(observation["runAfterRestart"], run_restart);
+        assert_eq!(observation["cancellationAfterRestart"], cancellation_exit);
+        // A settled run gives the restart nothing to do.
+        assert_eq!(
+            observation["restartIsNoop"],
+            matches!(run_exit, "cancelled" | "timed_out")
+        );
+        assert_eq!(observation["request"], request_answer);
+        assert_eq!(observation["runAfterPass"], run_pass);
+        assert_eq!(observation["cancellationAfterPass"], cancellation_pass);
+        assert_eq!(observation["resend"], resend);
+        assert_eq!(observation["runAfterSettle"], run_settle);
+        // The restart, the passes and the owner's requests stop nothing,
+        // launch nothing, and a final request and pass change nothing.
+        assert_eq!(observation["laterStops"], 0);
+        assert_eq!(observation["launches"], 0);
+        assert_eq!(observation["replayIsNoop"], true);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "cancellation-timeout-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    // No routine, run or session id, adoption key or reason.
+    assert!(!text.contains("conformance-race-crash"));
+    assert!(!text.contains("run-"));
+    assert!(!text.contains("adopt:"));
+    assert!(!text.contains("not needed today"));
     assert!(!coven_home.exists());
     Ok(())
 }

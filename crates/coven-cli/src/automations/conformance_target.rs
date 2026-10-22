@@ -30,6 +30,7 @@ use super::runs::{
 
 mod attempt_retry_process_crash;
 mod automatic_retry_process_crash;
+mod cancellation_timeout_process_crash;
 mod command_envelope_outcomes;
 mod command_process_crash_recovery;
 mod command_storage_capacity_recovery;
@@ -151,6 +152,12 @@ pub fn event_feed_crash_worker(request: &Value) -> Result<(), &'static str> {
     event_feed_process_crash::worker(request)
 }
 
+/// Execute the disposable hidden cancellation-timeout race crash conformance
+/// worker.
+pub fn cancellation_timeout_crash_worker(request: &Value) -> Result<(), &'static str> {
+    cancellation_timeout_process_crash::worker(request)
+}
+
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
 const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-request.v1";
 const SUITE_RESULT_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-result.v1";
@@ -259,6 +266,8 @@ pub const TICK_PROCESS_CRASH_RECOVERY_SUITE: &str = "tick-process-crash-recovery
 pub const NO_PROCESS_RECEIPT_PROCESS_CRASH_RECOVERY_SUITE: &str =
     "no-process-receipt-process-crash-recovery";
 pub const EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE: &str = "event-feed-process-crash-recovery";
+pub const CANCELLATION_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "cancellation-timeout-process-crash-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -1743,6 +1752,7 @@ pub fn capability() -> TargetCapability {
                     TICK_PROCESS_CRASH_RECOVERY_SUITE,
                     NO_PROCESS_RECEIPT_PROCESS_CRASH_RECOVERY_SUITE,
                     EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE,
+                    CANCELLATION_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE,
                 ],
             },
             TargetProfileCapability {
@@ -1967,6 +1977,15 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE) => {
             let (passed, observations) = event_feed_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, CANCELLATION_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                cancellation_timeout_process_crash::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);
