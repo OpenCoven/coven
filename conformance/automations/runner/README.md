@@ -246,6 +246,7 @@ The checked-in
 [`tick-process-crash-recovery.vectors.json`](tick-process-crash-recovery.vectors.json),
 [`no-process-receipt-process-crash-recovery.vectors.json`](no-process-receipt-process-crash-recovery.vectors.json),
 [`event-feed-process-crash-recovery.vectors.json`](event-feed-process-crash-recovery.vectors.json),
+[`cancellation-timeout-process-crash-recovery.vectors.json`](cancellation-timeout-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -309,7 +310,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, thirty-four
+The native Coven target implements twelve structural suites, thirty-five
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -1026,9 +1027,10 @@ keys, responses, paths, handshakes or output. This is `audit_only` evidence
 for a daemon killed while it handles one owner cancellation of a running
 scheduled run. It does not cover Runtime Authority runs, the flat
 `occurrence.cancel.v1` and `attempt.cancel.v1` commands (see
-`flat-cancellation-process-crash-recovery`), a cancellation racing a timeout,
-a stop the runtime fails to confirm, a graceful daemon restart, a real runtime
-process, power loss, load, complete profiles or release eligibility.
+`flat-cancellation-process-crash-recovery`), a cancellation racing a timeout
+(see `cancellation-timeout-process-crash-recovery`), a stop the runtime fails
+to confirm, a graceful daemon restart, a real runtime process, power loss,
+load, complete profiles or release eligibility.
 
 ## Owner occurrence and attempt cancellation process-crash audit boundary
 
@@ -1175,9 +1177,10 @@ of a run that ended after its deadline with no fence, a deadline that passes
 while a retry attempt waits (see `retry-timeout-process-crash-recovery`), a
 deadline that passes while a run is held for an operator retry (see
 `held-settlement-process-crash-recovery`), a timeout racing an owner
-cancellation, a stop the runtime fails to confirm, Runtime Authority runs, a
-graceful daemon restart, a real runtime process, power loss, load, complete
-profiles or release eligibility.
+cancellation (see `cancellation-timeout-process-crash-recovery`), a stop the
+runtime fails to confirm, Runtime Authority runs, a graceful daemon restart, a
+real runtime process, power loss, load, complete profiles or release
+eligibility.
 
 ## Held-for-retry settlement process-crash audit boundary
 
@@ -1850,3 +1853,108 @@ checkpoint expiry or pruning, `earliest_sequence` compaction and
 writers, the control plane's request handling, a kill inside the restart's
 own recovery, a real runtime process, power loss, load, complete profiles or
 release eligibility.
+
+## Cancellation-timeout race process-crash audit boundary
+
+The `cancellation-timeout-process-crash-recovery` suite kills a daemon worker
+while the owner's `run.cancel.v1` and a scheduled run's deadline race for the
+run's stop. The stop fence arbitrates the race. A `cancellation` fence needs the
+cancellation `requested`, inside its 30-second lease, and the deadline still
+ahead. A `timeout` fence needs no cancellation `requested` or `stopping`. A
+reserved cancellation whose lease ends after the deadline is rejected, and the
+timeout enforced. A request after the deadline is refused before it reserves
+anything. `cancellation-timeout-arbitration` proves these rules in one process;
+this suite kills the daemon between the race's writes. After a kill, the
+restart's containment ends the session before any request or enforcement reaches
+it. A request then finds the session ended and is refused before its own
+deadline check, and no fence's deadline or pending-cancellation clause is ever
+reached. What a kill exercises is the reconciler's deadline rejection, the
+restart's settlement after the deadline, and the fence each owner leaves behind.
+
+Each of sixteen cases starts the exact audited binary as a hidden worker, with
+the same harness, daemon restart and stop-recording runtime as
+`run-cancellation-process-crash-recovery`. The worker stores a fixed synthetic
+active daily definition with a one-minute deadline and no automatic retry, and
+claims and launches its 09:00 slot through a no-op runtime at 30 seconds, so the
+deadline passes at 90. Vectors cannot choose a path, run, definition, deadline,
+reason, principal, adoption key, clock or pause mechanics, must name every
+scene's boundaries once and in order, and every expected outcome is fixed per
+scene and boundary.
+
+- **Cancellation scene:** the worker handles the owner's request at 70 seconds,
+  as `run-cancellation-process-crash-recovery` does, with the cancellation's
+  lease ending at 100. A fixture TEMP trigger pauses it inside the reservation,
+  the fence's transaction, the settlement and the answer; the WAL hook after
+  each of their four commits; and its runtime right after it records the stop.
+  The control answers `cancelled`.
+- **Timeout scene:** the worker enforces the deadline at 92 seconds, as
+  `timeout-enforcement-process-crash-recovery` does, with the timeout's fence
+  lease ending at 122. It pauses inside the fence's transaction and the
+  settlement, after each of their two commits, and right after the stop. The
+  control settles the run timed out.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, or reaps the control once it exits. The
+store's raw integrity check must pass, and the store must still hold what the
+parent read.
+
+The parent restarts in the daemon's startup order at 95 seconds, after the
+deadline and inside either lease, and the owner sends the request at 97. A pass
+after both leases follows at 150, the request again at 160, and a second pass at
+230. One runtime confirms and counts every stop and launch that the restart, the
+passes and the requests make.
+
+- **Nothing committed,** in either scene: the restart's containment marks the
+  lost session `killed` after the deadline, and its startup pass settles the
+  attempt `timed_out` and the run and occurrence `failed`. The request is
+  refused with `ILLEGAL_TRANSITION`, as no longer cancellable, and replayed word
+  for word after.
+- **The cancellation reserved, without its fence:** the same timeout, while the
+  cancellation stays `requested`. Without a deadline, the same kill leaves the
+  run held for an operator retry. The request inside the lease is answered
+  `CANCEL_PENDING` and writes nothing; the pass rejects the cancellation with
+  `ILLEGAL_TRANSITION`, as overtaken by the deadline, which the next request
+  replays.
+- **The cancellation fenced, stopped, or inside its settlement:** the restart's
+  containment marks the session `killed` behind the cancellation's fence. The
+  timeout never takes a fence or issues a stop, though the deadline has passed.
+  The request is answered `CANCEL_PENDING`. The pass answers the cancellation
+  `recovery_required`, settles the attempt `ambiguous` and the run and
+  occurrence `failed` on the ended session, and releases the fence.
+- **The cancellation settled or answered:** the run stays cancelled, and the
+  pass answers `cancelled` where the worker had not.
+- **The timeout fenced, stopped, or inside its settlement:** the restart's
+  containment marks the session `killed` behind the timeout's fence. The owner's
+  request is refused with `ILLEGAL_TRANSITION`, as no longer cancellable, and
+  leaves the fence alone. The pass after the lease settles the attempt
+  `ambiguous` and the occurrence `recovery_required`, and the second pass
+  settles the run and occurrence `failed` and releases the fence. That exit is
+  the one #1461 asks about, and #1489 asks whether an expired `timeout` fence
+  should settle by the deadline instead.
+- **The timeout settled:** the run stays timed out, and every request is
+  refused.
+
+Run classes pin each settlement reason, so a run timed out by the enforcement,
+one timed out by the restart's containment, and the two ambiguous failures stay
+distinct. Two stop fences, or a fence of another owner or operation key, are no
+class at all. The worker must have recorded exactly one stop once it reached the
+stop, and none before it. The restart, the passes and the requests must issue no
+stop and launch nothing. A refusal and a rejection are told apart by their
+stored message. Storing a refusal must be its request's only write, a replay
+must return the stored error word for word, a pending or replayed answer must
+write nothing, and a request that errors fails the case. The same request and a
+further pass must then change no occurrence, run, attempt, event, session,
+reservation, adoption, cancellation or stop-fence row, and issue no stop or
+launch.
+
+Observations carry scene, boundary, run, cancellation and answer classes, counts
+and booleans. They never carry run, attempt, occurrence or session ids, adoption
+keys, responses, paths, handshakes or output. This is `audit_only` evidence for
+a daemon killed while one owner cancellation and one deadline race for a running
+scheduled run's stop. It does not cover a request or enforcement that reaches a
+live session after its deadline, a restart after the cancellation's lease, the
+flat `occurrence.cancel.v1` and `attempt.cancel.v1` commands, a deadline that
+passes while a retry waits or a run is held, a stop the runtime fails to
+confirm, Runtime Authority runs, a graceful daemon restart, a real runtime
+process, power loss, load, complete profiles or release eligibility.
