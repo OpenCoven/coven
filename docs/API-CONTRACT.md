@@ -682,15 +682,18 @@ reasons, validation text and lease owners are never returned.
 claimed, running and recovery-required occurrences, and every running run keyed
 to the routine whose occurrence is not one of those. It also lists what a
 scheduler pass would claim from, given the store at `observedAt`: the eligible
-queue and a due slot that planning has yet to create. A pass first recovers
-expired leases and settles retries past their deadlines, which can release a
-hold listed here; naming those is tracked by #1518. It holds at most 20
-items: those that hold claims first, then by code in the order below, then by
-stored scheduled time and ids. `workTruncated` is `true` when more exist. All
+queue and a due slot that planning has yet to create. A pass first settles
+retries past their deadlines (`retry_expired`, below) and recovers expired
+leases, which can release a hold listed here; naming expired leases and
+attempts held for an operator retry is tracked by #1518. It holds at most 20
+items: those that hold claims first, then by code in the order below, with
+each retry code sorted as the item it replaces, then by stored scheduled time
+and ids. `workTruncated` is `true` when more exist. All
 reads, `conditions` included, come from one read transaction. Each item has a
 `code`, `holdsClaims` and a `nextStep`, and `occurrenceId`, `runId` and `at`
 (the occurrence's scheduled time, in canonical millisecond form) when each
-exists and is readable. An id is omitted when it is empty, longer than 512
+exists and is readable. A retry item also carries `notBefore` and
+`deadlineAt`, described below. An id is omitted when it is empty, longer than 512
 bytes, not valid UTF-8, has leading or trailing whitespace, or contains a
 control character. A stored time is omitted when it is longer than 64 bytes or
 is not a readable timestamp.
@@ -699,6 +702,8 @@ is not a readable timestamp.
 | --- | --- | --- | --- |
 | `in_flight` | a `claimed` or `running` occurrence, given as `state`; `runId` is its running run, the lowest id if several | always | `inspect_occurrence` |
 | `running_run` | a running run keyed to the routine whose occurrence is not listed above: a retry on a still-planned occurrence, or a run whose occurrence is settled, another routine's, or missing | always | `inspect_run` |
+| `retry_waiting` | such a run retrying a planned occurrence: it has no session and an adopted attempt whose `notBefore` is after `observedAt`, and its deadline has not passed | always | `await_retry` |
+| `retry_expired` | a run with no session and an adopted attempt, retrying a planned occurrence or this routine's claimed one, whose deadline has passed; it replaces that run's `running_run` or `in_flight` item | until the next pass settles it | `await_settlement` |
 | `eligible_now` | a planned occurrence the scheduler's eligible queue selects now, unless misfire policy skips it first | never | `await_scheduler_pass` |
 | `due_unplanned` | the slot the next pass plans for the routine, with no `occurrenceId`; `at` is the slot | never | `await_scheduler_pass` |
 | `recovery_required` | a `recovery_required` occurrence; `runId` is its running run, if any | while a running run keyed to the routine is on it | the step recovery takes, below |
@@ -711,6 +716,29 @@ history. An unreadable creation time does not keep it out, so such an item can
 appear beside `definition_unavailable`. A ready adopted retry is selected even
 when planning does not admit the routine, unless the routine is quarantined.
 Its occurrence is then listed twice, as `running_run` and as `eligible_now`.
+
+A retry item says what the daemon does with the retry next. Each pass first
+reconciles runs. A run with no session and an adopted attempt whose deadline
+has passed is settled `failed`, with its `planned` or `claimed` occurrence,
+whatever its `notBefore`, before anything is claimed. That releases its hold,
+so the same pass can claim another occurrence of the routine. A
+`retry_waiting` item's occurrence can be claimed again from `notBefore`,
+subject to the rest of the claim gate: the occurrence's routine must not be
+quarantined, and no other work may hold it. If the deadline comes first, the
+retry is settled `failed` then instead. A pass runs about once a minute, so a
+retry can start up to a minute after `notBefore`. Once `notBefore` has passed,
+a retry the queue can claim is listed as `running_run` and `eligible_now`; one
+it cannot claim stays `running_run` until its deadline.
+
+Reconciliation parses the whole stored deadline, while the queue compares the
+deadline and `not_before` as stored text. A retry is listed as waiting only
+when its deadline is open both ways. `notBefore` is the latest adopted attempt
+time still ahead, shown only when it is stored in canonical form, and
+`deadlineAt` is the parsed deadline. One run anywhere in the store whose
+deadline cannot be parsed, or whose expired retry's occurrence is neither
+`planned` nor `claimed`, fails reconciliation on every pass for every routine:
+no retry is settled and nothing is claimed until it is repaired. Such a run is
+listed as `running_run`, or its occurrence as `in_flight`.
 
 A `due_unplanned` item is the slot planning creates when it next reaches an
 admitted routine: the schedule's latest slot at or before `observedAt` and after

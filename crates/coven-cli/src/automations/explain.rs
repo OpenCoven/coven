@@ -74,6 +74,10 @@ pub(crate) struct WorkItem {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<String>,
     pub holds_claims: bool,
     pub next_step: NextStep,
 }
@@ -83,6 +87,8 @@ pub(crate) struct WorkItem {
 pub(crate) enum WorkCode {
     InFlight,
     RunningRun,
+    RetryWaiting,
+    RetryExpired,
     EligibleNow,
     DueUnplanned,
     RecoveryRequired,
@@ -100,6 +106,8 @@ pub(crate) enum NextStep {
     AwaitRuntimeAuthority,
     AwaitCancellation,
     CancelRun,
+    AwaitRetry,
+    AwaitSettlement,
     AwaitSchedulerPass,
     None,
 }
@@ -151,11 +159,7 @@ fn work_select() -> String {
            substr(CAST(occurrence.id AS BLOB), 1, 513) AS occurrence_id,
            occurrence.state AS state,
            substr(CAST(occurrence.scheduled_for AS BLOB), 1, 65) AS scheduled_for,
-           (SELECT substr(CAST(run.id AS BLOB), 1, 513)
-            FROM main.automation_runs AS run
-            WHERE run.occurrence_id = occurrence.id AND run.status = 'running'
-            ORDER BY run.id
-            LIMIT 1) AS run_id,
+           substr(CAST(held.id AS BLOB), 1, 513) AS run_id,
            occurrence.state <> 'recovery_required' OR EXISTS (
                SELECT 1 FROM main.automation_runs AS run
                WHERE run.automation_id = ?3
@@ -198,8 +202,23 @@ fn work_select() -> String {
                      )
                ) THEN 3
                ELSE 0
-           END AS recovery_refusal
+           END AS recovery_refusal,
+           -- Reconciliation also settles a claimed occurrence's expired retry.
+           held.session_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM main.automation_attempts AS attempt
+                   WHERE attempt.run_id = held.id AND attempt.state = 'adopted'
+               ) AS retry,
+           CAST(held.timeout_at AS BLOB) AS deadline,
+           NULL AS not_before
     FROM main.automation_occurrences AS occurrence
+    LEFT JOIN main.automation_runs AS held
+      ON held.id = (
+          SELECT first.id FROM main.automation_runs AS first
+          WHERE first.occurrence_id = occurrence.id AND first.status = 'running'
+          ORDER BY first.id
+          LIMIT 1
+      )
     WHERE occurrence.automation_id = ?3
       AND occurrence.state IN ('claimed', 'running', 'recovery_required')
     UNION ALL
@@ -211,7 +230,26 @@ fn work_select() -> String {
             WHERE occurrence.id = run.occurrence_id),
            substr(CAST(run.id AS BLOB), 1, 513),
            1,
-           0
+           0,
+           -- The retry reconciliation and the eligible queue time: an adopted
+           -- attempt on a run with no session, whose occurrence, of any
+           -- routine, is planned.
+           run.session_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM main.automation_attempts AS attempt
+                   WHERE attempt.run_id = run.id AND attempt.state = 'adopted'
+               )
+               AND EXISTS (
+                   SELECT 1 FROM main.automation_occurrences AS occurrence
+                   WHERE occurrence.id = run.occurrence_id
+                     AND occurrence.state = 'planned'
+               ),
+           CAST(run.timeout_at AS BLOB),
+           (SELECT substr(CAST(MAX(attempt.not_before) AS BLOB), 1, 65)
+            FROM main.automation_attempts AS attempt
+            WHERE attempt.run_id = run.id
+              AND attempt.state = 'adopted'
+              AND attempt.not_before > ?1)
     FROM main.automation_runs AS run
     WHERE run.automation_id = ?3
       AND run.status = 'running'
@@ -228,7 +266,10 @@ fn work_select() -> String {
            substr(CAST(eligible.scheduled_for AS BLOB), 1, 65),
            NULL,
            0,
-           0
+           0,
+           0,
+           NULL,
+           NULL
     FROM ({ELIGIBLE_OCCURRENCES_SQL}) AS eligible
     WHERE ?5 IS NULL
        OR eligible.scheduled_for >= ?5
@@ -237,7 +278,7 @@ fn work_select() -> String {
            WHERE run.occurrence_id = eligible.id AND run.status = 'running'
        )
     UNION ALL
-    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0
+    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL
     WHERE ?5 IS NOT NULL
       AND NOT EXISTS (
           SELECT 1 FROM main.automation_occurrences AS later
@@ -420,15 +461,58 @@ fn work(
                     row.get::<_, Option<Vec<u8>>>(4)?,
                     row.get::<_, bool>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, bool>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
                 ))
             },
         )
         .context("failed to read the routine's work")?;
     let mut items = Vec::new();
     for row in rows {
-        let (rank, occurrence_id, state, scheduled_for, run_id, holds_claims, refusal) =
-            row.context("failed to read the routine's work")?;
+        let (
+            rank,
+            occurrence_id,
+            state,
+            scheduled_for,
+            run_id,
+            holds_claims,
+            refusal,
+            retry,
+            deadline,
+            not_before,
+        ) = row.context("failed to read the routine's work")?;
+        // Reconciliation parses the whole stored deadline and settles the
+        // retry once it has passed. The eligible queue compares the deadline
+        // and `not_before` as stored text, so a waiting retry needs its
+        // deadline open both ways, and `notBefore` is shown only when its text
+        // is canonical. A deadline that does not parse leaves a run unnamed.
+        let deadline = deadline.map(|stored| {
+            String::from_utf8(stored).ok().and_then(|stored| {
+                DateTime::parse_from_rfc3339(&stored)
+                    .ok()
+                    .map(|deadline| (deadline.with_timezone(&Utc), stored))
+            })
+        });
+        let expired = matches!(&deadline, Some(Some((deadline, _))) if *deadline <= now);
+        // Expiry is matched first, so an open deadline must also read as
+        // open as text.
+        let open = match &deadline {
+            None => true,
+            Some(Some((_, stored))) => stored.as_str() > iso(now).as_str(),
+            Some(None) => false,
+        };
+        let deadline_at = deadline
+            .flatten()
+            .map(|(deadline, _)| deadline.to_rfc3339_opts(SecondsFormat::Millis, true));
+        let mut timing = (None, None);
         let (code, state, next_step) = match (rank, state.as_deref()) {
+            // Each pass first settles an adopted retry failed once its
+            // deadline has passed, whatever its `not_before`.
+            (0 | 1, Some("claimed") | None) if retry && expired => {
+                timing.1 = deadline_at;
+                (WorkCode::RetryExpired, None, NextStep::AwaitSettlement)
+            }
             (0, Some("claimed")) => (
                 WorkCode::InFlight,
                 Some("claimed"),
@@ -439,6 +523,13 @@ fn work(
                 Some("running"),
                 NextStep::InspectOccurrence,
             ),
+            (1, None) if retry && open && not_before.is_some() => {
+                let not_before = not_before
+                    .and_then(stored_time)
+                    .filter(|stored| canonical(stored).as_deref() == Some(stored.as_str()));
+                timing = (not_before, deadline_at);
+                (WorkCode::RetryWaiting, None, NextStep::AwaitRetry)
+            }
             (1, None) => (WorkCode::RunningRun, None, NextStep::InspectRun),
             (2, None) => (WorkCode::EligibleNow, None, NextStep::AwaitSchedulerPass),
             (2, Some("unplanned")) => (WorkCode::DueUnplanned, None, NextStep::AwaitSchedulerPass),
@@ -464,10 +555,11 @@ fn work(
             state,
             run_id: run_id.and_then(bounded_id),
             at: scheduled_for
-                .filter(|stored| stored.len() <= MAX_STORED_TIME)
-                .and_then(|stored| String::from_utf8(stored).ok())
+                .and_then(stored_time)
                 .as_deref()
                 .and_then(canonical),
+            not_before: timing.0,
+            deadline_at: timing.1,
             holds_claims,
             next_step,
         });
@@ -475,6 +567,13 @@ fn work(
     let truncated = items.len() > MAX_WORK;
     items.truncate(MAX_WORK);
     Ok((items, truncated))
+}
+
+/// A stored time is read only when it is UTF-8 within the length bound.
+fn stored_time(stored: Vec<u8>) -> Option<String> {
+    (stored.len() <= MAX_STORED_TIME)
+        .then(|| String::from_utf8(stored).ok())
+        .flatten()
 }
 
 /// An id leaves only as valid UTF-8 within the operator views' id rules.
