@@ -180,7 +180,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "retry-timeout-process-crash-recovery",
                         "waiting-retry-cancellation-process-crash-recovery",
                         "run-now-process-crash-recovery",
-                        "run-now-envelope-process-crash-recovery"
+                        "run-now-envelope-process-crash-recovery",
+                        "tick-process-crash-recovery"
                     ]
                 },
                 {
@@ -3595,6 +3596,139 @@ fn native_target_evaluates_checked_in_run_now_envelope_process_crash_vectors() -
     assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
     assert!(!text.contains("occ-manual-"));
     assert!(!text.contains("adopt:"));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_tick_process_crash_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/tick-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "tick-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["suiteId"], "tick-process-crash-recovery");
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 14);
+    assert_eq!(response["evidence"]["passedCases"], 14);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("tick crash observations");
+    assert_eq!(observations.len(), 14);
+    // What the store had committed when the worker was gone, and whether a
+    // write was open there.
+    let boundaries = [
+        ("after_plan", "absent", 0, true),
+        ("after_plan_commit", "planned", 0, false),
+        ("after_cursor", "planned", 0, true),
+        ("after_cursor_commit", "planned", 1, false),
+        ("after_claim", "planned", 1, true),
+        ("after_claim_commit", "claimed", 1, false),
+        ("none", "claimed", 1, false),
+    ];
+    let cases = ["prompt", "late"]
+        .into_iter()
+        .flat_map(|scene| boundaries.map(|boundary| (scene, boundary)));
+    for (observation, (scene, (boundary, committed, cursor, open))) in
+        observations.iter().zip(cases)
+    {
+        let killed = boundary != "none";
+        let at_pause = |value: Value| if killed { value } else { json!(null) };
+        assert_eq!(observation["scene"], scene);
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(observation["transactionOpenAtPause"], at_pause(json!(open)));
+        assert_eq!(observation["slotAtPause"], at_pause(json!(committed)));
+        assert_eq!(observation["cursorAtPause"], at_pause(json!(cursor)));
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["slotAfterExit"], committed);
+        assert_eq!(observation["cursorAfterExit"], cursor);
+        assert_eq!(observation["recoveryRefused"], false);
+        // Exactly one slot launches, once, and nothing stops.
+        assert_eq!(observation["restartLaunches"], 1);
+        assert_eq!(observation["launches"], 1);
+        assert_eq!(observation["stops"], 0);
+        assert_eq!(observation["replayIsNoop"], true);
+        let (slot, next_slot, claims) = if scene == "prompt" {
+            // The slot itself launches; a committed claim with no run is
+            // restored to planned and claimed a second time.
+            (
+                "succeeded",
+                "absent",
+                if committed == "claimed" { 2 } else { 1 },
+            )
+        } else {
+            // The next day's slot launches instead. The missed slot is
+            // superseded if it was planned, its restored claim included.
+            let missed = match committed {
+                "absent" => "absent",
+                "planned" => "skipped",
+                _ => "skipped_claim",
+            };
+            (missed, "succeeded", 1)
+        };
+        let launched = |settled: &'static str| {
+            if settled == "succeeded" {
+                "owned"
+            } else {
+                settled
+            }
+        };
+        assert_eq!(observation["slotAfterRestart"], launched(slot));
+        assert_eq!(observation["nextSlotAfterRestart"], launched(next_slot));
+        assert_eq!(observation["claims"], claims);
+        assert_eq!(observation["slotAfterPass"], slot);
+        assert_eq!(observation["nextSlotAfterPass"], next_slot);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "tick-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    // No routine or occurrence id: occurrence ids extend the routine's.
+    assert!(!text.contains("conformance-tick-crash"));
     assert!(!coven_home.exists());
     Ok(())
 }
