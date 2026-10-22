@@ -1008,6 +1008,21 @@ enum DeviceCommand {
         #[arg(value_name = "REPLACEMENT_DEVICE", value_parser = parse_nonempty_arg)]
         replacement_device: String,
     },
+    #[command(
+        about = "Introduce a new installation through an already trusted device",
+        long_about = "Introduce a new installation through an already trusted device.\n\n\
+                      Reads the new installation's signed introduction envelope, prints every \
+                      signed field, and, after you type `introduce`, admits it over the local \
+                      owner socket. The named introducer must then approve on its own device \
+                      with a fresh step-up. Requires an installed introduction policy and a \
+                      running daemon with the mobile gateway enabled."
+    )]
+    Introduce {
+        #[arg(long, value_name = "ENVELOPE_JSON")]
+        request: PathBuf,
+        #[arg(long, help = "Skip the typed confirmation after the review is printed")]
+        yes: bool,
+    },
     #[command(about = "Manage the offline owner-root credential")]
     OwnerRoot {
         #[command(subcommand)]
@@ -2082,6 +2097,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 old_device,
                 replacement_device,
             } => mobile_memory::device::run_rotate(&old_device, &replacement_device),
+            DeviceCommand::Introduce { request, yes } => {
+                mobile_memory::enrollment::run_introduce(&request, yes)
+            }
             DeviceCommand::OwnerRoot {
                 command: OwnerRootCommand::Generate { out },
             } => mobile_memory::policy_cli::run_generate_owner_root(&out),
