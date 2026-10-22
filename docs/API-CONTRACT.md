@@ -683,14 +683,15 @@ claimed, running and recovery-required occurrences, and every running run keyed
 to the routine whose occurrence is not one of those. It also lists what a
 scheduler pass would claim from, given the store at `observedAt`: the eligible
 queue and a due slot that planning has yet to create. Before claiming, a pass
-settles retries and held failed attempts once their deadlines pass, and returns
-or fails stale and expired claims (`retry_expired`, `retry_held`,
-`claim_stale` and `lease_expired`, below), releasing the hold each lists.
-Reconciliation also acts on other runs before claiming, which are listed as
-`running_run` or `in_flight` and not named yet (#1523): it settles runs whose
-session has finished, stops or settles runs past their deadline, stops
-launches abandoned past their lease, and reconciles expired cancellations. It
-holds at most 20 items: those that hold claims first, then by code in the order
+settles retries and held failed attempts once their deadlines pass, settles
+runs whose session has finished, and returns or fails stale and expired claims
+(`retry_expired`, `retry_held`, `session_finished`, `claim_stale` and
+`lease_expired`, below). Each releases the hold it lists, except where
+settlement holds the run, as described below. Reconciliation also acts on other
+runs before claiming, which are listed as `running_run` or `in_flight` and not
+named yet (#1523): it stops or settles runs past their deadline, stops launches
+abandoned past their lease, and reconciles expired cancellations. It holds at
+most 20 items: those that hold claims first, then by code in the order
 below, with each code that replaces another item sorted as that item, then by
 stored scheduled time and ids. `workTruncated` is `true` when more exist. All
 reads, `conditions` included, come from one read transaction. Each item has a
@@ -712,6 +713,7 @@ timestamp.
 | `retry_waiting` | such a run retrying a planned occurrence: it has no session and an adopted attempt whose `notBefore` is after `observedAt`, and its deadline has not passed | always | `await_retry` |
 | `retry_expired` | a run with no session and an adopted attempt, retrying a planned occurrence or this routine's claimed one, whose deadline has passed; it replaces that run's `running_run` or `in_flight` item | until the next pass settles it | `await_settlement` |
 | `retry_held` | a claimed or running occurrence whose run's latest attempt failed and is held for an operator retry, described below; it replaces the occurrence's `in_flight` item | until a pass settles it at the run's deadline | `await_settlement` |
+| `session_finished` | a claimed or running occurrence whose run's session has finished, described below; it replaces the occurrence's `in_flight` item | until the next pass settles the run, unless settlement holds the run | `await_settlement`, or `await_runtime_authority` for a Runtime Authority run |
 | `eligible_now` | a planned occurrence the scheduler's eligible queue selects now, unless misfire policy skips it first | never | `await_scheduler_pass` |
 | `due_unplanned` | the slot the next pass plans for the routine, with no `occurrenceId`; `at` is the slot | never | `await_scheduler_pass` |
 | `recovery_required` | a `recovery_required` occurrence; `runId` is its running run, if any | while a running run keyed to the routine is on it | the step recovery takes, below |
@@ -748,8 +750,9 @@ Some runs anywhere in the store fail reconciliation on every pass for every
 routine. Until they are repaired, no claim is released and nothing is claimed.
 Among them:
 
-- any running run whose deadline is stored as anything but text, which
-  settlement cannot read;
+- any running run with a value settlement decodes as text, such as its
+  deadline, its session's exit time or its latest attempt's settlement time,
+  that is stored as anything but text or null, or is not valid UTF-8;
 - a run whose text deadline cannot be parsed, when it is a retry with no session
   and an adopted attempt, has an attempt still live, or is an unfenced plain run
   holding a failed attempt or whose session has finished;
@@ -789,6 +792,40 @@ A held run whose occurrence awaits recovery is listed as `recovery_required`;
 unless one of the cases above applies, settlement settles both at the deadline.
 One whose occurrence is not this routine's claimed or running one is listed as
 `running_run`.
+
+A `session_finished` item is a run whose session has finished: its status is
+`completed`, `failed`, `cancelled`, `killed` or `idle`. The next pass settles
+the run and its occurrence from the session's evidence; a run whose latest
+attempt is ambiguous settles `failed`, at that attempt's settlement time. A
+plain run whose latest attempt failed is a held retry instead, described above.
+Two outcomes keep the routine's claims:
+
+- a plain run that failed with no ambiguous stop, while its deadline is still
+  ahead and its latest attempt is below the attempt limit, is held for an
+  operator retry, and is then listed as `retry_held`;
+- a Runtime Authority run is held for recovery, since no trusted adapter
+  consumes its evidence yet, and its occurrence is then listed as
+  `recovery_required` with next step `await_runtime_authority`.
+
+These runs with a finished session are listed as `in_flight` instead:
+
+- one with an expired cancellation, which reconciliation acts on first;
+- one sharing its occurrence with another running run, which can settle the
+  occurrence first;
+- a plain run with a stop fence, unless its latest attempt is ambiguous:
+  settlement skips it, holds it for recovery when an expired timeout or
+  recovery stop left its attempt live, or fails the pass;
+- a plain run whose ambiguous attempt has a pending cancellation of its own,
+  which settlement leaves to that cancellation;
+- a plain run whose latest attempt is not live, ambiguous or failed, or a
+  Runtime Authority run without exactly one unresolved attempt, on which
+  settlement fails the pass;
+- one with a value settlement cannot read where it reads it, such as a deadline,
+  an exit time, an exit code or a plain run's pinned definition, on which
+  settlement fails the pass.
+
+A run with a finished session whose occurrence awaits recovery is listed as
+`recovery_required`; the next pass can settle both, or hold the run as above.
 
 Claim releases describe the next pass of the daemon holding the scheduler
 authority on record, if that pass completes. It first returns to `planned`

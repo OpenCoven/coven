@@ -87,10 +87,11 @@ listed in the [API contract](../API-CONTRACT.md#automations-explanation).
 A retry waiting for its `notBefore`, or past its deadline, is named with its
 times, and so is a failed attempt held for an operator retry, with its
 deadline when it has one. A claim the next pass releases because it is stale
-or its lease has expired is named too, with its lease when one is readable. Other runs a pass
-acts on before claiming, such as those whose session has finished, are not
-named yet (#1523). Principal-scoped reads and the remaining operator surface
-are still tracked by #858.
+or its lease has expired is named too, with its lease when one is readable,
+and so is a run whose session has finished, which the next pass settles or
+holds. Other runs a pass acts on before claiming, such as those past their
+deadline, are not named yet (#1523). Principal-scoped reads and the
+remaining operator surface are still tracked by #858.
 
 ## Color
 
