@@ -140,7 +140,10 @@ fn project(view: View<'_>, response: &Value) -> Result<Value> {
         View::Explain(id) => {
             let explanation: Explanation =
                 serde_json::from_value(payload["explanation"].clone()).map_err(|_| invalid())?;
-            if explanation.automation_id != id || explanation.conditions.is_empty() {
+            if explanation.automation_id != id
+                || explanation.conditions.is_empty()
+                || explanation.work.is_some() != explanation.work_truncated.is_some()
+            {
                 return Err(invalid());
             }
             output["explanation"] = serde_json::to_value(explanation)?;
@@ -255,6 +258,11 @@ struct Explanation {
     lifecycle_state: String,
     observed_at: String,
     conditions: Vec<Condition>,
+    // A daemon from before work was reported sends neither field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work: Option<Vec<WorkItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_truncated: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -265,6 +273,22 @@ struct Condition {
     at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<String>,
+    next_step: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkItem {
+    code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    occurrence_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+    holds_claims: bool,
     next_step: String,
 }
 
@@ -441,12 +465,16 @@ mod tests {
             output["explanation"]["conditions"],
             json!([{"code": "not_active", "nextStep": "activate_if_intended"}])
         );
+        assert_eq!(output["explanation"]["work"], json!([]));
+        assert_eq!(output["explanation"]["workTruncated"], false);
         assert!(!output.to_string().contains("private sentinel"));
         for (path, value) in [
             ("/event/payload/explanation/automationId", json!("other")),
             ("/event/payload/explanation/conditions", json!([])),
             ("/event/payload/explanation/revision", json!(-1)),
             ("/event/payload/explanation/conditions/0/code", json!(1)),
+            ("/event/payload/explanation/work", json!("private sentinel")),
+            ("/event/payload/explanation/workTruncated", json!("false")),
             ("/event/payload/explanation", json!("private sentinel")),
             ("/event/action", json!("coven.automations.run.get.v1")),
         ] {
@@ -456,6 +484,29 @@ mod tests {
                 project(view, &invalid).unwrap_err().to_string(),
                 "automation inspection response is invalid",
                 "{path}"
+            );
+        }
+        // An older daemon reports no work at all; half of it is a forgery.
+        let without = |fields: &[&str]| {
+            let mut response = response.clone();
+            let explanation = response
+                .pointer_mut("/event/payload/explanation")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            for field in fields {
+                explanation.remove(*field).unwrap();
+            }
+            project(view, &response)
+        };
+        let older = without(&["work", "workTruncated"]).unwrap();
+        assert_eq!(older["explanation"].get("work"), None);
+        assert_eq!(older["explanation"].get("workTruncated"), None);
+        for field in ["work", "workTruncated"] {
+            assert_eq!(
+                without(&[field]).unwrap_err().to_string(),
+                "automation inspection response is invalid",
+                "{field}"
             );
         }
     }

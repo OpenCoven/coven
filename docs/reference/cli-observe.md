@@ -74,9 +74,14 @@ also covers stored revision metadata that planning cannot verify.
 Each carries a `nextStep`. Only when none holds does it report `next_slot`, the
 schedule's first slot after `observedAt`. That is not a promise of a launch:
 overlap and misfire policy, slots already due and the scheduler's liveness are
-outside it (see `coven automations doctor`). The codes and next steps are listed
-in the [API contract](../API-CONTRACT.md#automations-explanation). Work in
-flight for the routine is tracked by #1518. Principal-scoped reads and the
+outside it (see `coven automations doctor`). Beside the conditions, `work`
+lists the routine's claimed, running and recovery-required occurrences and its
+other running runs, and whether each holds claims, which keeps every other
+occurrence of the routine from being claimed. Follow one with
+`coven automations occurrence <id>`, `coven automations run <id>` or
+`coven automations leases --automation-id <id>`. The codes and next steps are
+listed in the [API contract](../API-CONTRACT.md#automations-explanation).
+Retry timing and claimable occurrences are tracked by #1518. Principal-scoped reads and the
 remaining operator surface are still tracked by #858.
 
 ## Color
