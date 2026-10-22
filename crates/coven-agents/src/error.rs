@@ -240,8 +240,8 @@ impl RunError {
     }
 }
 
-/// Whether `error`, or any error in its source chain, is a [`RunError`] that
-/// leaves an unknown effect. Wrapping a child failure in another error keeps
+/// Whether `error`, or any error in its source chain, reports a run or durable
+/// invocation with an unknown effect. Wrapping a child failure in another error keeps
 /// it visible as long as the wrapper reports its source.
 pub(crate) fn chain_leaves_unknown_effect(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
@@ -249,6 +249,9 @@ pub(crate) fn chain_leaves_unknown_effect(error: &(dyn std::error::Error + 'stat
         if error
             .downcast_ref::<RunError>()
             .is_some_and(RunError::leaves_unknown_effect)
+            || error
+                .downcast_ref::<crate::DurableInvocationError>()
+                .is_some_and(crate::DurableInvocationError::leaves_unknown_effect)
         {
             return true;
         }

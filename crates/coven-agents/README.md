@@ -342,20 +342,15 @@ Unknown stays unknown across a restart:
 - As with `GoalLoopRunner`, `process_instance_id` must change on every
   process start.
 
-There is no reconciliation path yet. A record that requires recovery stays
-that way until a fenced reconciliation contract exists, and delegated
-children are not journaled yet.
+There is no reconciliation path yet. A record that requires recovery stays that way until Psyche's existing fencing contract has an authoritative consumer binding for these process-bound attempts (see [OpenCoven/psyche#19](https://github.com/OpenCoven/psyche/issues/19)). An opaque fence token alone does not prove that a prior attempt can no longer act.
+
+`DurableInvocationRunner::run_delegation` consumes a `PreparedDelegation` and records its child/parent identity and delegation, authority and context digests before context resolution or model execution. Its request digest includes the delegation contract, so direct submission cannot reuse the child identity to bypass attenuation. The ordinary delegation runner still enforces context, authority, result bounds and inherited cancellation/deadline controls. The child deadline includes time spent in journal I/O before dispatch. Journal errors with unresolved adoption or settlement propagate through tool error chains as parent `recovery_required` outcomes.
+
+Prepared delegations remain single-use. This API adds no retry, reconstruction of a consumed proof, parent scheduling or reconciliation. Hosts can discover children through `InvocationJournal::list` and each record's `parent_id`. Old records without delegation metadata continue to decode; delegated records carry only digests, never task text or resolved context.
 
 ## Supported checkpoint and deferred orchestration
 
-The existing `Runner` provides local control transfer, correlation, and
-bounded local delegation with selected context and attenuated authority.
-`GoalLoopRunner` journals iteration boundaries; it does not supply durable
-child invocation adoption or shared executor conformance.
-`DurableInvocationRunner` records root invocations durably. Several things
-remain deferred under #804: fenced reconciliation of an invocation whose
-outcome is unknown, journaled delegated children, remote executors, unified
-observability, and removal of legacy handoff/full-transcript behavior.
+The existing `Runner` provides local control transfer, correlation, and bounded local delegation with selected context and attenuated authority. `GoalLoopRunner` journals iteration boundaries; it does not supply durable child invocation adoption or shared executor conformance. `DurableInvocationRunner` records root and delegated child invocations durably. Several things remain deferred under #804: fenced reconciliation of an invocation whose outcome is unknown, remote executors, unified observability, and removal of legacy handoff/full-transcript behavior.
 
 Internally, `Runner` is a facade over a crate-private `AgentLoop`. The loop
 runs one agent's model and tool turns: input and output guardrails, the

@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     durable_store::{DurableStore, StoreFormat},
-    AgentId, AgentRef, BoxError, ContentDigest, InvocationContext, InvocationFailureKind,
-    InvocationId, InvocationRequest, InvocationSource, RunOptions,
+    AgentId, AgentRef, BoxError, ContentDigest, DelegationDigests, InvocationContext,
+    InvocationFailureKind, InvocationId, InvocationRequest, InvocationSource, RunOptions,
 };
 
 const REQUEST_CONTRACT: &str = "coven.agent-invocation-request.v1";
@@ -116,6 +116,9 @@ pub struct InvocationRecord {
     pub requested_target: AgentRef,
     /// Digest of the exact request; see [`invocation_request_digest`].
     pub request_digest: ContentDigest,
+    /// Bounded delegation evidence; never contains task or context payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationDigests>,
     pub state: InvocationState,
     /// The attempt that adopted the invocation. Absent while reserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
