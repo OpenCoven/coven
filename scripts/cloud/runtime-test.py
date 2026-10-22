@@ -3,6 +3,8 @@
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +13,20 @@ import runtime
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_real_npm_reads_isolated_configuration_without_double_loading(self):
+        node, npm = shutil.which('node'), shutil.which('npm')
+        if not node or not npm:
+            self.skipTest('real npm check requires the repository Node toolchain')
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / 'home'
+            home.mkdir()
+            (home / '.npmrc').write_text('registry=https://ambient.invalid/\n')
+            env = runtime.execution_environment(root / 'cache', home, node_bin=Path(node).parent)
+            result = runtime.run_command([npm, 'config', 'get', 'registry'], cwd=folder, env=env, timeout=30)
+            self.assertEqual(result['exit_code'], 0)
+            self.assertEqual(result['stdout'].strip(), 'https://registry.npmjs.org/')
+
     def test_child_environment_does_not_inherit_credentials_or_overrides(self):
         with tempfile.TemporaryDirectory() as folder:
             prior = os.environ.get("COVEN_TEST_PRIVATE_VALUE")
@@ -50,6 +66,39 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(result["native_diagnostic"]["code"], expected)
                     self.assertNotIn("private-fixture-marker", json.dumps(result))
                     self.assertTrue(result["native_diagnostic"]["recovery"])
+
+    def test_smoke_diagnostic_only_reports_source_names_and_panic_locations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "crates/coven-cli/tests/smoke.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text('#[test]\nfn known_case() { wait_until("child cleanup", || true); }\n')
+            stdout = "test known_case ... FAILED\ntest private_marker ... FAILED\nprivate-marker\n"
+            stderr = "thread 'known_case' panicked at crates/coven-cli/tests/smoke.rs:2:3:\nprivate-marker\nError: timed out waiting for child cleanup\nError: timed out waiting for private-marker\n"
+            diagnostic = runtime.smoke_diagnostic(root, stdout, stderr)
+            self.assertEqual(diagnostic, {"failed_tests": ["known_case"], "panic_lines": [2], "failed_waits": ["child cleanup"]})
+            self.assertNotIn("private", json.dumps(diagnostic))
+            self.assertEqual(runtime.smoke_diagnostic(root, "", ""),
+                             {"failed_tests": [], "panic_lines": [], "failed_waits": []})
+
+    def test_real_rust_smoke_failure_reports_safe_source_evidence(self):
+        rustc = shutil.which("rustc")
+        if not rustc:
+            self.skipTest("real diagnostic check requires the repository Rust toolchain")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "crates/coven-cli/tests/smoke.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text('#[test]\nfn smoke_case() { panic!("private-fixture-marker"); }\n')
+            binary = root / "smoke-test"
+            compiled = subprocess.run([rustc, "--test", "crates/coven-cli/tests/smoke.rs", "-o", str(binary)],
+                                      cwd=root, capture_output=True)
+            self.assertEqual(compiled.returncode, 0)
+            result = runtime.run_command([str(binary), "--test", "smoke", "--nocapture"],
+                                         cwd=root, env={}, timeout=30)
+            self.assertEqual(result["exit_code"], 101)
+            self.assertEqual(result["smoke_diagnostic"], {"failed_tests": ["smoke_case"], "panic_lines": [2], "failed_waits": []})
+            self.assertNotIn("private-fixture-marker", json.dumps(result["smoke_diagnostic"]))
 
     def test_timeout_terminates_owned_command(self):
         with tempfile.TemporaryDirectory() as folder:

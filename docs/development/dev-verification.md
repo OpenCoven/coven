@@ -109,8 +109,13 @@ setup and keep `PLAYWRIGHT_BROWSERS_PATH` consistent; see
 [optional browser verification](../../scripts/browser/README.md). The smoke
 checks one selected browser, not the package's whole browser test suite.
 Policy guard installs the locked parser tools and runs browser contract tests;
-it does not download or launch browser artifacts. Bootstrap/distro contracts
-remain separate under #1450.
+it does not download or launch browser artifacts.
+
+The fresh Debian/Ubuntu bootstrap matrix is a routed required CI job; run its
+explicit [safe container runner](../../scripts/bootstrap-contract/README.md)
+locally when Docker is available. PR/full includes its host contract tests and
+the A2 Cloud fixture suites, not actual container execution. These fixture
+suites require maintained Python 3.11+ as documented by the Cloud setup scripts.
 
 ## CI remains final merge authority
 
@@ -124,6 +129,7 @@ prove their results:
   unit tests do not prove artifact delivery.
 - Release-target npm onboarding matrix and the pinned engine contract job.
 - Informational/post-merge performance collection and the real mount probe.
+- Fresh Debian/Ubuntu bootstrap execution on routed setup, dependency and workflow changes.
 - GitHub's required `PR gate`, merge-queue evaluation, and protected-main review.
 
 Record exact failed commands and environment differences in the issue/PR.

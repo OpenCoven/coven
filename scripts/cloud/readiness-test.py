@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import readiness
 
@@ -54,6 +55,26 @@ class ReadinessTests(fixtures.ConfigTests):
         self.assertIn("--nocapture", smoke)
         self.assertNotIn("ready", report)
 
+    @patch("readiness.platform.system", return_value="Linux")
+    def test_missing_openssl_blocks_build_with_explicit_stage(self, *_):
+        report = readiness.verify(self.root, Path(self.temp.name) / "cache", run=self.runner("openssl"))
+        self.assertFalse(report["development_ready"])
+        self.assertEqual(report["blocked_stage"], "native_openssl")
+        self.assertEqual(report["stages"][-1]["exit_code"], 19)
+        self.assertIn(["pkg-config", "--exists", "openssl"], self.commands)
+        self.assertFalse(any("build" in argv or "doctor" in argv for argv in self.commands))
+
+    @patch("readiness.platform.system", return_value="Linux")
+    def test_missing_external_kill_blocks_build_with_explicit_stage(self, *_):
+        report = readiness.verify(self.root, Path(self.temp.name) / "cache", run=self.runner("kill"))
+        self.assertFalse(report["development_ready"])
+        self.assertEqual(report["blocked_stage"], "native_process_probe")
+        self.assertEqual(report["stages"][-1]["exit_code"], 19)
+        probe = next(argv for argv in self.commands if argv[0] == "kill")
+        self.assertEqual(probe[1], "-0")
+        self.assertTrue(probe[2].isdigit())
+        self.assertFalse(any("build" in argv or "doctor" in argv for argv in self.commands))
+
     def test_failed_build_stops_before_smoke_and_does_not_report_ready(self):
         report = readiness.verify(self.root, Path(self.temp.name) / "cache", run=self.runner("build"))
         self.assertFalse(report["development_ready"])
@@ -74,6 +95,20 @@ class ReadinessTests(fixtures.ConfigTests):
         self.assertFalse(report["operational_ready"])
         self.assertTrue(report["doctor"]["operational_ready"])
         self.assertEqual(report["blocked_stage"], "cli_smoke")
+
+    def test_smoke_failure_keeps_safe_diagnostic_without_raw_output(self):
+        runner = self.runner("smoke")
+        def diagnostic_runner(argv, **kwargs):
+            result = runner(argv, **kwargs)
+            if "smoke" in argv:
+                result.update(stdout="private-fixture-marker",
+                              smoke_diagnostic={"failed_tests": ["known_case"], "panic_lines": [12]})
+            return result
+        report = readiness.verify(self.root, Path(self.temp.name) / "cache", run=diagnostic_runner)
+        self.assertFalse(report["development_ready"])
+        self.assertEqual(report["blocked_stage"], "cli_smoke")
+        self.assertEqual(report["smoke_diagnostic"]["failed_tests"], ["known_case"])
+        self.assertNotIn("private-fixture-marker", json.dumps(report))
 
     def test_missing_pinned_components_block_build(self):
         runner = self.runner()

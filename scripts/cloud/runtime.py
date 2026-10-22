@@ -1,6 +1,7 @@
 """Credential-free child execution and faithful doctor capability classification."""
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -21,8 +22,11 @@ def execution_environment(cache, home, *, node_bin=None):
         "GIT_TERMINAL_PROMPT": "0", "CI": "true", "TERM": "dumb",
         "NO_COLOR": "1", "LANG": "C.UTF-8",
         "npm_config_cache": str(cache / "npm"),
-        "npm_config_userconfig": os.devnull,
-        "npm_config_globalconfig": os.devnull,
+        # npm rejects loading one path in both config roles (including /dev/null).
+        # These distinct absent files in the owned temporary home are empty
+        # configurations; neither the real user nor system npmrc is consulted.
+        "npm_config_userconfig": str(home / "npm-user.npmrc"),
+        "npm_config_globalconfig": str(home / "npm-global.npmrc"),
     }
     # Preserve managed routing and CA policy; do not add destinations, bypass
     # proxies or forward provider credentials / arbitrary process overrides.
@@ -66,6 +70,27 @@ def native_diagnostic(stderr):
     return None
 
 
+def smoke_diagnostic(repo, stdout, stderr):
+    """Export only source-known identifiers and bounded source line numbers."""
+    summary = {"failed_tests": [], "panic_lines": [], "failed_waits": []}
+    try:
+        source = (Path(repo) / "crates/coven-cli/tests/smoke.rs").read_text()
+    except (OSError, UnicodeError):
+        return summary
+    names = set(re.findall(r"^fn ([a-z][a-z0-9_]{0,127})\(", source, re.MULTILINE))
+    failed = set(re.findall(r"^test ([a-z][a-z0-9_]{0,127}) \.\.\. FAILED$", stdout, re.MULTILINE))
+    failed.update(re.findall(r"^thread '([a-z][a-z0-9_]{0,127})'(?: \([0-9]+\))? panicked at ", stderr, re.MULTILINE))
+    summary["failed_tests"] = sorted(failed & names)
+    waits = set(re.findall(r'wait_until\(\s*"([a-zA-Z0-9 _-]{1,120})"', source))
+    timed_out = set(re.findall(r"^Error: timed out waiting for ([a-zA-Z0-9 _-]{1,120})(?:; last error:.*)?$",
+                               stderr, re.MULTILINE))
+    summary["failed_waits"] = sorted(timed_out & waits)
+    lines = re.findall(r"^thread '[a-z][a-z0-9_]{0,127}'(?: \([0-9]+\))? panicked at crates/coven-cli/tests/smoke\.rs:([0-9]{1,6}):[0-9]{1,6}:$",
+                       stderr, re.MULTILINE)
+    summary["panic_lines"] = sorted({int(line) for line in lines if 0 < int(line) <= len(source.splitlines())})
+    return summary
+
+
 def run_command(argv, *, cwd, env, timeout):
     """Run an owned process group; never print potentially sensitive raw output."""
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -87,9 +112,11 @@ def run_command(argv, *, cwd, env, timeout):
         data = stdout.read(1024 * 1024 + 1)
         oversized = len(data) > 1024 * 1024
         stderr.seek(0)
-        safe_diagnostic = native_diagnostic(stderr.read(1024 * 1024).decode("utf-8", errors="replace"))
-        return {"native_diagnostic": safe_diagnostic, "exit_code": process.returncode, "timed_out": timed_out,
-                "stdout": "" if oversized else data.decode("utf-8", errors="replace"),
+        error_text = stderr.read(1024 * 1024).decode("utf-8", errors="replace")
+        output_text = "" if oversized else data.decode("utf-8", errors="replace")
+        safe_smoke = smoke_diagnostic(cwd, output_text, error_text) if "--test" in argv and "smoke" in argv else None
+        return {"native_diagnostic": native_diagnostic(error_text), "smoke_diagnostic": safe_smoke, "exit_code": process.returncode, "timed_out": timed_out,
+                "stdout": output_text,
                 "output_oversized": oversized, "launch_failed": False}
 
 

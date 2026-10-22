@@ -16,6 +16,7 @@ CATEGORY_NAMES = [
     'restricted_runtime',
     'workflow',
     'cargo_metadata',
+    'bootstrap',
 ]
 
 
@@ -92,6 +93,10 @@ def classify(paths: list[str]) -> dict[str, bool]:
             'scripts/install-native-link-dependencies.sh',
             'scripts/install-native-link-dependencies-test.py',
         }
+        is_bootstrap = (is_cargo_metadata or path.startswith(('scripts/cloud/', 'scripts/bootstrap-contract/'))
+                        or (path.startswith('packages/') and path.rsplit('/', 1)[-1] in
+                            {'package.json', 'package-lock.json', 'pnpm-lock.yaml'}))
+        categories['bootstrap'] |= is_bootstrap
         categories['rust'] |= is_rust
         categories['afs'] |= is_afs
         categories['channels'] |= is_channels

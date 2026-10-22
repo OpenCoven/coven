@@ -1,6 +1,7 @@
 """Prove contributor capabilities; provisioning and publication are separate."""
 import argparse
 import json
+import os
 from pathlib import Path
 import platform
 import tempfile
@@ -43,6 +44,8 @@ def verify(repo, cache, *, run=run_command):
                 report["stages"].append({"name": stage, "exit_code": result.get("exit_code"),
                                          "timed_out": bool(result.get("timed_out")), "passed": passed})
                 if not passed and not permit_doctor:
+                    if stage == "cli_smoke" and result.get("smoke_diagnostic") is not None:
+                        report["smoke_diagnostic"] = result["smoke_diagnostic"]
                     raise StageFailure
                 return result
 
@@ -63,6 +66,13 @@ def verify(repo, cache, *, run=run_command):
                 executable = cache / "managers" / pin / "bin" / name
                 command("package_manager:" + package, [str(executable), "--version"],
                         expected=lambda text, version=version: text == version)
+            # The locked Linux graph uses openssl-sys through coven-memory.
+            # Fail at the missing native prerequisite before an opaque Cargo error.
+            if platform.system() == "Linux":
+                command("native_openssl", ["pkg-config", "--exists", "openssl"])
+                # Smoke calls the external executable, not a shell builtin.
+                # Signal zero checks our live parent without sending a signal.
+                command("native_process_probe", ["kill", "-0", str(os.getpid())])
             command("workspace_build", [*cargo, "build", "--workspace", "--locked"], timeout=1800)
             doctor = command("doctor", [str(cache / "target/debug/coven"), "doctor", "--json"],
                              timeout=60, permit_doctor=True)
