@@ -243,6 +243,7 @@ The checked-in
 [`waiting-retry-cancellation-process-crash-recovery.vectors.json`](waiting-retry-cancellation-process-crash-recovery.vectors.json),
 [`run-now-process-crash-recovery.vectors.json`](run-now-process-crash-recovery.vectors.json),
 [`run-now-envelope-process-crash-recovery.vectors.json`](run-now-envelope-process-crash-recovery.vectors.json),
+[`tick-process-crash-recovery.vectors.json`](tick-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -306,7 +307,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, thirty-one
+The native Coven target implements twelve structural suites, thirty-two
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -800,8 +801,9 @@ launches one scheduled occurrence with no no-process containment receipt. It
 does not cover a real runtime process, receipt-proven no-process retry, which
 relaunches by design, an automatic retry after a launch fails before ownership
 (see `automatic-retry-process-crash-recovery`), Runtime Authority launches,
-manual occurrences (see `run-now-process-crash-recovery`), kills during
-held-for-retry (see
+manual occurrences (see `run-now-process-crash-recovery`), kills during the
+tick that plans and claims the slot (see `tick-process-crash-recovery`), kills
+during held-for-retry (see
 `held-settlement-process-crash-recovery`), timeout
 (see `timeout-enforcement-process-crash-recovery`) or cancellation, power loss,
 load, complete profiles or release eligibility.
@@ -1610,3 +1612,80 @@ containment receipt, or one whose lease expires before its deadline; the
 command's refusals; a graceful daemon restart (#1433); Runtime Authority runs,
 a real runtime process, power loss, load, complete profiles or release
 eligibility.
+
+## Tick process-crash audit boundary
+
+The `tick-process-crash-recovery` suite kills a daemon worker while its fenced
+scheduler tick plans and claims a due slot, then restarts the daemon before or
+after the next day's slot. The tick commits three transactions: it inserts the
+slot's `planned` occurrence, advances the scheduler's planning cursor under the
+fence, and claims the slot under the `daemon` lease and the scheduler's
+generation. Its lease recovery and misfire supersession change no row for a
+fresh slot. Each of fourteen cases starts the exact audited binary as a hidden
+worker with the same harness as `run-launch-process-crash-recovery`. The
+worker stores the fixed synthetic active daily definition, defined the day
+before its 09:00 slot, takes scheduler leadership and runs the fenced tick 30
+seconds after the slot. Vectors cannot choose a path, definition, clock,
+restart time or pause mechanics, must name every scene and boundary once, and
+every expected outcome is fixed per scene and boundary.
+
+Every occurrence state update compiles the transition trigger's insert into
+the AUTOINCREMENT event feed, and SQLite's bookkeeping for that table seeds its
+counter the first time such a statement runs, even when it updates no row. A
+daemon's store has had that counter since its first event. The worker's fresh
+store would commit it in the tick's stale-claim recovery, ahead of the plan,
+so the worker seeds it first with an update that matches no row. A unit test
+pins the tick's three commits, and the extra one without the seed.
+
+- **After plan, after cursor, after claim:** a fixture TEMP trigger pauses the
+  worker after the occurrence insert, the cursor update, or the occurrence's
+  `planned` to `claimed` update, inside that write's transaction.
+- **After plan commit, after cursor commit, after claim commit:** the tick
+  connection's WAL hook pauses it once SQLite has committed the first, second
+  or third transaction.
+- **Control:** no pause. The worker ticks and exits without the graceful
+  shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the previous commit left:
+nothing until the plan commits, then the slot `planned` with the cursor
+unmoved, then the cursor advanced, then the slot `claimed`. The parent then
+kills and reaps the worker. The store's raw integrity check must pass, and the
+store must hold what the parent read while the worker was paused.
+
+The parent restarts in the daemon's startup order, as the run-launch suite
+does, in one of two scenes:
+
+- **Before the next slot,** a minute after this one: this slot must launch
+  exactly once. The startup pass plans it if nothing was committed and claims
+  it if it was planned. A committed claim with no run is restored to `planned`
+  and claimed again, so it has been claimed twice.
+- **After the next slot,** a minute after it: under the `latest` misfire
+  policy, the next day's slot must launch exactly once and the missed slot
+  never. A missed slot that was planned is `skipped` with "superseded by latest
+  misfire policy". A restored claim is superseded the same way, claimed once
+  and never by the restarted scheduler. Nothing is planned for a slot the
+  worker never committed.
+
+The launched session then ends with exit code 0, and a pass settles its run
+`succeeded`. Every case ends with one launch, one run, one attempt and one
+session, and no stop. A store that recovery refuses fails the case. A further
+pass must change no occurrence, run, attempt, event, session or stop-fence row.
+
+The slot class reads each slot's one `scheduled` occurrence with its lease,
+scheduler generation, claim count, reason, run, first attempt and session. A
+torn launch, a claim under another lease or generation, or any occurrence,
+run, attempt or session outside the two slots makes the store mixed.
+
+Observations carry scene, boundary, slot classes, cursor revisions, counts and
+booleans. They never carry occurrence, run, attempt or session ids, paths,
+handshakes or output. This is `audit_only` evidence for a daemon killed while
+its scheduler tick plans and claims one daily slot of one routine. It does not
+cover a tick over many routines or several pages of the planning cursor, other
+misfire policies or recurrences, a definition revised between the kill and the
+restart, kills during stale-claim recovery, lease recovery or misfire
+supersession that have work to do, the launch itself (see
+`run-launch-process-crash-recovery`), manual occurrences (see
+`run-now-process-crash-recovery`), a graceful daemon restart (#1433), Runtime
+Authority runs, a real runtime process, power loss, load, complete profiles or
+release eligibility.
