@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 mod capacity;
 #[path = "doctor_failure_history.rs"]
 mod failure_history;
+#[path = "doctor_lease_partitions.rs"]
+mod lease_partitions;
 #[path = "doctor_planning.rs"]
 mod planning;
 #[path = "doctor_read.rs"]
@@ -27,8 +29,6 @@ mod running_runs;
 mod schema;
 #[path = "doctor_sequences.rs"]
 mod sequences;
-#[path = "doctor_stop_fences.rs"]
-mod stop_fences;
 
 pub const ACTION: &str = "coven.automations.doctor.v1";
 pub const SCHEMA: &str = "coven.automations.doctor.v1";
@@ -99,6 +99,7 @@ pub enum Fact {
     RunningRuns,
     RunningRunsWithEndedSessions,
     RunningRunsWithFailedLatestAttempt,
+    RunningRunsWithAmbiguousLatestAttempt,
     LeaseBearingOccurrences,
     ActiveLeaseOccurrences,
     ExpiredLeaseOccurrences,
@@ -111,6 +112,10 @@ pub enum Fact {
     ActiveStopFences,
     ExpiredStopFences,
     InvalidStopFenceExpiries,
+    PendingCancellations,
+    ActivePendingCancellations,
+    ExpiredPendingCancellations,
+    InvalidPendingCancellationExpiries,
     QuarantinedRoutines,
     FailedAttempts,
     RetryExhaustionHistories,
@@ -186,7 +191,8 @@ impl Fact {
             | Self::RecoveryRequiredOccurrences
             | Self::RunningRuns
             | Self::RunningRunsWithEndedSessions
-            | Self::RunningRunsWithFailedLatestAttempt => Category::Queue,
+            | Self::RunningRunsWithFailedLatestAttempt
+            | Self::RunningRunsWithAmbiguousLatestAttempt => Category::Queue,
             Self::LeaseBearingOccurrences
             | Self::ActiveLeaseOccurrences
             | Self::ExpiredLeaseOccurrences
@@ -198,7 +204,11 @@ impl Fact {
             | Self::StopFences
             | Self::ActiveStopFences
             | Self::ExpiredStopFences
-            | Self::InvalidStopFenceExpiries => Category::LeasesFences,
+            | Self::InvalidStopFenceExpiries
+            | Self::PendingCancellations
+            | Self::ActivePendingCancellations
+            | Self::ExpiredPendingCancellations
+            | Self::InvalidPendingCancellationExpiries => Category::LeasesFences,
             Self::QuarantinedRoutines
             | Self::FailedAttempts
             | Self::RetryExhaustionHistories
@@ -271,6 +281,7 @@ pub enum Gap {
     LeaseStoreUnavailable,
     LeaseStateUnavailable,
     StopFenceStoreUnavailable,
+    CancellationStoreUnavailable,
     RunningRunStoreUnavailable,
     LagHistoryNotMeasured,
     OccurrencePlanningStoreUnavailable,
@@ -740,7 +751,9 @@ impl Report {
             } else if core.category == Category::RepeatedFailures {
                 failure_history::validate_and_strip(&mut core)?;
             } else if core.category == Category::LeasesFences {
-                stop_fences::validate_and_strip(&mut core)?;
+                // Appended after the stop fences, so stripped before them.
+                lease_partitions::PENDING_CANCELLATIONS.validate_and_strip(&mut core)?;
+                lease_partitions::STOP_FENCES.validate_and_strip(&mut core)?;
             } else if core.category == Category::Queue {
                 running_runs::validate_and_strip(&mut core)?;
             }
@@ -2772,14 +2785,17 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
             .expect("failure category is constructed above"),
         failure_history_measurement,
     );
-    let stop_fence_measurement = stop_fences::inspect(&transaction, now)?;
-    stop_fences::append(
-        observations
-            .iter_mut()
-            .find(|value| value.category == Category::LeasesFences)
-            .expect("lease category is constructed above"),
-        stop_fence_measurement,
-    );
+    let leases = observations
+        .iter()
+        .position(|value| value.category == Category::LeasesFences)
+        .expect("lease category is constructed above");
+    for partition in [
+        &lease_partitions::STOP_FENCES,
+        &lease_partitions::PENDING_CANCELLATIONS,
+    ] {
+        let measurement = partition.inspect(&transaction, now)?;
+        partition.append(&mut observations[leases], measurement);
+    }
     let running_run_measurement = running_runs::inspect(&transaction)?;
     running_runs::append(
         observations

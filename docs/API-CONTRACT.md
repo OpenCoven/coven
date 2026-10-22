@@ -613,20 +613,27 @@ all return paths and never raises a stricter caller limit. Older reports with
 `active_stop_fences`, `expired_stop_fences` and `invalid_stop_fence_expiries`.
 Only each fence's bounded text lease timestamp is read from the main table. A
 missing table or lease column, or a view in the table's place, reports
-`stop_fence_store_unavailable` as the last lease gap and omits all four counts.
-Otherwise all four are required, and the three lease counts must sum to a
-total within the safe-integer range.
+`stop_fence_store_unavailable` after the occurrence lease gaps and omits all
+four counts. Otherwise all four are required, and the three lease counts must
+sum to a total within the safe-integer range. Owner cancellations still
+`requested` or `stopping` are counted by their own lease the same way:
+`pending_cancellations`, `active_pending_cancellations`,
+`expired_pending_cancellations` and `invalid_pending_cancellation_expiries`,
+with `cancellation_store_unavailable` as the last lease gap when the main
+`automation_cancellations` table or its `state` or lease column cannot be read.
 
 `queue` also counts runs that settlement has not finished: `running_runs`,
 `running_runs_with_ended_sessions` (the session is `completed`, `failed`,
-`cancelled`, `killed` or `idle`) and `running_runs_with_failed_latest_attempt`
+`cancelled`, `killed` or `idle`), `running_runs_with_failed_latest_attempt`
 (no authority profile, and the latest attempt is `failed`; this is stored
-state, not retry eligibility). The subsets overlap, neither may exceed the
-total, and the failed-attempt subset may not exceed `failed_attempts` in
-`repeated_failures` when both are present. A missing table or required column
-among `automation_runs`, `sessions` and `automation_attempts`, or a view in a
-table's place, reports `running_run_store_unavailable` as the last queue gap
-and omits all three counts. Otherwise all three are required.
+state, not retry eligibility) and `running_runs_with_ambiguous_latest_attempt`
+(the latest attempt is `ambiguous`). No subset may exceed the total, the
+failed and ambiguous subsets are disjoint, and the failed-attempt subset may
+not exceed `failed_attempts` in `repeated_failures` when both are present. A
+missing table or required column among `automation_runs`, `sessions` and
+`automation_attempts`, or a view in a table's place, reports
+`running_run_store_unavailable` as the last queue gap and omits all four
+counts. Otherwise all four are required.
 
 This initial diagnostic contract explicitly reports incomplete evidence. It has
 no aggregate health or certification bit. See the [doctor runbook](reference/automations-doctor.md)

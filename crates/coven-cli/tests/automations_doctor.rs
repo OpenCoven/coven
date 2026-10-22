@@ -218,6 +218,18 @@ fn doctor_report_fixture(genuine_receipt: bool) -> anyhow::Result<()> {
         assert_eq!(facts("queue")["running_runs"], 0);
         assert_eq!(facts("queue")["running_runs_with_ended_sessions"], 0);
         assert_eq!(facts("queue")["running_runs_with_failed_latest_attempt"], 0);
+        assert_eq!(
+            facts("queue")["running_runs_with_ambiguous_latest_attempt"],
+            0
+        );
+        for fact in [
+            "pending_cancellations",
+            "active_pending_cancellations",
+            "expired_pending_cancellations",
+            "invalid_pending_cancellation_expiries",
+        ] {
+            assert_eq!(facts("leases_fences")[fact], 0, "{fact}");
+        }
         let delivery = report["observations"]
             .as_array()
             .unwrap()
