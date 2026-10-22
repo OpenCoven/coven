@@ -84,7 +84,9 @@ from being claimed. Follow one with
 `coven automations occurrence <id>`, `coven automations run <id>` or
 `coven automations leases --automation-id <id>`. The codes and next steps are
 listed in the [API contract](../API-CONTRACT.md#automations-explanation).
-Retry timing is tracked by #1518. Principal-scoped reads and the
+A retry waiting for its `notBefore`, or past its deadline, is named with its
+times. Expired leases and attempts held for an operator retry are tracked by
+#1518. Principal-scoped reads and the
 remaining operator surface are still tracked by #858.
 
 ## Color

@@ -1400,6 +1400,35 @@ fn temporary_tables_cannot_add_or_hide_work() {
             .collect::<Vec<_>>(),
         ["running_run", "eligible_now", "due_unplanned"]
     );
+    // A waiting retry is read from runs, attempts and occurrences.
+    insert_definition_at(
+        &conn,
+        &definition("waiting", "ACTIVE"),
+        "2026-10-01T00:00:00.000Z",
+    )
+    .unwrap();
+    occurrence(&conn, "o-waiting", "waiting", 21, "planned");
+    run(&conn, "r-waiting", "o-waiting", "running");
+    adopted_attempt(&conn, "r-waiting", "2026-10-22T11:00:00.000Z");
+    let waiting = work_of(&conn, "waiting");
+    assert_eq!(waiting[0]["code"], "retry_waiting");
+    insert_definition_at(
+        &conn,
+        &definition("expired-claim", "ACTIVE"),
+        "2026-10-01T00:00:00.000Z",
+    )
+    .unwrap();
+    occurrence(&conn, "o-expired-claim", "expired-claim", 21, "claimed");
+    run(&conn, "r-expired-claim", "o-expired-claim", "running");
+    conn.execute(
+        "UPDATE automation_runs SET timeout_at = '2026-10-22T09:45:00.000Z'
+         WHERE id = 'r-expired-claim'",
+        [],
+    )
+    .unwrap();
+    adopted_attempt(&conn, "r-expired-claim", "2026-10-22T09:30:00.000Z");
+    let expired_claim = work_of(&conn, "expired-claim");
+    assert_eq!(expired_claim[0]["code"], "retry_expired");
     // Recovery's refusals are read from three more tables.
     occurrence(&conn, "o-cancelling", "daily", 16, "recovery_required");
     run(&conn, "r-cancelling", "o-cancelling", "running");
@@ -1441,4 +1470,429 @@ fn temporary_tables_cannot_add_or_hide_work() {
     .unwrap();
     assert_eq!(work_of(&conn, "daily"), expected);
     assert_eq!(work_of(&conn, "retrying"), retrying);
+    assert_eq!(work_of(&conn, "waiting"), waiting);
+    assert_eq!(work_of(&conn, "expired-claim"), expired_claim);
+}
+
+#[test]
+fn each_retry_item_names_what_the_next_passes_do_with_it() {
+    let (_temp, conn) = store();
+    let at = |hour: u32, minute: u32| Utc.with_ymd_and_hms(2026, 10, 22, hour, minute, 0).unwrap();
+    let time = |hour: u32, minute: u32| format!("2026-10-22T{hour:02}:{minute:02}:00.000Z");
+    // (routine, not_before, deadline)
+    let shapes = [
+        ("waiting", time(11, 0), Some(time(12, 0))),
+        ("waiting-no-deadline", time(11, 0), None),
+        ("expires-first", time(11, 0), Some(time(10, 30))),
+        ("expired", time(9, 30), Some(time(9, 45))),
+        ("expired-waiting", time(11, 0), Some(time(9, 45))),
+        ("ready", time(9, 30), Some(time(12, 0))),
+        ("with-session", time(11, 0), Some(time(9, 45))),
+        ("paused-waiting", time(11, 0), Some(time(12, 0))),
+        ("quarantined-waiting", time(11, 0), Some(time(12, 0))),
+        // Its run retries the occurrence of `foreign-owner`.
+        ("foreign", time(9, 30), Some(time(9, 45))),
+    ];
+    for id in shapes.iter().map(|(id, _, _)| *id).chain(["foreign-owner"]) {
+        insert_definition_at(&conn, &definition(id, "ACTIVE"), "2026-10-01T00:00:00.000Z").unwrap();
+    }
+    crate::automations::occurrences::tick_planning(&conn, now() - chrono::Duration::days(1))
+        .unwrap();
+    let mut retried = std::collections::HashMap::new();
+    for (id, not_before, deadline) in &shapes {
+        let owner = if *id == "foreign" {
+            "foreign-owner"
+        } else {
+            id
+        };
+        let occurrence = planned_occurrence(&conn, owner);
+        let run = format!("r-{id}");
+        run_keyed(&conn, &run, id, Some(&occurrence), "running", false);
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run, deadline],
+        )
+        .unwrap();
+        adopted_attempt(&conn, &run, not_before);
+        retried.insert(*id, occurrence);
+    }
+    session(&conn, "PRIVATE-SESSION", "running");
+    conn.execute_batch(
+        "UPDATE automation_runs SET session_id = 'PRIVATE-SESSION' WHERE id = 'r-with-session';
+         UPDATE automation_definitions SET status = 'PAUSED' WHERE id = 'paused-waiting';",
+    )
+    .unwrap();
+    quarantine(&conn, "quarantined-waiting");
+
+    let retry_items: Vec<_> = shapes
+        .iter()
+        .map(|(id, _, _)| {
+            let item = found(&conn, id)
+                .work
+                .into_iter()
+                .find(|item| item.run_id.as_deref() == Some(format!("r-{id}").as_str()))
+                .unwrap();
+            assert!(item.holds_claims, "{id}");
+            (
+                *id,
+                item.code,
+                item.next_step,
+                item.not_before,
+                item.deadline_at,
+            )
+        })
+        .collect();
+    let waiting = |deadline: Option<String>| {
+        (
+            WorkCode::RetryWaiting,
+            NextStep::AwaitRetry,
+            Some(time(11, 0)),
+            deadline,
+        )
+    };
+    let expired = (
+        WorkCode::RetryExpired,
+        NextStep::AwaitSettlement,
+        None,
+        Some(time(9, 45)),
+    );
+    let running = (WorkCode::RunningRun, NextStep::InspectRun, None, None);
+    let expected = [
+        ("waiting", waiting(Some(time(12, 0)))),
+        ("waiting-no-deadline", waiting(None)),
+        ("expires-first", waiting(Some(time(10, 30)))),
+        ("expired", expired.clone()),
+        ("expired-waiting", expired.clone()),
+        ("ready", running.clone()),
+        ("with-session", running),
+        ("paused-waiting", waiting(Some(time(12, 0)))),
+        ("quarantined-waiting", waiting(Some(time(12, 0)))),
+        ("foreign", expired),
+    ]
+    .map(|(id, (code, step, not_before, deadline))| (id, code, step, not_before, deadline));
+    assert_eq!(retry_items, expected);
+
+    // The daemon's own steps, in its order: reconciliation settles expired
+    // retries, then the scheduler pass plans, supersedes and claims.
+    let status = |run: &str| -> String {
+        conn.query_row(
+            "SELECT status FROM automation_runs WHERE id = ?1",
+            [run],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let pass = |instant: DateTime<Utc>| {
+        crate::automations::runner::enforce_run_timeouts(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            instant,
+        )
+        .unwrap();
+        crate::automations::runner::settle_finished_runs(&conn, instant).unwrap();
+        let mut claimed = crate::automations::occurrences::tick(&conn, instant)
+            .unwrap()
+            .claimed;
+        claimed.sort();
+        claimed
+    };
+    let today = |id: &str| format!("{id}-{}", at(9, 0).timestamp_millis());
+    let code_at = |id: &str, instant: DateTime<Utc>| {
+        let Lookup::Found(explanation) = explain(&conn, id, instant).unwrap() else {
+            panic!("{id} not found");
+        };
+        explanation
+            .work
+            .into_iter()
+            .find(|item| item.run_id.as_deref() == Some(format!("r-{id}").as_str()))
+            .map(|item| item.code)
+    };
+    // An expired retry is settled before claiming, which releases its hold.
+    // Settling `foreign` fails the occurrence of `foreign-owner` it retried.
+    let mut expected = vec![
+        retried["ready"].clone(),
+        today("expired"),
+        today("expired-waiting"),
+        today("foreign"),
+        today("foreign-owner"),
+    ];
+    expected.sort();
+    assert_eq!(pass(at(10, 0)), expected);
+    for (id, _, _) in &shapes {
+        let settled = matches!(*id, "expired" | "expired-waiting" | "foreign");
+        assert_eq!(
+            status(&format!("r-{id}")),
+            if settled { "failed" } else { "running" },
+            "{id}"
+        );
+    }
+    // A deadline before `notBefore` settles the retry instead.
+    assert_eq!(pass(at(10, 30)), [today("expires-first")]);
+    assert_eq!(status("r-expires-first"), "failed");
+    // At `notBefore` the queue claims a waiting retry, even for a paused
+    // routine, but never for a quarantined one.
+    assert_eq!(code_at("waiting", at(11, 0)), Some(WorkCode::RunningRun));
+    let mut expected = vec![
+        retried["waiting"].clone(),
+        retried["waiting-no-deadline"].clone(),
+        retried["paused-waiting"].clone(),
+    ];
+    expected.sort();
+    assert_eq!(pass(at(11, 0)), expected);
+    assert_eq!(status("r-quarantined-waiting"), "running");
+    // Ready but quarantined, it stays out of the queue until its deadline.
+    assert_eq!(
+        code_at("quarantined-waiting", at(11, 59)),
+        Some(WorkCode::RunningRun)
+    );
+    assert_eq!(
+        code_at("quarantined-waiting", at(12, 0)),
+        Some(WorkCode::RetryExpired)
+    );
+    pass(at(12, 0));
+    assert_eq!(status("r-quarantined-waiting"), "failed");
+}
+
+/// What reconciliation's `enforce_run_timeouts` does with a retry's run.
+#[derive(Debug, PartialEq)]
+enum Reconciled {
+    Settled,
+    Untouched,
+    FailsThePass,
+}
+
+/// (shape, occurrence state, run deadline, attempts as (state, not_before),
+/// code, notBefore, deadlineAt, what reconciliation does)
+type RetryShape<'a> = (
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    &'a [(&'a str, &'a str)],
+    WorkCode,
+    Option<&'a str>,
+    Option<&'a str>,
+    Reconciled,
+);
+
+#[test]
+fn retry_timing_is_read_only_as_reconciliation_and_the_queue_read_it() {
+    use Reconciled::*;
+    let (deadline, waiting) = ("2026-10-22T09:45:00.000Z", "2026-10-22T11:00:00.000Z");
+    let shapes: [RetryShape<'_>; 13] = [
+        // Reconciliation reads the whole stored deadline and any RFC 3339 form.
+        (
+            "overlong",
+            "planned",
+            Some("2026-10-22T09:45:00.0000000000000000000000000000000000000000000000000Z"),
+            &[("adopted", waiting)],
+            WorkCode::RetryExpired,
+            None,
+            Some(deadline),
+            Settled,
+        ),
+        (
+            "offset",
+            "planned",
+            Some("2026-10-22T11:45:00+02:00"),
+            &[("adopted", waiting)],
+            WorkCode::RetryExpired,
+            None,
+            Some(deadline),
+            Settled,
+        ),
+        // It also settles a claimed occurrence's retry.
+        (
+            "claimed",
+            "claimed",
+            Some(deadline),
+            &[("adopted", "2026-10-22T09:30:00.000Z")],
+            WorkCode::RetryExpired,
+            None,
+            Some(deadline),
+            Settled,
+        ),
+        // A deadline it cannot parse, or a retry whose occurrence it cannot
+        // settle, fails every pass.
+        (
+            "unreadable",
+            "planned",
+            Some("PRIVATE"),
+            &[("adopted", waiting)],
+            WorkCode::RunningRun,
+            None,
+            None,
+            FailsThePass,
+        ),
+        (
+            "settled",
+            "failed",
+            Some(deadline),
+            &[("adopted", waiting)],
+            WorkCode::RunningRun,
+            None,
+            None,
+            FailsThePass,
+        ),
+        (
+            "running",
+            "running",
+            Some(deadline),
+            &[("adopted", waiting)],
+            WorkCode::InFlight,
+            None,
+            None,
+            FailsThePass,
+        ),
+        // It settles only an adopted attempt's run.
+        (
+            "dispatching",
+            "planned",
+            Some(deadline),
+            &[("dispatching", waiting)],
+            WorkCode::RunningRun,
+            None,
+            None,
+            Untouched,
+        ),
+        (
+            "claimed-dispatching",
+            "claimed",
+            Some(deadline),
+            &[("dispatching", waiting)],
+            WorkCode::InFlight,
+            None,
+            None,
+            Untouched,
+        ),
+        // Nor a run with a session.
+        (
+            "claimed-session",
+            "claimed",
+            Some(deadline),
+            &[("adopted", "2026-10-22T09:30:00.000Z")],
+            WorkCode::InFlight,
+            None,
+            None,
+            Untouched,
+        ),
+        // Only an adopted attempt's `notBefore` keeps its retry waiting.
+        (
+            "ready",
+            "planned",
+            Some("2026-10-22T12:00:00.000Z"),
+            &[("failed", waiting), ("adopted", "2026-10-22T09:30:00.000Z")],
+            WorkCode::RunningRun,
+            None,
+            None,
+            Untouched,
+        ),
+        // The queue reads this deadline, as text, as passed; reconciliation
+        // settles it at 11:30.
+        (
+            "offset-open",
+            "planned",
+            Some("2026-10-22T09:30:00-02:00"),
+            &[("adopted", waiting)],
+            WorkCode::RunningRun,
+            None,
+            None,
+            Untouched,
+        ),
+        // The queue compares `notBefore` as stored text, so a time stored in
+        // any other form is not shown.
+        (
+            "offset-not-before",
+            "planned",
+            Some("2026-10-22T12:00:00.000Z"),
+            &[("adopted", "2026-10-22T13:00:00+02:00")],
+            WorkCode::RetryWaiting,
+            None,
+            Some("2026-10-22T12:00:00.000Z"),
+            Untouched,
+        ),
+        (
+            "unreadable-not-before",
+            "planned",
+            Some("2026-10-22T12:00:00.000Z"),
+            &[("adopted", "PRIVATE")],
+            WorkCode::RetryWaiting,
+            None,
+            Some("2026-10-22T12:00:00.000Z"),
+            Untouched,
+        ),
+    ];
+    for (shape, state, timeout, attempts, code, not_before, deadline_at, reconciled) in shapes {
+        let (_temp, conn) = store();
+        insert_definition_at(
+            &conn,
+            &definition("daily", "ACTIVE"),
+            "2026-10-01T00:00:00.000Z",
+        )
+        .unwrap();
+        fence_due_slot(&conn, "daily");
+        occurrence(&conn, "o-retry", "daily", 21, state);
+        run_keyed(&conn, "r-retry", "daily", Some("o-retry"), "running", false);
+        if shape == "claimed-session" {
+            session(&conn, "PRIVATE-SESSION", "running");
+            conn.execute(
+                "UPDATE automation_runs SET session_id = 'PRIVATE-SESSION' WHERE id = 'r-retry'",
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?1 WHERE id = 'r-retry'",
+            [timeout],
+        )
+        .unwrap();
+        for (index, (attempt_state, attempt_not_before)) in attempts.iter().enumerate() {
+            let number = i64::try_from(index).unwrap() + 1;
+            conn.execute(
+                "INSERT INTO automation_attempts
+                    (id, run_id, occurrence_id, attempt_number, adoption_key,
+                     occurrence_fence_generation, state, prior_attempt_number,
+                     prior_disposition, retry_classification, not_before, opened_at)
+                 VALUES ('a-' || ?1, 'r-retry', 'o-retry', ?1, 'key-' || ?1, 1, ?2,
+                         CASE WHEN ?1 > 1 THEN ?1 - 1 END,
+                         CASE WHEN ?1 > 1 THEN 'failed' END,
+                         CASE WHEN ?1 > 1 THEN 'automatic_retry' ELSE 'initial' END,
+                         ?3, '2026-10-21T09:00:00.000Z')",
+                rusqlite::params![number, attempt_state, attempt_not_before],
+            )
+            .unwrap();
+        }
+        let item = found(&conn, "daily")
+            .work
+            .into_iter()
+            .find(|item| item.run_id.as_deref() == Some("r-retry"))
+            .unwrap();
+        assert_eq!(
+            (
+                item.code,
+                item.not_before.as_deref(),
+                item.deadline_at.as_deref()
+            ),
+            (code, not_before, deadline_at),
+            "{shape}"
+        );
+        let outcome = crate::automations::runner::enforce_run_timeouts(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            now(),
+        );
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM automation_runs WHERE id = 'r-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let actual = match (outcome, status.as_str()) {
+            (Err(_), _) => FailsThePass,
+            (Ok(_), "failed") => Settled,
+            (Ok(_), "running") => Untouched,
+            (Ok(_), other) => panic!("{shape}: run became {other}"),
+        };
+        assert_eq!(actual, reconciled, "{shape}");
+    }
 }

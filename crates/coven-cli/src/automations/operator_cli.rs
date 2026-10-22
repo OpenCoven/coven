@@ -288,6 +288,10 @@ struct WorkItem {
     run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deadline_at: Option<String>,
     holds_claims: bool,
     next_step: String,
 }
@@ -450,6 +454,24 @@ mod tests {
         }))
         .unwrap();
         crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        // A retry waiting until far beyond the real clock this test reads.
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('o-retry', 'daily', '2026-10-21T09:00:00.000Z', 'planned', 1,
+                     '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at, timeout_at)
+             VALUES ('r-retry', 'daily', 'o-retry', 'coven-code', 'running',
+                     '2026-10-21T09:00:00.000Z', '2099-01-01T01:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 opened_at)
+             VALUES ('a-retry', 'r-retry', 'o-retry', 1, 'r-retry-key', 1, 'adopted',
+                     'initial', '2099-01-01T00:00:00.000Z', '2026-10-21T09:00:00.000Z');",
+        )
+        .unwrap();
         let view = View::Explain("daily");
         let (status, result) = crate::control_plane::route_action(
             view.request().unwrap(),
@@ -465,7 +487,15 @@ mod tests {
             output["explanation"]["conditions"],
             json!([{"code": "not_active", "nextStep": "activate_if_intended"}])
         );
-        assert_eq!(output["explanation"]["work"], json!([]));
+        assert_eq!(
+            output["explanation"]["work"],
+            json!([{
+                "code": "retry_waiting", "occurrenceId": "o-retry", "runId": "r-retry",
+                "at": "2026-10-21T09:00:00.000Z", "notBefore": "2099-01-01T00:00:00.000Z",
+                "deadlineAt": "2099-01-01T01:00:00.000Z", "holdsClaims": true,
+                "nextStep": "await_retry"
+            }])
+        );
         assert_eq!(output["explanation"]["workTruncated"], false);
         assert!(!output.to_string().contains("private sentinel"));
         for (path, value) in [
