@@ -252,6 +252,10 @@ where
         self
     }
 
+    pub(crate) fn start_signal(&self, controls: RunControls) -> RunSignal {
+        RunSignal::new(controls, Arc::clone(&self.clock))
+    }
+
     /// Allows at most `limit` delegated children of the same parent
     /// invocation to run on this runner at once. A delegation beyond the
     /// limit is refused before its target runs. Unlimited by default.
@@ -282,7 +286,7 @@ where
         }))
     }
 
-    fn registered_agent_ref(&self, id: &AgentId) -> Option<AgentRef> {
+    pub(crate) fn registered_agent_ref(&self, id: &AgentId) -> Option<AgentRef> {
         self.agents
             .get(id)
             .map(|agent| agent.agent_ref().expect("runner validates agent refs"))

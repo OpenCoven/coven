@@ -11,6 +11,7 @@
 
 use std::{
     collections::BTreeSet,
+    future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -21,8 +22,9 @@ use thiserror::Error;
 
 use crate::{
     agent_loop::invocation_failure_kind, invocation_request_digest, BoxError, ContentDigest,
-    InvocationAttempt, InvocationId, InvocationJournal, InvocationRecord, InvocationRequest,
-    InvocationState, RunControls, RunError, RunFailure, RunOptions, RunResult, Runner,
+    ContextResolver, DelegationDigests, InvocationAttempt, InvocationId, InvocationJournal,
+    InvocationRecord, InvocationRequest, InvocationSource, InvocationState, PreparedDelegation,
+    RunControls, RunError, RunFailure, RunOptions, RunResult, Runner,
 };
 
 /// Attempt sequence shared by every runner in this process, so attempt ids
@@ -133,6 +135,20 @@ pub enum DurableInvocationError {
     },
 }
 
+impl DurableInvocationError {
+    /// Whether the journal cannot establish a settled child outcome. Hosts
+    /// must propagate this uncertainty instead of treating it as a safe retry.
+    pub fn leaves_unknown_effect(&self) -> bool {
+        matches!(
+            self,
+            Self::ActiveInFlight { .. }
+                | Self::RecoveryRequired { .. }
+                | Self::AdoptionUnknown { .. }
+                | Self::SettlementFailed { .. }
+        )
+    }
+}
+
 /// Runs invocations through `runner` with their lifecycle in `journal`.
 pub struct DurableInvocationRunner<C>
 where
@@ -197,15 +213,102 @@ where
         options: RunOptions,
         controls: RunControls,
     ) -> Result<DurableInvocation, DurableInvocationError> {
+        let input = input.into();
+        let digest = invocation_request_digest(&request, &input, &options);
+        self.run_journaled(
+            &request,
+            digest,
+            None,
+            self.runner.run_invocation_controlled(
+                request.clone(),
+                input,
+                context,
+                options,
+                controls,
+            ),
+        )
+        .await
+    }
+
+    /// Journals one prepared child under its existing parent identity before
+    /// resolving context or dispatching the target. The existing delegation
+    /// boundary enforces authority, context, result bounds and child controls.
+    /// This does not schedule, retry or reconcile the parent or child.
+    pub async fn run_delegation(
+        &self,
+        delegation: PreparedDelegation,
+        resolver: &dyn ContextResolver<C>,
+        context: &C,
+        controls: RunControls,
+    ) -> Result<DurableInvocation, DurableInvocationError> {
+        let spec = delegation.spec();
+        let timeout = match (controls.timeout(), spec.budget.timeout()) {
+            (Some(parent), Some(child)) => Some(parent.min(child)),
+            (parent, child) => parent.or(child),
+        };
+        let controls = match timeout {
+            Some(timeout) => controls.with_timeout(timeout),
+            None => controls,
+        };
+        // Start the inherited bound before journal I/O. Starting it only at
+        // target dispatch would give the child back time spent adopting it.
+        let signal = self.runner.start_signal(controls);
+        let target = match spec.target.revision() {
+            Some(_) => spec.target.clone(),
+            None => self
+                .runner
+                .registered_agent_ref(spec.target.id())
+                .unwrap_or_else(|| spec.target.clone()),
+        };
+        let request = InvocationRequest::new(
+            delegation.invocation().clone(),
+            InvocationSource::Agent {
+                agent: delegation.source().clone(),
+            },
+            target,
+        );
+        let options = RunOptions {
+            max_turns: spec.budget.max_turns(),
+            max_handoffs: spec.budget.max_handoffs(),
+            session_id: None,
+        };
+        let digests = delegation.digests().clone();
+        // Domain separated from direct requests: the same id cannot bypass
+        // attenuation by being resubmitted through the direct entry point.
+        let digest = ContentDigest::of_bytes(
+            &serde_json::to_vec(&(
+                "coven.agent-delegated-invocation-request.v1",
+                invocation_request_digest(&request, spec.task.as_str(), &options),
+                &digests,
+            ))
+            .expect("delegation metadata always serializes"),
+        );
+        self.run_journaled(&request, digest, Some(digests), async {
+            self.runner
+                .run_delegation_controlled(delegation, resolver, context, signal.child_controls())
+                .await
+                .map(|result| result.run)
+                .map_err(|failure| *failure.failure)
+        })
+        .await
+    }
+
+    async fn run_journaled(
+        &self,
+        request: &InvocationRequest,
+        digest: ContentDigest,
+        delegation: Option<DelegationDigests>,
+        execute: impl Future<Output = Result<RunResult, RunFailure>>,
+    ) -> Result<DurableInvocation, DurableInvocationError> {
         if self.process_instance_id.trim().is_empty() {
             return Err(DurableInvocationError::InvalidProcessInstanceId);
         }
-        let input = input.into();
         let invocation = request.invocation.id;
-        let digest = invocation_request_digest(&request, &input, &options);
 
         let (running, active) = loop {
-            let record = self.reserve_or_load(&request, &digest).await?;
+            let record = self
+                .reserve_or_load(request, &digest, delegation.as_ref())
+                .await?;
             if record.request_digest != digest {
                 return Err(DurableInvocationError::Conflict {
                     invocation,
@@ -261,10 +364,7 @@ where
             }
         };
 
-        let outcome = self
-            .runner
-            .run_invocation_controlled(request, input, context, options, controls)
-            .await;
+        let outcome = execute.await;
 
         let settled = InvocationRecord {
             state: settled_state(&outcome),
@@ -299,6 +399,7 @@ where
         &self,
         request: &InvocationRequest,
         digest: &ContentDigest,
+        delegation: Option<&DelegationDigests>,
     ) -> Result<InvocationRecord, DurableInvocationError> {
         let invocation = request.invocation.id;
         loop {
@@ -316,6 +417,7 @@ where
                 source: request.source.clone(),
                 requested_target: request.requested_target.clone(),
                 request_digest: digest.clone(),
+                delegation: delegation.cloned(),
                 state: InvocationState::Reserved {},
                 attempt: None,
             };

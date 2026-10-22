@@ -85,6 +85,7 @@ enum Behavior {
     CancelThenFail(CancellationToken),
     /// Fails with a delegated child whose termination is unknown.
     ReportUnknownChild,
+    ReportDurableUnknownChild,
 }
 
 struct WorkTool {
@@ -130,6 +131,12 @@ impl Tool<()> for WorkTool {
             Behavior::CancelThenFail(cancellation) => {
                 cancellation.cancel();
                 Err(Box::new(io::Error::other("connection reset")))
+            }
+            Behavior::ReportDurableUnknownChild => {
+                Err(Box::new(DurableInvocationError::AdoptionUnknown {
+                    invocation: InvocationId::new(),
+                    source: Box::new(io::Error::other("lost adoption receipt")),
+                }))
             }
             Behavior::ReportUnknownChild => Err(Box::new(RunError::TerminationUnknown {
                 agent: AgentId::from("child"),
@@ -828,6 +835,7 @@ fn the_request_digest_covers_identity_target_input_and_options() {
 #[test]
 fn the_record_has_a_closed_snake_case_wire_shape() {
     let record = InvocationRecord {
+        delegation: None,
         invocation: InvocationContext::root(
             "11111111-1111-4111-8111-111111111111".parse().unwrap(),
         ),
@@ -882,4 +890,297 @@ fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     files
+}
+
+struct NoContext;
+
+#[async_trait]
+impl coven_agents::ContextResolver<()> for NoContext {
+    async fn resolve(
+        &self,
+        _: &coven_agents::ContextRef,
+        _: &(),
+    ) -> Result<Vec<coven_agents::RunItem>, BoxError> {
+        panic!("empty manifest must not resolve context")
+    }
+}
+
+fn child() -> coven_agents::PreparedDelegation {
+    child_with_work(true)
+}
+
+fn child_with_work(allow: bool) -> coven_agents::PreparedDelegation {
+    use coven_agents::{
+        AuthorityScope, ContextManifest, DelegationBudget, DelegationGrant, DelegationSpec,
+        PreparedDelegation, ProjectRef, ResultContract, TaskInput,
+    };
+    let authority = AuthorityScope::new(ProjectRef::new("project").unwrap());
+    let authority = if allow {
+        authority.with_tool("work").unwrap()
+    } else {
+        authority
+    };
+    let grant = DelegationGrant {
+        invocation: InvocationContext::root(InvocationId::new()),
+        agent: AgentRef::new("parent").unwrap(),
+        authority: authority.clone().with_delegation(),
+        context: ContextManifest::default(),
+        budget: DelegationBudget::new(2, 0).unwrap(),
+    };
+    PreparedDelegation::prepare(
+        &grant,
+        DelegationSpec {
+            target: worker(),
+            task: TaskInput::new("PRIVATE_CHILD_TASK").unwrap(),
+            context: ContextManifest::default(),
+            authority,
+            budget: DelegationBudget::new(2, 0).unwrap(),
+            result: ResultContract::new(64).unwrap(),
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn delegated_child_is_journaled_with_parent_and_digests_without_content() {
+    let delegation = child();
+    let identity = delegation.invocation().clone();
+    let digests = delegation.digests().clone();
+    let model = ScriptedModel::new([ModelResponse::final_output("PRIVATE_CHILD_OUTPUT")]);
+    let runner = runner(model.clone(), None);
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Arc::new(FileInvocationJournal::new(dir.path()).unwrap());
+    let result = durable(&runner, journal.clone(), "process")
+        .run_delegation(delegation, &NoContext, &(), RunControls::default())
+        .await
+        .unwrap();
+    assert_eq!(result.record().invocation, identity);
+    assert_eq!(result.record().delegation.as_ref(), Some(&digests));
+    assert!(matches!(
+        result.record().state,
+        InvocationState::Completed { .. }
+    ));
+    drop(journal);
+    let reopened = FileInvocationJournal::new(dir.path()).unwrap();
+    assert_eq!(
+        reopened.load(identity.id).await.unwrap().as_ref(),
+        Some(result.record())
+    );
+    for path in walk(dir.path()) {
+        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+        assert!(!text.contains("PRIVATE_CHILD_TASK"));
+        assert!(!text.contains("PRIVATE_CHILD_OUTPUT"));
+    }
+    assert_eq!(model.calls(), 1);
+}
+
+#[tokio::test]
+async fn delegated_child_unknown_adoption_never_dispatches() {
+    let delegation = child();
+    let identity = delegation.invocation().clone();
+    let model = ScriptedModel::new([ModelResponse::final_output("done")]);
+    let runner = runner(model.clone(), None);
+    let journal = FaultyJournal::failing(ADOPTION, true);
+    let result = durable(&runner, journal.clone(), "process")
+        .run_delegation(delegation, &NoContext, &(), RunControls::default())
+        .await;
+    assert!(matches!(
+        result,
+        Err(DurableInvocationError::AdoptionUnknown { .. })
+    ));
+    let record = journal.load(identity.id).await.unwrap().unwrap();
+    assert_eq!(record.invocation, identity);
+    assert!(record.delegation.is_some());
+    assert_eq!(
+        durable(&runner, journal, "restart").disposition(&record),
+        InvocationDisposition::RecoveryRequired
+    );
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test]
+async fn dropped_delegated_child_keeps_parent_link_and_requires_recovery() {
+    let delegation = child();
+    let identity = delegation.invocation().clone();
+    let model = ScriptedModel::new(work_then_finish());
+    let tool = WorkTool::new(Behavior::Block(Arc::new(AtomicBool::new(false))));
+    let runner = runner(model.clone(), Some(tool.clone()));
+    let journal = Arc::new(InMemoryInvocationJournal::default());
+    let owner = durable(&runner, journal.clone(), "process");
+    {
+        let run = owner.run_delegation(delegation, &NoContext, &(), RunControls::default());
+        let mut run = std::pin::pin!(run);
+        assert!(poll_once(run.as_mut()).is_pending());
+        assert_eq!(tool.executions(), 1);
+        let running = journal.load(identity.id).await.unwrap().unwrap();
+        assert_eq!(owner.disposition(&running), InvocationDisposition::Running);
+    }
+    let record = journal.load(identity.id).await.unwrap().unwrap();
+    assert_eq!(record.invocation, identity);
+    assert!(record.delegation.is_some());
+    assert_eq!(
+        durable(&runner, journal, "restart").disposition(&record),
+        InvocationDisposition::RecoveryRequired
+    );
+    assert_eq!(tool.executions(), 1);
+    assert_eq!(model.calls(), 1);
+}
+
+#[tokio::test]
+async fn direct_submission_cannot_reuse_a_delegated_child_id() {
+    let delegation = child();
+    let request = InvocationRequest::new(
+        delegation.invocation().clone(),
+        InvocationSource::Agent {
+            agent: delegation.source().clone(),
+        },
+        worker(),
+    );
+    let input = delegation.spec().task.as_str().to_owned();
+    let model = ScriptedModel::new([ModelResponse::final_output("done")]);
+    let runner = runner(model.clone(), None);
+    let journal = Arc::new(InMemoryInvocationJournal::default());
+    let owner = durable(&runner, journal, "process");
+    owner
+        .run_delegation(delegation, &NoContext, &(), RunControls::default())
+        .await
+        .unwrap();
+    let result = owner
+        .run(
+            request,
+            input,
+            &(),
+            RunOptions {
+                max_turns: 2,
+                max_handoffs: 0,
+                session_id: None,
+            },
+            RunControls::default(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(DurableInvocationError::Conflict { .. })
+    ));
+    assert_eq!(model.calls(), 1);
+}
+
+#[tokio::test]
+async fn delegated_child_settlement_failure_keeps_uncertainty() {
+    let delegation = child();
+    let identity = delegation.invocation().clone();
+    let model = ScriptedModel::new([ModelResponse::final_output("done")]);
+    let runner = runner(model.clone(), None);
+    let journal = FaultyJournal::failing(SETTLEMENT, false);
+    let error = durable(&runner, journal.clone(), "process")
+        .run_delegation(delegation, &NoContext, &(), RunControls::default())
+        .await
+        .unwrap_err();
+    assert!(error.leaves_unknown_effect());
+    assert!(matches!(
+        error,
+        DurableInvocationError::SettlementFailed { .. }
+    ));
+    let record = journal.load(identity.id).await.unwrap().unwrap();
+    assert_eq!(record.invocation, identity);
+    assert_eq!(
+        durable(&runner, journal, "restart").disposition(&record),
+        InvocationDisposition::RecoveryRequired
+    );
+    assert_eq!(model.calls(), 1);
+}
+
+#[tokio::test]
+async fn durable_child_still_enforces_attenuated_tool_authority() {
+    let model = ScriptedModel::new(work_then_finish());
+    let tool = WorkTool::new(Behavior::Block(Arc::new(AtomicBool::new(true))));
+    let runner = runner(model.clone(), Some(tool.clone()));
+    let journal = Arc::new(InMemoryInvocationJournal::default());
+    let result = durable(&runner, journal, "process")
+        .run_delegation(
+            child_with_work(false),
+            &NoContext,
+            &(),
+            RunControls::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result.record().state,
+        InvocationState::Failed {
+            kind: InvocationFailureKind::Authority,
+            ..
+        }
+    ));
+    assert_eq!(tool.executions(), 0);
+    assert_eq!(model.calls(), 1);
+}
+
+#[tokio::test]
+async fn durable_child_ambiguity_propagates_to_parent() {
+    let model = ScriptedModel::new(work_then_finish());
+    let tool = WorkTool::new(Behavior::ReportDurableUnknownChild);
+    let runner = runner(model, Some(tool));
+    let journal = Arc::new(InMemoryInvocationJournal::default());
+    let result = submit(&durable(&runner, journal, "process"), &request(), "go").await;
+    assert!(matches!(
+        dispatched_state(result),
+        InvocationState::RecoveryRequired { .. }
+    ));
+}
+
+struct SlowAdoptionJournal {
+    inner: InMemoryInvocationJournal,
+    clock: Arc<coven_agents::ManualClock>,
+}
+
+#[async_trait]
+impl InvocationJournal for SlowAdoptionJournal {
+    async fn load(&self, id: InvocationId) -> Result<Option<InvocationRecord>, BoxError> {
+        self.inner.load(id).await
+    }
+    async fn list(&self) -> Result<Vec<InvocationRecord>, BoxError> {
+        self.inner.list().await
+    }
+    async fn compare_and_set(
+        &self,
+        id: InvocationId,
+        expected: Option<&InvocationRecord>,
+        next: &InvocationRecord,
+    ) -> Result<bool, BoxError> {
+        if matches!(next.state, InvocationState::Running {}) {
+            self.clock.advance(std::time::Duration::from_secs(1));
+        }
+        self.inner.compare_and_set(id, expected, next).await
+    }
+}
+
+#[tokio::test]
+async fn child_deadline_includes_time_spent_journaling() {
+    let clock = Arc::new(coven_agents::ManualClock::new());
+    let model = ScriptedModel::new([ModelResponse::final_output("too late")]);
+    let runner = Arc::new(
+        Runner::new([Agent::new("worker", "Worker", "work", model.clone())
+            .with_revision("rev-1".parse().unwrap())])
+        .unwrap()
+        .with_clock(clock.clone()),
+    );
+    let journal = Arc::new(SlowAdoptionJournal {
+        inner: InMemoryInvocationJournal::default(),
+        clock,
+    });
+    let result = durable(&runner, journal, "process")
+        .run_delegation(
+            child(),
+            &NoContext,
+            &(),
+            RunControls::new().with_timeout(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result.record().state,
+        InvocationState::Cancelled { turns: 0 }
+    ));
+    assert_eq!(model.calls(), 0);
 }
