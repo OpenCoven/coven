@@ -663,21 +663,28 @@ condition has a `code` and a `nextStep`, and some have `at` or
 | `not_active` | the stored `status` is not exactly `ACTIVE`, or the readable definition's own status is not `ACTIVE` | `activate_if_intended` |
 | `quarantined` | retry exhaustion quarantined the routine; `at` is the quarantine time and `failureClass` its class, each omitted unless canonical | `review_failure_then_unquarantine` |
 | `definition_unavailable` | the stored definition is unreadable or fails validation; or, with a stored `status` of `ACTIVE`, planning could not verify its revision: a missing or stale digest, a definition whose own `id` is not the routine's, or an unreadable creation or revision time | `revise_definition` |
+| `schedule_history_unreadable` | with a stored `ACTIVE` row and a verified revision, the latest slot recorded for the current revision is unreadable, so planning fails the routine whenever it reads that history | `revise_definition`; a new revision starts an empty history |
 | `next_slot` | none of the above holds; `at` is the schedule's first slot after `observedAt` | `none` |
 
-These are the predicates planning applies, read from the main schema in one
-statement. Every blocking condition that holds is listed in the order above,
-because each alone keeps planning from scheduling the routine. The revision
-checks apply only to a stored `ACTIVE` row, because planning reaches them only
-then. `next_slot`
-appears only when none holds. It states what the schedule produces next, not
-that a pass will plan or launch it: overlap and misfire policy, slots already
-due, and the scheduler's liveness are outside this read. Prompts, quarantine
+These are the predicates planning applies, read from the main schema. Every
+blocking condition that holds is listed in the order above, because each alone
+keeps planning from scheduling the routine. The revision and history checks
+apply only to a stored `ACTIVE` row, because planning reaches them only then.
+An unreadable creation time does not fail planning, which falls back to the
+pass instant and still reads the history, so an unreadable history is listed
+beside it. `next_slot` appears only when none holds. It states what the
+schedule produces next, not that a pass will plan or launch it: the
+scheduler's liveness is outside this read, and a due slot that planning has
+yet to create is listed in `work`. Prompts, quarantine
 reasons, validation text and lease owners are never returned.
 
 `work` lists what the scheduler's claim gate counts against the routine: its
 claimed, running and recovery-required occurrences, and every running run keyed
-to the routine whose occurrence is not one of those. It holds at most 20
+to the routine whose occurrence is not one of those. It also lists what a
+scheduler pass would claim from, given the store at `observedAt`: the eligible
+queue and a due slot that planning has yet to create. A pass first recovers
+expired leases and settles retries past their deadlines, which can release a
+hold listed here; naming those is tracked by #1518. It holds at most 20
 items: those that hold claims first, then by code in the order below, then by
 stored scheduled time and ids. `workTruncated` is `true` when more exist. All
 reads, `conditions` included, come from one read transaction. Each item has a
@@ -692,7 +699,36 @@ is not a readable timestamp.
 | --- | --- | --- | --- |
 | `in_flight` | a `claimed` or `running` occurrence, given as `state`; `runId` is its running run, the lowest id if several | always | `inspect_occurrence` |
 | `running_run` | a running run keyed to the routine whose occurrence is not listed above: a retry on a still-planned occurrence, or a run whose occurrence is settled, another routine's, or missing | always | `inspect_run` |
+| `eligible_now` | a planned occurrence the scheduler's eligible queue selects now, unless misfire policy skips it first | never | `await_scheduler_pass` |
+| `due_unplanned` | the slot the next pass plans for the routine, with no `occurrenceId`; `at` is the slot | never | `await_scheduler_pass` |
 | `recovery_required` | a `recovery_required` occurrence; `runId` is its running run, if any | while a running run keyed to the routine is on it | the step recovery takes, below |
+
+An `eligible_now` item is read with the scheduler's own eligibility statement,
+for the routines a planning pass admits. Planning admits a routine it reaches
+without failing: a stored `ACTIVE` row, not quarantined, whose readable
+definition is `ACTIVE`, with a verified revision and a readable schedule
+history. An unreadable creation time does not keep it out, so such an item can
+appear beside `definition_unavailable`. A ready adopted retry is selected even
+when planning does not admit the routine, unless the routine is quarantined.
+Its occurrence is then listed twice, as `running_run` and as `eligible_now`.
+
+A `due_unplanned` item is the slot planning creates when it next reaches an
+admitted routine: the schedule's latest slot at or before `observedAt` and after
+planning's cursor, the latest of the creation time, the revision time and the
+latest slot recorded for the revision. Misfire policy then skips every planned,
+due occurrence of the routine that has no running run and is earlier than the
+routine's latest planned, due one. Neither an `eligible_now` item nor the
+`due_unplanned` slot is listed when that would skip it. Planning creates the
+slot under an id derived from it: when that id already exists, the slot counts
+as planned and is not listed, and when another occurrence holds the routine's
+slot, planning fails the routine and nothing of it is listed as claimable.
+
+A pass reaches a routine when its planning page includes it: each pass plans at
+most 64 routines, in name order, wrapping. It skips at most 64 occurrences, and
+claims at most 64, from the routines on its page and from ready retries. One
+unreadable time in any routine's eligible queue fails the whole pass;
+`coven automations doctor` reports it. `coven automations status` reports the
+scheduler's last pass.
 
 A `recovery_required` item's `nextStep` is the step
 `coven.automations.occurrence.recover.v1` takes, checked in recovery's order

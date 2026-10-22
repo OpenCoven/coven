@@ -69,19 +69,22 @@ An assigned authority or a previous successful pass is not a current liveness
 or overall health guarantee.
 
 `explain` lists every condition that keeps planning from scheduling the routine,
-in this order: `not_active`, `quarantined`, `definition_unavailable`. The last
-also covers stored revision metadata that planning cannot verify.
+in this order: `not_active`, `quarantined`, `definition_unavailable`,
+`schedule_history_unreadable`. The third also covers stored revision metadata
+that planning cannot verify.
 Each carries a `nextStep`. Only when none holds does it report `next_slot`, the
 schedule's first slot after `observedAt`. That is not a promise of a launch:
-overlap and misfire policy, slots already due and the scheduler's liveness are
-outside it (see `coven automations doctor`). Beside the conditions, `work`
-lists the routine's claimed, running and recovery-required occurrences and its
-other running runs, and whether each holds claims, which keeps every other
-occurrence of the routine from being claimed. Follow one with
+the scheduler's liveness is outside it (see `coven automations doctor`).
+Beside the conditions, `work` lists the routine's claimed, running and
+recovery-required occurrences, its other running runs, and what a scheduler
+pass would claim from as the store stands: an eligible occurrence, or a due
+slot it has yet to plan, after misfire policy skips the older of the two. It says
+whether each holds claims, which keeps every other occurrence of the routine
+from being claimed. Follow one with
 `coven automations occurrence <id>`, `coven automations run <id>` or
 `coven automations leases --automation-id <id>`. The codes and next steps are
 listed in the [API contract](../API-CONTRACT.md#automations-explanation).
-Retry timing and claimable occurrences are tracked by #1518. Principal-scoped reads and the
+Retry timing is tracked by #1518. Principal-scoped reads and the
 remaining operator surface are still tracked by #858.
 
 ## Color

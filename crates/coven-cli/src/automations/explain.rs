@@ -3,8 +3,9 @@
 //! Read-only. Each condition is one of the scheduler's own predicates: the
 //! stored `status` planning compares, its quarantine predicate,
 //! `occurrences::stored_definition` and `occurrences::verified_revision`.
-//! Each work item mirrors the claim gate's own clauses, and a recovery item's
-//! next step mirrors recovery's own refusals. Beside the routine's
+//! Each work item mirrors the claim gate's own clauses or its eligibility
+//! statement, and a recovery item's next step mirrors recovery's own
+//! refusals. Beside the routine's
 //! id, revision and lifecycle state, only codes, canonical timestamps,
 //! bounded ids and failure-class tokens leave; prompts, quarantine reasons,
 //! validation text, lease owners and authority profiles do not.
@@ -14,9 +15,11 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
-use super::definition::{RoutineDefinition, RoutineStatus};
-use super::occurrences::{stored_definition, verified_revision, ACTIVE_STATUS};
-use super::store::RoutineRecord;
+use super::definition::RoutineStatus;
+use super::occurrences::{
+    iso, latest_due_slot_after, latest_scheduled_slot, stored_definition, verified_revision,
+    ACTIVE_STATUS, ELIGIBLE_OCCURRENCES_SQL,
+};
 
 pub(crate) const ACTION: &str = "coven.automations.explain.v1";
 
@@ -52,6 +55,7 @@ pub(crate) enum Code {
     NotActive,
     Quarantined,
     DefinitionUnavailable,
+    ScheduleHistoryUnreadable,
     NextSlot,
 }
 
@@ -79,6 +83,8 @@ pub(crate) struct WorkItem {
 pub(crate) enum WorkCode {
     InFlight,
     RunningRun,
+    EligibleNow,
+    DueUnplanned,
     RecoveryRequired,
 }
 
@@ -94,6 +100,7 @@ pub(crate) enum NextStep {
     AwaitRuntimeAuthority,
     AwaitCancellation,
     CancelRun,
+    AwaitSchedulerPass,
     None,
 }
 
@@ -126,12 +133,21 @@ const MAX_WORK: usize = 20;
 /// What the claim gate (`ELIGIBLE_OCCURRENCES_SQL` and `claim_due_occurrence`)
 /// counts against the routine: a claimed or running occurrence of it, or a
 /// running run keyed to it, keeps every other occurrence from being claimed.
-/// Rank 0 lists claimed and running occurrences, rank 2 recovery-required
-/// ones, and rank 1 every running run of the routine whose occurrence is not
-/// listed by those two. Ids and times are read as bounded bytes; lease
-/// owners, sessions, authority profiles and reasons are never returned.
-const WORK_SELECT: &str = "
-    SELECT CASE occurrence.state WHEN 'recovery_required' THEN 2 ELSE 0 END AS rank,
+/// Rank 0 lists claimed and running occurrences, rank 3 recovery-required
+/// ones, rank 1 every running run of the routine whose occurrence is not
+/// listed by those two. Rank 2 is what a pass claims from: the eligible
+/// queue, read through the scheduler's own statement, and the due slot the
+/// pass plans first. Misfire supersession then skips every planned, due
+/// occurrence of the routine without a running run that is earlier than its
+/// latest planned, due one, so the earlier of the two is left out. `?1` is
+/// the pass instant, `?2` the routines planning admits, `?3` this routine,
+/// `?4` the limit and `?5` the due slot, if any. Ids and times are read as
+/// bounded bytes; lease owners, sessions, authority profiles and reasons are
+/// never returned.
+fn work_select() -> String {
+    format!(
+        "
+    SELECT CASE occurrence.state WHEN 'recovery_required' THEN 3 ELSE 0 END AS rank,
            substr(CAST(occurrence.id AS BLOB), 1, 513) AS occurrence_id,
            occurrence.state AS state,
            substr(CAST(occurrence.scheduled_for AS BLOB), 1, 65) AS scheduled_for,
@@ -142,7 +158,7 @@ const WORK_SELECT: &str = "
             LIMIT 1) AS run_id,
            occurrence.state <> 'recovery_required' OR EXISTS (
                SELECT 1 FROM main.automation_runs AS run
-               WHERE run.automation_id = ?1
+               WHERE run.automation_id = ?3
                  AND run.status = 'running'
                  AND run.occurrence_id = occurrence.id
            ) AS holds_claims,
@@ -184,7 +200,7 @@ const WORK_SELECT: &str = "
                ELSE 0
            END AS recovery_refusal
     FROM main.automation_occurrences AS occurrence
-    WHERE occurrence.automation_id = ?1
+    WHERE occurrence.automation_id = ?3
       AND occurrence.state IN ('claimed', 'running', 'recovery_required')
     UNION ALL
     SELECT 1,
@@ -197,16 +213,43 @@ const WORK_SELECT: &str = "
            1,
            0
     FROM main.automation_runs AS run
-    WHERE run.automation_id = ?1
+    WHERE run.automation_id = ?3
       AND run.status = 'running'
       AND NOT EXISTS (
           SELECT 1 FROM main.automation_occurrences AS listed
           WHERE listed.id = run.occurrence_id
-            AND listed.automation_id = ?1
+            AND listed.automation_id = ?3
             AND listed.state IN ('claimed', 'running', 'recovery_required')
       )
+    UNION ALL
+    SELECT 2,
+           substr(CAST(eligible.id AS BLOB), 1, 513),
+           NULL,
+           substr(CAST(eligible.scheduled_for AS BLOB), 1, 65),
+           NULL,
+           0,
+           0
+    FROM ({ELIGIBLE_OCCURRENCES_SQL}) AS eligible
+    WHERE ?5 IS NULL
+       OR eligible.scheduled_for >= ?5
+       OR EXISTS (
+           SELECT 1 FROM main.automation_runs AS run
+           WHERE run.occurrence_id = eligible.id AND run.status = 'running'
+       )
+    UNION ALL
+    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0
+    WHERE ?5 IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM main.automation_occurrences AS later
+          WHERE later.automation_id = ?3
+            AND later.state = 'planned'
+            AND later.scheduled_for <= ?1
+            AND later.scheduled_for > ?5
+      )
     ORDER BY holds_claims DESC, rank, scheduled_for, occurrence_id, run_id
-    LIMIT ?2";
+    LIMIT ?4"
+    )
+}
 
 /// Canonical stored timestamps are at most this long; a longer one is omitted.
 const MAX_STORED_TIME: usize = 64;
@@ -232,6 +275,7 @@ pub(crate) fn explain(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
     let Some((record, quarantined_at, failure_class, created_at)) = row else {
         return Ok(Lookup::NotFound);
     };
+    let quarantined = quarantined_at.is_some();
     if record.tombstoned_at.is_some() {
         return Ok(Lookup::Tombstoned);
     }
@@ -252,15 +296,56 @@ pub(crate) fn explain(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
             ..condition(Code::Quarantined, NextStep::ReviewFailureThenUnquarantine)
         });
     }
-    let available = definition.as_ref().is_some_and(|definition| {
-        record.status != ACTIVE_STATUS || revision_verified(&record, definition, &created_at)
-    });
+    // Planning loads an `ACTIVE` routine by its definition's own id, verifies
+    // the stored revision, then reads the revision's latest scheduled slot to
+    // plan from. An unreadable creation time falls back to the pass instant,
+    // so the routine never comes due, but planning still reads the history.
+    let revision = definition
+        .as_ref()
+        .filter(|definition| definition.id == record.id)
+        .and_then(|definition| verified_revision(&record, definition).ok());
+    let available = definition.is_some()
+        && (record.status != ACTIVE_STATUS
+            || (revision.is_some() && DateTime::parse_from_rfc3339(&created_at).is_ok()));
     if !available {
         conditions.push(condition(
             Code::DefinitionUnavailable,
             NextStep::ReviseDefinition,
         ));
     }
+    // A verified revision requires a stored `ACTIVE` row. A new revision
+    // starts an empty history, so revising clears an unreadable one.
+    let history = revision.as_ref().map(|(digest, revision_updated_at)| {
+        latest_scheduled_slot(conn, &record.id, record.revision, digest)
+            .map(|latest| (latest, *revision_updated_at))
+    });
+    if matches!(history, Some(Err(_))) {
+        conditions.push(condition(
+            Code::ScheduleHistoryUnreadable,
+            NextStep::ReviseDefinition,
+        ));
+    }
+    // A planning pass that reaches the routine admits its occurrences to
+    // claiming and first plans the latest slot due since the cursor it keeps,
+    // computed here as planning computes it.
+    let (admitted, due_slot) = match (&history, &definition) {
+        (Some(Ok((latest, revision_updated_at))), Some(definition))
+            if !quarantined && definition.status == RoutineStatus::Active =>
+        {
+            let created = DateTime::parse_from_rfc3339(&created_at)
+                .map(|created| created.with_timezone(&Utc))
+                .unwrap_or(now);
+            let effective = created.max(*revision_updated_at);
+            let cursor = latest.map_or(effective, |latest| effective.max(latest));
+            let due = latest_due_slot_after(definition, cursor, now)
+                .map_err(|_| anyhow!("the routine schedule could not be evaluated"))?;
+            match due {
+                Some(slot) => planned_slot(conn, &record.id, slot)?,
+                None => (true, None),
+            }
+        }
+        _ => (false, None),
+    };
     if let (true, Some(definition)) = (conditions.is_empty(), definition) {
         // Validation admits only DAILY or WEEKLY rules with an hour and an
         // exact timezone, which always have a slot within the search window.
@@ -272,7 +357,7 @@ pub(crate) fn explain(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
             ..condition(Code::NextSlot, NextStep::None)
         });
     }
-    let (work, work_truncated) = work(conn, &record.id)?;
+    let (work, work_truncated) = work(conn, &record.id, admitted, due_slot, now)?;
     Ok(Lookup::Found(Explanation {
         automation_id: record.id,
         revision: record.revision,
@@ -284,23 +369,60 @@ pub(crate) fn explain(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
     }))
 }
 
-fn work(conn: &Connection, id: &str) -> Result<(Vec<WorkItem>, bool)> {
+/// Planning creates a due slot under an id derived from it. When that id
+/// already exists the slot counts as fenced and nothing is created; when
+/// another occurrence holds the routine's slot, planning fails the routine,
+/// which keeps it from claiming.
+fn planned_slot(
+    conn: &Connection,
+    id: &str,
+    slot: DateTime<Utc>,
+) -> Result<(bool, Option<DateTime<Utc>>)> {
+    let (fenced, taken) = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM main.automation_occurrences WHERE id = ?1),
+                    EXISTS (SELECT 1 FROM main.automation_occurrences
+                            WHERE automation_id = ?2 AND scheduled_for = ?3)",
+            rusqlite::params![format!("{id}-{}", slot.timestamp_millis()), id, iso(slot)],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .context("failed to read the routine's planned slots")?;
+    Ok(match (fenced, taken) {
+        (true, _) => (true, None),
+        (false, true) => (false, None),
+        (false, false) => (true, Some(slot)),
+    })
+}
+
+fn work(
+    conn: &Connection,
+    id: &str,
+    admitted: bool,
+    due_slot: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<(Vec<WorkItem>, bool)> {
+    let admitted: Vec<&str> = if admitted { vec![id] } else { Vec::new() };
+    let admitted =
+        serde_json::to_string(&admitted).context("failed to encode the admitted routine")?;
     let mut statement = conn
-        .prepare(WORK_SELECT)
+        .prepare(&work_select())
         .context("failed to prepare the routine's work")?;
     let limit = i64::try_from(MAX_WORK + 1).context("work limit exceeds SQLite range")?;
     let rows = statement
-        .query_map(rusqlite::params![id, limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<Vec<u8>>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<Vec<u8>>>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, bool>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })
+        .query_map(
+            rusqlite::params![iso(now), admitted, id, limit, due_slot.map(iso)],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
         .context("failed to read the routine's work")?;
     let mut items = Vec::new();
     for row in rows {
@@ -318,10 +440,12 @@ fn work(conn: &Connection, id: &str) -> Result<(Vec<WorkItem>, bool)> {
                 NextStep::InspectOccurrence,
             ),
             (1, None) => (WorkCode::RunningRun, None, NextStep::InspectRun),
+            (2, None) => (WorkCode::EligibleNow, None, NextStep::AwaitSchedulerPass),
+            (2, Some("unplanned")) => (WorkCode::DueUnplanned, None, NextStep::AwaitSchedulerPass),
             // The step `occurrence.recover.v1` takes: it refuses a Runtime
             // Authority run, a run whose cancellation is still reconciling,
             // and a latest attempt that may still be live.
-            (2, _) => (
+            (3, _) => (
                 WorkCode::RecoveryRequired,
                 None,
                 match refusal {
@@ -358,20 +482,6 @@ fn bounded_id(bytes: Vec<u8>) -> Option<String> {
     String::from_utf8(bytes)
         .ok()
         .filter(|id| super::leases::valid_id(id))
-}
-
-/// Planning loads an `ACTIVE` routine by its definition's own id, verifies
-/// the stored revision, and plans from its creation time. An unreadable
-/// creation time falls back to the pass instant, so the routine never comes
-/// due and no failure is recorded.
-fn revision_verified(
-    record: &RoutineRecord,
-    definition: &RoutineDefinition,
-    created_at: &str,
-) -> bool {
-    definition.id == record.id
-        && DateTime::parse_from_rfc3339(created_at).is_ok()
-        && verified_revision(record, definition).is_ok()
 }
 
 fn condition(code: Code, next_step: NextStep) -> Condition {

@@ -903,7 +903,7 @@ fn tick_inner(
     Ok(report)
 }
 
-fn iso(instant: DateTime<Utc>) -> String {
+pub(crate) fn iso(instant: DateTime<Utc>) -> String {
     instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -1402,7 +1402,7 @@ pub(crate) const ELIGIBILITY_QUERY_PREREQUISITES: &[(&str, &[&str])] = &[
     ("automation_attempts", &["run_id", "state", "not_before"]),
 ];
 
-const ELIGIBLE_OCCURRENCES_SQL: &str = "WITH active_definition(automation_id) AS (
+pub(crate) const ELIGIBLE_OCCURRENCES_SQL: &str = "WITH active_definition(automation_id) AS (
                      SELECT value FROM json_each(?2)
                  )
                  SELECT occurrence.id,
@@ -1624,7 +1624,7 @@ fn definition_created_at(conn: &Connection, id: &str) -> Result<DateTime<Utc>> {
 /// Latest due slot for `definition` at or before `now`, walking forward from
 /// `cursor` (never further back than the routine's creation time). Returns
 /// `None` when the next slot is still in the future.
-fn latest_due_slot_after(
+pub(crate) fn latest_due_slot_after(
     definition: &RoutineDefinition,
     cursor: DateTime<Utc>,
     now: DateTime<Utc>,
@@ -1649,7 +1649,7 @@ fn latest_due_slot_after(
     Ok(latest)
 }
 
-fn latest_scheduled_slot(
+pub(crate) fn latest_scheduled_slot(
     conn: &Connection,
     automation_id: &str,
     automation_revision: u64,
@@ -1658,7 +1658,7 @@ fn latest_scheduled_slot(
     let latest: Option<String> = conn
         .query_row(
             "SELECT MAX(scheduled_for)
-             FROM automation_occurrences
+             FROM main.automation_occurrences
              WHERE automation_id = ?1
                AND automation_revision = ?2
                AND definition_digest = ?3
