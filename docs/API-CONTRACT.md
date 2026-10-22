@@ -682,25 +682,32 @@ reasons, validation text and lease owners are never returned.
 claimed, running and recovery-required occurrences, and every running run keyed
 to the routine whose occurrence is not one of those. It also lists what a
 scheduler pass would claim from, given the store at `observedAt`: the eligible
-queue and a due slot that planning has yet to create. A pass first settles
-retries past their deadlines (`retry_expired`, below) and recovers expired
-leases, which can release a hold listed here; naming expired leases and
-attempts held for an operator retry is tracked by #1518. It holds at most 20
+queue and a due slot that planning has yet to create. Before claiming, a pass
+settles retries past their deadlines and returns or fails stale and expired
+claims (`retry_expired`, `claim_stale` and `lease_expired`, below), releasing
+the hold each lists. Reconciliation also acts on other runs before claiming,
+which are listed as `running_run` or `in_flight` and not named yet (#1523): it
+settles runs whose session has finished, stops or settles runs past their
+deadline, stops launches abandoned past their lease, reconciles expired
+cancellations, and settles a failed attempt held for an operator retry at its
+deadline, or at once if the run has none. It holds at most 20
 items: those that hold claims first, then by code in the order below, with
-each retry code sorted as the item it replaces, then by stored scheduled time
-and ids. `workTruncated` is `true` when more exist. All
-reads, `conditions` included, come from one read transaction. Each item has a
+each code that replaces another item sorted as that item, then by stored
+scheduled time and ids. `workTruncated` is `true` when more exist. All reads,
+`conditions` included, come from one read transaction. Each item has a
 `code`, `holdsClaims` and a `nextStep`, and `occurrenceId`, `runId` and `at`
 (the occurrence's scheduled time, in canonical millisecond form) when each
 exists and is readable. A retry item also carries `notBefore` and
-`deadlineAt`, described below. An id is omitted when it is empty, longer than 512
-bytes, not valid UTF-8, has leading or trailing whitespace, or contains a
+`deadlineAt`, and a claimed occurrence's item `leaseExpiresAt`, described
+below. An id is omitted when it is empty, longer than 512 bytes, not valid UTF-8, has leading or trailing whitespace, or contains a
 control character. A stored time is omitted when it is longer than 64 bytes or
 is not a readable timestamp.
 
 | `code` | What it is | `holdsClaims` | `nextStep` |
 | --- | --- | --- | --- |
 | `in_flight` | a `claimed` or `running` occurrence, given as `state`; `runId` is its running run, the lowest id if several | always | `inspect_occurrence` |
+| `claim_stale` | a claimed occurrence the daemon claimed under a generation of the scheduler authority other than the current one, or under none, with no run at all; it replaces the occurrence's `in_flight` item | until the next pass returns it to `planned` | `await_scheduler_pass` |
+| `lease_expired` | a claimed occurrence whose lease has expired, claimed by the daemon under the current generation or manually with none, with no running run; it replaces the occurrence's `in_flight` item | until the next pass settles it `failed` | `await_settlement` |
 | `running_run` | a running run keyed to the routine whose occurrence is not listed above: a retry on a still-planned occurrence, or a run whose occurrence is settled, another routine's, or missing | always | `inspect_run` |
 | `retry_waiting` | such a run retrying a planned occurrence: it has no session and an adopted attempt whose `notBefore` is after `observedAt`, and its deadline has not passed | always | `await_retry` |
 | `retry_expired` | a run with no session and an adopted attempt, retrying a planned occurrence or this routine's claimed one, whose deadline has passed; it replaces that run's `running_run` or `in_flight` item | until the next pass settles it | `await_settlement` |
@@ -737,8 +744,24 @@ time still ahead, shown only when it is stored in canonical form, and
 `deadlineAt` is the parsed deadline. One run anywhere in the store whose
 deadline cannot be parsed, or whose expired retry's occurrence is neither
 `planned` nor `claimed`, fails reconciliation on every pass for every routine:
-no retry is settled and nothing is claimed until it is repaired. Such a run is
-listed as `running_run`, or its occurrence as `in_flight`.
+no retry is settled, no claim is released and nothing is claimed until it is
+repaired. Such a run is listed as `running_run`, or its occurrence as
+`in_flight`.
+
+Claim releases describe the next pass of the daemon holding the scheduler
+authority on record, if that pass completes. It first returns to `planned`
+every claim the daemon made under a generation other than the current one, or
+under none, that has no run, and after planning settles `failed` every expired
+lease of a daemon claim of the current generation, or of a manual claim with no
+generation, that has no running run; both happen before anything is claimed. A
+pass that fails part way, as above or because planning fails, releases only
+what it reached. A released claim no longer holds the routine's claims, so the
+same pass can claim another occurrence of the routine, which is not listed
+while the claim holds; a returned claim can itself be claimed again or
+superseded. When no daemon holds the authority, no claim is named released. A daemon that takes over starts a new generation and runs its
+own startup recovery first, so if the holder on record has stopped, these codes
+do not describe what its successor does. The pass compares the lease as stored
+text, so `leaseExpiresAt` is shown only when it is stored in canonical form.
 
 A `due_unplanned` item is the slot planning creates when it next reaches an
 admitted routine: the schedule's latest slot at or before `observedAt` and after
@@ -777,9 +800,9 @@ claims no other occurrence of the routine. A `running_run` item's own
 occurrence can still be claimed, as a ready retry's is. Because items that hold
 claims come first, the first item answers whether any does, even when the list
 is truncated. An adopted retry that is waiting for its next attempt, or is past
-its deadline, also keeps its own occurrence from being claimed; its run, keyed
-to the routine, is listed as `running_run`, and its timing is reported by a
-later slice (#1518).
+its deadline, also keeps its own occurrence from being claimed; its run is
+listed as `retry_waiting` or `retry_expired`, or as `running_run` when its
+times cannot be read as both reconciliation and the queue read them.
 `work` is read whatever `conditions` say, so a paused or quarantined routine
 still shows its work. Leases are read with
 `coven.automations.occurrence.leases.v1` and runs with

@@ -17,8 +17,9 @@ use serde::Serialize;
 
 use super::definition::RoutineStatus;
 use super::occurrences::{
-    iso, latest_due_slot_after, latest_scheduled_slot, stored_definition, verified_revision,
-    ACTIVE_STATUS, ELIGIBLE_OCCURRENCES_SQL,
+    iso, latest_due_slot_after, latest_scheduled_slot, recorded_scheduler_authority,
+    stored_definition, verified_revision, RecordedSchedulerAuthority, ACTIVE_STATUS,
+    ELIGIBLE_OCCURRENCES_SQL,
 };
 
 pub(crate) const ACTION: &str = "coven.automations.explain.v1";
@@ -78,6 +79,8 @@ pub(crate) struct WorkItem {
     pub not_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
     pub holds_claims: bool,
     pub next_step: NextStep,
 }
@@ -86,6 +89,8 @@ pub(crate) struct WorkItem {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkCode {
     InFlight,
+    ClaimStale,
+    LeaseExpired,
     RunningRun,
     RetryWaiting,
     RetryExpired,
@@ -149,7 +154,8 @@ const MAX_WORK: usize = 20;
 /// occurrence of the routine without a running run that is earlier than its
 /// latest planned, due one, so the earlier of the two is left out. `?1` is
 /// the pass instant, `?2` the routines planning admits, `?3` this routine,
-/// `?4` the limit and `?5` the due slot, if any. Ids and times are read as
+/// `?4` the limit, `?5` the due slot, if any, and `?6` the generation of the
+/// scheduler authority on record, if a daemon holds it. Ids and times are read as
 /// bounded bytes; lease owners, sessions, authority profiles and reasons are
 /// never returned.
 fn work_select() -> String {
@@ -210,7 +216,35 @@ fn work_select() -> String {
                    WHERE attempt.run_id = held.id AND attempt.state = 'adopted'
                ) AS retry,
            CAST(held.timeout_at AS BLOB) AS deadline,
-           NULL AS not_before
+           NULL AS not_before,
+           -- A running occurrence keeps its lease, which no longer applies.
+           CASE WHEN occurrence.state = 'claimed'
+               THEN substr(CAST(occurrence.lease_expires_at AS BLOB), 1, 65)
+           END AS lease,
+           -- The claim releases a fenced pass makes before claiming: stale
+           -- claims of an earlier generation return to planned, then expired
+           -- leases of this generation, or of manual claims, fail.
+           CASE
+               WHEN ?6 IS NULL THEN 0
+               WHEN occurrence.lease_owner = 'daemon'
+                    AND occurrence.scheduler_generation IS NOT ?6
+                    AND NOT EXISTS (
+                        SELECT 1 FROM main.automation_runs AS any_run
+                        WHERE any_run.occurrence_id = occurrence.id
+                    ) THEN 1
+               WHEN (
+                       (occurrence.lease_owner = 'daemon'
+                        AND occurrence.scheduler_generation = ?6)
+                       OR (occurrence.kind = 'manual'
+                           AND occurrence.scheduler_generation IS NULL)
+                    )
+                    AND occurrence.lease_expires_at <= ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM main.automation_runs AS live
+                        WHERE live.occurrence_id = occurrence.id AND live.status = 'running'
+                    ) THEN 2
+               ELSE 0
+           END AS lease_release
     FROM main.automation_occurrences AS occurrence
     LEFT JOIN main.automation_runs AS held
       ON held.id = (
@@ -249,7 +283,9 @@ fn work_select() -> String {
             FROM main.automation_attempts AS attempt
             WHERE attempt.run_id = run.id
               AND attempt.state = 'adopted'
-              AND attempt.not_before > ?1)
+              AND attempt.not_before > ?1),
+           NULL,
+           0
     FROM main.automation_runs AS run
     WHERE run.automation_id = ?3
       AND run.status = 'running'
@@ -269,7 +305,9 @@ fn work_select() -> String {
            0,
            0,
            NULL,
-           NULL
+           NULL,
+           NULL,
+           0
     FROM ({ELIGIBLE_OCCURRENCES_SQL}) AS eligible
     WHERE ?5 IS NULL
        OR eligible.scheduled_for >= ?5
@@ -278,7 +316,7 @@ fn work_select() -> String {
            WHERE run.occurrence_id = eligible.id AND run.status = 'running'
        )
     UNION ALL
-    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL
+    SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL, NULL, 0
     WHERE ?5 IS NOT NULL
       AND NOT EXISTS (
           SELECT 1 FROM main.automation_occurrences AS later
@@ -398,7 +436,16 @@ pub(crate) fn explain(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
             ..condition(Code::NextSlot, NextStep::None)
         });
     }
-    let (work, work_truncated) = work(conn, &record.id, admitted, due_slot, now)?;
+    // The daemon's pass is fenced by the scheduler authority on record; with
+    // none recorded, no pass would release a claim.
+    let generation = match recorded_scheduler_authority(conn)? {
+        RecordedSchedulerAuthority::Observed(authority) => Some(
+            i64::try_from(authority.generation())
+                .context("scheduler generation exceeds SQLite range")?,
+        ),
+        _ => None,
+    };
+    let (work, work_truncated) = work(conn, &record.id, admitted, due_slot, generation, now)?;
     Ok(Lookup::Found(Explanation {
         automation_id: record.id,
         revision: record.revision,
@@ -440,6 +487,7 @@ fn work(
     id: &str,
     admitted: bool,
     due_slot: Option<DateTime<Utc>>,
+    generation: Option<i64>,
     now: DateTime<Utc>,
 ) -> Result<(Vec<WorkItem>, bool)> {
     let admitted: Vec<&str> = if admitted { vec![id] } else { Vec::new() };
@@ -451,7 +499,7 @@ fn work(
     let limit = i64::try_from(MAX_WORK + 1).context("work limit exceeds SQLite range")?;
     let rows = statement
         .query_map(
-            rusqlite::params![iso(now), admitted, id, limit, due_slot.map(iso)],
+            rusqlite::params![iso(now), admitted, id, limit, due_slot.map(iso), generation],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -464,6 +512,8 @@ fn work(
                     row.get::<_, bool>(7)?,
                     row.get::<_, Option<Vec<u8>>>(8)?,
                     row.get::<_, Option<Vec<u8>>>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
+                    row.get::<_, i64>(11)?,
                 ))
             },
         )
@@ -481,6 +531,8 @@ fn work(
             retry,
             deadline,
             not_before,
+            lease,
+            lease_release,
         ) = row.context("failed to read the routine's work")?;
         // Reconciliation parses the whole stored deadline and settles the
         // retry once it has passed. The eligible queue compares the deadline
@@ -513,11 +565,16 @@ fn work(
                 timing.1 = deadline_at;
                 (WorkCode::RetryExpired, None, NextStep::AwaitSettlement)
             }
-            (0, Some("claimed")) => (
-                WorkCode::InFlight,
-                Some("claimed"),
-                NextStep::InspectOccurrence,
-            ),
+            (0, Some("claimed")) => match lease_release {
+                0 => (
+                    WorkCode::InFlight,
+                    Some("claimed"),
+                    NextStep::InspectOccurrence,
+                ),
+                1 => (WorkCode::ClaimStale, None, NextStep::AwaitSchedulerPass),
+                2 => (WorkCode::LeaseExpired, None, NextStep::AwaitSettlement),
+                _ => anyhow::bail!("the routine's work has an unexpected shape"),
+            },
             (0, Some("running")) => (
                 WorkCode::InFlight,
                 Some("running"),
@@ -560,6 +617,11 @@ fn work(
                 .and_then(canonical),
             not_before: timing.0,
             deadline_at: timing.1,
+            // The pass compares the lease as stored text, so only a canonical
+            // one is shown.
+            lease_expires_at: lease
+                .and_then(stored_time)
+                .filter(|stored| canonical(stored).as_deref() == Some(stored.as_str())),
             holds_claims,
             next_step,
         });

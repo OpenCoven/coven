@@ -409,7 +409,7 @@ fn process_automations_pass_inner(
     })
 }
 
-fn reconcile_automation_runs(
+pub(super) fn reconcile_automation_runs(
     coven_home: &Path,
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
