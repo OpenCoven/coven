@@ -12,6 +12,7 @@ pub(crate) enum View<'a> {
     Occurrence(&'a str),
     Run(&'a str),
     Attempts(&'a str),
+    Explain(&'a str),
 }
 
 impl View<'_> {
@@ -20,12 +21,14 @@ impl View<'_> {
             Self::Status => "coven.automations.scheduler.status.v1",
             Self::Occurrence(_) => "coven.automations.occurrence.get.v1",
             Self::Run(_) | Self::Attempts(_) => "coven.automations.run.get.v1",
+            Self::Explain(_) => super::explain::ACTION,
         }
     }
 
     fn request(self) -> Result<Value> {
         let mut request = json!({"action": self.action()});
-        if let Self::Occurrence(id) | Self::Run(id) | Self::Attempts(id) = self {
+        if let Self::Occurrence(id) | Self::Run(id) | Self::Attempts(id) | Self::Explain(id) = self
+        {
             if id.is_empty()
                 || id.len() > 512
                 || id.chars().any(char::is_control)
@@ -54,6 +57,9 @@ pub(crate) fn run(view: View<'_>, as_json: bool) -> Result<()> {
         .map_err(|_| anyhow!("automation inspection could not reach a compatible owner-local daemon; check `coven daemon status`"))?;
     // Never propagate daemon error text: it can include database paths or logs.
     if response.status != 200 {
+        if let Some(message) = known_refusal(view, response.status, &response.body) {
+            bail!(message);
+        }
         bail!(
             "automation inspection was refused by the daemon (HTTP {})",
             response.status
@@ -68,6 +74,23 @@ pub(crate) fn run(view: View<'_>, as_json: bool) -> Result<()> {
     // JSON escaping also prevents persisted ids from injecting terminal controls.
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+/// A typed refusal an operator can act on, recognized by status, code and
+/// action together. Its message is still never shown.
+fn known_refusal(view: View<'_>, status: u16, body: &[u8]) -> Option<&'static str> {
+    let View::Explain(_) = view else {
+        return None;
+    };
+    let body: Value = serde_json::from_slice(body).ok()?;
+    if body["action"] != view.action() {
+        return None;
+    }
+    match (status, body["error"]["code"].as_str()?) {
+        (404, "NOT_FOUND") => Some("automation routine was not found"),
+        (410, "GONE_TOMBSTONED") => Some("automation routine is tombstoned"),
+        _ => None,
+    }
 }
 
 fn project(view: View<'_>, response: &Value) -> Result<Value> {
@@ -113,6 +136,14 @@ fn project(view: View<'_>, response: &Value) -> Result<Value> {
             } else {
                 output["run"] = serde_json::to_value(run)?;
             }
+        }
+        View::Explain(id) => {
+            let explanation: Explanation =
+                serde_json::from_value(payload["explanation"].clone()).map_err(|_| invalid())?;
+            if explanation.automation_id != id || explanation.conditions.is_empty() {
+                return Err(invalid());
+            }
+            output["explanation"] = serde_json::to_value(explanation)?;
         }
     }
     Ok(output)
@@ -214,6 +245,27 @@ struct Attempt {
     session_id: Option<String>,
     opened_at: String,
     settled_at: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Explanation {
+    automation_id: String,
+    revision: u64,
+    lifecycle_state: String,
+    observed_at: String,
+    conditions: Vec<Condition>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Condition {
+    code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<String>,
+    next_step: String,
 }
 
 #[cfg(test)]
@@ -359,6 +411,91 @@ mod tests {
                 "automation inspection response is invalid",
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn explanation_projection_round_trips_a_real_store_and_rejects_forgeries() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let definition = crate::automations::definition::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1, "id": "daily", "name": "daily", "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
+            "overlap": "forbid", "timeoutMinutes": 30, "runtime": "coven-code",
+            "cwd": "/work/project", "prompt": "private sentinel"
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        let view = View::Explain("daily");
+        let (status, result) = crate::control_plane::route_action(
+            view.request().unwrap(),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(status, 200);
+        let response = serde_json::to_value(result).unwrap();
+        let output = project(view, &response).unwrap();
+        assert_eq!(output["schemaVersion"], "coven.automations.inspection.v1");
+        assert_eq!(output["explanation"]["lifecycleState"], "paused");
+        assert_eq!(
+            output["explanation"]["conditions"],
+            json!([{"code": "not_active", "nextStep": "activate_if_intended"}])
+        );
+        assert!(!output.to_string().contains("private sentinel"));
+        for (path, value) in [
+            ("/event/payload/explanation/automationId", json!("other")),
+            ("/event/payload/explanation/conditions", json!([])),
+            ("/event/payload/explanation/revision", json!(-1)),
+            ("/event/payload/explanation/conditions/0/code", json!(1)),
+            ("/event/payload/explanation", json!("private sentinel")),
+            ("/event/action", json!("coven.automations.run.get.v1")),
+        ] {
+            let mut invalid = response.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                project(view, &invalid).unwrap_err().to_string(),
+                "automation inspection response is invalid",
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_typed_explain_refusals_get_their_own_message() {
+        let explain = View::Explain("daily");
+        let body = |action: &str, code: &str| {
+            serde_json::to_vec(&json!({
+                "action": action,
+                "error": {"code": code, "message": "private sentinel"}
+            }))
+            .unwrap()
+        };
+        let action = explain.action();
+        assert_eq!(
+            known_refusal(explain, 404, &body(action, "NOT_FOUND")),
+            Some("automation routine was not found")
+        );
+        assert_eq!(
+            known_refusal(explain, 410, &body(action, "GONE_TOMBSTONED")),
+            Some("automation routine is tombstoned")
+        );
+        for (view, status, refusal) in [
+            (
+                explain,
+                404,
+                body("coven.automations.run.get.v1", "NOT_FOUND"),
+            ),
+            (explain, 404, body(action, "GONE_TOMBSTONED")),
+            (explain, 410, body(action, "NOT_FOUND")),
+            (explain, 500, body(action, "INTERNAL")),
+            (explain, 404, b"private sentinel".to_vec()),
+            (
+                View::Run("daily"),
+                404,
+                body("coven.automations.run.get.v1", "NOT_FOUND"),
+            ),
+        ] {
+            assert_eq!(known_refusal(view, status, &refusal), None, "{status}");
         }
     }
 }

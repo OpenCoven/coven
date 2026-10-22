@@ -24,6 +24,7 @@ const PUBLIC_READ_ACTIONS: &[&str] = &[
 /// Owner-local reads: sensitive records and minimized lease diagnostics.
 const OWNER_LOCAL_READ_ACTIONS: &[&str] = &[
     "coven.automations.occurrence.leases.v1",
+    "coven.automations.explain.v1",
     "coven.automations.list",
     "coven.automations.get",
     "coven.automations.definition.list.v1",

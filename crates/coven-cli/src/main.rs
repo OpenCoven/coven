@@ -1181,6 +1181,12 @@ enum AutomationsCommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Explain what decides whether one routine runs next")]
+    Explain {
+        automation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Inspect occurrence lease metadata through the owner-local daemon")]
     Leases {
         #[arg(long)]
@@ -1703,6 +1709,7 @@ fn main() -> Result<()> {
                 | AutomationsCommand::Occurrence { .. }
                 | AutomationsCommand::Run { .. }
                 | AutomationsCommand::Attempts { .. }
+                | AutomationsCommand::Explain { .. }
         })
     ) || matches!(
         &cli.command,
@@ -4187,6 +4194,10 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
         AutomationsCommand::Occurrence { id, json } => run(View::Occurrence(&id), json),
         AutomationsCommand::Run { id, json } => run(View::Run(&id), json),
         AutomationsCommand::Attempts { run_id, json } => run(View::Attempts(&run_id), json),
+        AutomationsCommand::Explain {
+            automation_id,
+            json,
+        } => run(View::Explain(&automation_id), json),
         AutomationsCommand::Leases {
             automation_id,
             limit,
