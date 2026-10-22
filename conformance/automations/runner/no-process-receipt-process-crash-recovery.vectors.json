@@ -1,0 +1,375 @@
+{
+  "schemaVersion": "coven.automations.no-process-receipt-process-crash-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "no-retry-killed-after-receipt",
+      "scene": "no_retry",
+      "boundary": "after_receipt",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "launchAfterExit": "launching",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "owned",
+        "restartLaunches": 1,
+        "launchAfterRetryPass": "owned",
+        "launchAfterSettlePass": "succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "no-retry-killed-inside-restore-after-run-delete",
+      "scene": "no_retry",
+      "boundary": "after_run_delete",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "launchAfterExit": "launching",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "owned",
+        "restartLaunches": 1,
+        "launchAfterRetryPass": "owned",
+        "launchAfterSettlePass": "succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "no-retry-killed-inside-restore-after-occurrence",
+      "scene": "no_retry",
+      "boundary": "after_restore",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "launchAfterExit": "launching",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "owned",
+        "restartLaunches": 1,
+        "launchAfterRetryPass": "owned",
+        "launchAfterSettlePass": "succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "no-retry-killed-after-restore-commit",
+      "scene": "no_retry",
+      "boundary": "after_restore_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "launchAfterExit": "restored",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "owned",
+        "restartLaunches": 1,
+        "launchAfterRetryPass": "owned",
+        "launchAfterSettlePass": "succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "no-retry-uninterrupted-shutdown-control",
+      "scene": "no_retry",
+      "boundary": "none",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "restored",
+        "launchAfterExit": "restored",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "owned",
+        "restartLaunches": 1,
+        "launchAfterRetryPass": "owned",
+        "launchAfterSettlePass": "succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "lease-retry-killed-after-receipt",
+      "scene": "lease_retry",
+      "boundary": "after_receipt",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "lease_expired"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "launchAfterExit": "launching",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "retry_waiting",
+        "restartLaunches": 0,
+        "launchAfterRetryPass": "retry_owned",
+        "launchAfterSettlePass": "retry_succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "lease-retry-killed-inside-restore-after-run-delete",
+      "scene": "lease_retry",
+      "boundary": "after_run_delete",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "lease_expired"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "launchAfterExit": "launching",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "retry_waiting",
+        "restartLaunches": 0,
+        "launchAfterRetryPass": "retry_owned",
+        "launchAfterSettlePass": "retry_succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "lease-retry-killed-inside-restore-after-occurrence",
+      "scene": "lease_retry",
+      "boundary": "after_restore",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "lease_expired"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "launchAfterExit": "launching",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "retry_waiting",
+        "restartLaunches": 0,
+        "launchAfterRetryPass": "retry_owned",
+        "launchAfterSettlePass": "retry_succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "lease-retry-killed-after-restore-commit",
+      "scene": "lease_retry",
+      "boundary": "after_restore_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "lease_expired"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "launchAfterExit": "restored",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "owned",
+        "restartLaunches": 1,
+        "launchAfterRetryPass": "owned",
+        "launchAfterSettlePass": "succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "lease-retry-uninterrupted-shutdown-control",
+      "scene": "lease_retry",
+      "boundary": "none",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-receipt-crash",
+        "name": "Conformance no-process receipt crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native no-process receipt crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "lease_expired"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "restored",
+        "launchAfterExit": "restored",
+        "receiptAfterExit": true,
+        "launchAfterRestart": "owned",
+        "restartLaunches": 1,
+        "launchAfterRetryPass": "owned",
+        "launchAfterSettlePass": "succeeded",
+        "claims": 2,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    }
+  ]
+}

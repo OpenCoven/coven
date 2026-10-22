@@ -122,6 +122,12 @@ const RUN_NOW_ENVELOPE_PROCESS_CRASH_TARGET_TIMEOUT_MS = 270_000;
 // wait; the store's busy waits and cleanup need room on loaded hosts. Fixture
 // hang guard only: this is not a recovery SLO or a production deadline.
 const TICK_PROCESS_CRASH_TARGET_TIMEOUT_MS = 420_000;
+// Each of ten no-process receipt workers has a 10-second handshake guard, the
+// controls also a 10-second exit guard, and each parent restart a 10-second
+// leadership wait; the store's busy waits and cleanup need room on loaded
+// hosts. Fixture hang guard only: this is not a recovery SLO or a production
+// deadline.
+const NO_PROCESS_RECEIPT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 300_000;
 const TARGET_KILL_GRACE_MS = 100;
 const TARGET_OUTPUT_LIMIT = 1024 * 1024;
 const MAX_JCS_DEPTH = 128;
@@ -564,6 +570,9 @@ async function invokeTarget(subject, operation, input) {
           : operation === "evaluate" &&
               input?.suiteId === "tick-process-crash-recovery"
             ? TICK_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "no-process-receipt-process-crash-recovery"
+            ? NO_PROCESS_RECEIPT_PROCESS_CRASH_TARGET_TIMEOUT_MS
         : operation === "evaluate" &&
       input?.suiteId === "startup-reconciliation-wake"
         ? STARTUP_WAKE_TARGET_TIMEOUT_MS

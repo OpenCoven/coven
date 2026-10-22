@@ -181,7 +181,8 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                         "waiting-retry-cancellation-process-crash-recovery",
                         "run-now-process-crash-recovery",
                         "run-now-envelope-process-crash-recovery",
-                        "tick-process-crash-recovery"
+                        "tick-process-crash-recovery",
+                        "no-process-receipt-process-crash-recovery"
                     ]
                 },
                 {
@@ -3729,6 +3730,127 @@ fn native_target_evaluates_checked_in_tick_process_crash_vectors() -> anyhow::Re
     assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
     // No routine or occurrence id: occurrence ids extend the routine's.
     assert!(!text.contains("conformance-tick-crash"));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_no_process_receipt_process_crash_vectors(
+) -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../conformance/automations/runner/no-process-receipt-process-crash-recovery.vectors.json"
+    ))?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "scheduler_reliability",
+        "suiteId": "no-process-receipt-process-crash-recovery",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        response["suiteId"],
+        "no-process-receipt-process-crash-recovery"
+    );
+    assert_eq!(response["status"], "passed", "{response}");
+    assert_eq!(response["evidence"]["executedCases"], 10);
+    assert_eq!(response["evidence"]["passedCases"], 10);
+    let observations = response["evidence"]["observations"]
+        .as_array()
+        .expect("no-process receipt crash observations");
+    assert_eq!(observations.len(), 10);
+    // What the store had committed when the worker was gone, and whether a
+    // write was open there. The receipt is always recorded first.
+    let boundaries = [
+        ("after_receipt", "launching", false),
+        ("after_run_delete", "launching", true),
+        ("after_restore", "launching", true),
+        ("after_restore_commit", "restored", false),
+        ("none", "restored", false),
+    ];
+    let cases = ["no_retry", "lease_retry"]
+        .into_iter()
+        .flat_map(|scene| boundaries.map(|boundary| (scene, boundary)));
+    for (observation, (scene, (boundary, committed, open))) in observations.iter().zip(cases) {
+        let killed = boundary != "none";
+        let at_pause = |value: Value| if killed { value } else { json!(null) };
+        assert_eq!(observation["scene"], scene);
+        assert_eq!(observation["boundary"], boundary);
+        assert_eq!(observation["abruptlyTerminated"], killed);
+        assert_eq!(observation["transactionOpenAtPause"], at_pause(json!(open)));
+        assert_eq!(observation["launchAtPause"], at_pause(json!(committed)));
+        assert_eq!(observation["receiptAtPause"], at_pause(json!(true)));
+        assert_eq!(observation["pauseConsistent"], true);
+        assert_eq!(observation["integrityOk"], true);
+        assert_eq!(observation["launchAfterExit"], committed);
+        assert_eq!(observation["receiptAfterExit"], true);
+        assert_eq!(observation["recoveryRefused"], false);
+        // Exactly one launch, after the restart; nothing stops; the slot is
+        // claimed twice in all.
+        assert_eq!(observation["launches"], 1);
+        assert_eq!(observation["stops"], 0);
+        assert_eq!(observation["claims"], 2);
+        assert_eq!(observation["replayIsNoop"], true);
+        // The receipt recovers a launch the dispatcher did not restore. Under
+        // a lease-expiry retry policy it settles the attempt and retries it
+        // after the policy's delay; otherwise it restores the launch as the
+        // dispatcher would have, and the restart launches it again.
+        let (after_restart, restart_launches, after_retry, after_settle) =
+            if scene == "lease_retry" && committed == "launching" {
+                ("retry_waiting", 0, "retry_owned", "retry_succeeded")
+            } else {
+                ("owned", 1, "owned", "succeeded")
+            };
+        assert_eq!(observation["launchAfterRestart"], after_restart);
+        assert_eq!(observation["restartLaunches"], restart_launches);
+        assert_eq!(observation["launchAfterRetryPass"], after_retry);
+        assert_eq!(observation["launchAfterSettlePass"], after_settle);
+    }
+    let mut invalid = request.clone();
+    invalid["vector"]["cases"][0]["storePath"] = json!("private-must-not-be-read");
+    let rejected = run_target(&coven_home, "evaluate", Some(&invalid))?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conformance vector is invalid"));
+    let rejected = run_target(
+        &coven_home,
+        "no-process-receipt-crash-worker",
+        Some(&invalid["vector"]["cases"][0]),
+    )?;
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("conformance vector is invalid"));
+    assert!(!error.contains("private-must-not-be-read"));
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(temp_dir.path().to_string_lossy().as_ref()));
+    // No routine, occurrence, run or session id: occurrence ids extend the
+    // routine's, and session ids name receipts.
+    assert!(!text.contains("conformance-receipt-crash"));
+    assert!(!text.contains("session-"));
+    assert!(!text.contains(".receipt"));
     assert!(!coven_home.exists());
     Ok(())
 }

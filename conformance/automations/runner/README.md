@@ -244,6 +244,7 @@ The checked-in
 [`run-now-process-crash-recovery.vectors.json`](run-now-process-crash-recovery.vectors.json),
 [`run-now-envelope-process-crash-recovery.vectors.json`](run-now-envelope-process-crash-recovery.vectors.json),
 [`tick-process-crash-recovery.vectors.json`](tick-process-crash-recovery.vectors.json),
+[`no-process-receipt-process-crash-recovery.vectors.json`](no-process-receipt-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -307,7 +308,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target implements twelve structural suites, thirty-two
+The native Coven target implements twelve structural suites, thirty-three
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -799,7 +800,8 @@ handshakes or output. As with delivery, these cases do not require uncommitted
 frames in the WAL. This is `audit_only` evidence for a daemon killed while it
 launches one scheduled occurrence with no no-process containment receipt. It
 does not cover a real runtime process, receipt-proven no-process retry, which
-relaunches by design, an automatic retry after a launch fails before ownership
+relaunches by design (see `no-process-receipt-process-crash-recovery`), an
+automatic retry after a launch fails before ownership
 (see `automatic-retry-process-crash-recovery`), Runtime Authority launches,
 manual occurrences (see `run-now-process-crash-recovery`), kills during the
 tick that plans and claims the slot (see `tick-process-crash-recovery`), kills
@@ -1689,3 +1691,85 @@ supersession that have work to do, the launch itself (see
 `run-now-process-crash-recovery`), a graceful daemon restart (#1433), Runtime
 Authority runs, a real runtime process, power loss, load, complete profiles or
 release eligibility.
+
+## No-process receipt process-crash audit boundary
+
+The `no-process-receipt-process-crash-recovery` suite kills a daemon worker
+after its runtime has proven that a committed launch started no process. A
+daemon that begins to shut down while it launches has a closing runtime: the
+runtime records the no-process containment receipt for the launch's session,
+`coven.containment.no-process.v1` under `runtime/automation-containment/`, and
+refuses admission. The dispatcher then restores the launch for retry in one
+transaction: it deletes the run with its attempt, then the `created` session,
+and returns the occurrence to `planned`. A restart that finds the launch
+committed and the receipt recorded recovers it by the receipt instead of
+holding it, as `run-launch-process-crash-recovery` does without one.
+
+Each of ten cases starts the exact audited binary as a hidden worker with the
+same harness as `run-launch-process-crash-recovery`. The worker stores the
+fixed synthetic active daily definition, takes scheduler leadership, runs the
+fenced tick that claims the 09:00 slot, and runs the fenced dispatch through a
+fixture runtime that behaves as a closing runtime: it writes the exact receipt
+at the production path, and from then on the dispatcher sees the shutdown.
+Vectors cannot choose a path, definition, clock, receipt or pause mechanics,
+must name every scene and boundary once, and every expected outcome is fixed
+per scene and boundary.
+
+- **After receipt:** the runtime parks once the receipt is written.
+- **Inside restore:** a fixture TEMP trigger pauses the worker after the run's
+  delete or after the occurrence's return to `planned`, the restoration's
+  first and last writes.
+- **After restore commit:** the WAL hook pauses it once SQLite has committed
+  the restoration: the dispatch's second commit, the one after the launch.
+- **Control:** no pause. The worker exits after the restoration without
+  releasing its leadership.
+
+There are two scenes: a routine with no retry policy, and one whose policy
+retries `lease_expired` once after a fixed 60 seconds. While the worker is
+paused, the parent must find the receipt recorded, the write transaction open
+exactly when the pause is inside one, and the launch committed until the
+restoration commits, then the occurrence `planned` with no run, attempt or
+session. The parent then kills and reaps a paused worker, or reaps the control
+once it exits. The store's raw integrity check must pass, and the store must
+hold what the parent read.
+
+The parent restarts in the daemon's startup order, as the run-launch suite
+does, then runs a pass after any retry's delay, ends the launched session with
+exit code 0, runs a pass that settles the run, and runs a further pass that
+must change nothing.
+
+- **The dispatcher's restoration committed,** and the control: the restart
+  claims and launches the slot again, and it succeeds.
+- **The launch committed and the receipt recorded, no retry policy:** the
+  restart's receipt-proven recovery restores the launch as the dispatcher
+  would have, and the startup pass launches it again.
+- **The launch committed and the receipt recorded, lease-expiry retry:** the
+  restart settles the first attempt `failed` for `lease_expired`, "claim lease
+  expired with proof that no process started", fails its session, and opens a
+  second attempt due 60 seconds later on the same run, with the occurrence
+  `planned` and the proof as its reason. Nothing launches at the restart. The
+  pass after the delay launches the second attempt, and the occurrence keeps
+  the proof as its reason until the run settles, as an automatic retry keeps
+  the failure it retries.
+
+Every case ends with exactly one launch, the slot claimed twice, and no stop. A
+stop fence, or a retry exhaustion or quarantine recorded for the routine, makes
+a store mixed. A store that recovery refuses fails the case. A further pass
+must change no occurrence, run, attempt, event, session, stop-fence or
+retry-state row.
+
+Observations carry scene, boundary, launch classes, receipt booleans, counts
+and booleans. They never carry occurrence, run, attempt or session ids, receipt
+paths, paths, handshakes or output. This is `audit_only` evidence for a daemon
+killed after a closing runtime recorded the no-process receipt for one
+scheduled launch. It does not cover a kill inside the restart's own
+receipt-proven recovery, which would need a worker that reopens the parent's
+store; the supervisor guardian's receipts, or a fork failure's; the quiescent
+receipt and restart containment; a refused launch that is itself a retry, which
+the dispatcher restores by returning its attempt to `adopted` and keeping the
+run; a receipt-proven launch whose lease-expiry retries are exhausted, which
+records the exhaustion and holds the run; a retry policy with attempts left
+after the second; a receipt for a manual occurrence; Runtime Authority
+launches, whose refused launch settles for a transient dispatch retry instead;
+a real runtime process, power loss, load, complete profiles or release
+eligibility.
