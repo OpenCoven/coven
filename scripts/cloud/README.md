@@ -70,6 +70,28 @@ or redirected tool storage, choose a new dedicated external cache; do not delete
 unrelated directories. For a denied host, record the stage and official endpoint
 for the environment owner's review rather than broadening access automatically.
 
+## Network destinations
+
+Bootstrap and readiness need only these destinations, all anonymous HTTPS. Start
+the managed environment on the Package managers preset with no provider
+credentials. This table lists what the repository source and lockfiles reference.
+It is not an observed policy: a host the preset denies becomes an #1447 exception
+only once an owner records the denied stage, purpose and removal criterion.
+
+| Host | Stage | Purpose | Removal criterion |
+| --- | --- | --- | --- |
+| Host distribution APT archives | `native_dependencies` | Signed Debian/Ubuntu packages from the validated base-image sources | Base image ships the native prerequisites |
+| `static.rust-lang.org` | `rustup_download`, `rust_toolchain` | rustup-init, its checksum and the pinned toolchain | Toolchain persisted in the prepared cache |
+| `nodejs.org` | `node_download` | Pinned Node archive and `SHASUMS256.txt` | Node persisted in the prepared cache |
+| `registry.npmjs.org` | `manager_install`, `dependencies` | Pinned package managers and locked npm/pnpm dependencies | Dependencies vendored or cached |
+| `index.crates.io` | `readiness` (cargo build) | crates.io sparse index for `Cargo.lock` | Crates vendored |
+| `static.crates.io` | `readiness` (cargo build) | crates.io crate downloads | Crates vendored |
+| `github.com` | `readiness` (cargo build) | Public OpenCoven git dependencies pinned in `Cargo.lock` (git transport, not `api.github.com`) | Dependencies published to crates.io |
+
+`bootstrap-test.py` fails when a source or lockfile references a host missing
+from this table. Do not add `api.github.com`, browser CDNs, wildcards or
+unrestricted internet to make setup pass.
+
 ## Verification and managed handoff
 
 Local fixture tests run without provisioning tools or contacting providers:
