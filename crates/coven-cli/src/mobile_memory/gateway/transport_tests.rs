@@ -327,6 +327,53 @@ fn encrypted_gateway_keeps_per_request_signatures_and_shared_replay_state() {
 }
 
 #[test]
+fn relay_shutdown_cancels_contended_registry_lock_without_mutating_authority() {
+    use fs2::FileExt;
+    let fixture = Fixture::new();
+    let relay = super::super::transport::test_support::Relay::start();
+    let home = fixture.state.coven_home.clone();
+    storage::RelayConfig {
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(&home)
+    .unwrap();
+    let before = std::fs::read(home.join("mobile/devices.json")).unwrap();
+    let identity = super::super::identity::load_existing_host_identity(&home).unwrap();
+    let signer = Arc::new(SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap());
+    let state = Arc::new(fixture.state);
+    let registry = Arc::clone(&state.registry);
+    let held = crate::state_lock::open_lock_file(&home.join("mobile/.devices.lock")).unwrap();
+    held.lock_exclusive().unwrap();
+    let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+    registry.observe_lock_waits(ready);
+    let runtime = relay_runtime::RelayHandle::start(state, signer).unwrap();
+    // An explicit failed try-lock, not a sleep, proves the manager is waiting.
+    waiting.recv_timeout(Duration::from_secs(30)).unwrap();
+    let started = Instant::now();
+    drop(runtime);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "registry contention exceeded daemon stop contract: {elapsed:?}"
+    );
+    assert!(
+        registry.reload().is_err(),
+        "stopping registry admitted another operation"
+    );
+    FileExt::unlock(&held).unwrap();
+    assert_eq!(
+        std::fs::read(home.join("mobile/devices.json")).unwrap(),
+        before
+    );
+    assert!(
+        DeviceRegistry::load(&home).is_ok(),
+        "shutdown poisoned a future registry instance"
+    );
+}
+
+#[test]
 fn authenticated_bootstrap_reuses_identity_and_persists_routing_without_qr() {
     let fixture = Fixture::new();
     let wire = fixture.request(

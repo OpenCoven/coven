@@ -5,6 +5,7 @@ pub(super) use introduction::fail_after_introduction_write;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 
 use anyhow::{bail, Context, Result};
@@ -47,16 +48,53 @@ struct DeviceRegistryStoreLock {
 
 impl DeviceRegistryStoreLock {
     fn acquire(path: &Path) -> Result<Self> {
-        let process = DEVICE_REGISTRY_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile device registry process lock poisoned"))?;
+        Self::acquire_cancellable(path, &AtomicBool::new(false), || {})
+    }
+
+    fn acquire_cancellable(
+        path: &Path,
+        stopped: &AtomicBool,
+        mut waiting: impl FnMut(),
+    ) -> Result<Self> {
+        let check = || -> Result<()> {
+            anyhow::ensure!(
+                !stopped.load(Ordering::Acquire),
+                "mobile device registry is stopping"
+            );
+            Ok(())
+        };
+        let mut wait = || {
+            waiting();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let process = loop {
+            check()?;
+            match DEVICE_REGISTRY_LOCK.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::WouldBlock) => wait(),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    bail!("mobile device registry process lock poisoned")
+                }
+            }
+        };
         let parent = path
             .parent()
             .context("mobile device registry path has no parent")?;
         let lock_path = parent.join(DEVICE_REGISTRY_LOCK_FILE);
         let file = crate::state_lock::open_lock_file(&lock_path)?;
-        file.lock_exclusive()
-            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        loop {
+            check()?;
+            match file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if crate::state_lock::is_lock_contended(&error) => wait(),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to lock {}", lock_path.display()))
+                }
+            }
+        }
+        // Cancellation stops admission, never interrupts an acquired transaction.
+        check()?;
         Ok(Self {
             _process: process,
             file,
@@ -192,6 +230,9 @@ pub struct DeviceRegistry {
     path: PathBuf,
     devices: RwLock<Vec<GrantedDeviceRecord>>,
     authorization_keys: AuthorizationKeyRegistry,
+    stopped: AtomicBool,
+    #[cfg(test)]
+    lock_wait_observer: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -214,6 +255,24 @@ pub struct DeviceStatusRecord {
 }
 
 impl DeviceRegistry {
+    pub(crate) fn cancel_pending_operations(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    fn acquire_store_lock(&self) -> Result<DeviceRegistryStoreLock> {
+        DeviceRegistryStoreLock::acquire_cancellable(&self.path, &self.stopped, || {
+            #[cfg(test)]
+            if let Some(observer) = self.lock_wait_observer.lock().unwrap().as_ref() {
+                let _ = observer.try_send(());
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_lock_waits(&self, observer: std::sync::mpsc::SyncSender<()>) {
+        *self.lock_wait_observer.lock().unwrap() = Some(observer);
+    }
+
     pub fn load(coven_home: &Path) -> Result<Self> {
         let mobile_dir = ensure_private_mobile_dir(coven_home)?;
         let path = mobile_dir.join(DEVICES_FILE);
@@ -231,6 +290,9 @@ impl DeviceRegistry {
             path,
             devices: RwLock::new(loaded.devices),
             authorization_keys: AuthorizationKeyRegistry::load(coven_home)?,
+            stopped: AtomicBool::new(false),
+            #[cfg(test)]
+            lock_wait_observer: Mutex::new(None),
         })
     }
 
@@ -243,7 +305,7 @@ impl DeviceRegistry {
     }
 
     pub fn reload(&self) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         if loaded.migrated {
             write_registry(
@@ -286,7 +348,7 @@ impl DeviceRegistry {
             grant,
         };
         validate_granted_device(&granted)?;
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         if loaded.devices.len() >= MAX_DEVICE_RECORDS {
             bail!("mobile device registry is full");
@@ -371,7 +433,7 @@ impl DeviceRegistry {
     }
 
     pub fn replace_grant(&self, device_id: Uuid, grant: DeviceGrant) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         if loaded
             .grant_reissue_transitions
@@ -422,7 +484,7 @@ impl DeviceRegistry {
         &self,
         request: DeviceGrantReissueRequest,
     ) -> Result<DeviceGrantReissueResult> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         if loaded.grant_reissue_transitions.iter().any(|transition| {
             transition.device_id == request.expected.device_id && transition.audited_at.is_none()
@@ -510,7 +572,7 @@ impl DeviceRegistry {
         if source_revision.device_id == replacement_revision.device_id {
             bail!("source and replacement mobile devices must differ");
         }
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         let mut devices = self
             .devices
@@ -691,7 +753,7 @@ impl DeviceRegistry {
     }
 
     pub fn rename(&self, device_id: Uuid, display_name: String) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         let mut devices = self
             .devices
@@ -727,7 +789,7 @@ impl DeviceRegistry {
     /// Suspending an already-suspended device keeps the original timestamp, so
     /// repeating the command cannot quietly extend or reset anything.
     pub fn suspend(&self, device_id: Uuid, suspended_at: DateTime<Utc>) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         let mut devices = self
             .devices
@@ -762,7 +824,7 @@ impl DeviceRegistry {
     /// grant that expired or was tightened while the device was suspended stays
     /// unusable afterwards.
     pub fn resume(&self, device_id: Uuid) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         let mut devices = self
             .devices
@@ -789,7 +851,7 @@ impl DeviceRegistry {
     }
 
     pub fn revoke(&self, device_id: Uuid, revoked_at: DateTime<Utc>) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         if loaded
             .grant_reissue_transitions
@@ -827,7 +889,7 @@ impl DeviceRegistry {
     }
 
     pub fn forget_all(&self) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         if loaded.rotation_transitions.iter().any(|transition| {
             transition.audited_at.is_none()
@@ -899,7 +961,7 @@ impl DeviceRegistry {
     }
 
     pub(crate) fn pending_rotation_audits(&self) -> Result<Vec<DeviceRotationAuditTransition>> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         Ok(loaded
             .rotation_transitions
@@ -912,7 +974,7 @@ impl DeviceRegistry {
         &self,
         device_id: Uuid,
     ) -> Result<Option<DeviceGrantReissueAuditTransition>> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         let pending: Vec<_> = loaded
             .grant_reissue_transitions
@@ -944,7 +1006,7 @@ impl DeviceRegistry {
         receipt: &AuditDeliveryReceipt,
         audited_at: DateTime<Utc>,
     ) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let mut loaded = read_registry(&self.path)?;
         let transition = loaded
             .rotation_transitions
@@ -972,7 +1034,7 @@ impl DeviceRegistry {
         transition_id: Uuid,
         completed_at: DateTime<Utc>,
     ) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let mut loaded = read_registry(&self.path)?;
         let transition = loaded
             .rotation_transitions
@@ -1011,7 +1073,7 @@ impl DeviceRegistry {
         receipt: &AuditDeliveryReceipt,
         audited_at: DateTime<Utc>,
     ) -> Result<()> {
-        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _store_lock = self.acquire_store_lock()?;
         let mut loaded = read_registry(&self.path)?;
         let transition = loaded
             .grant_reissue_transitions
@@ -1395,6 +1457,34 @@ fn validate_device(device: &DeviceRecord) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shutdown_cancels_a_wait_on_the_process_registry_mutex() {
+        let home = tempfile::tempdir().unwrap();
+        let path = super::ensure_private_mobile_dir(home.path())
+            .unwrap()
+            .join(super::DEVICES_FILE);
+        let held = super::DEVICE_REGISTRY_LOCK.lock().unwrap();
+        let stopped = std::sync::Arc::new(super::AtomicBool::new(false));
+        let worker_stopped = std::sync::Arc::clone(&stopped);
+        let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result =
+                super::DeviceRegistryStoreLock::acquire_cancellable(&path, &worker_stopped, || {
+                    let _ = ready.try_send(());
+                });
+            match result {
+                Ok(_) => panic!("contended registry operation was admitted"),
+                Err(error) => assert_eq!(error.to_string(), "mobile device registry is stopping"),
+            }
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        stopped.store(true, super::Ordering::Release);
+        worker.join().unwrap();
+        drop(held);
+    }
+
     use super::super::assurance::AssuranceClass;
     use super::*;
     use p256::elliptic_curve::sec1::ToEncodedPoint;

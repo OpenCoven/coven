@@ -79,6 +79,7 @@ struct Retry {
 
 pub(super) struct RelayHandle {
     stop: Arc<Stop>,
+    registry: Arc<DeviceRegistry>,
     thread: Option<JoinHandle<()>>,
 }
 impl RelayHandle {
@@ -86,11 +87,13 @@ impl RelayHandle {
         transport::diagnostics::initialize()?;
         let stop = Arc::new(Stop::default());
         let manager_stop = Arc::clone(&stop);
+        let registry = Arc::clone(&state.registry);
         let thread = std::thread::Builder::new()
             .name("coven-relay-manager".into())
             .spawn(move || manage(state, signer, manager_stop))?;
         Ok(Self {
             stop,
+            registry,
             thread: Some(thread),
         })
     }
@@ -98,6 +101,7 @@ impl RelayHandle {
 impl Drop for RelayHandle {
     fn drop(&mut self) {
         self.stop.request();
+        self.registry.cancel_pending_operations();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
