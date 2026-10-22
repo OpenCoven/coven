@@ -179,20 +179,44 @@ fn transition_digest(
     Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(material)))
 }
 
-/// True when `new` grants no introduction authority that `old` refused.
+/// Names every dimension on which `new` grants introduction authority that
+/// `old` refused. Empty means the change keeps or tightens policy.
+pub(super) fn broadened_dimensions(
+    new: &IntroductionPolicy,
+    old: &IntroductionPolicy,
+) -> Vec<&'static str> {
+    let mut broadened = Vec::new();
+    if new.required_approvals < old.required_approvals {
+        broadened.push("required approvals");
+    }
+    if new
+        .eligible_introducers
+        .iter()
+        .any(|id| old.eligible_introducers.binary_search(id).is_err())
+    {
+        broadened.push("eligible introducers");
+    }
+    if new
+        .allowed_scopes
+        .iter()
+        .any(|scope| old.allowed_scopes.binary_search(scope).is_err())
+    {
+        broadened.push("allowed scopes");
+    }
+    if new.maximum_grant_lifetime_seconds > old.maximum_grant_lifetime_seconds {
+        broadened.push("maximum grant lifetime");
+    }
+    if new.minimum_assurance() < old.minimum_assurance() {
+        broadened.push("required assurance");
+    }
+    if new.maximum_step_up_age_seconds > old.maximum_step_up_age_seconds {
+        broadened.push("maximum step-up age");
+    }
+    broadened
+}
+
 pub(super) fn is_at_least_as_strict(new: &IntroductionPolicy, old: &IntroductionPolicy) -> bool {
-    new.required_approvals >= old.required_approvals
-        && new
-            .eligible_introducers
-            .iter()
-            .all(|id| old.eligible_introducers.binary_search(id).is_ok())
-        && new
-            .allowed_scopes
-            .iter()
-            .all(|scope| old.allowed_scopes.binary_search(scope).is_ok())
-        && new.maximum_grant_lifetime_seconds <= old.maximum_grant_lifetime_seconds
-        && new.minimum_assurance() >= old.minimum_assurance()
-        && new.maximum_step_up_age_seconds <= old.maximum_step_up_age_seconds
+    broadened_dimensions(new, old).is_empty()
 }
 
 struct PolicyStoreLock {
