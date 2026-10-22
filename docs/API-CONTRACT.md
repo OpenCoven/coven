@@ -617,6 +617,17 @@ missing table or lease column, or a view in the table's place, reports
 Otherwise all four are required, and the three lease counts must sum to a
 total within the safe-integer range.
 
+`queue` also counts runs that settlement has not finished: `running_runs`,
+`running_runs_with_ended_sessions` (the session is `completed`, `failed`,
+`cancelled`, `killed` or `idle`) and `running_runs_with_failed_latest_attempt`
+(no authority profile, and the latest attempt is `failed`; this is stored
+state, not retry eligibility). The subsets overlap, neither may exceed the
+total, and the failed-attempt subset may not exceed `failed_attempts` in
+`repeated_failures` when both are present. A missing table or required column
+among `automation_runs`, `sessions` and `automation_attempts`, or a view in a
+table's place, reports `running_run_store_unavailable` as the last queue gap
+and omits all three counts. Otherwise all three are required.
+
 This initial diagnostic contract explicitly reports incomplete evidence. It has
 no aggregate health or certification bit. See the [doctor runbook](reference/automations-doctor.md)
 for each category's scope and remaining checks. The complete doctor outcome in
