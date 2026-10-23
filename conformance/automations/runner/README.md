@@ -991,8 +991,11 @@ each case requires depends on how far the cancellation got:
 
 - **Nothing committed:** the restart's containment marks the lost session
   `killed`, and its startup pass settles the attempt `failed`, which holds the
-  run for an operator retry. The re-sent request stores an
-  `ILLEGAL_TRANSITION` refusal, and later requests replay it.
+  run for an operator retry. The re-sent request releases the held run as a
+  fresh one would (#1486): in one transaction it reserves, settles the run
+  and the occurrence `cancelled`, leaves the failed attempt and its `killed`
+  session as they are, and stores a `cancelled` answer, which later requests
+  replay.
 - **Reserved, without the fence:** the same containment and hold. The request
   inside the lease is answered `CANCEL_PENDING` and writes nothing. The pass
   rejects the cancellation with `ILLEGAL_TRANSITION`, which later requests
@@ -1112,7 +1115,8 @@ It does not cover an eligible or planned slot, a waiting retry attempt (see
 `waiting-retry-cancellation-process-crash-recovery` for an automatic one), a
 request first sent to a run already held for an operator retry, a kill inside
 an `occurrence.cancel.v1` request that delegates a running attempt's stop
-(tracked in #1486), the run-cancellation envelope, a delegation waiting on
+(native unit tests cover its delegation window, #1486), the run-cancellation
+envelope, a delegation waiting on
 runtime ownership, Runtime Authority runs, a stop the runtime fails to confirm,
 a graceful daemon restart, a real runtime process, power loss, load, complete
 profiles or release eligibility.

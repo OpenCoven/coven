@@ -2427,13 +2427,15 @@ fn native_target_evaluates_checked_in_run_cancellation_process_crash_vectors() -
             "fenced" | "stopped" => "contained",
             _ => "cancelled",
         };
+        // With nothing reserved, the re-sent request releases the run held
+        // for an operator retry (#1486).
         let reissue = match stage {
-            "untouched" => "refused",
+            "untouched" => "released",
             "answered" => "cancelled",
             _ => "pending",
         };
         let (run_after_pass, cancellation_after_pass, resend) = match stage {
-            "untouched" => ("held", "refused", "rejected"),
+            "untouched" => ("released", "cancelled", "cancelled"),
             "reserved" => ("held", "rejected", "rejected"),
             "fenced" | "stopped" => ("failed", "recovery_required", "recovery_required"),
             _ => ("cancelled", "cancelled", "cancelled"),

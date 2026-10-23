@@ -1465,6 +1465,179 @@ mod tests {
         }
     }
 
+    /// The daemon dies after `occurrence.cancel.v1` stores its delegation and
+    /// before the run cancellation is reserved; the restart fails the attempt
+    /// and holds the run (#1486).
+    fn delegated_then_held(key: &str) -> (Fixture, Value) {
+        let fixture = running();
+        let body = json!({ "action": OCCURRENCE_CANCEL_ACTION, "adoptionKey": key,
+                           "occurrenceId": "occ.notes-1" });
+        super::super::cancel_commands::set_after_delegation_commit_test_hook(Some(Box::new(
+            || panic!("synthetic crash after the delegation commit"),
+        )));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_occurrence_cancel(
+                &fixture.conn,
+                &NoopSessionRuntime,
+                body.clone(),
+                fixture.now,
+            )
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+        let session: String = fixture
+            .conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE id = ?1",
+                [&fixture.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::store::update_session_terminal_if_active(
+            &fixture.conn,
+            &session,
+            "killed",
+            None,
+            &iso(fixture.now),
+        )
+        .unwrap();
+        assert_eq!(
+            settle_finished_runs(&fixture.conn, fixture.now)
+                .unwrap()
+                .failed,
+            0
+        );
+        (fixture, body)
+    }
+
+    fn run_occurrence_attempt(fixture: &Fixture) -> (String, String, String) {
+        fixture
+            .conn
+            .query_row(
+                "SELECT run.status, occurrence.state, attempt.state
+                 FROM automation_runs AS run
+                 JOIN automation_occurrences AS occurrence ON occurrence.id = run.occurrence_id
+                 JOIN automation_attempts AS attempt ON attempt.run_id = run.id
+                 WHERE run.id = ?1 AND attempt.attempt_number = 1",
+                [&fixture.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn replayed_occurrence_delegation_releases_the_run_held_after_a_crash() {
+        let (fixture, body) = delegated_then_held("adopt:cancel:delegated-held");
+        assert_eq!(
+            run_occurrence_attempt(&fixture),
+            ("running".into(), "running".into(), "failed".into())
+        );
+        // A fresh request would release the held run, and so does the
+        // owner's re-sent one, whichever side of the delegation the daemon
+        // died on.
+        let CancelExecution::Success { payload, .. } = execute_occurrence_cancel(
+            &fixture.conn,
+            &NoopSessionRuntime,
+            body.clone(),
+            fixture.now,
+        )
+        .unwrap() else {
+            panic!("the re-sent occurrence cancellation was refused");
+        };
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["occurrenceId"], "occ.notes-1");
+        assert_eq!(
+            run_occurrence_attempt(&fixture),
+            ("cancelled".into(), "cancelled".into(), "failed".into())
+        );
+        let CancelExecution::Success {
+            payload: replayed, ..
+        } = execute_occurrence_cancel(&fixture.conn, &NoopSessionRuntime, body, fixture.now)
+            .unwrap()
+        else {
+            panic!("the stored answer must replay");
+        };
+        assert_eq!(replayed, payload);
+    }
+
+    #[test]
+    fn replayed_occurrence_delegation_never_cancels_a_later_attempt() {
+        let (fixture, body) = delegated_then_held("adopt:cancel:delegated-retried");
+        assert!(matches!(
+            execute_attempt_retry(
+                &fixture.conn,
+                request(&fixture, "adopt:retry:after-delegation", 1, "failed"),
+                fixture.now
+            )
+            .unwrap(),
+            RetryExecution::Success { .. }
+        ));
+        // The delegation stays pinned to attempt 1: the replay may not move
+        // to the attempt the operator opened.
+        let CancelExecution::Rejected(error) =
+            execute_occurrence_cancel(&fixture.conn, &NoopSessionRuntime, body, fixture.now)
+                .unwrap()
+        else {
+            panic!("the replay cancelled the retried run");
+        };
+        assert_eq!(error.code(), ErrorCode::IllegalTransition);
+        let run_status: String = fixture
+            .conn
+            .query_row(
+                "SELECT status FROM automation_runs WHERE id = ?1",
+                [&fixture.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_status, "running");
+    }
+
+    #[test]
+    fn replayed_attempt_delegation_still_refuses_a_held_run() {
+        let fixture = running();
+        let body = json!({ "action": ATTEMPT_CANCEL_ACTION, "adoptionKey": "adopt:cancel:attempt-held",
+                           "attemptId": format!("attempt-{}-1", fixture.run_id) });
+        super::super::cancel_commands::set_after_delegation_commit_test_hook(Some(Box::new(
+            || panic!("synthetic crash after the delegation commit"),
+        )));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_attempt_cancel(
+                &fixture.conn,
+                &NoopSessionRuntime,
+                body.clone(),
+                fixture.now,
+            )
+        }));
+        assert!(crashed.is_err());
+        let session: String = fixture
+            .conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE id = ?1",
+                [&fixture.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::store::update_session_terminal_if_active(
+            &fixture.conn,
+            &session,
+            "killed",
+            None,
+            &iso(fixture.now),
+        )
+        .unwrap();
+        settle_finished_runs(&fixture.conn, fixture.now).unwrap();
+        // A failed attempt is never cancellable (#1485): the hold stays.
+        let CancelExecution::Rejected(error) =
+            execute_attempt_cancel(&fixture.conn, &NoopSessionRuntime, body, fixture.now).unwrap()
+        else {
+            panic!("an attempt cancellation released the held run");
+        };
+        assert_eq!(error.code(), ErrorCode::IllegalTransition);
+        assert_eq!(
+            run_occurrence_attempt(&fixture),
+            ("running".into(), "running".into(), "failed".into())
+        );
+    }
+
     #[test]
     fn cancelling_the_occurrence_releases_a_held_run() {
         let fixture = held();

@@ -7,6 +7,8 @@ use super::contract::authority::AUTHORITY_PROFILE;
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{ErrorCode, ErrorEnvelope};
 use super::contract::types::AdoptionKey;
+use super::occurrences::settle_occurrence;
+use super::runs::{record_run_finish, RunFinish};
 use crate::api::SessionRuntime;
 
 #[cfg(test)]
@@ -801,6 +803,9 @@ struct ReservedCancellation {
 
 enum CancellationReservation {
     Reserved(ReservedCancellation),
+    /// The request released a run held for an operator retry, and its
+    /// `cancelled` answer is already stored.
+    Released(Value),
     DeadlineExpired {
         run_id: String,
         reservation: Option<ReservedCancellation>,
@@ -851,6 +856,26 @@ pub(crate) fn execute_run_cancellation_at_stop_fence_with_observer(
     )
 }
 
+/// Delegated by `attempt.cancel.v1`, which never cancels a failed attempt:
+/// a run held for an operator retry is refused, not released (#1485, #1486).
+pub(crate) fn execute_attempt_run_cancellation(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+    stop_fence_at: Option<DateTime<Utc>>,
+) -> Result<CancellationExecution, String> {
+    execute_run_cancellation_releasing(
+        conn,
+        runtime,
+        body,
+        now,
+        stop_fence_at,
+        None,
+        HeldRun::Refuse,
+    )
+}
+
 fn execute_run_cancellation_with_stop_fence_time(
     conn: &Connection,
     runtime: &dyn SessionRuntime,
@@ -858,6 +883,36 @@ fn execute_run_cancellation_with_stop_fence_time(
     now: DateTime<Utc>,
     stop_fence_at: Option<DateTime<Utc>>,
     before_stop_fence: Option<Box<dyn FnOnce() -> Result<(), String>>>,
+) -> Result<CancellationExecution, String> {
+    execute_run_cancellation_releasing(
+        conn,
+        runtime,
+        body,
+        now,
+        stop_fence_at,
+        before_stop_fence,
+        HeldRun::Release,
+    )
+}
+
+/// What a new reservation does with a run held for an operator retry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeldRun {
+    /// Settle the run and its occurrence `cancelled`, as the run
+    /// cancellation envelope does for a held run (#1486).
+    Release,
+    /// Refuse: the attempt is no longer cancellable.
+    Refuse,
+}
+
+fn execute_run_cancellation_releasing(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+    stop_fence_at: Option<DateTime<Utc>>,
+    before_stop_fence: Option<Box<dyn FnOnce() -> Result<(), String>>>,
+    held_run: HeldRun,
 ) -> Result<CancellationExecution, String> {
     let digest = sha256_hex(
         &canonicalize(&body)
@@ -894,8 +949,15 @@ fn execute_run_cancellation_with_stop_fence_time(
         return Ok(CancellationExecution::Rejected(error));
     }
 
-    let reservation = match reserve_cancellation(conn, request, digest.clone(), now)? {
+    let reservation = match reserve_cancellation(conn, request, digest.clone(), now, held_run)? {
         Ok(CancellationReservation::Reserved(reservation)) => reservation,
+        Ok(CancellationReservation::Released(payload)) => {
+            return Ok(CancellationExecution::Success(CancellationSuccess {
+                payload,
+                terminal_replayed: false,
+                replayed: false,
+            }));
+        }
         Ok(CancellationReservation::DeadlineExpired {
             run_id,
             reservation,
@@ -1356,6 +1418,7 @@ fn reserve_cancellation(
     request: CancellationRequest,
     digest: String,
     now: DateTime<Utc>,
+    held_run: HeldRun,
 ) -> Result<Result<CancellationReservation, ErrorEnvelope>, String> {
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin cancellation reservation: {error}"))?;
@@ -1602,21 +1665,42 @@ fn reserve_cancellation(
             "run, attempt, and runtime correlation do not identify one live attempt",
         )));
     };
-    if run_state != "running"
-        || !matches!(
-            attempt_state.as_str(),
-            "dispatching" | "started" | "observing"
-        )
-        || !matches!(session_state.as_str(), "created" | "running" | "orphaned")
+    // A failed attempt whose run is held for an operator retry is released
+    // below, once its reservation is written; anything else that has ended
+    // is no longer cancellable.
+    let held = held_run == HeldRun::Release
+        && run_state == "running"
+        && attempt_state == "failed"
+        && !matches!(session_state.as_str(), "created" | "running" | "orphaned");
+    let not_cancellable =
+        || illegal_transition_error("the targeted automation attempt is no longer cancellable");
+    if !held
+        && (run_state != "running"
+            || !matches!(
+                attempt_state.as_str(),
+                "dispatching" | "started" | "observing"
+            )
+            || !matches!(session_state.as_str(), "created" | "running" | "orphaned"))
     {
         transaction
             .rollback()
             .map_err(|error| format!("failed to close terminal cancellation lookup: {error}"))?;
-        return Ok(Err(illegal_transition_error(
-            "the targeted automation attempt is no longer cancellable",
-        )));
+        return Ok(Err(not_cancellable()));
     }
-    if let Some(timeout_at) = timeout_at {
+    let earlier_cancellation: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM automation_cancellations WHERE attempt_id = ?1)",
+            [&request.attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to inspect earlier attempt cancellation: {error}"))?;
+    if held && earlier_cancellation {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to close held cancellation lookup: {error}"))?;
+        return Ok(Err(not_cancellable()));
+    }
+    if let Some(timeout_at) = timeout_at.filter(|_| !held) {
         let timeout_at = DateTime::parse_from_rfc3339(&timeout_at)
             .map_err(|error| format!("stored cancellation target timeout is invalid: {error}"))?
             .with_timezone(&Utc);
@@ -1665,21 +1749,32 @@ fn reserve_cancellation(
             ],
         )
         .map_err(|error| format!("failed to reserve automation cancellation: {error}"))?;
+    let reservation = ReservedCancellation {
+        request,
+        digest,
+        automation_id,
+        requested_at,
+        execution_expires_at,
+        owns_execution: true,
+        recover_unknown_stop: false,
+    };
+    if held {
+        let Some(payload) = release_held_run_in(&transaction, &reservation, now)? else {
+            transaction
+                .rollback()
+                .map_err(|error| format!("failed to close held cancellation lookup: {error}"))?;
+            return Ok(Err(not_cancellable()));
+        };
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit held run cancellation: {error}"))?;
+        return Ok(Ok(CancellationReservation::Released(payload)));
+    }
     transaction.commit().map_err(|error| {
         format!("failed to commit automation cancellation reservation: {error}")
     })?;
 
-    Ok(Ok(CancellationReservation::Reserved(
-        ReservedCancellation {
-            request,
-            digest,
-            automation_id,
-            requested_at,
-            execution_expires_at,
-            owns_execution: true,
-            recover_unknown_stop: false,
-        },
-    )))
+    Ok(Ok(CancellationReservation::Reserved(reservation)))
 }
 
 fn load_adopted_response(
@@ -1749,6 +1844,19 @@ fn finalize_success(
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| format!("failed to begin cancellation finalization: {error}"))?;
+    finalize_success_in(&transaction, reservation, state, payload, now)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit cancellation finalization: {error}"))
+}
+
+fn finalize_success_in(
+    transaction: &Connection,
+    reservation: &ReservedCancellation,
+    state: &str,
+    payload: &Value,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
     let now_iso = iso(now);
     let (acknowledged_at, reconciled_at) = if state == "cancelled" {
         (Some(now_iso.as_str()), Some(now_iso.as_str()))
@@ -1787,15 +1895,94 @@ fn finalize_success(
         )
         .map_err(|error| format!("failed to release cancellation adoption reservation: {error}"))?;
     insert_adoption(
-        &transaction,
+        transaction,
         reservation,
         "committed",
         &json!({"outcome": "committed", "result": payload}),
         now,
-    )?;
-    transaction
-        .commit()
-        .map_err(|error| format!("failed to commit cancellation finalization: {error}"))
+    )
+}
+
+/// Releases a run held for an operator retry when the reservation names its
+/// latest, failed attempt, as the run-cancellation envelope's held branch
+/// does (#1486). The run and the occurrence settle `cancelled`, the failed
+/// attempt stays as it is, and the reservation is answered `cancelled`, all
+/// in the caller's transaction. `None` when the run is not so held.
+fn release_held_run_in(
+    conn: &Connection,
+    reservation: &ReservedCancellation,
+    now: DateTime<Utc>,
+) -> Result<Option<Value>, String> {
+    let request = &reservation.request;
+    let held = conn
+        .query_row(
+            "SELECT r.occurrence_id, r.session_id, r.timeout_at
+             FROM automation_runs AS r
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             JOIN sessions AS s ON s.id = a.session_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             WHERE r.id = ?1 AND a.id = ?2 AND a.session_id = ?3
+               AND r.status = 'running' AND r.authority_profile IS NULL
+               AND a.state = 'failed'
+               AND a.attempt_number = (
+                   SELECT MAX(latest.attempt_number) FROM automation_attempts AS latest
+                   WHERE latest.run_id = r.id
+               )
+               AND s.status IN ('completed', 'failed', 'cancelled', 'killed', 'idle')
+               AND o.state IN ('claimed', 'running')
+               AND NOT EXISTS (SELECT 1 FROM automation_stop_fences f WHERE f.run_id = r.id)",
+            params![
+                request.run_id,
+                request.attempt_id,
+                request.runtime_correlation.session_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect held cancellation target: {error}"))?;
+    let Some((occurrence_id, session_id, Some(timeout_at))) = held else {
+        return Ok(None);
+    };
+    // Past its deadline, the hold settles failed; cancellation cannot win.
+    let deadline = DateTime::parse_from_rfc3339(&timeout_at)
+        .map_err(|error| format!("invalid held cancellation deadline: {error}"))?;
+    if deadline <= now {
+        return Ok(None);
+    }
+    let finished = record_run_finish(
+        conn,
+        &request.run_id,
+        RunFinish {
+            status: "cancelled",
+            exit_code: None,
+            session_id,
+            log_json: None,
+            output_commit: None,
+        },
+        now,
+    )
+    .map_err(|error| format!("failed to cancel the held run: {error:#}"))?;
+    if !finished
+        || !settle_occurrence(
+            conn,
+            &occurrence_id,
+            "cancelled",
+            Some(&request.reason),
+            now,
+        )?
+    {
+        return Err("the held run changed during cancellation".to_string());
+    }
+    let now_iso = iso(now);
+    let payload = cancellation_payload(reservation, "cancelled", Some(&now_iso), Some(&now_iso));
+    finalize_success_in(conn, reservation, "cancelled", &payload, now)?;
+    Ok(Some(payload))
 }
 
 fn finalize_rejection(
