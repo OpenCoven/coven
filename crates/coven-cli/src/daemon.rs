@@ -17088,4 +17088,83 @@ mod tests {
         assert!(!published, "nothing launched");
         Ok(())
     }
+
+    /// TEMPORARY #1227 diagnostic, never for merge: splits the startup store
+    /// close into its checkpoint and file-close parts on the native runner.
+    #[test]
+    fn diag_1227_startup_store_close_split() -> Result<()> {
+        use std::fmt::Write as _;
+        fn ms(d: Duration) -> f64 {
+            d.as_secs_f64() * 1000.0
+        }
+        let mut table = String::from(
+            "mode iter init_ms hub_ms wal_bytes ckpt_passive_ms frames ckpt_truncate_ms close_ms\n",
+        );
+        for iter in 0..6 {
+            for split in [false, true] {
+                let home = tempfile::tempdir()?;
+                let store_path = home.path().join("coven.sqlite3");
+                let started = Instant::now();
+                let conn =
+                    crate::store::open_store_with_initialization_observer(&store_path, |_| {})?;
+                let init = started.elapsed();
+                let started = Instant::now();
+                crate::hub::initialize_hub_identity(&conn)?;
+                let _ = crate::hub::refresh_status_snapshot_from_connection(home.path(), &conn);
+                let _ = crate::store::refresh_storage_health_snapshot_from_connection(
+                    home.path(),
+                    &conn,
+                    None,
+                );
+                let hub = started.elapsed();
+                let mut wal = store_path.as_os_str().to_owned();
+                wal.push("-wal");
+                let wal_bytes = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+                let (mut passive, mut frames, mut truncate) = (0.0, -1_i64, 0.0);
+                if split {
+                    let started = Instant::now();
+                    frames = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        row.get::<_, i64>(1)
+                    })?;
+                    passive = ms(started.elapsed());
+                    let started = Instant::now();
+                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
+                    truncate = ms(started.elapsed());
+                }
+                let started = Instant::now();
+                conn.close().map_err(|(_, error)| error)?;
+                let close = ms(started.elapsed());
+                writeln!(
+                    table,
+                    "{} {iter} {:.1} {:.1} {wal_bytes} {passive:.1} {frames} {truncate:.1} {close:.1}",
+                    if split { "split" } else { "plain" },
+                    ms(init),
+                    ms(hub),
+                )?;
+            }
+            let home = tempfile::tempdir()?;
+            let probe = home.path().join("probe.bin");
+            let started = Instant::now();
+            let mut file = std::fs::File::create(&probe)?;
+            std::io::Write::write_all(&mut file, &vec![7_u8; 4 * 1024 * 1024])?;
+            let write = ms(started.elapsed());
+            let started = Instant::now();
+            file.sync_all()?;
+            let sync = ms(started.elapsed());
+            drop(file);
+            let started = Instant::now();
+            std::fs::remove_file(&probe)?;
+            let remove = ms(started.elapsed());
+            writeln!(
+                table,
+                "file {iter} write4m_ms={write:.1} sync_ms={sync:.1} remove_ms={remove:.1}"
+            )?;
+        }
+        panic!(
+            "#1227 startup close diagnostic ({}):\n{table}",
+            std::env::consts::OS
+        );
+    }
 }
