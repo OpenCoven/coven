@@ -3526,6 +3526,7 @@ impl crate::api::SessionRuntime for ConfirmedKill {
 struct TimeoutShape {
     name: &'static str,
     occurrence: &'static str,
+    lease: Option<&'static str>,
     deadline: Option<&'static str>,
     session: &'static str,
     /// (number, state, carries the run's session)
@@ -3537,14 +3538,16 @@ struct TimeoutShape {
     next_step: NextStep,
     deadline_at: Option<&'static str>,
     /// The occurrence after the daemon's reconciliation at 10:00 with a
-    /// runtime that confirms the kill, and with one that never does; `None`
-    /// when that pass fails.
+    /// runtime that confirms the kill, and with one that never does, followed
+    /// for an abandoned launch by its run's latest attempt; `None` when that
+    /// pass fails.
     after: [Option<&'static str>; 2],
 }
 
 const TIMED_OUT: TimeoutShape = TimeoutShape {
     name: "timed-out",
     occurrence: "claimed",
+    lease: Some("2099-01-01T00:00:00.000Z"),
     deadline: Some("2026-10-22T09:30:00.000Z"),
     session: "running",
     attempts: &[(1, "started", true)],
@@ -3571,6 +3574,25 @@ macro_rules! late_fence {
     };
 }
 
+/// Renames the session of the run under test, given its new id as SQL.
+macro_rules! late_session_id {
+    ($id:literal) => {
+        concat!(
+            "PRAGMA foreign_keys = OFF;
+             UPDATE sessions SET id = ",
+            $id,
+            " WHERE id = 's-late';
+             UPDATE automation_runs SET session_id = ",
+            $id,
+            " WHERE session_id = 's-late';
+             UPDATE automation_attempts SET session_id = ",
+            $id,
+            " WHERE session_id = 's-late';
+             PRAGMA foreign_keys = ON;"
+        )
+    };
+}
+
 /// A requested cancellation of the run under test's attempt 1.
 const LATE_CANCELLATION: &str = "
     INSERT INTO automation_cancellations
@@ -3593,9 +3615,8 @@ fn timeout_store(shape: &TimeoutShape) -> (tempfile::TempDir, Connection) {
             (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
              lease_expires_at, created_at, updated_at)
          VALUES ('o-late', 'daily', '2026-10-21T09:00:00.000Z', 'manual', ?1, 1,
-                 'operator', '2099-01-01T00:00:00.000Z', '2026-10-21T09:00:00.000Z',
-                 '2026-10-21T09:00:00.000Z')",
-        [shape.occurrence],
+                 'operator', ?2, '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z')",
+        rusqlite::params![shape.occurrence, shape.lease],
     )
     .unwrap();
     session(&conn, "s-late", shape.session);
@@ -4184,6 +4205,920 @@ fn each_run_past_its_deadline_names_what_reconciliation_does_with_it() {
                 shape.next_step,
                 shape.deadline_at.map(str::to_string),
                 shape.after.map(|state| state.map(str::to_string)),
+            )
+        })
+        .collect();
+    assert_eq!(seen, expected);
+}
+
+/// The occurrence after the daemon's reconciliation at 10:00 with `runtime`,
+/// or `None` when the pass fails.
+fn occurrence_after_pass(
+    temp: &tempfile::TempDir,
+    conn: &Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+) -> Option<String> {
+    crate::automations::daemon_tick::reconcile_automation_runs(
+        temp.path(),
+        conn,
+        runtime,
+        now(),
+        None,
+    )
+    .ok()
+    .map(|()| {
+        conn.query_row(
+            "SELECT state FROM automation_occurrences WHERE id = 'o-late'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    })
+}
+
+/// The occurrence and its run's latest attempt after the daemon's
+/// reconciliation at 10:00 with `runtime`, or `None` when the pass fails.
+fn launch_after_pass(
+    temp: &tempfile::TempDir,
+    conn: &Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+) -> Option<String> {
+    occurrence_after_pass(temp, conn, runtime).map(|occurrence| {
+        let attempt: Option<String> = conn
+            .query_row(
+                "SELECT state FROM automation_attempts WHERE run_id = 'r-late'
+                 ORDER BY attempt_number DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        format!("{occurrence}/{}", attempt.as_deref().unwrap_or("none"))
+    })
+}
+
+const ABANDONED: TimeoutShape = TimeoutShape {
+    name: "abandoned",
+    lease: Some("2026-10-22T09:00:00.000Z"),
+    deadline: None,
+    session: "created",
+    attempts: &[(1, "dispatching", true)],
+    code: WorkCode::LaunchAbandoned,
+    deadline_at: None,
+    after: [Some("failed/failed"), Some("recovery_required/ambiguous")],
+    ..TIMED_OUT
+};
+
+/// What the daemon's reconciliation does with a launch whose session has not
+/// started when its claim's lease expires, one store per shape and runtime so
+/// that a failing pass hides nothing. Each shape gives the occurrence and the
+/// run's latest attempt after each pass, and also after a pass that finds a
+/// containment receipt, proving the launch already stopped, with a runtime
+/// that never confirms a kill.
+#[test]
+fn each_abandoned_launch_names_what_reconciliation_does_with_it() {
+    let in_flight = |name, after| TimeoutShape {
+        name,
+        code: WorkCode::InFlight,
+        next_step: NextStep::InspectOccurrence,
+        after,
+        ..ABANDONED
+    };
+    let shapes = [
+        (ABANDONED, Some("failed/failed")),
+        (
+            TimeoutShape {
+                name: "authority",
+                authority: true,
+                next_step: NextStep::AwaitRuntimeAuthority,
+                after: [
+                    Some("recovery_required/dispatching"),
+                    Some("recovery_required/ambiguous"),
+                ],
+                ..ABANDONED
+            },
+            Some("recovery_required/dispatching"),
+        ),
+        (
+            TimeoutShape {
+                name: "dispatching-unbound",
+                attempts: &[(1, "dispatching", false)],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "started",
+                attempts: &[(1, "started", true)],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "observing",
+                attempts: &[(1, "observing", true)],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        // Recovery compares the lease as stored text.
+        (
+            TimeoutShape {
+                name: "lease-now",
+                lease: Some("2026-10-22T10:00:00.000Z"),
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                lease: Some("2026-10-22T10:00:00.001Z"),
+                ..in_flight(
+                    "lease-ahead",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                lease: Some("2026-10-22T10:30:00+01:00"),
+                ..in_flight(
+                    "lease-expired-sorting-ahead",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "lease-ahead-sorting-behind",
+                lease: Some("2026-10-22T09:30:00-01:00"),
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                lease: None,
+                ..in_flight(
+                    "no-lease",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "lease-unparseable-sorting-behind",
+                lease: Some("0"),
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        // Recovery compares the deadline as stored text too, and leaves a run
+        // past it to timeout enforcement, which parses it.
+        (
+            TimeoutShape {
+                name: "deadline-ahead",
+                deadline: Some("2026-10-22T11:00:00.000Z"),
+                after: [Some("claimed/failed"), Some("recovery_required/ambiguous")],
+                ..ABANDONED
+            },
+            Some("claimed/failed"),
+        ),
+        (
+            TimeoutShape {
+                deadline: Some("2026-10-22T10:00:00.000Z"),
+                ..in_flight(
+                    "deadline-now",
+                    [
+                        Some("failed/timed_out"),
+                        Some("recovery_required/ambiguous"),
+                    ],
+                )
+            },
+            Some("failed/timed_out"),
+        ),
+        (
+            TimeoutShape {
+                name: "deadline-expired-sorting-ahead",
+                deadline: Some("2026-10-22T10:30:00+01:00"),
+                after: [
+                    Some("failed/timed_out"),
+                    Some("recovery_required/ambiguous"),
+                ],
+                ..ABANDONED
+            },
+            Some("failed/timed_out"),
+        ),
+        (
+            TimeoutShape {
+                deadline: Some("2026-10-22T09:30:00-01:00"),
+                ..in_flight(
+                    "deadline-ahead-sorting-behind",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("claimed/failed"),
+        ),
+        (
+            TimeoutShape {
+                deadline: Some("never"),
+                ..in_flight(
+                    "unparseable-deadline",
+                    [None, Some("recovery_required/ambiguous")],
+                )
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                name: "authority-unparseable-deadline",
+                authority: true,
+                deadline: Some("never"),
+                next_step: NextStep::AwaitRuntimeAuthority,
+                after: [
+                    Some("recovery_required/dispatching"),
+                    Some("recovery_required/ambiguous"),
+                ],
+                ..ABANDONED
+            },
+            Some("recovery_required/dispatching"),
+        ),
+        (
+            TimeoutShape {
+                extra: &["UPDATE automation_runs SET timeout_at = X'00';"],
+                ..in_flight("blob-deadline", [None, None])
+            },
+            None,
+        ),
+        // Only a session not yet started is a launch, and only on a claim.
+        (
+            TimeoutShape {
+                session: "running",
+                ..in_flight(
+                    "running-session",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("claimed/dispatching"),
+        ),
+        (
+            TimeoutShape {
+                session: "orphaned",
+                ..in_flight(
+                    "orphaned",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                occurrence: "running",
+                ..in_flight(
+                    "running-occurrence",
+                    [Some("running/dispatching"), Some("running/dispatching")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        // The stop needs exactly one attempt live on the session, and
+        // settling a plain run its latest attempt live.
+        (
+            TimeoutShape {
+                attempts: &[(1, "started", false)],
+                ..in_flight(
+                    "started-unbound",
+                    [Some("claimed/started"), Some("claimed/started")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                attempts: &[],
+                ..in_flight("no-attempt", [Some("claimed/none"), Some("claimed/none")])
+            },
+            Some("failed/none"),
+        ),
+        (
+            TimeoutShape {
+                attempts: &[(1, "started", true), (2, "dispatching", false)],
+                ..in_flight("two-live", [Some("failed/failed"), None])
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                attempts: &[(1, "dispatching", true), (2, "failed", false)],
+                ..in_flight(
+                    "latest-settled",
+                    [Some("failed/failed"), Some("recovery_required/failed")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "started-after-settled",
+                attempts: &[(1, "failed", false), (2, "started", true)],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "live-elsewhere",
+                attempts: &[(1, "started", true), (2, "started", false)],
+                after: [Some("failed/failed"), Some("recovery_required/started")],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "dispatching-after-ambiguous",
+                attempts: &[(1, "ambiguous", true), (2, "dispatching", false)],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                attempts: &[(1, "dispatching", true), (2, "ambiguous", false)],
+                ..in_flight(
+                    "latest-ambiguous",
+                    [
+                        Some("failed/ambiguous"),
+                        Some("recovery_required/ambiguous"),
+                    ],
+                )
+            },
+            Some("failed/ambiguous"),
+        ),
+        (
+            TimeoutShape {
+                attempts: &[(1, "ambiguous", true)],
+                ..in_flight(
+                    "ambiguous",
+                    [Some("claimed/ambiguous"), Some("claimed/ambiguous")],
+                )
+            },
+            Some("failed/ambiguous"),
+        ),
+        (
+            TimeoutShape {
+                authority: true,
+                attempts: &[(1, "ambiguous", false), (2, "dispatching", true)],
+                ..in_flight(
+                    "authority-beside-ambiguous",
+                    [None, Some("recovery_required/ambiguous")],
+                )
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                authority: true,
+                attempts: &[(1, "observing", false), (2, "dispatching", true)],
+                ..in_flight(
+                    "authority-beside-unbound-observing",
+                    [None, Some("recovery_required/ambiguous")],
+                )
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                authority: true,
+                attempts: &[(1, "started", false), (2, "dispatching", true)],
+                ..in_flight(
+                    "authority-beside-unbound-started",
+                    [None, Some("recovery_required/ambiguous")],
+                )
+            },
+            None,
+        ),
+        // Recovery leaves a run to a pending cancellation or another stop.
+        (
+            TimeoutShape {
+                extra: &[LATE_CANCELLATION],
+                ..in_flight(
+                    "cancellation-requested",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[
+                    LATE_CANCELLATION,
+                    "UPDATE automation_cancellations SET state = 'stopping';",
+                ],
+                ..in_flight(
+                    "cancellation-stopping",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "cancellation-rejected",
+                extra: &[
+                    LATE_CANCELLATION,
+                    "UPDATE automation_cancellations SET state = 'rejected';",
+                ],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_fence!("recovery", "2099-01-01T00:00:00.000Z")],
+                ..in_flight(
+                    "recovery-fence",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("claimed/dispatching"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+                ..in_flight(
+                    "recovery-fence-expired",
+                    [
+                        Some("recovery_required/ambiguous"),
+                        Some("recovery_required/ambiguous"),
+                    ],
+                )
+            },
+            Some("recovery_required/ambiguous"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_fence!("recovery", "never")],
+                ..in_flight("recovery-fence-unparseable", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                attempts: &[(1, "started", true), (2, "dispatching", false)],
+                extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+                ..in_flight("recovery-fence-expired-two-live", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                attempts: &[],
+                extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+                ..in_flight("recovery-fence-expired-no-attempt", [None, None])
+            },
+            Some("claimed/none"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+                ..in_flight(
+                    "timeout-fence",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
+            },
+            Some("claimed/dispatching"),
+        ),
+        // Another running run can settle the occurrence first, or share the
+        // session.
+        (
+            TimeoutShape {
+                extra: &["
+                    INSERT INTO sessions
+                        (id, project_root, harness, title, status, created_at, updated_at)
+                    VALUES ('s-stray', '/PRIVATE', 'codex', 'PRIVATE', 'running',
+                            '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z');
+                    INSERT INTO automation_runs
+                        (id, automation_id, occurrence_id, session_id, runtime, status,
+                         started_at)
+                    VALUES ('r-stray', 'other', 'o-late', 's-stray', 'coven-code', 'running',
+                            '2026-10-21T09:00:00.000Z');"],
+                ..in_flight(
+                    "rival",
+                    [Some("failed/failed"), Some("recovery_required/ambiguous")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[
+                    OTHER_RUN,
+                    "UPDATE automation_runs SET session_id = 's-late' WHERE id = 'r-other';",
+                ],
+                ..in_flight(
+                    "session-shared",
+                    [Some("failed/failed"), Some("recovery_required/ambiguous")],
+                )
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "rival-finished",
+                extra: &["
+                    INSERT INTO sessions
+                        (id, project_root, harness, title, status, created_at, updated_at)
+                    VALUES ('s-stray', '/PRIVATE', 'codex', 'PRIVATE', 'failed',
+                            '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z');
+                    INSERT INTO automation_runs
+                        (id, automation_id, occurrence_id, session_id, runtime, status,
+                         started_at, finished_at)
+                    VALUES ('r-stray', 'other', 'o-late', 's-stray', 'coven-code', 'failed',
+                            '2026-10-21T09:00:00.000Z', '2026-10-21T09:10:00.000Z');"],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "session-shared-by-finished-run",
+                extra: &[
+                    OTHER_RUN,
+                    "UPDATE automation_runs
+                        SET session_id = 's-late', status = 'failed',
+                            finished_at = '2026-10-21T09:10:00.000Z'
+                      WHERE id = 'r-other';",
+                ],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "other-run-dispatching-unbound",
+                extra: &[
+                    OTHER_RUN,
+                    OTHER_ATTEMPT,
+                    "UPDATE automation_attempts SET state = 'dispatching', session_id = NULL
+                      WHERE id = 'a-other';",
+                ],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "other-run-cancelling",
+                extra: &[
+                    OTHER_RUN,
+                    OTHER_ATTEMPT,
+                    "INSERT INTO automation_cancellations
+                        (adoption_key, request_digest, automation_id, run_id, attempt_id,
+                         session_id, scope, requested_by_json, reason, state, requested_at,
+                         execution_expires_at)
+                     VALUES ('cancel-other', 'digest', 'daily', 'r-other', 'a-other',
+                             's-other', 'run', '{\"principalId\":\"operator\"}', 'stop',
+                             'requested', '2026-10-22T09:00:00.000Z',
+                             '2099-01-01T00:00:00.000Z');",
+                ],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "authority-beside-other-run",
+                authority: true,
+                extra: &[OTHER_RUN, OTHER_ATTEMPT],
+                next_step: NextStep::AwaitRuntimeAuthority,
+                after: [
+                    Some("recovery_required/dispatching"),
+                    Some("recovery_required/ambiguous"),
+                ],
+                ..ABANDONED
+            },
+            Some("recovery_required/dispatching"),
+        ),
+        (
+            TimeoutShape {
+                name: "other-run-fenced",
+                extra: &[
+                    OTHER_RUN,
+                    OTHER_ATTEMPT,
+                    "INSERT INTO automation_stop_fences
+                        (run_id, session_id, owner, acquired_at, execution_expires_at)
+                     VALUES ('r-other', 's-other', 'recovery', '2026-10-22T09:00:00.000Z',
+                             '2099-01-01T00:00:00.000Z');",
+                ],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        // Every pass decodes each running run's values; restart containment
+        // parses a launch's creation time, and settling a plain run with a
+        // deadline its session's exit time.
+        (
+            TimeoutShape {
+                extra: &["UPDATE automation_runs SET definition_json = CAST('{}' AS BLOB);"],
+                ..in_flight(
+                    "blob-definition",
+                    [None, Some("recovery_required/ambiguous")],
+                )
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                extra: &["UPDATE sessions SET exit_code = 'zero';"],
+                ..in_flight("text-exit-code", [Some("failed/failed"), None])
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                extra: &["UPDATE sessions SET created_at = 'never';"],
+                ..in_flight("unparseable-launch-time", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                extra: &[
+                    "UPDATE sessions SET created_at = CAST('2026-10-21T09:00:00.000Z' AS BLOB);",
+                ],
+                ..in_flight("blob-launch-time", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                session: "orphaned",
+                extra: &["UPDATE sessions SET created_at = 'never';"],
+                ..in_flight("orphaned-unparseable-launch-time", [None, None])
+            },
+            None,
+        ),
+        // Restart containment also decodes a launch's occurrence kind and
+        // lease owner, and reads its receipt file by the session id.
+        (
+            TimeoutShape {
+                name: "no-lease-owner",
+                extra: &["UPDATE automation_occurrences SET lease_owner = NULL;"],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                extra: &["UPDATE automation_occurrences SET kind = CAST(kind AS BLOB);"],
+                ..in_flight("blob-kind", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                extra: &["UPDATE automation_occurrences SET lease_owner = X'00';"],
+                ..in_flight("blob-lease-owner", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                extra: &["UPDATE automation_occurrences SET lease_owner = CAST(X'FF' AS TEXT);"],
+                ..in_flight("invalid-lease-owner", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                extra: &["UPDATE automation_occurrences
+                             SET kind = kind || CAST(X'C3' AS TEXT),
+                                 lease_owner = CAST(X'A9' AS TEXT) || lease_owner;"],
+                ..in_flight("character-split-across-kind-and-owner", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                name: "session-id-at-bound",
+                extra: &[late_session_id!(
+                    "'s-_' || substr(hex(zeroblob(100)), 1, 197)"
+                )],
+                ..ABANDONED
+            },
+            Some("recovery_required/ambiguous"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_session_id!(
+                    "'s-_' || substr(hex(zeroblob(100)), 1, 198)"
+                )],
+                ..in_flight(
+                    "session-id-past-bound",
+                    [Some("failed/failed"), Some("recovery_required/ambiguous")],
+                )
+            },
+            Some("recovery_required/ambiguous"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_session_id!("'s late'")],
+                ..in_flight(
+                    "spaced-session-id",
+                    [Some("failed/failed"), Some("recovery_required/ambiguous")],
+                )
+            },
+            Some("recovery_required/ambiguous"),
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_session_id!("'s-' || char(0) || 'late'")],
+                ..in_flight("nul-session-id", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_session_id!("'s-late' || char(10) || char(0)")],
+                ..in_flight("nul-after-line-feed-session-id", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_session_id!("'s-' || CAST(X'FF' AS TEXT)")],
+                ..in_flight("invalid-session-id", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                extra: &[late_session_id!("CAST('s-late' AS BLOB)")],
+                ..in_flight("blob-session-id", [None, None])
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                deadline: Some("2026-10-22T11:00:00.000Z"),
+                extra: &[
+                    "INSERT INTO events (id, session_id, kind, payload_json, created_at)
+                          VALUES ('e-late', 's-late', 'exit', '{}', 'yesterday');",
+                ],
+                ..in_flight(
+                    "unparseable-exit-with-deadline",
+                    [None, Some("recovery_required/ambiguous")],
+                )
+            },
+            None,
+        ),
+        (
+            TimeoutShape {
+                name: "exit-with-deadline",
+                deadline: Some("2026-10-22T11:00:00.000Z"),
+                extra: &[
+                    "INSERT INTO events (id, session_id, kind, payload_json, created_at)
+                          VALUES ('e-late', 's-late', 'exit', '{}',
+                                  '2026-10-22T09:10:00.000Z');",
+                ],
+                after: [Some("claimed/failed"), Some("recovery_required/ambiguous")],
+                ..ABANDONED
+            },
+            Some("claimed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "authority-unparseable-exit-with-deadline",
+                authority: true,
+                deadline: Some("2026-10-22T11:00:00.000Z"),
+                extra: &[
+                    "INSERT INTO events (id, session_id, kind, payload_json, created_at)
+                          VALUES ('e-late', 's-late', 'exit', '{}', 'yesterday');",
+                ],
+                next_step: NextStep::AwaitRuntimeAuthority,
+                after: [
+                    Some("recovery_required/dispatching"),
+                    Some("recovery_required/ambiguous"),
+                ],
+                ..ABANDONED
+            },
+            Some("recovery_required/dispatching"),
+        ),
+        (
+            TimeoutShape {
+                name: "unparseable-exit-without-deadline",
+                extra: &[
+                    "INSERT INTO events (id, session_id, kind, payload_json, created_at)
+                          VALUES ('e-late', 's-late', 'exit', '{}', 'yesterday');",
+                ],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "unparseable-update-with-deadline",
+                deadline: Some("2026-10-22T11:00:00.000Z"),
+                extra: &["UPDATE sessions SET updated_at = 'never';"],
+                after: [Some("claimed/failed"), Some("recovery_required/ambiguous")],
+                ..ABANDONED
+            },
+            Some("claimed/failed"),
+        ),
+        (
+            TimeoutShape {
+                name: "recovery",
+                occurrence: "recovery_required",
+                code: WorkCode::RecoveryRequired,
+                next_step: NextStep::CancelRun,
+                after: [
+                    Some("recovery_required/dispatching"),
+                    Some("recovery_required/dispatching"),
+                ],
+                ..ABANDONED
+            },
+            Some("failed/failed"),
+        ),
+    ];
+    let mut seen = Vec::new();
+    for (shape, _) in &shapes {
+        let (_temp, conn) = timeout_store(shape);
+        let item = found(&conn, "daily").work.into_iter().next().unwrap();
+        // TEMP tables cannot change what the launch reads as.
+        let explained = work_of(&conn, "daily");
+        conn.execute_batch(
+            "CREATE TEMP TABLE automation_occurrences AS
+                 SELECT * FROM main.automation_occurrences;
+             UPDATE temp.automation_occurrences
+                 SET lease_expires_at = '2099-01-01T00:00:00.000Z';
+             CREATE TEMP TABLE sessions AS SELECT * FROM main.sessions;
+             UPDATE temp.sessions SET status = CASE status
+                 WHEN 'created' THEN 'running' ELSE 'created' END, created_at = 'never';
+             CREATE TEMP TABLE events AS SELECT * FROM main.events;
+             INSERT INTO temp.events (id, session_id, kind, payload_json, created_at)
+                 VALUES ('e-shadow', 's-late', 'exit', '{}', 'never');
+             CREATE TEMP TABLE automation_attempts AS SELECT * FROM main.automation_attempts;
+             UPDATE temp.automation_attempts SET id = 'shadow-' || id, session_id = NULL,
+                 state = CASE state WHEN 'dispatching' THEN 'failed' ELSE 'dispatching' END;
+             CREATE TEMP TABLE automation_runs AS SELECT * FROM main.automation_runs;
+             UPDATE temp.automation_runs SET timeout_at = '2026-10-22T09:00:00.000Z',
+                 authority_profile = CASE WHEN authority_profile IS NULL THEN 'shadow' END;
+             INSERT INTO temp.automation_attempts (id, run_id, state)
+                 VALUES ('shadow-extra', 'r-late', 'observing'),
+                        ('shadow-unresolved', 'r-late', 'ambiguous');
+             INSERT INTO temp.automation_runs (id, occurrence_id, session_id, status)
+                 VALUES ('r-shadow', 'o-late', 's-late', 'running');
+             CREATE TEMP TABLE automation_stop_fences AS
+                 SELECT * FROM main.automation_stop_fences WHERE 0;
+             INSERT INTO temp.automation_stop_fences (run_id) VALUES ('r-late');
+             CREATE TEMP TABLE automation_cancellations AS
+                 SELECT * FROM main.automation_cancellations WHERE 0;
+             INSERT INTO temp.automation_cancellations (run_id, state)
+                 VALUES ('r-late', 'requested');",
+        )
+        .unwrap();
+        assert_eq!(work_of(&conn, "daily"), explained, "{}", shape.name);
+        let after = [
+            &ConfirmedKill as &dyn crate::api::SessionRuntime,
+            &UnconfirmedKill,
+        ]
+        .map(|runtime| {
+            let (temp, conn) = timeout_store(shape);
+            launch_after_pass(&temp, &conn, runtime)
+        });
+        let contained = {
+            let (temp, conn) = timeout_store(shape);
+            let receipt =
+                crate::automations::runner::containment_receipt_path(temp.path(), "s-late");
+            std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+            std::fs::write(&receipt, crate::pty_runner::CONTAINMENT_QUIESCENT_RECEIPT).unwrap();
+            launch_after_pass(&temp, &conn, &UnconfirmedKill)
+        };
+        seen.push((
+            shape.name,
+            item.code,
+            item.next_step,
+            item.deadline_at,
+            after,
+            contained,
+        ));
+    }
+    let expected: Vec<_> = shapes
+        .iter()
+        .map(|(shape, contained)| {
+            (
+                shape.name,
+                shape.code,
+                shape.next_step,
+                shape.deadline_at.map(str::to_string),
+                shape.after.map(|state| state.map(str::to_string)),
+                contained.map(str::to_string),
             )
         })
         .collect();

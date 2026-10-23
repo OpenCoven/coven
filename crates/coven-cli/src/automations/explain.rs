@@ -97,6 +97,7 @@ pub(crate) enum WorkCode {
     RetryHeld,
     SessionFinished,
     TimeoutExpired,
+    LaunchAbandoned,
     EligibleNow,
     DueUnplanned,
     RecoveryRequired,
@@ -387,6 +388,67 @@ fn work_select() -> String {
                ) = 1 THEN 2
                ELSE 0
            END AS timed_out,
+           -- A launch whose session has not started when its claim's lease
+           -- expires, which abandoned-launch recovery stops, and settlement
+           -- then settles in the same pass: 1 for a plain run, and 2 for a
+           -- Runtime Authority run, which it holds for recovery. A stop that
+           -- is not confirmed holds either for recovery. Recovery compares the
+           -- lease and the deadline as stored text, leaving a run past its
+           -- deadline to timeout enforcement, and leaves a run with a pending
+           -- cancellation or a stop fence to that stop; another running run
+           -- can settle the occurrence first. The stop can fail unless
+           -- exactly one attempt is live on the session, where a dispatch
+           -- needs none, and no other running run shares the session.
+           -- Settling a plain run needs its latest attempt live, and holding
+           -- a Runtime Authority one needs that attempt to be its only
+           -- unresolved one.
+           CASE
+               WHEN session.status IS NOT 'created'
+                    OR occurrence.lease_expires_at IS NULL
+                    OR occurrence.lease_expires_at > ?1
+                    OR held.timeout_at <= ?1
+                    OR (
+                        SELECT COUNT(*) FROM main.automation_attempts AS live
+                        WHERE live.run_id = held.id
+                          AND live.state IN ('dispatching', 'started', 'observing')
+                          AND (
+                              live.session_id = held.session_id
+                              OR (live.state = 'dispatching' AND live.session_id IS NULL)
+                          )
+                    ) <> 1
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_runs AS sharer
+                        WHERE sharer.session_id = held.session_id
+                          AND sharer.status = 'running'
+                          AND sharer.id <> held.id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_cancellations AS cancellation
+                        WHERE cancellation.run_id = held.id
+                          AND cancellation.state IN ('requested', 'stopping')
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_stop_fences AS fence
+                        WHERE fence.run_id = held.id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_runs AS rival
+                        WHERE rival.occurrence_id = occurrence.id
+                          AND rival.status = 'running'
+                          AND rival.id <> held.id
+                    ) THEN 0
+               WHEN held.authority_profile IS NULL THEN
+                   CASE WHEN latest.state IN ('dispatching', 'started', 'observing')
+                       THEN 1 ELSE 0 END
+               WHEN (
+                   SELECT COUNT(*) FROM main.automation_attempts AS unresolved
+                   WHERE unresolved.run_id = held.id
+                     AND unresolved.state IN (
+                         'dispatching', 'started', 'observing', 'ambiguous'
+                     )
+               ) = 1 THEN 2
+               ELSE 0
+           END AS abandoned,
            -- Whether settlement's scan of running runs decodes this run's
            -- values as their types; recording a plain run's finish also
            -- reads its definition.
@@ -417,7 +479,30 @@ fn work_select() -> String {
                       THEN COALESCE(CAST(held.definition_json AS BLOB), X'')
                       ELSE X''
                   END
-           AS BLOB) AS decoded
+           AS BLOB) AS decoded,
+           -- The times a pass parses for a launch: restart containment its
+           -- session's creation, and settling a plain run with a deadline the
+           -- session's exit, when it has one.
+           CASE WHEN typeof(session.created_at) = 'text'
+               THEN CAST(session.created_at AS BLOB) ELSE X''
+           END AS launched,
+           CASE WHEN held.authority_profile IS NULL AND held.timeout_at IS NOT NULL
+               THEN CAST(ending.created_at AS BLOB)
+           END AS exited,
+           -- What restart containment also reads for a launch as text: its
+           -- session id, which names its receipt file, and its occurrence's
+           -- kind and lease owner, joined by a line feed, the owner when not
+           -- null. Each is null when stored as another type.
+           CASE WHEN typeof(held.session_id) = 'text'
+               THEN CAST(held.session_id AS BLOB)
+           END AS receipt,
+           CASE WHEN typeof(occurrence.kind) = 'text'
+                     AND typeof(occurrence.lease_owner) IN ('text', 'null')
+               THEN CAST(
+                   CAST(occurrence.kind AS BLOB) || X'0A'
+                   || COALESCE(CAST(occurrence.lease_owner AS BLOB), X'')
+               AS BLOB)
+           END AS contained
     FROM main.automation_occurrences AS occurrence
     LEFT JOIN main.automation_runs AS held
       ON held.id = (
@@ -480,6 +565,11 @@ fn work_select() -> String {
            0,
            0,
            0,
+           0,
+           NULL,
+           NULL,
+           NULL,
+           NULL,
            NULL,
            NULL
     FROM main.automation_runs AS run
@@ -508,6 +598,11 @@ fn work_select() -> String {
            0,
            0,
            0,
+           0,
+           NULL,
+           NULL,
+           NULL,
+           NULL,
            NULL,
            NULL
     FROM ({ELIGIBLE_OCCURRENCES_SQL}) AS eligible
@@ -519,7 +614,7 @@ fn work_select() -> String {
        )
     UNION ALL
     SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0,
-           0, 0, NULL, NULL
+           0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL
     WHERE ?5 IS NOT NULL
       AND NOT EXISTS (
           SELECT 1 FROM main.automation_occurrences AS later
@@ -535,6 +630,10 @@ fn work_select() -> String {
 
 /// Canonical stored timestamps are at most this long; a longer one is omitted.
 const MAX_STORED_TIME: usize = 64;
+
+/// A launch is named only when its session id is at most this long, so its
+/// receipt's file name stays well inside every platform's limit.
+const MAX_RECEIPT_ID: usize = 200;
 
 pub(crate) fn explain(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result<Lookup> {
     // A deferred transaction: every read below comes from one snapshot, and
@@ -720,9 +819,14 @@ fn work(
                     row.get::<_, bool>(12)?,
                     row.get::<_, i64>(13)?,
                     row.get::<_, i64>(14)?,
-                    row.get::<_, bool>(15)?,
-                    row.get::<_, Option<Vec<u8>>>(16)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, bool>(16)?,
                     row.get::<_, Option<Vec<u8>>>(17)?,
+                    row.get::<_, Option<Vec<u8>>>(18)?,
+                    row.get::<_, Option<Vec<u8>>>(19)?,
+                    row.get::<_, Option<Vec<u8>>>(20)?,
+                    row.get::<_, Option<Vec<u8>>>(21)?,
+                    row.get::<_, Option<Vec<u8>>>(22)?,
                 ))
             },
         )
@@ -745,9 +849,14 @@ fn work(
             held_retry,
             finished,
             timed_out,
+            abandoned,
             typed,
             evidence,
             decoded,
+            launched,
+            exited,
+            receipt,
+            contained,
         ) = row.context("failed to read the routine's work")?;
         // Reconciliation parses the whole stored deadline and settles the
         // retry once it has passed. The eligible queue compares the deadline
@@ -772,11 +881,7 @@ fn work(
             Some(None) => false,
         };
         let decodes = typed && decoded.is_none_or(|stored| std::str::from_utf8(&stored).is_ok());
-        let readable = decodes
-            && evidence.is_none_or(|stored| {
-                String::from_utf8(stored)
-                    .is_ok_and(|stored| DateTime::parse_from_rfc3339(&stored).is_ok())
-            });
+        let readable = decodes && parses(evidence);
         let deadline_at = deadline
             .flatten()
             .map(|(deadline, _)| deadline.to_rfc3339_opts(SecondsFormat::Millis, true));
@@ -822,6 +927,24 @@ fn work(
                     NextStep::AwaitSettlement
                 };
                 (WorkCode::TimeoutExpired, None, next_step)
+            }
+            // Abandoned-launch recovery stops a launch past its claim's
+            // lease, and settlement then settles a plain run, parsing its
+            // deadline, or holds a Runtime Authority one.
+            (0, Some("claimed"))
+                if abandoned != 0
+                    && decodes
+                    && parses(launched)
+                    && parses(exited)
+                    && contains(receipt, contained)
+                    && (abandoned == 2 || !unreadable) =>
+            {
+                let next_step = if abandoned == 2 {
+                    NextStep::AwaitRuntimeAuthority
+                } else {
+                    NextStep::AwaitSettlement
+                };
+                (WorkCode::LaunchAbandoned, None, next_step)
             }
             (0, Some("claimed")) => match lease_release {
                 0 => (
@@ -887,6 +1010,24 @@ fn work(
     let truncated = items.len() > MAX_WORK;
     items.truncate(MAX_WORK);
     Ok((items, truncated))
+}
+
+/// Whether a time the pass parses whole, if there is one, parses.
+fn parses(stored: Option<Vec<u8>>) -> bool {
+    stored.is_none_or(|stored| {
+        String::from_utf8(stored).is_ok_and(|stored| DateTime::parse_from_rfc3339(&stored).is_ok())
+    })
+}
+
+/// Whether restart containment reads a launch's values: its whole session id
+/// names a plain receipt file, and its other values are valid UTF-8.
+fn contains(receipt: Option<Vec<u8>>, read: Option<Vec<u8>>) -> bool {
+    receipt.is_some_and(|session_id| {
+        session_id.len() <= MAX_RECEIPT_ID
+            && session_id
+                .iter()
+                .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }) && read.is_some_and(|read| std::str::from_utf8(&read).is_ok())
 }
 
 /// A stored time is read only when it is UTF-8 within the length bound.
