@@ -58,12 +58,12 @@ incomplete.
 | `leadership` | Recorded owner presence and scheduler generation | Process liveness and current admission ownership |
 | `last_successful_pass` | Latest pass success and retained successful completion time, when observed | Success before instrumentation when no successful observation survives |
 | `store` | Automations table count, required-object presence/form counts, and recorded contract-migration timestamp/counters, when valid | Expected schema, other migrations, current row verifiability and integrity verification |
-| `queue` | Stored states, due planned rows and scheduler-eligible candidates at the observation cutoff | Runtime authority admission is not proven by scheduler eligibility |
-| `leases_fences` | Lease-bearing total, active/expired/missing/invalid expiry counts, leases outside claimed/running states, recorded authority presence, and mismatched unlaunched scheduler claims | Process liveness and complete attempt-fence consistency |
+| `queue` | Stored states, due planned rows, scheduler-eligible candidates at the observation cutoff, and running runs whose session has ended or whose latest attempt failed or is ambiguous | Runtime authority admission is not proven by scheduler eligibility; what an unsettled run waits on |
+| `leases_fences` | Lease-bearing total, active/expired/missing/invalid expiry counts, leases outside claimed/running states, recorded authority presence, mismatched unlaunched scheduler claims, run stop fences by lease, and pending owner cancellations by lease | Process liveness, complete attempt-fence consistency and each stop's outcome |
 | `planning_start_lag` | Latest pass duration/start lag and bounded retained scheduled-occurrence planning delay, when observed | Actual runtime-start lag, full recovery/history evidence and ratified SLO comparisons |
 | `repeated_failures` | Quarantine, failed attempts, retry exhaustion and retained failed occurrences since latest retained success | Strict consecutive-occurrence streaks, full history and historical classification |
 | `authority_refusals` | Launch-refused and unsupported-authority attempt counts | Complete identity, authority and approval refusal evidence |
-| `delivery_receipts` | Failed/pending deliveries, stored receipts and bounded reciprocal index links | Delivery obligations, full receipt correlation and integrity |
+| `delivery_receipts` | Failed/pending deliveries, stored receipts, reciprocal index links and bounded base commitment validation | External delivery obligations and authenticated authority evidence |
 | `event_changefeed` | Stored events/streams and checkpoint expiry/cursor/retention observations | Cursor consistency, checkpoint resumability and actual subscriber reconnect/replay health |
 | `disk_retention` | Main page geometry, separately sampled filesystem available bytes, and WAL-sidecar metadata estimates | Active WAL/frame/checkpoint semantics, quota/write guarantees, retention pressure and clock/platform evidence |
 
@@ -102,7 +102,7 @@ When counts are present, it also requires due ≤ planned and eligible ≤ due;
 unavailable counts stay omitted rather than being substituted with zero.
 Present occurrence states are decoded from bounded byte projections with the
 canonical occurrence-state enum. A null, non-text, invalid UTF-8, oversized or
-unknown state reports `invalid_occurrence_state` and omits all queue counts;
+unknown state reports `invalid_occurrence_state` and omits all occurrence counts;
 the CLI rejects accompanying fabricated counts. Other categories, including
 readable lease expiry facts, remain available. This avoids reporting an empty
 or partial queue from malformed state data. State decoding does not prove
@@ -110,7 +110,55 @@ transition validity, referential integrity, or a whole-read execution-time bound
 
 Missing occurrence state or the table reports the ordered gaps
 `queue_state_unavailable`, `due_queue_unavailable`, and
-`eligibility_store_unavailable`, with every queue count omitted.
+`eligibility_store_unavailable`, with every occurrence count omitted.
+
+In both cases the running-run counts are still read from their own tables.
+`running_runs` counts runs whose status is `running`, read from the main
+`automation_runs`, `sessions` and `automation_attempts` tables with the
+predicates settlement selects runs by. `running_runs_with_ended_sessions`
+counts those whose session is `completed`, `failed`, `cancelled`, `killed` or
+`idle`, the statuses settlement treats as finished. A run whose session row is
+missing is not counted as ended, and settlement does not finish it either.
+`running_runs_with_failed_latest_attempt` counts runs without an authority
+profile whose latest attempt is `failed`. Settlement holds such a run for
+`attempt.retry.v1` until its deadline, but the count is stored state, not
+retry eligibility. A run past its deadline, without one, behind a stop fence
+or at its last attempt is counted too, and `attempt.retry.v1` refuses it.
+`running_runs_with_ambiguous_latest_attempt` counts runs, with or without an
+authority profile, whose latest attempt is `ambiguous`: its stop outcome is
+unknown. Settlement finishes a plain run `failed` itself once its session has
+ended and no cancellation of that attempt is pending; until then the run waits
+on the cancellation, and `occurrence.recover.v1` refuses it too. A run with an
+authority profile is held for Runtime Authority terminal evidence, and
+`occurrence.recover.v1` refuses it with `AUTHORITY_REQUIRED`. Every comparison
+is byte for byte, as settlement's are. A latest attempt has one state, so the failed and ambiguous subsets are
+disjoint; both overlap the ended subset, since such a run has usually ended its
+session too. Only counts are read out.
+
+A missing table or required column, or a view in a table's place, reports
+`running_run_store_unavailable` after every other queue gap and omits all four
+counts, while the occurrence counts are read independently. The CLI rejects a
+subset larger than the total, failed and ambiguous subsets that together
+exceed it, a total beyond the safe-integer range, a report that omits the four
+without that gap, any of them beside it, the gap anywhere but last, or more
+runs with a failed latest attempt than `failed_attempts` in
+`repeated_failures`.
+
+Settlement normally finishes a running run whose session has ended on its next
+pass. One that stays counted is waiting on something:
+
+- a stop fence (see `leases_fences`), or an `ambiguous` attempt whose
+  cancellation is still `requested` or `stopping`;
+- a retry hold, before the run's deadline;
+- Runtime Authority terminal evidence;
+- a settlement step that fails. An error on one run, such as a missing or
+  already terminal occurrence or an unreadable timestamp, leaves every later
+  run unsettled. Check `last_successful_pass` and `coven automations status
+  --json`.
+
+Compare two reports taken across a scheduler pass rather than reading one.
+None of these counts authorizes settling a run, retrying an attempt or stopping
+a session.
 
 The eligibility missing-dependency regression covers 23 relation/column variants
 with and without TEMP shadows. Lease and queue prerequisite combinations have
@@ -183,6 +231,68 @@ A measured zero does not grant recovery permission or prove scheduler liveness.
 An expired lease on a running occurrence does not authorize settlement or a
 repeat launch. Inspect correlated run and attempt evidence first.
 
+Run stop fences are counted from the main `automation_stop_fences` table, which
+holds one row for each run whose stop a cancellation, a timeout or a recovery
+owns. `stop_fences` is partitioned by each fence's lease, with the same bounded
+timestamp classifier, into `active_stop_fences`, `expired_stop_fences` (a lease
+at or before the observation instant) and `invalid_stop_fence_expiries` (a
+missing, malformed, oversized or non-text lease). Only the lease is read; run,
+session, owner and operation key are not. A missing table or lease column, or a
+view in the table's place, reports `stop_fence_store_unavailable` after the
+occurrence lease gaps and omits all four counts; a TEMP object cannot supply
+them.
+The CLI rejects a partition that does not sum to the total or exceeds the
+safe-integer range, a report that omits the four without that gap, any of them
+beside it, or the gap anywhere except after the occurrence lease gaps and
+before any cancellation gap.
+
+Settlement skips a run that holds a fence while its attempt is not `ambiguous`,
+so a run whose session has already ended can still count as running in `queue`.
+One case moves: once a `timeout` or `recovery` fence's lease has expired over a
+session that has ended, the next pass marks the attempt `ambiguous` and the
+occurrence `recovery_required`. That records an unknown stop outcome, not a
+confirmed one. An expired `cancellation` fence is left to the cancellation
+reconciler instead. A fence is released when its owner settles the run, when a
+later settlement finishes the run's `ambiguous` attempt, whoever owns the
+fence, or when `occurrence.recover.v1` records a determination for that run. An
+expired fence can therefore still be counted beside an occurrence that already
+needs recovery. A lease the scheduler cannot read fails its settlement step
+when it reaches that run's fence, which leaves later runs unsettled and that
+pass's results undelivered. None of these counts authorizes clearing a fence or
+stopping a session again.
+
+Owner cancellations that are still pending are counted the same way, from the
+main `automation_cancellations` table. `pending_cancellations` counts rows in
+state `requested` (reserved, before its stop fence) or `stopping` (fenced, its
+stop under way), compared byte for byte. It is partitioned by the cancellation's
+own lease into `active_pending_cancellations`, `expired_pending_cancellations`
+and `invalid_pending_cancellation_expiries`. Settled states (`cancelled`,
+`rejected`, `recovery_required`) are not counted. Only the lease is read; the
+key, run, session, principal and reason are not. A missing table or `state` or
+lease column, or a view in the table's place, reports
+`cancellation_store_unavailable` after the stop-fence gap, if any, and omits
+all four counts. The CLI applies the same partition rules, and rejects the two
+gaps in the other order.
+
+On its next pass, the scheduler's expiry reconciler takes over an expired
+pending cancellation: it renews the lease by 30 seconds, then finishes it. A
+`requested` cancellation is carried out, unless the run's deadline has passed,
+in which case it is rejected and the timeout enforced. A `stopping` one adopts
+a result that was already stored or settled, and otherwise has its stop
+recorded as an unknown outcome. A renewed lease reads as active again, so an
+active count alone does not mean the owner's request is still in flight. An
+expired count that persists across passes means the reconciler is not reaching
+it; check `last_successful_pass`.
+
+The reconciler compares the stored lease as text with its own canonical
+timestamp, and the doctor compares instants. They agree on the canonical UTC
+form the daemon writes, but not on a malformed lease. The reconciler selects,
+renews and finishes one that sorts before its timestamp, and never selects one
+that sorts after it. The doctor counts both as invalid, so an invalid count may
+clear on the next pass or stay. No count authorizes cancelling again or
+clearing a cancellation. Replaying the owner's request is not a read: against
+an expired lease, the replay carries the cancellation out itself.
+
 Receipt counting independently requires the main `automation_receipts` table.
 If that table is missing or replaced by a view, `delivery_receipts` reports
 `receipt_store_unavailable`, omits `stored_receipts`, and retains the failed and
@@ -222,9 +332,44 @@ whose receipt count or available failed-plus-pending run count exceeds the
 corresponding scan row cap. Link gaps follow independent delivery-state and
 receipt-store gaps; raw counts remain available. TEMP tables cannot supply
 links. Matching links do not validate receipt bodies, digests, attempt/occurrence
-bindings, authority evidence or external delivery. `receipt_integrity_not_verified`
-remains the default gap when no conditional finding applies. These caps do not
+bindings, authority evidence or external delivery. These link caps do not
 establish a whole-read time or release SLO bound.
+
+A separate commitment check reuses the Rust committed-receipt reader in the
+same read snapshot. It verifies canonical receipt/event digests, stored indexes,
+run/attempt identity, definition-digest and occurrence/fence references,
+terminal settlement and reciprocal commitment. Every read uses `main`; TEMP
+receipt, event, run, attempt or rich-revision tables cannot supply evidence.
+Identity matching is exact even if damaged columns have case-insensitive
+collation or numeric affinity. Healthy-schema lookups retain indexed candidate
+selection before applying exact identity checks.
+The result exposes only `receipt_commitments_checked` and
+`invalid_receipt_commitments`. A complete cohort has a checked count equal to
+`stored_receipts`; any invalid count adds `receipt_commitments_inconsistent`.
+
+The check accepts at most 256 receipts, 128 KiB per receipt/event body and
+1 MiB of combined receipt/event body input. Before reading those bodies, it
+validates bounded keys and sizes. A temporary SQLite string/BLOB/record limit
+of at most 256 KiB also bounds the reused reader's other stored metadata. A
+stricter caller limit stays in force, and the previous limit is restored after
+success, refusal or read error. These are implementation limits within the
+existing cooperative budget; they do not establish a hard filesystem deadline
+or ratified SLO.
+
+Missing prerequisites or unavailable reads add `receipt_commitments_unavailable`;
+malformed or ambiguous key metadata adds `receipt_commitments_metadata_invalid`.
+Input/length exhaustion adds `receipt_commitments_read_budget_exceeded`.
+These outcomes omit both commitment counts, preserving independently available
+delivery, receipt and link observations. A missing receipt table retains its
+existing receipt-store/link-store gaps and cannot acquire commitment counts.
+
+`receipt_authority_not_verified` remains explicit whenever a receipt cohort can
+be considered. The doctor does not invoke an authority-provider verifier or
+validate the authorized terminal sidecar. Base consistency also leaves external
+delivery obligations unobserved. Inspect the run and attempts through the
+existing owner-local commands; follow the authority runbook before any policy
+activation. Earlier reports with `receipt_integrity_not_verified` remain
+readable as incomplete observations and cannot carry the new checked counts.
 Other run-table dependencies still need complete isolation before every missing
 run-table case can return a report.
 
@@ -614,6 +759,10 @@ categories can still help investigate, but cannot fill the missing category.
 | --- | --- |
 | Assigned leader, no recent successful pass, or growing eligible work | Run `coven automations status --json` and compare pass timestamps and gaps. Assigned metadata does not prove the process is live; a failed latest pass does not erase a retained earlier success. Do not infer a ratified lag violation from these observations alone. |
 | Expired leases, missing/invalid expiry, or mismatched unlaunched claims | Check `coven automations leases --help` and inspect supported pages. For an already known occurrence ID, run `coven automations occurrence <occurrence-id> --json`, then inspect its run and attempts. Expiry or generation mismatch alone does not authorize takeover, settlement or another external effect. |
+| Running runs with ended sessions, or with a failed latest attempt | Compare with a report from after the next scheduler pass. If the count persists, read `last_successful_pass` and `coven automations status --json` for a failing settlement step, and `leases_fences` for a stop fence. Then inspect the known run and its attempts. A run held for retry settles failed at its deadline unless `attempt.retry.v1` opens a retry first, and the command refuses a run past its deadline, behind a fence or at its last attempt; do not retry on this count alone. |
+| Running runs with an ambiguous latest attempt | Compare with a report from after the next scheduler pass. A plain run clears once its session has ended and no cancellation of that attempt is pending; read `pending_cancellations`. A run that stays counted, or one with an authority profile, needs the supported recovery path: inspect the known occurrence, run and attempts. `occurrence.recover.v1` refuses a run with a pending cancellation, and refuses a Runtime Authority run with `AUTHORITY_REQUIRED`. |
+| Pending owner cancellations, active or expired | Inspect the known run and its attempts, and read `running_runs_with_ambiguous_latest_attempt`: settlement waits for a pending cancellation before it finishes an ambiguous attempt. The reconciler renews and finishes an expired one on its next pass, so an expired count that persists means it is not reaching it; check `last_successful_pass`. Do not replay or reissue the owner's request to learn its outcome: against an expired lease, a replay carries the cancellation out. Do not edit the row. |
+| Held, expired or unreadable stop fences | Inspect the known run and its attempts. A held fence means a cancellation, a timeout or a recovery owns that run's stop. An expired one means its owner did not finish; check whether the occurrence already needs recovery. An unreadable lease blocks the scheduler's settlement step; preserve the report and the daemon's diagnostics. Do not delete a fence or stop the session again; follow the supported cancellation or `occurrence.recover.v1` path. |
 | Failed attempts, quarantine, or retry exhaustion | Inspect the known occurrence, run and attempts. A retained failure total is not a consecutive failure streak; exhaustion counters are not occurrence-failure counters. Preserve that distinction before assessing repetition or a retry policy. |
 | Pending/failed delivery or inconsistent receipt links | Inspect the known run and attempts, preserving their terminal states and correlation. A reciprocal index link is not authenticated receipt content or proof of the external effect. If delivery outcome is ambiguous, require the supported reconciliation path before another dispatch. |
 | Authority refusal, unsupported authority, or absent identity/approval evidence | Retain the refusal codes and compare the approved authority contract. No recorded refusal does not prove approval-service availability. Permission or provider changes require their existing approval gate. |

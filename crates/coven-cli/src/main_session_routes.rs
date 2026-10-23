@@ -59,7 +59,7 @@ const EVENT_KIND_RESET: &str = "main_session.reset";
 const EVENT_KIND_ROLLOVER: &str = "main_session.rollover";
 const DEFAULT_ROLLOVER_REASON: &str = "stale-conversation";
 const HOME_TITLE: &str = "Home";
-const SCOPE_LOCK_DIR: &str = "main-session-locks";
+pub(crate) const SCOPE_LOCK_DIR: &str = "main-session-locks";
 
 /// Exclusive per-scope gate for every main-session mutation. It is an OS
 /// file lock, so it excludes other daemon worker threads (each acquisition

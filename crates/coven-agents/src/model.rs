@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AgentId, BoxError, ToolDefinition};
+use crate::{AgentId, BoxError, RunSignal, ToolDefinition};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -112,4 +112,18 @@ where
 {
     async fn generate(&self, request: ModelRequest, context: &C)
         -> Result<ModelResponse, BoxError>;
+
+    /// Generates with access to the invocation's stop signal. The runner
+    /// calls this method; the default ignores the signal and calls
+    /// [`Model::generate`]. A response that arrives after a stop is
+    /// discarded, so a model may return early once it observes one.
+    async fn generate_with_signal(
+        &self,
+        request: ModelRequest,
+        context: &C,
+        signal: &RunSignal,
+    ) -> Result<ModelResponse, BoxError> {
+        let _ = signal;
+        self.generate(request, context).await
+    }
 }

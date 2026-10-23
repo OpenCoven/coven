@@ -228,6 +228,25 @@ The checked-in
 [`runtime-authority-terminal-recovery.vectors.json`](runtime-authority-terminal-recovery.vectors.json),
 [`scheduler-leadership-fencing.vectors.json`](scheduler-leadership-fencing.vectors.json),
 [`startup-reconciliation-wake.vectors.json`](startup-reconciliation-wake.vectors.json),
+[`result-delivery-recovery.vectors.json`](result-delivery-recovery.vectors.json),
+[`result-delivery-process-crash-recovery.vectors.json`](result-delivery-process-crash-recovery.vectors.json),
+[`run-settlement-process-crash-recovery.vectors.json`](run-settlement-process-crash-recovery.vectors.json),
+[`run-launch-process-crash-recovery.vectors.json`](run-launch-process-crash-recovery.vectors.json),
+[`attempt-retry-process-crash-recovery.vectors.json`](attempt-retry-process-crash-recovery.vectors.json),
+[`occurrence-recovery-process-crash-recovery.vectors.json`](occurrence-recovery-process-crash-recovery.vectors.json),
+[`run-cancellation-process-crash-recovery.vectors.json`](run-cancellation-process-crash-recovery.vectors.json),
+[`flat-cancellation-process-crash-recovery.vectors.json`](flat-cancellation-process-crash-recovery.vectors.json),
+[`timeout-enforcement-process-crash-recovery.vectors.json`](timeout-enforcement-process-crash-recovery.vectors.json),
+[`held-settlement-process-crash-recovery.vectors.json`](held-settlement-process-crash-recovery.vectors.json),
+[`automatic-retry-process-crash-recovery.vectors.json`](automatic-retry-process-crash-recovery.vectors.json),
+[`retry-timeout-process-crash-recovery.vectors.json`](retry-timeout-process-crash-recovery.vectors.json),
+[`waiting-retry-cancellation-process-crash-recovery.vectors.json`](waiting-retry-cancellation-process-crash-recovery.vectors.json),
+[`run-now-process-crash-recovery.vectors.json`](run-now-process-crash-recovery.vectors.json),
+[`run-now-envelope-process-crash-recovery.vectors.json`](run-now-envelope-process-crash-recovery.vectors.json),
+[`tick-process-crash-recovery.vectors.json`](tick-process-crash-recovery.vectors.json),
+[`no-process-receipt-process-crash-recovery.vectors.json`](no-process-receipt-process-crash-recovery.vectors.json),
+[`event-feed-process-crash-recovery.vectors.json`](event-feed-process-crash-recovery.vectors.json),
+[`cancellation-timeout-process-crash-recovery.vectors.json`](cancellation-timeout-process-crash-recovery.vectors.json),
 [`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 [`rrule-vocabulary.vectors.json`](rrule-vocabulary.vectors.json), and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
@@ -291,7 +310,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements eleven structural suites, fifteen
+The native Coven target implements twelve structural suites, thirty-five
 scheduler-reliability suites, and one bounded Runtime Authority recovery suite.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
@@ -544,3 +563,1398 @@ standalone Windows runner containment remains unsupported.
 This adds `audit_only` command transaction crash coverage. It does not cover
 external dispatch crashes, physical disk exhaustion, permission/I/O/corruption,
 complete profiles, production authority, or release eligibility.
+
+## Command SQLite corruption audit boundary
+
+The `command-storage-corruption-recovery` suite seeds a disposable private
+store through production owner-local commands: an active definition, which
+records its owner grant, and a richly authored draft. The fixture then inserts
+a settled occurrence/run/attempt chain and a pending runNow result reservation
+with SQL, so every compared table holds rows before the fault. After a truncating checkpoint it
+copies the main database to a path that has never been opened, then sets one
+byte to zero: the first header byte (`sqlite_header`), or the first byte of the
+B-tree root page of the definition table (`definition_btree`) or of the command
+adoption table (`adoption_btree`). A fourth case writes nothing. Vectors cannot
+choose a path, offset or bytes.
+
+The production store initializer opens the copy cold, and the production
+definition command runs only if that open succeeds. The header case must fail
+with `rusqlite::ErrorCode::NotADatabase`, both B-tree cases with
+`DatabaseCorrupt`, and the control must commit. Each vector states the stage
+that must refuse its fault, and the suite fixes that stage per fault. The cold
+initializer reads the header and the definition table, so it refuses those two
+(`cold_open`), and the command is never reached. It never reads the adoption
+table's root page, so the command itself must refuse that fault (`command`).
+The command writes the definition row and its lifecycle event (stream head and
+event row) before it inserts the adoption row. The adoption case must show that
+the command had completed at least one write before it was refused
+(`refusedAfterEarlierWrites`, from SQLite's total-change counter), that the
+connection is left outside a transaction, and that none of those writes
+persisted. If a future initializer refused the adoption fault at cold open, the
+case would no longer exercise the command, so the suite fails rather than
+silently losing that coverage. A refusal must
+leave the corrupted main file byte-for-byte as written, which proves it wrote
+nothing there. The suite then restores only the damaged byte and requires every
+other main, WAL, shared-memory and rollback-journal byte to be unchanged. A read-only inspection must find every seeded row
+intact and no row for the refused key before any writable reopen. Replacing the
+file with a backup or deleting the WAL would hide a refused operation's writes,
+so the fixture does neither.
+
+The same command and key then commit once. A reopen must replay the original
+result and event reference without further writes. Observations carry fixed
+fault, error and stage classes, per-table counts and booleans, never offsets,
+paths, SQL, native errors or row values. Restoring the byte is a fixture step,
+not operator guidance or a production repair. This is `audit_only` evidence
+for three deterministic corruption modes. Corruption on a page that neither the
+initializer nor the command reads stays latent, and the command commits around
+it; no production integrity scan exists, and this suite does not claim one. It
+does not cover other corruption patterns, WAL-frame corruption, I/O faults,
+disk exhaustion, process crashes, complete profiles or release eligibility.
+
+## Result delivery audit boundary
+
+The `result-delivery-recovery` suite drives a settled run's `pending`
+main-session delivery obligation through the production discharge path,
+`deliver_pending_results`. Each of six cases uses its own disposable private
+store and Coven home. The fixture stores the vector's definition, which must
+target the main session, and settles a run through the production run record,
+which writes the obligation. Vectors cannot choose a path, run id or fault
+mechanics. The definition they supply must be paused, target the main session
+and carry no working directory, and every expected outcome is fixed per fault.
+
+- **Control:** the first pass delivers one notice, and the run's record names
+  it.
+- **Held gate:** the fixture holds the main-session scope gate. The pass defers
+  the run, which stays `pending` with no notice. After release, it delivers
+  once.
+- **Full inbox:** the scope already holds the most pending notices it keeps.
+  The pass defers the run and evicts none of the waiting notices. After the
+  fixture marks them delivered, as a turn would, the run delivers once.
+- **Discharge rollback:** a fixture TEMP trigger on the delivering connection
+  aborts the `delivered` record inside the discharge transaction, and only once
+  the notice it names is visible there. The pass fails with that abort, the
+  notice rolls back with the record, and the run stays `pending`. With the
+  trigger removed, it delivers once. A failed discharge ends the whole pass, so
+  runs after it wait for the next pass.
+- **Gate unavailable:** a file stands where the gate's lock directory belongs.
+  The run is recorded `failed` with the fixed gate reason and no notice. A
+  later pass with the directory restored neither retries nor reopens it.
+- **Unreadable result:** the run is launched through the production runner with
+  a no-op runtime, and its session holds a malformed output event. It alone is
+  recorded `failed` with the fixed unreadable reason, while a healthy run that
+  settled after it is delivered in the same pass.
+
+Every case then runs a further pass that must change nothing. The settled
+record must refuse, through the production immutability trigger, to point at
+another notice or to reopen, and must read back unchanged; a failed record
+names no notice. Observations carry fixed pass, state, reason and fault
+classes, counts and booleans. They never carry run or notice ids, notice text,
+paths or output.
+
+This is `audit_only` evidence for deferral, transactional rollback and failure
+isolation. A process kill during delivery is the next suite's. This one does
+not cover the offer to an idle live session, per-familiar or other principals'
+scopes (#857), delivery SLOs, load, complete profiles or release eligibility.
+
+## Result delivery process-crash audit boundary
+
+The `result-delivery-process-crash-recovery` suite kills the process that is
+delivering a result. Each of four cases starts the exact audited binary as a
+hidden worker, with the same scrubbed environment and parent-owned scratch
+root as `command-process-crash-recovery`. The worker creates a private Coven
+home and disposable store, stores the fixed synthetic paused definition, settles
+one run with a `pending` main-session obligation through the production run
+record, and runs `deliver_pending_results`. Vectors cannot choose a path, run,
+definition or pause mechanics, and every expected outcome is fixed per boundary.
+
+- **After notice:** a fixture TEMP trigger calls a local callback after the
+  result notice insert, inside the delivery transaction.
+- **After record:** the same, after the `delivered` update and before commit.
+- **After commit:** the delivering connection's WAL hook calls the callback
+  once SQLite has committed the delivery, while the worker still holds the
+  scope gate.
+- **Control:** no pause. The worker delivers once and exits.
+
+The callback announces the boundary and parks. While the worker is paused, the
+parent must fail to take the main-session gate and to begin a write
+transaction before the commit, and must read the run as `pending` before the
+commit and `delivered` after it. The parent then kills and reaps the worker.
+SQLite may still hold a killed transaction's pages in memory, so these cases
+do not require uncommitted frames in the WAL; `command-process-crash-recovery`
+proves recovery from spilled frames.
+
+After the kill, the gate must become free, and the store's raw integrity check
+must pass before the production initializer opens it. Before the commit, the
+run is `pending` with no notice; after it, the run is `delivered` and its
+record names its one notice. A recovery pass in the parent delivers the
+pending run once, or changes nothing for a delivered one. A further pass from a
+fresh connection must change nothing.
+
+Observations carry boundary, state and pass classes, counts and booleans. They
+never carry run or notice ids, notice text, paths, handshakes or output. This
+is `audit_only` evidence for a process kill inside one delivery. It does not
+cover power loss or unsynced pages, a kill inside a failure record, the idle
+session offer, per-familiar scopes (#857), load, complete profiles or release
+eligibility.
+
+## Run settlement process-crash audit boundary
+
+The `run-settlement-process-crash-recovery` suite kills the process that is
+settling a run whose session has ended. Settlement writes the occurrence's
+terminal state, the attempt's terminal state, and the run's terminal status
+with its pinned delivery obligation, in one transaction. Each of five cases
+starts the exact audited binary as a hidden worker with the same harness as
+`result-delivery-process-crash-recovery`. The worker stores the fixed synthetic
+paused, main-session-targeted definition, launches one run through
+`run_routine_now` with a no-op runtime, ends its session with exit code 0, and
+runs `settle_finished_runs`. Vectors cannot choose a path, run, definition or
+pause mechanics, and every expected outcome is fixed per boundary.
+
+- **After occurrence, after attempt, after run:** a fixture TEMP trigger
+  pauses the worker after that terminal update, inside the settlement
+  transaction.
+- **After commit:** the settling connection's WAL hook pauses it once SQLite
+  has committed the settlement.
+- **Control:** no pause. The worker settles the run and exits.
+
+While the worker is paused, the parent must fail to begin a write transaction
+before the commit and read the run, attempt and occurrence exactly as the
+launch left them. After the commit, it must begin one, and read all three
+settled with a `pending` obligation. The parent then kills and reaps the
+worker, and the store's raw integrity check must pass.
+
+After the kill, a run killed before the commit must be unsettled with no
+obligation, and one killed after it settled with its obligation pending; no
+notice exists either way. The parent then runs the settlement and delivery
+steps of the daemon's reconciliation, in its order, with no runtime and so no
+idle-session offer. The steps before them recover containment, expired
+cancellations, abandoned launches and timeouts, none of which these cases
+hold. It must settle a killed-before-commit run once, never settle a settled
+run again, and deliver each run's result once, with the record naming its one
+notice. A store that recovery refuses fails the case. A further
+reconciliation from a fresh connection must change nothing.
+
+Observations carry boundary, settlement, state and pass classes, counts and
+booleans. They never carry run, attempt, occurrence, session or notice ids,
+notice text, paths, handshakes or output. As with delivery, these cases do not
+require uncommitted frames in the WAL. This is `audit_only` evidence for a
+process kill inside one plain successful settlement. It does not cover kills
+during dispatch or launch, held-for-retry (see
+`held-settlement-process-crash-recovery`), timeout, cancellation or Runtime
+Authority settlement, power loss, load, complete profiles or release
+eligibility.
+
+## Run launch process-crash audit boundary
+
+The `run-launch-process-crash-recovery` suite kills a daemon worker while it
+launches a claimed scheduled occurrence, then restarts the daemon's scheduler
+over the store it left. The launch writes the session as `created`, starts the
+run and marks its first attempt `dispatching` in one transaction. The runtime
+launch then publishes ownership in a second: the session, attempt and
+occurrence become `running`, `started` and `running`. Each of six cases starts
+the exact audited binary as a hidden worker with the same harness as
+`run-settlement-process-crash-recovery`. The worker stores the fixed synthetic
+active daily definition, takes scheduler leadership, runs the fenced tick that
+plans and claims the 09:00 slot, and runs the fenced dispatch with a no-op
+runtime. Vectors cannot choose a path, run, definition, clock or pause
+mechanics, and every expected outcome is fixed per boundary.
+
+- **After session, after dispatching:** a fixture TEMP trigger pauses the
+  worker after the session insert or the attempt's `dispatching` update, the
+  launch transaction's first and last writes.
+- **After launch commit:** the dispatching connection's WAL hook pauses it once
+  SQLite has committed the launch.
+- **After ownership:** a fixture TEMP trigger pauses it after the occurrence's
+  `running` update, the ownership transaction's last write.
+- **After ownership commit:** the WAL hook pauses it once SQLite has committed
+  ownership, its second commit.
+- **Control:** no pause. The worker dispatches and exits without the graceful
+  shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one. Before the launch commits, it must read
+the occurrence claimed with no run, attempt or session. After the launch
+commits, and inside ownership, it must read the launch. After ownership
+commits, it must read the occurrence, run and session `running`. The parent
+then kills and reaps the worker. The store's raw integrity check must pass, and
+the store must hold what the parent read while the worker was paused.
+
+The parent then restarts in the daemon's startup order, through production
+entry points and without the scheduler thread. Session recovery orphans
+`running` sessions; it never fails the launch's `created` session, which a
+running run owns. Scheduler leadership follows, with a bounded wait because
+Windows documents a delay before it releases a dead holder's lock. The
+scheduler's own startup recovery and its startup pass come last.
+That pass runs with the startup cutoff, on a runtime that counts launches. A
+claim with no launch must be restored and launched exactly once. A launch or
+published ownership must never launch again: restart containment kills the
+session, and the run is held for an operator retry. The relaunched session then
+ends with exit code 0. An ordinary pass before the run's deadline must settle
+the relaunched run `succeeded` and keep the held run held. A pass after the
+deadline must settle the held run `failed`. Every case ends with one session in
+the store, and no pass after the restart's may launch. A store that recovery
+refuses fails the case. A further pass must change no occurrence, run, attempt,
+event or session row.
+
+Observations carry boundary, launch, state and pass classes, counts and
+booleans. They never carry run, attempt, occurrence or session ids, paths,
+handshakes or output. As with delivery, these cases do not require uncommitted
+frames in the WAL. This is `audit_only` evidence for a daemon killed while it
+launches one scheduled occurrence with no no-process containment receipt. It
+does not cover a real runtime process, receipt-proven no-process retry, which
+relaunches by design (see `no-process-receipt-process-crash-recovery`), an
+automatic retry after a launch fails before ownership
+(see `automatic-retry-process-crash-recovery`), Runtime Authority launches,
+manual occurrences (see `run-now-process-crash-recovery`), kills during the
+tick that plans and claims the slot (see `tick-process-crash-recovery`), kills
+during held-for-retry (see
+`held-settlement-process-crash-recovery`), timeout
+(see `timeout-enforcement-process-crash-recovery`) or cancellation, power loss,
+load, complete profiles or release eligibility.
+
+## Operator retry process-crash audit boundary
+
+The `attempt-retry-process-crash-recovery` suite kills a daemon worker while it
+handles the operator's `attempt.retry.v1` request for a held run. The parent
+then restarts the daemon's scheduler and sends the identical request again,
+with the same adoption key, as an operator who never saw an answer would. The
+retry is one transaction. It opens attempt 2 as `adopted`, an operator retry
+of attempt 1's failure. It returns the occurrence to `planned` and releases the
+run's session. Last, it stores the response under the request's adoption key.
+Each of six cases starts the exact audited binary as a hidden worker, with the
+same harness and daemon restart as `run-launch-process-crash-recovery`. The
+worker stores a fixed synthetic active daily definition with no automatic
+retry, and claims and launches its 09:00 slot through a no-op runtime. The
+session then ends with exit code 1, and an ordinary pass holds the run for an
+operator retry. Vectors cannot choose a path, run, definition, adoption key,
+clock or pause mechanics, and every expected outcome is fixed per boundary.
+
+- **After attempt, after replan, after release, after adoption:** a fixture
+  TEMP trigger pauses the worker after each of the retry transaction's four
+  writes, in order.
+- **After commit:** the WAL hook pauses it once SQLite has committed the retry.
+- **Control:** no pause. The worker answers the request and exits without the
+  graceful shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one. Inside it, the parent must read the held
+run with no attempt 2 or stored answer. After the commit it must read the
+whole retry. The parent then kills and reaps the worker. The store's raw
+integrity check must pass, and the store must hold what the parent read while
+the worker was paused.
+
+After the restart's startup pass, a committed retry must have dispatched
+attempt 2 once, and a held run must be untouched. The re-sent request must then
+commit the retry if it was lost. If it had committed, the request must replay
+the stored response, which names the attempt 2 the store opened earlier, even
+though that attempt has since started. The next pass dispatches a retry that
+has not yet launched. Its session ends with exit code 0, and a pass settles the
+run `succeeded`. Every case ends with one launch since the restart, two
+sessions and the request's one stored answer. A store that recovery refuses,
+or a request that errors, fails the case. The same request and a further pass
+must then change no occurrence, run, attempt, event, session or adoption row.
+
+Observations carry boundary, retry, answer and state classes, counts and
+booleans. They never carry run, attempt, occurrence or session ids, adoption
+keys, responses, paths, handshakes or output. This is `audit_only` evidence for
+a daemon killed while it handles one operator retry of a failed scheduled run.
+It does not cover Runtime Authority runs, which this command refuses,
+`occurrence.recover.v1`, cancellation, retries of a timed-out or cancelled
+attempt, a graceful daemon restart, a real runtime process, power loss, load,
+complete profiles or release eligibility.
+
+## Owner recovery process-crash audit boundary
+
+The `occurrence-recovery-process-crash-recovery` suite kills a daemon worker
+while it handles the owner's `occurrence.recover.v1` request for an occurrence
+whose stop could not be confirmed. The parent then restarts the daemon's
+scheduler and sends the identical request again, with the same adoption key,
+as an owner who never saw an answer would. Each of thirteen cases starts the
+exact audited binary as a hidden worker, with the same harness and daemon
+restart as `run-launch-process-crash-recovery`. The worker stores a fixed
+synthetic active daily definition with no automatic retry, and claims and
+launches its 09:00 slot through a no-op runtime. The owner's `run.cancel.v1`
+then runs through a runtime that never confirms the stop. The daemon's API
+fences a stop on the wall clock; the worker fences it on the fixture's fixed
+clock, so its times agree with the scheduler's. The attempt becomes
+`ambiguous`, the occurrence `recovery_required`, and the cancellation's stop
+fence stays on the run. A daemon restart then marks the session `orphaned` and
+launches nothing. Vectors cannot choose a path, run, definition, determination
+statement, adoption key, clock or pause mechanics, and every expected outcome
+is fixed per determination and boundary.
+
+Each determination is one transaction that releases the run's stop fence and
+stores the response under the request's adoption key last:
+
+- **`retry_with_new_attempt`** opens attempt 2 as `adopted`, an operator
+  recovery of attempt 1's ambiguity. It returns the occurrence to `planned` and
+  releases the run's session.
+- **`failed_deterministic`** settles the occurrence `failed`, then finishes the
+  run `failed`. It launches nothing.
+
+For each determination:
+
+- **After each write:** a fixture TEMP trigger pauses the worker after each
+  of the transaction's writes, in order. That is the attempt insert, the
+  occurrence replan, the session release, the fence release and the adoption
+  insert for a retry. For a failed determination it is the occurrence
+  settlement, the run finish, the fence release and the adoption insert.
+- **After commit:** the WAL hook pauses it once SQLite has committed the
+  determination.
+- **Control:** no pause. The worker answers the request and exits without the
+  graceful shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one. Inside it, the parent must read the
+occurrence still waiting for the owner under the cancellation's fence, with no
+attempt 2 or stored answer. After the commit it must read the whole
+determination, with no fence. The parent then kills and reaps the worker. The
+store's raw integrity check must pass, and the store must hold what the parent
+read while the worker was paused.
+
+After the restart's startup pass, a committed retry must have dispatched
+attempt 2 once. For a committed failed determination and an unresolved
+occurrence, the restart must change no occurrence, run, attempt, event,
+session, adoption, cancellation or stop-fence row. The re-sent request must
+then commit the determination if
+it was lost. If it had committed, the request must replay the stored response,
+which names the store's run and, for a retry, the attempt 2 it opened earlier,
+even though that attempt has since started. For a retry, the next pass
+dispatches an attempt that has not yet launched. Its session ends with exit
+code 0, and a pass settles the run `succeeded`, which needs the run's fence
+released. A retry case ends with one launch since the restart and two
+sessions. A failed case ends with no launch, one session, and a `failed` run
+and occurrence. Every case ends with the request's one stored answer. A store
+that recovery refuses, or a request that errors, fails the case. The same
+request and a further pass must then change no occurrence, run, attempt,
+event, session, adoption, cancellation or stop-fence row.
+
+Observations carry determination, boundary, occurrence, answer and state
+classes, counts and booleans. They never carry run, attempt, occurrence or
+session ids, adoption keys, responses, paths, handshakes or output. This is
+`audit_only` evidence for a daemon killed while it handles one owner recovery
+after an unconfirmed cancellation of a scheduled run. It does not cover
+Runtime Authority runs, which this command refuses, a recovery after a
+timeout's or an abandoned launch's unconfirmed stop, a daemon killed inside
+the cancellation itself, a graceful daemon restart, a real runtime process,
+power loss, load, complete profiles or release eligibility.
+
+## Owner cancellation process-crash audit boundary
+
+The `run-cancellation-process-crash-recovery` suite kills a daemon worker
+while it handles the owner's `run.cancel.v1` request for a running scheduled
+run. The parent then restarts the daemon's scheduler and sends the identical
+request again, with the same adoption key, as an owner who never saw an
+answer would. Each of eighteen cases starts the exact audited binary as a
+hidden worker, with the same harness and daemon restart as
+`run-launch-process-crash-recovery`. The worker stores a fixed synthetic
+active daily definition with no automatic retry, and claims and launches its
+09:00 slot through a no-op runtime. It then handles the cancellation as the
+daemon's API does, through a runtime that confirms every stop and records it
+in the worker's private home, so the parent can count the stops of a worker
+it killed. The daemon's API fences a stop on the wall clock; the worker fences
+it on the fixture's fixed clock, so its times agree with the scheduler's.
+Vectors cannot choose a path, run, definition, reason, principal, adoption
+key, clock or pause mechanics, and every expected outcome is fixed per
+boundary.
+
+The cancellation runs four transactions, with the stop between the second
+and the third:
+
+1. **Reservation:** the global adoption-key reservation, then the
+   cancellation `requested` with a 30-second execution lease.
+2. **Stop ownership:** the run's `cancellation` stop fence, then the
+   cancellation `stopping`.
+3. **Settlement:** once the runtime confirms the stop, the session
+   `cancelled`, then the attempt, the run and the occurrence `cancelled`, then
+   the fence released.
+4. **Answer:** the cancellation `cancelled`, then the reservation released,
+   then the response stored under the request's adoption key.
+
+A fixture TEMP trigger pauses the worker after each of those twelve writes,
+and the WAL hook after each of the four commits. The worker's runtime pauses
+right after it records the stop. The control has no pause: the worker answers
+`cancelled` and exits without the graceful shutdown's reconciliation or the
+release of its scheduler authority.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker. The store's raw integrity check must
+pass, and the store must still hold what the parent read.
+
+The parent restarts in the daemon's startup order 10 seconds after the
+request, inside the cancellation's lease, and the owner re-sends the request
+10 seconds later. A pass after the lease reconciles the cancellation, and the
+owner sends the request once more. One runtime confirms and counts every stop
+and launch that the restart, the passes and the re-sent requests make. What
+each case requires depends on how far the cancellation got:
+
+- **Nothing committed:** the restart's containment marks the lost session
+  `killed`, and its startup pass settles the attempt `failed`, which holds the
+  run for an operator retry. The re-sent request stores an
+  `ILLEGAL_TRANSITION` refusal, and later requests replay it.
+- **Reserved, without the fence:** the same containment and hold. The request
+  inside the lease is answered `CANCEL_PENDING` and writes nothing. The pass
+  rejects the cancellation with `ILLEGAL_TRANSITION`, which later requests
+  replay.
+- **Fenced, stopped, or inside the settlement:** behind the fence, the
+  restart's containment marks the session `killed`, and its startup pass
+  leaves the attempt to the cancellation. The request inside the lease is
+  answered `CANCEL_PENDING`. The pass answers the cancellation
+  `recovery_required`, because the stop's outcome was never recorded. The
+  same pass then settles the ambiguous run and occurrence `failed` on its
+  ended session and releases the cancellation's fence. Later requests replay
+  the stored `recovery_required` answer: it records that the stop was never
+  confirmed, and the run's history shows how it settled.
+- **Settled, without the answer:** the restart changes no row. The request
+  inside the lease is answered `CANCEL_PENDING`. The pass answers `cancelled`,
+  acknowledged and reconciled when the stop was settled, and later requests
+  replay that answer.
+- **Answered,** and the control: the restart changes no row, and every
+  request replays `cancelled`.
+
+The worker must have recorded exactly one stop once it reached the stop, and
+none before it. The restart, the passes and the re-sent requests must issue
+no stop and launch nothing. A pending or replayed answer must write nothing,
+and a success must name the store's run, attempt and session. A request that
+errors fails the case. The same request and a further pass must then change
+no occurrence, run, attempt, event, session, reservation, adoption,
+cancellation or stop-fence row, and issue no stop or launch.
+
+Observations carry boundary, run, cancellation and answer classes, counts and
+booleans. They never carry run, attempt, occurrence or session ids, adoption
+keys, responses, paths, handshakes or output. This is `audit_only` evidence
+for a daemon killed while it handles one owner cancellation of a running
+scheduled run. It does not cover Runtime Authority runs, the flat
+`occurrence.cancel.v1` and `attempt.cancel.v1` commands (see
+`flat-cancellation-process-crash-recovery`), a cancellation racing a timeout
+(see `cancellation-timeout-process-crash-recovery`), a stop the runtime fails
+to confirm, a graceful daemon restart, a real runtime process, power loss,
+load, complete profiles or release eligibility.
+
+## Owner occurrence and attempt cancellation process-crash audit boundary
+
+The `flat-cancellation-process-crash-recovery` suite kills a daemon worker
+while it handles the owner's `occurrence.cancel.v1` or `attempt.cancel.v1`
+request. The parent then restarts the daemon's scheduler and sends the
+identical request again, with the same adoption key, as an owner who never saw
+an answer would. Each of twelve cases starts the exact audited binary as a
+hidden worker, with the same harness, daemon restart and stop-recording
+runtime as `run-cancellation-process-crash-recovery`. The worker stores a
+fixed synthetic active daily definition with no automatic retry, establishes
+the owner principal, and claims its 09:00 slot. The daemon's API fences a
+delegated stop on the wall clock; the worker fences it on the fixture's fixed
+clock. Vectors cannot choose a path, occurrence, attempt, definition, reason,
+adoption key, clock or pause mechanics, and every expected outcome is fixed
+per boundary.
+
+The two commands answer in one of two ways:
+
+- **Nothing dispatched.** `occurrence.cancel.v1` for the claimed slot settles
+  the occurrence `cancelled` and stores the answer under the owner's key in one
+  transaction. A fixture TEMP trigger pauses the worker after the occurrence
+  write and after the answer's write, and the WAL hook after the commit. The
+  control has no pause.
+- **A running attempt.** The worker launches the slot through a no-op runtime,
+  and `attempt.cancel.v1` stores, as its answer, a delegation to a
+  `run.cancel.v1` request under a key derived from the owner's. It then sends
+  that run cancellation, which keeps its own reservation, stop fence and
+  answer. The worker pauses after the delegation's write and after its
+  commit, after each of the run cancellation's four commits, and right after
+  its runtime records the stop. The control has no pause.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check
+must pass.
+
+The parent restarts in the daemon's startup order 10 seconds after the
+request, inside a run cancellation's lease, and the owner re-sends the request
+10 seconds later. A pass after the lease reconciles any run cancellation, and
+the owner sends the request once more. One runtime confirms and counts every
+stop and launch that the restart, the passes and the re-sent requests make.
+What each case requires depends on how far the request got:
+
+- **A claimed slot, nothing committed:** the restart launches the slot. The
+  re-sent request is then a new one: it delegates the launched run's stop,
+  which settles the run `cancelled`, and later requests replay that answer.
+  This is the only case with a launch and a later stop, one of each.
+- **A claimed slot, withdrawn,** and its control: the restart changes no row
+  and launches nothing, and every request replays the withdrawal.
+- **A running attempt, nothing committed:** the restart's containment marks
+  the session `killed` and its startup pass fails the attempt, holding the run
+  for an operator retry. The re-sent request stores its own
+  `ILLEGAL_TRANSITION` refusal, which later requests replay.
+- **Delegated, not sent:** the same hold. The re-sent request replays the
+  delegation and sends its run cancellation, which refuses the failed attempt
+  and stores that refusal under the derived key. Later requests replay it.
+- **The run cancellation reserved, fenced, stopped, settled or answered:**
+  every re-sent request replays the delegation into the same run cancellation,
+  which answers exactly as it does when the owner sends it directly: a
+  reservation is rejected; an unconfirmed stop answers `recovery_required`
+  and its run settles `failed`; a settled stop answers `cancelled`.
+
+The worker must have recorded exactly one stop once it reached the stop, and
+none before it. Except for the claimed slot nobody withdrew, the restart, the
+passes and the re-sent requests must issue no stop and launch nothing. A
+pending or replayed answer must write nothing. A success must name the store's
+occurrence, or the store's run, attempt and session with the time its run
+cancellation was requested. A request that errors fails the case. The same
+request and a further pass must then change no occurrence, run, attempt,
+event, session, reservation, adoption, cancellation or stop-fence row, and
+issue no stop or launch.
+
+Observations carry boundary, run, cancellation and answer classes, counts and
+booleans. They never carry occurrence, run, attempt or session ids, adoption
+keys, responses, paths, handshakes or output. This is `audit_only` evidence for
+a daemon killed while it handles one owner occurrence or attempt cancellation.
+It does not cover an eligible or planned slot, a waiting retry attempt (see
+`waiting-retry-cancellation-process-crash-recovery` for an automatic one), a
+request first sent to a run already held for an operator retry, a kill inside
+an `occurrence.cancel.v1` request that delegates a running attempt's stop
+(tracked in #1486), the run-cancellation envelope, a delegation waiting on
+runtime ownership, Runtime Authority runs, a stop the runtime fails to confirm,
+a graceful daemon restart, a real runtime process, power loss, load, complete
+profiles or release eligibility.
+
+## Timeout enforcement process-crash audit boundary
+
+The `timeout-enforcement-process-crash-recovery` suite kills a daemon worker
+while its scheduler enforces a scheduled run's deadline. The parent then
+restarts the daemon's scheduler inside the timeout's stop lease and runs passes
+after it. Each of ten cases starts the exact audited binary as a hidden worker,
+with the same harness, daemon restart and stop-recording runtime as
+`run-cancellation-process-crash-recovery`. The worker stores a fixed synthetic
+active daily definition with a one-minute deadline and no automatic retry,
+claims and launches its 09:00 slot through a no-op runtime, and calls the
+production enforcement the daemon's pass runs, 10 seconds after the deadline.
+Vectors cannot choose a path, run, definition, deadline, clock or pause
+mechanics, and every expected outcome is fixed per boundary.
+
+The enforcement claims the run's `timeout` stop fence in one transaction, asks
+the runtime to stop the session, and then, in a second transaction, ends the
+session `killed`, settles the attempt `timed_out` and the run and occurrence
+`failed`, and releases the fence. A fixture TEMP trigger pauses the worker
+after the fence's write and after each of the settlement's five writes, the WAL
+hook after each commit, and its runtime right after it records the stop. The
+control has no pause. While the worker is paused, the parent must find the
+write transaction open exactly when the pause is inside one, and read what the
+last commit left. The parent then kills and reaps the worker, and the store's
+raw integrity check must pass.
+
+The parent restarts in the daemon's startup order 10 seconds after the
+enforcement, inside the fence's 30-second lease, runs a pass after the lease, a
+second pass after that and a further pass. One runtime confirms and counts
+every stop and launch they make. What each case requires depends on how far
+the enforcement got:
+
+- **No fence committed:** the restart's containment marks the session `killed`
+  after the deadline, and its startup pass settles the attempt `timed_out` and
+  the run and occurrence `failed`.
+- **The fence committed, with or without the stop, or the settlement
+  uncommitted:** the restart's containment marks the session `killed` and
+  leaves the run behind the fence. The pass after the lease takes the expired
+  fence as a stop whose outcome is unknown: the attempt settles `ambiguous` and
+  the occurrence `recovery_required`, and the fence stays. The next pass
+  settles the run and occurrence `failed` on the ended session and releases
+  the fence. That exit from `recovery_required` is the one #1461 asks about,
+  and #1489 asks whether an expired `timeout` fence should settle by the
+  deadline instead.
+- **The settlement committed,** and the control: the restart changes no row,
+  and every pass leaves the run timed out.
+
+The worker must have recorded exactly one stop once it reached the stop, and
+none before it. The restart and the passes must issue no stop and launch
+nothing, and every case must end with the run terminal and no stop fence. The
+further pass must change no occurrence, run, attempt, event, session or
+stop-fence row, and issue no stop or launch.
+
+Observations carry boundary and run classes, counts and booleans. They never
+carry occurrence, run, attempt or session ids, paths, handshakes or output. This
+is `audit_only` evidence for a daemon killed while it enforces one scheduled
+run's deadline. It does not cover a kill inside the scheduler's own settlement
+of a run that ended after its deadline with no fence, a deadline that passes
+while a retry attempt waits (see `retry-timeout-process-crash-recovery`), a
+deadline that passes while a run is held for an operator retry (see
+`held-settlement-process-crash-recovery`), a timeout racing an owner
+cancellation (see `cancellation-timeout-process-crash-recovery`), a stop the
+runtime fails to confirm, Runtime Authority runs, a graceful daemon restart, a
+real runtime process, power loss, load, complete profiles or release
+eligibility.
+
+## Held-for-retry settlement process-crash audit boundary
+
+The `held-settlement-process-crash-recovery` suite kills a daemon worker while
+its scheduler holds a scheduled run for an operator retry, or while it settles
+that held run once the deadline passes. The parent then restarts the daemon's
+scheduler and runs passes after the deadline. Each of seven cases starts the
+exact audited binary as a hidden worker, with the same harness and daemon
+restart as `timeout-enforcement-process-crash-recovery`. The worker stores a
+fixed synthetic active daily definition with a one-minute deadline and no
+automatic retry, and claims and launches its 09:00 slot through a no-op
+runtime. The runtime's write then ends the session `failed` (exit code 1)
+before the deadline. The worker runs the production settlement the daemon's
+pass runs twice: inside the hold window, and 10 seconds after the deadline.
+Vectors cannot choose a path, run, definition, deadline, clock or pause
+mechanics, and every expected outcome is fixed per boundary.
+
+The hold settles the attempt `failed` in one transaction and leaves the run and
+the occurrence `running` under the daemon's lease. Once the deadline passes
+with no retry opened, a second transaction settles the occurrence and the run
+`failed`. A fixture TEMP trigger pauses the worker after the hold's write and
+after each of the settlement's two writes, and the WAL hook after the session's
+failure commits, after the hold commits and after the settlement commits. The
+control has no pause. While the worker is paused, the parent must find the
+write transaction open exactly when the pause is inside one, and read what the
+last commit left. The parent then kills and reaps the worker, and the store's
+raw integrity check must pass.
+
+The parent restarts in the daemon's startup order inside the hold window, 10
+seconds after the hold, when the worker died before the deadline's settlement
+began, and 10 seconds after that settlement otherwise. It then runs a pass 30
+seconds after the deadline and a further pass. One runtime counts every stop
+and launch they make. What each case requires depends on how far the worker
+got:
+
+- **The session ended, with the hold uncommitted:** the restart, inside the
+  hold window, holds the run, and the pass after the deadline settles it.
+- **The hold committed, before the deadline:** the restart, inside the hold
+  window, changes no row, and the pass after the deadline settles the run.
+- **The hold committed, with the deadline's settlement uncommitted:** the
+  restart, after the deadline, settles the run.
+- **The settlement committed,** and the control: the restart and every pass
+  change no row.
+
+Every case must end with the attempt as the hold settled it, before the
+deadline, and the run and the occurrence `failed` at or after the deadline
+because no retry was opened. The pass after the deadline must change no row
+once the restart has settled the run. The restart and the passes must issue no
+stop and launch nothing. The further pass must change no occurrence, run,
+attempt, event, session or stop-fence row, and issue no stop or launch.
+
+Observations carry boundary and run classes, counts and booleans. They never
+carry occurrence, run, attempt or session ids, paths, handshakes or output.
+This is `audit_only` evidence for a daemon killed while it holds one scheduled
+run for an operator retry or settles it after its deadline. It does not cover a
+run held after its launch failed before ownership, whose occurrence waits
+`claimed`, a daemon that stays down past the deadline of a run it never held, a
+kill inside an operator retry of a held run (see
+`attempt-retry-process-crash-recovery`), an owner cancellation of a held run, a
+graceful daemon restart (#1433), Runtime Authority runs, a real runtime
+process, power loss, load, complete profiles or release eligibility.
+
+## Automatic retry process-crash audit boundary
+
+The `automatic-retry-process-crash-recovery` suite kills a daemon worker while
+its scheduler schedules the retry a definition's policy allows after a launch
+fails before ownership, or while it re-claims and relaunches that retry. The
+parent then restarts the daemon's scheduler and runs passes after the retry's
+backoff. Each of eleven cases starts the exact audited binary as a hidden
+worker, with the same harness and daemon restart as
+`run-launch-process-crash-recovery`. The worker stores a fixed synthetic active
+daily definition whose policy retries an unavailable runtime once, 60 seconds
+after the failure, within a 30-minute deadline. It claims the 09:00 slot and
+dispatches it through a no-op runtime that is unavailable for its first launch
+and accepts every later one. Once the backoff ends, it runs the fenced tick and
+dispatch again. Vectors cannot choose a path, run, definition, policy, clock or
+pause mechanics, and every expected outcome is fixed per boundary.
+
+The slot's launch commits first. One transaction then ends its session
+`failed`, settles the first attempt `failed` as `runtime_unavailable`, records
+the retry `adopted` until the backoff ends, returns the occurrence to `planned`
+with no lease, and releases the run's session. At the retry, the tick advances
+its planning cursor, then re-claims the occurrence and binds the retry to that
+claim in one transaction. The retry's launch and its ownership follow, as in
+the launch suite, under the same run.
+
+- **Inside the rejection:** a fixture TEMP trigger pauses the worker after its
+  first write (the session), the retry's insert and its last write (the run's
+  session).
+- **After the rejection commits:** the WAL hook pauses it after the second
+  commit.
+- **Inside the re-claim and after it commits:** a TEMP trigger on the
+  occurrence's `claimed` update, and the WAL hook after the fourth commit.
+- **Inside the retry's launch and after it commits:** a TEMP trigger on the
+  retry's `dispatching` update, and the WAL hook after the fifth commit.
+- **Inside the retry's ownership and after it commits:** a TEMP trigger on the
+  occurrence's `running` update, and the WAL hook after the sixth commit.
+- **Control:** no pause. The worker relaunches and exits without the graceful
+  shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check
+must pass. It restarts in the daemon's startup order before the backoff ends
+when the worker died at the slot, and after it when the worker died at the
+retry. It then runs a pass after the backoff and a further pass. One runtime
+counts every stop and launch they make. What each case requires depends on how
+far the worker got:
+
+- **The slot's launch committed, with the rejection uncommitted:** the store
+  cannot show that the runtime refused, so the restart holds the run for an
+  operator retry, as the launch suite does. The policy's retry is not
+  scheduled, and nothing launches.
+- **The retry scheduled, with the worker killed before the backoff ended:** the
+  restart changes no row and launches nothing. The pass after the backoff
+  re-claims the occurrence and launches the retry once.
+- **The retry scheduled or re-claimed, with the worker killed at the retry:**
+  the restart re-claims the occurrence under its own leadership and launches
+  the retry once.
+- **The retry's launch committed or owned,** and the control: the restart
+  holds the retry for an operator retry, and nothing launches again.
+
+Every class pins the whole store: one occurrence and one `running`, unfinished
+run with no stop fence; at most two attempts and two sessions; the first
+attempt never bound to a session; the retry's classification, prior attempt,
+`not_before` and claim binding; the run's session; and both settlement reasons.
+No case may launch the retry more than once, launch it before its backoff ends,
+or open a third attempt or session. The restart and the passes must issue no
+stop. Once the run is held or its retry has launched, the pass after the
+backoff must change no row. The further pass must change no occurrence, run,
+attempt, event, session or stop-fence row, and issue no stop or launch.
+
+Observations carry boundary and retry classes, counts and booleans. They never
+carry occurrence, run, attempt or session ids, paths, handshakes or output. This
+is `audit_only` evidence for a daemon killed while it schedules or relaunches
+one automatic retry after a launch failed before ownership. It does not cover a
+kill inside the pass's reconciliation between the backoff and the re-claim, a
+retry after an expired claim lease, an exponential backoff's jitter, retry
+exhaustion or quarantine (see `retry-quarantine-recovery`), a retry whose wait
+outlasts the run's deadline (see `retry-timeout-process-crash-recovery`), a kill
+inside an operator retry (see `attempt-retry-process-crash-recovery`),
+cancellation of a waiting retry (see
+`waiting-retry-cancellation-process-crash-recovery`), a graceful daemon restart
+(#1433), Runtime Authority launches, a real runtime process, power loss, load,
+complete profiles or release eligibility.
+
+## Retry timeout process-crash audit boundary
+
+The `retry-timeout-process-crash-recovery` suite kills a daemon worker while an
+automatic retry waits past its run's deadline, or while the scheduler's timeout
+enforcement settles that retry. The parent then restarts the daemon's scheduler
+once both the deadline and the retry's backoff have passed, and runs a further
+pass. Each of six cases starts the exact audited binary as a hidden worker,
+with the same harness and daemon restart as
+`run-launch-process-crash-recovery`. The worker stores a fixed synthetic active
+daily definition whose policy retries an unavailable runtime once, 120 seconds
+after the failure, within a one-minute deadline. It claims the 09:00 slot and
+dispatches it through a no-op runtime that is unavailable for its first launch,
+so the retry waits past the deadline. Once the deadline has passed, it runs the
+pass's timeout enforcement. Vectors cannot choose a path, run, definition,
+policy, clock or pause mechanics, and every expected outcome is fixed per
+boundary.
+
+The slot's launch commits first, and the rejection that schedules the retry
+second, as in `automatic-retry-process-crash-recovery`. Timeout enforcement then
+settles the waiting retry in one transaction: the retry `timed_out` with the
+`timeout` class, the occurrence `failed` with no lease, and the run `failed`,
+each with the timeout's reason where it has one.
+
+- **While the retry waits:** the WAL hook pauses the worker after the second
+  commit, so the daemon stays down past both the deadline and the backoff.
+- **Inside the settlement:** a fixture TEMP trigger pauses it after each of the
+  three writes.
+- **After the settlement commits:** the WAL hook pauses it after the third
+  commit.
+- **Control:** no pause. The worker settles the retry and exits without the
+  graceful shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check must
+pass. It restarts in the daemon's startup order after both the deadline and the
+backoff, then runs a further pass. One runtime counts every stop and launch they
+make. A restart that finds the retry still waiting settles it timed out even
+though its backoff has ended: the startup pass enforces deadlines before it
+ticks, and the scheduler's claim also excludes a waiting retry past its
+deadline. A restart that finds the settlement committed changes no row.
+
+Every class pins the whole store: one occurrence claimed once, one run, two
+attempts, one session and no stop fence; the first attempt settled for the
+unavailable runtime and never bound to a session; the retry's classification,
+prior attempt, `not_before` and claim binding; no session on the retry or the
+run; the run's deadline, before the retry's backoff ends; and the occurrence's
+lease and reason. No case may re-claim the occurrence, launch the retry or issue
+a stop. Every case must end with the retry `timed_out` and the occurrence and
+the run `failed`, and the further pass must change no occurrence, run, attempt,
+event, session or stop-fence row.
+
+Observations carry boundary and retry classes, counts and booleans. They never
+carry occurrence, run, attempt or session ids, paths, handshakes or output. This
+is `audit_only` evidence for a daemon killed while one automatic retry waits
+past its run's deadline or while its timeout settles it. It does not cover the
+owner cancelling a waiting retry, including that cancellation's own timeout
+settlement once the deadline has passed (see
+`waiting-retry-cancellation-process-crash-recovery`); the dispatcher's and the
+launch's own timeout settlement, which a pass reaches only when the deadline
+falls between its claim and its dispatch; a retry re-claimed before its deadline
+whose deadline passes while the daemon is down; a graceful daemon restart
+(#1433); Runtime Authority runs, a real runtime process, power loss, load,
+complete profiles or release eligibility.
+
+## Waiting retry cancellation process-crash audit boundary
+
+The `waiting-retry-cancellation-process-crash-recovery` suite kills a daemon
+worker while it handles the owner's cancellation of an automatic retry that
+waits for its backoff. The parent then restarts the daemon's scheduler, the
+owner sends the same request again, and passes after the backoff must launch
+nothing. Each of twelve cases starts the exact audited binary as a hidden
+worker, with the same harness and daemon restart as
+`run-launch-process-crash-recovery`. The worker stores a fixed synthetic active
+daily definition whose policy retries an unavailable runtime once, 120 seconds
+after the failure, within a one-minute deadline, as in
+`retry-timeout-process-crash-recovery`. It claims the 09:00 slot and dispatches
+it through a no-op runtime that is unavailable for its first launch, so the
+retry waits. Vectors cannot choose a path, run, definition, policy, adoption
+key, reason, clock or pause mechanics, and every expected outcome is fixed per
+boundary.
+
+The command settles the waiting retry and stores its answer under the owner's
+key in one transaction, in one of two ways:
+
+- **Before the deadline.** `occurrence.cancel.v1`, 30 seconds after the claim,
+  withdraws the retry: the retry `cancelled` with the `cancelled` class, the run
+  `cancelled`, and the occurrence `cancelled` with no lease, each with the
+  owner's reason where it has one. The answer is the withdrawal.
+- **After the deadline.** `attempt.cancel.v1` for the retry, 30 seconds after
+  the deadline and before any pass has enforced it, settles the retry as the
+  pass's timeout enforcement does: the retry `timed_out`, the occurrence
+  `failed` and the run `failed`. The answer is an `ILLEGAL_TRANSITION` refusal,
+  because the run reached its timeout before cancellation.
+
+A fixture TEMP trigger pauses the worker after each of the command's three
+settlement writes and after the answer's write, and the WAL hook after the
+commit. Each scene has a control with no pause, which exits after the answer
+without the graceful shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check must
+pass. It restarts in the daemon's startup order 10 seconds after the request,
+and the owner re-sends the request 10 seconds later. A pass after the backoff
+follows, then the request once more, and then the request and a pass again. One
+runtime counts every stop and launch they make. What each case requires depends
+on the scene and on whether the command committed:
+
+- **Before the deadline, nothing committed:** the restart changes no row and
+  leaves the retry waiting. The re-sent request withdraws it, and later
+  requests replay that withdrawal.
+- **Before the deadline, committed,** and its control: the restart changes no
+  row, and every request replays the withdrawal the worker answered.
+- **After the deadline, nothing committed:** the restart settles the waiting
+  retry timed out, as in `retry-timeout-process-crash-recovery`. The re-sent
+  request finds the run ended and stores its own `ILLEGAL_TRANSITION` refusal,
+  that only a running run's current attempt can be cancelled. Later requests
+  replay it.
+- **After the deadline, committed,** and its control: the restart changes no
+  row, and every request replays the stored timeout refusal.
+
+Every class pins the whole store as `retry-timeout-process-crash-recovery`
+does, and the store's only command adoption: the owner's key and command, with
+an outcome that matches its response. A fresh answer must be the one the store
+now holds, and a withdrawal must name the store's occurrence, run and retry at
+the request's time. A replay must write nothing and repeat the answer first
+given. No case may re-claim the occurrence, launch the retry or issue a stop,
+and the passes after the backoff must change no occurrence, run, attempt,
+event, session, reservation, adoption, cancellation or stop-fence row.
+
+Observations carry boundary, retry, stored-answer and answer classes, counts
+and booleans. They never carry occurrence, run, attempt or session ids,
+adoption keys, responses, paths, handshakes or output. This is `audit_only`
+evidence for a daemon killed while it handles one owner cancellation of a
+waiting automatic retry. It does not cover `attempt.cancel.v1` before the
+deadline or `occurrence.cancel.v1` after it, whose first request takes the same
+settlement branch; an operator retry's waiting attempt, which takes it too; a
+retry the scheduler has re-claimed but not yet launched; the run-cancellation
+envelope; a graceful daemon restart (#1433); Runtime Authority runs, a real
+runtime process, power loss, load, complete profiles or release eligibility.
+
+## Run-now process-crash audit boundary
+
+The `run-now-process-crash-recovery` suite kills a daemon worker while it
+handles the owner's `occurrence.runNow.v1` request. The parent then restarts
+the daemon's scheduler, the owner sends the same request again, and passes after
+the run's deadline and after the manual claim's lease must not launch it again.
+Each of nine cases starts the exact audited binary as a hidden worker, with the
+same harness and daemon restart as `run-launch-process-crash-recovery`. The
+worker stores a fixed synthetic active daily definition with a working
+directory and a 30-minute deadline, whose next slot falls after every pass, and
+takes scheduler leadership as the serving daemon does. It sends the flat
+request, with a fixed adoption key, 30 seconds after the base time, through a
+no-op runtime. Vectors cannot choose a path, run, definition, adoption key,
+clock or pause mechanics, and every expected outcome is fixed per boundary.
+
+The command has three durable steps, each one transaction:
+
+- **Claim.** It inserts a `manual` occurrence, the one the owner's key names,
+  claimed under a 60-minute manual lease, and stores the owner's answer naming
+  that occurrence.
+- **Launch.** As for a scheduled slot, though without a scheduler fence, it
+  writes the session `created`, starts the run and marks its first attempt
+  `dispatching`.
+- **Ownership.** The runtime launch publishes ownership: the session, the
+  attempt and the occurrence become `running`, `started` and `running`.
+
+A fixture TEMP trigger pauses the worker after the claim's first and last
+writes, the occurrence and the answer; after the launch's first and last
+writes, the session and the attempt's `dispatching` update; and after the
+occurrence's `running` update. The WAL hook pauses it after each of the three
+commits. A control with no pause exits after the answer without the graceful
+shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, and the store's raw integrity check must
+pass. It restarts in the daemon's startup order 30 seconds after the request,
+and the owner re-sends the request 10 seconds later. If that request launches,
+its session ends with exit code 0 at 90 seconds. Passes follow before the run's
+deadline, after it, and after the claim's lease, then the request once more,
+and then the request and a pass again. One runtime counts every stop and launch
+they make. What each case requires depends on what the worker committed:
+
+- **Nothing:** the restart changes no row. The re-sent request claims and
+  launches the routine once, the passes settle that run `succeeded`, and later
+  requests replay the claim.
+- **The claim, killed after it commits or inside the launch:** the restart
+  changes no row. Startup restores only daemon claims, and the scheduler never
+  dispatches a manual one. Every request replays the stored claim without a
+  launch. The occurrence stays claimed until the pass after its lease fails it
+  `lease expired`, with no run, attempt or session.
+- **The launch, killed after it commits or inside ownership:** the restart
+  changes no row. Restart containment treats a missing receipt as the previous
+  daemon's containment only for a daemon-owned scheduled launch, so the manual
+  launch's `created` session stays ambiguous and is never relaunched: it stays
+  until the run's deadline. Every request replays the claim. The pass after
+  the deadline stops the session once and settles the run timed out.
+- **Ownership,** killed after it commits, and the control: the restart orphans
+  the `running` session and leaves the run, attempt and occurrence as they
+  were. Every request replays the claim, and the pass after the run's deadline
+  stops the session once and settles the run timed out.
+
+A run settled timed out has its attempt `timed_out` with the `timeout` class,
+its run `failed`, its occurrence `failed` with no lease, the deadline's reason
+on the attempt and the occurrence, and its session `killed`.
+
+Every class pins the whole store: the counts, the one occurrence the owner's key
+names, of the `manual` kind and claimed once, with its lease and reason, and
+the run, first attempt and session that belong to it. The store's only command
+adoption must carry the owner's key, command and routine, committed with that
+occurrence, and the store must hold no result reservation. A fresh answer must launch exactly once and be what the store now
+projects. A replay must write nothing and launch nothing. No case may launch
+more than once in all, and the request and a pass after the lease must change
+no occurrence, run, attempt, event, session, reservation, adoption,
+cancellation or stop-fence row.
+
+Observations carry boundary, launch, stored-answer and answer classes, counts
+and booleans. They never carry occurrence, run, attempt or session ids,
+adoption keys, responses, paths, handshakes or output. This is `audit_only`
+evidence for a daemon killed while it handles one flat run-now request. It does
+not cover the command envelope, whose claim also reserves a result key and
+whose result is retained in a further transaction (see
+`run-now-envelope-process-crash-recovery`); a manual launch with a
+containment receipt; a manual launch left before ownership whose claim's lease
+expires before the run's deadline, which abandoned-launch recovery stops
+instead; the command's refusals; a graceful daemon restart (#1433);
+Runtime Authority runs, a real runtime process, power loss, load, complete
+profiles or release eligibility.
+
+## Run-now envelope process-crash audit boundary
+
+The `run-now-envelope-process-crash-recovery` suite kills a daemon worker while
+it handles the owner's `occurrence.runNow.v1` request through the command
+envelope. The envelope's claim also reserves a result key for the request, and
+once the launch returns, a fourth transaction consumes that reservation and
+retains the dispatch result as a second immutable adoption. A replay that finds
+the result answers it; a replay that finds a claim and no result is refused
+with `AMBIGUOUS_RETRY_FORBIDDEN`, because the launch may have happened. Each of
+nine cases runs as `run-now-process-crash-recovery` does, with the same harness,
+definition, adoption key, clocks, restart, passes and requests, but sends the
+request through the envelope's executor. As in production, the result's
+adoption time is the wall clock; no class reads it.
+
+A fixture TEMP trigger pauses the worker inside the claim, after the
+reservation's write and after the owner's answer; inside the retention, after
+the reservation is consumed and after the result's write. The WAL hook pauses
+it after the claim's, the launch's, ownership's and the retention's commits. A
+control with no pause exits after the answer without the graceful shutdown's
+reconciliation or leadership release.
+
+The launch's recovery is the flat request's: a restart changes no row except
+to orphan an owned session, the scheduler never dispatches the manual claim,
+the pass after the lease fails a claim that never launched `lease expired`,
+and the pass after the run's deadline stops a launch once and settles it timed
+out. What the owner is answered depends on what the worker retained:
+
+- **Nothing committed:** the re-sent request claims, launches once and retains
+  its result, and later requests replay that result.
+- **The claim, with or without its launch, and no result:** every request is
+  refused as ambiguous, without a write or a launch, and the reservation stays.
+- **The result,** killed after the retention commits, and the control: every
+  request replays the retained result, which still names the run `running`
+  after its deadline has settled it.
+
+The launch classes are the flat suite's. The stored-answer class pins the
+store's command adoptions and reservations: the owner's claim with its key,
+command, routine and result key; then either that result key reserved for the
+same request and no result, or the result retained for the same request with
+no reservation. A retained result must be exactly the launch the store holds:
+the occurrence and run `running`, with the run's id and the first attempt's
+session. The claim must carry the digest the envelope gives the request, under
+its own domain. A fresh answer must launch once and be the result it retained, a
+replay must be that result, and a refusal must be the exact ambiguous refusal
+of a pending claim. None may write or launch except the first fresh answer,
+and the request and a pass after the lease must change no occurrence, run,
+attempt, event, session, reservation, adoption, cancellation or stop-fence row.
+
+Observations carry boundary, launch, stored-answer and answer classes, counts
+and booleans. They never carry occurrence, run, attempt or session ids,
+adoption keys, responses, paths, handshakes or output. This is `audit_only`
+evidence for a daemon killed while it handles one run-now request through the
+envelope's executor. It does not cover the envelope's own request parsing,
+authority and routing; pauses inside the launch and ownership transactions,
+which leave the previous commit's state and which the flat suite covers; a
+retained dispatch refusal; a manual launch with a
+containment receipt, or one whose lease expires before its deadline; the
+command's refusals; a graceful daemon restart (#1433); Runtime Authority runs,
+a real runtime process, power loss, load, complete profiles or release
+eligibility.
+
+## Tick process-crash audit boundary
+
+The `tick-process-crash-recovery` suite kills a daemon worker while its fenced
+scheduler tick plans and claims a due slot, then restarts the daemon before or
+after the next day's slot. The tick commits three transactions: it inserts the
+slot's `planned` occurrence, advances the scheduler's planning cursor under the
+fence, and claims the slot under the `daemon` lease and the scheduler's
+generation. Its lease recovery and misfire supersession change no row for a
+fresh slot. Each of fourteen cases starts the exact audited binary as a hidden
+worker with the same harness as `run-launch-process-crash-recovery`. The
+worker stores the fixed synthetic active daily definition, defined the day
+before its 09:00 slot, takes scheduler leadership and runs the fenced tick 30
+seconds after the slot. Vectors cannot choose a path, definition, clock,
+restart time or pause mechanics, must name every scene and boundary once, and
+every expected outcome is fixed per scene and boundary.
+
+Every occurrence state update compiles the transition trigger's insert into
+the AUTOINCREMENT event feed, and SQLite's bookkeeping for that table seeds its
+counter the first time such a statement runs, even when it updates no row. A
+daemon's store has had that counter since its first event. The worker's fresh
+store would commit it in the tick's stale-claim recovery, ahead of the plan,
+so the worker seeds it first with an update that matches no row. A unit test
+pins the tick's three commits, and the extra one without the seed.
+
+- **After plan, after cursor, after claim:** a fixture TEMP trigger pauses the
+  worker after the occurrence insert, the cursor update, or the occurrence's
+  `planned` to `claimed` update, inside that write's transaction.
+- **After plan commit, after cursor commit, after claim commit:** the tick
+  connection's WAL hook pauses it once SQLite has committed the first, second
+  or third transaction.
+- **Control:** no pause. The worker ticks and exits without the graceful
+  shutdown's reconciliation or leadership release.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the previous commit left:
+nothing until the plan commits, then the slot `planned` with the cursor
+unmoved, then the cursor advanced, then the slot `claimed`. The parent then
+kills and reaps the worker. The store's raw integrity check must pass, and the
+store must hold what the parent read while the worker was paused.
+
+The parent restarts in the daemon's startup order, as the run-launch suite
+does, in one of two scenes:
+
+- **Before the next slot,** a minute after this one: this slot must launch
+  exactly once. The startup pass plans it if nothing was committed and claims
+  it if it was planned. A committed claim with no run is restored to `planned`
+  and claimed again, so it has been claimed twice.
+- **After the next slot,** a minute after it: under the `latest` misfire
+  policy, the next day's slot must launch exactly once and the missed slot
+  never. A missed slot that was planned is `skipped` with "superseded by latest
+  misfire policy". A restored claim is superseded the same way, claimed once
+  and never by the restarted scheduler. Nothing is planned for a slot the
+  worker never committed.
+
+The launched session then ends with exit code 0, and a pass settles its run
+`succeeded`. Every case ends with one launch, one run, one attempt and one
+session, and no stop. A store that recovery refuses fails the case. A further
+pass must change no occurrence, run, attempt, event, session or stop-fence row.
+
+The slot class reads each slot's one `scheduled` occurrence with its lease,
+scheduler generation, claim count, reason, run, first attempt and session. A
+torn launch, a claim under another lease or generation, or any occurrence,
+run, attempt or session outside the two slots makes the store mixed.
+
+Observations carry scene, boundary, slot classes, cursor revisions, counts and
+booleans. They never carry occurrence, run, attempt or session ids, paths,
+handshakes or output. This is `audit_only` evidence for a daemon killed while
+its scheduler tick plans and claims one daily slot of one routine. It does not
+cover a tick over many routines or several pages of the planning cursor, other
+misfire policies or recurrences, a definition revised between the kill and the
+restart, kills during stale-claim recovery, lease recovery or misfire
+supersession that have work to do, the launch itself (see
+`run-launch-process-crash-recovery`), manual occurrences (see
+`run-now-process-crash-recovery`), a graceful daemon restart (#1433), Runtime
+Authority runs, a real runtime process, power loss, load, complete profiles or
+release eligibility.
+
+## No-process receipt process-crash audit boundary
+
+The `no-process-receipt-process-crash-recovery` suite kills a daemon worker
+after its runtime has proven that a committed launch started no process. A
+daemon that begins to shut down while it launches has a closing runtime: the
+runtime records the no-process containment receipt for the launch's session,
+`coven.containment.no-process.v1` under `runtime/automation-containment/`, and
+refuses admission. The dispatcher then restores the launch for retry in one
+transaction: it deletes the run with its attempt, then the `created` session,
+and returns the occurrence to `planned`. A restart that finds the launch
+committed and the receipt recorded recovers it by the receipt instead of
+holding it, as `run-launch-process-crash-recovery` does without one.
+
+Each of ten cases starts the exact audited binary as a hidden worker with the
+same harness as `run-launch-process-crash-recovery`. The worker stores the
+fixed synthetic active daily definition, takes scheduler leadership, runs the
+fenced tick that claims the 09:00 slot, and runs the fenced dispatch through a
+fixture runtime that behaves as a closing runtime: it writes the exact receipt
+at the production path, and from then on the dispatcher sees the shutdown.
+Vectors cannot choose a path, definition, clock, receipt or pause mechanics,
+must name every scene and boundary once, and every expected outcome is fixed
+per scene and boundary.
+
+- **After receipt:** the runtime parks once the receipt is written.
+- **Inside restore:** a fixture TEMP trigger pauses the worker after the run's
+  delete or after the occurrence's return to `planned`, the restoration's
+  first and last writes.
+- **After restore commit:** the WAL hook pauses it once SQLite has committed
+  the restoration: the dispatch's second commit, the one after the launch.
+- **Control:** no pause. The worker exits after the restoration without
+  releasing its leadership.
+
+There are two scenes: a routine with no retry policy, and one whose policy
+retries `lease_expired` once after a fixed 60 seconds. While the worker is
+paused, the parent must find the receipt recorded, the write transaction open
+exactly when the pause is inside one, and the launch committed until the
+restoration commits, then the occurrence `planned` with no run, attempt or
+session. The parent then kills and reaps a paused worker, or reaps the control
+once it exits. The store's raw integrity check must pass, and the store must
+hold what the parent read.
+
+The parent restarts in the daemon's startup order, as the run-launch suite
+does, then runs a pass after any retry's delay, ends the launched session with
+exit code 0, runs a pass that settles the run, and runs a further pass that
+must change nothing.
+
+- **The dispatcher's restoration committed,** and the control: the restart
+  claims and launches the slot again, and it succeeds.
+- **The launch committed and the receipt recorded, no retry policy:** the
+  restart's receipt-proven recovery restores the launch as the dispatcher
+  would have, and the startup pass launches it again.
+- **The launch committed and the receipt recorded, lease-expiry retry:** the
+  restart settles the first attempt `failed` for `lease_expired`, "claim lease
+  expired with proof that no process started", fails its session, and opens a
+  second attempt due 60 seconds later on the same run, with the occurrence
+  `planned` and the proof as its reason. Nothing launches at the restart. The
+  pass after the delay launches the second attempt, and the occurrence keeps
+  the proof as its reason until the run settles, as an automatic retry keeps
+  the failure it retries.
+
+Every case ends with exactly one launch, the slot claimed twice, and no stop. A
+stop fence, or a retry exhaustion or quarantine recorded for the routine, makes
+a store mixed. A store that recovery refuses fails the case. A further pass
+must change no occurrence, run, attempt, event, session, stop-fence or
+retry-state row.
+
+Observations carry scene, boundary, launch classes, receipt booleans, counts
+and booleans. They never carry occurrence, run, attempt or session ids, receipt
+paths, paths, handshakes or output. This is `audit_only` evidence for a daemon
+killed after a closing runtime recorded the no-process receipt for one
+scheduled launch. It does not cover a kill inside the restart's own
+receipt-proven recovery, which would need a worker that reopens the parent's
+store; the supervisor guardian's receipts, or a fork failure's; the quiescent
+receipt and restart containment; a refused launch that is itself a retry, which
+the dispatcher restores by returning its attempt to `adopted` and keeping the
+run; a receipt-proven launch whose lease-expiry retries are exhausted, which
+records the exhaustion and holds the run; a retry policy with attempts left
+after the second; a receipt for a manual occurrence; Runtime Authority
+launches, whose refused launch settles for a transient dispatch retry instead;
+a real runtime process, power loss, load, complete profiles or release
+eligibility.
+
+## Event feed process-crash audit boundary
+
+The `event-feed-process-crash-recovery` suite kills a daemon worker while a
+client follows the global automation event feed. Clients follow the
+append-only `automation_events` table through
+`coven.automations.events.read.v1` and `coven.automations.events.subscribe.v1`.
+The transition triggers write each event inside the state change's own
+transaction, with the next sequence of its occurrence or run stream and the
+next feed position. Each read inserts a checkpoint holding the page's last
+position, valid for 24 hours, after pruning checkpoints that expired more than
+seven days ago; the prune and the insert are separate autocommit statements.
+`subscribe.v1` resumes from a checkpoint and `read.v1` from a cursor.
+
+Each of five cases starts the exact audited binary as a hidden worker with the
+same harness as `run-launch-process-crash-recovery`. The worker plays the
+daemon and the parent plays the client. The worker stores a fixed synthetic
+active daily routine, takes scheduler leadership and runs the fenced tick that
+plans and claims its 09:00 slot. It serves the client's first subscription:
+two events and a checkpoint. It then stores a second routine with the same
+schedule, runs a second tick that plans and claims that routine's slot in
+three commits, and serves the client's resubscription from its checkpoint.
+Vectors cannot choose a path, definition, clock or pause mechanics, must name
+every boundary once, and every expected outcome is fixed per boundary.
+
+- **Inside the claim:** a fixture TEMP trigger pauses the worker after the
+  second claim writes its event.
+- **After the claim commits:** the WAL hook pauses it after the second tick's
+  third commit.
+- **Inside the checkpoint read:** a TEMP trigger pauses the worker before the
+  resubscription inserts its checkpoint.
+- **After the checkpoint commits:** the WAL hook pauses it once the
+  checkpoint has committed, before the page reaches the client.
+- **Control:** no pause. The client receives the second page, and the worker
+  exits without releasing its leadership.
+
+Before any pause, the worker hands the parent the pages the client received:
+each page's checkpoint, cursor and event ids. While the worker is paused, the
+parent must find the write transaction open exactly when the pause is inside
+one, the committed occurrence events the boundary leaves, and one checkpoint
+for each committed read. The parent then kills and reaps a paused worker, or
+reaps the control once it exits. The store's raw integrity check must pass,
+the store must hold what the parent read, and every checkpoint the client
+received must exist for its page's cursor.
+
+The parent restarts in the daemon's startup order, as the run-launch suite
+does. The restart restores each committed claim with no run and launches both
+slots. The client then resumes from the last page it received, by its
+checkpoint and by its cursor, paging until a page carries no event. The cursor
+resume reads three events a page and a whole-feed read one, so those `read.v1`
+pages stop at their limit. Paging is bounded: a resume that stops advancing
+ends, and a read the store refuses as it refuses a client (a missing, expired
+or foreign checkpoint) fails the case instead of the suite.
+
+- Both resumptions return the same events.
+- Every event the client received, followed by every event it resumed, is the
+  whole committed feed, in the store's feed-position order: every committed
+  event exactly once.
+- No event the killed claim wrote appears. A lost page's events arrive again
+  from the previous checkpoint.
+- Every stream's sequences run 0, 1, 2 in feed order, and each stream head
+  names the next.
+- A resume from the last checkpoint returns no event.
+- Each routine's occurrence path and run path are fixed per boundary.
+
+Observations carry boundary, event labels of routine, entity and state,
+counts and booleans. They never carry routine, occurrence, run, attempt or
+event ids, checkpoints, paths, handshakes or output. This is `audit_only`
+evidence for a daemon killed while one client follows the global feed across
+two routines. It does not cover a client following an occurrence or run
+stream, a subscription page that reaches `subscribe.v1`'s 100-event limit,
+checkpoint expiry or pruning, `earliest_sequence` compaction and
+`CURSOR_EXPIRED`, the `from` timestamp cursor, several clients or concurrent
+writers, the control plane's request handling, a kill inside the restart's
+own recovery, a real runtime process, power loss, load, complete profiles or
+release eligibility.
+
+## Cancellation-timeout race process-crash audit boundary
+
+The `cancellation-timeout-process-crash-recovery` suite kills a daemon worker
+while the owner's `run.cancel.v1` and a scheduled run's deadline race for the
+run's stop. The stop fence arbitrates the race. A `cancellation` fence needs the
+cancellation `requested`, inside its 30-second lease, and the deadline still
+ahead. A `timeout` fence needs no cancellation `requested` or `stopping`. A
+reserved cancellation whose lease ends after the deadline is rejected, and the
+timeout enforced. A request after the deadline is refused before it reserves
+anything. `cancellation-timeout-arbitration` proves these rules in one process;
+this suite kills the daemon between the race's writes. After a kill, the
+restart's containment ends the session before any request or enforcement reaches
+it. A request then finds the session ended and is refused before its own
+deadline check, and no fence's deadline or pending-cancellation clause is ever
+reached. What a kill exercises is the reconciler's deadline rejection, the
+restart's settlement after the deadline, and the fence each owner leaves behind.
+
+Each of sixteen cases starts the exact audited binary as a hidden worker, with
+the same harness, daemon restart and stop-recording runtime as
+`run-cancellation-process-crash-recovery`. The worker stores a fixed synthetic
+active daily definition with a one-minute deadline and no automatic retry, and
+claims and launches its 09:00 slot through a no-op runtime at 30 seconds, so the
+deadline passes at 90. Vectors cannot choose a path, run, definition, deadline,
+reason, principal, adoption key, clock or pause mechanics, must name every
+scene's boundaries once and in order, and every expected outcome is fixed per
+scene and boundary.
+
+- **Cancellation scene:** the worker handles the owner's request at 70 seconds,
+  as `run-cancellation-process-crash-recovery` does, with the cancellation's
+  lease ending at 100. A fixture TEMP trigger pauses it inside the reservation,
+  the fence's transaction, the settlement and the answer; the WAL hook after
+  each of their four commits; and its runtime right after it records the stop.
+  The control answers `cancelled`.
+- **Timeout scene:** the worker enforces the deadline at 92 seconds, as
+  `timeout-enforcement-process-crash-recovery` does, with the timeout's fence
+  lease ending at 122. It pauses inside the fence's transaction and the
+  settlement, after each of their two commits, and right after the stop. The
+  control settles the run timed out.
+
+While the worker is paused, the parent must find the write transaction open
+exactly when the pause is inside one, and read what the last commit left. The
+parent then kills and reaps the worker, or reaps the control once it exits. The
+store's raw integrity check must pass, and the store must still hold what the
+parent read.
+
+The parent restarts in the daemon's startup order at 95 seconds, after the
+deadline and inside either lease, and the owner sends the request at 97. A pass
+after both leases follows at 150, the request again at 160, and a second pass at
+230. One runtime confirms and counts every stop and launch that the restart, the
+passes and the requests make.
+
+- **Nothing committed,** in either scene: the restart's containment marks the
+  lost session `killed` after the deadline, and its startup pass settles the
+  attempt `timed_out` and the run and occurrence `failed`. The request is
+  refused with `ILLEGAL_TRANSITION`, as no longer cancellable, and replayed word
+  for word after.
+- **The cancellation reserved, without its fence:** the same timeout, while the
+  cancellation stays `requested`. Without a deadline, the same kill leaves the
+  run held for an operator retry. The request inside the lease is answered
+  `CANCEL_PENDING` and writes nothing; the pass rejects the cancellation with
+  `ILLEGAL_TRANSITION`, as overtaken by the deadline, which the next request
+  replays.
+- **The cancellation fenced, stopped, or inside its settlement:** the restart's
+  containment marks the session `killed` behind the cancellation's fence. The
+  timeout never takes a fence or issues a stop, though the deadline has passed.
+  The request is answered `CANCEL_PENDING`. The pass answers the cancellation
+  `recovery_required`, settles the attempt `ambiguous` and the run and
+  occurrence `failed` on the ended session, and releases the fence.
+- **The cancellation settled or answered:** the run stays cancelled, and the
+  pass answers `cancelled` where the worker had not.
+- **The timeout fenced, stopped, or inside its settlement:** the restart's
+  containment marks the session `killed` behind the timeout's fence. The owner's
+  request is refused with `ILLEGAL_TRANSITION`, as no longer cancellable, and
+  leaves the fence alone. The pass after the lease settles the attempt
+  `ambiguous` and the occurrence `recovery_required`, and the second pass
+  settles the run and occurrence `failed` and releases the fence. That exit is
+  the one #1461 asks about, and #1489 asks whether an expired `timeout` fence
+  should settle by the deadline instead.
+- **The timeout settled:** the run stays timed out, and every request is
+  refused.
+
+Run classes pin each settlement reason, so a run timed out by the enforcement,
+one timed out by the restart's containment, and the two ambiguous failures stay
+distinct. Two stop fences, or a fence of another owner or operation key, are no
+class at all. The worker must have recorded exactly one stop once it reached the
+stop, and none before it. The restart, the passes and the requests must issue no
+stop and launch nothing. A refusal and a rejection are told apart by their
+stored message. Storing a refusal must be its request's only write, a replay
+must return the stored error word for word, a pending or replayed answer must
+write nothing, and a request that errors fails the case. The same request and a
+further pass must then change no occurrence, run, attempt, event, session,
+reservation, adoption, cancellation or stop-fence row, and issue no stop or
+launch.
+
+Observations carry scene, boundary, run, cancellation and answer classes, counts
+and booleans. They never carry run, attempt, occurrence or session ids, adoption
+keys, responses, paths, handshakes or output. This is `audit_only` evidence for
+a daemon killed while one owner cancellation and one deadline race for a running
+scheduled run's stop. It does not cover a request or enforcement that reaches a
+live session after its deadline, a restart after the cancellation's lease, the
+flat `occurrence.cancel.v1` and `attempt.cancel.v1` commands, a deadline that
+passes while a retry waits or a run is held, a stop the runtime fails to
+confirm, Runtime Authority runs, a graceful daemon restart, a real runtime
+process, power loss, load, complete profiles or release eligibility.

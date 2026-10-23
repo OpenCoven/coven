@@ -24,6 +24,7 @@ pub mod delivery;
 pub mod diagnostics;
 pub mod doctor;
 pub(crate) mod doctor_cli;
+pub(crate) mod explain;
 // Role keys for the daemon's Runtime Authority signers; no production caller
 // until the trusted adapter lands (coven#857).
 #[allow(dead_code)]

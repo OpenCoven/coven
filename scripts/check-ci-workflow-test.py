@@ -93,6 +93,19 @@ class CheckCiWorkflowTests(unittest.TestCase):
             ci_job_block('changes'),
         )
 
+    def test_bootstrap_matrix_is_required_when_routed_and_preserves_safe_evidence(self) -> None:
+        job = ci_job_block('bootstrap-contract')
+        self.assertIn("needs.changes.outputs.bootstrap == 'true'", job)
+        self.assertIn('image: [debian12, debian13, ubuntu24]', job)
+        self.assertIn('fail-fast: false', job)
+        self.assertIn('scripts/bootstrap-contract/runner.py', job)
+        self.assertIn('if: ${{ always() }}', job)
+        self.assertIn('/*.json', job)
+        self.assertNotIn('continue-on-error:', job)
+        self.assertNotIn('actions/cache', job)
+        self.assertIn('\n      - bootstrap-contract\n', ci_job_block('pr-gate'))
+        self.assertIn('bootstrap: ${{ steps.classify.outputs.bootstrap }}', ci_job_block('changes'))
+
     def test_full_macos_workspace_suite_stays_push_only(self) -> None:
         # macOS runners bill at ~10x Linux; the workspace suite is push-only by
         # design and the PR-scoped job above exists so that split can hold.
@@ -155,8 +168,10 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'scripts/check-workflows.sh',
             'node --test scripts/package-github-release-test.mjs',
             'node --test scripts/release-governance.test.mjs',
+            'node --test scripts/authorize-release-publication.test.mjs',
             'node --test scripts/package-automations-authority-profile.test.mjs',
             'node --test scripts/check-action-pins.test.mjs',
+            'node --test scripts/release-receipt.test.mjs scripts/release-dependency-inventory.test.mjs',
             'node --test scripts/release-stress-test.mjs',
             'node --test scripts/verify-release-tag.test.mjs',
             'automations-authority-profile-bundle',
@@ -447,6 +462,12 @@ class CheckCiWorkflowTests(unittest.TestCase):
         for step in ["Exercise isolated Threads clock feature", "Exercise real-daemon Threads journeys"]:
             self.assertIn(f"- name: {step}\n        if: ${{{{ !cancelled() }}}}", windows)
 
+    def test_cloud_setup_fixtures_run_in_required_policy_guard(self) -> None:
+        policy = ci_job_block("policy-guard")
+        for suite in ("config", "runtime", "provision", "bootstrap", "readiness"):
+            self.assertIn(f"- run: python3 scripts/cloud/{suite}-test.py", policy)
+        self.assertIn("- run: bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh", policy)
+
     def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
         release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
         for workflow_text in [CI_TEXT, RELEASE_TEXT, release_stress_text]:
@@ -470,15 +491,23 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("Release npm packages", RELEASE_GITHUB_TEXT)
         self.assertIn("workflow_dispatch:", RELEASE_GITHUB_TEXT)
         self.assertIn("source_run_attempt:", RELEASE_GITHUB_TEXT)
-        self.assertIn("actions: read", RELEASE_GITHUB_TEXT)
-        self.assertIn("contents: write", RELEASE_GITHUB_TEXT)
-        self.assertNotIn("id-token: write", RELEASE_GITHUB_TEXT)
+        verify = RELEASE_GITHUB_TEXT.split("\n  verify-release:\n", 1)[1].split("\n  publish-release:\n", 1)[0]
+        publish = RELEASE_GITHUB_TEXT.split("\n  publish-release:\n", 1)[1]
+        self.assertIn("    permissions:\n      actions: read\n      contents: read\n", verify)
+        self.assertNotIn("write", verify)
+        # id-token signs the asset and reconciliation attestations; npm is
+        # never published from this workflow.
+        self.assertIn(
+            "    permissions:\n      attestations: write\n      contents: write\n      id-token: write\n",
+            publish,
+        )
         self.assertEqual(
             RELEASE_GITHUB_TEXT.count(
                 "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
             ),
-            3,
+            8,
         )
+        self.assertIn("RELEASE_GOVERNANCE_READ_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_READ_TOKEN }}", verify)
         self.assertNotIn(
             "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
             RELEASE_GITHUB_TEXT,
@@ -561,7 +590,43 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("--suite unix --iterations 10 --command-timeout-ms 180000", stress_text)
         self.assertIn("--suite windows --iterations 10 --command-timeout-ms 180000", stress_text)
         self.assertEqual(stress_text.count("if: ${{ always() }}"), 2)
-        self.assertEqual(stress_text.count("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"), 2)
+        self.assertEqual(stress_text.count("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"), 2)
+
+    def test_release_governance_check_runs_read_only_with_the_dedicated_credential(self) -> None:
+        text = (CI_WORKFLOW.parent / 'release-governance.yml').read_text(encoding='utf-8')
+        self.assertIn("  workflow_dispatch:\n  schedule:\n", text)
+        self.assertIn("permissions:\n  contents: read\n", text)
+        self.assertNotIn("write", text)
+        self.assertIn(
+            "RELEASE_GOVERNANCE_READ_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_READ_TOKEN }}",
+            text,
+        )
+        self.assertNotIn("GH_TOKEN", text, "a GITHUB_TOKEN fallback cannot see bypass actors")
+        self.assertIn("node scripts/release-governance.mjs check", text)
+        self.assertNotRegex(text, r"(?m)^\s+continue-on-error:")
+
+    def test_release_publish_job_authorizes_immediately_before_registry_writes(self) -> None:
+        publish = RELEASE_TEXT.split("\n  npm-publish:\n", 1)[1]
+        self.assertIn(
+            "    concurrency:\n      group: coven-release-channel\n      cancel-in-progress: false\n",
+            publish,
+        )
+        self.assertIn("      actions: read\n      id-token: write\n      contents: read\n", publish)
+        self.assertIn("        with:\n          fetch-depth: 0\n", publish)
+        self.assertIn(
+            "RELEASE_GOVERNANCE_READ_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_READ_TOKEN }}",
+            publish,
+        )
+        authorize = publish.index("node scripts/authorize-release-publication.mjs")
+        first_write = publish.index("--publish")
+        self.assertLess(authorize, first_write)
+        for download in re.finditer(r"actions/download-artifact@", publish):
+            self.assertLess(download.start(), authorize, "authorize after every artifact is present")
+        step = publish[publish.rindex("      - name:", 0, authorize):authorize]
+        self.assertNotRegex(step, r"(?m)^\s+(if|continue-on-error):")
+        retain = publish.split("      - name: Retain publication authorization\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("if: ${{ always() }}", retain)
+        self.assertIn("path: release-publication-authorization/", retain)
 
     def test_release_npm_workflow_uses_same_tag_specific_concurrency_without_cancellation(self) -> None:
         self.assertIn(

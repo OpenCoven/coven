@@ -32,6 +32,7 @@ jobs:
       restricted_runtime: ${{ steps.classify.outputs.restricted_runtime }}
       workflow: ${{ steps.classify.outputs.workflow }}
       cargo_metadata: ${{ steps.classify.outputs.cargo_metadata }}
+      bootstrap: ${{ steps.classify.outputs.bootstrap }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,11 +127,23 @@ jobs:
       - run: python3 scripts/check-workflows-test.py
       - run: python3 scripts/check-ci-workflow-test.py
       - run: python3 scripts/install-native-link-dependencies-test.py
+      - run: python3 scripts/bootstrap-contract/runner-test.py
+      - run: python3 scripts/cloud/config-test.py
+      - run: python3 scripts/cloud/runtime-test.py
+      - run: python3 scripts/cloud/provision-test.py
+      - run: python3 scripts/cloud/bootstrap-test.py
+      - run: python3 scripts/cloud/readiness-test.py
+      - run: bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh
+      - run: python3 scripts/dev-verify-test.py
+      - run: npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund
+      - run: node --test scripts/browser-capability.test.mjs
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/release-governance.test.mjs
+      - run: node --test scripts/authorize-release-publication.test.mjs
       - run: node --test scripts/package-automations-protocol.test.mjs scripts/script-entrypoint.test.mjs
       - run: node --test scripts/package-automations-authority-profile.test.mjs
       - run: node --test scripts/check-action-pins.test.mjs
+      - run: node --test scripts/release-receipt.test.mjs scripts/release-dependency-inventory.test.mjs
       - run: node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs
       - run: node --test scripts/release-stress-test.mjs
       - run: node --test scripts/verify-release-tag.test.mjs
@@ -175,7 +188,7 @@ jobs:
             '.sourceCommit == $sourceCommit and (.contractContentSha256 | test("^[0-9a-f]{64}$"))' \
             "$AUTOMATIONS_ARTIFACT_DIR/manifest.json"
       - name: Upload exact-commit Automations protocol
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-automations-v1-contract-${{ github.sha }}
           path: |
@@ -214,7 +227,7 @@ jobs:
             '.sourceCommit == $sourceCommit and .contractProfile == "coven.automations.authority.v1" and (.contractContentSha256 | test("^[0-9a-f]{64}$"))' \
             "$AUTHORITY_ARTIFACT_DIR/manifest.json"
       - name: Upload exact-commit Automations authority profile
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-automations-authority-v1-contract-${{ github.sha }}
           path: |
@@ -285,7 +298,7 @@ jobs:
         run: node conformance/automations/runner/audit.mjs --output "$AUTOMATIONS_AUDIT_DIR"
       - name: Upload native Automations audit
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: automations-audit-linux-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/automations-audit
@@ -396,7 +409,7 @@ jobs:
         run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock --test threads_identity_invariants --test threads_protected_intake --test threads_terminal_recovery --no-fail-fast
       - name: Upload Threads daemon evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: threads-daemon-windows-feature-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
@@ -589,7 +602,7 @@ jobs:
           set -o pipefail
           cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture | tee coven-tui-metrics.txt
       - name: Upload baseline artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-cli-performance-baseline
           path: |
@@ -824,6 +837,37 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
+  bootstrap-contract:
+    name: Bootstrap contract (${{ matrix.image }})
+    needs: changes
+    if: ${{ needs.changes.outputs.bootstrap == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian12, debian13, ubuntu24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+      - name: Run exact-source fresh distro contract
+        env:
+          CONTRACT_IMAGE: ${{ matrix.image }}
+          CONTRACT_OUTPUT: ${{ runner.temp }}/bootstrap-${{ matrix.image }}
+        run: python3 scripts/bootstrap-contract/runner.py --image "$CONTRACT_IMAGE" --output "$CONTRACT_OUTPUT"
+      - name: Retain structured contract evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bootstrap-contract-${{ matrix.image }}
+          path: ${{ runner.temp }}/bootstrap-${{ matrix.image }}/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
   pr-gate:
     name: PR gate
     # Keep the branch-protection context stable while also producing an
@@ -853,6 +897,7 @@ jobs:
       - npm-onboarding-main
       - engine-contract
       - cargo-deny
+      - bootstrap-contract
     env:
       JOB_RESULTS: ${{ toJSON(needs) }}
     steps:

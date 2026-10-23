@@ -15,6 +15,9 @@ import {
   packageGitHubRelease,
   resolveReleaseSourceAcceptance,
   resolveReleaseSource,
+  publishGitHubRelease,
+  releaseReceiptAssetName,
+  releaseSbomAssetName,
   syncGitHubRelease,
   verifyAllPackageProvenance,
   verifyAnnotatedTag,
@@ -256,13 +259,16 @@ function baseExistingRelease({
   title = `Coven ${RELEASE_TAG}`,
   draft = false,
   prerelease = false,
+  immutable = false,
   assets = []
 } = {}) {
   return {
+    id: 4242,
     tag_name: tagName,
     name: title,
     draft,
     prerelease,
+    immutable,
     assets
   };
 }
@@ -498,13 +504,20 @@ function expectedZipTimestamp(epochSeconds) {
   };
 }
 
-function fakeReleaseClient({ existingRelease = null, assetBytesByName = {}, revalidateTagState = null } = {}) {
+function fakeReleaseClient({
+  existingRelease = null,
+  assetBytesByName = {},
+  revalidateTagState = null,
+  latestTag = 'v0.4.3',
+  immutableOnPublish = true
+} = {}) {
   const state = {
     release: existingRelease,
     created: [],
     revalidated: [],
     downloads: [],
-    uploads: []
+    uploads: [],
+    published: []
   };
   return {
     state,
@@ -518,10 +531,17 @@ function fakeReleaseClient({ existingRelease = null, assetBytesByName = {}, reva
       }
       return revalidateTagState;
     },
-    async createRelease({ releaseTag, title, notesFromTag, verifyTag }) {
-      state.created.push({ releaseTag, title, notesFromTag, verifyTag });
-      state.release = baseExistingRelease({ tagName: releaseTag, title, assets: [] });
+    async createRelease({ releaseTag, title, notesFromTag, verifyTag, draft }) {
+      state.created.push({ releaseTag, title, notesFromTag, verifyTag, draft });
+      state.release = baseExistingRelease({ tagName: releaseTag, title, draft: draft === true, assets: [] });
       return state.release;
+    },
+    async latestReleaseTag() {
+      return latestTag;
+    },
+    async publishRelease({ releaseId, makeLatest }) {
+      state.published.push({ releaseId, makeLatest });
+      state.release = { ...state.release, draft: false, immutable: immutableOnPublish, published_at: '2026-10-19T00:00:00Z' };
     },
     async downloadAsset(asset, filePath) {
       state.downloads.push(asset.name);
@@ -531,9 +551,14 @@ function fakeReleaseClient({ existingRelease = null, assetBytesByName = {}, reva
       }
       writeFileSync(filePath, bytes);
     },
-    async uploadAsset({ releaseTag, assetName, filePath }) {
-      state.uploads.push({ releaseTag, assetName, bytes: readFileSync(filePath) });
-      state.release.assets.push({ id: state.release.assets.length + 1, name: assetName });
+    async uploadAsset({ releaseTag, releaseId, assetName, filePath }) {
+      const bytes = readFileSync(filePath);
+      state.uploads.push({ releaseTag, releaseId, assetName, bytes });
+      state.release.assets.push({
+        id: state.release.assets.length + 1,
+        name: assetName,
+        digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+      });
     }
   };
 }
@@ -617,20 +642,39 @@ test('release-github workflow supports automatic and recovery triggers with pinn
   );
   assert.match(workflowText, new RegExp(`actions/checkout@${CHECKOUT_ACTION_SHA}`));
   assert.match(workflowText, new RegExp(`actions/setup-node@${SETUP_NODE_ACTION_SHA}`));
+  // The four native artifacts and the publication authorization come from the
+  // npm source run; the publish job takes the verified assets from this run.
   assert.equal(
     (
       workflowText.match(
         new RegExp(`actions/download-artifact@${DOWNLOAD_ARTIFACT_ACTION_SHA}`, 'g')
       ) ?? []
     ).length,
-    4
+    6
   );
+  assert.equal((workflowText.match(/run-id: \$\{\{ steps\.source\.outputs\.source_run_id \}\}/g) ?? []).length, 5);
 });
+
+function releaseGithubJob(name) {
+  const marker = `\n  ${name}:\n`;
+  assert.ok(workflowText.includes(marker), `release-github.yml has no job ${name}`);
+  const rest = workflowText.slice(workflowText.indexOf(marker) + 1);
+  const next = rest.slice(1).search(/\n  [a-z][a-z0-9-]*:\n/);
+  return next === -1 ? rest : rest.slice(0, next + 1);
+}
 
 test('release-github workflow uses least privilege, default-branch code, and never publishes npm', () => {
   assert.match(workflowText, /permissions:\s*\n  contents: read/);
-  assert.match(workflowText, /permissions:[\s\S]*actions: read[\s\S]*contents: write/);
-  assert.doesNotMatch(workflowText, /id-token: write/);
+  // Everything that decides what to publish runs read-only; only the publish
+  // job can write, and it signs attestations rather than publishing npm.
+  const verify = releaseGithubJob('verify-release');
+  const publish = releaseGithubJob('publish-release');
+  assert.match(verify, /    permissions:\n      actions: read\n      contents: read\n    outputs:/);
+  assert.doesNotMatch(verify, /write/);
+  assert.match(publish, /    permissions:\n      attestations: write\n      contents: write\n      id-token: write\n    steps:/);
+  assert.match(publish, /    needs: verify-release\n/);
+  assert.match(publish, /    concurrency:\n      group: coven-release-channel\n      cancel-in-progress: false\n/);
+  assert.doesNotMatch(publish, /actions: read|run-id:/, 'the publish job only uses what verify-release handed it');
   assert.match(workflowText, /cancel-in-progress: false/);
   assert.match(workflowText, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.match(workflowText, /GitHub release recovery must run from the default branch code/);
@@ -1745,6 +1789,33 @@ test('verifyPackageProvenance accepts the real npm attestation shape for every r
   });
 });
 
+test('verifyPackageProvenance returns the evidence the release receipt records', async () => {
+  const packageName = '@opencoven/cli-windows';
+  const tarballBytes = Buffer.from('windows tarball fixture');
+  const integrity = integrityFor(tarballBytes);
+  const result = await verifyPackageProvenance({
+    packageName,
+    npmVersion: NPM_VERSION,
+    releaseTag: RELEASE_TAG,
+    headSha: HEAD_SHA,
+    sourceRunId: SOURCE_RUN_ID,
+    sourceRunAttempt: SOURCE_RUN_ATTEMPT,
+    packageMetadata: makePackageMetadata(packageName, integrity),
+    attestationDocument: buildAttestations({
+      packageName,
+      subjectDigest: createHash('sha512').update(tarballBytes).digest('hex')
+    })
+  });
+  assert.equal(result.packageName, packageName);
+  assert.equal(result.integrity, integrity);
+  assert.equal(result.integrityHex, createHash('sha512').update(tarballBytes).digest('hex'));
+  assert.equal(result.provenancePredicateType, 'https://slsa.dev/provenance/v1');
+  assert.equal(
+    result.invocationId,
+    `https://github.com/OpenCoven/coven/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}`
+  );
+});
+
 test('verifyPackageProvenance accepts npm trusted publisher config ids with and without the oidc prefix', async () => {
   const packageName = '@opencoven/cli';
   const tarballBytes = Buffer.from('npm package tarball fixture');
@@ -2321,8 +2392,9 @@ test('syncGitHubRelease revalidates the verified remote tag before creating a mi
       }
     ]);
     assert.deepEqual(client.state.created, [
-      { releaseTag: RELEASE_TAG, title: 'Coven v0.4.4', notesFromTag: true, verifyTag: true }
+      { releaseTag: RELEASE_TAG, title: 'Coven v0.4.4', notesFromTag: true, verifyTag: true, draft: true }
     ]);
+    assert.equal(result.draft, true, 'a new release starts as a draft');
     assert.deepEqual(result.uploaded.sort(), EXPECTED_ASSET_NAMES);
     assert.deepEqual(result.skipped, []);
   });
@@ -2698,12 +2770,9 @@ test('syncGitHubRelease rejects existing release metadata mismatches before acce
         error: /title .*Coven v0\.4\.4/i
       },
       {
-        name: 'draft release',
-        release: baseExistingRelease({
-          draft: true,
-          assets: allAssets
-        }),
-        error: /must not be a draft/i
+        name: 'release with no draft state',
+        release: { ...baseExistingRelease({ assets: allAssets }), draft: undefined },
+        error: /must report draft=true or draft=false/i
       },
       {
         name: 'prerelease',
@@ -2798,4 +2867,153 @@ test('release creation never combines --notes-from-tag with --repo', () => {
     pushes('--notes-file'),
     'release notes must still come from the signed tag annotation, via --notes-file'
   );
+});
+
+
+/// Packages the canonical assets plus the release record (SBOM and receipt)
+/// that every tag carrying the receipt builder publishes.
+function packageReleaseWithRecord(scratchDir) {
+  const artifactsDir = path.join(scratchDir, 'artifacts');
+  const outputDir = path.join(scratchDir, 'out');
+  cpSync(fixtureRoot, artifactsDir, { recursive: true });
+  packageCanonicalRelease({ releaseTag: RELEASE_TAG, artifactsDir, outputDir, sourceDateEpoch: SOURCE_DATE_EPOCH });
+  writeFileSync(path.join(outputDir, releaseSbomAssetName(NPM_VERSION)), '{"bomFormat":"CycloneDX"}\n');
+  writeFileSync(path.join(outputDir, releaseReceiptAssetName(NPM_VERSION)), '{"kind":"coven.release-receipt"}\n');
+  const names = [...EXPECTED_ASSET_NAMES, releaseSbomAssetName(NPM_VERSION), releaseReceiptAssetName(NPM_VERSION)].sort();
+  const assets = names.map((name, index) => {
+    const bytes = readFileSync(path.join(outputDir, name));
+    return { id: index + 1, name, digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` };
+  });
+  return { outputDir, names, assets };
+}
+
+const RELEASE_OPTIONS = () => ({
+  releaseTag: RELEASE_TAG,
+  expectedTagObjectSha: baseTagRef().object.sha,
+  expectedHeadSha: HEAD_SHA,
+  releaseRecord: true
+});
+
+test('the release record joins the canonical assets only for tags that carry it', () => {
+  const base = canonicalReleaseAssetNames(RELEASE_TAG, HEAD_SHA);
+  const withRecord = canonicalReleaseAssetNames(RELEASE_TAG, HEAD_SHA, { releaseRecord: true });
+  assert.deepEqual(withRecord.filter((name) => !base.includes(name)), [
+    'coven-v0.4.4-sbom.cdx.json',
+    'coven-v0.4.4-release-receipt.json'
+  ]);
+  assert.equal(withRecord.at(-1), 'SHA256SUMS');
+});
+
+test('syncGitHubRelease resumes an existing draft and uploads by release id', async () => {
+  await withScratchDir('sync-resume-draft', async (scratchDir) => {
+    const { outputDir, names, assets } = packageReleaseWithRecord(scratchDir);
+    const client = fakeReleaseClient({
+      existingRelease: baseExistingRelease({ draft: true, assets: assets.slice(0, 3) })
+    });
+    const result = await syncGitHubRelease({ ...RELEASE_OPTIONS(), outputDir, releaseClient: client });
+    assert.equal(result.draft, true);
+    assert.equal(result.createdRelease, false);
+    assert.deepEqual(result.skipped, names.slice(0, 3));
+    assert.deepEqual(result.uploaded.sort(), names.slice(3));
+    assert.ok(client.state.uploads.every((upload) => upload.releaseId === 4242));
+    assert.equal(client.state.downloads.length, 0, 'API digests stand in for downloads');
+  });
+});
+
+test('syncGitHubRelease never repairs a published immutable release', async () => {
+  await withScratchDir('sync-immutable', async (scratchDir) => {
+    const { outputDir, assets } = packageReleaseWithRecord(scratchDir);
+    const missing = fakeReleaseClient({
+      existingRelease: baseExistingRelease({ immutable: true, assets: assets.slice(1) })
+    });
+    await assert.rejects(
+      syncGitHubRelease({ ...RELEASE_OPTIONS(), outputDir, releaseClient: missing }),
+      /published immutable release missing .*bump forward/
+    );
+    assert.equal(missing.state.uploads.length, 0);
+
+    const tampered = assets.map((asset, index) => (index === 0 ? { ...asset, digest: `sha256:${'0'.repeat(64)}` } : asset));
+    await assert.rejects(
+      syncGitHubRelease({
+        ...RELEASE_OPTIONS(),
+        outputDir,
+        releaseClient: fakeReleaseClient({ existingRelease: baseExistingRelease({ immutable: true, assets: tampered }) })
+      }),
+      /mismatch: .*The release is immutable, so it cannot be repaired/
+    );
+
+    const complete = fakeReleaseClient({ existingRelease: baseExistingRelease({ immutable: true, assets }) });
+    const result = await syncGitHubRelease({ ...RELEASE_OPTIONS(), outputDir, releaseClient: complete });
+    assert.deepEqual(result.uploaded, []);
+  });
+});
+
+test('publishGitHubRelease publishes a verified draft and requires the lock to hold', async () => {
+  await withScratchDir('publish-draft', async (scratchDir) => {
+    const { outputDir, names, assets } = packageReleaseWithRecord(scratchDir);
+    const client = fakeReleaseClient({ existingRelease: baseExistingRelease({ draft: true, assets }) });
+    const result = await publishGitHubRelease({ ...RELEASE_OPTIONS(), outputDir, requireImmutable: true, releaseClient: client });
+    assert.deepEqual(client.state.published, [{ releaseId: 4242, makeLatest: true }]);
+    assert.equal(client.state.revalidated.length, 1, 'the tag is re-checked right before publication');
+    assert.equal(result.publishedNow, true);
+    assert.equal(result.release.immutable, true);
+    assert.deepEqual(result.assets.map((asset) => asset.name), names);
+    assert.ok(result.assets.every((asset) => /^[0-9a-f]{64}$/.test(asset.sha256)));
+  });
+});
+
+test('publishGitHubRelease does not take latest from a newer release', async () => {
+  await withScratchDir('publish-older', async (scratchDir) => {
+    const { outputDir, assets } = packageReleaseWithRecord(scratchDir);
+    const client = fakeReleaseClient({ existingRelease: baseExistingRelease({ draft: true, assets }), latestTag: 'v0.4.9' });
+    const result = await publishGitHubRelease({ ...RELEASE_OPTIONS(), outputDir, releaseClient: client });
+    assert.equal(result.makeLatest, false);
+  });
+});
+
+test('publishGitHubRelease refuses a release GitHub did not lock', async () => {
+  await withScratchDir('publish-mutable', async (scratchDir) => {
+    const { outputDir, assets } = packageReleaseWithRecord(scratchDir);
+    const client = fakeReleaseClient({ existingRelease: baseExistingRelease({ draft: true, assets }), immutableOnPublish: false });
+    await assert.rejects(
+      publishGitHubRelease({ ...RELEASE_OPTIONS(), outputDir, requireImmutable: true, releaseClient: client }),
+      /published without GitHub immutability/
+    );
+  });
+});
+
+test('publishGitHubRelease refuses before publication on any missing or changed asset or a moved tag', async () => {
+  await withScratchDir('publish-refusals', async (scratchDir) => {
+    const { outputDir, assets } = packageReleaseWithRecord(scratchDir);
+    const cases = [
+      ['missing asset', { existingRelease: baseExistingRelease({ draft: true, assets: assets.slice(1) }) }, /is missing asset/],
+      ['changed asset', {
+        existingRelease: baseExistingRelease({
+          draft: true,
+          assets: assets.map((asset, index) => (index === 2 ? { ...asset, digest: `sha256:${'1'.repeat(64)}` } : asset))
+        })
+      }, /mismatch/],
+      ['extra asset', { existingRelease: baseExistingRelease({ draft: true, assets: [...assets, { id: 99, name: 'extra.txt' }] }) }, /unexpected release assets extra\.txt/],
+      ['moved tag', {
+        existingRelease: baseExistingRelease({ draft: true, assets }),
+        revalidateTagState: () => { throw new Error('Refusing GitHub release: v0.4.4 tag object SHA changed'); }
+      }, /tag object SHA changed/],
+      ['no release', { existingRelease: null }, /has no release to publish/]
+    ];
+    for (const [label, options, expected] of cases) {
+      const client = fakeReleaseClient(options);
+      await assert.rejects(publishGitHubRelease({ ...RELEASE_OPTIONS(), outputDir, releaseClient: client }), expected, label);
+      assert.deepEqual(client.state.published, [], `${label} must not publish`);
+    }
+  });
+});
+
+test('publishGitHubRelease verifies an already-published release without republishing it', async () => {
+  await withScratchDir('publish-rerun', async (scratchDir) => {
+    const { outputDir, assets } = packageReleaseWithRecord(scratchDir);
+    const client = fakeReleaseClient({ existingRelease: baseExistingRelease({ immutable: true, assets }) });
+    const result = await publishGitHubRelease({ ...RELEASE_OPTIONS(), outputDir, requireImmutable: true, releaseClient: client });
+    assert.equal(result.publishedNow, false);
+    assert.deepEqual(client.state.published, []);
+  });
 });

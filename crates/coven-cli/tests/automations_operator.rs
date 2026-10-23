@@ -117,6 +117,7 @@ fn inspection_reads_real_daemon_records_without_mutating_them() -> anyhow::Resul
         (vec!["occurrence", "occurrence-1", "--json"], "occurrence"),
         (vec!["run", "run-1", "--json"], "run"),
         (vec!["attempts", "run-1", "--json"], "attempts"),
+        (vec!["explain", "inspection", "--json"], "explanation"),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_coven"))
             .arg("automations")
@@ -140,17 +141,31 @@ fn inspection_reads_real_daemon_records_without_mutating_them() -> anyhow::Resul
         if key == "attempts" {
             assert_eq!(body[key][0]["state"], "failed");
         }
+        if key == "explanation" {
+            // Paused: no next slot is promised.
+            assert_eq!(
+                body[key]["conditions"],
+                json!([{"code": "not_active", "nextStep": "activate_if_intended"}])
+            );
+        }
     }
-    let missing = Command::new(env!("CARGO_BIN_EXE_coven"))
-        .args(["automations", "run", "absent", "--json"])
-        .env("COVEN_HOME", &home)
-        .output()?;
-    assert!(!missing.status.success());
-    assert!(missing.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(missing.stderr)?,
-        "Error: automation run was not found\n"
-    );
+    for (args, error) in [
+        (["run", "absent"], "automation run was not found"),
+        (["explain", "absent"], "automation routine was not found"),
+    ] {
+        let missing = Command::new(env!("CARGO_BIN_EXE_coven"))
+            .arg("automations")
+            .args(args)
+            .arg("--json")
+            .env("COVEN_HOME", &home)
+            .output()?;
+        assert!(!missing.status.success());
+        assert!(missing.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(missing.stderr)?,
+            format!("Error: {error}\n")
+        );
+    }
     assert_eq!(snapshot()?, before);
     let raw: String = conn.query_row(
         "SELECT log_json FROM automation_runs WHERE id = 'run-1'",
@@ -170,6 +185,7 @@ fn inspection_refuses_unavailable_daemon_without_creating_home() {
         vec!["occurrence", "occurrence-1", "--json"],
         vec!["run", "run-1", "--json"],
         vec!["attempts", "run-1", "--json"],
+        vec!["explain", "routine-1", "--json"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_coven"))
             .arg("automations")
@@ -197,7 +213,14 @@ fn inspection_help_exposes_reads_without_initializing_state() {
         .unwrap();
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    for command in ["status", "occurrence", "run", "attempts", "conformance"] {
+    for command in [
+        "status",
+        "occurrence",
+        "run",
+        "attempts",
+        "explain",
+        "conformance",
+    ] {
         assert!(help.contains(command), "missing {command}");
     }
     assert!(!home.exists());

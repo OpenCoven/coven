@@ -109,7 +109,7 @@ test('the proposed settings satisfy every control', () => {
     snapshotSha256: 'b'.repeat(64)
   });
   assert.equal(evaluation.compliant, true, JSON.stringify(evaluation.controls, null, 2));
-  assert.equal(evaluation.controls.length, 13);
+  assert.equal(evaluation.controls.length, 14);
   assert.equal(evaluation.kind, 'coven.release-governance-evaluation');
   assert.equal(evaluation.policySha256, 'a'.repeat(64));
   assert.equal(evaluation.snapshotSha256, 'b'.repeat(64));
@@ -150,6 +150,13 @@ const mutations = [
   }],
   ['an unknown exclude token', 'branch.pull_request', /no active branch ruleset/, (snapshot) => {
     rulesetBody(snapshot, 'main-protection').conditions.ref_name.exclude = ['~SOMETHING_NEW'];
+  }],
+  ['a ruleset check the release never verifies', 'branch.required-checks-verified', /requires "Security scan", which release acceptance does not verify/, (snapshot) => {
+    rulesetBody(snapshot, 'main-protection').rules
+      .find((rule) => rule.type === 'required_status_checks').parameters.required_status_checks.push({ context: 'Security scan', integration_id: 15368 });
+  }],
+  ['a classic check the release never verifies', 'branch.required-checks-verified', /requires "Docs build"/, (snapshot) => {
+    snapshot.responses.classicProtection.body.required_status_checks.contexts.push('Docs build');
   }],
   ['the merge queue removed', 'branch.merge_queue', /enforces merge_queue/, (snapshot) => {
     rulesetBody(snapshot, 'merge-queue-main').rules = [];
@@ -228,6 +235,7 @@ test('an unreadable ruleset list fails every ruleset control', () => {
     'branch.merge_queue',
     'branch.non_fast_forward',
     'branch.deletion',
+    'branch.required-checks-verified',
     'tags.update',
     'tags.deletion',
     'tags.creation'
@@ -390,7 +398,7 @@ test('the evaluate command writes the evaluation and exits non-zero on any gap',
       assert.match(evaluation.snapshotSha256, /^[0-9a-f]{64}$/);
       if (expectedStatus === 1) {
         assert.match(result.stderr, /FAIL tags\.creation/);
-        assert.match(result.stderr, /Refusing release: 10 of 13 release governance controls/);
+        assert.match(result.stderr, /Refusing release: 10 of 14 release governance controls/);
       }
     }
   } finally {

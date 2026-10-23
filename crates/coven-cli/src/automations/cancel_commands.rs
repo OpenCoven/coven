@@ -24,7 +24,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::cancellation::{execute_run_cancellation, CancellationExecution};
+use super::cancellation::{
+    execute_run_cancellation, execute_run_cancellation_at_stop_fence, CancellationExecution,
+};
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{ErrorCode, ErrorEnvelope};
 use super::contract::types::{AdoptionKey, AttemptId, OccurrenceId, RunId};
@@ -140,7 +142,27 @@ pub fn execute_occurrence_cancel(
     body: Value,
     now: DateTime<Utc>,
 ) -> Result<CancelExecution, String> {
-    execute(conn, runtime, Target::Occurrence, body, now)
+    execute(conn, runtime, Target::Occurrence, body, now, None)
+}
+
+/// `occurrence.cancel.v1` with any delegated stop fenced at `stop_fence_at`
+/// instead of on the wall clock, so a fixture's fixed clock and the
+/// scheduler's agree.
+pub(crate) fn execute_occurrence_cancel_at_stop_fence(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+    stop_fence_at: DateTime<Utc>,
+) -> Result<CancelExecution, String> {
+    execute(
+        conn,
+        runtime,
+        Target::Occurrence,
+        body,
+        now,
+        Some(stop_fence_at),
+    )
 }
 
 pub fn execute_attempt_cancel(
@@ -149,7 +171,26 @@ pub fn execute_attempt_cancel(
     body: Value,
     now: DateTime<Utc>,
 ) -> Result<CancelExecution, String> {
-    execute(conn, runtime, Target::Attempt, body, now)
+    execute(conn, runtime, Target::Attempt, body, now, None)
+}
+
+/// `attempt.cancel.v1` with any delegated stop fenced at `stop_fence_at`, as
+/// for `occurrence.cancel.v1`.
+pub(crate) fn execute_attempt_cancel_at_stop_fence(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+    stop_fence_at: DateTime<Utc>,
+) -> Result<CancelExecution, String> {
+    execute(
+        conn,
+        runtime,
+        Target::Attempt,
+        body,
+        now,
+        Some(stop_fence_at),
+    )
 }
 
 /// Bind the envelope's run target once, before delegating to the correlated
@@ -160,7 +201,7 @@ pub fn execute_run_cancel_envelope(
     body: Value,
     now: DateTime<Utc>,
 ) -> Result<CancelExecution, String> {
-    execute(conn, runtime, Target::Run, body, now)
+    execute(conn, runtime, Target::Run, body, now, None)
 }
 
 fn execute(
@@ -169,6 +210,7 @@ fn execute(
     target: Target,
     body: Value,
     now: DateTime<Utc>,
+    stop_fence_at: Option<DateTime<Utc>>,
 ) -> Result<CancelExecution, String> {
     let canonical = canonicalize(&body)
         .map_err(|error| format!("failed to canonicalize cancel request: {error:#}"))?;
@@ -196,7 +238,16 @@ fn execute(
                 transaction
                     .commit()
                     .map_err(|error| format!("failed to close cancel replay: {error}"))?;
-                return delegate(conn, runtime, target, &body, &run_cancel, now, true);
+                return delegate(
+                    conn,
+                    runtime,
+                    target,
+                    &body,
+                    &run_cancel,
+                    now,
+                    stop_fence_at,
+                    true,
+                );
             }
             Some(Adopted::Answered(answer)) => return Ok(answer),
             None => {}
@@ -254,15 +305,23 @@ fn execute(
         .commit()
         .map_err(|error| format!("failed to commit cancellation: {error}"))?;
     match (plan, answer) {
-        (Ok(Plan::Delegate(run_cancel)), _) => {
-            delegate(conn, runtime, target, &body, &run_cancel, now, false)
-        }
+        (Ok(Plan::Delegate(run_cancel)), _) => delegate(
+            conn,
+            runtime,
+            target,
+            &body,
+            &run_cancel,
+            now,
+            stop_fence_at,
+            false,
+        ),
         (_, Some(answer)) => Ok(answer),
         _ => Err("a cancellation produced no answer".to_owned()),
     }
 }
 
 /// Sends the run cancellation and answers with its outcome.
+#[allow(clippy::too_many_arguments)]
 fn delegate(
     conn: &Connection,
     runtime: &dyn SessionRuntime,
@@ -270,6 +329,7 @@ fn delegate(
     body: &Value,
     run_cancel: &Value,
     now: DateTime<Utc>,
+    stop_fence_at: Option<DateTime<Utc>>,
     replayed: bool,
 ) -> Result<CancelExecution, String> {
     // The run owns its intended session ID before the runtime publishes the
@@ -304,7 +364,17 @@ fn delegate(
             .expect("the pending ownership message satisfies protocol bounds"),
         ));
     }
-    match execute_run_cancellation(conn, runtime, run_cancel.clone(), now)? {
+    let execution = match stop_fence_at {
+        Some(stop_fence_at) => execute_run_cancellation_at_stop_fence(
+            conn,
+            runtime,
+            run_cancel.clone(),
+            now,
+            stop_fence_at,
+        )?,
+        None => execute_run_cancellation(conn, runtime, run_cancel.clone(), now)?,
+    };
+    match execution {
         CancellationExecution::Success(success) => {
             let mut payload = success.payload;
             // Retained results must still identify the exact delegated stop.
@@ -489,14 +559,28 @@ fn plan_in(
     // The occurrence, its running run, and that run's latest attempt.
     let occurrence_id: Option<String> = match target {
         Target::Occurrence => Some(request.target_id.clone()),
-        Target::Run => conn
-            .query_row(
-                "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
-                [&request.target_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| format!("failed to read the run: {error}"))?,
+        Target::Run => {
+            // `occurrence_id` is nullable: a run can start without an
+            // occurrence, and deleting one sets its runs' column to NULL.
+            let occurrence: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
+                    [&request.target_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("failed to read the run: {error}"))?;
+            if occurrence == Some(None) {
+                return refuse(
+                    ErrorCode::IllegalTransition,
+                    format!(
+                        "run `{}` has no occurrence; only an occurrence's running run can be cancelled",
+                        request.target_id
+                    ),
+                );
+            }
+            occurrence.flatten()
+        }
         Target::Attempt => conn
             .query_row(
                 "SELECT occurrence_id FROM automation_attempts WHERE id = ?1",
@@ -1409,7 +1493,7 @@ mod tests {
         body: Value,
         target: Target,
     ) -> ErrorCode {
-        match execute(conn, runtime, target, body, now()).unwrap() {
+        match execute(conn, runtime, target, body, now(), None).unwrap() {
             CancelExecution::Rejected(error) => error.code(),
             success => panic!("expected a refusal, got {success:?}"),
         }
@@ -1460,6 +1544,63 @@ mod tests {
             ),
             ErrorCode::IllegalTransition
         );
+        assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_run_without_an_occurrence_is_refused_and_the_refusal_replays() {
+        // `automation_runs.occurrence_id` is nullable: a run started without
+        // an occurrence, or whose occurrence was deleted (ON DELETE SET NULL).
+        let (_temp, conn) = store();
+        let runtime = KillCounting::default();
+        let start = now();
+        super::super::runs::record_run_start(
+            &conn,
+            "run-unbound",
+            super::super::runs::RunStart {
+                automation_id: "notes",
+                occurrence_id: None,
+                authority_profile: None,
+                session_id: None,
+                familiar_id: None,
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
+            start,
+        )
+        .unwrap();
+
+        let request = cancel_envelope(run_cancel("adopt:cancel:unbound", "run-unbound"));
+        let (status, first) = crate::control_plane::route_action(request.clone(), &conn, &runtime);
+        let first = first.result.unwrap();
+        assert_eq!(
+            first["error"]["code"], "ILLEGAL_TRANSITION",
+            "{status}: {first}"
+        );
+        assert_eq!(
+            state(
+                &conn,
+                "SELECT status FROM automation_runs WHERE id = ?1",
+                "run-unbound"
+            ),
+            "running",
+            "a refusal writes no execution state"
+        );
+        assert_eq!(
+            state(
+                &conn,
+                "SELECT outcome FROM automation_command_adoptions WHERE adoption_key = ?1",
+                "adopt:cancel:unbound"
+            ),
+            "rejected"
+        );
+        let (replay_status, replay) = crate::control_plane::route_action(request, &conn, &runtime);
+        assert_eq!(replay_status, status);
+        assert_eq!(replay.result.unwrap()["error"], first["error"]);
+
+        let unknown = cancel_envelope(run_cancel("adopt:cancel:unknown-run", "run-none"));
+        let (_, unknown) = crate::control_plane::route_action(unknown, &conn, &runtime);
+        assert_eq!(unknown.result.unwrap()["error"]["code"], "NOT_FOUND");
         assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
     }
 
@@ -1529,7 +1670,7 @@ mod tests {
                     Target::Occurrence => occurrence_cancel("adopt:cancel:dispatch", "occ.notes-1"),
                     Target::Attempt => attempt_cancel("adopt:cancel:dispatch", &attempt),
                 };
-                let answer = execute(&conn, self, self.target, body.clone(), now()).unwrap();
+                let answer = execute(&conn, self, self.target, body.clone(), now(), None).unwrap();
                 assert!(
                     matches!(&answer, CancelExecution::Rejected(error)
                         if error.code() == ErrorCode::CancelPending && error.retryable),
@@ -1561,7 +1702,7 @@ mod tests {
             assert_eq!(report.dispatched.len(), 1);
             let body = runtime.request.lock().unwrap().clone().unwrap();
             for _ in 0..2 {
-                let answer = execute(&conn, &runtime, target, body.clone(), now()).unwrap();
+                let answer = execute(&conn, &runtime, target, body.clone(), now(), None).unwrap();
                 assert!(
                     matches!(answer, CancelExecution::Success { replayed: true, .. }),
                     "{answer:?}"
@@ -1592,14 +1733,14 @@ mod tests {
                     }
                 };
                 body["reason"] = json!(reason);
-                let answer = execute(&conn, &runtime, target, body.clone(), now()).unwrap();
+                let answer = execute(&conn, &runtime, target, body.clone(), now(), None).unwrap();
                 assert!(
                     matches!(answer, CancelExecution::Success { .. }),
                     "{answer:?}"
                 );
                 assert_eq!(runtime.0.load(Ordering::SeqCst), 1);
                 assert!(matches!(
-                    execute(&conn, &runtime, target, body, now()).unwrap(),
+                    execute(&conn, &runtime, target, body, now(), None).unwrap(),
                     CancelExecution::Success { replayed: true, .. }
                 ));
                 assert_eq!(runtime.0.load(Ordering::SeqCst), 1);
@@ -1644,7 +1785,7 @@ mod tests {
                 Target::Occurrence => occurrence_cancel("adopt:cancel:deadline", "occ.notes-1"),
                 Target::Attempt => attempt_cancel("adopt:cancel:deadline", &waiting),
             };
-            let answer = execute(&conn, &runtime, target, body.clone(), deadline).unwrap();
+            let answer = execute(&conn, &runtime, target, body.clone(), deadline, None).unwrap();
             assert!(
                 matches!(&answer, CancelExecution::Rejected(error)
                 if error.code() == ErrorCode::IllegalTransition),
@@ -1675,7 +1816,7 @@ mod tests {
                 "failed"
             );
             assert_eq!(
-                execute(&conn, &runtime, target, body, deadline).unwrap(),
+                execute(&conn, &runtime, target, body, deadline, None).unwrap(),
                 answer
             );
             assert_eq!(runtime.0.load(Ordering::SeqCst), 0);

@@ -46,8 +46,8 @@ const RESULT_EXCERPT_MAX_BYTES: usize = 4 * 1024;
 /// A failure reason carried in a result notice, so a runaway reason cannot
 /// push the notice past the inbox's body limit.
 const REASON_MAX_BYTES: usize = 1024;
-const GATE_UNAVAILABLE_REASON: &str = "the main-session inbox lock could not be opened";
-const RESULT_UNREADABLE_REASON: &str = "the run's recorded output could not be read";
+pub(crate) const GATE_UNAVAILABLE_REASON: &str = "the main-session inbox lock could not be opened";
+pub(crate) const RESULT_UNREADABLE_REASON: &str = "the run's recorded output could not be read";
 
 #[cfg(test)]
 type NoticeInsertHook = Box<dyn FnOnce() -> Result<()>>;
@@ -462,7 +462,7 @@ fn result_excerpt(output: &str) -> (String, bool) {
 
 /// Drops terminal escape sequences (CSI, OSC and two-character escapes), so
 /// the notice carries the text a terminal shows rather than its styling.
-fn strip_escape_sequences(text: &str) -> String {
+pub(crate) fn strip_escape_sequences(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {

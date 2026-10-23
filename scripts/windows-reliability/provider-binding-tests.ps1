@@ -19,8 +19,119 @@ try {
             [IO.File]::WriteAllBytes($file,[IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $name)))
         } else { [IO.File]::WriteAllText($file,'controlled source') }
     }
-    $capture=Get-CovenProviderSourceCapture -Directory $root -Commit ('1'*40)
+    # The initial complete positive also preserves relative-root normalization.
+    $savedCurrent=[Environment]::CurrentDirectory
+    try {
+        [Environment]::CurrentDirectory=$root
+        $capture=Get-CovenProviderSourceCapture -Directory '.' -Commit ('1'*40)
+    } finally { [Environment]::CurrentDirectory=$savedCurrent }
     if ($capture.Files.Count -ne 21) { throw 'Capture omitted source' }
+    if ($BundleOutputFile) {
+        # This integration fixture exercises the packet and refusal boundary.
+        # The separately required default invocation runs every component control.
+        Add-CovenProviderCapturedTypes -Capture $capture
+        # Exercise the actual parent packet boundary with controlled identities only.
+        $source=ConvertTo-CovenProviderSourceDto -Capture $capture
+        $assemblies=[Collections.Generic.List[CovenProviderBound.CovenKernelAssembly]]::new()
+        foreach ($kind in @('corelib','crypto','json','powershell','xml')) {
+            $major=if ($kind -ceq 'powershell') { 7 } else { 8 }
+            $assemblies.Add([CovenProviderBound.CovenKernelAssembly]::new($kind,('3'*64),[uint[]]@($major,0,0,0)))
+        }
+        $hostProof=[CovenProviderBound.CovenKernelHost]::new(('2'*64),$assemblies,('4'*64),$true)
+        $summary=[ordered]@{kind='controlled-parent-packet'}
+        $query=[pscustomobject]@{Stdout='{}'}
+        $utf8=[Text.UTF8Encoding]::new($false,$true)
+        $runner=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'run-provider-schema.ps1'))
+        $start=$runner.IndexOf('    $packet=[ordered]@',[StringComparison]::Ordinal)
+        $end=$runner.IndexOf('    if ($packetBytes.Length',$start,[StringComparison]::Ordinal)
+        if ($start -lt 0 -or $end -le $start) { throw 'Parent packet boundary missing' }
+        . ([scriptblock]::Create($runner.Substring($start,$end-$start)))
+        [IO.File]::WriteAllBytes($BundleOutputFile,$packetBytes)
+        foreach ($candidate in @($capture,[pscustomobject]@{private='PRIVATE_SENTINEL'},
+            [CovenProviderBound.CovenKernelSource]::new(('x'*8192),$source.Files,$true))) {
+            $rejected=$false
+            try { ConvertTo-CovenProviderPublicObject -Value $candidate | Out-Null } catch { $rejected=$true }
+            if (-not $rejected) { throw 'Private or oversized identity admitted' }
+        }
+
+        return
+    }
+    # All root negatives use this already-valid complete inventory. A missing
+    # descendant must never make a root-admission control pass accidentally.
+    function New-ControlledProviderRootAlias {
+        param([string]$Path,[string]$Target)
+        $kind=if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        New-Item -ItemType $kind -Path $Path -Target $Target -ErrorAction Stop | Out-Null
+        if ((Get-Item -LiteralPath $Path -Force).LinkType -cne $kind) { throw 'Owned root alias setup failed' }
+    }
+    $rootFailures=[Collections.Generic.List[string]]::new()
+    $rootAlias=$root+'-alias'
+    $savedProviderRootRead=${function:Read-CovenProviderSourceBytes}
+    $script:providerRootEntryReads=0
+    try {
+        function Read-CovenProviderSourceBytes {
+            param([string]$Path)
+            $script:providerRootEntryReads++
+            return ,([byte[]](& $savedProviderRootRead -Path $Path))
+        }
+        New-ControlledProviderRootAlias -Path $rootAlias -Target $root
+        $rejected=$false
+        try { Get-CovenProviderSourceCapture -Directory $rootAlias -Commit ('1'*40) | Out-Null } catch { $rejected=$true }
+        if (-not $rejected) { $rootFailures.Add('selected-root-alias') }
+        if ($script:providerRootEntryReads -ne 0) { $rootFailures.Add('selected-root-read-before-admission') }
+    } finally {
+        Set-Item -Path function:Read-CovenProviderSourceBytes -Value $savedProviderRootRead
+        if ([IO.Directory]::Exists($rootAlias)) { [IO.Directory]::Delete($rootAlias) }
+    }
+    $backup=$root+'-backup'
+    $script:providerRootEntryReads=0
+    try {
+        function Read-CovenProviderSourceBytes {
+            param([string]$Path)
+            $script:providerRootEntryReads++
+            return ,([byte[]](& $savedProviderRootRead -Path $Path))
+        }
+        [IO.Directory]::Move($root,$backup)
+        New-ControlledProviderRootAlias -Path $root -Target $backup
+        if (Test-CovenProviderSourceCapture -Capture $capture) { $rootFailures.Add('recheck-root-replacement') }
+        if ($script:providerRootEntryReads -ne 0) { $rootFailures.Add('recheck-root-read-before-admission') }
+    } finally {
+        Set-Item -Path function:Read-CovenProviderSourceBytes -Value $savedProviderRootRead
+        if ([IO.Directory]::Exists($backup)) {
+            if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root) }
+            [IO.Directory]::Move($backup,$root)
+        }
+    }
+    $savedProviderRead=${function:Read-CovenProviderSourceBytes}
+    foreach ($operation in @('capture','recheck')) {
+        $script:providerRootReadCount=0
+        try {
+            function Read-CovenProviderSourceBytes {
+                param([string]$Path)
+                [byte[]]$data=& $savedProviderRead -Path $Path
+                $script:providerRootReadCount++
+                if ($script:providerRootReadCount -eq $inventory.Count) {
+                    [IO.Directory]::Move($root,$backup)
+                    New-ControlledProviderRootAlias -Path $root -Target $backup
+                }
+                return ,$data
+            }
+            $rejected=$false
+            if ($operation -ceq 'capture') {
+                try { Get-CovenProviderSourceCapture -Directory $root -Commit ('1'*40) | Out-Null } catch { $rejected=$true }
+            } else { $rejected=-not (Test-CovenProviderSourceCapture -Capture $capture) }
+            if ($script:providerRootReadCount -ne $inventory.Count) { throw 'Final-read replacement control did not execute' }
+            if (-not $rejected) { $rootFailures.Add($operation+'-final-root-replacement') }
+        } finally {
+            Set-Item -Path function:Read-CovenProviderSourceBytes -Value $savedProviderRead
+            if ([IO.Directory]::Exists($backup)) {
+                if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root) }
+                [IO.Directory]::Move($backup,$root)
+            }
+        }
+    }
+    if (-not (Test-CovenProviderSourceCapture -Capture $capture)) { throw 'Restored plain source root rejected' }
+    if ($rootFailures.Count -gt 0) { throw ('Provider root controls admitted: '+($rootFailures -join ',')) }
     $runnerFile=@($capture.Files | Where-Object { $_.Id -ceq 'runner' })[0]
     $admittedCases=[Collections.Generic.List[string]]::new()
     foreach ($mode in @('case-only','case-alias-with-omission')) {
@@ -48,32 +159,6 @@ try {
     $result=[CovenProviderBound.CovenKernelTemplate]::Project('<template><data name="Irp" inType="win:Pointer"/></template>',2048)
     if ($result.Status -cne 'supported-flat') { throw 'Captured source compilation changed projector semantics' }
     if (-not (Test-CovenProviderSourceCapture -Capture $capture)) { throw 'Unchanged captured source rejected' }
-    if ($BundleOutputFile) {
-        # Exercise the actual parent packet boundary with controlled identities only.
-        $source=ConvertTo-CovenProviderSourceDto -Capture $capture
-        $assemblies=[Collections.Generic.List[CovenProviderBound.CovenKernelAssembly]]::new()
-        foreach ($kind in @('corelib','crypto','json','powershell','xml')) {
-            $major=if ($kind -ceq 'powershell') { 7 } else { 8 }
-            $assemblies.Add([CovenProviderBound.CovenKernelAssembly]::new($kind,('3'*64),[uint[]]@($major,0,0,0)))
-        }
-        $hostProof=[CovenProviderBound.CovenKernelHost]::new(('2'*64),$assemblies,('4'*64),$true)
-        $summary=[ordered]@{kind='controlled-parent-packet'}
-        $query=[pscustomobject]@{Stdout='{}'}
-        $utf8=[Text.UTF8Encoding]::new($false,$true)
-        $runner=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'run-provider-schema.ps1'))
-        $start=$runner.IndexOf('    $packet=[ordered]@',[StringComparison]::Ordinal)
-        $end=$runner.IndexOf('    if ($packetBytes.Length',$start,[StringComparison]::Ordinal)
-        if ($start -lt 0 -or $end -le $start) { throw 'Parent packet boundary missing' }
-        . ([scriptblock]::Create($runner.Substring($start,$end-$start)))
-        [IO.File]::WriteAllBytes($BundleOutputFile,$packetBytes)
-        foreach ($candidate in @($capture,[pscustomobject]@{private='PRIVATE_SENTINEL'},
-            [CovenProviderBound.CovenKernelSource]::new(('x'*8192),$source.Files,$true))) {
-            $rejected=$false
-            try { ConvertTo-CovenProviderPublicObject -Value $candidate | Out-Null } catch { $rejected=$true }
-            if (-not $rejected) { throw 'Private or oversized identity admitted' }
-        }
-
-    }
 
     [IO.File]::AppendAllText($readerPath,"`n// changed after compilation")
     if (Test-CovenProviderSourceCapture -Capture $capture) { throw 'Post-compilation mutation accepted' }

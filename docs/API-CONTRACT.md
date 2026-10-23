@@ -592,10 +592,339 @@ private IDs, owner strings, prompts, paths, logs, and raw errors are omitted.
 Missing scheduler pass data is omitted rather than reported as a zero-duration
 pass. Category/fact/gap/next-step mismatches are invalid reports.
 
+Receipt commitment inspection uses the existing committed-receipt validator in
+the same bounded snapshot. Its optional `receipt_commitments_checked` and
+`invalid_receipt_commitments` facts cover base receipt/event digests, indexes,
+run/attempt identity and terminal correlation. Checked count must equal the
+stored receipt count and stay within the 256-receipt cap; a nonzero invalid
+count requires `receipt_commitments_inconsistent`. Missing prerequisites,
+invalid key metadata and input/read limits have separate fixed gaps and omit
+both facts. `receipt_authority_not_verified` preserves the provider/authorized
+sidecar boundary. The read performs no authority verification or activation.
+All involved lookups use the main schema; temporary shadows are excluded.
+Identity comparisons exclude case variants and numeric-affinity aliases while
+retaining indexed candidate lookups on the supported schema.
+Receipt/event bodies are individually capped at 128 KiB and jointly at 1 MiB.
+A temporary SQLite string/BLOB/record limit of at most 256 KiB is restored on
+all return paths and never raises a stricter caller limit. Older reports with
+`receipt_integrity_not_verified` remain incomplete and cannot claim these facts.
+
+`leases_fences` also counts run stop fences by lease: `stop_fences`,
+`active_stop_fences`, `expired_stop_fences` and `invalid_stop_fence_expiries`.
+Only each fence's bounded text lease timestamp is read from the main table. A
+missing table or lease column, or a view in the table's place, reports
+`stop_fence_store_unavailable` after the occurrence lease gaps and omits all
+four counts. Otherwise all four are required, and the three lease counts must
+sum to a total within the safe-integer range. Owner cancellations still
+`requested` or `stopping` are counted by their own lease the same way:
+`pending_cancellations`, `active_pending_cancellations`,
+`expired_pending_cancellations` and `invalid_pending_cancellation_expiries`,
+with `cancellation_store_unavailable` as the last lease gap when the main
+`automation_cancellations` table or its `state` or lease column cannot be read.
+
+`queue` also counts runs that settlement has not finished: `running_runs`,
+`running_runs_with_ended_sessions` (the session is `completed`, `failed`,
+`cancelled`, `killed` or `idle`), `running_runs_with_failed_latest_attempt`
+(no authority profile, and the latest attempt is `failed`; this is stored
+state, not retry eligibility) and `running_runs_with_ambiguous_latest_attempt`
+(the latest attempt is `ambiguous`). No subset may exceed the total, the
+failed and ambiguous subsets are disjoint, and the failed-attempt subset may
+not exceed `failed_attempts` in `repeated_failures` when both are present. A
+missing table or required column among `automation_runs`, `sessions` and
+`automation_attempts`, or a view in a table's place, reports
+`running_run_store_unavailable` as the last queue gap and omits all four
+counts. Otherwise all four are required.
+
 This initial diagnostic contract explicitly reports incomplete evidence. It has
 no aggregate health or certification bit. See the [doctor runbook](reference/automations-doctor.md)
 for each category's scope and remaining checks. The complete doctor outcome in
 #1355 and the full certification outcome in #858 remain open.
+
+### Automations explanation
+
+`coven.automations.explain.v1` (`{ "id": "<automation-id>" }`) is an
+owner-local read that names what decides whether one routine runs next. Over
+TCP it returns `403 AUTHORITY_REQUIRED` before store access. It returns
+`{ "explanation": … }` as the response's event payload, as
+`.definition.health.v1` and the occurrence and run reads do. Nothing is
+published, and the read itself writes nothing; the route opens the store as
+every owner-local action does. An unknown id or a mission returns
+`404 NOT_FOUND`; a tombstoned routine returns `410 GONE_TOMBSTONED`.
+
+The explanation carries `automationId`, `revision`, `lifecycleState`,
+`observedAt`, a non-empty, ordered `conditions` list, and a `work` list with
+`workTruncated`. `conditions` say whether planning creates the routine's next
+occurrence; `work` says what holds the occurrences that already exist. Each
+condition has a `code` and a `nextStep`, and some have `at` or
+`failureClass`:
+
+| `code` | Holds when | `nextStep` |
+| --- | --- | --- |
+| `not_active` | the stored `status` is not exactly `ACTIVE`, or the readable definition's own status is not `ACTIVE` | `activate_if_intended` |
+| `quarantined` | retry exhaustion quarantined the routine; `at` is the quarantine time and `failureClass` its class, each omitted unless canonical | `review_failure_then_unquarantine` |
+| `definition_unavailable` | the stored definition is unreadable or fails validation; or, with a stored `status` of `ACTIVE`, planning could not verify its revision: a missing or stale digest, a definition whose own `id` is not the routine's, or an unreadable creation or revision time | `revise_definition` |
+| `schedule_history_unreadable` | with a stored `ACTIVE` row and a verified revision, the latest slot recorded for the current revision is unreadable, so planning fails the routine whenever it reads that history | `revise_definition`; a new revision starts an empty history |
+| `next_slot` | none of the above holds; `at` is the schedule's first slot after `observedAt` | `none` |
+
+These are the predicates planning applies, read from the main schema. Every
+blocking condition that holds is listed in the order above, because each alone
+keeps planning from scheduling the routine. The revision and history checks
+apply only to a stored `ACTIVE` row, because planning reaches them only then.
+An unreadable creation time does not fail planning, which falls back to the
+pass instant and still reads the history, so an unreadable history is listed
+beside it. `next_slot` appears only when none holds. It states what the
+schedule produces next, not that a pass will plan or launch it: the
+scheduler's liveness is outside this read, and a due slot that planning has
+yet to create is listed in `work`. Prompts, quarantine
+reasons, validation text and lease owners are never returned.
+
+`work` lists what the scheduler's claim gate counts against the routine: its
+claimed, running and recovery-required occurrences, and every running run keyed
+to the routine whose occurrence is not one of those. It also lists what a
+scheduler pass would claim from, given the store at `observedAt`: the eligible
+queue and a due slot that planning has yet to create. Before claiming, a pass
+settles retries and held failed attempts once their deadlines pass, settles
+runs whose session has finished, stops runs whose session is still running past
+their deadline, and returns or fails stale and expired claims (`retry_expired`,
+`retry_held`, `session_finished`, `timeout_expired`, `claim_stale` and
+`lease_expired`, below). Each releases the hold it lists, except where the pass
+holds the run, as described below. Reconciliation also acts on other runs
+before claiming, which are listed as `running_run` or `in_flight` and not named
+yet (#1523): it stops or settles other runs past their deadline, stops
+launches abandoned past their lease, and reconciles expired cancellations. It
+holds at
+most 20 items: those that hold claims first, then by code in the order
+below, with each code that replaces another item sorted as that item, then by
+stored scheduled time and ids. `workTruncated` is `true` when more exist. All
+reads, `conditions` included, come from one read transaction. Each item has a
+`code`, `holdsClaims` and a `nextStep`, and `occurrenceId`, `runId` and `at`
+(the occurrence's scheduled time, in canonical millisecond form) when each
+exists and is readable. A retry item also carries `notBefore` and
+`deadlineAt`, a `timeout_expired` item `deadlineAt`, and a claimed
+occurrence's item `leaseExpiresAt`, described below. An id is omitted when it
+is empty, longer than 512 bytes, not valid UTF-8, has leading or trailing
+whitespace, or contains a control character. A stored time is omitted when it
+is longer than 64 bytes or is not a readable timestamp.
+
+| `code` | What it is | `holdsClaims` | `nextStep` |
+| --- | --- | --- | --- |
+| `in_flight` | a `claimed` or `running` occurrence, given as `state`; `runId` is its running run, the lowest id if several | always | `inspect_occurrence` |
+| `claim_stale` | a claimed occurrence the daemon claimed under a generation of the scheduler authority other than the current one, or under none, with no run at all; it replaces the occurrence's `in_flight` item | until the next pass returns it to `planned` | `await_scheduler_pass` |
+| `lease_expired` | a claimed occurrence whose lease has expired, claimed by the daemon under the current generation or manually with none, with no running run; it replaces the occurrence's `in_flight` item | until the next pass settles it `failed` | `await_settlement` |
+| `running_run` | a running run keyed to the routine whose occurrence is not listed above: a retry on a still-planned occurrence, or a run whose occurrence is settled, another routine's, or missing | always | `inspect_run` |
+| `retry_waiting` | such a run retrying a planned occurrence: it has no session and an adopted attempt whose `notBefore` is after `observedAt`, and its deadline has not passed | always | `await_retry` |
+| `retry_expired` | a run with no session and an adopted attempt, retrying a planned occurrence or this routine's claimed one, whose deadline has passed; it replaces that run's `running_run` or `in_flight` item | until the next pass settles it | `await_settlement` |
+| `retry_held` | a claimed or running occurrence whose run's latest attempt failed and is held for an operator retry, described below; it replaces the occurrence's `in_flight` item | until a pass settles it at the run's deadline | `await_settlement` |
+| `session_finished` | a claimed or running occurrence whose run's session has finished, described below; it replaces the occurrence's `in_flight` item | until the next pass settles the run, unless settlement holds the run | `await_settlement`, or `await_runtime_authority` for a Runtime Authority run |
+| `timeout_expired` | a claimed or running occurrence whose run's session is still running past the run's deadline, described below; it replaces the occurrence's `in_flight` item | until the next pass settles the run `failed`, unless it holds the run for recovery | `await_settlement`, or `await_runtime_authority` for a Runtime Authority run |
+| `eligible_now` | a planned occurrence the scheduler's eligible queue selects now, unless misfire policy skips it first | never | `await_scheduler_pass` |
+| `due_unplanned` | the slot the next pass plans for the routine, with no `occurrenceId`; `at` is the slot | never | `await_scheduler_pass` |
+| `recovery_required` | a `recovery_required` occurrence; `runId` is its running run, if any | while a running run keyed to the routine is on it | the step recovery takes, below |
+
+An `eligible_now` item is read with the scheduler's own eligibility statement,
+for the routines a planning pass admits. Planning admits a routine it reaches
+without failing: a stored `ACTIVE` row, not quarantined, whose readable
+definition is `ACTIVE`, with a verified revision and a readable schedule
+history. An unreadable creation time does not keep it out, so such an item can
+appear beside `definition_unavailable`. A ready adopted retry is selected even
+when planning does not admit the routine, unless the routine is quarantined.
+Its occurrence is then listed twice, as `running_run` and as `eligible_now`.
+
+A retry item says what the daemon does with the retry next. Each pass first
+reconciles runs. A run with no session and an adopted attempt whose deadline
+has passed is settled `failed`, with its `planned` or `claimed` occurrence,
+whatever its `notBefore`, before anything is claimed. That releases its hold,
+so the same pass can claim another occurrence of the routine. A
+`retry_waiting` item's occurrence can be claimed again from `notBefore`,
+subject to the rest of the claim gate: the occurrence's routine must not be
+quarantined, and no other work may hold it. If the deadline comes first, the
+retry is settled `failed` then instead. A pass runs about once a minute, so a
+retry can start up to a minute after `notBefore`. Once `notBefore` has passed,
+a retry the queue can claim is listed as `running_run` and `eligible_now`; one
+it cannot claim stays `running_run` until its deadline.
+
+Reconciliation parses the whole stored deadline, while the queue compares the
+deadline and `not_before` as stored text. A retry is listed as waiting only
+when its deadline is open both ways. `notBefore` is the latest adopted attempt
+time still ahead, shown only when it is stored in canonical form, and
+`deadlineAt` is the parsed deadline, truncated to the millisecond.
+
+Some runs anywhere in the store fail reconciliation on every pass for every
+routine. Until they are repaired, no claim is released and nothing is claimed.
+Among them:
+
+- any running run with a value settlement decodes as text, such as its
+  deadline, its session's exit time or its latest attempt's settlement time,
+  that is stored as anything but text or null, or is not valid UTF-8;
+- a run whose text deadline cannot be parsed, when it is a retry with no session
+  and an adopted attempt, has an attempt still live, or is an unfenced plain run
+  holding a failed attempt or whose session has finished;
+- a retry with no session and an adopted attempt whose expired retry's
+  occurrence is neither `planned` nor `claimed`, on which timeout enforcement
+  fails before settlement runs;
+- an unfenced run holding a failed attempt whose occurrence is not `claimed`,
+  `running` or `recovery_required` at its deadline, on which settlement fails
+  after timeout enforcement has run;
+- a run past its deadline whose session and attempt are live, holding its own
+  timeout stop fence whose expiry cannot be read, on which timeout enforcement
+  fails.
+
+Such a run is not named: it is listed as `running_run`, or its occurrence as
+`in_flight` or `recovery_required`.
+
+A `retry_held` item is a failed attempt held for an operator retry: its run
+has no authority profile and its latest attempt failed. The run holds the
+routine's claims until a pass settles it and its occurrence `failed`: the first
+pass at or after the run's deadline, or the next pass if it has none. An
+operator can open a retry first with `coven.automations.attempt.retry.v1`,
+which has no CLI command yet and refuses in several cases, among them a run
+with no deadline or past it, and one with no attempt left. The retry returns
+the occurrence to `planned`, and the run, still holding the claims, is then
+listed as `running_run`, and as `eligible_now` while the queue can claim it.
+
+These held runs are listed as `in_flight` instead:
+
+- one with a stop fence, which settlement skips on every pass;
+- one with a stopping cancellation, whose reconciliation can fail the pass once
+  it expires;
+- one with an attempt still live, which timeout enforcement or abandoned-launch
+  recovery can stop first;
+- one sharing its occurrence with another running run, which can settle the
+  occurrence first;
+- one on a running occurrence whose run has no session, an adopted attempt and
+  a deadline, on which timeout enforcement fails the pass.
+
+A held run whose occurrence awaits recovery is listed as `recovery_required`;
+unless one of the cases above applies, settlement settles both at the deadline.
+One whose occurrence is not this routine's claimed or running one is listed as
+`running_run`.
+
+A `session_finished` item is a run whose session has finished: its status is
+`completed`, `failed`, `cancelled`, `killed` or `idle`. The next pass settles
+the run and its occurrence from the session's evidence; a run whose latest
+attempt is ambiguous settles `failed`, at that attempt's settlement time. A
+plain run whose latest attempt failed is a held retry instead, described above.
+Two outcomes keep the routine's claims:
+
+- a plain run that failed with no ambiguous stop, while its deadline is still
+  ahead and its latest attempt is below the attempt limit, is held for an
+  operator retry, and is then listed as `retry_held`;
+- a Runtime Authority run is held for recovery, since no trusted adapter
+  consumes its evidence yet, and its occurrence is then listed as
+  `recovery_required` with next step `await_runtime_authority`.
+
+These runs with a finished session are listed as `in_flight` instead:
+
+- one with an expired cancellation, which reconciliation acts on first;
+- one sharing its occurrence with another running run, which can settle the
+  occurrence first;
+- a plain run with a stop fence, unless its latest attempt is ambiguous:
+  settlement skips it, holds it for recovery when an expired timeout or
+  recovery stop left its attempt live, or fails the pass;
+- a plain run whose ambiguous attempt has a pending cancellation of its own,
+  which settlement leaves to that cancellation;
+- a plain run whose latest attempt is not live, ambiguous or failed, or a
+  Runtime Authority run without exactly one unresolved attempt, on which
+  settlement fails the pass;
+- one with a value settlement cannot read where it reads it, such as a deadline,
+  an exit time, an exit code or a plain run's pinned definition, on which
+  settlement fails the pass.
+
+A run with a finished session whose occurrence awaits recovery is listed as
+`recovery_required`; the next pass can settle both, or hold the run as above.
+
+A `timeout_expired` item is a run whose session is still `running` after the
+run's deadline, given as `deadlineAt`. Timeout enforcement parses the whole
+deadline, so a deadline with an offset counts from its own instant. The next
+pass stops the session. A plain run whose stop is confirmed is settled `failed`
+with its occurrence, and its attempt `timed_out`. When the stop is not
+confirmed, its attempt is marked ambiguous and its occurrence is held for
+recovery, and is then listed as `recovery_required`. A Runtime Authority run is
+held for recovery either way.
+
+These runs past their deadline are listed as `in_flight` instead:
+
+- one whose session is `created` or `orphaned`, which restart containment can
+  act on first, from containment receipts outside the store;
+- one with no live attempt on the session, which the pass does not stop; an
+  attempt still dispatching needs no session;
+- one with more than one live attempt on the session, one whose session
+  another running run shares, a plain run whose dispatching attempt would take
+  a session another attempt holds, or a Runtime Authority run with another
+  unresolved attempt, on which the stop can fail the pass;
+- one with a requested or stopping cancellation, which the pass leaves to that
+  cancellation, or reconciles first once it expires;
+- one with a stop fence, which the pass leaves to that stop, holds for recovery
+  when its own timeout stop expired, or fails on when that stop's expiry cannot
+  be read;
+- one sharing its occurrence with another running run, which can settle the
+  occurrence first;
+- one with a value the pass cannot decode, such as its session's exit code or
+  update time or a plain run's pinned definition, which can fail the pass.
+
+A run past its deadline whose occurrence awaits recovery is listed as
+`recovery_required`; timeout enforcement does not stop it.
+
+Claim releases describe the next pass of the daemon holding the scheduler
+authority on record, if that pass completes. It first returns to `planned`
+every claim the daemon made under a generation other than the current one, or
+under none, that has no run, and after planning settles `failed` every expired
+lease of a daemon claim of the current generation, or of a manual claim with no
+generation, that has no running run; both happen before anything is claimed. A
+pass that fails part way, as above or because planning fails, releases only
+what it reached. A released claim no longer holds the routine's claims, so the
+same pass can claim another occurrence of the routine, which is not listed
+while the claim holds; a returned claim can itself be claimed again or
+superseded. When no daemon holds the authority, no claim is named released. A
+daemon that takes over starts a new generation and runs its own startup
+recovery first, so if the holder on record has stopped, these codes do not
+describe what its successor does. The pass compares the lease as stored
+text, so `leaseExpiresAt` is shown only when it is stored in canonical form.
+
+A `due_unplanned` item is the slot planning creates when it next reaches an
+admitted routine: the schedule's latest slot at or before `observedAt` and after
+planning's cursor, the latest of the creation time, the revision time and the
+latest slot recorded for the revision. Misfire policy then skips every planned,
+due occurrence of the routine that has no running run and is earlier than the
+routine's latest planned, due one. Neither an `eligible_now` item nor the
+`due_unplanned` slot is listed when that would skip it. Planning creates the
+slot under an id derived from it: when that id already exists, the slot counts
+as planned and is not listed, and when another occurrence holds the routine's
+slot, planning fails the routine and nothing of it is listed as claimable.
+
+A pass reaches a routine when its planning page includes it: each pass plans at
+most 64 routines, in name order, wrapping. It skips at most 64 occurrences, and
+claims at most 64, from the routines on its page and from ready retries. One
+unreadable time in any routine's eligible queue fails the whole pass;
+`coven automations doctor` reports it. `coven automations status` reports the
+scheduler's last pass.
+
+A `recovery_required` item's `nextStep` is the step
+`coven.automations.occurrence.recover.v1` takes, checked in recovery's order
+against the occurrence's running runs:
+
+1. `await_runtime_authority` when one is a Runtime Authority run. Recovery
+   refuses it with `AUTHORITY_REQUIRED` until an adapter can produce
+   authority-evidenced receipts.
+2. `await_cancellation` while a cancellation of one is `requested` or
+   `stopping`. Recovery refuses with `CANCEL_PENDING`.
+3. `cancel_run` while one's latest attempt may still be live: `dispatching`,
+   `started` or `observing`, or its session `created` or `running`. Recovery
+   refuses with `ILLEGAL_TRANSITION` until the run is cancelled.
+4. `recover_occurrence` otherwise.
+
+`holdsClaims` mirrors the claim gate: while an item holds claims, the scheduler
+claims no other occurrence of the routine. A `running_run` item's own
+occurrence can still be claimed, as a ready retry's is. Because items that hold
+claims come first, the first item answers whether any does, even when the list
+is truncated. An adopted retry that is waiting for its next attempt, or is past
+its deadline, also keeps its own occurrence from being claimed; its run is
+listed as `retry_waiting` or `retry_expired`, or as `running_run` when its
+times cannot be read as both reconciliation and the queue read them.
+`work` is read whatever `conditions` say, so a paused or quarantined routine
+still shows its work. Leases are read with
+`coven.automations.occurrence.leases.v1` and runs with
+`coven.automations.run.get.v1`.
 
 Other unknown action ids return `400` and fail closed:
 
@@ -1031,7 +1360,9 @@ or `null`: `id`, `conversationId`, `sessionId` (the host it was sent to),
 `state` (`requested`, `compacted` or `failed`), `fillTokens` and
 `windowTokens` (the reading that triggered it), `requestedAt`, `settledAt`,
 `preTokens` and `postTokens` (as the harness reported them), and `reason` for
-a failure. See [Compaction](#compaction).
+a failure; once compacted, `flushState` (`appended`, `empty` or `failed`),
+`flushPath` (the daily note, relative to the familiar's workspace) and
+`flushReason`. See [Compaction](#compaction).
 
 ### `GET /api/v1/main-session/events`
 
@@ -1212,8 +1543,11 @@ The daemon compacts a Claude main session before Claude's own automatic point
   above it.
 - **How.** The daemon sends `/compact` with fixed summary headings (Decisions,
   Open TODOs, Constraints, Pending user asks, Exact identifiers) as an `input`
-  event on the host session. Claude compacts natively, with no rotation: the
-  conversation id and its feed continue.
+  event on the host session, and asks for the durable facts the
+  conversation's own messages established, worth keeping beyond it, between
+  `<durable-facts>` and `</durable-facts>` lines. Restatements of system
+  prompts or instruction files such as `CLAUDE.md` are excluded. Claude compacts natively, with no rotation: the conversation id and
+  its feed continue.
 - **Evidence.** The first `result` after the request ends it. A
   `compact_boundary` before that result settles it `compacted` and records a
   `main_session.compacted` event on the host session, so it is in the event
@@ -1230,12 +1564,14 @@ The daemon compacts a Claude main session before Claude's own automatic point
     "preTokens": 612502,
     "postTokens": 2310,
     "summary": "…",
-    "summaryTruncated": false
+    "summaryTruncated": false,
+    "flush": { "state": "appended", "path": "memory/2026-10-19.md", "facts": 4 }
   }
   ```
 
-  `summary` is Claude's summary, at most 16 KiB (`summaryTruncated` says if it
-  was cut), passed through the instance's privacy policy like other events.
+  `summary` is Claude's summary without the durable-facts block, at most
+  16 KiB (`summaryTruncated` says if it was cut), passed through the
+  instance's privacy policy like other events.
   `trigger` is as Claude reported it: `manual`, because the daemon issued the
   command. A result without a boundary, a host that stops first, or no result
   within 10 minutes settles it `failed` with a `reason` in `lastCompaction`.
@@ -1243,6 +1579,19 @@ The daemon compacts a Claude main session before Claude's own automatic point
   what the host emitted afterwards. After a daemon crash, the next tick
   settles the open request from that evidence, and no second `/compact` is
   sent while one is open.
+- **Daily-note flush.** Settlement appends the durable facts to the
+  familiar's daily note, `<workspace>/memory/YYYY-MM-DD.md` (the daemon's
+  local date), under a `### Home compaction, HH:MM` heading and a
+  `<!-- coven:main-session-compaction <id> -->` marker. The daemon only
+  appends; it never truncates or rewrites a note. It refuses a `memory`
+  directory or note that is a symlink, creates `memory` when it is missing,
+  and requires the workspace itself to exist. A settlement repeated after a
+  crash finds its marker and appends nothing. Facts are single lines with
+  terminal escapes and control characters removed, at most 50 of 1 KiB each.
+  `flush.state` is `appended` (with `path` and the fact count), `empty` when
+  Claude listed none, or `failed` with a `reason` (no block, no familiar, a
+  refused or failed write). A failed flush never fails the compaction, and
+  summaries are never written to `MEMORY.md`.
 
 ### Runtime notices (the main-session inbox)
 

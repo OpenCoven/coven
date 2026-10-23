@@ -40,6 +40,105 @@ const LEGACY_IMPORT_TARGET_TIMEOUT_MS = 600_000;
 // and error cleanup need their own room on loaded hosts. Fixture hang guard
 // only: this is not a recovery SLO or a production deadline.
 const COMMAND_PROCESS_CRASH_TARGET_TIMEOUT_MS = 120_000;
+// Each of four delivery workers has a 10-second handshake guard and a 10-second
+// wait for its gate to free, and the control also a 10-second exit guard;
+// store busy waits and cleanup need room on loaded hosts. Fixture hang guard
+// only: this is not a recovery SLO or a production deadline.
+const DELIVERY_PROCESS_CRASH_TARGET_TIMEOUT_MS = 180_000;
+// Each of five settlement workers has a 10-second handshake guard, and the
+// control also a 10-second exit guard; the store's busy waits and cleanup need
+// room on loaded hosts. Fixture hang guard only: this is not a recovery SLO or
+// a production deadline.
+const SETTLEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 120_000;
+// Each of six launch workers has a 10-second handshake guard, the control
+// also a 10-second exit guard, and each restart a 10-second leadership wait;
+// the store's busy waits and cleanup need room on loaded hosts. Fixture hang
+// guard only: this is not a recovery SLO or a production deadline.
+const LAUNCH_PROCESS_CRASH_TARGET_TIMEOUT_MS = 180_000;
+// Each of six retry workers has a 10-second handshake guard, the control also
+// a 10-second exit guard, and each restart a 10-second leadership wait; the
+// store's busy waits and cleanup need room on loaded hosts. Fixture hang guard
+// only: this is not a recovery SLO or a production deadline.
+const RETRY_PROCESS_CRASH_TARGET_TIMEOUT_MS = 180_000;
+// Each of thirteen recovery workers has a 10-second handshake guard that
+// covers its own restart, the two controls also a 10-second exit guard, and
+// each parent restart a 10-second leadership wait; the store's busy waits and
+// cleanup need room on loaded hosts. Fixture hang guard only: this is not a
+// recovery SLO or a production deadline.
+const RECOVERY_PROCESS_CRASH_TARGET_TIMEOUT_MS = 360_000;
+// Each of eighteen cancellation workers has a 10-second handshake guard, the
+// control also a 10-second exit guard, and each parent restart a 10-second
+// leadership wait; the store's busy waits and cleanup need room on loaded
+// hosts. Fixture hang guard only: this is not a recovery SLO or a production
+// deadline.
+const CANCELLATION_PROCESS_CRASH_TARGET_TIMEOUT_MS = 480_000;
+// Each of twelve flat-cancellation workers has a 10-second handshake guard,
+// the two controls also a 10-second exit guard, and each parent restart a
+// 10-second leadership wait; the store's busy waits and cleanup need room on
+// loaded hosts. Fixture hang guard only: this is not a recovery SLO or a
+// production deadline.
+const FLAT_CANCELLATION_PROCESS_CRASH_TARGET_TIMEOUT_MS = 360_000;
+// Each of ten timeout-enforcement workers has a 10-second handshake guard, the
+// control also a 10-second exit guard, and each parent restart a 10-second
+// leadership wait; the store's busy waits and cleanup need room on loaded
+// hosts. Fixture hang guard only: this is not a recovery SLO or a production
+// deadline.
+const TIMEOUT_ENFORCEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 300_000;
+// Each of seven held-settlement workers has a 10-second handshake guard, the
+// control also a 10-second exit guard, and each parent restart a 10-second
+// leadership wait; the store's busy waits and cleanup need room on loaded
+// hosts. Fixture hang guard only: this is not a recovery SLO or a production
+// deadline.
+const HELD_SETTLEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 240_000;
+// Each of eleven automatic-retry workers has a 10-second handshake guard, the
+// control also a 10-second exit guard, and each parent restart a 10-second
+// leadership wait; the store's busy waits and cleanup need room on loaded
+// hosts. Fixture hang guard only: this is not a recovery SLO or a production
+// deadline.
+const AUTOMATIC_RETRY_PROCESS_CRASH_TARGET_TIMEOUT_MS = 330_000;
+// Each of six retry-timeout workers has a 10-second handshake guard, the
+// control also a 10-second exit guard, and each parent restart a 10-second
+// leadership wait; the store's busy waits and cleanup need room on loaded
+// hosts. Fixture hang guard only: this is not a recovery SLO or a production
+// deadline.
+const RETRY_TIMEOUT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 180_000;
+// Each of twelve waiting-retry cancellation workers has a 10-second handshake
+// guard, each control also a 10-second exit guard, and each parent restart a
+// 10-second leadership wait; the store's busy waits and cleanup need room on
+// loaded hosts. Fixture hang guard only: this is not a recovery SLO or a
+// production deadline.
+const WAITING_RETRY_CANCELLATION_PROCESS_CRASH_TARGET_TIMEOUT_MS = 330_000;
+// Each of nine run-now workers has a 10-second handshake guard, the control
+// also a 10-second exit guard, and each parent restart a 10-second leadership
+// wait; the store's busy waits and cleanup need room on loaded hosts. Fixture
+// hang guard only: this is not a recovery SLO or a production deadline.
+const RUN_NOW_PROCESS_CRASH_TARGET_TIMEOUT_MS = 270_000;
+// The run-now envelope's nine workers have the same guards as the flat
+// request's. Fixture hang guard only: this is not a recovery SLO or a
+// production deadline.
+const RUN_NOW_ENVELOPE_PROCESS_CRASH_TARGET_TIMEOUT_MS = 270_000;
+// Each of fourteen tick workers has a 10-second handshake guard, the controls
+// also a 10-second exit guard, and each parent restart a 10-second leadership
+// wait; the store's busy waits and cleanup need room on loaded hosts. Fixture
+// hang guard only: this is not a recovery SLO or a production deadline.
+const TICK_PROCESS_CRASH_TARGET_TIMEOUT_MS = 420_000;
+// Each of ten no-process receipt workers has a 10-second handshake guard, the
+// controls also a 10-second exit guard, and each parent restart a 10-second
+// leadership wait; the store's busy waits and cleanup need room on loaded
+// hosts. Fixture hang guard only: this is not a recovery SLO or a production
+// deadline.
+const NO_PROCESS_RECEIPT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 300_000;
+// Each of five event-feed workers has a 10-second handshake guard, the control
+// also a 10-second exit guard, and each parent restart a 10-second leadership
+// wait; the store's busy waits and cleanup need room on loaded hosts. Fixture
+// hang guard only: this is not a recovery SLO or a production deadline.
+const EVENT_FEED_PROCESS_CRASH_TARGET_TIMEOUT_MS = 180_000;
+// Each of sixteen cancellation-timeout race workers has a 10-second handshake
+// guard, the two controls also a 10-second exit guard, and each parent restart
+// a 10-second leadership wait; the store's busy waits and cleanup need room on
+// loaded hosts. Fixture hang guard only: this is not a recovery SLO or a
+// production deadline.
+const CANCELLATION_TIMEOUT_PROCESS_CRASH_TARGET_TIMEOUT_MS = 450_000;
 const TARGET_KILL_GRACE_MS = 100;
 const TARGET_OUTPUT_LIMIT = 1024 * 1024;
 const MAX_JCS_DEPTH = 128;
@@ -665,6 +764,60 @@ async function invokeTarget(subject, operation, input) {
     const targetTimeoutMs =
       operation === "evaluate" && input?.suiteId === "command-process-crash-recovery"
         ? COMMAND_PROCESS_CRASH_TARGET_TIMEOUT_MS
+        : operation === "evaluate" &&
+            input?.suiteId === "result-delivery-process-crash-recovery"
+          ? DELIVERY_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "run-settlement-process-crash-recovery"
+            ? SETTLEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "run-launch-process-crash-recovery"
+            ? LAUNCH_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "attempt-retry-process-crash-recovery"
+            ? RETRY_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "occurrence-recovery-process-crash-recovery"
+            ? RECOVERY_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "run-cancellation-process-crash-recovery"
+            ? CANCELLATION_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "flat-cancellation-process-crash-recovery"
+            ? FLAT_CANCELLATION_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "timeout-enforcement-process-crash-recovery"
+            ? TIMEOUT_ENFORCEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "held-settlement-process-crash-recovery"
+            ? HELD_SETTLEMENT_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "automatic-retry-process-crash-recovery"
+            ? AUTOMATIC_RETRY_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "retry-timeout-process-crash-recovery"
+            ? RETRY_TIMEOUT_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "waiting-retry-cancellation-process-crash-recovery"
+            ? WAITING_RETRY_CANCELLATION_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "run-now-process-crash-recovery"
+            ? RUN_NOW_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "run-now-envelope-process-crash-recovery"
+            ? RUN_NOW_ENVELOPE_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "tick-process-crash-recovery"
+            ? TICK_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "no-process-receipt-process-crash-recovery"
+            ? NO_PROCESS_RECEIPT_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "event-feed-process-crash-recovery"
+            ? EVENT_FEED_PROCESS_CRASH_TARGET_TIMEOUT_MS
+          : operation === "evaluate" &&
+              input?.suiteId === "cancellation-timeout-process-crash-recovery"
+            ? CANCELLATION_TIMEOUT_PROCESS_CRASH_TARGET_TIMEOUT_MS
         : operation === "evaluate" &&
       input?.suiteId === "startup-reconciliation-wake"
         ? STARTUP_WAKE_TARGET_TIMEOUT_MS

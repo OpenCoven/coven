@@ -61,6 +61,15 @@ impl ProbeFixture {
     }
 
     fn run(&self, label: &str, mode: &str, json: bool) -> Result<ProbeRun> {
+        let args: &[&str] = if json {
+            &["doctor", "--json"]
+        } else {
+            &["doctor"]
+        };
+        self.run_command(label, mode, args)
+    }
+
+    fn run_command(&self, label: &str, mode: &str, args: &[&str]) -> Result<ProbeRun> {
         let home = self.root.join(format!("home-{label}"));
         let config = self.root.join(format!("config-{label}"));
         let log = self.root.join(format!("invocations-{label}.log"));
@@ -70,7 +79,7 @@ impl ProbeFixture {
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_coven"));
         command
-            .arg("doctor")
+            .args(args)
             .env("COVEN_HOME", &home)
             .env("COVEN_ENGINE_BIN", &self.engine)
             .env("COVEN_DOCTOR_PROBE_LOG", &log)
@@ -85,10 +94,6 @@ impl ProbeFixture {
         if cfg!(windows) {
             command.env("PATHEXT", ".EXE");
         }
-        if json {
-            command.arg("--json");
-        }
-
         let started = Instant::now();
         let output = command
             .output()
@@ -175,7 +180,7 @@ fn doctor_auth_boundary_is_offline_hermetic_and_failure_bounded() -> Result<()> 
     assert_success("timed-out auth probe", &timed_out.output);
     anyhow::ensure!(
         timed_out.elapsed < Duration::from_secs(12),
-        "Doctor did not enforce its five-second auth timeout: {:?}",
+        "Doctor did not enforce its shared engine-probe deadline: {:?}",
         timed_out.elapsed
     );
     let timeout_json = parse_json("timed-out auth probe", &timed_out.output)?;
@@ -236,6 +241,135 @@ fn platform_executable_name(stem: &str) -> String {
     } else {
         stem.to_string()
     }
+}
+
+// This is Cave's documented execution contract, not a tight assertion around
+// normal process scheduling. The broken version probe waits twenty seconds.
+fn assert_doctor_deadline(run: &ProbeRun) {
+    assert!(
+        run.elapsed < Duration::from_secs(6),
+        "Doctor exceeded Cave's six-second execution deadline: {:?}",
+        run.elapsed
+    );
+}
+
+fn assert_probe_cleanup(run: &ProbeRun) {
+    for invocation in &run.invocations {
+        assert_eq!(invocation.executable, "coven-code");
+        assert!(
+            invocation.args == ["--version"] || invocation.args == ["auth", "status", "--json"],
+            "unexpected engine command: {invocation:?}"
+        );
+        assert_process_stopped(invocation.pid, "engine probe");
+    }
+    if let Some(pid) = run.descendant_pid {
+        assert_process_stopped(pid, "version stdout holder");
+    }
+}
+
+#[test]
+fn doctor_version_probe_is_bounded_and_cleans_up() -> Result<()> {
+    let fixture = ProbeFixture::new()?;
+    let run = fixture.run("version-timeout", "version-timeout", true)?;
+    assert_success("version timeout", &run.output);
+    assert_probe_cleanup(&run);
+    assert_doctor_deadline(&run);
+    let document = parse_json("version timeout", &run.output)?;
+    assert_eq!(check(&document, "engine")["status"], "warn");
+    assert_eq!(
+        credential_message(&document, "engine"),
+        "authentication status unavailable; provider turn not verified"
+    );
+    assert_eq!(run.invocations.len(), 1, "no new probe after the deadline");
+    assert_eq!(run.invocations[0].args, ["--version"]);
+    Ok(())
+}
+
+#[test]
+fn cli_version_remains_available_when_the_engine_probe_hangs() -> Result<()> {
+    let fixture = ProbeFixture::new()?;
+    let run = fixture.run_command("cli-version", "version-timeout", &["--version"])?;
+    assert_success("CLI version with hung engine", &run.output);
+    assert_probe_cleanup(&run);
+    assert_doctor_deadline(&run);
+    let version = String::from_utf8_lossy(&run.output.stdout);
+    assert!(version.starts_with("coven "));
+    assert!(version.contains("engine coven-code unknown"), "{version}");
+    assert!(!version.contains("engine not installed"), "{version}");
+    assert_eq!(run.invocations.len(), 1);
+    assert_eq!(run.invocations[0].args, ["--version"]);
+    Ok(())
+}
+
+#[test]
+fn doctor_version_descendants_do_not_hold_output_open() -> Result<()> {
+    let fixture = ProbeFixture::new()?;
+    let run = fixture.run("version-descendant", "version-descendant", true)?;
+    assert_success("version stdout holder", &run.output);
+    assert!(
+        run.descendant_pid.is_some(),
+        "fixture must spawn a descendant"
+    );
+    assert_probe_cleanup(&run);
+    assert_doctor_deadline(&run);
+    let document = parse_json("version stdout holder", &run.output)?;
+    assert_eq!(check(&document, "engine")["status"], "pass");
+    assert_only_local_engine_probes(&run.invocations);
+    Ok(())
+}
+
+#[test]
+fn doctor_combined_engine_faults_share_one_deadline() -> Result<()> {
+    let fixture = ProbeFixture::new()?;
+    let run = fixture.run("combined-timeout", "combined-timeout", true)?;
+    assert_success("combined slow engine probes", &run.output);
+    assert_probe_cleanup(&run);
+    assert_doctor_deadline(&run);
+    let document = parse_json("combined slow engine probes", &run.output)?;
+    match check(&document, "engine")["status"].as_str() {
+        // The version may answer just as the shared budget runs out. Doctor
+        // then reports authentication unavailable, and the auth probe either
+        // never starts or is stopped before it records its invocation.
+        Some("pass") if run.invocations.len() == 1 => {
+            assert_eq!(run.invocations[0].args, ["--version"]);
+        }
+        Some("pass") => assert_only_local_engine_probes(&run.invocations),
+        Some("warn") => {
+            // Cold engine loading plus the two-second response delay may use
+            // the whole budget. Report unknown and do not start another probe.
+            assert_eq!(run.invocations.len(), 1);
+            assert_eq!(run.invocations[0].args, ["--version"]);
+        }
+        other => panic!("unexpected version classification: {other:?}"),
+    }
+    assert_eq!(
+        credential_message(&document, "engine"),
+        "authentication status unavailable; provider turn not verified"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_version_failures_remain_private_and_unavailable() -> Result<()> {
+    let fixture = ProbeFixture::new()?;
+    for mode in ["version-flood", "version-malformed", "version-nonzero"] {
+        let run = fixture.run(mode, mode, true)?;
+        assert_success(mode, &run.output);
+        assert_probe_cleanup(&run);
+        let document = parse_json(mode, &run.output)?;
+        let engine = check(&document, "engine");
+        assert_eq!(
+            engine["status"], "warn",
+            "{mode} cannot establish a version"
+        );
+        assert!(engine["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("coven engine install")));
+        assert!(!String::from_utf8_lossy(&run.output.stdout).contains("private-version-sentinel"));
+        assert!(!String::from_utf8_lossy(&run.output.stderr).contains("private-version-sentinel"));
+        assert_only_local_engine_probes(&run.invocations);
+    }
+    Ok(())
 }
 
 fn install_probe_as(compiled: &Path, bin_dir: &Path, name: &str) -> Result<PathBuf> {

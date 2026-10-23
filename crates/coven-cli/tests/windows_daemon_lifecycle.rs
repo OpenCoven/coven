@@ -448,6 +448,27 @@ fn send_launch_request(
     Ok(stream)
 }
 
+/// Every lifecycle command parses the whole command tree on the main thread,
+/// which an unoptimised build cannot do in Windows' default 1 MB (#1492).
+#[test]
+fn coven_reserves_the_main_thread_stack_unix_gives_it() -> Result<()> {
+    let image = std::fs::read(env!("CARGO_BIN_EXE_coven"))?;
+    let read = |offset: usize, len: usize| {
+        image
+            .get(offset..offset + len)
+            .context("the coven binary is shorter than its PE headers")
+    };
+    let pe = u32::from_le_bytes(read(0x3c, 4)?.try_into()?) as usize;
+    assert_eq!(read(pe, 4)?, b"PE\0\0");
+    // The optional header follows the 4-byte signature and the 20-byte COFF
+    // header. In PE32+, SizeOfStackReserve is the u64 at offset 72.
+    let optional = pe + 24;
+    assert_eq!(read(optional, 2)?, 0x20bu16.to_le_bytes(), "not PE32+");
+    let reserve = u64::from_le_bytes(read(optional + 72, 8)?.try_into()?);
+    assert_eq!(reserve, 8 * 1024 * 1024);
+    Ok(())
+}
+
 #[test]
 fn inherited_legacy_status_with_dead_pid_does_not_wedge_lifecycle_commands() -> Result<()> {
     let _real_daemon = real_daemon_test_lock();

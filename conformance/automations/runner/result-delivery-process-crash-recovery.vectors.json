@@ -1,0 +1,129 @@
+{
+  "schemaVersion": "coven.automations.result-delivery-process-crash-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "killed-after-notice-insert",
+      "boundary": "after_notice",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-delivery-crash",
+        "name": "Conformance delivery crash",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native delivery crash conformance probe.",
+        "outputTarget": {
+          "kind": "main-session"
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "stateAfterExit": "pending",
+        "noticesAfterExit": 0,
+        "recoveryPass": "delivered",
+        "finalState": "delivered",
+        "finalNotices": 1,
+        "integrityOk": true,
+        "gateReleased": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "killed-after-delivered-record",
+      "boundary": "after_record",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-delivery-crash",
+        "name": "Conformance delivery crash",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native delivery crash conformance probe.",
+        "outputTarget": {
+          "kind": "main-session"
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "stateAfterExit": "pending",
+        "noticesAfterExit": 0,
+        "recoveryPass": "delivered",
+        "finalState": "delivered",
+        "finalNotices": 1,
+        "integrityOk": true,
+        "gateReleased": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "killed-after-delivery-commit",
+      "boundary": "after_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-delivery-crash",
+        "name": "Conformance delivery crash",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native delivery crash conformance probe.",
+        "outputTarget": {
+          "kind": "main-session"
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "stateAfterExit": "delivered",
+        "noticesAfterExit": 1,
+        "recoveryPass": "unchanged",
+        "finalState": "delivered",
+        "finalNotices": 1,
+        "integrityOk": true,
+        "gateReleased": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "uninterrupted-delivery-control",
+      "boundary": "none",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-delivery-crash",
+        "name": "Conformance delivery crash",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native delivery crash conformance probe.",
+        "outputTarget": {
+          "kind": "main-session"
+        }
+      },
+      "expected": {
+        "initialOutcome": "delivered",
+        "stateAfterExit": "delivered",
+        "noticesAfterExit": 1,
+        "recoveryPass": "unchanged",
+        "finalState": "delivered",
+        "finalNotices": 1,
+        "integrityOk": true,
+        "gateReleased": true,
+        "replayIsNoop": true
+      }
+    }
+  ]
+}

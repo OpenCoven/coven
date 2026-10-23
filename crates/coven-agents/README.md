@@ -10,6 +10,10 @@ primitives:
 - journaled goal loops with explicit exit criteria
 - agent handoffs (control transfer within one run, not child delegation)
 - bounded child delegation with selected context and attenuated authority
+- cooperative cancellation and deadlines on an injectable clock
+- parent-to-child cancellation, deadlines and concurrency bounds for
+  delegated children, with a recovery disposition when a child's effect is
+  unknown
 - blocking input and output guardrails
 - fail-closed review of proposed tool calls before dispatch
 - pluggable session journals
@@ -18,6 +22,8 @@ primitives:
 - metadata-only lifecycle observation
 - validated logical agent references with optional immutable revisions
 - versioned, serializable invocation lifecycle events
+- durable, at-most-once invocation records that survive a restart and keep
+  unknown outcomes explicit
 
 ## Policy and context boundaries
 
@@ -90,9 +96,82 @@ invocation may use, and the grant is what the host vouches for. Resource
 names are proven as subsets at the boundary; the crate does not execute
 resources, so tools and the host enforce `AuthorityScope::resources` against
 the context they are given. Delegation here is local execution with
-correlation: it does not adopt, persist, retry, cancel, time out, or place the
-child anywhere. Legacy `Handoff` remains available as in-run control transfer
-during migration.
+correlation: it does not adopt, persist, retry, or place the child anywhere.
+A delegated child can be cancelled and bounded in time, as described under
+[delegated children](#delegated-children). Legacy `Handoff` remains available
+as in-run control transfer during migration.
+
+## Deadlines and cancellation
+
+`Runner::run_invocation_controlled` runs a request under `RunControls`: an
+optional `CancellationToken` and an optional timeout measured on the runner's
+`Clock` (`SystemClock` by default; `ManualClock` for deterministic tests;
+replace it with `Runner::with_clock`). Cancelling a token cancels its child
+tokens, never its parent. The default controls never stop a run, and the
+legacy entry points use them.
+
+The runner never preempts a future. It observes a stop at checkpoints: before
+each model turn, after each model response, and before each tool dispatch.
+Tools and models can watch the same `RunSignal` through
+`Tool::execute_with_signal` and `Model::generate_with_signal`. Both default
+to `execute` and `generate`, so existing implementations are unchanged. The
+signal reports `stop_reason()` (`cancelled` ahead of `deadline_exceeded`) and
+`remaining()` time.
+
+Outcomes are distinct and never retried:
+
+- **Cancellation requested.** One `CancellationRequested` event, in both
+  streams, the first time the runner observes the stop. It is always
+  followed immediately by the terminal failure below.
+- **Cancelled.** The stop was acknowledged with no tool in flight. A model
+  response that arrives after the stop is discarded and none of its actions
+  run. Tool calls that already returned keep their results in the partial
+  transcript. Cancellation does not mean nothing happened.
+- **Termination unknown.** A tool was in flight when the stop arrived and
+  then failed. Its effect may or may not have happened, so the run fails as
+  `TerminationUnknown` with the call id. A tool turns this into a clean
+  cancellation only by returning `NotStarted`. That mirrors Coven's rule
+  that `not_started` is asserted explicitly and never inferred from errors,
+  timeouts, cancellation or disconnection. `NotStarted` without a stop is an
+  ordinary tool failure.
+
+A tool that returns successfully during a stop is a known effect: its result
+is recorded and the run is acknowledged as cancelled at the next checkpoint.
+Once a final output passes policy, the run completes even if a stop arrives
+afterwards. These are in-memory outcomes of one local run. They are not
+persisted states, adoption decisions, or proof that an external process
+stopped.
+
+### Delegated children
+
+`Runner::run_delegation_controlled` runs a prepared delegation under controls
+derived from its parent, usually `RunSignal::child_controls()`. Cancelling the
+parent's token stops the child; cancelling the child never stops the parent.
+The child's deadline is the earlier of the parent's remaining time and the
+spec's own `DelegationBudget::with_timeout`. When the parent's budget has a
+timeout, `PreparedDelegation::prepare` refuses a child with none or a longer
+one (`DeadlineWidened`). A host that orchestrates delegation outside any run
+can start a `RunSignal::new` to derive child controls from.
+
+`Runner::with_child_limit(n)` lets at most `n` delegated children of one
+parent invocation run at once on that runner. A child beyond the limit is
+refused with `ChildLimitExceeded` before its target runs, as a `Limit`
+failure with the usual paired lifecycle events. A slot is released when the
+child finishes or its future is dropped. There is no limit by default.
+
+`DelegationFailure::disposition()` tells the parent what a failed child means:
+
+- **Failed.** The child failed or was refused, and nothing about its outcome
+  is ambiguous beyond its partial transcript.
+- **Cancelled.** The child acknowledged a stop with no tool in flight.
+- **Recovery required.** The child, or one of its descendants, left an effect
+  whose outcome is unknown (`TerminationUnknown` or `RecoveryRequired`).
+
+A tool that returns such a child failure fails its own run as
+`RecoveryRequired`, with the call id, whether or not a stop arrived. It
+counts even when wrapped in another error, as long as the wrapper reports
+its source. That outcome outranks a clean cancellation, and the work must be
+reconciled before any retry.
 
 ## Tool proposal review
 
@@ -142,6 +221,8 @@ individual event variants. `Runner::run_with_invocation` accepts an explicit
 context, including an optional parent invocation ID for caller-managed nested
 work. These IDs provide correlation only: they do not authorize execution or
 promise durable adoption, idempotency, deduplication, or safe retries.
+`DurableInvocationRunner` adds at-most-once execution per id (see
+[durable invocations](#durable-invocations)).
 
 `AgentRef` pairs a validated logical agent ID with an optional immutable
 `AgentRevision`. Agent IDs and revisions are non-empty, at most 127 bytes, and
@@ -152,16 +233,7 @@ exact revision or the run fails before model execution. The compatibility
 `Runner::run` and `Runner::run_with_invocation` entry points resolve the
 currently registered revision automatically.
 
-`InvocationObserver` receives a separate canonical metadata stream without
-changing the existing `RunObserver` event shapes. Every admitted request emits
-one versioned `started` event and one terminal `completed` or `failed` event.
-Legacy handoffs inside the same run are emitted as `control_transferred`, not as
-durable delegation. Every event carries the original requested target and
-source; failures separately identify `failed_at`, so a target-resolution
-failure is not mislabeled as execution by that target. The
-`coven.agent-invocation-event.v1` wire schema rejects unknown fields. Attempt
-and executor bindings remain absent until Coven has an executor contract that
-can supply them truthfully.
+`InvocationObserver` receives a separate canonical metadata stream without changing the existing `RunObserver` event shapes. Every admitted request emits one versioned `started` event and one terminal `completed` or `failed` event. Legacy handoffs inside the same run are emitted as `control_transferred`, not as durable delegation. A run that observes a stop emits one `cancellation_requested` event immediately before its terminal `failed`. Every event carries the original requested target and source; failures separately identify `failed_at`, so a target-resolution failure is not mislabeled as execution by that target. The `coven.agent-invocation-event.v1` wire schema rejects unknown fields. Events for prepared delegated children also carry `delegation` with the spec, authority and selected-context digests. The same digests accompany start, cancellation, control transfer and terminal events, including refusals before the target runs. They are correlation evidence, not portable authority or context payloads. Direct and legacy events omit the optional field; old events still decode. Older readers that reject unknown fields reject delegated events with this new metadata instead of silently losing it. Attempt and executor bindings remain absent until Coven has an executor contract that can supply them truthfully.
 
 This pre-1.0 API adds an `invocation` field to event and outcome shapes.
 `RunFailure::invocation` is boxed, and `RunFailure::new_items` is an owned boxed
@@ -217,15 +289,68 @@ executor termination. The host/reconciler must establish that the previous
 executor cannot act before supplying it; a nonempty evidence string alone does
 not establish distributed fencing.
 
+## Durable invocations
+
+`DurableInvocationRunner` runs an `InvocationRequest` against an
+`InvocationJournal`, so each invocation id executes at most once and its
+outcome survives a restart. `FileInvocationJournal` stores records with the
+same crash-safe checkpoints as `FileLoopJournal`. `InMemoryInvocationJournal`
+is for tests.
+
+The journal is separate from any `SessionStore`. An `InvocationRecord` holds
+the invocation's identity, source and target, a digest of the exact request,
+its state and the attempt that adopted it. Content appears only as digests;
+no prompt, transcript or output is stored.
+
+Every run takes the same steps:
+
+1. **Reserve.** The request and its digest are written as `reserved` before
+   anything runs. `invocation_request_digest` covers the identity, source,
+   target, input and run options.
+2. **Adopt.** One attempt, bound to the runner's process instance id, writes
+   `running` before the first model turn. Effects may happen from here on.
+3. **Run** under the caller's `RunControls`.
+4. **Settle** into exactly one state.
+
+The state names follow Psyche's attempt vocabulary:
+
+| State | Meaning | A duplicate submission |
+| --- | --- | --- |
+| `reserved` | Recorded and never adopted, so proven not adopted. | Dispatches it, once. |
+| `running` | Adopted by an attempt. | `ActiveInFlight` while that attempt runs in this process; otherwise `RecoveryRequired`. |
+| `completed` | The final output passed policy. Only its digest is kept. | Replayed from the journal. |
+| `rejected` | Failed before the first model turn, so nothing ran. | Replayed. |
+| `failed` | Failed with a known kind after execution began. | Replayed. |
+| `cancelled` | A stop was acknowledged with no tool in flight. | Replayed. |
+| `termination_unknown` | A stop arrived while a tool ran, and the tool did not prove it did nothing. | `RecoveryRequired`. |
+| `recovery_required` | A tool reported a descendant whose outcome is unknown. | `RecoveryRequired`. |
+
+The same invocation id with a different request, input or options is a
+`Conflict`, never a replay. Nothing is retried: to try again after a settled
+failure, use a new invocation id.
+
+Unknown stays unknown across a restart:
+
+- `adoption_unknown` is never written. If the adoption write fails, the
+  runner returns `AdoptionUnknown` and does not run. A later read finds the
+  record either still `reserved`, which is proven not adopted and safe to
+  dispatch, or `running`, which requires recovery.
+- A `running` record whose attempt is not executing in this process requires
+  recovery in every process. That covers a restart, a dropped run future and
+  a failed settlement write. `SettlementFailed` still hands the run's outcome
+  to the caller.
+- As with `GoalLoopRunner`, `process_instance_id` must change on every
+  process start.
+
+There is no reconciliation path yet. A record that requires recovery stays that way until Psyche's existing fencing contract has an authoritative consumer binding for these process-bound attempts (see [OpenCoven/psyche#19](https://github.com/OpenCoven/psyche/issues/19)). An opaque fence token alone does not prove that a prior attempt can no longer act.
+
+`DurableInvocationRunner::run_delegation` consumes a `PreparedDelegation` and records its child/parent identity and delegation, authority and context digests before context resolution or model execution. Its request digest includes the delegation contract, so direct submission cannot reuse the child identity to bypass attenuation. The ordinary delegation runner still enforces context, authority, result bounds and inherited cancellation/deadline controls. The child deadline includes time spent in journal I/O before dispatch. Journal errors with unresolved adoption or settlement propagate through tool error chains as parent `recovery_required` outcomes.
+
+Prepared delegations remain single-use. This API adds no retry, reconstruction of a consumed proof, parent scheduling or reconciliation. Hosts can discover children through `InvocationJournal::list` and each record's `parent_id`. Old records without delegation metadata continue to decode; delegated records carry only digests, never task text or resolved context.
+
 ## Supported checkpoint and deferred orchestration
 
-The existing `Runner` provides local control transfer, correlation, and
-bounded local delegation with selected context and attenuated authority.
-`GoalLoopRunner` journals iteration boundaries; it does not supply durable
-child invocation adoption or shared executor conformance. Wall-clock
-deadlines and cancellation, durable invocation adoption/recovery, remote
-executors, unified observability, and removal of legacy
-handoff/full-transcript behavior remain deferred under #804.
+The existing `Runner` provides local control transfer, correlation, and bounded local delegation with selected context and attenuated authority. `GoalLoopRunner` journals iteration boundaries; it does not supply durable child invocation adoption or shared executor conformance. `DurableInvocationRunner` records root and delegated child invocations durably. Several things remain deferred under #804: fenced reconciliation of an invocation whose outcome is unknown, remote executors, unified observability, and removal of legacy handoff/full-transcript behavior.
 
 Internally, `Runner` is a facade over a crate-private `AgentLoop`. The loop
 runs one agent's model and tool turns: input and output guardrails, the
@@ -253,6 +378,11 @@ wire shape, fail-closed attenuation (cross-project, tool, resource,
 re-delegation, budget, context leak), bounded child context without parent
 transcript inheritance, authority enforcement across control transfer, digest
 verification before model execution, and result-contract and budget limits.
+[`tests/lifecycle.rs`](tests/lifecycle.rs) covers cancellation before start,
+deadlines on an injected clock, stops during model calls and tool batches,
+termination-unknown versus `NotStarted`, signal observation by tools, the
+closed stop vocabulary, and unchanged legacy entry points. Interleavings are
+driven from inside scripted models and tools; nothing sleeps.
 [`tests/loop_runner.rs`](tests/loop_runner.rs) covers local checkpoint and
 reconciliation behavior. These are in-process tests with scripted models and
 tools, not real-daemon, provider-containment, packaged-client, or external A2A

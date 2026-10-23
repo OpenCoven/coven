@@ -440,8 +440,10 @@ def _read_stable_regular(path,limit):
 def capture_source_tree(source_root,expected_source):
     from pathlib import Path
     validate_source(expected_source)
-    root=Path(source_root);require(root.is_absolute())
-    root=root.resolve(strict=True);root_id=_identity(_plain_status(root,True))
+    selected=Path(source_root);require(selected.is_absolute())
+    selected_id=_identity(_plain_status(selected,True))
+    root=selected.resolve(strict=True);root_id=_identity(_plain_status(root,True))
+    require(root_id==selected_id)
     total=0;phase=None
     for item in expected_source['files']:
         current=root;parts=Path(SOURCE_PATHS[item['id']]).parts
@@ -449,7 +451,8 @@ def capture_source_tree(source_root,expected_source):
         data=_read_stable_regular(current/parts[-1],262144)
         total+=len(data);require(total<=2097152 and hashlib.sha256(data).hexdigest()==item['sha256'])
         if item['id']=='phase-validator':phase=data
-    require(_identity(_plain_status(root,True))==root_id and phase is not None)
+    require(_identity(_plain_status(selected,True))==selected_id and
+            _identity(_plain_status(root,True))==root_id and phase is not None)
     return phase
 
 

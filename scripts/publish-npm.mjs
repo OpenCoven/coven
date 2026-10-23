@@ -9,6 +9,9 @@ const repoRoot = path.resolve(__dirname, '..');
 const distRoot = path.join(repoRoot, 'npm', 'dist');
 const primaryWrapperPackageName = '@opencoven/cli';
 const wrapperPackageNames = [primaryWrapperPackageName];
+const RELEASE_SUPPORT_PATH = path.join(repoRoot, '.github', 'release-support.json');
+const PUBLISHABLE_STATE = 'supported';
+const BLOCKED_STATES = new Set(['support-disabled', 'security-blocked']);
 
 const targets = {
   macos: {
@@ -144,6 +147,29 @@ function main() {
 
   validatePublishVersion(version, dryRun);
   validatePublishToken(process.env, dryRun);
+  try {
+    const support = loadReleaseSupport();
+    // Dry-runs stage arbitrary versions (CI uses 999.0.0); only a registry
+    // write has to be on the supported line.
+    if (!dryRun) {
+      assertSupportedReleaseLine(support, version);
+    }
+    if (!wrapperOnly) {
+      assertPublishableSurface(support, target.packageName);
+    }
+    if (!skipWrapper) {
+      for (const packageName of wrapperPackageNames) {
+        assertPublishableSurface(support, packageName);
+      }
+      // The wrapper's optionalDependencies name these natives, so it is only
+      // publishable when every one of them is.
+      for (const targetName of nativeTargetNamesForPackageSet()) {
+        assertPublishableSurface(support, targets[targetName].packageName);
+      }
+    }
+  } catch (error) {
+    fail(error.message);
+  }
 
   prepareDistRoot();
 
@@ -193,7 +219,15 @@ export function prepareDistRoot(root = distRoot) {
 }
 
 function publishPackage(packageName, version, dryRun, cwd) {
-  if (!dryRun && packageVersionPublished(packageName, version)) {
+  let published = false;
+  if (!dryRun) {
+    try {
+      published = packageVersionPublished(packageName, version);
+    } catch (error) {
+      fail(error.message);
+    }
+  }
+  if (published) {
     fail(`${packageName}@${version} is already published to npm. Refusing to publish because this package version already exists on npm and could trust an unverified pre-existing artifact.`);
   }
   run('npm', publishArgs(dryRun), {
@@ -202,15 +236,24 @@ function publishPackage(packageName, version, dryRun, cwd) {
   });
 }
 
+/// Whether this exact version is already on the registry. Only two answers
+/// are trusted: npm printing the version back, and npm's E404. A network,
+/// auth, or registry error is neither, and throws rather than letting the
+/// publish proceed on a guess (#805).
 export function packageVersionPublished(packageName, version, runner = npmViewRunner) {
   const result = runner(packageName, version);
-  if (result.status === 0) {
+  const stdout = String(result.stdout ?? '').trim();
+  const stderr = String(result.stderr ?? '');
+  if (result.status === 0 && stdout === version) {
     return true;
   }
-  // npm view exits non-zero (commonly 1) with E404 when the version doesn't exist.
-  // Any other surface (network error, auth error) returns false so the caller still
-  // attempts the publish and surfaces the real error.
-  return false;
+  if (result.status !== 0 && /\bE404\b/.test(stderr)) {
+    return false;
+  }
+  throw new Error(
+    `Refusing to publish ${packageName}@${version}: npm view could not say whether it is already published ` +
+      `(exit ${result.status ?? 'unknown'}, stdout ${JSON.stringify(stdout.slice(0, 80))}, stderr ${JSON.stringify(stderr.trim().split('\n').slice(0, 2).join(' '))}).`
+  );
 }
 
 function npmViewRunner(packageName, version) {
@@ -218,7 +261,8 @@ function npmViewRunner(packageName, version) {
     ...spawnOptionsForCommand(),
     cwd: repoRoot,
     env: process.env,
-    stdio: ['ignore', 'ignore', 'ignore']
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe']
   });
 }
 
@@ -376,6 +420,62 @@ if ('NODE_TEST_CONTEXT' in process.env) {
   test('defaultTargetName maps win32 x64 to windows', () => {
     assert.strictEqual(defaultTargetName('win32', 'x64'), 'windows');
   });
+}
+
+/// Reads the reviewed support policy. Packaging metadata in this script lists
+/// what *can* be built; .github/release-support.json decides what may be
+/// published, so a blocked surface cannot come back through a package-set or
+/// template edit alone.
+export function loadReleaseSupport(filePath = RELEASE_SUPPORT_PATH) {
+  const support = JSON.parse(readFileSync(filePath, 'utf8'));
+  if (support?.schemaVersion !== 1 || support?.kind !== 'coven.release-support') {
+    throw new Error(`${path.basename(filePath)} must be coven.release-support schemaVersion 1.`);
+  }
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(String(support.supportedReleaseLine ?? ''))) {
+    throw new Error(`${path.basename(filePath)} supportedReleaseLine must be MAJOR.MINOR, got ${JSON.stringify(support.supportedReleaseLine)}.`);
+  }
+  for (const [packageName, entry] of Object.entries(support.packages ?? {})) {
+    if (entry?.state === PUBLISHABLE_STATE) {
+      continue;
+    }
+    if (!BLOCKED_STATES.has(entry?.state) || !entry?.reason || !/^https:\/\/github\.com\/OpenCoven\/[^/]+\/issues\/\d+$/.test(String(entry?.issue ?? ''))) {
+      throw new Error(
+        `${path.basename(filePath)} ${packageName} must be "supported", or "support-disabled"/"security-blocked" with a reason and an OpenCoven issue URL.`
+      );
+    }
+  }
+  return support;
+}
+
+export function assertPublishableSurface(support, packageName) {
+  const entry = support.packages?.[packageName];
+  if (!entry) {
+    throw new Error(`Refusing to publish ${packageName}: it is not listed in .github/release-support.json, so it has no support state.`);
+  }
+  if (entry.state !== PUBLISHABLE_STATE) {
+    throw new Error(`Refusing to publish ${packageName}: .github/release-support.json marks it ${entry.state} (${entry.reason}; ${entry.issue}).`);
+  }
+}
+
+/// A release must be on the supported line. Coven has no long-term support
+/// before 1.0, so a patch to an older minor line is refused, and opening a new
+/// line means updating the support policy and SECURITY.md first. The 0.0.0
+/// placeholder used by local dry-runs is exempt.
+export function assertSupportedReleaseLine(support, version) {
+  if (version === '0.0.0') {
+    return;
+  }
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version);
+  if (!match) {
+    throw new Error(`Refusing to publish version ${JSON.stringify(version)}: it is not a stable MAJOR.MINOR.PATCH version.`);
+  }
+  const line = `${match[1]}.${match[2]}`;
+  if (line !== support.supportedReleaseLine) {
+    throw new Error(
+      `Refusing to publish ${version}: .github/release-support.json supports the ${support.supportedReleaseLine}.x line, not ${line}.x. ` +
+        'Open a new line by updating the support policy and SECURITY.md through a reviewed pull request first.'
+    );
+  }
 }
 
 export function validatePublishVersion(version, dryRun) {

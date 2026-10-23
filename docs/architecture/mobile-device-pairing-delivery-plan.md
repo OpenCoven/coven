@@ -2,6 +2,8 @@
 
 Tracks #784–#788.
 
+The next #787 endpoint slice follows the [returning-device transport contract](mobile-device-reconnect-contract.md), approved by Val for implementation and validation on 2026-10-22. The concrete cryptographic profile and rendezvous behavior still require security-focused review before delivery. The merged relay-server checkpoint does not satisfy endpoint or reconnection acceptance.
+
 ## Delivery train
 
 ### PR 1 — Protocol foundation

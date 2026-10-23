@@ -12,6 +12,7 @@ pub(crate) enum View<'a> {
     Occurrence(&'a str),
     Run(&'a str),
     Attempts(&'a str),
+    Explain(&'a str),
 }
 
 impl View<'_> {
@@ -20,12 +21,14 @@ impl View<'_> {
             Self::Status => "coven.automations.scheduler.status.v1",
             Self::Occurrence(_) => "coven.automations.occurrence.get.v1",
             Self::Run(_) | Self::Attempts(_) => "coven.automations.run.get.v1",
+            Self::Explain(_) => super::explain::ACTION,
         }
     }
 
     fn request(self) -> Result<Value> {
         let mut request = json!({"action": self.action()});
-        if let Self::Occurrence(id) | Self::Run(id) | Self::Attempts(id) = self {
+        if let Self::Occurrence(id) | Self::Run(id) | Self::Attempts(id) | Self::Explain(id) = self
+        {
             if id.is_empty()
                 || id.len() > 512
                 || id.chars().any(char::is_control)
@@ -54,6 +57,9 @@ pub(crate) fn run(view: View<'_>, as_json: bool) -> Result<()> {
         .map_err(|_| anyhow!("automation inspection could not reach a compatible owner-local daemon; check `coven daemon status`"))?;
     // Never propagate daemon error text: it can include database paths or logs.
     if response.status != 200 {
+        if let Some(message) = known_refusal(view, response.status, &response.body) {
+            bail!(message);
+        }
         bail!(
             "automation inspection was refused by the daemon (HTTP {})",
             response.status
@@ -68,6 +74,23 @@ pub(crate) fn run(view: View<'_>, as_json: bool) -> Result<()> {
     // JSON escaping also prevents persisted ids from injecting terminal controls.
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+/// A typed refusal an operator can act on, recognized by status, code and
+/// action together. Its message is still never shown.
+fn known_refusal(view: View<'_>, status: u16, body: &[u8]) -> Option<&'static str> {
+    let View::Explain(_) = view else {
+        return None;
+    };
+    let body: Value = serde_json::from_slice(body).ok()?;
+    if body["action"] != view.action() {
+        return None;
+    }
+    match (status, body["error"]["code"].as_str()?) {
+        (404, "NOT_FOUND") => Some("automation routine was not found"),
+        (410, "GONE_TOMBSTONED") => Some("automation routine is tombstoned"),
+        _ => None,
+    }
 }
 
 fn project(view: View<'_>, response: &Value) -> Result<Value> {
@@ -113,6 +136,17 @@ fn project(view: View<'_>, response: &Value) -> Result<Value> {
             } else {
                 output["run"] = serde_json::to_value(run)?;
             }
+        }
+        View::Explain(id) => {
+            let explanation: Explanation =
+                serde_json::from_value(payload["explanation"].clone()).map_err(|_| invalid())?;
+            if explanation.automation_id != id
+                || explanation.conditions.is_empty()
+                || explanation.work.is_some() != explanation.work_truncated.is_some()
+            {
+                return Err(invalid());
+            }
+            output["explanation"] = serde_json::to_value(explanation)?;
         }
     }
     Ok(output)
@@ -214,6 +248,54 @@ struct Attempt {
     session_id: Option<String>,
     opened_at: String,
     settled_at: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Explanation {
+    automation_id: String,
+    revision: u64,
+    lifecycle_state: String,
+    observed_at: String,
+    conditions: Vec<Condition>,
+    // A daemon from before work was reported sends neither field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work: Option<Vec<WorkItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_truncated: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Condition {
+    code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<String>,
+    next_step: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkItem {
+    code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    occurrence_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deadline_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_expires_at: Option<String>,
+    holds_claims: bool,
+    next_step: String,
 }
 
 #[cfg(test)]
@@ -359,6 +441,243 @@ mod tests {
                 "automation inspection response is invalid",
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn explanation_projection_round_trips_a_real_store_and_rejects_forgeries() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let definition = crate::automations::definition::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1, "id": "daily", "name": "daily", "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
+            "overlap": "forbid", "timeoutMinutes": 30, "runtime": "coven-code",
+            "cwd": "/work/project", "prompt": "private sentinel"
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        // A retry waiting, and a lease running, until far beyond the real
+        // clock this test reads; a stale claim, a lease long expired, a
+        // failed attempt held for an operator retry, and a run whose session
+        // has finished.
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('o-retry', 'daily', '2026-10-21T09:00:00.000Z', 'planned', 1,
+                     '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at, timeout_at)
+             VALUES ('r-retry', 'daily', 'o-retry', 'coven-code', 'running',
+                     '2026-10-21T09:00:00.000Z', '2099-01-01T01:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 opened_at)
+             VALUES ('a-retry', 'r-retry', 'o-retry', 1, 'r-retry-key', 1, 'adopted',
+                     'initial', '2099-01-01T00:00:00.000Z', '2026-10-21T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 lease_expires_at, created_at, updated_at)
+             VALUES ('o-claimed', 'daily', '2026-10-20T09:00:00.000Z', 'manual', 'claimed', 1,
+                     'operator', '2099-01-01T02:00:00.000Z', '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 lease_expires_at, created_at, updated_at)
+             VALUES ('o-stale', 'daily', '2026-10-18T09:00:00.000Z', 'scheduled', 'claimed', 1,
+                     'daemon', NULL, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z'),
+                    ('o-lapsed', 'daily', '2026-10-19T09:00:00.000Z', 'manual', 'claimed', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z'),
+                    ('o-hold', 'daily', '2026-10-17T09:00:00.000Z', 'manual', 'claimed', 1,
+                     'operator', NULL, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at, timeout_at)
+             VALUES ('r-hold', 'daily', 'o-hold', 'coven-code', 'running',
+                     '2026-10-17T09:00:00.000Z', '2099-01-01T03:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 opened_at)
+             VALUES ('a-hold', 'r-hold', 'o-hold', 1, 'r-hold-key', 1, 'failed', 'initial',
+                     '2026-10-17T09:00:00.000Z', '2026-10-17T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 created_at, updated_at)
+             VALUES ('o-done', 'daily', '2026-10-16T09:00:00.000Z', 'manual', 'running', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, exit_code, created_at, updated_at)
+             VALUES ('s-done', '/work/project', 'codex', 'private sentinel', 'completed', 0,
+                     '2026-10-16T09:00:00.000Z', '2026-10-16T09:30:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+             VALUES ('r-done', 'daily', 'o-done', 's-done', 'coven-code', 'running',
+                     '2026-10-16T09:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-done', 'r-done', 'o-done', 1, 'r-done-key', 1, 'started', 'initial',
+                     '2026-10-16T09:00:00.000Z', 's-done', '2026-10-16T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 created_at, updated_at)
+             VALUES ('o-late', 'daily', '2026-10-15T09:00:00.000Z', 'manual', 'running', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, created_at, updated_at)
+             VALUES ('s-late', '/work/project', 'codex', 'private sentinel', 'running',
+                     '2026-10-15T09:00:00.000Z', '2026-10-15T09:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at,
+                 timeout_at)
+             VALUES ('r-late', 'daily', 'o-late', 's-late', 'coven-code', 'running',
+                     '2026-10-15T09:00:00.000Z', '2026-10-15T10:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-late', 'r-late', 'o-late', 1, 'r-late-key', 1, 'started', 'initial',
+                     '2026-10-15T09:00:00.000Z', 's-late', '2026-10-15T09:00:00.000Z');",
+        )
+        .unwrap();
+        // A held authority names the claims its next pass releases.
+        let _leadership = crate::automations::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let view = View::Explain("daily");
+        let (status, result) = crate::control_plane::route_action(
+            view.request().unwrap(),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(status, 200);
+        let response = serde_json::to_value(result).unwrap();
+        let output = project(view, &response).unwrap();
+        assert_eq!(output["schemaVersion"], "coven.automations.inspection.v1");
+        assert_eq!(output["explanation"]["lifecycleState"], "paused");
+        assert_eq!(
+            output["explanation"]["conditions"],
+            json!([{"code": "not_active", "nextStep": "activate_if_intended"}])
+        );
+        assert_eq!(
+            output["explanation"]["work"],
+            json!([{
+                "code": "timeout_expired", "occurrenceId": "o-late", "runId": "r-late",
+                "at": "2026-10-15T09:00:00.000Z", "deadlineAt": "2026-10-15T10:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
+                "code": "session_finished", "occurrenceId": "o-done", "runId": "r-done",
+                "at": "2026-10-16T09:00:00.000Z", "holdsClaims": true,
+                "nextStep": "await_settlement"
+            }, {
+                "code": "retry_held", "occurrenceId": "o-hold", "runId": "r-hold",
+                "at": "2026-10-17T09:00:00.000Z", "deadlineAt": "2099-01-01T03:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
+                "code": "claim_stale", "occurrenceId": "o-stale",
+                "at": "2026-10-18T09:00:00.000Z", "holdsClaims": true,
+                "nextStep": "await_scheduler_pass"
+            }, {
+                "code": "lease_expired", "occurrenceId": "o-lapsed",
+                "at": "2026-10-19T09:00:00.000Z", "leaseExpiresAt": "2026-10-01T00:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
+                "code": "in_flight", "occurrenceId": "o-claimed", "state": "claimed",
+                "at": "2026-10-20T09:00:00.000Z", "leaseExpiresAt": "2099-01-01T02:00:00.000Z",
+                "holdsClaims": true, "nextStep": "inspect_occurrence"
+            }, {
+                "code": "retry_waiting", "occurrenceId": "o-retry", "runId": "r-retry",
+                "at": "2026-10-21T09:00:00.000Z", "notBefore": "2099-01-01T00:00:00.000Z",
+                "deadlineAt": "2099-01-01T01:00:00.000Z", "holdsClaims": true,
+                "nextStep": "await_retry"
+            }])
+        );
+        assert_eq!(output["explanation"]["workTruncated"], false);
+        assert!(!output.to_string().contains("private sentinel"));
+        for (path, value) in [
+            ("/event/payload/explanation/automationId", json!("other")),
+            ("/event/payload/explanation/conditions", json!([])),
+            ("/event/payload/explanation/revision", json!(-1)),
+            ("/event/payload/explanation/conditions/0/code", json!(1)),
+            ("/event/payload/explanation/work", json!("private sentinel")),
+            ("/event/payload/explanation/workTruncated", json!("false")),
+            ("/event/payload/explanation", json!("private sentinel")),
+            ("/event/action", json!("coven.automations.run.get.v1")),
+        ] {
+            let mut invalid = response.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                project(view, &invalid).unwrap_err().to_string(),
+                "automation inspection response is invalid",
+                "{path}"
+            );
+        }
+        // An older daemon reports no work at all; half of it is a forgery.
+        let without = |fields: &[&str]| {
+            let mut response = response.clone();
+            let explanation = response
+                .pointer_mut("/event/payload/explanation")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            for field in fields {
+                explanation.remove(*field).unwrap();
+            }
+            project(view, &response)
+        };
+        let older = without(&["work", "workTruncated"]).unwrap();
+        assert_eq!(older["explanation"].get("work"), None);
+        assert_eq!(older["explanation"].get("workTruncated"), None);
+        for field in ["work", "workTruncated"] {
+            assert_eq!(
+                without(&[field]).unwrap_err().to_string(),
+                "automation inspection response is invalid",
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_typed_explain_refusals_get_their_own_message() {
+        let explain = View::Explain("daily");
+        let body = |action: &str, code: &str| {
+            serde_json::to_vec(&json!({
+                "action": action,
+                "error": {"code": code, "message": "private sentinel"}
+            }))
+            .unwrap()
+        };
+        let action = explain.action();
+        assert_eq!(
+            known_refusal(explain, 404, &body(action, "NOT_FOUND")),
+            Some("automation routine was not found")
+        );
+        assert_eq!(
+            known_refusal(explain, 410, &body(action, "GONE_TOMBSTONED")),
+            Some("automation routine is tombstoned")
+        );
+        for (view, status, refusal) in [
+            (
+                explain,
+                404,
+                body("coven.automations.run.get.v1", "NOT_FOUND"),
+            ),
+            (explain, 404, body(action, "GONE_TOMBSTONED")),
+            (explain, 410, body(action, "NOT_FOUND")),
+            (explain, 500, body(action, "INTERNAL")),
+            (explain, 404, b"private sentinel".to_vec()),
+            (
+                View::Run("daily"),
+                404,
+                body("coven.automations.run.get.v1", "NOT_FOUND"),
+            ),
+        ] {
+            assert_eq!(known_refusal(view, status, &refusal), None, "{status}");
         }
     }
 }

@@ -250,6 +250,59 @@ async fn file_journal_removes_crash_leftover_staging_files_before_writing() {
 }
 
 #[tokio::test]
+async fn file_journal_reads_and_extends_checkpoints_in_the_existing_format() {
+    let root = tempfile::tempdir().unwrap();
+    let checkpoint = LoopCheckpoint {
+        loop_id: "format-loop".to_owned(),
+        starting_agent: AgentId::from("worker"),
+        completed_iterations: 2,
+        status: LoopCheckpointStatus::Pending,
+        next_input: Some("continue".to_owned()),
+        active_attempt: None,
+        blocked_reason: None,
+    };
+    // The layout every earlier release wrote: a directory named by the hex
+    // bytes of the loop id, holding sequenced checkpoint files.
+    let loop_directory = root.path().join(hex("format-loop"));
+    std::fs::create_dir_all(&loop_directory).unwrap();
+    std::fs::write(
+        loop_directory.join("checkpoint-00000000000000000001.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "checkpoint": checkpoint,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let journal = FileLoopJournal::new(root.path()).unwrap();
+    assert_eq!(
+        journal.load("format-loop").await.unwrap(),
+        Some(checkpoint.clone())
+    );
+    let mut next = checkpoint.clone();
+    next.completed_iterations = 3;
+    assert!(journal
+        .compare_and_set("format-loop", Some(&checkpoint), &next)
+        .await
+        .unwrap());
+
+    let written: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(loop_directory.join("checkpoint-00000000000000000002.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(written["schema_version"], serde_json::json!(1));
+    assert_eq!(
+        serde_json::from_value::<LoopCheckpoint>(written["checkpoint"].clone()).unwrap(),
+        next
+    );
+}
+
+fn hex(value: &str) -> String {
+    value.bytes().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[tokio::test]
 async fn resumes_pending_work_after_file_journal_reopens() {
     let directory = tempfile::tempdir().unwrap();
     let journal = FileLoopJournal::new(directory.path()).unwrap();

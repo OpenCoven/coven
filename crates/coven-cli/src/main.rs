@@ -1008,6 +1008,119 @@ enum DeviceCommand {
         #[arg(value_name = "REPLACEMENT_DEVICE", value_parser = parse_nonempty_arg)]
         replacement_device: String,
     },
+    #[command(about = "Manage the offline owner-root credential")]
+    OwnerRoot {
+        #[command(subcommand)]
+        command: OwnerRootCommand,
+    },
+    #[command(about = "Show or change the protected trusted-device introduction policy")]
+    IntroductionPolicy {
+        #[command(subcommand)]
+        command: IntroductionPolicyCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OwnerRootCommand {
+    #[command(
+        about = "Generate an owner-root key outside COVEN_HOME",
+        long_about = "Generate an owner-root P-256 key and write it to a new file outside \
+                      COVEN_HOME. Coven stores only the public key, at policy install. Keep \
+                      the file offline: it is required to approve any introduction-policy \
+                      downgrade."
+    )]
+    Generate {
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IntroductionPolicyCommand {
+    #[command(about = "Show the installed introduction policy")]
+    Show {
+        #[arg(long, help = "Print the policy as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Install the first policy, registering the owner-root key")]
+    Install(IntroductionPolicyArgs),
+    #[command(about = "Replace the policy with an owner-root signature (may downgrade)")]
+    Replace(IntroductionPolicyArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct IntroductionPolicyArgs {
+    #[arg(
+        long,
+        value_name = "PEM",
+        help = "Owner-root private key file (outside COVEN_HOME)"
+    )]
+    root_key: PathBuf,
+    #[arg(
+        long = "introducer",
+        value_name = "DEVICE_ID",
+        required = true,
+        help = "Device allowed to introduce new devices; repeat for several"
+    )]
+    introducers: Vec<Uuid>,
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        required = true,
+        help = "Scopes an introduced grant may carry; repeat or comma-separate values"
+    )]
+    scope: Vec<DeviceScopeArg>,
+    #[arg(
+        long,
+        value_name = "DAYS",
+        value_parser = clap::value_parser!(u16).range(1..=365),
+        help = "Maximum lifetime of an introduced grant in whole days (1-365)"
+    )]
+    max_grant_days: u16,
+    #[arg(long, value_enum, help = "Fresh assurance the introducer must prove")]
+    assurance: IntroductionAssuranceArg,
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u32).range(1..=120),
+        help = "Maximum age of the introducer's step-up (1-120 seconds)"
+    )]
+    max_step_up_seconds: u32,
+    #[arg(long, help = "Skip the typed confirmation after the review is printed")]
+    yes: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum IntroductionAssuranceArg {
+    FreshUserVerification,
+    FreshBiometric,
+}
+
+impl IntroductionPolicyArgs {
+    fn into_change(self, kind: mobile_memory::policy_cli::PolicyChangeKind) -> Result<()> {
+        let mut introducers = self.introducers;
+        introducers.sort_unstable();
+        if introducers.windows(2).any(|window| window[0] == window[1]) {
+            bail!("introducers must be unique");
+        }
+        let policy = mobile_memory::introduction::IntroductionPolicy {
+            eligible_introducers: introducers,
+            required_approvals: 1,
+            allowed_scopes: canonical_device_scopes(self.scope)?,
+            maximum_grant_lifetime_seconds: u32::from(self.max_grant_days) * 86_400,
+            required_assurance: match self.assurance {
+                IntroductionAssuranceArg::FreshUserVerification => {
+                    mobile_memory::assurance::RequestedAssurance::FreshUserVerification
+                }
+                IntroductionAssuranceArg::FreshBiometric => {
+                    mobile_memory::assurance::RequestedAssurance::FreshBiometric
+                }
+            },
+            maximum_step_up_age_seconds: self.max_step_up_seconds,
+        };
+        mobile_memory::policy_cli::run_root_change(kind, &self.root_key, policy, self.yes)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1181,6 +1294,12 @@ enum AutomationsCommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Explain what decides whether one routine runs next")]
+    Explain {
+        automation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Inspect occurrence lease metadata through the owner-local daemon")]
     Leases {
         #[arg(long)]
@@ -1203,6 +1322,42 @@ enum AutomationsCommand {
 enum AutomationsConformanceCommand {
     #[command(hide = true, name = "command-crash-worker")]
     CommandCrashWorker,
+    #[command(hide = true, name = "result-delivery-crash-worker")]
+    ResultDeliveryCrashWorker,
+    #[command(hide = true, name = "run-settlement-crash-worker")]
+    RunSettlementCrashWorker,
+    #[command(hide = true, name = "run-launch-crash-worker")]
+    RunLaunchCrashWorker,
+    #[command(hide = true, name = "attempt-retry-crash-worker")]
+    AttemptRetryCrashWorker,
+    #[command(hide = true, name = "occurrence-recovery-crash-worker")]
+    OccurrenceRecoveryCrashWorker,
+    #[command(hide = true, name = "run-cancellation-crash-worker")]
+    RunCancellationCrashWorker,
+    #[command(hide = true, name = "flat-cancellation-crash-worker")]
+    FlatCancellationCrashWorker,
+    #[command(hide = true, name = "timeout-enforcement-crash-worker")]
+    TimeoutEnforcementCrashWorker,
+    #[command(hide = true, name = "held-settlement-crash-worker")]
+    HeldSettlementCrashWorker,
+    #[command(hide = true, name = "automatic-retry-crash-worker")]
+    AutomaticRetryCrashWorker,
+    #[command(hide = true, name = "retry-timeout-crash-worker")]
+    RetryTimeoutCrashWorker,
+    #[command(hide = true, name = "waiting-retry-cancellation-crash-worker")]
+    WaitingRetryCancellationCrashWorker,
+    #[command(hide = true, name = "run-now-crash-worker")]
+    RunNowCrashWorker,
+    #[command(hide = true, name = "run-now-envelope-crash-worker")]
+    RunNowEnvelopeCrashWorker,
+    #[command(hide = true, name = "tick-crash-worker")]
+    TickCrashWorker,
+    #[command(hide = true, name = "no-process-receipt-crash-worker")]
+    NoProcessReceiptCrashWorker,
+    #[command(hide = true, name = "event-feed-crash-worker")]
+    EventFeedCrashWorker,
+    #[command(hide = true, name = "cancellation-timeout-crash-worker")]
+    CancellationTimeoutCrashWorker,
     #[command(about = "Print the native conformance suites supported by this binary")]
     Capability,
     #[command(about = "Evaluate one conformance suite request from standard input")]
@@ -1619,9 +1774,11 @@ fn main() -> Result<()> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
             let coven_desc = env!("COVEN_VERSION_DESC");
-            let installed = engine::resolve()
-                .and_then(|r| engine::engine_version(&r.path).ok())
-                .map(|(a, b, c)| format!("{a}.{b}.{c}"));
+            let installed = engine::resolve().map(|r| {
+                engine::engine_version(&r.path)
+                    .map(|(a, b, c)| format!("{a}.{b}.{c}"))
+                    .unwrap_or_else(|_| "unknown".to_owned())
+            });
             let pinned = engine::pinned_version();
             println!("{}", version_line(coven_desc, installed.as_deref(), pinned));
             std::process::exit(0);
@@ -1665,6 +1822,7 @@ fn main() -> Result<()> {
                 | AutomationsCommand::Occurrence { .. }
                 | AutomationsCommand::Run { .. }
                 | AutomationsCommand::Attempts { .. }
+                | AutomationsCommand::Explain { .. }
         })
     ) || matches!(
         &cli.command,
@@ -1924,6 +2082,20 @@ fn run_cli(cli: Cli) -> Result<()> {
                 old_device,
                 replacement_device,
             } => mobile_memory::device::run_rotate(&old_device, &replacement_device),
+            DeviceCommand::OwnerRoot {
+                command: OwnerRootCommand::Generate { out },
+            } => mobile_memory::policy_cli::run_generate_owner_root(&out),
+            DeviceCommand::IntroductionPolicy { command } => match command {
+                IntroductionPolicyCommand::Show { json } => {
+                    mobile_memory::policy_cli::run_show(json)
+                }
+                IntroductionPolicyCommand::Install(args) => {
+                    args.into_change(mobile_memory::policy_cli::PolicyChangeKind::Install)
+                }
+                IntroductionPolicyCommand::Replace(args) => {
+                    args.into_change(mobile_memory::policy_cli::PolicyChangeKind::Replace)
+                }
+            },
         },
         Some(Command::Memory { command, json }) => match command {
             Some(MemoryCommand::Open) => memory_dashboard::run_open(),
@@ -2864,7 +3036,12 @@ fn doctor_repo_config_path(
     }
 }
 
+const ENGINE_VERSION_RECOVERY_HINT: &str =
+    "check COVEN_ENGINE_BIN and PATH, or repair the managed engine with: coven engine install";
+
 fn gather_doctor_report() -> Result<DoctorReport> {
+    // Leave headroom for rendering within Cave's six-second execution limit.
+    let probe_deadline = std::time::Instant::now() + engine::PROBE_TIMEOUT;
     let home = coven_home_dir()?;
     let project_root = std::env::current_dir()
         .ok()
@@ -2894,11 +3071,12 @@ fn gather_doctor_report() -> Result<DoctorReport> {
     let harnesses = harness::configured_harnesses()?;
     let (engine, engine_auth) = match engine::resolve() {
         Some(resolved) => {
-            let auth = engine_auth_summary(&resolved.path);
+            let version = engine::engine_version_until(&resolved.path, probe_deadline).ok();
+            let auth = engine_auth_summary(&resolved.path, probe_deadline);
             (
                 Some(DoctorEngineReport {
                     source_label: engine_source_label(&resolved.source).to_string(),
-                    version: engine::engine_version(&resolved.path).ok(),
+                    version,
                     other_on_path: engine_other_on_path(&resolved),
                     path: resolved.path,
                 }),
@@ -3110,7 +3288,10 @@ fn print_doctor_prose(report: &DoctorReport) {
                         );
                     }
                 }
-                None => println!("  [--] version: unknown (could not run the engine)"),
+                None => {
+                    println!("  [--] version: unknown (could not run the engine)");
+                    println!("       {ENGINE_VERSION_RECOVERY_HINT}");
+                }
             }
             println!("       pin: {}", engine::pinned_version());
         }
@@ -3447,7 +3628,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
                 None => DoctorCheck::warn(
                     "engine",
                     format!("{located}, version unknown (could not run the engine)"),
-                    None,
+                    Some(ENGINE_VERSION_RECOVERY_HINT.to_string()),
                 ),
                 Some(version) => {
                     let (a, b, c) = version;
@@ -4140,6 +4321,10 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
         AutomationsCommand::Occurrence { id, json } => run(View::Occurrence(&id), json),
         AutomationsCommand::Run { id, json } => run(View::Run(&id), json),
         AutomationsCommand::Attempts { run_id, json } => run(View::Attempts(&run_id), json),
+        AutomationsCommand::Explain {
+            automation_id,
+            json,
+        } => run(View::Explain(&automation_id), json),
         AutomationsCommand::Leases {
             automation_id,
             limit,
@@ -4152,6 +4337,132 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
                 let request = serde_json::from_str(&payload)
                     .map_err(|_| anyhow!("conformance request is invalid"))?;
                 automations::conformance_target::command_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::ResultDeliveryCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::result_delivery_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::RunSettlementCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::run_settlement_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::RunLaunchCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::run_launch_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::AttemptRetryCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::attempt_retry_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::OccurrenceRecoveryCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::occurrence_recovery_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::RunCancellationCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::run_cancellation_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::FlatCancellationCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::flat_cancellation_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::TimeoutEnforcementCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::timeout_enforcement_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::HeldSettlementCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::held_settlement_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::AutomaticRetryCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::automatic_retry_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::RetryTimeoutCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::retry_timeout_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::WaitingRetryCancellationCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::waiting_retry_cancellation_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::RunNowCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::run_now_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::RunNowEnvelopeCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::run_now_envelope_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::TickCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::tick_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::NoProcessReceiptCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::no_process_receipt_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::EventFeedCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::event_feed_crash_worker(&request)
+                    .map_err(|message| anyhow!(message))
+            }
+            AutomationsConformanceCommand::CancellationTimeoutCrashWorker => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                automations::conformance_target::cancellation_timeout_crash_worker(&request)
                     .map_err(|message| anyhow!(message))
             }
             AutomationsConformanceCommand::Capability => {
@@ -4448,105 +4759,15 @@ fn engine_source_label(source: &engine::EngineSource) -> &'static str {
     }
 }
 
-/// Query the engine's local auth state via `auth status --json`, bounded to ~5s
-/// so a hung engine never hangs `coven doctor`. Returns `Some(configured)` only
+/// Query the engine's local auth state via `auth status --json` within Doctor's
+/// shared deadline, so a hung engine cannot hold the report open. Returns `Some(configured)` only
 /// when the JSON value agrees with the engine contract's exit status (0 for
 /// configured, 1 for not configured). This is local configuration evidence,
 /// not proof that a provider turn succeeds.
-fn engine_auth_summary(binary: &Path) -> Option<bool> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc::{self, TryRecvError};
-    use std::time::{Duration, Instant};
-
-    const TIMEOUT: Duration = Duration::from_secs(5);
-    const CLEANUP_BUDGET: Duration = Duration::from_millis(500);
-    const OUTPUT_LIMIT: usize = 1024 * 1024;
-    let total_deadline = Instant::now() + TIMEOUT;
-    let probe_deadline = total_deadline - CLEANUP_BUDGET;
-
-    let mut command = Command::new(binary);
-    command
-        .args(["auth", "status", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let (mut child, mut process_tree) =
-        pty_runner::spawn_strict_child_process_tree(&mut command).ok()?;
-    let terminate_and_reap = |process_tree: &mut pty_runner::StrictChildProcessTree,
-                              child: &mut std::process::Child| {
-        process_tree.terminate(child);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => break,
-                Ok(None) => {}
-            }
-            let remaining = total_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10).min(remaining));
-        }
-    };
-
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_and_reap(&mut process_tree, &mut child);
-            return None;
-        }
-    };
-    let (sender, receiver) = mpsc::channel::<std::io::Result<Vec<u8>>>();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .take((OUTPUT_LIMIT + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = sender.send(result);
-    });
-
-    let mut status = None;
-    let mut output = None;
-    loop {
-        if output.is_none() {
-            match receiver.try_recv() {
-                Ok(Ok(bytes)) if bytes.len() <= OUTPUT_LIMIT => output = Some(bytes),
-                Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-                    terminate_and_reap(&mut process_tree, &mut child);
-                    return None;
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit_status)) => {
-                    status = Some(exit_status);
-                    // The direct engine has exited. Terminate anything it left
-                    // behind before waiting for pipe EOF; a descendant that
-                    // inherited stdout must not extend Doctor's deadline.
-                    terminate_and_reap(&mut process_tree, &mut child);
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    terminate_and_reap(&mut process_tree, &mut child);
-                    return None;
-                }
-            }
-        }
-
-        if let (Some(status), Some(bytes)) = (status.as_ref(), output.as_ref()) {
-            let stdout = std::str::from_utf8(bytes).ok()?;
-            return parse_engine_auth_summary(status.code(), stdout);
-        }
-
-        if Instant::now() >= probe_deadline {
-            terminate_and_reap(&mut process_tree, &mut child);
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+fn engine_auth_summary(binary: &Path, deadline: std::time::Instant) -> Option<bool> {
+    let (status, bytes) =
+        engine::probe_stdout(binary, &["auth", "status", "--json"], deadline, 1024 * 1024)?;
+    parse_engine_auth_summary(status.code(), std::str::from_utf8(&bytes).ok()?)
 }
 
 /// Parse only the engine's boolean auth summary and reject contradictory
@@ -9357,7 +9578,13 @@ mod tests {
         } else {
             "missing-coven-code"
         });
-        assert_eq!(engine_auth_summary(&missing), None);
+        assert_eq!(
+            engine_auth_summary(
+                &missing,
+                std::time::Instant::now() + std::time::Duration::from_secs(5)
+            ),
+            None
+        );
     }
 
     #[test]

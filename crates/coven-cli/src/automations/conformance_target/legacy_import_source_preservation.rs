@@ -12,6 +12,10 @@ use serde_json::{json, Value};
 
 const INVALID: &str = "conformance vector is invalid";
 const FAILED: &str = "conformance suite execution failed";
+/// A daemon request outran the client's fixed response deadline (#1360). It is
+/// a transport stall, not a conformance result, so it is never reported as
+/// [`FAILED`].
+const TIMED_OUT: &str = "conformance suite request exceeded the client response deadline";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -149,11 +153,26 @@ pub(super) fn evaluate(vector: &Value) -> Result<(bool, Value), &'static str> {
     let mut passed = true;
     let mut observations = Vec::new();
     for case in vectors.cases {
-        let (case_passed, observation) = case_matches(&case).map_err(|_| FAILED)?;
+        let (case_passed, observation) =
+            case_matches(&case).map_err(|error| execution_error(&error))?;
         passed &= case_passed;
         observations.push(observation);
     }
     Ok((passed, json!(observations)))
+}
+
+/// The static error for a case that could not run. Only the classification
+/// leaves the fixture; the underlying error text stays private.
+fn execution_error(error: &anyhow::Error) -> &'static str {
+    let timed_out = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<coven_client::ClientError>())
+        .any(coven_client::is_response_deadline_timeout);
+    if timed_out {
+        TIMED_OUT
+    } else {
+        FAILED
+    }
 }
 
 struct Daemon(Child);
@@ -460,6 +479,29 @@ mod tests {
             "distinct source paths must not collapse through lossy Unicode conversion"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_response_deadline_is_reported_apart_from_a_conformance_failure() {
+        let deadline = || {
+            anyhow::Error::from(coven_client::ClientError::InvalidHttpResponse(
+                coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE.to_owned(),
+            ))
+        };
+        assert_eq!(execution_error(&deadline()), TIMED_OUT);
+        assert_eq!(
+            execution_error(&deadline().context("dry-run import")),
+            TIMED_OUT,
+            "context added on the way up keeps the classification"
+        );
+        assert_eq!(
+            execution_error(&anyhow::anyhow!("fixture action failed")),
+            FAILED
+        );
+        let other_transport = anyhow::Error::from(coven_client::ClientError::InvalidHttpResponse(
+            "response status line was malformed".to_owned(),
+        ));
+        assert_eq!(execution_error(&other_transport), FAILED);
     }
 
     #[test]
