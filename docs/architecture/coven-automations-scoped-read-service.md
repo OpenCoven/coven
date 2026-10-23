@@ -9,12 +9,42 @@ source_adjacent_reason: "Defines the replacement runtime envelope and authority 
 
 # Automations scoped read service
 
-Status: **design for review, not implemented or certified**. On 2026-10-18,
-Val selected a **Coven-owned scoped Rust read service** as the boundary to
-prepare for review. This replaces the proposed reliance on unrestricted native
-read tools. It requires a reviewed revision of the existing no-MCP envelope
-contract. The selection does not satisfy the upstream Threads human-review,
-merged-dependency-pin, adapter, receipt or certification gates.
+Status: **design for review, partly implemented, not certified**. On
+2026-10-18, Val selected a **Coven-owned scoped Rust read service** as the
+boundary to prepare for review. This replaces the proposed reliance on
+unrestricted native read tools. It requires a reviewed revision of the existing
+no-MCP envelope contract. The selection does not satisfy the upstream Threads
+human-review, merged-dependency-pin, adapter, receipt or certification gates.
+
+## Implementation status
+
+The first increment, exact-file reads, is in
+`crates/coven-cli/src/automations/scoped_read/`. Its deterministic vectors are
+in `vectors.json` beside it. Nothing calls it yet. It covers:
+
+- the lexical rules for grant and request paths, and authorization before any
+  filesystem access;
+- the open walk on Unix;
+- protected resources, held by identity;
+- the recheck from the root after the open;
+- the per-file, per-attempt, call, depth and path-length limits.
+
+Still open: the service channel, harness admission, response commitment under
+the revocation fence, directory listing and search, the adapter and receipts,
+and Windows. The vectors are engineering evidence, not containment
+certification.
+
+The increment settles these points the design left open. Each is for review:
+
+| Question | Increment's answer |
+| --- | --- |
+| What a retained root means | The directory opened when the reader is built. A request is served only while the root's path still names that directory. A root renamed away or replaced refuses every read (`root_moved`). |
+| A granted filesystem scope the service cannot enforce as written | The whole grant is refused (`grant_unsupported`), not silently narrowed. This covers backslashes, repeated separators, `.` components, and anything the profile's breadth rule refuses. |
+| Spellings that platforms read differently | Refused in grants and requests on every platform: backslash, colon (drive or data stream), control characters, a trailing dot or space, and Windows device names. |
+| How protected resources match | By the identity of what each protected path names, so a case or Unicode alias still matches. A root that is, or is inside, a protected resource refuses the reader (`root_protected`). The daemon supplies the list; choosing it belongs to the service step. |
+| Mount crossings | Refused by device on Unix. On Linux the mount id is also compared, which catches a bind mount from the same filesystem. A kernel that cannot report the mount id refuses (`platform_unsupported`). |
+| Platforms without a reviewed walk | Every read is refused (`platform_unsupported`). Today that is Windows. |
+| What counts against the call limit | Every call, refused ones included. Paths are limited to 32 components and 4,096 bytes. |
 
 ## Problem and chosen boundary
 

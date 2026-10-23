@@ -61,6 +61,10 @@ pub mod runs;
 #[allow(dead_code)]
 pub mod runtime_terminal_evidence;
 pub mod schedule;
+// The scoped read service's exact-file reads (coven#857); nothing serves them
+// until the service channel and harness admission land.
+#[allow(dead_code)]
+pub(crate) mod scoped_read;
 pub mod store;
 pub mod stream_observation;
 // Wired into every session ending; it observes only Runtime Authority attempts,
