@@ -22,25 +22,33 @@ pub(crate) fn acquire_shared(coven_home: &Path) -> Result<StateLock> {
     crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let dir = Dir::open_ambient_dir(coven_home, ambient_authority())
         .with_context(|| format!("failed to open COVEN_HOME {}", coven_home.display()))?;
+    // Refuse before opening the lock when the marker is already visible. A
+    // refusal that briefly held the shared lock would leave it held by any
+    // child forked meanwhile (flock follows the inherited descriptor until
+    // exec), and the reset retry could then see the lock as contended (#1067).
+    refuse_interrupted_reset(&dir, coven_home)?;
     let path = coven_home.join(STATE_LOCK_FILE);
     let file = open_lock_file_in(&dir, STATE_LOCK_FILE, &path)?;
     file.lock_shared()
         .with_context(|| format!("failed to acquire shared state lock {}", path.display()))?;
+    // Authoritative check: a reset can begin between the first check and the lock.
+    refuse_interrupted_reset(&dir, coven_home)?;
+    Ok(StateLock { file })
+}
+
+fn refuse_interrupted_reset(dir: &Dir, coven_home: &Path) -> Result<()> {
     match dir.symlink_metadata(RESET_TRANSACTION_FILE) {
         Ok(_) => anyhow::bail!(
             "an interrupted reset transaction requires recovery; rerun the intended `coven reset ... --apply` command before using other Coven commands"
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to inspect reset transaction marker in {}",
-                    coven_home.display()
-                )
-            });
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect reset transaction marker in {}",
+                coven_home.display()
+            )
+        }),
     }
-    Ok(StateLock { file })
 }
 
 #[cfg(test)]
@@ -184,6 +192,39 @@ mod tests {
         drop(first);
         assert!(try_acquire_exclusive(home.path())?.is_none());
         drop(second);
+        assert!(try_acquire_exclusive(home.path())?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_reset_refuses_without_waiting_on_or_taking_the_state_lock() -> Result<()> {
+        // A refused command must not take the state lock even briefly. In a
+        // process that forks, a child created while that descriptor is open
+        // keeps sharing the flock until it execs, so a reset retry right after
+        // the refusal could find the lock contended (#1067).
+        let home = tempfile::tempdir()?;
+        let holder = try_acquire_exclusive(home.path())?.expect("uncontended exclusive lock");
+        std::fs::write(home.path().join(RESET_TRANSACTION_FILE), b"{}")?;
+        let path = home.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(
+                acquire_shared(&path)
+                    .map(drop)
+                    .map_err(|error| error.to_string()),
+            );
+        });
+        // Hang guard only: the refusal needs no lock, so it never waits on one.
+        let refusal = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("refusal waited on the state lock held by another command")
+            .expect_err("an interrupted reset must refuse normal commands");
+        assert!(
+            refusal.contains("interrupted reset transaction"),
+            "{refusal}"
+        );
+        drop(holder);
+        std::fs::remove_file(home.path().join(RESET_TRANSACTION_FILE))?;
         assert!(try_acquire_exclusive(home.path())?.is_some());
         Ok(())
     }
