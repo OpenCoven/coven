@@ -25,7 +25,7 @@ use super::runner::MAX_ATTEMPT_NUMBER;
 
 pub const RETRY_ACTION: &str = "coven.automations.attempt.retry.v1";
 const COMMAND: &str = "attempt.retry.v1";
-const NOTE_MAX_CHARS: usize = 500;
+pub(crate) const NOTE_MAX_CHARS: usize = 500;
 
 /// The answer to one retry command.
 #[derive(Debug, Clone, PartialEq)]
