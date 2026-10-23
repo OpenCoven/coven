@@ -465,26 +465,42 @@ fn iso(now: DateTime<Utc>) -> String {
 
 #[cfg(test)]
 pub(crate) fn assert_operator_retry_transition(before: &str, after: &str) {
+    assert_protocol_transition(
+        "occurrence.v1",
+        before,
+        after,
+        "operator_retry",
+        "command_handler",
+    );
+}
+
+/// Fails unless `state-machines.json` lists the observed transition.
+#[cfg(test)]
+pub(crate) fn assert_protocol_transition(
+    machine: &str,
+    before: &str,
+    after: &str,
+    on: &str,
+    actor: &str,
+) {
     let machines: Value = serde_json::from_str(include_str!(
         "../../../../spec/coven-automations/v1/state-machines.json"
     ))
     .unwrap();
-    let occurrence = machines["machines"]
+    let transitions = machines["machines"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|machine| machine["id"] == "occurrence.v1")
+        .find(|candidate| candidate["id"] == machine)
+        .unwrap()["transitions"]
+        .as_array()
         .unwrap();
     assert!(
-        occurrence["transitions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|edge| edge["from"] == before
-                && edge["to"] == after
-                && edge["on"] == "operator_retry"
-                && edge["actor"] == "command_handler"),
-        "observed operator retry {before} -> {after} is absent from the protocol artifact"
+        transitions.iter().any(|edge| edge["from"] == before
+            && edge["to"] == after
+            && edge["on"] == on
+            && edge["actor"] == actor),
+        "observed {machine} {on} {before} -> {after} by {actor} is absent from the protocol artifact"
     );
 }
 

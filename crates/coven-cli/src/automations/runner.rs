@@ -4121,6 +4121,9 @@ pub(crate) fn settle_finished_runs_with(
             && !ambiguous
             && deadline.is_some_and(|deadline| deadline > now)
             && attempt_number.is_some_and(|number| number < MAX_ATTEMPT_NUMBER);
+        // An ambiguous attempt whose session ended takes the scheduler's
+        // `terminal_evidence_after_ambiguous_stop` exit: the run and the
+        // occurrence settle failed and no work opens (#1461).
         let reason = if ambiguous {
             Some("terminal session evidence observed after an ambiguous stop outcome".to_string())
         } else if succeeded {
@@ -9860,6 +9863,20 @@ mod tests {
                 read_states(),
                 ("failed".into(), "failed".into(), "ambiguous".into())
             );
+            for machine in ["occurrence.v1", "run.v1"] {
+                let before = if machine == "run.v1" {
+                    "running"
+                } else {
+                    "recovery_required"
+                };
+                crate::automations::attempt_retry::assert_protocol_transition(
+                    machine,
+                    before,
+                    "failed",
+                    "terminal_evidence_after_ambiguous_stop",
+                    "scheduler",
+                );
+            }
             assert_eq!(fences(), 0, "{owner}: settlement releases the fence");
         }
     }

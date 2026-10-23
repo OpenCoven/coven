@@ -1157,9 +1157,10 @@ the enforcement got:
   fence as a stop whose outcome is unknown: the attempt settles `ambiguous` and
   the occurrence `recovery_required`, and the fence stays. The next pass
   settles the run and occurrence `failed` on the ended session and releases
-  the fence. That exit from `recovery_required` is the one #1461 asks about,
-  and #1489 asks whether an expired `timeout` fence should settle by the
-  deadline instead.
+  the fence. That exit from `recovery_required` is the scheduler's
+  `terminal_evidence_after_ambiguous_stop` transition, ratified by #1461.
+  #1489 asks whether an expired `timeout` fence should settle by the deadline
+  instead.
 - **The settlement committed,** and the control: the restart changes no row,
   and every pass leaves the run timed out.
 
@@ -1930,8 +1931,9 @@ passes and the requests make.
   leaves the fence alone. The pass after the lease settles the attempt
   `ambiguous` and the occurrence `recovery_required`, and the second pass
   settles the run and occurrence `failed` and releases the fence. That exit is
-  the one #1461 asks about, and #1489 asks whether an expired `timeout` fence
-  should settle by the deadline instead.
+  the scheduler's `terminal_evidence_after_ambiguous_stop` transition (#1461),
+  and #1489 asks whether an expired `timeout` fence should settle by the
+  deadline instead.
 - **The timeout settled:** the run stays timed out, and every request is
   refused.
 

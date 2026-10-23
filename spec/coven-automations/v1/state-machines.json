@@ -53,6 +53,7 @@
         { "from": "running", "to": "recovery_required", "on": "evidence_lost", "actor": "scheduler", "guard": "runtime lost mid-run: outcome cannot be determined automatically" },
         { "from": "recovering", "to": "failed", "on": "recovery_determined", "actor": "scheduler", "guard": "no side effects were possible (sideEffectClass bounds proven)" },
         { "from": "recovering", "to": "recovery_required", "on": "recovery_ambiguous", "actor": "scheduler", "guard": "side effects cannot be ruled out; requires explicit operator recovery" },
+        { "from": "recovery_required", "to": "failed", "on": "terminal_evidence_after_ambiguous_stop", "actor": "scheduler", "guard": "the latest attempt settled ambiguous after an unconfirmed stop, no run cancellation for it is still requested or stopping, and its runtime session has durable terminal evidence; settles failed without opening work, so the ambiguous attempt is never retried" },
         { "from": "recovery_required", "to": "failed", "on": "operator_recovery_failed", "actor": "command_handler", "guard": "occurrence.recover.v1 with evidenceDetermination=failed_deterministic" },
         { "from": "recovery_required", "to": "dispatching", "on": "operator_recovery_attempt", "actor": "command_handler", "guard": "occurrence.recover.v1 with evidenceDetermination=retry_with_new_attempt; opens a new attempt carrying priorDisposition=ambiguous" }
       ]
@@ -113,6 +114,7 @@
         { "from": "running", "to": "failed", "on": "attempt_settled", "actor": "dispatcher", "guard": "an attempt settled failed, retry policy opens no further attempt, and no operator hold window remains; held ordinary runs retain running until cancellation or their original deadline" },
         { "from": "running", "to": "timed_out", "on": "timeout", "actor": "scheduler" },
         { "from": "running", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler" },
+        { "from": "running", "to": "failed", "on": "terminal_evidence_after_ambiguous_stop", "actor": "scheduler", "guard": "the current attempt settled ambiguous after an unconfirmed stop and its runtime session has durable terminal evidence; the ambiguous attempt stays immutable and no further attempt opens" },
         { "from": "running", "to": "ambiguous", "on": "attempt_ambiguous", "actor": "dispatcher", "guard": "the current attempt settled ambiguous and no operator recovery has resolved it" }
       ]
     },

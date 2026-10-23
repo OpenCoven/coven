@@ -212,13 +212,15 @@ planned -> eligible -> claimed -> dispatching -> running
 
 planned/eligible -> skipped | superseded | cancelled
 claimed/dispatching with expired evidence -> recovering -> failed | recovery_required
-recovery_required -> failed | dispatching (explicit operator recovery only)
+recovery_required -> failed | dispatching (explicit operator recovery)
+recovery_required -> failed (scheduler: terminal session evidence after an ambiguous stop)
 ```
 
 Terminal: `succeeded, failed, cancelled, timed_out, skipped, superseded`. Non-obvious ratifications:
 
 - `dispatching -> failed` exists for deterministic pre-side-effect launch refusals (`launch_refused`); without it, every refused launch would be ambiguous, which is wrong — the #816 runner already treats a launch error as a recorded failure with a reason (`runner.rs`).
-- `recovering` is automatic reconciliation in progress; `recovery_required` needs an explicit operator command. `recovery_required` is deliberately **not terminal**: its only exits are `failed` (operator determines no side effects were possible) or `dispatching` (operator-approved recovery attempt, which creates a new attempt carrying `priorDisposition: ambiguous`).
+- `recovering` is automatic reconciliation in progress; `recovery_required` needs an explicit operator command to open work. `recovery_required` is deliberately **not terminal**. Its operator exits are `failed` (operator determines no side effects were possible) or `dispatching` (operator-approved recovery attempt, which creates a new attempt carrying `priorDisposition: ambiguous`).
+- The scheduler has one exit of its own, `terminal_evidence_after_ambiguous_stop` (ratified for #1461). A stop whose outcome was lost leaves the latest attempt `ambiguous` and the occurrence `recovery_required`. Once that attempt's session has durable terminal evidence, nothing is still running for an operator to contain. The scheduler then settles the run and the occurrence `failed`, releases the stop fence, and opens no work. It waits while a run cancellation for the attempt is still `requested` or `stopping`, so that command can adopt its result. Settling `failed` never retries the ambiguous attempt, so `ambiguous-never-auto-retried` holds. Without this exit, every lost-stop crash window would wait for the owner.
 - `skipped` vs `superseded`: skipped means policy disposed of the slot (overlap forbid, paused, invalid); superseded means a newer definition revision replaced this one before it was claimed.
 
 ### Attempt
