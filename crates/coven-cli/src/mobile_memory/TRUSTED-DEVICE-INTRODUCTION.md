@@ -120,6 +120,16 @@ It hides a request from an approver who has already approved, and reports
 `approvalsReceived`/`approvalsRequired`. It commits on the N-th approval;
 that commit is the request's single, terminal attempt.
 
+**Stale earlier approvals.** When the N-th approval arrives, the ledger first
+drops any collected approval whose step-up is already older than the maximum
+age. Nothing is verified or consumed. The request stays `awaiting_approval`, and
+its status lists those approvers in `stepUpExpired`. The request reappears in
+their pending list, and each must approve again with a fresh step-up before the
+request expires. Recovery only removes approvals: N, required assurance and every
+commit-time check are unchanged, and a step-up time that only claims to be fresh
+is still verified at commit. If the request expires first, the owner admits a
+new request.
+
 Under N > 1, an eligible introducer can still *tighten* the owner policy
 alone. The strictness check never lets that lower N, and loosening requires
 the owner-root key. Fixture:
@@ -201,7 +211,11 @@ registry and is outside this store's threat model. The store defends against
 caller-selected policy, relay or account services, and approval by a device.
 
 Lock order is policy store → device registry → authorization-key registry →
-assurance challenge store. Introduction reads the head without the policy lock.
+assurance challenge store. An introduction commit checks the head and writes the
+enrollment under one policy lock, in that order. A replacement therefore lands
+either before the commit, which then refuses the request, or after it, never in
+between. Challenge issuance and admission read the head without the lock;
+commit is the authoritative check.
 Audit uses `introduction_policy_installed`, `_replaced`, `_rejected` and
 `_uncertain` with opaque transition IDs only. Success returns after audit
 delivery. A committed-but-unaudited head is retried by `reconcile_audit`, which

@@ -143,9 +143,21 @@ impl Fixture {
         index: usize,
         step_up_key: &SigningKey,
     ) -> IntroductionApproval {
+        self.approval_at(authority, request, index, step_up_key, self.now)
+    }
+
+    /// An approval whose challenge and step-up are issued at `at`.
+    fn approval_at(
+        &self,
+        authority: &IntroductionAuthority,
+        request: &ThresholdIntroductionRequest,
+        index: usize,
+        step_up_key: &SigningKey,
+        at: DateTime<Utc>,
+    ) -> IntroductionApproval {
         let approver = &self.approvers[index];
         let challenge = authority
-            .issue_threshold_challenge(request, approver.id, self.now)
+            .issue_threshold_challenge(request, approver.id, at)
             .unwrap();
         let key = authority
             .registry
@@ -156,8 +168,9 @@ impl Fixture {
         let mut step_up = PresentedAssuranceProof {
             context_mode: AssuranceContextMode::Action,
             challenge: challenge.challenge,
-            issued_at: self.now,
-            expires_at: challenge.expires_at,
+            issued_at: at,
+            // Bounded by both the challenge and the approved action.
+            expires_at: challenge.expires_at.min(request.expires_at),
             requested_assurance: RequestedAssurance::FreshBiometric,
             signature: String::new(),
         };
@@ -436,7 +449,7 @@ mod ledger {
         IntroductionEnvelope, IntroductionLedger, IntroductionState, MobileIntroductionApproval,
         MobileStepUpProof,
     };
-    use crate::mobile_memory::owner_policy::{OwnerPolicyStore, PolicyProposal};
+    use crate::mobile_memory::owner_policy::{OwnerPolicyStore, PolicyApproval, PolicyProposal};
 
     fn mobile(approval: IntroductionApproval) -> MobileIntroductionApproval {
         MobileIntroductionApproval {
@@ -577,6 +590,167 @@ mod ledger {
             ledger.status(admitted.id, fixture.now).unwrap().state,
             IntroductionState::Rejected
         );
+        assert!(!fixture.enrolled());
+    }
+
+    fn approval_at(
+        fixture: &Fixture,
+        envelope: &IntroductionEnvelope,
+        index: usize,
+        at: DateTime<Utc>,
+    ) -> MobileIntroductionApproval {
+        let IntroductionTranscript::Threshold(request) = &envelope.request else {
+            unreachable!()
+        };
+        let authority =
+            IntroductionAuthority::load_installed(fixture.home.path(), AUDIENCE).unwrap();
+        mobile(fixture.approval_at(
+            &authority,
+            request,
+            index,
+            &fixture.approvers[index].step_up,
+            at,
+        ))
+    }
+
+    /// Owner-root replacement raising N from 2 to 3.
+    fn require_three(fixture: &Fixture) {
+        let store = OwnerPolicyStore::open(fixture.home.path(), AUDIENCE).unwrap();
+        let head = store.current().unwrap().unwrap();
+        let root = SigningKey::from_slice(&[90; 32]).unwrap();
+        let mut tighter = fixture.policy.clone();
+        tighter.required_approvals = 3;
+        let proposal = PolicyProposal {
+            revision: 2,
+            previous_digest: Some(head.digest),
+            policy: tighter,
+            nonce: [5; 32],
+            issued_at: fixture.now,
+            expires_at: fixture.now + chrono::Duration::seconds(60),
+        };
+        let action = store.replace_action(&proposal).unwrap();
+        store
+            .replace(
+                &proposal,
+                &PolicyApproval::OwnerRoot {
+                    signature: sign(&root, &action.canonical_bytes().unwrap()),
+                },
+                fixture.now,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_stale_earlier_approval_is_dropped_and_recovers_with_a_fresh_step_up() {
+        let fixture = Fixture::new(2);
+        let (ledger, envelope) = installed(&fixture);
+        let ids: Vec<_> = fixture.approvers.iter().map(|a| a.id).collect();
+        let admitted = ledger.admit(envelope.clone(), fixture.now).unwrap();
+        ledger
+            .approve(
+                admitted.id,
+                ids[0],
+                approval(&fixture, &envelope, 0),
+                fixture.now,
+            )
+            .unwrap();
+
+        // The final approval arrives after the first step-up aged out (60 s).
+        let late = fixture.now + chrono::Duration::seconds(70);
+        let status = ledger
+            .approve(
+                admitted.id,
+                ids[1],
+                approval_at(&fixture, &envelope, 1, late),
+                late,
+            )
+            .unwrap();
+        assert_eq!(status.state, IntroductionState::AwaitingApproval);
+        assert_eq!(
+            (status.approvals_received, status.approvals_required),
+            (1, 2)
+        );
+        assert_eq!(status.step_up_expired, [ids[0]]);
+        assert!(!fixture.enrolled());
+        // Only the expired approver is asked again; N is unchanged.
+        assert_eq!(ledger.pending_for(ids[0], late).unwrap().len(), 1);
+        assert!(ledger.pending_for(ids[1], late).unwrap().is_empty());
+
+        let fresh = late + chrono::Duration::seconds(10);
+        let done = ledger
+            .approve(
+                admitted.id,
+                ids[0],
+                approval_at(&fixture, &envelope, 0, fresh),
+                fresh,
+            )
+            .unwrap();
+        assert_eq!(done.state, IntroductionState::Introduced);
+        assert!(done.step_up_expired.is_empty());
+        assert!(fixture.enrolled());
+    }
+
+    #[test]
+    fn the_policy_lock_is_held_from_head_check_through_the_registry_write() {
+        let fixture = Fixture::new(2);
+        let (ledger, envelope) = installed(&fixture);
+        let ids: Vec<_> = fixture.approvers.iter().map(|a| a.id).collect();
+        let admitted = ledger.admit(envelope.clone(), fixture.now).unwrap();
+        ledger
+            .approve(
+                admitted.id,
+                ids[0],
+                approval(&fixture, &envelope, 0),
+                fixture.now,
+            )
+            .unwrap();
+        let store = OwnerPolicyStore::open(fixture.home.path(), AUDIENCE).unwrap();
+        assert!(!store.is_locked().unwrap());
+
+        // Every check has passed and nothing is written yet: a replacement
+        // here would retire the request, so it must not be able to land.
+        let home = fixture.home.path().to_owned();
+        let observed = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = observed.clone();
+        BEFORE_INTRODUCTION_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let store = OwnerPolicyStore::open(&home, AUDIENCE).unwrap();
+                seen.set(Some(store.is_locked().unwrap()));
+            }));
+        });
+        let done = ledger
+            .approve(
+                admitted.id,
+                ids[1],
+                approval(&fixture, &envelope, 1),
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(done.state, IntroductionState::Introduced);
+        assert_eq!(observed.get(), Some(true));
+        assert!(!store.is_locked().unwrap());
+    }
+
+    #[test]
+    fn a_tightened_policy_retires_a_fully_approved_introduction() {
+        let fixture = Fixture::new(2);
+        let _ = installed(&fixture);
+        let request = fixture.request(&[0, 1]);
+        // Authority and both approvals are bound to the N = 2 head.
+        let authority =
+            IntroductionAuthority::load_installed(fixture.home.path(), AUDIENCE).unwrap();
+        let a = fixture.genuine(&authority, &request, 0);
+        let b = fixture.genuine(&authority, &request, 1);
+        require_three(&fixture);
+        let error = authority
+            .introduce_threshold(
+                &request,
+                &fixture.destination_signature(&request),
+                &[(fixture.approvers[0].id, &a), (fixture.approvers[1].id, &b)],
+                fixture.now,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("owner policy was replaced"));
         assert!(!fixture.enrolled());
     }
 }

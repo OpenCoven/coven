@@ -28,6 +28,13 @@ pub(super) const MAX_INTRODUCTIONS: usize = 128;
 /// and step-up verification inside one commit.
 pub(super) const MAX_INTRODUCTION_APPROVERS: usize = 16;
 
+#[cfg(test)]
+thread_local! {
+    /// Runs inside the commit after every check passes, before the registry write.
+    pub(super) static BEFORE_INTRODUCTION_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug)]
 pub(super) struct IntroductionCommitUncertain;
 
@@ -432,6 +439,10 @@ impl IntroductionAuthority {
         self.policy.digest()
     }
 
+    pub(super) fn maximum_step_up_age(&self) -> chrono::Duration {
+        chrono::Duration::seconds(i64::from(self.policy.maximum_step_up_age_seconds))
+    }
+
     /// Admission check before approvers are asked: the request is current under
     /// trusted policy for every named approver and the destination proved
     /// possession. Consumes nothing; commit re-runs every check.
@@ -662,29 +673,46 @@ impl IntroductionAuthority {
         let nonce_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(terms.nonce));
         let mut possession = action.clone();
         possession.operation = "devices.introduction.accept".into();
-        self.registry.commit_introduction(
-            &approver_ids,
-            record,
-            terms.grant.clone(),
-            nonce_digest,
-            now,
-            |sources| {
-                self.validate_request(terms, now)?;
-                verify_assurance_signature(
-                    terms.destination_public_key,
-                    &possession.canonical_bytes()?,
-                    destination_signature,
-                )?;
-                for ((source, key), approver) in sources.iter().zip(&terms.approvers) {
-                    let (_, approval) = approvals
-                        .iter()
-                        .find(|(id, _)| *id == approver.device_id)
-                        .context("introduction approval is missing")?;
-                    self.verify_approval(terms, action, approver, source, key, approval, now)?;
+        let commit = || {
+            self.registry.commit_introduction(
+                &approver_ids,
+                record,
+                terms.grant.clone(),
+                nonce_digest,
+                now,
+                |sources| {
+                    self.validate_request(terms, now)?;
+                    verify_assurance_signature(
+                        terms.destination_public_key,
+                        &possession.canonical_bytes()?,
+                        destination_signature,
+                    )?;
+                    for ((source, key), approver) in sources.iter().zip(&terms.approvers) {
+                        let (_, approval) = approvals
+                            .iter()
+                            .find(|(id, _)| *id == approver.device_id)
+                            .context("introduction approval is missing")?;
+                        self.verify_approval(terms, action, approver, source, key, approval, now)?;
+                    }
+                    #[cfg(test)]
+                    BEFORE_INTRODUCTION_WRITE
+                        .with(|hook| hook.borrow_mut().take().map(|hook| hook()));
+                    Ok(())
+                },
+            )
+        };
+        match &self.installed {
+            // Policy → registry: the head is checked and the enrollment written
+            // under one policy lock, so a replacement retires this request
+            // atomically rather than racing its commit.
+            Some((store, digest)) => store.with_current_locked(|head| {
+                if head.map(|head| &head.digest) != Some(digest) {
+                    bail!("introduction owner policy was replaced");
                 }
-                Ok(())
-            },
-        )
+                commit()
+            }),
+            None => commit(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // each input is a distinct bound value
@@ -705,8 +733,7 @@ impl IntroductionAuthority {
             &approval.possession_signature,
         )?;
         if approval.step_up.issued_at < terms.issued_at
-            || now - approval.step_up.issued_at
-                > chrono::Duration::seconds(i64::from(self.policy.maximum_step_up_age_seconds))
+            || now - approval.step_up.issued_at > self.maximum_step_up_age()
         {
             bail!("introduction step-up is not fresh");
         }

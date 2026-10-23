@@ -62,6 +62,11 @@ pub struct IntroductionStatus {
     pub device_id: Option<Uuid>,
     pub approvals_received: usize,
     pub approvals_required: usize,
+    /// Approvers whose step-up aged out before the N-th approval. Their
+    /// approvals were dropped unconsumed; each must approve again with a
+    /// fresh step-up on the same request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub step_up_expired: Vec<Uuid>,
 }
 
 /// Everything the introducer must render before it signs: the complete request
@@ -117,6 +122,7 @@ struct TrackedIntroduction {
     /// Collected but unverified; every approval is verified and consumed only
     /// inside the single commit that runs once all named approvers have signed.
     approvals: Vec<(Uuid, MobileIntroductionApproval)>,
+    step_up_expired: Vec<Uuid>,
 }
 
 impl TrackedIntroduction {
@@ -128,6 +134,7 @@ impl TrackedIntroduction {
             device_id: self.device_id,
             approvals_received: self.approvals.len(),
             approvals_required: self.envelope.request.approvers().len(),
+            step_up_expired: self.step_up_expired.clone(),
         }
     }
 }
@@ -198,6 +205,7 @@ impl IntroductionLedger {
             state: IntroductionState::AwaitingApproval,
             device_id: None,
             approvals: Vec::new(),
+            step_up_expired: Vec::new(),
         };
         let status = entry.status(id);
         entries.insert(id, entry);
@@ -253,6 +261,12 @@ impl IntroductionLedger {
     /// Records one named approver's approval; the N-th triggers the single
     /// commit. That commit is the one attempt per request: any failure is
     /// terminal, so a bad or replayed approval can never be retried into success.
+    ///
+    /// Before that commit, approvals whose step-up is already older than the
+    /// policy's maximum age are dropped unconsumed and reported in
+    /// `step_up_expired`, and the request keeps awaiting approval. This only
+    /// ever removes approvals: N, assurance and every commit-time check stay
+    /// as they are, and a claimed step-up time is verified at commit.
     pub(super) fn approve(
         &self,
         id: Uuid,
@@ -273,8 +287,25 @@ impl IntroductionLedger {
             bail!("this approver has already approved");
         }
         entry.approvals.push((introducer, approval));
+        entry.step_up_expired.retain(|id| *id != introducer);
         if entry.approvals.len() < entry.envelope.request.approvers().len() {
             return Ok(entry.status(id));
+        }
+        let authority = IntroductionAuthority::load_installed(&self.home, self.audience);
+        if let Ok(authority) = &authority {
+            let maximum_age = authority.maximum_step_up_age();
+            let expired: Vec<_> = entry
+                .approvals
+                .iter()
+                .filter(|(_, approval)| now - approval.step_up.issued_at > maximum_age)
+                .map(|(id, _)| *id)
+                .collect();
+            if !expired.is_empty() {
+                entry.approvals.retain(|(id, _)| !expired.contains(id));
+                entry.step_up_expired.extend(expired);
+                entry.step_up_expired.sort_unstable();
+                return Ok(entry.status(id));
+            }
         }
         let outcome = (|| {
             let approvals = entry
@@ -291,8 +322,7 @@ impl IntroductionLedger {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let approvals: Vec<_> = approvals.iter().map(|(id, a)| (*id, a)).collect();
-            let authority = IntroductionAuthority::load_installed(&self.home, self.audience)?;
-            authority.introduce_transcript(
+            authority?.introduce_transcript(
                 &entry.envelope.request,
                 &entry.envelope.destination_signature,
                 &approvals,
