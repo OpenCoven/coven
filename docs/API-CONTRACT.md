@@ -793,10 +793,11 @@ has no authority profile and its latest attempt failed. The run holds the
 routine's claims until a pass settles it and its occurrence `failed`: the first
 pass at or after the run's deadline, or the next pass if it has none. An
 operator can open a retry first with `coven.automations.attempt.retry.v1`,
-which has no CLI command yet and refuses in several cases, among them a run
-with no deadline or past it, and one with no attempt left. The retry returns
-the occurrence to `planned`, and the run, still holding the claims, is then
-listed as `running_run`, and as `eligible_now` while the queue can claim it.
+which `coven automations retry` sends. It refuses in several cases, among them
+a run with no deadline or past it, and one with no attempt left. The retry
+returns the occurrence to `planned`, and the run, still holding the claims, is
+then listed as `running_run`, and as `eligible_now` while the queue can claim
+it.
 
 These held runs are listed as `in_flight` instead:
 

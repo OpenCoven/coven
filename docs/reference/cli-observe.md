@@ -96,6 +96,10 @@ finishes. Other runs a pass acts on before claiming, such as other runs past
 their deadline or lease, are not named yet (#1523). Principal-scoped reads and
 the remaining operator surface are still tracked by #858.
 
+`coven automations retry` is the one write command under `coven automations`.
+It retries a run held after a failure, before its deadline; see
+[`cli-automations-retry.md`](cli-automations-retry.md).
+
 ## Color
 
 On a color-capable terminal the human views carry the Coven brand palette:
