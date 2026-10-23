@@ -125,6 +125,7 @@ impl Fixture {
         let envelope = IntroductionEnvelope {
             destination_signature: sign(&destination, &request.possession_bytes().unwrap()),
             request: IntroductionTranscript::Single(request),
+            passkey_assertion: None,
         };
         Self {
             ledger: IntroductionLedger::new(home.path(), AUDIENCE),

@@ -21,6 +21,7 @@ silently performs another.
 | **Recover access** | adds one device and grant | owner-root signature over the exact request | `access_recovered` | owner root, policy, other devices, familiars |
 | Rotate or replace a device | moves a grant to an already-paired device | local owner (`coven device rotate`) | `device_authorization_reenrolled` | owner root, policy, familiars |
 | Rotate the owner root | replaces the root key in the policy chain | old *and* new root keys | `owner_root_rotated` | policy, devices, grants, familiars |
+| Register a passkey factor | adds one recovery credential | owner-root signature + the passkey's own assertion | `passkey_registered` | devices, grants, policy, familiars |
 | Rotate a familiar identity | — | no such operation exists | — | — |
 
 ## Recovering access
@@ -103,6 +104,43 @@ key fingerprints and every signed field, and signs only after the owner types
 `rotate`. A lost root key cannot be rotated. Recovering from that is an
 explicit owner trust-domain reset: remove `mobile/introduction-policy.json`
 and install a new policy. This is never automatic.
+
+## Passkey recovery factor
+
+A passkey is an optional owner credential, **never a device**. It has no
+`DeviceRecord`, grant, introducer identity or pairwise ID, and it is never
+listed by `coven device list`. Its WebAuthn backup flags are recorded as
+`backupEligible` and `backedUp`, so a synced passkey is shown as synced and
+is never treated as evidence of one physical device.
+
+**Registration.** `PasskeyStore::register` needs:
+
+- the owner-root signature over `owner.passkey.register`, which binds the
+  audience, current root, credential ID, RP ID, allowed origins and ES256 key
+- an assertion from that passkey, proving possession, whose WebAuthn
+  challenge is the SHA-256 of the same action's canonical bytes
+
+Credentials are self-verifying against the **current** root. Rotating the
+root retires every registration, and the owner re-registers.
+
+**What a passkey may do.** It may fill **at most one** of the N approvals of
+a v2 threshold introduction (`passkeyApprover`). The request must still name
+at least one trusted device, so N ≥ 2. A passkey can never approve alone, and
+it has no slot under N = 1.
+
+**Verification.** The passkey's assertion over the exact introduction action
+(challenge = SHA-256 of its canonical bytes) is verified in Rust, inside the
+same registry commit as the device approvals:
+
+- the client data type, challenge and origin
+- the RP ID hash
+- user presence *and* verification
+- the ES256 signature
+- that the sign counter advances, so a cloned authenticator is refused
+
+No vendor SDK, browser, relying-party server or hosted account service is
+involved in the decision. Optional account sign-in with a passkey needs a
+hosted account service and is out of scope here.
 
 ## Why a compromised service cannot recover access
 

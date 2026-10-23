@@ -11,6 +11,7 @@ pub mod identity;
 pub mod introduction;
 pub mod owner_policy;
 pub mod pairing;
+pub mod passkey;
 pub mod policy_cli;
 pub mod recovery;
 pub mod registry;
