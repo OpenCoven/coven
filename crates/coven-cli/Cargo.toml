@@ -94,6 +94,9 @@ rustls-pki-types = "1"
 rcgen = { version = "0.14", features = ["crypto", "pem", "ring"] }
 ring = "0.17"
 p256 = { version = "0.14", features = ["ecdsa", "pem", "pkcs8"] }
+# Parses and verifies optional device attestation chains against owner-supplied
+# anchors only; no vendor root is compiled in.
+x509-parser = { version = "0.18", features = ["verify"] }
 qrcode = { version = "0.14", default-features = false }
 # Event replay uses SQLite 3.43+'s metadata-only octet_length() path before
 # loading payloads. Keep SQLite bundled so the locked library version provides it.

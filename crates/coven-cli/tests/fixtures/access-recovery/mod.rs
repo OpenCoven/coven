@@ -24,6 +24,7 @@ fn policy() -> IntroductionPolicy {
         maximum_grant_lifetime_seconds: 86400,
         required_assurance: RequestedAssurance::FreshBiometric,
         maximum_step_up_age_seconds: 30,
+        minimum_attestation: Default::default(),
     }
 }
 
