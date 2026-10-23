@@ -89,10 +89,11 @@ times, and so is a failed attempt held for an operator retry, with its
 deadline when it has one. A claim the next pass releases because it is stale
 or its lease has expired is named too, with its lease when one is readable,
 and so is a run whose session has finished, which the next pass settles or
-holds, or is still running past its deadline, which the next pass stops. Other
-runs a pass acts on before claiming, such as launches abandoned past their
-lease, are not named yet (#1523). Principal-scoped reads and the
-remaining operator surface are still tracked by #858.
+holds, is still running past its deadline, or has not started when its claim's
+lease expires, both of which the next pass stops. Other runs a pass acts on
+before claiming, such as those with an expired cancellation, are not named yet
+(#1523). Principal-scoped reads and the remaining operator surface are still
+tracked by #858.
 
 ## Color
 

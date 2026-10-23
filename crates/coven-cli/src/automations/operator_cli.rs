@@ -539,7 +539,28 @@ mod tests {
                  occurrence_fence_generation, state, retry_classification, not_before,
                  session_id, opened_at)
              VALUES ('a-late', 'r-late', 'o-late', 1, 'r-late-key', 1, 'started', 'initial',
-                     '2026-10-15T09:00:00.000Z', 's-late', '2026-10-15T09:00:00.000Z');",
+                     '2026-10-15T09:00:00.000Z', 's-late', '2026-10-15T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 lease_expires_at, created_at, updated_at)
+             VALUES ('o-launch', 'daily', '2026-10-14T09:00:00.000Z', 'manual', 'claimed', 1,
+                     'operator', '2026-10-14T10:00:00.000Z', '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, created_at, updated_at)
+             VALUES ('s-launch', '/work/project', 'codex', 'private sentinel', 'created',
+                     '2026-10-14T09:00:00.000Z', '2026-10-14T09:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+             VALUES ('r-launch', 'daily', 'o-launch', 's-launch', 'coven-code', 'running',
+                     '2026-10-14T09:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-launch', 'r-launch', 'o-launch', 1, 'r-launch-key', 1, 'dispatching',
+                     'initial', '2026-10-14T09:00:00.000Z', 's-launch',
+                     '2026-10-14T09:00:00.000Z');",
         )
         .unwrap();
         // A held authority names the claims its next pass releases.
@@ -567,6 +588,10 @@ mod tests {
         assert_eq!(
             output["explanation"]["work"],
             json!([{
+                "code": "launch_abandoned", "occurrenceId": "o-launch", "runId": "r-launch",
+                "at": "2026-10-14T09:00:00.000Z", "leaseExpiresAt": "2026-10-14T10:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
                 "code": "timeout_expired", "occurrenceId": "o-late", "runId": "r-late",
                 "at": "2026-10-15T09:00:00.000Z", "deadlineAt": "2026-10-15T10:00:00.000Z",
                 "holdsClaims": true, "nextStep": "await_settlement"
