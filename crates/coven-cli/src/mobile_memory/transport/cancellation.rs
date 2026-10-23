@@ -11,7 +11,7 @@ enum State {
     Connecting(Option<Arc<mio::Waker>>),
     Connected(TcpStream),
     Finished,
-    Cancelled,
+    Cancelled(Option<Arc<mio::Waker>>),
 }
 
 /// Clones refer to the same attempt. Create a new token for every retry.
@@ -31,7 +31,13 @@ impl Cancellation {
         if let State::Connecting(Some(waker)) = &*state {
             let _ = waker.wake();
         }
-        *state = State::Cancelled;
+        // Keep the wake source alive until Attempt drops after its poller exits.
+        // Dropping the last Waker here can discard a pending event on Linux.
+        let previous = std::mem::replace(&mut *state, State::Cancelled(None));
+        *state = match previous {
+            State::Connecting(waker) | State::Cancelled(waker) => State::Cancelled(waker),
+            _ => State::Cancelled(None),
+        };
     }
 
     pub(super) fn ensure_pending(&self) -> Result<()> {
@@ -133,9 +139,11 @@ impl Drop for Attempt {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !matches!(*state, State::Cancelled) {
-            *state = State::Finished;
-        }
+        *state = if matches!(*state, State::Cancelled(_)) {
+            State::Cancelled(None)
+        } else {
+            State::Finished
+        };
     }
 }
 
@@ -159,6 +167,31 @@ mod tests {
         assert!(attempt.ensure_active().is_err());
         assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
         drop(attempt);
+        assert!(cancellation.begin().is_err());
+    }
+
+    #[test]
+    fn cancellation_retains_registered_waker_until_attempt_finishes() {
+        let cancellation = Cancellation::default();
+        let attempt = cancellation.begin().unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
+        let lifetime = Arc::downgrade(&waker);
+        attempt.register_waker(waker).unwrap();
+        cancellation.cancel();
+        cancellation.cancel();
+        // Mio only guarantees delivery while the registered waker remains alive.
+        // Repeated cancellation must not close its eventfd before the poller exits.
+        assert!(
+            lifetime.upgrade().is_some(),
+            "cancel dropped the pending wake source"
+        );
+        assert!(attempt.ensure_connecting().is_err());
+        drop(attempt);
+        assert!(
+            lifetime.upgrade().is_none(),
+            "finished attempt retained its wake source"
+        );
         assert!(cancellation.begin().is_err());
     }
 
