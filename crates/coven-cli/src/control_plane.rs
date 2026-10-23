@@ -161,6 +161,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.health",
                     "coven.automations.definition.health.v1",
                     "coven.automations.doctor.v1",
+                    crate::automations::explain::ACTION,
                     "coven.automations.scheduler.status.v1",
                     "coven.automations.occurrence.list.v1",
                     crate::automations::leases::ACTION,
@@ -251,6 +252,7 @@ pub(crate) fn automation_transport_rejection(
         crate::automations::leases::ACTION => {
             "Automation lease inspection requires owner-local IPC."
         }
+        crate::automations::explain::ACTION => "Automation explanations require owner-local IPC.",
         _ if OWNER_AUTOMATION_READS.contains(&action) => {
             "Automation reads that return prompts or run logs require owner-local IPC."
         }
@@ -1133,6 +1135,10 @@ pub(crate) fn route_action_at(
             Ok(id) => automation_definition_health_result(conn, action, origin, intent_id, &id),
             Err(error) => validation_rejection(action, error),
         },
+        crate::automations::explain::ACTION => match required_id_field(&payload, action) {
+            Ok(id) => automation_explain_result(conn, action, origin, intent_id, &id),
+            Err(error) => validation_rejection(action, error),
+        },
         "coven.automations.doctor.v1" => doctor_response(
             crate::automations::doctor::inspect_owner_store(conn, chrono::Utc::now()),
         ),
@@ -2008,6 +2014,44 @@ fn automation_definition_health_result(
         Err(error) => typed_rejection(
             action,
             automation_error(ErrorCode::Internal, format!("{error:#}")),
+        ),
+    }
+}
+
+fn automation_explain_result(
+    conn: &rusqlite::Connection,
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    id: &str,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    use crate::automations::explain::{explain, Lookup};
+    match explain(conn, id, chrono::Utc::now()) {
+        Ok(Lookup::Found(explanation)) => (
+            200,
+            automation_event(
+                action,
+                origin,
+                intent_id,
+                json!({ "explanation": explanation }),
+            ),
+        ),
+        Ok(Lookup::NotFound) => typed_rejection(
+            action,
+            automation_error(ErrorCode::NotFound, format!("no routine with id `{id}`")),
+        ),
+        Ok(Lookup::Tombstoned) => typed_rejection(
+            action,
+            automation_error(
+                ErrorCode::GoneTombstoned,
+                format!("routine `{id}` is tombstoned"),
+            ),
+        ),
+        // Store errors can name paths; the explanation carries none.
+        Err(_) => typed_rejection(
+            action,
+            automation_error(ErrorCode::Internal, "the routine could not be explained"),
         ),
     }
 }

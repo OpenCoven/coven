@@ -107,13 +107,15 @@ justifying comment.
 
 The five commands above are **not** the whole gate. `cargo test` does not run
 any of the repo's guard scripts, so a branch can be green locally and still fail
-the required `PR gate` on `Policy guard` — a ~24-step job whose failures show up
+the required `PR gate` on `Policy guard` — a ~40-step job whose failures show up
 only after you push. Two of its steps have bitten recent PRs: the documentation
 ownership guard (#1089) and the CI workflow guard (#1118).
 
 Reproduce the whole job before pushing. The subshell keeps a failing guard from
 closing your terminal, and still reports a non-zero status, so a printed
-`FAILED:` line cannot be lost in the scroll:
+`FAILED:` line cannot be lost in the scroll. Run it with `bash`: zsh does not
+word-split the unquoted two-file `node --test` lines, so they fail spuriously.
+The Cloud suites need Python 3.11+ on `PATH` as `python3`.
 
 ```sh
 (
@@ -125,15 +127,24 @@ closing your terminal, and still reports a non-zero status, so a printed
            check-theme-tokens.py check-secrets.py \
            classify-ci-changes-test.py check-reliability-scorecard-test.py \
            check-reliability-scorecard.py check-workflows-test.py \
-           check-ci-workflow-test.py install-native-link-dependencies-test.py; do
+           check-ci-workflow-test.py install-native-link-dependencies-test.py \
+           bootstrap-contract/runner-test.py cloud/config-test.py \
+           cloud/runtime-test.py cloud/provision-test.py cloud/bootstrap-test.py \
+           cloud/readiness-test.py; do
     python3 "scripts/$s" || { echo "FAILED: $s"; fail=1; }
   done
+  bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh || fail=1
+  python3 scripts/dev-verify-test.py || fail=1
+  npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund || fail=1
+  node --test scripts/browser-capability.test.mjs || fail=1
 
   node --test scripts/package-github-release-test.mjs || fail=1
   node --test scripts/release-governance.test.mjs || fail=1
+  node --test scripts/authorize-release-publication.test.mjs || fail=1
   node --test scripts/package-automations-protocol.test.mjs scripts/script-entrypoint.test.mjs || fail=1
   node --test scripts/package-automations-authority-profile.test.mjs || fail=1
   node --test scripts/check-action-pins.test.mjs || fail=1
+  node --test scripts/release-receipt.test.mjs scripts/release-dependency-inventory.test.mjs || fail=1
   node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs || fail=1
   node --test scripts/release-stress-test.mjs || fail=1
   node --test scripts/verify-release-tag.test.mjs || fail=1

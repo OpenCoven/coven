@@ -32,7 +32,7 @@
     "!src/**/*.test.ts"
   ],
   "dependencies": {
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   },
   "peerDependencies": {
     "openclaw": ">=2026.4.26"
@@ -67,9 +67,9 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
-    "openclaw": "2026.9.9",
+    "openclaw": "2026.10.4",
     "typescript": "^5.9.0",
     "vite": "^8.3.4",
-    "vitest": "^5.0.3"
+    "vitest": "^5.0.5"
   }
 }

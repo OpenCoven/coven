@@ -251,7 +251,7 @@ fn process_automations_pass(
         .map_err(|failure| failure.error)
 }
 
-fn process_automations_pass_with_scheduler(
+pub(super) fn process_automations_pass_with_scheduler(
     coven_home: &Path,
     runtime: &dyn crate::api::SessionRuntime,
     clock: &dyn AutomationClock,
@@ -335,9 +335,9 @@ fn process_automations_pass_with_scheduler(
 }
 
 #[derive(Clone, Copy)]
-struct SchedulerPassContext<'a> {
-    trigger: &'a str,
-    scheduled_at: DateTime<Utc>,
+pub(super) struct SchedulerPassContext<'a> {
+    pub(super) trigger: &'a str,
+    pub(super) scheduled_at: DateTime<Utc>,
 }
 
 struct CompletedAutomationPass {
@@ -409,7 +409,7 @@ fn process_automations_pass_inner(
     })
 }
 
-fn reconcile_automation_runs(
+pub(super) fn reconcile_automation_runs(
     coven_home: &Path,
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
@@ -628,6 +628,21 @@ fn run_automations_scheduler_after_startup(
     }
 }
 
+/// The recovery a scheduler runs once it holds leadership, before its startup
+/// pass: pre-ownership launches whose receipt proves no process started, then
+/// daemon claims that never launched.
+pub(super) fn recover_before_startup_pass(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    super::runner::recover_no_process_preownership_launches(coven_home, conn, now)
+        .map_err(anyhow::Error::msg)?;
+    super::runner::restore_unlaunched_daemon_claims_for_retry(conn, now)
+        .map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
 /// Starts the automations scheduler. The worker immediately performs startup
 /// reconciliation and due-work dispatch without delaying transport readiness.
 /// The returned handle wakes and joins the worker on daemon shutdown.
@@ -655,10 +670,7 @@ pub(crate) fn start_automations_scheduler_with_clock(
     let recovery_now = clock.now_utc();
     let leadership =
         super::leadership::SchedulerLeadership::acquire(coven_home, &conn, recovery_now)?;
-    super::runner::recover_no_process_preownership_launches(coven_home, &conn, recovery_now)
-        .map_err(anyhow::Error::msg)?;
-    super::runner::restore_unlaunched_daemon_claims_for_retry(&conn, recovery_now)
-        .map_err(anyhow::Error::msg)?;
+    recover_before_startup_pass(coven_home, &conn, recovery_now)?;
     drop(conn);
 
     let observed_generation = wake.generation();
@@ -1817,7 +1829,7 @@ mod tests {
             ready
                 .recv_timeout(HANG_GUARD)
                 .expect("successor startup must finish");
-            // Snapshot BEFORE this successor's own shutdown can mark recovery_required.
+            // Snapshot BEFORE this successor's own shutdown reconciliation runs.
             let recovered = recovery_rows(&conn);
             assert!(
                 matches!(
@@ -1868,12 +1880,11 @@ mod tests {
         if let Err(panic) = checked {
             std::panic::resume_unwind(panic);
         }
+        // The held runs have no work to reconcile, so the successor's graceful
+        // shutdown leaves them retryable until their deadline (#1432).
         for (old, row) in before.iter().zip(recovery_rows(&conn)) {
             assert_eq!(row.identity, old.identity);
-            assert_eq!(
-                row.states,
-                ["recovery_required", "running", "failed", "killed"]
-            );
+            assert_eq!(row.states, ["running", "running", "failed", "killed"]);
             assert_eq!(
                 row.reason.as_deref(),
                 Some("session killed; held for an operator retry until the run's deadline")

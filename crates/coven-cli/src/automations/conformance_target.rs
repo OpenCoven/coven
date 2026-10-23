@@ -28,21 +28,134 @@ use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
 };
 
+mod attempt_retry_process_crash;
+mod automatic_retry_process_crash;
+mod cancellation_timeout_process_crash;
 mod command_envelope_outcomes;
 mod command_process_crash_recovery;
 mod command_storage_capacity_recovery;
+mod command_storage_corruption_recovery;
 mod command_storage_lock_recovery;
 mod command_storage_readonly_recovery;
 mod command_transaction_rollback;
+mod event_feed_process_crash;
+mod flat_cancellation_process_crash;
+mod held_settlement_process_crash;
 mod legacy_import_source_preservation;
 mod mission_commands;
+mod no_process_receipt_process_crash;
+mod occurrence_recovery_process_crash;
+mod process_crash_fixture;
+mod result_delivery_process_crash;
+mod result_delivery_recovery;
+mod retry_timeout_process_crash;
+mod run_cancellation_process_crash;
+mod run_launch_process_crash;
+mod run_now_envelope_process_crash;
+mod run_now_process_crash;
+mod run_settlement_process_crash;
 mod runtime_authority_terminal_recovery;
 mod startup_wake_trace;
+mod tick_process_crash;
+mod timeout_enforcement_process_crash;
+mod waiting_retry_cancellation_process_crash;
 use startup_wake_trace::{StartupWakeOutcome, StartupWakePhase, StartupWakeTrace};
 
 /// Execute the disposable hidden process-crash conformance worker.
 pub fn command_crash_worker(request: &Value) -> Result<(), &'static str> {
     command_process_crash_recovery::worker(request)
+}
+
+/// Execute the disposable hidden result-delivery crash conformance worker.
+pub fn result_delivery_crash_worker(request: &Value) -> Result<(), &'static str> {
+    result_delivery_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden run-settlement crash conformance worker.
+pub fn run_settlement_crash_worker(request: &Value) -> Result<(), &'static str> {
+    run_settlement_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden run-launch crash conformance worker.
+pub fn run_launch_crash_worker(request: &Value) -> Result<(), &'static str> {
+    run_launch_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden attempt-retry crash conformance worker.
+pub fn attempt_retry_crash_worker(request: &Value) -> Result<(), &'static str> {
+    attempt_retry_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden occurrence-recovery crash conformance worker.
+pub fn occurrence_recovery_crash_worker(request: &Value) -> Result<(), &'static str> {
+    occurrence_recovery_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden run-cancellation crash conformance worker.
+pub fn run_cancellation_crash_worker(request: &Value) -> Result<(), &'static str> {
+    run_cancellation_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden flat-cancellation crash conformance worker.
+pub fn flat_cancellation_crash_worker(request: &Value) -> Result<(), &'static str> {
+    flat_cancellation_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden timeout-enforcement crash conformance worker.
+pub fn timeout_enforcement_crash_worker(request: &Value) -> Result<(), &'static str> {
+    timeout_enforcement_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden held-settlement crash conformance worker.
+pub fn held_settlement_crash_worker(request: &Value) -> Result<(), &'static str> {
+    held_settlement_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden automatic-retry crash conformance worker.
+pub fn automatic_retry_crash_worker(request: &Value) -> Result<(), &'static str> {
+    automatic_retry_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden retry-timeout crash conformance worker.
+pub fn retry_timeout_crash_worker(request: &Value) -> Result<(), &'static str> {
+    retry_timeout_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden waiting-retry cancellation crash conformance
+/// worker.
+pub fn waiting_retry_cancellation_crash_worker(request: &Value) -> Result<(), &'static str> {
+    waiting_retry_cancellation_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden run-now crash conformance worker.
+pub fn run_now_crash_worker(request: &Value) -> Result<(), &'static str> {
+    run_now_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden run-now envelope crash conformance worker.
+pub fn run_now_envelope_crash_worker(request: &Value) -> Result<(), &'static str> {
+    run_now_envelope_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden scheduler-tick crash conformance worker.
+pub fn tick_crash_worker(request: &Value) -> Result<(), &'static str> {
+    tick_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden no-process receipt crash conformance worker.
+pub fn no_process_receipt_crash_worker(request: &Value) -> Result<(), &'static str> {
+    no_process_receipt_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden event-feed crash conformance worker.
+pub fn event_feed_crash_worker(request: &Value) -> Result<(), &'static str> {
+    event_feed_process_crash::worker(request)
+}
+
+/// Execute the disposable hidden cancellation-timeout race crash conformance
+/// worker.
+pub fn cancellation_timeout_crash_worker(request: &Value) -> Result<(), &'static str> {
+    cancellation_timeout_process_crash::worker(request)
 }
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -105,6 +218,7 @@ pub const CALENDAR_SCHEDULE_RESOLUTION_SUITE: &str = "calendar-schedule-resoluti
 pub const CANCELLATION_TIMEOUT_ARBITRATION_SUITE: &str = "cancellation-timeout-arbitration";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const COMMAND_ADOPTION_IDEMPOTENCY_SUITE: &str = "command-adoption-idempotency";
+pub const COMMAND_STORAGE_CORRUPTION_RECOVERY_SUITE: &str = "command-storage-corruption-recovery";
 pub const COMMAND_STORAGE_READONLY_RECOVERY_SUITE: &str = "command-storage-readonly-recovery";
 pub const COMMAND_TRANSACTION_ROLLBACK_SUITE: &str = "command-transaction-rollback";
 pub const COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE: &str = "command-storage-capacity-recovery";
@@ -123,6 +237,37 @@ pub const RETRY_BACKOFF_TIMING_SUITE: &str = "retry-backoff-timing";
 pub const RETRY_QUARANTINE_RECOVERY_SUITE: &str = "retry-quarantine-recovery";
 pub const SCHEDULER_LEADERSHIP_FENCING_SUITE: &str = "scheduler-leadership-fencing";
 pub const STARTUP_RECONCILIATION_WAKE_SUITE: &str = "startup-reconciliation-wake";
+pub const RESULT_DELIVERY_RECOVERY_SUITE: &str = "result-delivery-recovery";
+pub const RESULT_DELIVERY_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "result-delivery-process-crash-recovery";
+pub const RUN_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "run-settlement-process-crash-recovery";
+pub const RUN_LAUNCH_PROCESS_CRASH_RECOVERY_SUITE: &str = "run-launch-process-crash-recovery";
+pub const ATTEMPT_RETRY_PROCESS_CRASH_RECOVERY_SUITE: &str = "attempt-retry-process-crash-recovery";
+pub const OCCURRENCE_RECOVERY_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "occurrence-recovery-process-crash-recovery";
+pub const RUN_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "run-cancellation-process-crash-recovery";
+pub const FLAT_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "flat-cancellation-process-crash-recovery";
+pub const TIMEOUT_ENFORCEMENT_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "timeout-enforcement-process-crash-recovery";
+pub const HELD_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "held-settlement-process-crash-recovery";
+pub const AUTOMATIC_RETRY_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "automatic-retry-process-crash-recovery";
+pub const RETRY_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE: &str = "retry-timeout-process-crash-recovery";
+pub const WAITING_RETRY_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "waiting-retry-cancellation-process-crash-recovery";
+pub const RUN_NOW_PROCESS_CRASH_RECOVERY_SUITE: &str = "run-now-process-crash-recovery";
+pub const RUN_NOW_ENVELOPE_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "run-now-envelope-process-crash-recovery";
+pub const TICK_PROCESS_CRASH_RECOVERY_SUITE: &str = "tick-process-crash-recovery";
+pub const NO_PROCESS_RECEIPT_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "no-process-receipt-process-crash-recovery";
+pub const EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE: &str = "event-feed-process-crash-recovery";
+pub const CANCELLATION_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE: &str =
+    "cancellation-timeout-process-crash-recovery";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RRULE_VOCABULARY_SUITE: &str = "rrule-vocabulary";
@@ -1577,6 +1722,7 @@ pub fn capability() -> TargetCapability {
                     CANCELLATION_TIMEOUT_ARBITRATION_SUITE,
                     COMMAND_STORAGE_LOCK_RECOVERY_SUITE,
                     COMMAND_STORAGE_READONLY_RECOVERY_SUITE,
+                    COMMAND_STORAGE_CORRUPTION_RECOVERY_SUITE,
                     COMMAND_TRANSACTION_ROLLBACK_SUITE,
                     LEGACY_IMPORT_SOURCE_PRESERVATION_SUITE,
                     COMMAND_STORAGE_CAPACITY_RECOVERY_SUITE,
@@ -1588,6 +1734,25 @@ pub fn capability() -> TargetCapability {
                     RETRY_QUARANTINE_RECOVERY_SUITE,
                     SCHEDULER_LEADERSHIP_FENCING_SUITE,
                     STARTUP_RECONCILIATION_WAKE_SUITE,
+                    RESULT_DELIVERY_RECOVERY_SUITE,
+                    RESULT_DELIVERY_PROCESS_CRASH_RECOVERY_SUITE,
+                    RUN_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE,
+                    RUN_LAUNCH_PROCESS_CRASH_RECOVERY_SUITE,
+                    ATTEMPT_RETRY_PROCESS_CRASH_RECOVERY_SUITE,
+                    OCCURRENCE_RECOVERY_PROCESS_CRASH_RECOVERY_SUITE,
+                    RUN_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
+                    FLAT_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
+                    TIMEOUT_ENFORCEMENT_PROCESS_CRASH_RECOVERY_SUITE,
+                    HELD_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE,
+                    AUTOMATIC_RETRY_PROCESS_CRASH_RECOVERY_SUITE,
+                    RETRY_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE,
+                    WAITING_RETRY_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
+                    RUN_NOW_PROCESS_CRASH_RECOVERY_SUITE,
+                    RUN_NOW_ENVELOPE_PROCESS_CRASH_RECOVERY_SUITE,
+                    TICK_PROCESS_CRASH_RECOVERY_SUITE,
+                    NO_PROCESS_RECEIPT_PROCESS_CRASH_RECOVERY_SUITE,
+                    EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE,
+                    CANCELLATION_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE,
                 ],
             },
             TargetProfileCapability {
@@ -1660,6 +1825,176 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         (SCHEDULER_RELIABILITY_PROFILE, COMMAND_PROCESS_CRASH_RECOVERY_SUITE) => {
             let (passed, observations) = command_process_crash_recovery::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RESULT_DELIVERY_RECOVERY_SUITE) => {
+            let (passed, observations) = result_delivery_recovery::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RESULT_DELIVERY_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = result_delivery_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RUN_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = run_settlement_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RUN_LAUNCH_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = run_launch_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, ATTEMPT_RETRY_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = attempt_retry_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, OCCURRENCE_RECOVERY_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                occurrence_recovery_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RUN_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = run_cancellation_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, FLAT_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                flat_cancellation_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, TIMEOUT_ENFORCEMENT_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                timeout_enforcement_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, HELD_SETTLEMENT_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = held_settlement_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, AUTOMATIC_RETRY_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = automatic_retry_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RETRY_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = retry_timeout_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (
+            SCHEDULER_RELIABILITY_PROFILE,
+            WAITING_RETRY_CANCELLATION_PROCESS_CRASH_RECOVERY_SUITE,
+        ) => {
+            let (passed, observations) =
+                waiting_retry_cancellation_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RUN_NOW_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = run_now_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, RUN_NOW_ENVELOPE_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = run_now_envelope_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, TICK_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = tick_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, NO_PROCESS_RECEIPT_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                no_process_receipt_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, EVENT_FEED_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) = event_feed_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, CANCELLATION_TIMEOUT_PROCESS_CRASH_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                cancellation_timeout_process_crash::evaluate(&request.vector)?;
+            let mut result = result_for(&request.suite_id, &request.vector, passed)?;
+            if let Some(evidence) = result.evidence.as_mut() {
+                evidence["observations"] = json!(observations);
+            }
+            return Ok(result);
+        }
+        (SCHEDULER_RELIABILITY_PROFILE, COMMAND_STORAGE_CORRUPTION_RECOVERY_SUITE) => {
+            let (passed, observations) =
+                command_storage_corruption_recovery::evaluate(&request.vector)?;
             let mut result = result_for(&request.suite_id, &request.vector, passed)?;
             if let Some(evidence) = result.evidence.as_mut() {
                 evidence["observations"] = json!(observations);

@@ -1,0 +1,434 @@
+{
+  "schemaVersion": "coven.automations.automatic-retry-process-crash-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "retry-killed-after-rejected-session",
+      "boundary": "after_rejected_session",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "launching",
+        "retryAfterRestart": "held",
+        "restartIsNoop": false,
+        "restartLaunches": 0,
+        "retryAfterPass": "held",
+        "passIsNoop": true,
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-after-retry-recorded",
+      "boundary": "after_retry_recorded",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "launching",
+        "retryAfterRestart": "held",
+        "restartIsNoop": false,
+        "restartLaunches": 0,
+        "retryAfterPass": "held",
+        "passIsNoop": true,
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-after-session-released",
+      "boundary": "after_session_released",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "launching",
+        "retryAfterRestart": "held",
+        "restartIsNoop": false,
+        "restartLaunches": 0,
+        "retryAfterPass": "held",
+        "passIsNoop": true,
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-after-retry-commit",
+      "boundary": "after_retry_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "retryAfterRestart": "scheduled",
+        "restartIsNoop": true,
+        "restartLaunches": 0,
+        "retryAfterPass": "retried",
+        "passIsNoop": false,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-inside-reclaim",
+      "boundary": "after_reclaim",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "scheduled",
+        "retryAfterRestart": "retried",
+        "restartIsNoop": false,
+        "restartLaunches": 1,
+        "retryAfterPass": "retried",
+        "passIsNoop": true,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-after-reclaim-commit",
+      "boundary": "after_reclaim_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "reclaimed",
+        "retryAfterRestart": "retried",
+        "restartIsNoop": false,
+        "restartLaunches": 1,
+        "retryAfterPass": "retried",
+        "passIsNoop": true,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-inside-relaunch",
+      "boundary": "after_relaunch_dispatching",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "reclaimed",
+        "retryAfterRestart": "retried",
+        "restartIsNoop": false,
+        "restartLaunches": 1,
+        "retryAfterPass": "retried",
+        "passIsNoop": true,
+        "launches": 1,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-after-relaunch-commit",
+      "boundary": "after_relaunch_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "relaunching",
+        "retryAfterRestart": "relaunch_held",
+        "restartIsNoop": false,
+        "restartLaunches": 0,
+        "retryAfterPass": "relaunch_held",
+        "passIsNoop": true,
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-inside-ownership",
+      "boundary": "after_relaunch_ownership",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "relaunching",
+        "retryAfterRestart": "relaunch_held",
+        "restartIsNoop": false,
+        "restartLaunches": 0,
+        "retryAfterPass": "relaunch_held",
+        "passIsNoop": true,
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "retry-killed-after-ownership-commit",
+      "boundary": "after_ownership_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "retryAfterExit": "retried",
+        "retryAfterRestart": "relaunch_held",
+        "restartIsNoop": false,
+        "restartLaunches": 0,
+        "retryAfterPass": "relaunch_held",
+        "passIsNoop": true,
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "uninterrupted-retry-control",
+      "boundary": "none",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-auto-retry-crash",
+        "name": "Conformance automatic retry crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native automatic retry crash conformance probe.",
+        "cwd": "/work/project",
+        "retry": {
+          "maxAttempts": 2,
+          "backoffPolicy": "fixed",
+          "backoffSeconds": 60,
+          "retryableClasses": [
+            "runtime_unavailable"
+          ]
+        }
+      },
+      "expected": {
+        "initialOutcome": "relaunched",
+        "retryAfterExit": "retried",
+        "retryAfterRestart": "relaunch_held",
+        "restartIsNoop": false,
+        "restartLaunches": 0,
+        "retryAfterPass": "relaunch_held",
+        "passIsNoop": true,
+        "launches": 0,
+        "stops": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    }
+  ]
+}

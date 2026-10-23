@@ -46,8 +46,8 @@ const RESULT_EXCERPT_MAX_BYTES: usize = 4 * 1024;
 /// A failure reason carried in a result notice, so a runaway reason cannot
 /// push the notice past the inbox's body limit.
 const REASON_MAX_BYTES: usize = 1024;
-const GATE_UNAVAILABLE_REASON: &str = "the main-session inbox lock could not be opened";
-const RESULT_UNREADABLE_REASON: &str = "the run's recorded output could not be read";
+pub(crate) const GATE_UNAVAILABLE_REASON: &str = "the main-session inbox lock could not be opened";
+pub(crate) const RESULT_UNREADABLE_REASON: &str = "the run's recorded output could not be read";
 
 #[cfg(test)]
 type NoticeInsertHook = Box<dyn FnOnce() -> Result<()>>;

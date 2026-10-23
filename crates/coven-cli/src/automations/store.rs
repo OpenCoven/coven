@@ -277,7 +277,7 @@ pub fn get_definition_with_tombstone(
     }
 }
 
-fn routine_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineRecord> {
+pub(crate) fn routine_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineRecord> {
     Ok(RoutineRecord {
         id: row.get(0)?,
         name: row.get(1)?,

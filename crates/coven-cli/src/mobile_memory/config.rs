@@ -11,6 +11,19 @@ use uuid::Uuid;
 pub const MOBILE_STATE_DIR: &str = "mobile";
 pub const GATEWAY_CONFIG_FILE: &str = "gateway.json";
 
+/// Safe classification for background startup; retain the original cause for
+/// direct callers without copying it into startup diagnostics.
+#[derive(Debug)]
+pub(crate) struct MobileConfigValidationFailure;
+
+impl std::fmt::Display for MobileConfigValidationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid mobile gateway configuration")
+    }
+}
+
+impl std::error::Error for MobileConfigValidationFailure {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MobileGatewayConfig {

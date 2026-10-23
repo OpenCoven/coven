@@ -18,7 +18,15 @@ class ClassifyTest(unittest.TestCase):
         return MOD.classify(list(paths))
 
     def test_docs_only(self):
-        self.assertEqual(self.classify('docs/a.md'), {'docs_only': True, 'rust': False, 'afs': False, 'channels': False, 'openclaw': False, 'npm_packaging': False, 'engine': False, 'restricted_runtime': False, 'workflow': False, 'cargo_metadata': False})
+        self.assertEqual(self.classify('docs/a.md'), {'docs_only': True, 'rust': False, 'afs': False, 'channels': False, 'openclaw': False, 'npm_packaging': False, 'engine': False, 'restricted_runtime': False, 'workflow': False, 'cargo_metadata': False, 'bootstrap': False})
+
+    def test_bootstrap_contract_inputs_are_routed(self):
+        for path in ('scripts/cloud/bootstrap.py', 'scripts/bootstrap-contract/inside.py',
+                     'Cargo.lock', 'rust-toolchain.toml', '.node-version',
+                     'packages/channels/package-lock.json', 'packages/openclaw-coven/pnpm-lock.yaml'):
+            self.assertTrue(self.classify(path)['bootstrap'], path)
+        self.assertFalse(self.classify('packages/channels/src/index.ts')['bootstrap'])
+        self.assertFalse(self.classify('docs/guide.md')['bootstrap'])
 
     def test_restricted_runtime_crates(self):
         for path in (

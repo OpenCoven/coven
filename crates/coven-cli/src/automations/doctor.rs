@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 mod capacity;
 #[path = "doctor_failure_history.rs"]
 mod failure_history;
+#[path = "doctor_lease_partitions.rs"]
+mod lease_partitions;
 #[path = "doctor_planning.rs"]
 mod planning;
 #[path = "doctor_read.rs"]
@@ -21,6 +23,8 @@ pub(crate) use read::ReadBudgetExceeded;
 mod receipt_commitments;
 #[path = "doctor_receipt_links.rs"]
 mod receipt_links;
+#[path = "doctor_running_runs.rs"]
+mod running_runs;
 #[path = "doctor_schema.rs"]
 mod schema;
 #[path = "doctor_sequences.rs"]
@@ -92,6 +96,10 @@ pub enum Fact {
     ClaimedOccurrences,
     RunningOccurrences,
     RecoveryRequiredOccurrences,
+    RunningRuns,
+    RunningRunsWithEndedSessions,
+    RunningRunsWithFailedLatestAttempt,
+    RunningRunsWithAmbiguousLatestAttempt,
     LeaseBearingOccurrences,
     ActiveLeaseOccurrences,
     ExpiredLeaseOccurrences,
@@ -100,6 +108,14 @@ pub enum Fact {
     LeaseOutsideActiveStateOccurrences,
     RecordedSchedulerFencePresent,
     MismatchedUnlaunchedSchedulerClaims,
+    StopFences,
+    ActiveStopFences,
+    ExpiredStopFences,
+    InvalidStopFenceExpiries,
+    PendingCancellations,
+    ActivePendingCancellations,
+    ExpiredPendingCancellations,
+    InvalidPendingCancellationExpiries,
     QuarantinedRoutines,
     FailedAttempts,
     RetryExhaustionHistories,
@@ -172,7 +188,11 @@ impl Fact {
             | Self::EligibleOccurrences
             | Self::ClaimedOccurrences
             | Self::RunningOccurrences
-            | Self::RecoveryRequiredOccurrences => Category::Queue,
+            | Self::RecoveryRequiredOccurrences
+            | Self::RunningRuns
+            | Self::RunningRunsWithEndedSessions
+            | Self::RunningRunsWithFailedLatestAttempt
+            | Self::RunningRunsWithAmbiguousLatestAttempt => Category::Queue,
             Self::LeaseBearingOccurrences
             | Self::ActiveLeaseOccurrences
             | Self::ExpiredLeaseOccurrences
@@ -180,7 +200,15 @@ impl Fact {
             | Self::InvalidLeaseExpiryOccurrences
             | Self::LeaseOutsideActiveStateOccurrences
             | Self::RecordedSchedulerFencePresent
-            | Self::MismatchedUnlaunchedSchedulerClaims => Category::LeasesFences,
+            | Self::MismatchedUnlaunchedSchedulerClaims
+            | Self::StopFences
+            | Self::ActiveStopFences
+            | Self::ExpiredStopFences
+            | Self::InvalidStopFenceExpiries
+            | Self::PendingCancellations
+            | Self::ActivePendingCancellations
+            | Self::ExpiredPendingCancellations
+            | Self::InvalidPendingCancellationExpiries => Category::LeasesFences,
             Self::QuarantinedRoutines
             | Self::FailedAttempts
             | Self::RetryExhaustionHistories
@@ -252,6 +280,9 @@ pub enum Gap {
     RecordedClaimStoreUnavailable,
     LeaseStoreUnavailable,
     LeaseStateUnavailable,
+    StopFenceStoreUnavailable,
+    CancellationStoreUnavailable,
+    RunningRunStoreUnavailable,
     LagHistoryNotMeasured,
     OccurrencePlanningStoreUnavailable,
     OccurrencePlanningMetadataInvalid,
@@ -719,6 +750,12 @@ impl Report {
                 planning::validate_and_strip(&mut core)?;
             } else if core.category == Category::RepeatedFailures {
                 failure_history::validate_and_strip(&mut core)?;
+            } else if core.category == Category::LeasesFences {
+                // Appended after the stop fences, so stripped before them.
+                lease_partitions::PENDING_CANCELLATIONS.validate_and_strip(&mut core)?;
+                lease_partitions::STOP_FENCES.validate_and_strip(&mut core)?;
+            } else if core.category == Category::Queue {
+                running_runs::validate_and_strip(&mut core)?;
             }
             let observation = &core;
             ensure!(
@@ -1347,6 +1384,7 @@ impl Report {
             }
         }
         planning::validate_cohort(&self.observations)?;
+        running_runs::validate_cohort(&self.observations)?;
         Ok(())
     }
 }
@@ -2746,6 +2784,25 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
             .find(|value| value.category == Category::RepeatedFailures)
             .expect("failure category is constructed above"),
         failure_history_measurement,
+    );
+    let leases = observations
+        .iter()
+        .position(|value| value.category == Category::LeasesFences)
+        .expect("lease category is constructed above");
+    for partition in [
+        &lease_partitions::STOP_FENCES,
+        &lease_partitions::PENDING_CANCELLATIONS,
+    ] {
+        let measurement = partition.inspect(&transaction, now)?;
+        partition.append(&mut observations[leases], measurement);
+    }
+    let running_run_measurement = running_runs::inspect(&transaction)?;
+    running_runs::append(
+        observations
+            .iter_mut()
+            .find(|value| value.category == Category::Queue)
+            .expect("queue category is constructed above"),
+        running_run_measurement,
     );
     transaction.commit()?;
     let report = Report {

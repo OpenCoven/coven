@@ -142,7 +142,7 @@ pub(crate) fn outside_active_state_count(conn: &Connection) -> Result<u64, ReadE
     Ok(count)
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 512 && id.trim() == id && !id.chars().any(char::is_control)
 }
 

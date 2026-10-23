@@ -48,6 +48,25 @@ fn main() {
 
     println!("cargo:rustc-env=COVEN_VERSION_DESC={}", describe);
     println!("cargo:rustc-env=COVEN_BUILD_COMMIT={}", commit);
+    reserve_windows_main_stack();
+}
+
+/// The main-thread stack Linux and macOS give the binary by default.
+const MAIN_STACK_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Windows reserves only 1 MB for the main thread. An unoptimised build
+/// spends most of that parsing any command: clap's derived builder for the
+/// top-level command enum keeps one stack slot per subcommand, and every new
+/// subcommand grows it (#1492). Reserve what the other platforms give.
+fn reserve_windows_main_stack() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => println!("cargo:rustc-link-arg-bins=/STACK:{MAIN_STACK_BYTES}"),
+        Ok("gnu") => println!("cargo:rustc-link-arg-bins=-Wl,--stack,{MAIN_STACK_BYTES}"),
+        _ => {}
+    }
 }
 
 fn explicit_build_version() -> Option<String> {

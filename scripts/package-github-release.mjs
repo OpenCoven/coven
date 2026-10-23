@@ -89,7 +89,7 @@ async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command) {
     throw new Error(
-      'Usage: package-github-release.mjs <verify-source-acceptance|verify-source-run|verify-source-run-attempt|verify-npm-provenance|verify-npm-signatures|package|sync-release> [--option value ...]'
+      'Usage: package-github-release.mjs <verify-source-acceptance|verify-source-run|verify-source-run-attempt|verify-npm-provenance|verify-npm-signatures|package|sync-release|publish-release> [--option value ...]'
     );
   }
 
@@ -138,13 +138,16 @@ async function main() {
       return;
     }
     case 'verify-npm-provenance': {
-      await verifyAllPackageProvenance({
+      const packages = await verifyAllPackageProvenance({
         releaseTag: requiredOption(options, 'release-tag'),
         npmVersion: requiredOption(options, 'npm-version'),
         headSha: requiredOption(options, 'head-sha'),
         sourceRunId: requiredOption(options, 'source-run-id'),
         sourceRunAttempt: requiredOption(options, 'source-run-attempt')
       });
+      if (options.has('output')) {
+        writeJsonFile(options.get('output'), { schemaVersion: 1, kind: 'coven.npm-provenance-verification', packages });
+      }
       return;
     }
     case 'verify-npm-signatures': {
@@ -172,10 +175,28 @@ async function main() {
         outputDir: requiredOption(options, 'output-dir'),
         expectedTagObjectSha: requiredOption(options, 'expected-tag-object-sha'),
         expectedHeadSha: requiredOption(options, 'expected-head-sha'),
+        releaseRecord: booleanOption(options, 'release-record'),
         releaseClient: createGhReleaseClient({
           repository: requiredOption(options, 'repository')
         })
       });
+      return;
+    }
+    case 'publish-release': {
+      const result = await publishGitHubRelease({
+        releaseTag: requiredOption(options, 'release-tag'),
+        outputDir: requiredOption(options, 'output-dir'),
+        expectedTagObjectSha: requiredOption(options, 'expected-tag-object-sha'),
+        expectedHeadSha: requiredOption(options, 'expected-head-sha'),
+        releaseRecord: booleanOption(options, 'release-record'),
+        requireImmutable: booleanOption(options, 'require-immutable'),
+        releaseClient: createGhReleaseClient({
+          repository: requiredOption(options, 'repository')
+        })
+      });
+      if (options.has('output')) {
+        writeJsonFile(options.get('output'), result);
+      }
       return;
     }
     default:
@@ -199,6 +220,23 @@ function parseOptions(args) {
     index += 1;
   }
   return options;
+}
+
+function booleanOption(options, key) {
+  const value = options.get(key);
+  if (value === undefined) {
+    return false;
+  }
+  if (value !== 'true' && value !== 'false') {
+    throw new Error(`--${key} must be true or false, got ${JSON.stringify(value)}.`);
+  }
+  return value === 'true';
+}
+
+function writeJsonFile(filePath, value) {
+  const resolved = path.resolve(String(filePath));
+  mkdirSync(path.dirname(resolved), { recursive: true });
+  writeFileSync(resolved, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function requiredOption(options, key) {
@@ -239,7 +277,18 @@ function releaseIncludesAutomationsProtocol(releaseTag) {
   return true;
 }
 
-export function canonicalReleaseAssetNames(releaseTag, sourceCommit) {
+export function releaseReceiptAssetName(npmVersion) {
+  return `coven-v${npmVersion}-release-receipt.json`;
+}
+
+export function releaseSbomAssetName(npmVersion) {
+  return `coven-v${npmVersion}-sbom.cdx.json`;
+}
+
+/// The release record (the CycloneDX SBOM and the final receipt) is part of
+/// the asset contract for every tag whose source carries the receipt builder;
+/// GitHub-only recovery of older tags keeps their original contract.
+export function canonicalReleaseAssetNames(releaseTag, sourceCommit, { releaseRecord = false } = {}) {
   const { npmVersion } = parseReleaseTag(releaseTag);
   return [
     ...Object.values(PACKAGE_DEFINITIONS).map((definition) => definition.assetName(npmVersion)),
@@ -249,6 +298,7 @@ export function canonicalReleaseAssetNames(releaseTag, sourceCommit) {
           automationsAuthorityProfileBundleName(sourceCommit)
         ]
       : []),
+    ...(releaseRecord ? [releaseSbomAssetName(npmVersion), releaseReceiptAssetName(npmVersion)] : []),
     CHECKSUMS_NAME
   ];
 }
@@ -785,7 +835,14 @@ export async function verifyPackageProvenance({
   return {
     packageName,
     npmVersion,
-    integrityHex
+    integrity: packageMetadata.dist.integrity,
+    integrityHex,
+    shasum: packageMetadata?.dist?.shasum ?? null,
+    tarball: packageMetadata?.dist?.tarball ?? null,
+    attestationsUrl: packageMetadata?.dist?.attestations?.url ?? null,
+    provenancePredicateType: SLSA_PREDICATE,
+    trustedPublisherPredicateType: TRUSTED_PUBLISHER_PREDICATE,
+    invocationId: statement.predicate.runDetails.metadata.invocationId
   };
 }
 
@@ -1030,11 +1087,12 @@ export async function verifyAllPackageProvenance({
   registryWait = {}
 }) {
   const fetchVisible = (url) => fetchJsonWhenVisible(url, { fetchJson, ...registryWait });
+  const verified = [];
   for (const packageName of RELEASE_PACKAGES) {
     const encodedPackageName = encodeURIComponent(packageName);
     const metadata = await fetchVisible(`https://registry.npmjs.org/${encodedPackageName}/${npmVersion}`);
     const attestations = await fetchVisible(metadata?.dist?.attestations?.url);
-    await verifyPackageProvenance({
+    verified.push(await verifyPackageProvenance({
       packageName,
       npmVersion,
       releaseTag,
@@ -1043,8 +1101,9 @@ export async function verifyAllPackageProvenance({
       sourceRunAttempt,
       packageMetadata: metadata,
       attestationDocument: attestations
-    });
+    }));
   }
+  return verified;
 }
 
 export function verifyNpmRegistrySignatures({
@@ -1528,9 +1587,9 @@ function assertExistingReleaseMetadata(release, releaseTag) {
       `Refusing GitHub release: existing release title must be ${JSON.stringify(expectedTitle)}, got ${JSON.stringify(release?.name)}.`
     );
   }
-  if (release?.draft !== false) {
+  if (typeof release?.draft !== 'boolean') {
     throw new Error(
-      'Refusing GitHub release: existing release must not be a draft; draft=false is required for recovery.'
+      `Refusing GitHub release: existing release must report draft=true or draft=false, got ${JSON.stringify(release?.draft)}.`
     );
   }
   if (release?.prerelease !== false) {
@@ -1540,14 +1599,8 @@ function assertExistingReleaseMetadata(release, releaseTag) {
   }
 }
 
-export async function syncGitHubRelease({
-  releaseTag,
-  outputDir,
-  expectedTagObjectSha,
-  expectedHeadSha,
-  releaseClient = createGhReleaseClient()
-}) {
-  const expectedAssetNames = canonicalReleaseAssetNames(releaseTag, expectedHeadSha).sort();
+function canonicalOutputHashes(releaseTag, outputDir, expectedHeadSha, releaseRecord) {
+  const expectedAssetNames = canonicalReleaseAssetNames(releaseTag, expectedHeadSha, { releaseRecord }).sort();
   const normalizedOutputDir = path.resolve(String(outputDir));
   const presentAssetNames = readdirSync(normalizedOutputDir).sort();
   if (presentAssetNames.join('\n') !== expectedAssetNames.join('\n')) {
@@ -1555,9 +1608,80 @@ export async function syncGitHubRelease({
       `Refusing GitHub release: ${normalizedOutputDir} must contain the exact canonical assets ${expectedAssetNames.join(', ')}.`
     );
   }
-  const expectedHashesByName = new Map(
-    expectedAssetNames.map((assetName) => [assetName, sha256Hex(readFileSync(path.join(normalizedOutputDir, assetName)))])
+  return {
+    normalizedOutputDir,
+    expectedAssetNames,
+    expectedHashesByName: new Map(
+      expectedAssetNames.map((assetName) => [assetName, sha256Hex(readFileSync(path.join(normalizedOutputDir, assetName)))])
+    )
+  };
+}
+
+function assertNoUnexpectedAssets(existingAssets, expectedHashesByName) {
+  const existingAssetNames = existingAssets.map((asset) => asset.name);
+  const duplicateAssets = [...new Set(existingAssetNames.filter(
+    (assetName, index) => existingAssetNames.indexOf(assetName) !== index
+  ))].sort();
+  if (duplicateAssets.length > 0) {
+    throw new Error(
+      `Refusing GitHub release: duplicate release assets ${duplicateAssets.join(', ')}. ` +
+        'Delete only the duplicate GitHub asset through an audited operator action, then rerun this GitHub-only workflow. Never move/reuse the tag and never republish npm.'
+    );
+  }
+  const extraAssets = existingAssetNames
+    .filter((assetName) => !expectedHashesByName.has(assetName))
+    .sort();
+  if (extraAssets.length > 0) {
+    throw new Error(
+      `Refusing GitHub release: unexpected release assets ${extraAssets.join(', ')}. ` +
+        'Delete only the unexpected or mismatched GitHub asset through an audited operator action, then rerun this GitHub-only workflow. Never move/reuse the tag and never republish npm.'
+    );
+  }
+  return new Map(existingAssets.map((asset) => [asset.name, asset]));
+}
+
+/// Hashes what GitHub actually serves for one asset. The API's own `digest`
+/// is used when present; otherwise the asset is streamed to disk and hashed.
+async function observedAssetHash(releaseClient, asset, downloadDir) {
+  const reported = /^sha256:([0-9a-f]{64})$/.exec(String(asset?.digest ?? ''));
+  if (reported) {
+    return reported[1];
+  }
+  const defaultDownloadPath = path.join(downloadDir, asset.name);
+  const downloadResult = await releaseClient.downloadAsset(asset, defaultDownloadPath);
+  let observedAssetPath = defaultDownloadPath;
+  if (Buffer.isBuffer(downloadResult)) {
+    writeFileSync(defaultDownloadPath, downloadResult);
+  } else if (typeof downloadResult === 'string' && downloadResult.trim() !== '') {
+    observedAssetPath = path.resolve(downloadResult);
+  }
+  return sha256Hex(readFileSync(observedAssetPath));
+}
+
+function mismatchError(assetName, observedHash, expectedHash, immutable) {
+  return new Error(
+    `Refusing GitHub release: asset ${assetName} mismatch: observed hash ${observedHash}, expected hash ${expectedHash}. ` +
+      (immutable
+        ? 'The release is immutable, so it cannot be repaired: record both hashes and the reason, then bump forward to a new version.'
+        : 'Record the observed hash, expected hash, and reason, delete only the mismatched GitHub asset through an audited operator action, then rerun this GitHub-only workflow. Never move/reuse the tag and never republish npm.')
   );
+}
+
+/// Creates or resumes the GitHub Release as a draft and uploads any missing
+/// canonical asset. A new release is always created as a draft: with
+/// immutable releases enabled, a published release can no longer take
+/// assets, so every asset (the receipt included) goes up before publication.
+/// An already-published immutable release is verified, never repaired.
+export async function syncGitHubRelease({
+  releaseTag,
+  outputDir,
+  expectedTagObjectSha,
+  expectedHeadSha,
+  releaseRecord = false,
+  releaseClient = createGhReleaseClient()
+}) {
+  const { normalizedOutputDir, expectedAssetNames, expectedHashesByName } =
+    canonicalOutputHashes(releaseTag, outputDir, expectedHeadSha, releaseRecord);
 
   let release = await releaseClient.getReleaseByTag(releaseTag);
   let createdRelease = false;
@@ -1571,34 +1695,19 @@ export async function syncGitHubRelease({
       releaseTag,
       title: `Coven ${releaseTag}`,
       notesFromTag: true,
-      verifyTag: true
+      verifyTag: true,
+      draft: true
     });
     createdRelease = true;
   } else {
     assertExistingReleaseMetadata(release, releaseTag);
   }
+  const immutable = release?.draft === false && release?.immutable === true;
 
-  const existingAssets = Array.isArray(release?.assets) ? release.assets : [];
-  const existingAssetNames = existingAssets.map((asset) => asset.name);
-  const duplicateAssets = [...new Set(existingAssetNames.filter(
-    (assetName, index) => existingAssetNames.indexOf(assetName) !== index
-  ))].sort();
-  if (duplicateAssets.length > 0) {
-    throw new Error(
-      `Refusing GitHub release: duplicate release assets ${duplicateAssets.join(', ')}. ` +
-        'Delete only the duplicate GitHub asset through an audited operator action, then rerun this GitHub-only workflow. Never move/reuse the tag and never republish npm.'
-    );
-  }
-  const existingAssetsByName = new Map(existingAssets.map((asset) => [asset.name, asset]));
-  const extraAssets = [...existingAssetsByName.keys()]
-    .filter((assetName) => !expectedHashesByName.has(assetName))
-    .sort();
-  if (extraAssets.length > 0) {
-    throw new Error(
-      `Refusing GitHub release: unexpected release assets ${extraAssets.join(', ')}. ` +
-        'Delete only the unexpected or mismatched GitHub asset through an audited operator action, then rerun this GitHub-only workflow. Never move/reuse the tag and never republish npm.'
-    );
-  }
+  const existingAssetsByName = assertNoUnexpectedAssets(
+    Array.isArray(release?.assets) ? release.assets : [],
+    expectedHashesByName
+  );
 
   const uploaded = [];
   const skipped = [];
@@ -1613,23 +1722,18 @@ export async function syncGitHubRelease({
         missingAssetNames.push(assetName);
         continue;
       }
-      const defaultDownloadPath = path.join(downloadDir, assetName);
-      const downloadResult = await releaseClient.downloadAsset(existingAsset, defaultDownloadPath);
-      let observedAssetPath = defaultDownloadPath;
-      if (Buffer.isBuffer(downloadResult)) {
-        writeFileSync(defaultDownloadPath, downloadResult);
-      } else if (typeof downloadResult === 'string' && downloadResult.trim() !== '') {
-        observedAssetPath = path.resolve(downloadResult);
-      }
-      const observedHash = sha256Hex(readFileSync(observedAssetPath));
+      const observedHash = await observedAssetHash(releaseClient, existingAsset, downloadDir);
       const expectedHash = expectedHashesByName.get(assetName);
       if (observedHash !== expectedHash) {
-        throw new Error(
-          `Refusing GitHub release: asset ${assetName} mismatch: observed hash ${observedHash}, expected hash ${expectedHash}. ` +
-            'Record the observed hash, expected hash, and reason, delete only the mismatched GitHub asset through an audited operator action, then rerun this GitHub-only workflow. Never move/reuse the tag and never republish npm.'
-        );
+        throw mismatchError(assetName, observedHash, expectedHash, immutable);
       }
       skipped.push(assetName);
+    }
+    if (immutable && missingAssetNames.length > 0) {
+      throw new Error(
+        `Refusing GitHub release: ${releaseTag} is a published immutable release missing ${missingAssetNames.join(', ')}. ` +
+          'Immutable releases cannot take new assets; bump forward to a new version.'
+      );
     }
     if (!createdRelease || missingAssetNames.length > 0) {
       await releaseClient.revalidateTag({
@@ -1641,6 +1745,7 @@ export async function syncGitHubRelease({
     for (const assetName of missingAssetNames) {
       await releaseClient.uploadAsset({
         releaseTag,
+        releaseId: release?.id,
         assetName,
         filePath: path.join(normalizedOutputDir, assetName)
       });
@@ -1652,8 +1757,95 @@ export async function syncGitHubRelease({
 
   return {
     createdRelease,
+    draft: release?.draft === true,
     uploaded,
     skipped
+  };
+}
+
+function compareStableVersions(left, right) {
+  const a = parseReleaseTag(left).npmVersion.split('.').map(Number);
+  const b = parseReleaseTag(right).npmVersion.split('.').map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) {
+      return a[index] - b[index];
+    }
+  }
+  return 0;
+}
+
+/// Publishes the draft once every canonical asset GitHub serves matches the
+/// local bytes and the tag still names the verified commit, then reads the
+/// release back. With `requireImmutable`, a release GitHub did not lock is a
+/// failure: the receipt promises an immutable record.
+export async function publishGitHubRelease({
+  releaseTag,
+  outputDir,
+  expectedTagObjectSha,
+  expectedHeadSha,
+  releaseRecord = false,
+  requireImmutable = false,
+  releaseClient = createGhReleaseClient()
+}) {
+  const { normalizedOutputDir, expectedAssetNames, expectedHashesByName } =
+    canonicalOutputHashes(releaseTag, outputDir, expectedHeadSha, releaseRecord);
+  const release = await releaseClient.getReleaseByTag(releaseTag);
+  if (!release) {
+    throw new Error(`Refusing GitHub release: ${releaseTag} has no release to publish; run sync-release first.`);
+  }
+  assertExistingReleaseMetadata(release, releaseTag);
+  const existingAssetsByName = assertNoUnexpectedAssets(
+    Array.isArray(release.assets) ? release.assets : [],
+    expectedHashesByName
+  );
+  const downloadDir = path.join(normalizedOutputDir, '.release-publish-downloads');
+  rmSync(downloadDir, { recursive: true, force: true });
+  mkdirSync(downloadDir, { recursive: true });
+  try {
+    for (const assetName of expectedAssetNames) {
+      const asset = existingAssetsByName.get(assetName);
+      if (!asset) {
+        throw new Error(`Refusing GitHub release: ${releaseTag} is missing asset ${assetName}; run sync-release first.`);
+      }
+      const observedHash = await observedAssetHash(releaseClient, asset, downloadDir);
+      if (observedHash !== expectedHashesByName.get(assetName)) {
+        throw mismatchError(assetName, observedHash, expectedHashesByName.get(assetName), release.immutable === true);
+      }
+    }
+  } finally {
+    rmSync(downloadDir, { recursive: true, force: true });
+  }
+
+  const wasDraft = release.draft === true;
+  let makeLatest = null;
+  if (wasDraft) {
+    await releaseClient.revalidateTag({ releaseTag, expectedTagObjectSha, expectedHeadSha });
+    const latestTag = await releaseClient.latestReleaseTag();
+    makeLatest = latestTag === null || compareStableVersions(releaseTag, latestTag) > 0;
+    await releaseClient.publishRelease({ releaseId: release.id, makeLatest });
+  }
+  const published = await releaseClient.getReleaseByTag(releaseTag);
+  if (published?.draft !== false) {
+    throw new Error(`Refusing GitHub release: ${releaseTag} is still a draft after publication.`);
+  }
+  if (requireImmutable && published.immutable !== true) {
+    throw new Error(
+      `Refusing GitHub release: ${releaseTag} published without GitHub immutability. Enable immutable releases before publishing; the release record must not be editable.`
+    );
+  }
+  return {
+    schemaVersion: 1,
+    kind: 'coven.github-release-publication',
+    releaseTag,
+    publishedNow: wasDraft,
+    makeLatest,
+    release: {
+      id: published.id ?? null,
+      htmlUrl: published.html_url ?? null,
+      immutable: published.immutable === true,
+      publishedAt: published.published_at ?? null
+    },
+    assets: expectedAssetNames.map((name) => ({ name, sha256: expectedHashesByName.get(name) }))
   };
 }
 
@@ -1696,25 +1888,70 @@ function createGitClient() {
   };
 }
 
+const TAG_SIGNATURE_BLOCK = /-----BEGIN (?:SSH|PGP) SIGNATURE-----[\s\S]*?-----END (?:SSH|PGP) SIGNATURE-----\s*/g;
+
+/// The GitHub Release body for a tag: the annotation as written, without the
+/// signature block GitHub's tag API appends to `message`. v0.4.1, v0.4.4 and
+/// v0.4.6 through v0.4.9 published that block as part of their notes.
+export function releaseNotesFromTagMessage(message) {
+  return `${String(message).replace(TAG_SIGNATURE_BLOCK, '').trimEnd()}\n`;
+}
+
 function createGhReleaseClient({ repository = process.env.GITHUB_REPOSITORY } = {}) {
   if (!repository) {
     throw new Error('GITHUB_REPOSITORY is required to synchronize GitHub release assets.');
   }
   return {
+    /// Published releases resolve by tag; drafts are not served by that
+    /// endpoint, so a miss falls back to the release list, which includes
+    /// drafts for a token with push access. More than one release for the tag
+    /// is ambiguous and refused.
     async getReleaseByTag(releaseTag) {
       const endpoint = `/repos/${repository}/releases/tags/${encodeURIComponent(releaseTag)}`;
       const result = spawnCapture('gh', ['api', endpoint], { encoding: 'utf8' });
       if (result.error) {
         throw new Error(result.error.message);
       }
-      if (result.status !== 0) {
-        const stderr = String(result.stderr ?? '').trim();
-        if (/404/.test(stderr)) {
-          return null;
-        }
+      if (result.status === 0) {
+        return JSON.parse(result.stdout);
+      }
+      const stderr = String(result.stderr ?? '').trim();
+      if (!/404/.test(stderr)) {
         throw new Error(stderr || `gh api ${endpoint} exited with ${result.status}.`);
       }
-      return JSON.parse(result.stdout);
+      const matches = [];
+      for (let page = 1; page <= 10; page += 1) {
+        const releases = JSON.parse(runCommand('gh', ['api', `/repos/${repository}/releases?per_page=100&page=${page}`]));
+        matches.push(...releases.filter((entry) => entry?.tag_name === releaseTag));
+        if (releases.length < 100) {
+          break;
+        }
+      }
+      if (matches.length > 1) {
+        throw new Error(`Refusing GitHub release: ${matches.length} releases name ${releaseTag}; delete the extra drafts through an audited operator action.`);
+      }
+      return matches[0] ?? null;
+    },
+    async latestReleaseTag() {
+      const endpoint = `/repos/${repository}/releases/latest`;
+      const result = spawnCapture('gh', ['api', endpoint, '--jq', '.tag_name'], { encoding: 'utf8' });
+      if (result.error) {
+        throw new Error(result.error.message);
+      }
+      if (result.status !== 0) {
+        if (/404/.test(String(result.stderr ?? ''))) {
+          return null;
+        }
+        throw new Error(String(result.stderr ?? '').trim() || `gh api ${endpoint} exited with ${result.status}.`);
+      }
+      return result.stdout.trim() || null;
+    },
+    async publishRelease({ releaseId, makeLatest }) {
+      runCommand('gh', [
+        'api', '-X', 'PATCH', `/repos/${repository}/releases/${toPositiveIntegerString(releaseId, 'release id')}`,
+        '-F', 'draft=false',
+        '-f', `make_latest=${makeLatest ? 'true' : 'false'}`
+      ]);
     },
     /// Read the annotated tag's message through the API rather than asking
     /// `gh release create --notes-from-tag` to do it. Recent `gh` refuses
@@ -1737,10 +1974,13 @@ function createGhReleaseClient({ repository = process.env.GITHUB_REPOSITORY } = 
       if (typeof message !== 'string' || message.trim().length === 0) {
         throw new Error(`Refusing GitHub release: ${releaseTag} has an empty tag annotation.`);
       }
-      return message;
+      return releaseNotesFromTagMessage(message);
     },
-    async createRelease({ releaseTag, title, notesFromTag, verifyTag }) {
+    async createRelease({ releaseTag, title, notesFromTag, verifyTag, draft }) {
       const args = ['release', 'create', releaseTag, '--repo', repository, '--title', title];
+      if (draft) {
+        args.push('--draft');
+      }
       // The cleanup guard opens before the directory exists and closes after
       // gh returns, so a throw from writeFileSync leaves nothing behind either.
       let notesDir;
@@ -1837,8 +2077,15 @@ function createGhReleaseClient({ repository = process.env.GITHUB_REPOSITORY } = 
         { filePath }
       );
     },
-    async uploadAsset({ releaseTag, filePath }) {
-      runCommand('gh', ['release', 'upload', releaseTag, filePath, '--repo', repository]);
+    /// Uploads by release id, which also works for a draft, rather than by
+    /// tag name, which only resolves once a release is published.
+    async uploadAsset({ releaseId, assetName, filePath }) {
+      runCommand('gh', [
+        'api', '-X', 'POST',
+        '-H', 'Content-Type: application/octet-stream',
+        '--input', filePath,
+        `https://uploads.github.com/repos/${repository}/releases/${toPositiveIntegerString(releaseId, 'release id')}/assets?name=${encodeURIComponent(assetName)}`
+      ]);
     }
   };
 }

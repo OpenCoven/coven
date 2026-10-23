@@ -243,6 +243,11 @@ pub struct RunOutcome {
 /// The attempts table's bound on attempt numbers.
 pub(crate) const MAX_ATTEMPT_NUMBER: i64 = 10;
 
+/// Session statuses settlement treats as terminal evidence for a running run.
+/// The doctor counts unsettled runs with the same list.
+pub(crate) const FINISHED_SESSION_STATUSES: [&str; 5] =
+    ["completed", "failed", "cancelled", "killed", "idle"];
+
 fn fresh_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
@@ -3480,9 +3485,31 @@ pub(crate) fn mark_unconfirmed_stop_for_recovery(
     state_reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
+    mark_unconfirmed_stop(conn, run_id, None, state_reason, now)
+}
+
+/// The same for one attempt: a command's unconfirmed stop never marks an
+/// attempt it did not target, such as one an owner opened since.
+pub(crate) fn mark_unconfirmed_attempt_stop_for_recovery(
+    conn: &Connection,
+    run_id: &str,
+    attempt_id: &str,
+    state_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    mark_unconfirmed_stop(conn, run_id, Some(attempt_id), state_reason, now)
+}
+
+fn mark_unconfirmed_stop(
+    conn: &Connection,
+    run_id: &str,
+    attempt_id: Option<&str>,
+    state_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin ambiguous stop settlement: {error}"))?;
-    mark_unconfirmed_stop_for_recovery_in(&transaction, run_id, state_reason, now)?;
+    mark_unconfirmed_stop_for_recovery_in(&transaction, run_id, attempt_id, state_reason, now)?;
     transaction
         .commit()
         .map_err(|error| format!("failed to commit ambiguous stop settlement: {error}"))
@@ -3491,6 +3518,7 @@ pub(crate) fn mark_unconfirmed_stop_for_recovery(
 fn mark_unconfirmed_stop_for_recovery_in(
     conn: &Connection,
     run_id: &str,
+    attempt_id: Option<&str>,
     state_reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
@@ -3503,6 +3531,7 @@ fn mark_unconfirmed_stop_for_recovery_in(
                  state_reason = ?2,
                  settled_at = ?3
              WHERE run_id = ?1
+               AND (?4 IS NULL OR id = ?4)
                AND state IN ('dispatching', 'started', 'observing')
                AND NOT EXISTS (
                    SELECT 1 FROM automation_runs r
@@ -3551,7 +3580,7 @@ fn mark_unconfirmed_stop_for_recovery_in(
                        )
                    )
                )",
-            rusqlite::params![run_id, state_reason, now_iso],
+            rusqlite::params![run_id, state_reason, now_iso, attempt_id],
         )
         .map_err(|error| format!("failed to mark ambiguous automation attempt: {error}"))?;
     if attempt_changed != 1 {
@@ -3679,6 +3708,9 @@ pub fn mark_active_attempts_for_restart_reconciliation(
             rusqlite::params![reason],
         )
         .map_err(|error| format!("failed to mark active attempts for reconciliation: {error}"))?;
+    // A run held for an operator retry (`attempt.retry.v1`) has no work to
+    // reconcile: its latest attempt has settled `failed`. Its occurrence keeps
+    // the state the retry command requires until the run's deadline.
     transaction
         .execute(
             "UPDATE automation_occurrences
@@ -3689,9 +3721,19 @@ pub fn mark_active_attempts_for_restart_reconciliation(
                  updated_at = ?2
              WHERE state IN ('claimed', 'running')
                AND id IN (
-                   SELECT occurrence_id
-                   FROM automation_runs
-                   WHERE status = 'running'
+                   SELECT r.occurrence_id
+                   FROM automation_runs AS r
+                   WHERE r.status = 'running'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM automation_attempts AS latest
+                         WHERE latest.run_id = r.id
+                           AND latest.state = 'failed'
+                           AND latest.attempt_number = (
+                               SELECT MAX(attempt_number)
+                               FROM automation_attempts
+                               WHERE run_id = r.id
+                           )
+                     )
                )",
             rusqlite::params![reason, now_iso],
         )
@@ -3846,12 +3888,9 @@ pub(crate) fn settle_finished_runs_with(
         attempt_number,
     ) in rows
     {
-        let terminal_session = session_status.as_deref().is_some_and(|status| {
-            matches!(
-                status,
-                "completed" | "failed" | "cancelled" | "killed" | "idle"
-            )
-        });
+        let terminal_session = session_status
+            .as_deref()
+            .is_some_and(|status| FINISHED_SESSION_STATUSES.contains(&status));
         // A pre-ownership failed attempt is durable even if its provisional
         // session was sacrificed. Its hold must still expire at the run deadline.
         let failed_plain_hold =
@@ -3991,6 +4030,7 @@ pub(crate) fn settle_finished_runs_with(
                 mark_unconfirmed_stop_for_recovery_in(
                     &transaction,
                     &run_id,
+                    None,
                     "stop owner expired after terminal session evidence",
                     now,
                 )?;
@@ -4198,6 +4238,16 @@ pub(crate) fn settle_finished_runs_with(
                 .commit()
                 .map_err(|error| format!("failed to commit held run: {error}"))?;
             continue;
+        }
+        if ambiguous {
+            // Terminal evidence settles the stop whose outcome was unknown. A
+            // finished run keeps no stop ownership, whoever claimed it.
+            transaction
+                .execute(
+                    "DELETE FROM automation_stop_fences WHERE run_id = ?1",
+                    [&run_id],
+                )
+                .map_err(|error| format!("failed to release settled stop ownership: {error}"))?;
         }
         if !record_run_finish(
             &transaction,
@@ -9787,6 +9837,14 @@ mod tests {
                 )
                 .unwrap()
             };
+            let fences = || -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = ?1",
+                    [&outcome.run_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
             assert_eq!(
                 read_states(),
                 (
@@ -9796,11 +9854,13 @@ mod tests {
                 ),
                 "{owner}"
             );
+            assert_eq!(fences(), 1, "{owner}: the unknown stop keeps its fence");
             assert_eq!(settle_finished_runs(&conn, expired).unwrap().failed, 1);
             assert_eq!(
                 read_states(),
                 ("failed".into(), "failed".into(), "ambiguous".into())
             );
+            assert_eq!(fences(), 0, "{owner}: settlement releases the fence");
         }
     }
 
@@ -10218,6 +10278,11 @@ mod tests {
                     super::super::runs::clear_retry_quarantine(&conn, &routine.id, now).unwrap()
                 );
             }
+            // A graceful shutdown inside the hold window keeps the claim retryable.
+            assert_eq!(
+                mark_active_attempts_for_restart_reconciliation(&conn, now).unwrap(),
+                0
+            );
             assert!(matches!(
                 execute_attempt_retry(&conn, request("adopt:retry:launch-hold"), now).unwrap(),
                 RetryExecution::Success { .. }

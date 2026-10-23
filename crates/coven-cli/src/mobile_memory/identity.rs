@@ -80,6 +80,24 @@ pub fn load_or_create_host_identity(
     })
 }
 
+/// The existing installation audience. Never creates a host identity, so
+/// owner policy cannot silently bind to a key generated as a side effect.
+pub fn installed_host_fingerprint(coven_home: &Path) -> Result<[u8; 32]> {
+    let key_path = coven_home
+        .join(super::config::MOBILE_STATE_DIR)
+        .join(HOST_KEY_FILE);
+    match fs::symlink_metadata(&key_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            bail!("mobile host identity is not initialized; run `coven memory mobile enable` first")
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", key_path.display()))
+        }
+    }
+    fingerprint_for_private_key(&Zeroizing::new(load_key_pair(&key_path)?.serialize_der()))
+}
+
 fn load_or_create_key_pair(path: &Path) -> Result<KeyPair> {
     match fs::symlink_metadata(path) {
         Ok(_) => load_key_pair(path),

@@ -32,13 +32,21 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  publish-release:
-    name: Publish GitHub Release assets
+  verify-release:
+    name: Verify and assemble the GitHub Release
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    # Everything that decides what to publish runs here, read-only. Only
+    # publish-release below can change the repository.
     permissions:
       actions: read
-      contents: write
+      contents: read
+    outputs:
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      npm_version: ${{ steps.source.outputs.npm_version }}
+      head_sha: ${{ steps.source.outputs.head_sha }}
+      tag_object_sha: ${{ steps.source.outputs.tag_object_sha }}
+      release_record: ${{ steps.contract.outputs.release_record }}
     steps:
       - name: Refuse non-default-branch manual recovery
         if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != github.event.repository.default_branch }}
@@ -82,7 +90,8 @@ jobs:
             --npm-version "$NPM_VERSION" \
             --head-sha "$HEAD_SHA" \
             --source-run-id "$SOURCE_RUN_ID" \
-            --source-run-attempt "$SOURCE_RUN_ATTEMPT"
+            --source-run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --output github-release-evidence/npm-provenance.json
       - name: Cryptographically verify npm registry signatures
         env:
           NPM_VERSION: ${{ steps.source.outputs.npm_version }}
@@ -96,6 +105,17 @@ jobs:
           fetch-depth: 0
           ref: ${{ steps.source.outputs.head_sha }}
           path: github-release-protocol-source
+      # Tags whose source carries the receipt builder publish the full release
+      # record (SBOM, receipt, attestations, immutable publication). Recovery
+      # of an older tag keeps that tag's original asset contract.
+      - name: Detect the release record contract
+        id: contract
+        run: |
+          if [[ -f github-release-protocol-source/scripts/release-receipt.mjs ]]; then
+            echo "release_record=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_record=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -124,6 +144,14 @@ jobs:
           run-id: ${{ steps.source.outputs.source_run_id }}
           name: coven-windows
           path: github-release-source/coven-windows
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ steps.contract.outputs.release_record == 'true' }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.source.outputs.source_run_id }}
+          name: coven-release-publication-authorization-${{ steps.source.outputs.release_tag }}
+          path: github-release-evidence/authorization
       - name: Reconfirm source run attempt after artifact download
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -176,7 +204,8 @@ jobs:
             --output-dir github-release-assets \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             "${PROTOCOL_ARGS[@]}"
-      - name: Synchronize canonical GitHub release assets
+      - name: Re-verify the signed tag before GitHub publication
+        if: ${{ steps.contract.outputs.release_record == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
@@ -184,9 +213,180 @@ jobs:
           HEAD_SHA: ${{ steps.source.outputs.head_sha }}
         run: |
           set -euo pipefail
+          node scripts/verify-release-tag.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --output github-release-evidence/tag-verification.json > github-release-evidence/tag-verification.env
+          grep -qx "head_sha=$HEAD_SHA" github-release-evidence/tag-verification.env
+          grep -qx "tag_object_sha=$TAG_OBJECT_SHA" github-release-evidence/tag-verification.env
+      - name: Re-check exact-source CI before GitHub publication
+        if: ${{ steps.contract.outputs.release_record == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          TAG_OBJECT_SHA: ${{ steps.source.outputs.tag_object_sha }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          node scripts/package-github-release.mjs verify-source-acceptance \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --head-sha "$HEAD_SHA" \
+            --tag-object-sha "$TAG_OBJECT_SHA" \
+            --output github-release-evidence/source-acceptance.json
+      - name: Check release governance before GitHub publication
+        if: ${{ steps.contract.outputs.release_record == 'true' }}
+        env:
+          RELEASE_GOVERNANCE_READ_TOKEN: ${{ secrets.RELEASE_GOVERNANCE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/release-governance.mjs check \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy github-release-protocol-source/.github/release-governance.json \
+            --snapshot-output github-release-evidence/governance-snapshot.json \
+            --output github-release-evidence/governance-evaluation.json
+      - name: Build the release SBOM from the tagged source
+        if: ${{ steps.contract.outputs.release_record == 'true' }}
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          node scripts/release-dependency-inventory.mjs \
+            --release-tag "$RELEASE_TAG" \
+            --source-commit "$HEAD_SHA" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --source-dir github-release-protocol-source \
+            --output-dir github-release-assets
+      - name: Build the release receipt
+        if: ${{ steps.contract.outputs.release_record == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          node scripts/release-receipt.mjs build \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --trigger "$TRIGGER" \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --source-run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --source-run-head-sha "$HEAD_SHA" \
+            --support-policy github-release-protocol-source/.github/release-support.json \
+            --tag-verification github-release-evidence/tag-verification.json \
+            --source-acceptance github-release-evidence/source-acceptance.json \
+            --publication-authorization github-release-evidence/authorization/release-publication-authorization.json \
+            --governance-evaluation github-release-evidence/governance-evaluation.json \
+            --npm-provenance github-release-evidence/npm-provenance.json \
+            --assets-dir github-release-assets
+      - name: Hand the verified assets to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coven-github-release-assets-${{ steps.source.outputs.release_tag }}
+          path: github-release-assets/
+          if-no-files-found: error
+      - name: Retain verification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coven-github-release-evidence-${{ steps.source.outputs.release_tag || 'unverified' }}
+          path: github-release-evidence/
+          if-no-files-found: warn
+
+  publish-release:
+    name: Publish GitHub Release assets
+    needs: verify-release
+    runs-on: ubuntu-latest
+    # The same group as the npm publication job: one channel mutation at a time.
+    concurrency:
+      group: coven-release-channel
+      cancel-in-progress: false
+    # contents:write publishes the release; id-token and attestations sign the
+    # asset provenance and the reconciliation record. Nothing here publishes npm.
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coven-github-release-assets-${{ needs.verify-release.outputs.release_tag }}
+          path: github-release-assets
+      - name: Attest every release asset
+        if: ${{ needs.verify-release.outputs.release_record == 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: github-release-assets/*
+      - name: Synchronize canonical GitHub release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
+          TAG_OBJECT_SHA: ${{ needs.verify-release.outputs.tag_object_sha }}
+          HEAD_SHA: ${{ needs.verify-release.outputs.head_sha }}
+          RELEASE_RECORD: ${{ needs.verify-release.outputs.release_record }}
+        run: |
+          set -euo pipefail
           node scripts/package-github-release.mjs sync-release \
             --repository "$GITHUB_REPOSITORY" \
             --release-tag "$RELEASE_TAG" \
             --output-dir github-release-assets \
             --expected-tag-object-sha "$TAG_OBJECT_SHA" \
-            --expected-head-sha "$HEAD_SHA"
+            --expected-head-sha "$HEAD_SHA" \
+            --release-record "$RELEASE_RECORD"
+      - name: Publish the verified draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
+          TAG_OBJECT_SHA: ${{ needs.verify-release.outputs.tag_object_sha }}
+          HEAD_SHA: ${{ needs.verify-release.outputs.head_sha }}
+          RELEASE_RECORD: ${{ needs.verify-release.outputs.release_record }}
+        run: |
+          set -euo pipefail
+          node scripts/package-github-release.mjs publish-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --output-dir github-release-assets \
+            --expected-tag-object-sha "$TAG_OBJECT_SHA" \
+            --expected-head-sha "$HEAD_SHA" \
+            --release-record "$RELEASE_RECORD" \
+            --require-immutable "$RELEASE_RECORD" \
+            --output github-release-publication/publication.json
+      - name: Reconcile every channel with the receipt
+        if: ${{ needs.verify-release.outputs.release_record == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
+          NPM_VERSION: ${{ needs.verify-release.outputs.npm_version }}
+        run: |
+          set -euo pipefail
+          node scripts/release-receipt.mjs reconcile \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --support-policy .github/release-support.json \
+            --receipt "github-release-assets/coven-v${NPM_VERSION}-release-receipt.json" \
+            --output github-release-publication/reconciliation.json
+      - name: Attest the reconciliation against the receipt
+        if: ${{ needs.verify-release.outputs.release_record == 'true' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: github-release-assets/coven-v${{ needs.verify-release.outputs.npm_version }}-release-receipt.json
+          predicate-type: https://opencoven.ai/attestations/release-reconciliation/v1
+          predicate-path: github-release-publication/reconciliation.json
+      - name: Retain the publication record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coven-github-release-publication-${{ needs.verify-release.outputs.release_tag }}
+          path: github-release-publication/
+          if-no-files-found: warn

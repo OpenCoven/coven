@@ -903,7 +903,7 @@ fn tick_inner(
     Ok(report)
 }
 
-fn iso(instant: DateTime<Utc>) -> String {
+pub(crate) fn iso(instant: DateTime<Utc>) -> String {
     instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -1166,33 +1166,16 @@ fn plan_bounded_definition_page(
     let mut report = PlanTickReport::default();
     let mut claimable_definition_ids = BTreeSet::new();
     for record in &page.rows {
-        if record.status != "ACTIVE" || record.quarantined {
+        if record.status != ACTIVE_STATUS || record.quarantined {
             continue;
         }
-        let definition: RoutineDefinition = match serde_json::from_str(&record.definition_json) {
+        let definition = match stored_definition(&record.id, &record.definition_json) {
             Ok(definition) => definition,
             Err(error) => {
-                report.failed.push(format!(
-                    "stored routine `{}` is unreadable: {error}",
-                    record.id
-                ));
+                report.failed.push(error);
                 continue;
             }
         };
-        if let Err(error) = definition.validate() {
-            report.failed.push(format!(
-                "stored routine `{}` is invalid: {error}",
-                record.id
-            ));
-            continue;
-        }
-        if let Err(error) = definition.validate_durable() {
-            report.failed.push(format!(
-                "stored routine `{}` is invalid: {error}",
-                record.id
-            ));
-            continue;
-        }
         if definition.status != RoutineStatus::Active {
             continue;
         }
@@ -1244,42 +1227,94 @@ fn active_definitions(conn: &Connection) -> Result<(Vec<RoutineDefinition>, Vec<
     let mut definitions = Vec::new();
     let mut failures = Vec::new();
     for record in records {
-        if record.status != "ACTIVE" {
+        if record.status != ACTIVE_STATUS {
             continue;
         }
         if quarantined.contains(&record.id) {
             continue;
         }
-        let definition: RoutineDefinition = match serde_json::from_str(&record.definition_json) {
+        let definition = match stored_definition(&record.id, &record.definition_json) {
             Ok(definition) => definition,
             Err(error) => {
-                failures.push(format!(
-                    "stored routine `{}` is unreadable: {error}",
-                    record.id
-                ));
+                failures.push(error);
                 continue;
             }
         };
-        if let Err(error) = definition.validate() {
-            failures.push(format!(
-                "stored routine `{}` is invalid: {error}",
-                record.id
-            ));
-            continue;
-        }
-        if let Err(error) = definition.validate_durable() {
-            failures.push(format!(
-                "stored routine `{}` is invalid: {error}",
-                record.id
-            ));
-            continue;
-        }
         if definition.status != RoutineStatus::Active {
             continue;
         }
         definitions.push(definition);
     }
     Ok((definitions, failures))
+}
+
+/// The revision metadata planning verifies before it fences a slot: an
+/// `ACTIVE` row with a digest that matches its stored definition, which must
+/// be `definition`, and a readable revision time. Returns the digest and that
+/// time. The error can carry definition text, as `stored_definition`'s can.
+pub(crate) fn verified_revision(
+    current: &super::store::RoutineRecord,
+    definition: &RoutineDefinition,
+) -> std::result::Result<(String, DateTime<Utc>), String> {
+    let Some(current_digest) = current.definition_digest.clone() else {
+        return Err(format!(
+            "routine `{}` has unverifiable definition metadata",
+            definition.id
+        ));
+    };
+    let persisted_digest = super::contract::migration::definition_digest(&current.definition_json)
+        .map_err(|error| {
+            format!(
+                "failed to digest stored routine `{}`: {error:#}",
+                definition.id
+            )
+        })?;
+    let persisted_definition: RoutineDefinition = serde_json::from_str(&current.definition_json)
+        .map_err(|error| {
+            format!(
+                "stored routine `{}` is unreadable while planning: {error}",
+                definition.id
+            )
+        })?;
+    if current.status != ACTIVE_STATUS
+        || persisted_digest != current_digest
+        || persisted_definition != *definition
+    {
+        return Err(format!(
+            "routine `{}` definition changed while planning",
+            definition.id
+        ));
+    }
+    let revision_updated_at = DateTime::parse_from_rfc3339(&current.updated_at)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            format!(
+                "routine `{}` has invalid revision updated_at: {error}",
+                definition.id
+            )
+        })?;
+    Ok((current_digest, revision_updated_at))
+}
+
+/// The stored `status` the scheduler plans from, compared byte for byte.
+pub(crate) const ACTIVE_STATUS: &str = "ACTIVE";
+
+/// Parses and validates one stored definition as planning does. The error
+/// names the routine and can carry definition text; keep it out of
+/// diagnostics that leave the daemon.
+pub(crate) fn stored_definition(
+    id: &str,
+    definition_json: &str,
+) -> std::result::Result<RoutineDefinition, String> {
+    let definition: RoutineDefinition = serde_json::from_str(definition_json)
+        .map_err(|error| format!("stored routine `{id}` is unreadable: {error}"))?;
+    definition
+        .validate()
+        .map_err(|error| format!("stored routine `{id}` is invalid: {error}"))?;
+    definition
+        .validate_durable()
+        .map_err(|error| format!("stored routine `{id}` is invalid: {error}"))?;
+    Ok(definition)
 }
 
 pub(crate) fn active_definition_ids(conn: &Connection) -> Result<BTreeSet<String>> {
@@ -1367,7 +1402,7 @@ pub(crate) const ELIGIBILITY_QUERY_PREREQUISITES: &[(&str, &[&str])] = &[
     ("automation_attempts", &["run_id", "state", "not_before"]),
 ];
 
-const ELIGIBLE_OCCURRENCES_SQL: &str = "WITH active_definition(automation_id) AS (
+pub(crate) const ELIGIBLE_OCCURRENCES_SQL: &str = "WITH active_definition(automation_id) AS (
                      SELECT value FROM json_each(?2)
                  )
                  SELECT occurrence.id,
@@ -1589,7 +1624,7 @@ fn definition_created_at(conn: &Connection, id: &str) -> Result<DateTime<Utc>> {
 /// Latest due slot for `definition` at or before `now`, walking forward from
 /// `cursor` (never further back than the routine's creation time). Returns
 /// `None` when the next slot is still in the future.
-fn latest_due_slot_after(
+pub(crate) fn latest_due_slot_after(
     definition: &RoutineDefinition,
     cursor: DateTime<Utc>,
     now: DateTime<Utc>,
@@ -1614,7 +1649,7 @@ fn latest_due_slot_after(
     Ok(latest)
 }
 
-fn latest_scheduled_slot(
+pub(crate) fn latest_scheduled_slot(
     conn: &Connection,
     automation_id: &str,
     automation_revision: u64,
@@ -1623,7 +1658,7 @@ fn latest_scheduled_slot(
     let latest: Option<String> = conn
         .query_row(
             "SELECT MAX(scheduled_for)
-             FROM automation_occurrences
+             FROM main.automation_occurrences
              WHERE automation_id = ?1
                AND automation_revision = ?2
                AND definition_digest = ?3
@@ -1728,43 +1763,7 @@ fn plan_latest_due_occurrence_in_transaction(
     let current = super::store::get_definition(conn, &definition.id)
         .map_err(|error| format!("failed to load routine `{}`: {error:#}", definition.id))?
         .ok_or_else(|| format!("routine `{}` vanished while planning", definition.id))?;
-    let Some(current_digest) = current.definition_digest else {
-        return Err(format!(
-            "routine `{}` has unverifiable definition metadata",
-            definition.id
-        ));
-    };
-    let persisted_digest = super::contract::migration::definition_digest(&current.definition_json)
-        .map_err(|error| {
-            format!(
-                "failed to digest stored routine `{}`: {error:#}",
-                definition.id
-            )
-        })?;
-    let persisted_definition: RoutineDefinition = serde_json::from_str(&current.definition_json)
-        .map_err(|error| {
-            format!(
-                "stored routine `{}` is unreadable while planning: {error}",
-                definition.id
-            )
-        })?;
-    if current.status != "ACTIVE"
-        || persisted_digest != current_digest
-        || persisted_definition != *definition
-    {
-        return Err(format!(
-            "routine `{}` definition changed while planning",
-            definition.id
-        ));
-    }
-    let revision_updated_at = DateTime::parse_from_rfc3339(&current.updated_at)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|error| {
-            format!(
-                "routine `{}` has invalid revision updated_at: {error}",
-                definition.id
-            )
-        })?;
+    let (current_digest, revision_updated_at) = verified_revision(&current, definition)?;
     let revision_effective_at = created_at.max(revision_updated_at);
     let latest_scheduled =
         latest_scheduled_slot(conn, &definition.id, current.revision, &current_digest)?;

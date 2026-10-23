@@ -105,6 +105,17 @@ fn startup_observation(line: &str) -> Option<String> {
                 | "daemon-store-end"
                 | "status-publication-begin"
                 | "status-publication-end"
+                | "runtime-initialize-begin"
+                | "orphaned-sessions-end"
+                | "stale-created-sessions-end"
+                | "afs-recovery-end"
+                | "session-runtime-end"
+                | "threads-scheduler-end"
+                | "maintenance-scheduler-end"
+                | "liveness-sweeper-end"
+                | "automations-scheduler-end"
+                | "mobile-gateway-end"
+                | "api-accept-loop-enter"
         ),
         _ => false,
     };
@@ -148,6 +159,17 @@ mod tests {
             "hub-identity-ready",
             "hub-status-returned",
             "storage-health-returned",
+            "runtime-initialize-begin",
+            "orphaned-sessions-end",
+            "stale-created-sessions-end",
+            "afs-recovery-end",
+            "session-runtime-end",
+            "threads-scheduler-end",
+            "maintenance-scheduler-end",
+            "liveness-sweeper-end",
+            "automations-scheduler-end",
+            "mobile-gateway-end",
+            "api-accept-loop-enter",
         ] {
             let record = format!(
                 "startup_checkpoint phase={phase} elapsed_ms=100 prior_observer_ms=50 interval_us=12345"

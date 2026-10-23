@@ -670,10 +670,7 @@ fn daemon_stop_terminates_live_piped_session_descendants() -> anyhow::Result<()>
     let (status, response) = unix_http_request(&coven_home, "POST", "/sessions", Some(&body))?;
     assert_eq!(status, 201, "unexpected launch response: {response}");
 
-    wait_until("piped descendant pid", || Ok(descendant_pid_file.exists()))?;
-    let descendant_pid = fs::read_to_string(&descendant_pid_file)?
-        .trim()
-        .parse::<u32>()?;
+    let descendant_pid = wait_for_shutdown_descendant_pid(&descendant_pid_file)?;
     assert!(
         pid_is_alive(descendant_pid),
         "fixture descendant should be live before daemon stop"
@@ -742,12 +739,7 @@ fn daemon_stop_kills_piped_tree_stalled_before_runtime_publication() -> anyhow::
     wait_until("piped pre-publication barrier", || {
         Ok(barrier_dir.join("ready").exists())
     })?;
-    wait_until("pre-publication descendant pid", || {
-        Ok(descendant_pid_file.exists())
-    })?;
-    let descendant_pid = fs::read_to_string(&descendant_pid_file)?
-        .trim()
-        .parse::<u32>()?;
+    let descendant_pid = wait_for_shutdown_descendant_pid(&descendant_pid_file)?;
     assert!(
         pid_is_alive(descendant_pid),
         "fixture descendant should be live in the pre-publication window"
@@ -2714,6 +2706,46 @@ fn write_fake_copilot(fake_bin: &Path) -> anyhow::Result<()> {
     permissions.set_mode(0o755);
     fs::set_permissions(&copilot, permissions)?;
     Ok(())
+}
+
+#[test]
+fn shutdown_descendant_pid_requires_a_complete_record() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pid_file = temp.path().join("descendant.pid");
+    assert_eq!(read_shutdown_descendant_pid(&pid_file)?, None);
+
+    // Hold the producer at each intermediate state deterministically: shell
+    // redirection creates the empty file before printf writes the PID record.
+    let mut producer = fs::File::create(&pid_file)?;
+    assert_eq!(read_shutdown_descendant_pid(&pid_file)?, None);
+    producer.write_all(b"123")?;
+    assert_eq!(read_shutdown_descendant_pid(&pid_file)?, None);
+    producer.write_all(b"45\n")?;
+    assert_eq!(read_shutdown_descendant_pid(&pid_file)?, Some(12345));
+    Ok(())
+}
+
+fn wait_for_shutdown_descendant_pid(pid_file: &Path) -> anyhow::Result<u32> {
+    let mut pid = None;
+    wait_until("complete shutdown descendant PID record", || {
+        pid = read_shutdown_descendant_pid(pid_file)?;
+        Ok(pid.is_some())
+    })?;
+    pid.context("shutdown descendant PID was not published")
+}
+
+fn read_shutdown_descendant_pid(pid_file: &Path) -> anyhow::Result<Option<u32>> {
+    let record = match fs::read_to_string(pid_file) {
+        Ok(record) => record,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // printf's redirection exposes the file before its contents. Only the
+    // terminating newline signals that the entire PID has been published.
+    let Some(pid) = record.strip_suffix('\n') else {
+        return Ok(None);
+    };
+    Ok(Some(pid.parse()?))
 }
 
 fn write_shutdown_fake_codex(fake_bin: &Path, pid_file: &Path) -> anyhow::Result<()> {

@@ -416,13 +416,18 @@ struct CancellationLifecycle {
 }
 
 fn lifecycle_requires_recovery(lifecycle: &CancellationLifecycle) -> bool {
-    if lifecycle.run_state != "running" || lifecycle.occurrence_state != "recovery_required" {
+    if lifecycle.run_state != "running" {
         return false;
     }
     // The attempt's immutable ambiguity survives a crash before cancellation
     // finalization, including when terminal session evidence arrives meanwhile.
+    // It holds after the owner has recovered the occurrence with a new attempt,
+    // which this cancellation never targeted and must not mark.
     if lifecycle.attempt_state == "ambiguous" {
         return true;
+    }
+    if lifecycle.occurrence_state != "recovery_required" {
+        return false;
     }
     let terminal_session = matches!(
         lifecycle.session_state.as_str(),
@@ -639,9 +644,15 @@ fn recover_settled_result(
         "succeeded" | "failed" | "timed_out" | "recovery_required"
     ) && terminal_session;
     if held_failure || terminal_completion {
+        // Only a success completed the run. An attempt that failed, timed out
+        // or ended ambiguous is answered as a fresh request for it would be.
         let error = typed_error(
             ErrorCode::IllegalTransition,
-            "automation completion already won the cancellation race",
+            if attempt_state == "succeeded" {
+                "automation completion already won the cancellation race"
+            } else {
+                "the targeted automation attempt is no longer cancellable"
+            },
         );
         if !finalize_rejection(conn, reservation, &error, now)? {
             if let Some(replay) =
@@ -679,6 +690,20 @@ pub(crate) fn has_unresolved_stop(conn: &Connection, run_id: &str) -> Result<boo
         |row| row.get(0),
     )
     .map_err(|error| format!("failed to inspect unresolved automation stop: {error}"))
+}
+
+/// Call under the command's write transaction before recovering an occurrence.
+/// A pending cancellation still reconciles its own stop; recovery waits for it.
+pub(crate) fn has_pending_cancellation(conn: &Connection, run_id: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM automation_cancellations
+             WHERE run_id = ?1 AND state IN ('requested', 'stopping')
+         )",
+        [run_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("failed to inspect pending automation cancellation: {error}"))
 }
 
 pub fn cancellation_for_run(conn: &Connection, run_id: &str) -> Result<Option<Value>, String> {
@@ -946,9 +971,10 @@ fn execute_reserved_cancellation(
         return Ok(execution);
     }
     if reservation.recover_unknown_stop {
-        if let Err(mark_error) = super::runner::mark_unconfirmed_stop_for_recovery(
+        if let Err(mark_error) = super::runner::mark_unconfirmed_attempt_stop_for_recovery(
             conn,
             &reservation.request.run_id,
+            &reservation.request.attempt_id,
             "cancellation stop outcome was not durably recorded",
             now,
         ) {
@@ -1001,9 +1027,10 @@ fn execute_reserved_cancellation(
         super::runner::StopFenceClaim::Acquired => after_stop_fence_test_hook(),
         super::runner::StopFenceClaim::InProgress => {}
         super::runner::StopFenceClaim::UnknownOutcome => {
-            super::runner::mark_unconfirmed_stop_for_recovery(
+            super::runner::mark_unconfirmed_attempt_stop_for_recovery(
                 conn,
                 &reservation.request.run_id,
+                &reservation.request.attempt_id,
                 "cancellation stop outcome was not durably recorded",
                 now,
             )?;
@@ -1095,9 +1122,10 @@ fn execute_reserved_cancellation(
             if let Some(execution) = recover_settled_result(conn, &reservation, now, true)? {
                 return Ok(execution);
             }
-            if let Err(mark_error) = super::runner::mark_unconfirmed_stop_for_recovery(
+            if let Err(mark_error) = super::runner::mark_unconfirmed_attempt_stop_for_recovery(
                 conn,
                 &reservation.request.run_id,
+                &reservation.request.attempt_id,
                 "cancellation stop was not confirmed",
                 now,
             ) {
@@ -2039,6 +2067,38 @@ mod tests {
             result_json TEXT
         );
     ";
+
+    #[test]
+    fn an_ambiguous_target_still_needs_recovery_after_the_owner_recovers() {
+        let lifecycle = |attempt: &str, occurrence: &str| CancellationLifecycle {
+            run_state: "running".to_owned(),
+            attempt_state: attempt.to_owned(),
+            occurrence_state: occurrence.to_owned(),
+            session_state: "killed".to_owned(),
+            settled_at: None,
+            authority_profile: None,
+            session_exit_code: None,
+        };
+        assert!(lifecycle_requires_recovery(&lifecycle(
+            "ambiguous",
+            "recovery_required"
+        )));
+        // The owner's retry moved the occurrence on; the targeted attempt is
+        // still the ambiguous one.
+        for occurrence in ["planned", "claimed", "dispatching", "running"] {
+            assert!(lifecycle_requires_recovery(&lifecycle(
+                "ambiguous",
+                occurrence
+            )));
+        }
+        assert!(!lifecycle_requires_recovery(&lifecycle(
+            "started", "running"
+        )));
+        assert!(!lifecycle_requires_recovery(&CancellationLifecycle {
+            run_state: "failed".to_owned(),
+            ..lifecycle("ambiguous", "failed")
+        }));
+    }
 
     #[test]
     fn modern_migration_preserves_history_and_allows_next_attempt() -> anyhow::Result<()> {

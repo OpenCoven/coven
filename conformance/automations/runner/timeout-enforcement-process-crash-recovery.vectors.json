@@ -1,0 +1,315 @@
+{
+  "schemaVersion": "coven.automations.timeout-enforcement-process-crash-recovery-vectors.v1",
+  "cases": [
+    {
+      "caseId": "timeout-killed-inside-fence",
+      "boundary": "after_fence_insert",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "running",
+        "workerStops": 0,
+        "runAfterRestart": "timed_out",
+        "restartIsNoop": false,
+        "runAfterPass": "timed_out",
+        "runAfterSettle": "timed_out",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "timeout-killed-after-fence-commit",
+      "boundary": "after_fence_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "fenced",
+        "workerStops": 0,
+        "runAfterRestart": "contained",
+        "restartIsNoop": false,
+        "runAfterPass": "ambiguous",
+        "runAfterSettle": "failed",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "timeout-killed-after-stop",
+      "boundary": "after_stop",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "fenced",
+        "workerStops": 1,
+        "runAfterRestart": "contained",
+        "restartIsNoop": false,
+        "runAfterPass": "ambiguous",
+        "runAfterSettle": "failed",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "timeout-killed-after-session-end",
+      "boundary": "after_session_end",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "fenced",
+        "workerStops": 1,
+        "runAfterRestart": "contained",
+        "restartIsNoop": false,
+        "runAfterPass": "ambiguous",
+        "runAfterSettle": "failed",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "timeout-killed-after-attempt-settle",
+      "boundary": "after_attempt_settle",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "fenced",
+        "workerStops": 1,
+        "runAfterRestart": "contained",
+        "restartIsNoop": false,
+        "runAfterPass": "ambiguous",
+        "runAfterSettle": "failed",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "timeout-killed-after-run-finish",
+      "boundary": "after_run_finish",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "fenced",
+        "workerStops": 1,
+        "runAfterRestart": "contained",
+        "restartIsNoop": false,
+        "runAfterPass": "ambiguous",
+        "runAfterSettle": "failed",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "timeout-killed-after-occurrence-settle",
+      "boundary": "after_occurrence_settle",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "fenced",
+        "workerStops": 1,
+        "runAfterRestart": "contained",
+        "restartIsNoop": false,
+        "runAfterPass": "ambiguous",
+        "runAfterSettle": "failed",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "timeout-killed-after-fence-release",
+      "boundary": "after_fence_release",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "fenced",
+        "workerStops": 1,
+        "runAfterRestart": "contained",
+        "restartIsNoop": false,
+        "runAfterPass": "ambiguous",
+        "runAfterSettle": "failed",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "timeout-killed-after-settle-commit",
+      "boundary": "after_settle_commit",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "terminated",
+        "runAfterExit": "timed_out",
+        "workerStops": 1,
+        "runAfterRestart": "timed_out",
+        "restartIsNoop": true,
+        "runAfterPass": "timed_out",
+        "runAfterSettle": "timed_out",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    },
+    {
+      "caseId": "uninterrupted-timeout-control",
+      "boundary": "none",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-timeout-crash",
+        "name": "Conformance timeout crash",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 1,
+        "runtime": "coven-code",
+        "prompt": "Run the native timeout crash conformance probe.",
+        "cwd": "/work/project"
+      },
+      "expected": {
+        "initialOutcome": "responded",
+        "runAfterExit": "timed_out",
+        "workerStops": 1,
+        "runAfterRestart": "timed_out",
+        "restartIsNoop": true,
+        "runAfterPass": "timed_out",
+        "runAfterSettle": "timed_out",
+        "laterStops": 0,
+        "launches": 0,
+        "integrityOk": true,
+        "replayIsNoop": true
+      }
+    }
+  ]
+}

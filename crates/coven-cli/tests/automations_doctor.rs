@@ -100,7 +100,9 @@ fn doctor_report_fixture(genuine_receipt: bool) -> anyhow::Result<()> {
         INSERT INTO automation_runs(id,automation_id,occurrence_id,status,started_at,finished_at,delivery_state,delivery_reason)
         VALUES('doctor-private-run','doctor-private-definition','doctor-private-occurrence','failed','2026-10-18T00:00:00Z','2026-10-18T00:00:01Z','failed','doctor-private-delivery');
         INSERT INTO automation_attempts(id,run_id,occurrence_id,attempt_number,adoption_key,occurrence_fence_generation,state,failure_class,retry_classification,not_before,opened_at,settled_at,state_reason)
-        VALUES('doctor-private-attempt','doctor-private-run','doctor-private-occurrence',1,'doctor-private-adoption',1,'failed','launch_refused','initial','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z','2026-10-18T00:00:01Z','doctor-private-attempt-reason');")?;
+        VALUES('doctor-private-attempt','doctor-private-run','doctor-private-occurrence',1,'doctor-private-adoption',1,'failed','launch_refused','initial','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z','2026-10-18T00:00:01Z','doctor-private-attempt-reason');
+        INSERT INTO automation_stop_fences(run_id,session_id,owner,operation_key,acquired_at,execution_expires_at)
+        VALUES('doctor-private-run','doctor-private-session','cancellation','doctor-private-operation','2026-10-18T00:00:00Z','2026-10-18T00:00:30Z');")?;
     conn.execute(
         "UPDATE automation_runs SET log_json=?1 WHERE id='doctor-private-run'",
         [&receipt_body],
@@ -207,6 +209,27 @@ fn doctor_report_fixture(genuine_receipt: bool) -> anyhow::Result<()> {
         assert_eq!(facts("authority_refusals")["launch_refused_attempts"], 1);
         assert_eq!(facts("delivery_receipts")["failed_deliveries"], 1);
         assert_eq!(facts("delivery_receipts")["stored_receipts"], 1);
+        // The fence's lease ended long before the daemon's clock.
+        assert_eq!(facts("leases_fences")["stop_fences"], 1);
+        assert_eq!(facts("leases_fences")["expired_stop_fences"], 1);
+        assert_eq!(facts("leases_fences")["active_stop_fences"], 0);
+        assert_eq!(facts("leases_fences")["invalid_stop_fence_expiries"], 0);
+        // The seeded run has already failed: nothing is left to settle.
+        assert_eq!(facts("queue")["running_runs"], 0);
+        assert_eq!(facts("queue")["running_runs_with_ended_sessions"], 0);
+        assert_eq!(facts("queue")["running_runs_with_failed_latest_attempt"], 0);
+        assert_eq!(
+            facts("queue")["running_runs_with_ambiguous_latest_attempt"],
+            0
+        );
+        for fact in [
+            "pending_cancellations",
+            "active_pending_cancellations",
+            "expired_pending_cancellations",
+            "invalid_pending_cancellation_expiries",
+        ] {
+            assert_eq!(facts("leases_fences")[fact], 0, "{fact}");
+        }
         let delivery = report["observations"]
             .as_array()
             .unwrap()

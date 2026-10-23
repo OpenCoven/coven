@@ -4,7 +4,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::AgentId;
+use crate::{AgentId, DelegationDigests, StopReason};
 
 const MAX_AGENT_REF_COMPONENT_BYTES: usize = 127;
 
@@ -161,6 +161,11 @@ pub enum InvocationEventKind {
         to: AgentRef,
         name: String,
     },
+    /// The runner observed a stop request. At most once per invocation,
+    /// immediately before its terminal `failed` event.
+    CancellationRequested {
+        reason: StopReason,
+    },
     Completed {
         final_agent: AgentRef,
         turns: usize,
@@ -189,6 +194,9 @@ pub enum InvocationFailureKind {
     Limit,
     Authority,
     Context,
+    Cancelled,
+    TerminationUnknown,
+    RecoveryRequired,
 }
 
 /// Versioned metadata-only event for one provider-neutral agent invocation.
@@ -199,6 +207,10 @@ pub struct InvocationEvent {
     pub invocation: InvocationContext,
     pub source: InvocationSource,
     pub requested_target: AgentRef,
+    /// Digests of the admitted delegation, selected context and authority.
+    /// Correlation evidence only; this is not an authorization grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationDigests>,
     pub event: InvocationEventKind,
 }
 
@@ -211,6 +223,7 @@ impl InvocationEvent {
     ) -> Self {
         Self {
             contract: InvocationEventVersion::V1,
+            delegation: None,
             invocation,
             source,
             requested_target,
