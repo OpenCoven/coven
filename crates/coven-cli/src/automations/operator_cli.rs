@@ -457,8 +457,9 @@ mod tests {
         .unwrap();
         crate::automations::store::insert_definition(&conn, &definition).unwrap();
         // A retry waiting, and a lease running, until far beyond the real
-        // clock this test reads; a stale claim, a lease long expired, and a
-        // failed attempt held for an operator retry.
+        // clock this test reads; a stale claim, a lease long expired, a
+        // failed attempt held for an operator retry, and a run whose session
+        // has finished.
         conn.execute_batch(
             "INSERT INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
@@ -499,7 +500,93 @@ mod tests {
                  occurrence_fence_generation, state, retry_classification, not_before,
                  opened_at)
              VALUES ('a-hold', 'r-hold', 'o-hold', 1, 'r-hold-key', 1, 'failed', 'initial',
-                     '2026-10-17T09:00:00.000Z', '2026-10-17T09:00:00.000Z');",
+                     '2026-10-17T09:00:00.000Z', '2026-10-17T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 created_at, updated_at)
+             VALUES ('o-done', 'daily', '2026-10-16T09:00:00.000Z', 'manual', 'running', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, exit_code, created_at, updated_at)
+             VALUES ('s-done', '/work/project', 'codex', 'private sentinel', 'completed', 0,
+                     '2026-10-16T09:00:00.000Z', '2026-10-16T09:30:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+             VALUES ('r-done', 'daily', 'o-done', 's-done', 'coven-code', 'running',
+                     '2026-10-16T09:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-done', 'r-done', 'o-done', 1, 'r-done-key', 1, 'started', 'initial',
+                     '2026-10-16T09:00:00.000Z', 's-done', '2026-10-16T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 created_at, updated_at)
+             VALUES ('o-late', 'daily', '2026-10-15T09:00:00.000Z', 'manual', 'running', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, created_at, updated_at)
+             VALUES ('s-late', '/work/project', 'codex', 'private sentinel', 'running',
+                     '2026-10-15T09:00:00.000Z', '2026-10-15T09:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at,
+                 timeout_at)
+             VALUES ('r-late', 'daily', 'o-late', 's-late', 'coven-code', 'running',
+                     '2026-10-15T09:00:00.000Z', '2026-10-15T10:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-late', 'r-late', 'o-late', 1, 'r-late-key', 1, 'started', 'initial',
+                     '2026-10-15T09:00:00.000Z', 's-late', '2026-10-15T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 lease_expires_at, created_at, updated_at)
+             VALUES ('o-launch', 'daily', '2026-10-14T09:00:00.000Z', 'manual', 'claimed', 1,
+                     'operator', '2026-10-14T10:00:00.000Z', '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, created_at, updated_at)
+             VALUES ('s-launch', '/work/project', 'codex', 'private sentinel', 'created',
+                     '2026-10-14T09:00:00.000Z', '2026-10-14T09:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+             VALUES ('r-launch', 'daily', 'o-launch', 's-launch', 'coven-code', 'running',
+                     '2026-10-14T09:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-launch', 'r-launch', 'o-launch', 1, 'r-launch-key', 1, 'dispatching',
+                     'initial', '2026-10-14T09:00:00.000Z', 's-launch',
+                     '2026-10-14T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 created_at, updated_at)
+             VALUES ('o-cancel', 'daily', '2026-10-13T09:00:00.000Z', 'manual', 'running', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, created_at, updated_at)
+             VALUES ('s-cancel', '/work/project', 'codex', 'private sentinel', 'running',
+                     '2026-10-13T09:00:00.000Z', '2026-10-13T09:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+             VALUES ('r-cancel', 'daily', 'o-cancel', 's-cancel', 'coven-code', 'running',
+                     '2026-10-13T09:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-cancel', 'r-cancel', 'o-cancel', 1, 'r-cancel-key', 1, 'started',
+                     'initial', '2026-10-13T09:00:00.000Z', 's-cancel',
+                     '2026-10-13T09:00:00.000Z');
+             INSERT INTO automation_cancellations
+                (adoption_key, request_digest, automation_id, run_id, attempt_id, session_id,
+                 scope, requested_by_json, reason, state, requested_at, execution_expires_at)
+             VALUES ('cancel-key', 'digest', 'daily', 'r-cancel', 'a-cancel', 's-cancel', 'run',
+                     '{\"principalId\":\"operator\"}', 'private sentinel', 'requested',
+                     '2026-10-13T09:00:00.000Z', '2026-10-13T09:00:30.000Z');",
         )
         .unwrap();
         // A held authority names the claims its next pass releases.
@@ -527,6 +614,22 @@ mod tests {
         assert_eq!(
             output["explanation"]["work"],
             json!([{
+                "code": "cancellation_expired", "occurrenceId": "o-cancel", "runId": "r-cancel",
+                "at": "2026-10-13T09:00:00.000Z", "holdsClaims": true,
+                "nextStep": "await_cancellation"
+            }, {
+                "code": "launch_abandoned", "occurrenceId": "o-launch", "runId": "r-launch",
+                "at": "2026-10-14T09:00:00.000Z", "leaseExpiresAt": "2026-10-14T10:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
+                "code": "timeout_expired", "occurrenceId": "o-late", "runId": "r-late",
+                "at": "2026-10-15T09:00:00.000Z", "deadlineAt": "2026-10-15T10:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
+                "code": "session_finished", "occurrenceId": "o-done", "runId": "r-done",
+                "at": "2026-10-16T09:00:00.000Z", "holdsClaims": true,
+                "nextStep": "await_settlement"
+            }, {
                 "code": "retry_held", "occurrenceId": "o-hold", "runId": "r-hold",
                 "at": "2026-10-17T09:00:00.000Z", "deadlineAt": "2099-01-01T03:00:00.000Z",
                 "holdsClaims": true, "nextStep": "await_settlement"

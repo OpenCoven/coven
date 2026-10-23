@@ -2,6 +2,7 @@
 //! Trusted inputs are the owner's explicit policy and instance fingerprint.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -20,6 +21,7 @@ use super::grant::{
     validate_scope_set, AssuranceLevel, DeviceActionIntent, DeviceGrant, DeviceScope,
     GrantTransportConstraint, DEVICE_ACTION_VERSION,
 };
+use super::owner_policy::OwnerPolicyStore;
 use super::registry::{DeviceAuthorizationRecord, DeviceRecord, DeviceRegistry};
 
 pub(super) const MAX_INTRODUCTIONS: usize = 128;
@@ -47,7 +49,7 @@ pub struct IntroductionPolicy {
 }
 
 impl IntroductionPolicy {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         if self.required_approvals != 1 {
             bail!("unsupported introduction approval threshold");
         }
@@ -66,12 +68,12 @@ impl IntroductionPolicy {
         Ok(())
     }
 
-    fn digest(&self) -> Result<String> {
+    pub(super) fn digest(&self) -> Result<String> {
         self.validate()?;
         Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(serde_jcs::to_vec(self)?)))
     }
 
-    fn minimum_assurance(&self) -> AssuranceLevel {
+    pub(super) fn minimum_assurance(&self) -> AssuranceLevel {
         match self.required_assurance {
             RequestedAssurance::FreshUserVerification => AssuranceLevel::FreshUserVerification,
             RequestedAssurance::FreshBiometric => AssuranceLevel::FreshBiometric,
@@ -168,8 +170,11 @@ pub struct IntroductionAuthority {
     home: PathBuf,
     audience: [u8; 32],
     policy: IntroductionPolicy,
-    registry: DeviceRegistry,
-    challenges: AssuranceChallengeStore,
+    /// Set when policy came from the protected store; each check re-reads the
+    /// head so a replacement retires requests bound to the previous policy.
+    installed: Option<(OwnerPolicyStore, String)>,
+    registry: Arc<DeviceRegistry>,
+    challenges: Arc<AssuranceChallengeStore>,
 }
 
 impl IntroductionAuthority {
@@ -187,9 +192,67 @@ impl IntroductionAuthority {
             home: home.to_owned(),
             audience,
             policy,
-            registry: DeviceRegistry::load(home)?,
-            challenges: AssuranceChallengeStore::load(home)?,
+            installed: None,
+            registry: Arc::new(DeviceRegistry::load(home)?),
+            challenges: Arc::new(AssuranceChallengeStore::load(home)?),
         })
+    }
+
+    /// Loads policy only from the owner-root anchored store.
+    pub fn load_installed(home: &Path, audience: [u8; 32]) -> Result<Self> {
+        let store = OwnerPolicyStore::open(home, audience)?;
+        let current = store
+            .current()?
+            .context("introduction policy is not installed")?;
+        let mut authority = Self::load(home, audience, Some(current.policy))?;
+        authority.installed = Some((store, current.digest));
+        Ok(authority)
+    }
+
+    /// Reuses runtime stores so registry waits observe runtime shutdown.
+    pub(super) fn load_installed_with_stores(
+        home: &Path,
+        audience: [u8; 32],
+        registry: Arc<DeviceRegistry>,
+        challenges: Arc<AssuranceChallengeStore>,
+    ) -> Result<Self> {
+        let store = OwnerPolicyStore::open(home, audience)?;
+        let current = store
+            .current()?
+            .context("introduction policy is not installed")?;
+        current.policy.validate()?;
+        if audience == [0; 32] {
+            bail!("introduction audience is not configured");
+        }
+        Ok(Self {
+            home: home.to_owned(),
+            audience,
+            policy: current.policy,
+            installed: Some((store, current.digest)),
+            registry,
+            challenges,
+        })
+    }
+
+    /// Admission check before an introducer is asked to approve: the request
+    /// is current under trusted policy and the destination proved possession.
+    /// Consumes nothing; `introduce` re-runs every check at commit.
+    pub fn admit(
+        &self,
+        request: &IntroductionRequest,
+        destination_signature: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.registry
+            .with_introducer(request.introducer_id, |source, key| {
+                self.validate_authority(request, source, key, now)?;
+                verify_assurance_signature(
+                    &request.destination_public_key,
+                    &request.possession_bytes()?,
+                    destination_signature,
+                )?;
+                Ok(())
+            })
     }
 
     pub fn policy_digest(&self) -> Result<String> {
@@ -334,6 +397,11 @@ impl IntroductionAuthority {
         request.validate()?;
         if request.audience != self.audience || request.policy_digest != self.policy.digest()? {
             bail!("introduction audience or owner policy mismatch");
+        }
+        if let Some((store, digest)) = &self.installed {
+            if store.current()?.map(|head| head.digest).as_ref() != Some(digest) {
+                bail!("introduction owner policy was replaced");
+            }
         }
         if self
             .policy

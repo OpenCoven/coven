@@ -55,6 +55,10 @@ impl Fixture {
             ),
             registry,
             advertised_endpoint: Some("https://192.0.2.1:7443".into()),
+            introductions: super::super::enrollment::IntroductionLedger::new(
+                home.path(),
+                identity.public_key_fingerprint,
+            ),
         };
         Self {
             _home: home,
@@ -435,6 +439,7 @@ fn authenticated_bootstrap_reuses_identity_and_persists_routing_without_qr() {
 
 #[test]
 fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers() {
+    let _guard = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
     use super::super::transport::{self, test_support::Relay, websocket};
     let fixture = Fixture::new();
     let relay = Relay::start();

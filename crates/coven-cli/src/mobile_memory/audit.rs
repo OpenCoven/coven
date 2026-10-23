@@ -56,6 +56,10 @@ pub enum MobileAuditEvent {
     DeviceIntroduced,
     DeviceIntroductionRejected,
     DeviceIntroductionUncertain,
+    IntroductionPolicyInstalled,
+    IntroductionPolicyReplaced,
+    IntroductionPolicyRejected,
+    IntroductionPolicyUncertain,
     DeviceRenamed,
     DeviceSuspended,
     DeviceResumed,
@@ -177,6 +181,27 @@ pub(crate) fn append_grant_reissue_event(
             event: MobileAuditEvent::DeviceGrantReissued,
             device_id: Some(transition.device_id),
             transition_id: Some(transition.transition_id),
+            source_device_id: None,
+            replacement_device_id: None,
+        },
+    )
+}
+
+pub(super) fn append_policy_event(
+    coven_home: &Path,
+    transition_id: Uuid,
+    occurred_at: DateTime<Utc>,
+    event: MobileAuditEvent,
+) -> Result<AuditDeliveryReceipt> {
+    let _guard = AuditStoreLock::acquire(coven_home)?;
+    append_transition_record_locked(
+        coven_home,
+        transition_id,
+        &MobileAuditRecord {
+            timestamp: occurred_at,
+            event,
+            device_id: None,
+            transition_id: Some(transition_id),
             source_device_id: None,
             replacement_device_id: None,
         },

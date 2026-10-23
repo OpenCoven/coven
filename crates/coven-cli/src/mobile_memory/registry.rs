@@ -259,6 +259,13 @@ impl DeviceRegistry {
         self.stopped.store(true, Ordering::Release);
     }
 
+    pub(super) fn ensure_running(&self) -> Result<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            bail!("device registry operation cancelled during runtime shutdown");
+        }
+        Ok(())
+    }
+
     fn acquire_store_lock(&self) -> Result<DeviceRegistryStoreLock> {
         DeviceRegistryStoreLock::acquire_cancellable(&self.path, &self.stopped, || {
             #[cfg(test)]

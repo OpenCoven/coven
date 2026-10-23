@@ -882,6 +882,7 @@ dependencies = [
  "sha2 0.11.1",
  "similar",
  "snow",
+ "syn 2.0.117",
  "sysinfo",
  "tempfile",
  "textwrap",
@@ -968,7 +969,7 @@ dependencies = [
 [[package]]
 name = "coven-threads-core"
 version = "0.2.0"
-source = "git+https://github.com/OpenCoven/coven-threads?rev=78e47c9d2430582128679fd4a54f9966f2f4f976#78e47c9d2430582128679fd4a54f9966f2f4f976"
+source = "git+https://github.com/OpenCoven/coven-threads?rev=7b5a9e688bff46bf9093e6065820921d119c4747#7b5a9e688bff46bf9093e6065820921d119c4747"
 dependencies = [
  "blake3",
  "serde",
@@ -1108,9 +1109,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
 ]

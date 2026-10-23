@@ -9,18 +9,21 @@ source_adjacent_reason: "Defines the authorization and persistence invariants im
 
 # Local trusted-device introduction
 
-Tracks #1256 under #788. `IntroductionAuthority` is a local Rust authorization
-seam; no CLI command, daemon/API route, relay connection or remote enrollment
-is enabled. Tests use synthetic P-256 keys and disposable local state.
+Tracks #1256 under #788. `IntroductionAuthority` is the Rust authorization
+seam. The only ingress is local enrollment (below): owner-socket admission plus
+the introducer's approval over the authenticated private-network gateway. No
+relay connection or remote enrollment is enabled. Tests use synthetic P-256
+keys and disposable local state.
 
 ## Trusted inputs and explicit policy
 
 The owner authority supplies the home, the installation's public-key fingerprint
 (the pairing-v2 audience), and an explicit `IntroductionPolicy`. These inputs
 are trusted local configuration, never fields selected by an enrollment caller.
-The policy is immutable for an authority instance; a future live policy manager
-must serialize policy replacement with in-flight enrollment and retire old
-instances. This checkpoint does not implement such a manager.
+The policy is immutable for an authority instance. `load_installed` reads it
+from the protected owner policy store (below) and re-reads the store head on
+every challenge and commit check, so a replacement retires authority instances
+and requests bound to the previous policy.
 
 There is no default policy or approval threshold. A policy must specify a
 canonical nonempty eligible-introducer list, allowed scopes, maximum grant
@@ -110,6 +113,130 @@ introduction records remain readable. Older binaries with a closed registry
 schema reject the new field; rolling back must preserve this state and use a
 compatible reader, never delete the ledger to make an older binary accept it.
 
+## Protected owner policy store
+
+Tracks #1533. `OwnerPolicyStore` persists the policy in
+`mobile/introduction-policy.json` as a hash chain anchored to an **owner-root
+credential**: a P-256 public key registered at install. Only the public key is
+stored; the private half stays with the owner, outside `COVEN_HOME` and off
+OpenCoven infrastructure.
+
+Each record binds the audience, owner-root key, revision, previous digest and
+policy. Its digest is SHA-256 of `COVEN-INTRODUCTION-POLICY/1\0` followed by
+the JCS encoding of those fields, and it becomes the `effect_digest` of a
+`COVEN-ACTION/1` intent (`DeviceAdmin`, audience target, nonce, at most 300
+seconds of validity).
+
+- **Install** (`owner.introduction_policy.install`) succeeds only when no policy
+  exists, starts the chain at revision 1, and must be signed by the root key it
+  registers, proving possession.
+- **Replace** (`owner.introduction_policy.replace`) must name the current head as
+  its predecessor. Committed and older signed changes therefore cannot be
+  replayed or rolled back.
+- The **owner-root signature** may approve any valid replacement, including a
+  downgrade.
+- A **current eligible introducer** may approve a replacement only when the new
+  policy is at least as strict on every dimension: introducers ⊆, scopes ⊆,
+  approvals ≥, lifetime ≤, step-up age ≤, assurance ≥. It signs
+  `devices.introduction_policy.replace` with its possession key, and supplies a
+  fresh `COVEN-ASSURANCE/1` action step-up meeting the *current* policy, under
+  the same source checks as introduction.
+- A downgrade without the root signature is refused. Replacing the root key is
+  owner identity rotation, which this store does not implement.
+
+Loads fail closed on an unknown version, another audience, a digest mismatch,
+or a broken chain. Root-approved heads re-verify their signature on every load,
+so a store edited to widen policy is refused even with a recomputed digest.
+Device-approved heads record the approver's device, grant, epoch, key ID and
+spent challenge.
+
+An attacker with owner write access to `COVEN_HOME` already controls the
+registry and is outside this store's threat model. The store defends against
+caller-selected policy, relay or account services, and approval by a device.
+
+Lock order is policy store → device registry → authorization-key registry →
+assurance challenge store. Introduction reads the head without the policy lock.
+Audit uses `introduction_policy_installed`, `_replaced`, `_rejected` and
+`_uncertain` with opaque transition IDs only. Success returns after audit
+delivery. A committed-but-unaudited head is retried by `reconcile_audit`, which
+never re-applies or re-authorizes a change. The fixture is
+`tests/fixtures/owner-introduction-policy/mod.rs`:
+
+```sh
+cargo test -p coven-cli --bin coven mobile_memory::owner_policy --locked
+```
+
+### Owner CLI
+
+`coven device owner-root generate --out PATH` writes a new P-256 PKCS#8 key
+(`0600`, never overwriting) and refuses any path inside `COVEN_HOME`.
+`coven device introduction-policy install|replace --root-key PATH …` reads the
+key transiently and binds to the existing host identity. It never creates one;
+run `coven memory mobile enable` first.
+
+Before signing, the command prints every field the action binds:
+
+- operation, scope and audience
+- the owner-root key fingerprint
+- revision and previous digest
+- each policy dimension
+- nonce, issued-at, expiry and effect digest
+
+A replacement also names each broadened dimension as a `DOWNGRADE`. Nothing is
+signed unless the owner types the exact word `install` or `replace`. A key that
+is not the installed root is refused before the prompt. `--yes` skips the typed
+word but not the printed review. `introduction-policy show [--json]` prints the
+head without key material. Device-approved tightening has no CLI; it needs the
+introducer's step-up through the enrollment route. Fixture:
+`tests/fixtures/owner-introduction-policy/cli.rs`.
+
+## Local enrollment
+
+`enrollment.rs` connects the seam to two parties who must both act.
+
+**1. Owner admission.** The local owner runs
+`coven device introduce --request ENVELOPE`. The envelope holds the new
+installation's `IntroductionRequest` and its `devices.introduction.accept`
+signature. The command prints every material field of the request:
+
+- operation and audience
+- owner policy revision and digest
+- introducer device, grant and epoch
+- new device ID, key fingerprint, name and context
+- grant ID, scopes, minimum assurance, fresh-verification scopes, transport,
+  not-before and expiry
+- nonce, issued-at, expiry and effect digest
+
+After the owner types `introduce`, the command posts the envelope to the
+owner-socket route `POST /api/v1/internal/mobile/introductions`.
+
+Admission loads policy and audience only from the protected store and host
+identity. `IntroductionAuthority::admit` re-runs every authority check and
+verifies the destination's possession signature, consuming nothing. A
+destination that is already enrolled is refused. The TLS gateway has no
+admission route, so a relay or account service cannot put a request in front
+of an introducer.
+
+**2. Introducer approval.** `GET /api/v1/mobile/introductions` returns
+pending requests, with their exact action, only to the device each request
+names as introducer. Other devices get an empty list. The introducer app
+renders the request, takes a step-up challenge from the existing
+`/api/v1/mobile/assurance/challenge` route (same binding), and submits
+`POST /api/v1/mobile/introductions/{id}/approve` with its possession signature
+and action step-up proof.
+
+Transport authentication requires no scope here; `introduce` enforces
+`DeviceAdmin`, eligibility and fresh assurance at commit. Each admitted
+request gets one approval attempt. Any failure is terminal (`rejected`, or
+`uncertain` when the destination may have committed), so a forged or replayed
+approval cannot be retried into success.
+
+**Ledger.** The ledger is in memory and bounded at 16. A daemon restart drops
+pending entries, but never committed state. `uncertain` is never presented as
+failure. Owner status and cancel routes are `…/{id}/status` and
+`…/{id}/cancel`. Fixtures: `tests/fixtures/trusted-device-introduction/enrollment.rs`
+and the gateway route tests.
+
 ## Audit and remaining integration
 
 Events distinguish `device_introduced`, `device_introduction_rejected` and
@@ -127,9 +254,9 @@ compiled into the CLI unit tests. Run it with:
 cargo test -p coven-cli --bin coven mobile_memory::introduction --locked
 ```
 
-Transport integration, UI rendering of every signed material field, protected
-policy installation/replacement, passkeys, platform attestation, N-of-M,
-remote recovery and end-to-end #788 acceptance remain pending. The future
+Remote (relay) transport, the mobile client's rendering/signing of the pending
+request, passkeys, platform attestation, N-of-M, remote recovery and end-to-end
+#788 acceptance remain pending. The future
 integration must authenticate its channels, enforce transport restrictions,
 source audience/policy from local authority and expose uncertain outcomes
 without offering automatic retry-as-success. This checkpoint does not close #788.
