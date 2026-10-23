@@ -1516,24 +1516,20 @@ they make. What each case requires depends on what the worker committed:
   launches the routine once, the passes settle that run `succeeded`, and later
   requests replay the claim.
 - **The claim, killed after it commits or inside the launch:** the restart
-  changes no row. Startup restores only daemon claims, and the scheduler never
-  dispatches a manual one. Every request replays the stored claim without a
-  launch. The occurrence stays claimed until the pass after its lease fails it
-  `lease expired`, with no run, attempt or session.
-- **The launch, killed after it commits or inside ownership:** the restart
-  changes no row. Restart containment treats a missing receipt as the previous
-  daemon's containment only for a daemon-owned scheduled launch, so the manual
-  launch's `created` session stays ambiguous and is never relaunched: it stays
-  until the run's deadline. Every request replays the claim. The pass after
-  the deadline stops the session once and settles the run timed out.
-- **Ownership,** killed after it commits, and the control: the restart orphans
-  the `running` session and leaves the run, attempt and occurrence as they
-  were. Every request replays the claim, and the pass after the run's deadline
-  stops the session once and settles the run timed out.
-
-A run settled timed out has its attempt `timed_out` with the `timeout` class,
-its run `failed`, its occurrence `failed` with no lease, the deadline's reason
-on the attempt and the occurrence, and its session `killed`.
+  fails the claim at once, `daemon restarted before launch`, with no lease and
+  no run, attempt or session (#1502). The claim and the launch commit
+  separately and the launch writes its run before anything starts, so a claim
+  with no run launched nothing. Every request replays the failed occurrence
+  without a launch.
+- **The launch, killed after it commits or inside ownership, ownership killed
+  after it commits, and the control:** restart containment treats a missing
+  receipt as the previous daemon's containment for a run-now launch created
+  before the startup cutoff, as it does for a daemon-owned scheduled one
+  (#1502). It marks the session `killed` without a stop, and the startup pass
+  settles the attempt `failed` and holds the run for an operator retry. Every
+  request replays the claim. The pass after the deadline settles the held run
+  and the occurrence `failed`, `no operator retry was opened before the run's
+  deadline`.
 
 Every class pins the whole store: the counts, the one occurrence the owner's key
 names, of the `manual` kind and claimed once, with its lease and reason, and
@@ -1552,9 +1548,8 @@ evidence for a daemon killed while it handles one flat run-now request. It does
 not cover the command envelope, whose claim also reserves a result key and
 whose result is retained in a further transaction (see
 `run-now-envelope-process-crash-recovery`); a manual launch with a
-containment receipt; a manual launch left before ownership whose claim's lease
-expires before the run's deadline, which abandoned-launch recovery stops
-instead; the command's refusals; a graceful daemon restart (#1433);
+containment receipt; a manual launch created after the startup cutoff; the
+command's refusals; a graceful daemon restart (#1433);
 Runtime Authority runs, a real runtime process, power loss, load, complete
 profiles or release eligibility.
 
@@ -1579,11 +1574,10 @@ it after the claim's, the launch's, ownership's and the retention's commits. A
 control with no pause exits after the answer without the graceful shutdown's
 reconciliation or leadership release.
 
-The launch's recovery is the flat request's: a restart changes no row except
-to orphan an owned session, the scheduler never dispatches the manual claim,
-the pass after the lease fails a claim that never launched `lease expired`,
-and the pass after the run's deadline stops a launch once and settles it timed
-out. What the owner is answered depends on what the worker retained:
+The launch's recovery is the flat request's: the restart fails a claim that
+never launched, `daemon restarted before launch`, and contains a launch,
+holding its run until the pass after its deadline settles it `failed` (#1502).
+What the owner is answered depends on what the worker retained:
 
 - **Nothing committed:** the re-sent request claims, launches once and retains
   its result, and later requests replay that result.
