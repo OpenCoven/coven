@@ -67,6 +67,7 @@ impl Fixture {
             maximum_grant_lifetime_seconds: 86400,
             required_assurance: RequestedAssurance::FreshBiometric,
             maximum_step_up_age_seconds: 30,
+            minimum_attestation: Default::default(),
         };
         let destination_id = Uuid::from_u128(2);
         let mut destination_grant = DeviceGrant::for_device(
@@ -795,6 +796,7 @@ fn trusted_device_introduction_process_worker() {
         maximum_grant_lifetime_seconds: 86400,
         required_assurance: RequestedAssurance::FreshBiometric,
         maximum_step_up_age_seconds: 30,
+        minimum_attestation: Default::default(),
     };
     let authority = IntroductionAuthority::load(&home, [7; 32], Some(policy)).unwrap();
     let approval = IntroductionApproval {

@@ -1043,6 +1043,11 @@ enum DeviceCommand {
         #[arg(long, help = "Skip the typed confirmation after the review is printed")]
         yes: bool,
     },
+    #[command(about = "Configure optional device attestation trust (owner-supplied anchors)")]
+    Attestation {
+        #[command(subcommand)]
+        command: AttestationCommand,
+    },
     #[command(about = "Register or list optional passkey recovery factors")]
     Passkey {
         #[command(subcommand)]
@@ -1058,6 +1063,36 @@ enum DeviceCommand {
         #[command(subcommand)]
         command: IntroductionPolicyCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum AttestationCommand {
+    #[command(about = "Show configured attestation anchors and official apps")]
+    Show {
+        #[arg(long, help = "Print the configuration as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(
+        about = "Trust an Android attestation root certificate you supply (PEM or DER)",
+        long_about = "Trust an Android attestation root certificate you supply (PEM or DER).\n\n\
+                      Coven compiles in no vendor roots. An anchor can only raise a device's \
+                      assurance attribute to verified_hardware_key or verified_official_app; it \
+                      never creates identity or authority, and devices without attestation keep \
+                      working under owner policy."
+    )]
+    AddAndroidRoot {
+        #[arg(long, value_name = "CERTIFICATE")]
+        certificate: PathBuf,
+    },
+    #[command(about = "Name an official Android app (package and signing-certificate SHA-256)")]
+    AddOfficialAndroidApp {
+        #[arg(long, value_name = "PACKAGE")]
+        package: String,
+        #[arg(long, value_name = "BASE64URL_SHA256")]
+        signature_digest: String,
+    },
+    #[command(about = "Remove every anchor and official app")]
+    Clear,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1190,8 +1225,23 @@ struct IntroductionPolicyArgs {
         help = "Maximum age of the introducer's step-up (1-120 seconds)"
     )]
     max_step_up_seconds: u32,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "unattested-device",
+        help = "Attestation floor for introduced devices; the default keeps self-built and \
+                unattested clients working"
+    )]
+    minimum_attestation: IntroductionAttestationArg,
     #[arg(long, help = "Skip the typed confirmation after the review is printed")]
     yes: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum IntroductionAttestationArg {
+    UnattestedDevice,
+    VerifiedHardwareKey,
+    VerifiedOfficialApp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1221,6 +1271,17 @@ impl IntroductionPolicyArgs {
                 }
             },
             maximum_step_up_age_seconds: self.max_step_up_seconds,
+            minimum_attestation: match self.minimum_attestation {
+                IntroductionAttestationArg::UnattestedDevice => {
+                    mobile_memory::attestation::DeviceAttestation::UnattestedDevice
+                }
+                IntroductionAttestationArg::VerifiedHardwareKey => {
+                    mobile_memory::attestation::DeviceAttestation::VerifiedHardwareKey
+                }
+                IntroductionAttestationArg::VerifiedOfficialApp => {
+                    mobile_memory::attestation::DeviceAttestation::VerifiedOfficialApp
+                }
+            },
         };
         mobile_memory::policy_cli::run_root_change(kind, &self.root_key, policy, self.yes)
     }
@@ -2193,6 +2254,22 @@ fn run_cli(cli: Cli) -> Result<()> {
                 root_key,
                 yes,
             } => mobile_memory::recovery::run_recover(&request, &root_key, yes),
+            DeviceCommand::Attestation { command } => match command {
+                AttestationCommand::Show { json } => {
+                    mobile_memory::attestation::run_trust_show(json)
+                }
+                AttestationCommand::AddAndroidRoot { certificate } => {
+                    mobile_memory::attestation::run_trust_add_android_root(&certificate)
+                }
+                AttestationCommand::AddOfficialAndroidApp {
+                    package,
+                    signature_digest,
+                } => mobile_memory::attestation::run_trust_add_official_android_app(
+                    &package,
+                    &signature_digest,
+                ),
+                AttestationCommand::Clear => mobile_memory::attestation::run_trust_clear(),
+            },
             DeviceCommand::Passkey { command } => match command {
                 PasskeyCommand::Register {
                     registration,

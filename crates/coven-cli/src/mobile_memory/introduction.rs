@@ -15,6 +15,7 @@ use super::assurance::{
     AssuranceChallengeStore, AssuranceContext, ChallengeBinding, DeviceAuthorizationKeyRecord,
     IssuedAssuranceChallenge, PresentedAssuranceProof, RequestedAssurance,
 };
+use super::attestation::DeviceAttestation;
 use super::audit::{append_event, append_introduction_event, MobileAuditEvent};
 use super::grant::{
     validate_scope_set, AssuranceLevel, DeviceActionIntent, DeviceGrant, DeviceScope,
@@ -57,6 +58,10 @@ pub struct IntroductionPolicy {
     pub maximum_grant_lifetime_seconds: u32,
     pub required_assurance: RequestedAssurance,
     pub maximum_step_up_age_seconds: u32,
+    /// Optional owner-chosen attestation floor for introduced devices. Skipped
+    /// at its default so every existing policy digest and transcript is unchanged.
+    #[serde(skip_serializing_if = "DeviceAttestation::is_unattested")]
+    pub minimum_attestation: DeviceAttestation,
 }
 
 impl IntroductionPolicy {
@@ -471,6 +476,18 @@ impl IntroductionAuthority {
 
     pub(super) fn maximum_step_up_age(&self) -> chrono::Duration {
         chrono::Duration::seconds(i64::from(self.policy.maximum_step_up_age_seconds))
+    }
+
+    /// Attestation can only satisfy an owner-chosen floor; it never grants.
+    pub fn require_attestation(&self, attestation: DeviceAttestation) -> Result<()> {
+        if attestation < self.policy.minimum_attestation {
+            bail!(
+                "owner policy requires {} for introduced devices; this device is {}",
+                self.policy.minimum_attestation.as_str(),
+                attestation.as_str()
+            );
+        }
+        Ok(())
     }
 
     /// Admission check before approvers are asked: the request is current under

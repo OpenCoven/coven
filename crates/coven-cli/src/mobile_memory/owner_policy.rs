@@ -19,6 +19,7 @@ use super::assurance::{
     AssuranceChallengeStore, AssuranceContext, ChallengeBinding, IssuedAssuranceChallenge,
     PresentedAssuranceProof, RequestedAssurance,
 };
+use super::attestation::DeviceAttestation;
 use super::audit::{append_event, append_policy_event, MobileAuditEvent};
 use super::config::{
     atomic_create_private, atomic_replace_private, ensure_private_mobile_dir, validate_private_file,
@@ -58,6 +59,8 @@ struct PolicyDocument {
     maximum_grant_lifetime_seconds: u32,
     required_assurance: RequestedAssurance,
     maximum_step_up_age_seconds: u32,
+    #[serde(default, skip_serializing_if = "DeviceAttestation::is_unattested")]
+    minimum_attestation: DeviceAttestation,
 }
 
 impl From<&IntroductionPolicy> for PolicyDocument {
@@ -69,6 +72,7 @@ impl From<&IntroductionPolicy> for PolicyDocument {
             maximum_grant_lifetime_seconds: policy.maximum_grant_lifetime_seconds,
             required_assurance: policy.required_assurance,
             maximum_step_up_age_seconds: policy.maximum_step_up_age_seconds,
+            minimum_attestation: policy.minimum_attestation,
         }
     }
 }
@@ -82,6 +86,7 @@ impl From<PolicyDocument> for IntroductionPolicy {
             maximum_grant_lifetime_seconds: document.maximum_grant_lifetime_seconds,
             required_assurance: document.required_assurance,
             maximum_step_up_age_seconds: document.maximum_step_up_age_seconds,
+            minimum_attestation: document.minimum_attestation,
         }
     }
 }
@@ -220,6 +225,9 @@ pub(super) fn broadened_dimensions(
     }
     if new.maximum_step_up_age_seconds > old.maximum_step_up_age_seconds {
         broadened.push("maximum step-up age");
+    }
+    if new.minimum_attestation < old.minimum_attestation {
+        broadened.push("minimum attestation");
     }
     broadened
 }
