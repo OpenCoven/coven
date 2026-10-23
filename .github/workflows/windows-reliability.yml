@@ -884,7 +884,7 @@ jobs:
           @{source=$env:SOURCE_OUTCOME;controls=$env:CONTROL_OUTCOME;collector=$env:TOKEN_OUTCOME;binding=$env:BINDING_OUTCOME;execution=$execution;publicReceiptAdmitted=($env:BINDING_OUTCOME -ceq 'success' -and $env:RECEIPT_ADMITTED -ceq 'true');captureAttempted=$false;metadataComplete=$false} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $env:TOKEN_ROOT 'outcome.json')
       - name: Retain explicit token source and outcome evidence
         if: always() && steps.prepare.outcome == 'success'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-reliability-token-source-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -896,7 +896,7 @@ jobs:
           retention-days: 14
       - name: Retain independently validated public token receipt only
         if: always() && steps.binding.outcome == 'success' && steps.binding.outputs.receipt-admitted == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-reliability-token-receipt-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.TOKEN_ROOT }}/public/receipt.json
