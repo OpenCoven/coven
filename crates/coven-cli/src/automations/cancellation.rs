@@ -1104,6 +1104,14 @@ fn execute_reserved_cancellation(
                 replayed: true,
             }));
         }
+        super::runner::StopFenceClaim::UnreadableLease(reason) => {
+            // A damaged lease cannot prove who owns the stop. Answer without
+            // storing a result, so a repaired store can still execute it.
+            return Ok(CancellationExecution::Rejected(typed_error(
+                ErrorCode::Internal,
+                format!("{reason}; run `coven automations doctor`"),
+            )));
+        }
         super::runner::StopFenceClaim::Conflict => {
             if let Some(replay) =
                 load_adopted_response(conn, &reservation.request.adoption_key, &reservation.digest)?

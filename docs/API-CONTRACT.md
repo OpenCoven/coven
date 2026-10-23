@@ -766,18 +766,15 @@ Among them:
   byte, on which restart containment fails;
 - a run whose session is still `created` on a `claimed` occurrence whose
   stored lease is not after `observedAt`, with no stored deadline at or before
-  it, holding its own recovery stop fence whose expiry cannot be read, or has
-  passed while the run does not have exactly one live attempt on the session,
-  where a dispatch needs none, on which abandoned-launch recovery fails;
+  it, holding its own recovery stop fence whose expiry has passed while the run
+  does not have exactly one live attempt on the session, where a dispatch needs
+  none, on which abandoned-launch recovery fails;
 - a retry with no session and an adopted attempt whose expired retry's
   occurrence is neither `planned` nor `claimed`, on which timeout enforcement
   fails before settlement runs;
 - an unfenced run holding a failed attempt whose occurrence is not `claimed`,
   `running` or `recovery_required` at its deadline, on which settlement fails
-  after timeout enforcement has run;
-- a run past its deadline whose session and attempt are live, holding its own
-  timeout stop fence whose expiry cannot be read, on which timeout enforcement
-  fails.
+  after timeout enforcement has run.
 
 Such a run is not named: it is listed as `running_run`, or its occurrence as
 `in_flight` or `recovery_required`.
@@ -865,8 +862,8 @@ These runs past their deadline are listed as `in_flight` instead:
 - one with a requested or stopping cancellation, which the pass leaves to that
   cancellation, or reconciles first once it expires;
 - one with a stop fence, which the pass leaves to that stop, holds for recovery
-  when its own timeout stop expired, or fails on when that stop's expiry cannot
-  be read;
+  when its own timeout stop expired, or skips when that stop's expiry cannot be
+  read;
 - one sharing its occurrence with another running run, which can settle the
   occurrence first;
 - one with a value the pass cannot decode, such as its session's exit code or
@@ -908,7 +905,8 @@ These launches past their lease are listed as `in_flight` instead:
   cancellation, or reconciles first once it expires;
 - one with a stop fence, which recovery leaves to that stop; when it is the
   run's own recovery stop and has expired, recovery holds the run for recovery
-  instead, and it fails the pass in the cases listed above;
+  instead, and it fails the pass in the cases listed above; recovery skips the
+  run when that stop's expiry cannot be read;
 - one sharing its occurrence with another running run, which can settle the
   occurrence first;
 - one with a value the pass cannot read, such as its session's creation time
