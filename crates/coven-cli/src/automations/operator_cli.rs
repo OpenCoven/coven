@@ -519,7 +519,27 @@ mod tests {
                  occurrence_fence_generation, state, retry_classification, not_before,
                  session_id, opened_at)
              VALUES ('a-done', 'r-done', 'o-done', 1, 'r-done-key', 1, 'started', 'initial',
-                     '2026-10-16T09:00:00.000Z', 's-done', '2026-10-16T09:00:00.000Z');",
+                     '2026-10-16T09:00:00.000Z', 's-done', '2026-10-16T09:00:00.000Z');
+             INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+                 created_at, updated_at)
+             VALUES ('o-late', 'daily', '2026-10-15T09:00:00.000Z', 'manual', 'running', 1,
+                     'operator', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO sessions
+                (id, project_root, harness, title, status, created_at, updated_at)
+             VALUES ('s-late', '/work/project', 'codex', 'private sentinel', 'running',
+                     '2026-10-15T09:00:00.000Z', '2026-10-15T09:00:00.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at,
+                 timeout_at)
+             VALUES ('r-late', 'daily', 'o-late', 's-late', 'coven-code', 'running',
+                     '2026-10-15T09:00:00.000Z', '2026-10-15T10:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, retry_classification, not_before,
+                 session_id, opened_at)
+             VALUES ('a-late', 'r-late', 'o-late', 1, 'r-late-key', 1, 'started', 'initial',
+                     '2026-10-15T09:00:00.000Z', 's-late', '2026-10-15T09:00:00.000Z');",
         )
         .unwrap();
         // A held authority names the claims its next pass releases.
@@ -547,6 +567,10 @@ mod tests {
         assert_eq!(
             output["explanation"]["work"],
             json!([{
+                "code": "timeout_expired", "occurrenceId": "o-late", "runId": "r-late",
+                "at": "2026-10-15T09:00:00.000Z", "deadlineAt": "2026-10-15T10:00:00.000Z",
+                "holdsClaims": true, "nextStep": "await_settlement"
+            }, {
                 "code": "session_finished", "occurrenceId": "o-done", "runId": "r-done",
                 "at": "2026-10-16T09:00:00.000Z", "holdsClaims": true,
                 "nextStep": "await_settlement"
