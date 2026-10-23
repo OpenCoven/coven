@@ -1008,6 +1008,119 @@ enum DeviceCommand {
         #[arg(value_name = "REPLACEMENT_DEVICE", value_parser = parse_nonempty_arg)]
         replacement_device: String,
     },
+    #[command(about = "Manage the offline owner-root credential")]
+    OwnerRoot {
+        #[command(subcommand)]
+        command: OwnerRootCommand,
+    },
+    #[command(about = "Show or change the protected trusted-device introduction policy")]
+    IntroductionPolicy {
+        #[command(subcommand)]
+        command: IntroductionPolicyCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OwnerRootCommand {
+    #[command(
+        about = "Generate an owner-root key outside COVEN_HOME",
+        long_about = "Generate an owner-root P-256 key and write it to a new file outside \
+                      COVEN_HOME. Coven stores only the public key, at policy install. Keep \
+                      the file offline: it is required to approve any introduction-policy \
+                      downgrade."
+    )]
+    Generate {
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IntroductionPolicyCommand {
+    #[command(about = "Show the installed introduction policy")]
+    Show {
+        #[arg(long, help = "Print the policy as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Install the first policy, registering the owner-root key")]
+    Install(IntroductionPolicyArgs),
+    #[command(about = "Replace the policy with an owner-root signature (may downgrade)")]
+    Replace(IntroductionPolicyArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct IntroductionPolicyArgs {
+    #[arg(
+        long,
+        value_name = "PEM",
+        help = "Owner-root private key file (outside COVEN_HOME)"
+    )]
+    root_key: PathBuf,
+    #[arg(
+        long = "introducer",
+        value_name = "DEVICE_ID",
+        required = true,
+        help = "Device allowed to introduce new devices; repeat for several"
+    )]
+    introducers: Vec<Uuid>,
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        required = true,
+        help = "Scopes an introduced grant may carry; repeat or comma-separate values"
+    )]
+    scope: Vec<DeviceScopeArg>,
+    #[arg(
+        long,
+        value_name = "DAYS",
+        value_parser = clap::value_parser!(u16).range(1..=365),
+        help = "Maximum lifetime of an introduced grant in whole days (1-365)"
+    )]
+    max_grant_days: u16,
+    #[arg(long, value_enum, help = "Fresh assurance the introducer must prove")]
+    assurance: IntroductionAssuranceArg,
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u32).range(1..=120),
+        help = "Maximum age of the introducer's step-up (1-120 seconds)"
+    )]
+    max_step_up_seconds: u32,
+    #[arg(long, help = "Skip the typed confirmation after the review is printed")]
+    yes: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum IntroductionAssuranceArg {
+    FreshUserVerification,
+    FreshBiometric,
+}
+
+impl IntroductionPolicyArgs {
+    fn into_change(self, kind: mobile_memory::policy_cli::PolicyChangeKind) -> Result<()> {
+        let mut introducers = self.introducers;
+        introducers.sort_unstable();
+        if introducers.windows(2).any(|window| window[0] == window[1]) {
+            bail!("introducers must be unique");
+        }
+        let policy = mobile_memory::introduction::IntroductionPolicy {
+            eligible_introducers: introducers,
+            required_approvals: 1,
+            allowed_scopes: canonical_device_scopes(self.scope)?,
+            maximum_grant_lifetime_seconds: u32::from(self.max_grant_days) * 86_400,
+            required_assurance: match self.assurance {
+                IntroductionAssuranceArg::FreshUserVerification => {
+                    mobile_memory::assurance::RequestedAssurance::FreshUserVerification
+                }
+                IntroductionAssuranceArg::FreshBiometric => {
+                    mobile_memory::assurance::RequestedAssurance::FreshBiometric
+                }
+            },
+            maximum_step_up_age_seconds: self.max_step_up_seconds,
+        };
+        mobile_memory::policy_cli::run_root_change(kind, &self.root_key, policy, self.yes)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1969,6 +2082,20 @@ fn run_cli(cli: Cli) -> Result<()> {
                 old_device,
                 replacement_device,
             } => mobile_memory::device::run_rotate(&old_device, &replacement_device),
+            DeviceCommand::OwnerRoot {
+                command: OwnerRootCommand::Generate { out },
+            } => mobile_memory::policy_cli::run_generate_owner_root(&out),
+            DeviceCommand::IntroductionPolicy { command } => match command {
+                IntroductionPolicyCommand::Show { json } => {
+                    mobile_memory::policy_cli::run_show(json)
+                }
+                IntroductionPolicyCommand::Install(args) => {
+                    args.into_change(mobile_memory::policy_cli::PolicyChangeKind::Install)
+                }
+                IntroductionPolicyCommand::Replace(args) => {
+                    args.into_change(mobile_memory::policy_cli::PolicyChangeKind::Replace)
+                }
+            },
         },
         Some(Command::Memory { command, json }) => match command {
             Some(MemoryCommand::Open) => memory_dashboard::run_open(),

@@ -117,7 +117,7 @@ Tracks #1533. `OwnerPolicyStore` persists the policy in
 `mobile/introduction-policy.json` as a hash chain anchored to an **owner-root
 credential**: a P-256 public key registered at install. Only the public key is
 stored; the private half stays with the owner, outside `COVEN_HOME` and off
-OpenCoven infrastructure. No CLI command or route reaches the store yet.
+OpenCoven infrastructure.
 
 Each record binds the audience, owner-root key, revision, previous digest and
 policy. Its digest is SHA-256 of `COVEN-INTRODUCTION-POLICY/1\0` followed by
@@ -164,6 +164,30 @@ never re-applies or re-authorizes a change. The fixture is
 cargo test -p coven-cli --bin coven mobile_memory::owner_policy --locked
 ```
 
+### Owner CLI
+
+`coven device owner-root generate --out PATH` writes a new P-256 PKCS#8 key
+(`0600`, never overwriting) and refuses any path inside `COVEN_HOME`.
+`coven device introduction-policy install|replace --root-key PATH …` reads the
+key transiently and binds to the existing host identity. It never creates one;
+run `coven memory mobile enable` first.
+
+Before signing, the command prints every field the action binds:
+
+- operation, scope and audience
+- the owner-root key fingerprint
+- revision and previous digest
+- each policy dimension
+- nonce, issued-at, expiry and effect digest
+
+A replacement also names each broadened dimension as a `DOWNGRADE`. Nothing is
+signed unless the owner types the exact word `install` or `replace`. A key that
+is not the installed root is refused before the prompt. `--yes` skips the typed
+word but not the printed review. `introduction-policy show [--json]` prints the
+head without key material. Device-approved tightening has no CLI; it needs the
+introducer's step-up through the enrollment route. Fixture:
+`tests/fixtures/owner-introduction-policy/cli.rs`.
+
 ## Audit and remaining integration
 
 Events distinguish `device_introduced`, `device_introduction_rejected` and
@@ -181,8 +205,8 @@ compiled into the CLI unit tests. Run it with:
 cargo test -p coven-cli --bin coven mobile_memory::introduction --locked
 ```
 
-Transport integration, UI rendering of every signed material field, an owner
-route/CLI for policy installation and replacement, passkeys, platform attestation, N-of-M,
+Transport integration, an owner enrollment route with UI rendering of every
+signed introduction field, passkeys, platform attestation, N-of-M,
 remote recovery and end-to-end #788 acceptance remain pending. The future
 integration must authenticate its channels, enforce transport restrictions,
 source audience/policy from local authority and expose uncertain outcomes
