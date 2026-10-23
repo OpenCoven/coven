@@ -32,10 +32,48 @@ yet. They cover:
 - listings and searches that leave out every entry a read would refuse;
 - the per-file, per-attempt, scan, call, page, depth and path-length limits.
 
-Still open: the service channel and tool schema, harness admission, response
-commitment under the revocation fence, the per-operation time limit, the
-adapter and receipts, and Windows. The vectors are engineering evidence, not
-containment certification.
+The service the harness talks to is beside them, in `service.rs` and
+`channel.rs`:
+
+- **An MCP server**, `coven`, with three tools: `read_file`, `list_directory`
+  and `search` (`coven.scoped-read.tools.v1`).
+  - Every `tools/call` reaches the reader, an unknown tool included, so every
+    call counts against the attempt.
+  - Each call is admitted by the attempt's gate before it runs, and its
+    result, refusals included, is committed by digest before a byte is
+    written. The text the harness receives is exactly the committed JCS text.
+  - Each operation runs under the 5-second limit, or less when the run's
+    deadline is nearer. One that overruns is refused (`limit_time`), and the
+    service stops.
+- **A private channel per attempt**, in a new directory under
+  `<COVEN_HOME>/runtime/scoped-read`.
+  - The directory is readable only by the owner. It holds a Unix socket and
+    the MCP configuration the harness is pointed at.
+  - That configuration names a hidden relay, `coven automations
+    scoped-read-relay`, as the only MCP server. It passes the socket and a
+    random token in the relay's environment, so neither appears in process
+    arguments.
+  - The channel serves one connection that presents the token, then closes
+    its listener.
+  - Closing the channel refuses every later call (`attempt_closed`) and
+    withholds the result of one already running. It then removes only the
+    files it created.
+
+Two opt-in tests launch the installed Claude Code through the real relay with
+a dummy key and a local server standing in for the model, so nothing is
+billed. On 2.1.305:
+- the init event and every model request listed exactly the three service
+  tools;
+- a scripted read of a granted file returned its content;
+- a sibling the grant does not name was refused (`scope_missing`) in the same
+  run;
+- no memory file from the home folder, the launch folder or its parent reached
+  the model.
+
+Still open: harness admission (the envelope descriptor, the exact Claude Code
+version list, the API key, the isolated launch), response commitment under the
+daemon's revocation fence, the adapter and receipts, and Windows. The vectors
+are engineering evidence, not containment certification.
 
 ### Scope operations
 
@@ -101,6 +139,9 @@ These are the points the design left open. Each is for review:
 | Content that is not text | `read_file` refuses it (`resource_not_text`); a search skips it. |
 | Platforms without a reviewed walk | Every request is refused (`platform_unsupported`). Today that is Windows. |
 | What counts against the call limit | Every call, refused ones included. Paths are limited to 32 components and 4,096 bytes. |
+| How the harness reaches the service | Through a per-attempt Unix socket in a private directory, by a relay the harness launches as its only MCP server. The socket path and token travel in the relay's environment through a 0600 configuration file, never in process arguments. One connection is served. |
+| Whether a refusal is committed | Yes. A refusal can disclose that something exists, so it passes the same gate as content. Only the gate's own `attempt_closed` is written uncommitted. |
+| What an overrun does | It refuses the call (`limit_time`) and stops the service. The worker cannot be interrupted, so no later call may share the reader with it. |
 
 ## Problem and chosen boundary
 
