@@ -3505,3 +3505,687 @@ fn each_finished_session_names_what_reconciliation_does_with_it() {
         .collect();
     assert_eq!(seen, expected);
 }
+
+/// A runtime whose kills are confirmed.
+struct ConfirmedKill;
+
+impl crate::api::SessionRuntime for ConfirmedKill {
+    fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn send_input(&self, _session_id: &str, _payload: &Value) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct TimeoutShape {
+    name: &'static str,
+    occurrence: &'static str,
+    deadline: Option<&'static str>,
+    session: &'static str,
+    /// (number, state, carries the run's session)
+    attempts: &'static [(i64, &'static str, bool)],
+    authority: bool,
+    /// SQL run against the store before explaining, to add or corrupt rows.
+    extra: &'static [&'static str],
+    code: WorkCode,
+    next_step: NextStep,
+    deadline_at: Option<&'static str>,
+    /// The occurrence after the daemon's reconciliation at 10:00 with a
+    /// runtime that confirms the kill, and with one that never does; `None`
+    /// when that pass fails.
+    after: [Option<&'static str>; 2],
+}
+
+const TIMED_OUT: TimeoutShape = TimeoutShape {
+    name: "timed-out",
+    occurrence: "claimed",
+    deadline: Some("2026-10-22T09:30:00.000Z"),
+    session: "running",
+    attempts: &[(1, "started", true)],
+    authority: false,
+    extra: &[],
+    code: WorkCode::TimeoutExpired,
+    next_step: NextStep::AwaitSettlement,
+    deadline_at: Some("2026-10-22T09:30:00.000Z"),
+    after: [Some("failed"), Some("recovery_required")],
+};
+
+/// A stop fence on the run under test: its owner, and when it expires.
+macro_rules! late_fence {
+    ($owner:literal, $expires:literal) => {
+        concat!(
+            "INSERT INTO automation_stop_fences
+                (run_id, session_id, owner, acquired_at, execution_expires_at)
+             VALUES ('r-late', 's-late', '",
+            $owner,
+            "', '2026-10-22T09:00:00.000Z', '",
+            $expires,
+            "');"
+        )
+    };
+}
+
+/// A requested cancellation of the run under test's attempt 1.
+const LATE_CANCELLATION: &str = "
+    INSERT INTO automation_cancellations
+        (adoption_key, request_digest, automation_id, run_id, attempt_id, session_id,
+         scope, requested_by_json, reason, state, requested_at, execution_expires_at)
+    VALUES ('cancel-late', 'digest', 'daily', 'r-late', 'a-late-19', 's-late', 'run',
+            '{\"principalId\":\"operator\"}', 'stop', 'requested',
+            '2026-10-22T09:00:00.000Z', '2099-01-01T00:00:00.000Z');";
+
+fn timeout_store(shape: &TimeoutShape) -> (tempfile::TempDir, Connection) {
+    let (temp, conn) = store();
+    insert_definition_at(
+        &conn,
+        &definition("daily", "PAUSED"),
+        "2026-10-01T00:00:00.000Z",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO automation_occurrences
+            (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+             lease_expires_at, created_at, updated_at)
+         VALUES ('o-late', 'daily', '2026-10-21T09:00:00.000Z', 'manual', ?1, 1,
+                 'operator', '2099-01-01T00:00:00.000Z', '2026-10-21T09:00:00.000Z',
+                 '2026-10-21T09:00:00.000Z')",
+        [shape.occurrence],
+    )
+    .unwrap();
+    session(&conn, "s-late", shape.session);
+    run_keyed(
+        &conn,
+        "r-late",
+        "daily",
+        Some("o-late"),
+        "running",
+        shape.authority,
+    );
+    conn.execute(
+        "UPDATE automation_runs SET timeout_at = ?1, session_id = 's-late'
+         WHERE id = 'r-late'",
+        [shape.deadline],
+    )
+    .unwrap();
+    // Ids that do not sort like attempt numbers.
+    for (number, state, carries) in shape.attempts {
+        let live = matches!(*state, "dispatching" | "started" | "observing");
+        conn.execute(
+            "INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, prior_attempt_number,
+                 prior_disposition, retry_classification, not_before, session_id,
+                 state_reason, opened_at, settled_at)
+             VALUES (?1, 'r-late', 'o-late', ?2, 'PRIVATE-' || ?1, 1, ?3,
+                     CASE WHEN ?2 > 1 THEN ?2 - 1 END, CASE WHEN ?2 > 1 THEN 'failed' END,
+                     CASE WHEN ?2 > 1 THEN 'automatic_retry' ELSE 'initial' END,
+                     '2026-10-21T09:00:00.000Z', CASE WHEN ?4 THEN 's-late' END,
+                     'PRIVATE-REASON', '2026-10-21T09:00:00.000Z',
+                     CASE WHEN NOT ?5 THEN '2026-10-22T09:20:00.000Z' END)",
+            rusqlite::params![
+                format!("a-late-{}", 20 - number),
+                number,
+                state,
+                carries,
+                live
+            ],
+        )
+        .unwrap();
+    }
+    for sql in shape.extra {
+        conn.execute_batch(sql).unwrap();
+    }
+    (temp, conn)
+}
+
+/// What the daemon's reconciliation does with a run whose session is still
+/// running past its deadline, one store per shape and runtime so that a
+/// failing pass hides nothing.
+#[test]
+fn each_run_past_its_deadline_names_what_reconciliation_does_with_it() {
+    let in_flight = |name, after| TimeoutShape {
+        name,
+        code: WorkCode::InFlight,
+        next_step: NextStep::InspectOccurrence,
+        deadline_at: None,
+        after,
+        ..TIMED_OUT
+    };
+    let shapes = [
+        TIMED_OUT,
+        TimeoutShape {
+            name: "running",
+            occurrence: "running",
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "authority",
+            authority: true,
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [Some("recovery_required"), Some("recovery_required")],
+            ..TIMED_OUT
+        },
+        // Enforcement parses the whole deadline, and expires it at its instant.
+        TimeoutShape {
+            name: "deadline-now",
+            deadline: Some("2026-10-22T10:00:00.000Z"),
+            deadline_at: Some("2026-10-22T10:00:00.000Z"),
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "deadline-offset",
+            deadline: Some("2026-10-22T10:59:00+01:00"),
+            deadline_at: Some("2026-10-22T09:59:00.000Z"),
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            deadline: Some("2026-10-22T09:01:00-01:00"),
+            ..in_flight(
+                "deadline-ahead-sorting-behind",
+                [Some("claimed"), Some("claimed")],
+            )
+        },
+        TimeoutShape {
+            deadline: Some("2026-10-22T10:00:00.001Z"),
+            ..in_flight("deadline-ahead", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            deadline: None,
+            ..in_flight("no-deadline", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            deadline: Some("soon"),
+            ..in_flight("unparseable-deadline", [None, None])
+        },
+        TimeoutShape {
+            extra: &["UPDATE automation_runs SET timeout_at = CAST(timeout_at AS BLOB);"],
+            ..in_flight("blob-deadline", [None, None])
+        },
+        TimeoutShape {
+            extra: &["UPDATE automation_runs SET timeout_at = CAST(X'FF' AS TEXT);"],
+            ..in_flight("invalid-utf8-deadline", [None, None])
+        },
+        // Restart containment can reach these first, from receipts the store
+        // does not hold.
+        TimeoutShape {
+            session: "created",
+            ..in_flight("created", [Some("failed"), Some("recovery_required")])
+        },
+        TimeoutShape {
+            session: "orphaned",
+            ..in_flight("orphaned", [Some("failed"), Some("recovery_required")])
+        },
+        TimeoutShape {
+            name: "dispatching",
+            attempts: &[(1, "dispatching", true)],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "dispatching-unbound",
+            attempts: &[(1, "dispatching", false)],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "observing",
+            attempts: &[(1, "observing", true)],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            attempts: &[(1, "started", false)],
+            ..in_flight("started-unbound", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            attempts: &[(1, "ambiguous", true)],
+            ..in_flight("ambiguous", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            attempts: &[(1, "succeeded", true)],
+            ..in_flight("succeeded", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            attempts: &[],
+            ..in_flight("no-attempt", [Some("claimed"), Some("claimed")])
+        },
+        // The stop needs exactly one attempt live on the session, whichever
+        // it is.
+        TimeoutShape {
+            attempts: &[(1, "dispatching", false), (2, "failed", true)],
+            ..in_flight(
+                "failed-beside-unbound-dispatch",
+                [None, Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            attempts: &[(1, "dispatching", false), (2, "dispatching", false)],
+            ..in_flight("two-unbound-dispatches", [None, None])
+        },
+        TimeoutShape {
+            attempts: &[(1, "dispatching", false), (2, "started", true)],
+            ..in_flight("started-beside-unbound-dispatch", [None, None])
+        },
+        TimeoutShape {
+            name: "started-after-settled",
+            attempts: &[(1, "failed", false), (2, "started", true)],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "dispatch-before-unbound-start",
+            attempts: &[(1, "dispatching", false), (2, "started", false)],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "dispatch-before-unbound-failure",
+            attempts: &[(1, "dispatching", false), (2, "failed", false)],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            attempts: &[(1, "dispatching", false), (2, "ambiguous", true)],
+            ..in_flight(
+                "dispatch-before-bound-ambiguity",
+                [None, Some("recovery_required")],
+            )
+        },
+        // Settling a dispatch binds it to the session, which no other
+        // attempt may hold.
+        TimeoutShape {
+            attempts: &[(1, "failed", true), (2, "dispatching", false)],
+            ..in_flight("dispatching-after-bound", [None, Some("recovery_required")])
+        },
+        TimeoutShape {
+            attempts: &[(1, "dispatching", false)],
+            extra: &["
+                INSERT INTO automation_runs
+                    (id, automation_id, occurrence_id, runtime, status, started_at)
+                VALUES ('r-taken', 'daily', 'o-late', 'coven-code', 'failed',
+                        '2026-10-21T08:00:00.000Z');
+                INSERT INTO automation_attempts
+                    (id, run_id, occurrence_id, attempt_number, adoption_key,
+                     occurrence_fence_generation, state, retry_classification, not_before,
+                     session_id, opened_at, settled_at)
+                VALUES ('a-taken', 'r-taken', 'o-late', 1, 'key-taken', 1, 'failed',
+                        'initial', '2026-10-21T08:00:00.000Z', 's-late',
+                        '2026-10-21T08:00:00.000Z', '2026-10-21T08:30:00.000Z');"],
+            ..in_flight(
+                "dispatching-session-taken",
+                [None, Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            name: "authority-dispatching-session-taken",
+            authority: true,
+            attempts: &[(1, "failed", true), (2, "dispatching", false)],
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [Some("recovery_required"), Some("recovery_required")],
+            ..TIMED_OUT
+        },
+        // Another running run's pass can bind the session first.
+        TimeoutShape {
+            extra: &[
+                OTHER_RUN,
+                "UPDATE automation_runs
+                 SET session_id = 's-late', timeout_at = '2026-10-22T09:00:00.000Z'
+                 WHERE id = 'r-other';
+                 INSERT INTO automation_attempts
+                    (id, run_id, occurrence_id, attempt_number, adoption_key,
+                     occurrence_fence_generation, state, retry_classification, not_before,
+                     opened_at)
+                 VALUES ('a-other', 'r-other', 'o-other', 1, 'key-other', 1, 'dispatching',
+                         'initial', '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z');",
+            ],
+            ..in_flight("session-shared", [None, Some("recovery_required")])
+        },
+        TimeoutShape {
+            name: "session-shared-by-settled-run",
+            extra: &[
+                OTHER_RUN,
+                "UPDATE automation_runs SET session_id = 's-late', status = 'failed'
+                 WHERE id = 'r-other';",
+            ],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            attempts: &[(1, "dispatching", false)],
+            extra: &[
+                OTHER_RUN,
+                "INSERT INTO automation_attempts
+                    (id, run_id, occurrence_id, attempt_number, adoption_key,
+                     occurrence_fence_generation, state, retry_classification, not_before,
+                     session_id, opened_at)
+                 VALUES ('a-other', 'r-other', 'o-other', 1, 'key-other', 1, 'started',
+                         'initial', '2026-10-21T09:00:00.000Z', 's-late',
+                         '2026-10-21T09:00:00.000Z');",
+            ],
+            ..in_flight(
+                "dispatching-session-live-elsewhere",
+                [None, Some("recovery_required")],
+            )
+        },
+        // Enforcement leaves a fenced run to that stop, or holds it for
+        // recovery once its own timeout stop has expired.
+        TimeoutShape {
+            extra: &[late_fence!("timeout", "2026-10-22T10:00:20.000Z")],
+            ..in_flight("fenced", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..in_flight(
+                "fence-expired",
+                [Some("recovery_required"), Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+            ..in_flight("recovery-fence", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            extra: &[late_fence!("timeout", "never")],
+            ..in_flight("fence-unparseable", [None, None])
+        },
+        TimeoutShape {
+            extra: &[LATE_CANCELLATION],
+            ..in_flight("cancellation-requested", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            extra: &[
+                LATE_CANCELLATION,
+                "UPDATE automation_cancellations SET state = 'stopping';",
+            ],
+            ..in_flight("cancellation-stopping", [Some("claimed"), Some("claimed")])
+        },
+        TimeoutShape {
+            extra: &[
+                LATE_CANCELLATION,
+                "UPDATE automation_cancellations
+                 SET execution_expires_at = '2026-10-22T09:00:00.000Z';",
+            ],
+            ..in_flight(
+                "cancellation-expired",
+                [Some("failed"), Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            extra: &[
+                LATE_CANCELLATION,
+                "UPDATE automation_cancellations SET state = 'stopping',
+                     execution_expires_at = '2026-10-22T09:00:00.000Z';",
+            ],
+            ..in_flight(
+                "stopping-expired",
+                [Some("recovery_required"), Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            name: "cancellation-rejected",
+            extra: &[
+                LATE_CANCELLATION,
+                "UPDATE automation_cancellations SET state = 'rejected';",
+            ],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            extra: &["
+                INSERT INTO sessions
+                    (id, project_root, harness, title, status, created_at, updated_at)
+                VALUES ('s-rival', '/PRIVATE', 'codex', 'PRIVATE', 'running',
+                        '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z');
+                INSERT INTO automation_runs
+                    (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+                VALUES ('r-rival', 'daily', 'o-late', 's-rival', 'coven-code', 'running',
+                        '2026-10-21T09:00:00.000Z');"],
+            ..in_flight("rival", [Some("failed"), Some("recovery_required")])
+        },
+        TimeoutShape {
+            name: "other-run",
+            extra: &[OTHER_RUN, OTHER_ATTEMPT],
+            ..TIMED_OUT
+        },
+        // Only the run's own attempts, cancellations and running rivals count.
+        TimeoutShape {
+            name: "other-run-dispatching",
+            extra: &[
+                OTHER_RUN,
+                "INSERT INTO automation_attempts
+                    (id, run_id, occurrence_id, attempt_number, adoption_key,
+                     occurrence_fence_generation, state, retry_classification, not_before,
+                     opened_at)
+                 VALUES ('a-other', 'r-other', 'o-other', 1, 'key-other', 1, 'dispatching',
+                         'initial', '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z');",
+            ],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "other-run-cancelling",
+            extra: &[
+                OTHER_RUN,
+                OTHER_ATTEMPT,
+                "INSERT INTO automation_cancellations
+                    (adoption_key, request_digest, automation_id, run_id, attempt_id,
+                     session_id, scope, requested_by_json, reason, state, requested_at,
+                     execution_expires_at)
+                 VALUES ('cancel-other', 'digest', 'daily', 'r-other', 'a-other', 's-other',
+                         'run', '{\"principalId\":\"operator\"}', 'stop', 'requested',
+                         '2026-10-22T09:00:00.000Z', '2099-01-01T00:00:00.000Z');",
+            ],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "other-run-fenced",
+            extra: &[
+                OTHER_RUN,
+                OTHER_ATTEMPT,
+                "INSERT INTO automation_stop_fences
+                    (run_id, session_id, owner, acquired_at, execution_expires_at)
+                 VALUES ('r-other', 's-other', 'timeout', '2026-10-22T09:00:00.000Z',
+                         '2099-01-01T00:00:00.000Z');",
+            ],
+            ..TIMED_OUT
+        },
+        // Another routine's run on the occurrence counts as a rival.
+        TimeoutShape {
+            extra: &["
+                INSERT INTO sessions
+                    (id, project_root, harness, title, status, created_at, updated_at)
+                VALUES ('s-stray', '/PRIVATE', 'codex', 'PRIVATE', 'running',
+                        '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z');
+                INSERT INTO automation_runs
+                    (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+                VALUES ('r-stray', 'other', 'o-late', 's-stray', 'coven-code', 'running',
+                        '2026-10-21T09:00:00.000Z');"],
+            ..in_flight(
+                "rival-of-another-routine",
+                [Some("failed"), Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            name: "settled-rival",
+            extra: &["
+                INSERT INTO automation_runs
+                    (id, automation_id, occurrence_id, runtime, status, started_at)
+                VALUES ('r-settled', 'daily', 'o-late', 'coven-code', 'failed',
+                        '2026-10-21T08:00:00.000Z');"],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "authority-beside-other-run",
+            authority: true,
+            extra: &[OTHER_RUN, OTHER_ATTEMPT],
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [Some("recovery_required"), Some("recovery_required")],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "lease-expired",
+            extra: &["UPDATE automation_occurrences
+                      SET lease_expires_at = '2026-10-22T09:00:00.000Z';"],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "authority-unbound-dispatch",
+            authority: true,
+            attempts: &[(1, "dispatching", false)],
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [Some("recovery_required"), Some("recovery_required")],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            authority: true,
+            attempts: &[(1, "ambiguous", false), (2, "started", true)],
+            ..in_flight(
+                "authority-beside-ambiguous",
+                [None, Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            authority: true,
+            attempts: &[(1, "observing", false), (2, "started", true)],
+            ..in_flight(
+                "authority-beside-unbound-observing",
+                [None, Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            authority: true,
+            attempts: &[(1, "ambiguous", true)],
+            ..in_flight("authority-ambiguous", [Some("claimed"), Some("claimed")])
+        },
+        // Settlement's scan decodes every running run's values, and
+        // recording a plain run's finish reads its definition.
+        TimeoutShape {
+            extra: &["UPDATE automation_runs SET definition_json = CAST('{}' AS BLOB);"],
+            ..in_flight("blob-definition", [None, Some("recovery_required")])
+        },
+        TimeoutShape {
+            extra: &["UPDATE automation_runs SET definition_json = CAST(X'FF' AS TEXT);"],
+            ..in_flight("invalid-utf8-definition", [None, Some("recovery_required")])
+        },
+        TimeoutShape {
+            name: "authority-blob-definition",
+            authority: true,
+            extra: &["UPDATE automation_runs SET definition_json = CAST('{}' AS BLOB);"],
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [Some("recovery_required"), Some("recovery_required")],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            extra: &["UPDATE sessions SET exit_code = 'zero';"],
+            ..in_flight("text-exit-code", [Some("failed"), None])
+        },
+        TimeoutShape {
+            extra: &["UPDATE sessions SET updated_at = X'00';"],
+            ..in_flight("blob-update", [Some("failed"), None])
+        },
+        TimeoutShape {
+            extra: &["UPDATE sessions SET updated_at = CAST(X'FF' AS TEXT);"],
+            ..in_flight("invalid-utf8-update", [Some("failed"), None])
+        },
+        TimeoutShape {
+            extra: &["UPDATE automation_attempts SET settled_at = X'00';"],
+            ..in_flight(
+                "blob-settled-at",
+                [Some("failed"), Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            authority: true,
+            extra: &["UPDATE automation_attempts SET settled_at = X'00';"],
+            ..in_flight(
+                "authority-blob-settled-at",
+                [None, Some("recovery_required")],
+            )
+        },
+        TimeoutShape {
+            name: "unparseable-update",
+            extra: &["UPDATE sessions SET updated_at = 'never';"],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            name: "recovery",
+            occurrence: "recovery_required",
+            code: WorkCode::RecoveryRequired,
+            next_step: NextStep::CancelRun,
+            deadline_at: None,
+            after: [Some("recovery_required"), Some("recovery_required")],
+            ..TIMED_OUT
+        },
+    ];
+    let mut seen = Vec::new();
+    for shape in &shapes {
+        let (_temp, conn) = timeout_store(shape);
+        let item = found(&conn, "daily").work.into_iter().next().unwrap();
+        // TEMP tables cannot change what the late run reads as.
+        let explained = work_of(&conn, "daily");
+        conn.execute_batch(
+            "CREATE TEMP TABLE sessions AS SELECT * FROM main.sessions;
+             UPDATE temp.sessions SET status = CASE status
+                 WHEN 'running' THEN 'completed' ELSE 'running' END, exit_code = 'x';
+             CREATE TEMP TABLE automation_attempts AS SELECT * FROM main.automation_attempts;
+             UPDATE temp.automation_attempts SET id = 'shadow-' || id, session_id = NULL,
+                 state = CASE state WHEN 'started' THEN 'ambiguous' ELSE 'dispatching' END;
+             CREATE TEMP TABLE automation_runs AS SELECT * FROM main.automation_runs;
+             UPDATE temp.automation_runs SET timeout_at = 'never', authority_profile =
+                 CASE WHEN authority_profile IS NULL THEN 'shadow' END;
+             INSERT INTO temp.automation_attempts (id, run_id, state)
+                 VALUES ('shadow-extra', 'r-late', 'observing');
+             INSERT INTO temp.automation_runs (id, occurrence_id, session_id, status)
+                 VALUES ('r-shadow', 'o-late', 's-late', 'running');
+             CREATE TEMP TABLE automation_stop_fences AS
+                 SELECT * FROM main.automation_stop_fences WHERE 0;
+             INSERT INTO temp.automation_stop_fences (run_id) VALUES ('r-late');
+             CREATE TEMP TABLE automation_cancellations AS
+                 SELECT * FROM main.automation_cancellations WHERE 0;
+             INSERT INTO temp.automation_cancellations (run_id, state)
+                 VALUES ('r-late', 'requested');",
+        )
+        .unwrap();
+        assert_eq!(work_of(&conn, "daily"), explained, "{}", shape.name);
+        let after = [
+            &ConfirmedKill as &dyn crate::api::SessionRuntime,
+            &UnconfirmedKill,
+        ]
+        .map(|runtime| {
+            let (temp, conn) = timeout_store(shape);
+            crate::automations::daemon_tick::reconcile_automation_runs(
+                temp.path(),
+                &conn,
+                runtime,
+                now(),
+                None,
+            )
+            .ok()
+            .map(|()| {
+                conn.query_row(
+                    "SELECT state FROM automation_occurrences WHERE id = 'o-late'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            })
+        });
+        seen.push((
+            shape.name,
+            item.code,
+            item.next_step,
+            item.deadline_at,
+            after,
+        ));
+    }
+    let expected: Vec<_> = shapes
+        .iter()
+        .map(|shape| {
+            (
+                shape.name,
+                shape.code,
+                shape.next_step,
+                shape.deadline_at.map(str::to_string),
+                shape.after.map(|state| state.map(str::to_string)),
+            )
+        })
+        .collect();
+    assert_eq!(seen, expected);
+}

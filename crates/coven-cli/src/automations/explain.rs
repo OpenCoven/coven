@@ -96,6 +96,7 @@ pub(crate) enum WorkCode {
     RetryExpired,
     RetryHeld,
     SessionFinished,
+    TimeoutExpired,
     EligibleNow,
     DueUnplanned,
     RecoveryRequired,
@@ -325,17 +326,80 @@ fn work_select() -> String {
                ) THEN 0
                ELSE 1
            END AS finished,
-           -- The time settlement parses: an ambiguous attempt's settlement
-           -- time, or, with a deadline, the session's last exit or update. A
-           -- value settlement cannot decode reads as unparseable.
+           -- A run past its deadline whose session is running, which timeout
+           -- enforcement stops first: 1 for a plain run, which it settles, or
+           -- holds for recovery when the stop is not confirmed, and 2 for a
+           -- Runtime Authority run, which it holds for recovery either way. It
+           -- leaves a run with a pending cancellation or a stop fence to that
+           -- stop, and another running run can settle the occurrence first.
+           -- The stop can fail unless exactly one attempt is live on the
+           -- session, where a dispatch needs none, and no other running run
+           -- shares the session. Settling a plain run binds a dispatch to the
+           -- session, which no other attempt may hold; a Runtime Authority
+           -- hold needs that attempt to be the only unresolved one.
            CASE
-               WHEN typeof(held.timeout_at) NOT IN ('text', 'null')
-                    OR (held.authority_profile IS NULL
-                        AND typeof(held.definition_json) NOT IN ('text', 'null'))
-                    OR typeof(session.exit_code) NOT IN ('integer', 'null')
-                    OR typeof(latest.settled_at) NOT IN ('text', 'null')
-                    OR typeof(COALESCE(ending.created_at, session.updated_at))
-                        NOT IN ('text', 'null') THEN X''
+               WHEN session.status IS NOT 'running'
+                    OR (
+                        SELECT COUNT(*) FROM main.automation_attempts AS live
+                        WHERE live.run_id = held.id
+                          AND live.state IN ('dispatching', 'started', 'observing')
+                          AND (
+                              live.session_id = held.session_id
+                              OR (live.state = 'dispatching' AND live.session_id IS NULL)
+                          )
+                    ) <> 1
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_runs AS sharer
+                        WHERE sharer.session_id = held.session_id
+                          AND sharer.status = 'running'
+                          AND sharer.id <> held.id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_cancellations AS cancellation
+                        WHERE cancellation.run_id = held.id
+                          AND cancellation.state IN ('requested', 'stopping')
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_stop_fences AS fence
+                        WHERE fence.run_id = held.id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM main.automation_runs AS rival
+                        WHERE rival.occurrence_id = occurrence.id
+                          AND rival.status = 'running'
+                          AND rival.id <> held.id
+                    ) THEN 0
+               WHEN held.authority_profile IS NULL THEN
+                   CASE WHEN EXISTS (
+                       SELECT 1 FROM main.automation_attempts AS bound
+                       WHERE bound.session_id = held.session_id
+                         AND NOT (
+                             bound.run_id = held.id
+                             AND bound.state IN ('dispatching', 'started', 'observing')
+                         )
+                   ) THEN 0 ELSE 1 END
+               WHEN (
+                   SELECT COUNT(*) FROM main.automation_attempts AS unresolved
+                   WHERE unresolved.run_id = held.id
+                     AND unresolved.state IN (
+                         'dispatching', 'started', 'observing', 'ambiguous'
+                     )
+               ) = 1 THEN 2
+               ELSE 0
+           END AS timed_out,
+           -- Whether settlement's scan of running runs decodes this run's
+           -- values as their types; recording a plain run's finish also
+           -- reads its definition.
+           typeof(held.timeout_at) IN ('text', 'null')
+               AND (held.authority_profile IS NOT NULL
+                    OR typeof(held.definition_json) IN ('text', 'null'))
+               AND typeof(session.exit_code) IN ('integer', 'null')
+               AND typeof(latest.settled_at) IN ('text', 'null')
+               AND typeof(COALESCE(ending.created_at, session.updated_at))
+                   IN ('text', 'null') AS typed,
+           -- The time settlement parses: an ambiguous attempt's settlement
+           -- time, or, with a deadline, the session's last exit or update.
+           CASE
                WHEN held.authority_profile IS NOT NULL THEN NULL
                WHEN latest.state = 'ambiguous'
                    THEN COALESCE(CAST(latest.settled_at AS BLOB), X'')
@@ -414,6 +478,8 @@ fn work_select() -> String {
            0,
            0,
            0,
+           0,
+           0,
            NULL,
            NULL
     FROM main.automation_runs AS run
@@ -440,6 +506,8 @@ fn work_select() -> String {
            0,
            0,
            0,
+           0,
+           0,
            NULL,
            NULL
     FROM ({ELIGIBLE_OCCURRENCES_SQL}) AS eligible
@@ -451,7 +519,7 @@ fn work_select() -> String {
        )
     UNION ALL
     SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0,
-           NULL, NULL
+           0, 0, NULL, NULL
     WHERE ?5 IS NOT NULL
       AND NOT EXISTS (
           SELECT 1 FROM main.automation_occurrences AS later
@@ -651,8 +719,10 @@ fn work(
                     row.get::<_, i64>(11)?,
                     row.get::<_, bool>(12)?,
                     row.get::<_, i64>(13)?,
-                    row.get::<_, Option<Vec<u8>>>(14)?,
-                    row.get::<_, Option<Vec<u8>>>(15)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, bool>(15)?,
+                    row.get::<_, Option<Vec<u8>>>(16)?,
+                    row.get::<_, Option<Vec<u8>>>(17)?,
                 ))
             },
         )
@@ -674,6 +744,8 @@ fn work(
             lease_release,
             held_retry,
             finished,
+            timed_out,
+            typed,
             evidence,
             decoded,
         ) = row.context("failed to read the routine's work")?;
@@ -699,10 +771,12 @@ fn work(
             Some(Some((_, stored))) => stored.as_str() > iso(now).as_str(),
             Some(None) => false,
         };
-        let readable = evidence.is_none_or(|stored| {
-            String::from_utf8(stored)
-                .is_ok_and(|stored| DateTime::parse_from_rfc3339(&stored).is_ok())
-        }) && decoded.is_none_or(|stored| std::str::from_utf8(&stored).is_ok());
+        let decodes = typed && decoded.is_none_or(|stored| std::str::from_utf8(&stored).is_ok());
+        let readable = decodes
+            && evidence.is_none_or(|stored| {
+                String::from_utf8(stored)
+                    .is_ok_and(|stored| DateTime::parse_from_rfc3339(&stored).is_ok())
+            });
         let deadline_at = deadline
             .flatten()
             .map(|(deadline, _)| deadline.to_rfc3339_opts(SecondsFormat::Millis, true));
@@ -737,6 +811,17 @@ fn work(
                     NextStep::AwaitSettlement
                 };
                 (WorkCode::SessionFinished, None, next_step)
+            }
+            // Timeout enforcement stops a session still running past the
+            // run's deadline, which it parses whole.
+            (0, Some("claimed" | "running")) if expired && timed_out != 0 && decodes => {
+                timing.1 = deadline_at;
+                let next_step = if timed_out == 2 {
+                    NextStep::AwaitRuntimeAuthority
+                } else {
+                    NextStep::AwaitSettlement
+                };
+                (WorkCode::TimeoutExpired, None, next_step)
             }
             (0, Some("claimed")) => match lease_release {
                 0 => (
