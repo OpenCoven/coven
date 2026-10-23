@@ -790,6 +790,11 @@ struct RequestedBy {
     principal_id: String,
 }
 
+/// Whether reconciling an expired cancellation reads its stored requester.
+pub(crate) fn requester_readable(requested_by_json: &str) -> bool {
+    serde_json::from_str::<RequestedBy>(requested_by_json).is_ok()
+}
+
 #[derive(Debug)]
 struct ReservedCancellation {
     request: CancellationRequest,
