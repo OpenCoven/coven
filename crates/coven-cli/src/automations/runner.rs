@@ -2659,6 +2659,9 @@ pub struct SettlementReport {
     pub succeeded: usize,
     pub failed: usize,
     pub cancelled: usize,
+    /// Runs left unsettled this pass because their stored stop lease cannot
+    /// be read (coven#1514). The rest of the pass still settles.
+    pub skipped: Vec<String>,
 }
 
 /// Requests strict termination for an abandoned pre-publication launch once
@@ -2703,6 +2706,10 @@ pub fn recover_abandoned_launches(
         match claim_stop_fence(conn, &run_id, &session_id, "recovery", None, None, now)? {
             StopFenceClaim::Acquired => {}
             StopFenceClaim::InProgress | StopFenceClaim::Conflict => continue,
+            StopFenceClaim::UnreadableLease(reason) => {
+                failures.push(format!("abandoned launch recovery skipped: {reason}"));
+                continue;
+            }
             StopFenceClaim::UnknownOutcome => {
                 mark_unconfirmed_stop_for_recovery(
                     conn,
@@ -3026,6 +3033,11 @@ fn enforce_timeout_candidate(
     match claim_stop_fence(conn, run_id, session_id, "timeout", None, None, now)? {
         StopFenceClaim::Acquired => {}
         StopFenceClaim::InProgress | StopFenceClaim::Conflict => return Ok(None),
+        StopFenceClaim::UnreadableLease(reason) => {
+            return Ok(Some(format!(
+                "automation `{automation_id}` timeout enforcement skipped: {reason}"
+            )));
+        }
         StopFenceClaim::UnknownOutcome => {
             mark_unconfirmed_stop_for_recovery(
                 conn,
@@ -3065,6 +3077,26 @@ pub(crate) enum StopFenceClaim {
     InProgress,
     UnknownOutcome,
     Conflict,
+    /// The run's stored stop lease cannot be read. Only a damaged store
+    /// reaches this; callers skip that one run rather than abort the pass
+    /// (coven#1514), and `automations doctor` counts the row.
+    UnreadableLease(String),
+}
+
+/// Reads a stop fence's `execution_expires_at`. A lease that is not text or
+/// not RFC 3339 is an error for that run only, never a failed row read.
+pub(crate) fn parse_stop_fence_lease(
+    run_id: &str,
+    lease: &rusqlite::types::Value,
+) -> Result<DateTime<Utc>, String> {
+    let rusqlite::types::Value::Text(lease) = lease else {
+        return Err(format!(
+            "run `{run_id}` has an unreadable stop lease: execution_expires_at is not text"
+        ));
+    };
+    DateTime::parse_from_rfc3339(lease)
+        .map(|lease| lease.with_timezone(&Utc))
+        .map_err(|error| format!("run `{run_id}` has an unreadable stop lease: {error}"))
 }
 
 pub(crate) fn claim_stop_fence(
@@ -3186,7 +3218,7 @@ pub(crate) fn claim_stop_fence(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, rusqlite::types::Value>(3)?,
                 ))
             },
         )
@@ -3207,9 +3239,15 @@ pub(crate) fn claim_stop_fence(
         })?;
         return Ok(StopFenceClaim::Conflict);
     }
-    let parsed_expires_at = DateTime::parse_from_rfc3339(&expires_at)
-        .map_err(|error| format!("stored automation stop lease is invalid: {error}"))?
-        .with_timezone(&Utc);
+    let parsed_expires_at = match parse_stop_fence_lease(run_id, &expires_at) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            transaction.commit().map_err(|error| {
+                format!("failed to close automation stop ownership lookup: {error}")
+            })?;
+            return Ok(StopFenceClaim::UnreadableLease(reason));
+        }
+    };
     if parsed_expires_at <= now {
         let reclaimed = transaction
             .execute(
@@ -4047,7 +4085,7 @@ pub(crate) fn settle_finished_runs_with(
                 continue;
             }
         }
-        let stop_fence: Option<(String, String, String)> = transaction
+        let stop_fence: Option<(String, String, rusqlite::types::Value)> = transaction
             .query_row(
                 "SELECT session_id, owner, execution_expires_at
                  FROM automation_stop_fences WHERE run_id = ?1",
@@ -4059,9 +4097,14 @@ pub(crate) fn settle_finished_runs_with(
         if let Some((fenced_session, owner, expires_at)) =
             stop_fence.filter(|_| attempt_state.as_deref() != Some("ambiguous"))
         {
-            let expired = DateTime::parse_from_rfc3339(&expires_at)
-                .map_err(|error| format!("stored automation stop lease is invalid: {error}"))?
-                <= now;
+            let expired = match parse_stop_fence_lease(&run_id, &expires_at) {
+                Ok(expires_at) => expires_at <= now,
+                Err(reason) => {
+                    // Dropping the transaction rolls it back; nothing was written.
+                    report.skipped.push(reason);
+                    continue;
+                }
+            };
             if expired
                 && matches!(owner.as_str(), "timeout" | "recovery")
                 && session_id.as_deref() == Some(fenced_session.as_str())
@@ -9994,6 +10037,137 @@ mod tests {
                 );
             }
             assert_eq!(fences(), 0, "{owner}: settlement releases the fence");
+        }
+    }
+
+    /// Two runs, the first holding a timeout stop fence whose lease is then
+    /// damaged in place: text that is not RFC 3339, or a value that is not text.
+    fn runs_with_one_damaged_stop_lease(
+        conn: &Connection,
+        damage: &str,
+        now: DateTime<Utc>,
+    ) -> [(String, String); 2] {
+        let runs = ["damaged-lease", "healthy-lease"].map(|name| {
+            let routine = definition(name);
+            insert_definition(conn, &routine).unwrap();
+            let outcome =
+                run_routine_now(conn, &crate::api::NoopSessionRuntime, &routine, now).unwrap();
+            (outcome.run_id, outcome.session_id.unwrap())
+        });
+        let (damaged_run, damaged_session) = &runs[0];
+        assert!(matches!(
+            claim_stop_fence(
+                conn,
+                damaged_run,
+                damaged_session,
+                "timeout",
+                None,
+                None,
+                now
+            )
+            .unwrap(),
+            StopFenceClaim::Acquired
+        ));
+        conn.execute(
+            &format!(
+                "UPDATE automation_stop_fences SET execution_expires_at = {damage}
+                 WHERE run_id = ?1"
+            ),
+            [damaged_run],
+        )
+        .unwrap();
+        runs
+    }
+
+    #[test]
+    fn unreadable_stop_lease_skips_only_its_run_during_settlement() {
+        for damage in ["'not-a-lease'", "17"] {
+            let (_temp, conn) = temp_store();
+            let now = Utc::now();
+            let [(damaged_run, damaged_session), (healthy_run, healthy_session)] =
+                runs_with_one_damaged_stop_lease(&conn, damage, now);
+            for session in [&damaged_session, &healthy_session] {
+                crate::store::update_session_terminal_if_active(
+                    &conn,
+                    session,
+                    "completed",
+                    Some(0),
+                    &now.to_rfc3339(),
+                )
+                .unwrap();
+            }
+
+            let report = settle_finished_runs(&conn, now).unwrap();
+            assert_eq!(report.succeeded, 1, "{damage}");
+            assert_eq!(report.skipped.len(), 1, "{damage}");
+            assert!(report.skipped[0].contains(&damaged_run), "{damage}");
+            let status = |run: &str| -> String {
+                conn.query_row(
+                    "SELECT status FROM automation_runs WHERE id = ?1",
+                    [run],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(status(&healthy_run), "succeeded", "{damage}");
+            assert_eq!(status(&damaged_run), "running", "{damage}");
+            let fences: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = ?1",
+                    [&damaged_run],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(fences, 1, "{damage}: the damaged row is left for doctor");
+        }
+    }
+
+    #[test]
+    fn unreadable_stop_lease_skips_only_its_run_during_timeout_enforcement() {
+        for damage in ["'not-a-lease'", "17"] {
+            let (_temp, conn) = temp_store();
+            let now = Utc::now();
+            let [(damaged_run, damaged_session), (healthy_run, healthy_session)] =
+                runs_with_one_damaged_stop_lease(&conn, damage, now);
+            assert!(matches!(
+                claim_stop_fence(
+                    &conn,
+                    &damaged_run,
+                    &damaged_session,
+                    "timeout",
+                    None,
+                    None,
+                    now
+                )
+                .unwrap(),
+                StopFenceClaim::UnreadableLease(_)
+            ));
+
+            let past_deadline = now + chrono::Duration::hours(1);
+            let failures =
+                enforce_run_timeouts(&conn, &crate::api::NoopSessionRuntime, past_deadline)
+                    .unwrap();
+            assert_eq!(failures.len(), 1, "{damage}: {failures:?}");
+            assert!(failures[0].contains(&damaged_run), "{damage}");
+            let session_status = |session: &str| -> String {
+                conn.query_row(
+                    "SELECT status FROM sessions WHERE id = ?1",
+                    [session],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(session_status(&healthy_session), "killed", "{damage}");
+            assert_ne!(session_status(&damaged_session), "killed", "{damage}");
+            settle_finished_runs(&conn, past_deadline).unwrap();
+            let healthy_status: String = conn
+                .query_row(
+                    "SELECT status FROM automation_runs WHERE id = ?1",
+                    [&healthy_run],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(healthy_status, "failed", "{damage}");
         }
     }
 
