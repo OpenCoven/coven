@@ -3436,15 +3436,14 @@ fn native_target_evaluates_checked_in_run_now_process_crash_vectors() -> anyhow:
         );
         let (after_restart, after_pass, after_deadline, after_lease, stops) = match committed {
             "absent" => ("absent", "succeeded", "succeeded", "succeeded", 0),
-            // The scheduler never dispatches a manual claim: it expires.
-            "claimed" => ("claimed", "claimed", "claimed", "expired", 0),
-            // A manual launch is not contained at restart; its deadline
-            // stops it once.
-            "launching" => ("launching", "launching", "timed_out", "timed_out", 1),
-            _ => ("orphaned", "orphaned", "timed_out", "timed_out", 1),
+            // The restart fails a claim that never launched at once.
+            "claimed" => ("abandoned", "abandoned", "abandoned", "abandoned", 0),
+            // It contains the previous daemon's launch, as it does a
+            // scheduled one, and holds the run until its deadline (#1502).
+            _ => ("held", "held", "held_expired", "held_expired", 0),
         };
-        // Only ownership's restart writes: it orphans the session.
-        assert_eq!(observation["restartIsNoop"], committed != "owned");
+        // Every restart that finds the worker's claim writes.
+        assert_eq!(observation["restartIsNoop"], committed == "absent");
         assert_eq!(observation["launchAfterRestart"], after_restart);
         assert_eq!(observation["launchAfterPass"], after_pass);
         assert_eq!(observation["launchAfterDeadline"], after_deadline);
@@ -3566,15 +3565,14 @@ fn native_target_evaluates_checked_in_run_now_envelope_process_crash_vectors() -
         );
         let (after_restart, after_pass, after_deadline, after_lease, stops) = match committed {
             "absent" => ("absent", "succeeded", "succeeded", "succeeded", 0),
-            // The scheduler never dispatches a manual claim: it expires.
-            "claimed" => ("claimed", "claimed", "claimed", "expired", 0),
-            // A manual launch is not contained at restart; its deadline
-            // stops it once.
-            "launching" => ("launching", "launching", "timed_out", "timed_out", 1),
-            _ => ("orphaned", "orphaned", "timed_out", "timed_out", 1),
+            // The restart fails a claim that never launched at once.
+            "claimed" => ("abandoned", "abandoned", "abandoned", "abandoned", 0),
+            // It contains the previous daemon's launch, as it does a
+            // scheduled one, and holds the run until its deadline (#1502).
+            _ => ("held", "held", "held_expired", "held_expired", 0),
         };
-        // Only ownership's restart writes: it orphans the session.
-        assert_eq!(observation["restartIsNoop"], committed != "owned");
+        // Every restart that finds the worker's claim writes.
+        assert_eq!(observation["restartIsNoop"], committed == "absent");
         assert_eq!(observation["launchAfterRestart"], after_restart);
         assert_eq!(observation["launchAfterPass"], after_pass);
         assert_eq!(observation["launchAfterDeadline"], after_deadline);

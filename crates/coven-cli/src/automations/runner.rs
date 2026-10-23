@@ -121,10 +121,13 @@ pub(crate) fn recover_restart_containment(
                 )
             })?
             .with_timezone(&Utc);
+        // A run-now launch is the daemon's own, like a scheduled one, so a
+        // previous daemon's manual launch is contained the same way (#1502).
         let previous_daemon_launch = startup_cutoff.is_some_and(|cutoff| {
-            occurrence_kind == "scheduled"
-                && lease_owner.as_deref() == Some("daemon")
-                && created_at.timestamp_millis() < cutoff.timestamp_millis()
+            matches!(
+                (occurrence_kind.as_str(), lease_owner.as_deref()),
+                ("scheduled", Some("daemon")) | ("manual", Some("manual"))
+            ) && created_at.timestamp_millis() < cutoff.timestamp_millis()
         });
         let path = containment_receipt_path(coven_home, &session_id);
         let receipt = match std::fs::read(&path) {
@@ -170,6 +173,48 @@ pub(crate) fn recover_restart_containment(
         })?;
     }
     Ok(recovered)
+}
+
+/// Why startup fails a run-now claim the previous daemon never launched.
+pub(crate) const MANUAL_CLAIM_RESTART_REASON: &str = "daemon restarted before launch";
+
+/// Fails each run-now claim the previous daemon made but never launched
+/// (#1502). The claim and its launch commit separately, and the launch writes
+/// its run before any process starts, so a claim with no run launched
+/// nothing. Failing it at once loses no work, and the owner's replay sees a
+/// terminal occurrence rather than a claim held until its lease expires.
+/// Mission occurrences keep their own lifecycle.
+pub(crate) fn fail_unlaunched_manual_claims(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    startup_cutoff: DateTime<Utc>,
+) -> Result<usize, String> {
+    conn.execute(
+        "UPDATE automation_occurrences
+         SET state = 'failed',
+             failure_reason = ?3,
+             lease_owner = NULL,
+             lease_expires_at = NULL,
+             updated_at = ?1
+         WHERE state = 'claimed'
+           AND kind = 'manual'
+           AND lease_owner = 'manual'
+           AND created_at < ?2
+           AND NOT EXISTS (
+               SELECT 1 FROM automation_runs
+               WHERE automation_runs.occurrence_id = automation_occurrences.id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM automation_missions
+               WHERE automation_missions.occurrence_id = automation_occurrences.id
+           )",
+        rusqlite::params![
+            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            startup_cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            MANUAL_CLAIM_RESTART_REASON,
+        ],
+    )
+    .map_err(|error| format!("failed to fail unlaunched manual claims: {error}"))
 }
 
 pub(crate) fn cleanup_terminal_containment_receipts(
@@ -7783,50 +7828,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_missing_receipt_does_not_contain_manual_launch() {
-        let (temp, conn) = temp_store();
-        let routine = definition("manual-startup-race");
-        insert_definition(&conn, &routine).unwrap();
-        let launched_at = Utc::now();
-        assert!(insert_claimed_occurrence(
-            &conn,
-            "manual-startup-occurrence",
-            &routine.id,
-            "manual",
-            60,
-            launched_at,
-        )
-        .unwrap());
-        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
-        persist_launch_at(
-            &conn,
-            "manual-startup-run",
-            "manual-startup-occurrence",
-            &routine,
-            &launch,
-            launched_at,
-        )
-        .unwrap();
-
-        let recovered = recover_restart_containment(
-            temp.path(),
-            &conn,
-            launched_at + chrono::Duration::seconds(2),
-            Some(launched_at + chrono::Duration::seconds(1)),
-        )
-        .unwrap();
-
-        assert_eq!(recovered, 0);
-        assert_eq!(
-            crate::store::get_session(&conn, &launch.id)
-                .unwrap()
-                .unwrap()
-                .status,
-            "created"
-        );
-    }
-
-    #[test]
     fn startup_cutoff_excludes_new_daemon_launch_without_receipt() {
         let (temp, conn) = temp_store();
         let mut routine = definition("new-daemon-launch");
@@ -7918,6 +7919,121 @@ mod tests {
                 .unwrap()
                 .status,
             "created"
+        );
+    }
+
+    #[test]
+    fn startup_cutoff_contains_previous_run_now_launch_without_receipt() {
+        let (temp, conn) = temp_store();
+        let routine = definition("previous-run-now-launch");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "previous-run-now-occurrence",
+            &routine.id,
+            "manual",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "previous-run-now-run",
+            "previous-run-now-occurrence",
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        // Launched by the newly serving daemon: no receipt proves anything.
+        assert_eq!(
+            recover_restart_containment(
+                temp.path(),
+                &conn,
+                launched_at + chrono::Duration::seconds(2),
+                Some(launched_at - chrono::Duration::seconds(1)),
+            )
+            .unwrap(),
+            0
+        );
+        // Launched by the previous daemon, which took it down with it (#1502).
+        assert_eq!(
+            recover_restart_containment(
+                temp.path(),
+                &conn,
+                launched_at + chrono::Duration::seconds(2),
+                Some(launched_at + chrono::Duration::seconds(1)),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "killed"
+        );
+    }
+
+    #[test]
+    fn startup_fails_only_the_previous_daemons_unlaunched_run_now_claims() {
+        let (_temp, conn) = temp_store();
+        let claimed_at = Utc::now();
+        let cutoff = claimed_at + chrono::Duration::seconds(1);
+        let mut claims = Vec::new();
+        for name in ["unlaunched", "launched", "after-cutoff", "daemon-owned"] {
+            let routine = definition(&format!("run-now-{name}"));
+            insert_definition(&conn, &routine).unwrap();
+            let occurrence = format!("occ-{name}");
+            let (owner, at) = match name {
+                "after-cutoff" => ("manual", cutoff + chrono::Duration::seconds(1)),
+                "daemon-owned" => ("daemon", claimed_at),
+                _ => ("manual", claimed_at),
+            };
+            assert!(
+                insert_claimed_occurrence(&conn, &occurrence, &routine.id, owner, 60, at).unwrap()
+            );
+            if name == "launched" {
+                let launch =
+                    build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+                persist_launch_at(&conn, "run-launched", &occurrence, &routine, &launch, at)
+                    .unwrap();
+            }
+            claims.push(occurrence);
+        }
+
+        let later = cutoff + chrono::Duration::seconds(5);
+        assert_eq!(
+            fail_unlaunched_manual_claims(&conn, later, cutoff).unwrap(),
+            1
+        );
+        let state = |occurrence: &str| -> (String, Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT state, failure_reason, lease_owner FROM automation_occurrences
+                 WHERE id = ?1",
+                [occurrence],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            state(&claims[0]),
+            (
+                "failed".into(),
+                Some(MANUAL_CLAIM_RESTART_REASON.into()),
+                None
+            )
+        );
+        for claim in &claims[1..] {
+            assert_eq!(state(claim).0, "claimed", "{claim}");
+        }
+        assert_eq!(
+            fail_unlaunched_manual_claims(&conn, later, cutoff).unwrap(),
+            0
         );
     }
 
