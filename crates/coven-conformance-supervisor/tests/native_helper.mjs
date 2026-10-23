@@ -83,8 +83,11 @@ async function run(mode, options = {}) {
   });
   if (options.blockOutput) child.stdout.pause();
   let injected = false;
+  // Input is sent with one end() call, after which Node always reports
+  // writableNeedDrain as false; bytes still buffered (writableLength) are what
+  // show the helper is blocked forwarding input to a target that never reads.
   const injectLoss = options.leaseLoss ? (async () => {
-    while (!existsSync(marker) || !ack || (options.blockInput && !child.stdin.writableNeedDrain) || (options.blockOutput && child.stdout.readableLength < child.stdout.readableHighWaterMark)) {
+    while (!existsSync(marker) || !ack || (options.blockInput && child.stdin.writableLength === 0) || (options.blockOutput && child.stdout.readableLength < child.stdout.readableHighWaterMark)) {
       if (child.exitCode !== null || failure) return;
       await delay(10);
     }
