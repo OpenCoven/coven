@@ -873,12 +873,9 @@ mod over_the_channel {
         /// returns its stream, raw and as events. Only `ANTHROPIC_BASE_URL`
         /// is added to the envelope's environment, to reach the stand-in.
         fn run(&self, channel: &Channel, port: u16) -> (String, Vec<Value>) {
-            use std::io::Read;
-            use std::process::{Command, Stdio};
-            use std::time::Instant;
-
             let base = self.scratch.path();
-            let mut child = Command::new(&self.claude)
+            let mut command = std::process::Command::new(&self.claude);
+            command
                 .env_clear()
                 .env("HOME", base.join("home"))
                 .env("PATH", "/usr/bin:/bin")
@@ -889,34 +886,45 @@ mod over_the_channel {
                 .current_dir(base.join("launch"))
                 .args(CLAUDE_R0_SCOPED_READ.args)
                 .arg("--mcp-config")
-                .arg(channel.config_path())
-                .args(["--", "Read notes/today.md and tell me what it says."])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("claude starts");
-            let mut stdout = child.stdout.take().unwrap();
-            let reading = thread::spawn(move || {
-                let mut text = String::new();
-                let _ = stdout.read_to_string(&mut text);
-                text
-            });
-            let started = Instant::now();
-            while child.try_wait().unwrap().is_none() {
-                if started.elapsed() > Duration::from_secs(120) {
-                    let _ = child.kill();
-                    panic!("claude did not finish in two minutes");
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            let raw = reading.join().unwrap();
-            let events = raw
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
-            (raw, events)
+                .arg(channel.config_path());
+            run_to_end(command)
         }
+    }
+
+    /// Runs `command` with the scripted prompt to completion and returns its
+    /// stream, raw and as events.
+    fn run_to_end(mut command: std::process::Command) -> (String, Vec<Value>) {
+        use std::io::Read;
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        let mut child = command
+            .args(["--", "Read notes/today.md and tell me what it says."])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("claude starts");
+        let mut stdout = child.stdout.take().unwrap();
+        let reading = thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stdout.read_to_string(&mut text);
+            text
+        });
+        let started = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > Duration::from_secs(120) {
+                let _ = child.kill();
+                panic!("claude did not finish in two minutes");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let raw = reading.join().unwrap();
+        let events = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        (raw, events)
     }
 
     /// The init event's tools, sorted, after checking it names only the
@@ -1081,6 +1089,110 @@ mod over_the_channel {
                 }
             ]
         ));
+    }
+
+    /// The whole admission path with the installed Claude Code: `prepare`
+    /// checks its version, reads the saved key, builds the reader with the
+    /// owner's harness folders protected, opens the channel and isolates the
+    /// launch, and claude runs with exactly what it returns. The same
+    /// scripted model then reads the granted file and is refused a sibling.
+    #[test]
+    #[ignore = "launches the installed claude; needs COVEN_TEST_RELAY_BIN"]
+    fn claude_runs_through_admission() {
+        use super::super::admission::{self, Request};
+        use super::super::credential;
+
+        let harness = Harness::new();
+        let base = harness.scratch.path();
+        let coven_home = base.join("coven");
+        fs::create_dir_all(&coven_home).unwrap();
+        credential::store(&coven_home, "sk-ant-test-capture-only").unwrap();
+        let scopes = [
+            json!({"kind": "filesystem", "root": "project", "path": "notes/today.md", "access": "read", "recursive": false}),
+        ];
+        let (root, owner_home) = (base.join("root"), base.join("home"));
+        let prepared = admission::prepare(
+            Request {
+                coven_home: &coven_home,
+                envelope: &CLAUDE_R0_SCOPED_READ,
+                program: &harness.claude,
+                relay: &harness.relay,
+                scopes: &scopes,
+                project: &root,
+                owner_home: Some(&owner_home),
+                deadline: None,
+            },
+            Box::new(Open),
+        )
+        .unwrap_or_else(|error| panic!("admitted: {error}"));
+        eprintln!(
+            "admitted Claude Code {} with environment {:?}",
+            prepared.version,
+            prepared
+                .environment
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let (port, requests) = model_server(vec![
+            Reply::ToolUse {
+                name: "mcp__coven__read_file",
+                input: json!({"root": "project", "path": "notes/today.md"}),
+            },
+            Reply::ToolUse {
+                name: "mcp__coven__read_file",
+                input: json!({"root": "project", "path": "notes/secret.md"}),
+            },
+            Reply::Text("done"),
+        ]);
+        let mut command = std::process::Command::new(&prepared.program);
+        command
+            .env_clear()
+            .envs(
+                prepared
+                    .environment
+                    .iter()
+                    .map(|(name, value)| (name, value)),
+            )
+            .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"))
+            .current_dir(&prepared.cwd)
+            .args(&prepared.args);
+        let (raw, events) = run_to_end(command);
+        assert_eq!(init_tools(&events), SERVICE_TOOLS);
+        let observed = classify_claude_stream(&CLAUDE_R0_SCOPED_READ, &raw, false);
+        assert!(observed.complete, "{raw}");
+        assert_eq!(observed.result, StreamResult::Produced("done".to_owned()));
+        let model = model_requests(&requests);
+        assert!(last_tool_result(&model[1]).contains("granted notes"));
+        assert!(last_tool_result(&model[2]).contains("scope_missing"));
+
+        let launch = prepared.launch_root().to_path_buf();
+        assert!(
+            launch.join("home").read_dir().unwrap().next().is_some(),
+            "claude wrote its state into the isolated home"
+        );
+        let operations = prepared.finish();
+        assert!(matches!(
+            operations
+                .iter()
+                .map(|operation| &operation.outcome)
+                .collect::<Vec<_>>()[..],
+            [
+                Outcome::Served { .. },
+                Outcome::Refused {
+                    refusal: Refusal::ScopeMissing,
+                    ..
+                }
+            ]
+        ));
+        assert!(!launch.exists(), "the launch folder goes with the launch");
+        assert!(
+            fs::read_dir(coven_home.join("runtime/scoped-read"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "and so does the channel"
+        );
     }
 
     #[test]
