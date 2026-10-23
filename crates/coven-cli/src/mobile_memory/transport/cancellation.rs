@@ -24,10 +24,21 @@ impl Cancellation {
     /// Interrupt TLS, HTTP upgrade, and record reads/writes on the active socket.
     /// Wake a pending TCP connection as well as interrupting established I/O.
     pub fn cancel(&self) {
+        let _ = self.cancel_inner();
+    }
+
+    #[cfg(test)]
+    pub(super) fn cancel_observed(&self) -> Option<std::io::Result<()>> {
+        self.cancel_inner()
+    }
+
+    fn cancel_inner(&self) -> Option<std::io::Result<()>> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if let State::Connected(socket) = &*state {
-            let _ = socket.shutdown(Shutdown::Both);
-        }
+        let shutdown = if let State::Connected(socket) = &*state {
+            Some(socket.shutdown(Shutdown::Both))
+        } else {
+            None
+        };
         if let State::Connecting(Some(waker)) = &*state {
             let _ = waker.wake();
         }
@@ -38,6 +49,7 @@ impl Cancellation {
             State::Connecting(waker) | State::Cancelled(waker) => State::Cancelled(waker),
             _ => State::Cancelled(None),
         };
+        shutdown
     }
 
     pub(super) fn ensure_pending(&self) -> Result<()> {

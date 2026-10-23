@@ -172,7 +172,12 @@ pub fn connect_cancellable(
         "relay port mismatch"
     );
     let socket = network::connect(address, &attempt, deadline)?;
-    let stream = DeadlineStream { socket, deadline };
+    let stream = DeadlineStream {
+        socket,
+        deadline,
+        #[cfg(test)]
+        read_probe: None,
+    };
     let mut url = endpoint.url.clone();
     url.query_pairs_mut()
         .append_pair("v", "1")
@@ -213,16 +218,42 @@ fn limits() -> WebSocketConfig {
         .max_write_buffer_size(MAX_RECORD_BYTES * 2)
 }
 
+#[cfg(test)]
+struct ReadProbe {
+    events: std::sync::mpsc::Sender<(&'static str, Instant, String)>,
+    resume: Option<std::sync::mpsc::Receiver<()>>,
+}
+
 struct DeadlineStream {
     socket: TcpStream,
     deadline: Instant,
+    #[cfg(test)]
+    read_probe: Option<ReadProbe>,
 }
 
 impl Read for DeadlineStream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.socket
             .set_read_timeout(Some(remaining(self.deadline)?))?;
-        self.socket.read(bytes)
+        #[cfg(test)]
+        if let Some(probe) = &mut self.read_probe {
+            let _ = probe
+                .events
+                .send(("before socket read", Instant::now(), String::new()));
+            if let Some(resume) = probe.resume.take() {
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .map_err(|error| io::Error::other(format!("read probe gate: {error}")))?;
+            }
+        }
+        let result = self.socket.read(bytes);
+        #[cfg(test)]
+        if let Some(probe) = &self.read_probe {
+            let _ = probe
+                .events
+                .send(("after socket read", Instant::now(), format!("{result:?}")));
+        }
+        result
     }
 }
 impl Write for DeadlineStream {
@@ -315,6 +346,7 @@ fn fixture_connect_cancellable(
     let stream = DeadlineStream {
         socket: TcpStream::connect_timeout(&address, remaining(deadline)?)?,
         deadline,
+        read_probe: None,
     };
     attempt.register(&stream.socket)?;
     let (socket, _) = tungstenite::client::client_with_config(
@@ -473,13 +505,21 @@ mod tests {
 
     #[test]
     fn cancellation_interrupts_established_record_receive() {
-        use std::net::TcpListener;
+        established_receive_cancellation(false);
+    }
+
+    #[test]
+    fn cancellation_before_established_socket_read_is_observed() {
+        established_receive_cancellation(true);
+    }
+
+    fn established_receive_cancellation(gate_read: bool) {
+        use std::net::{Shutdown, TcpListener};
         use std::sync::mpsc;
         use std::time::Duration;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (release, released) = mpsc::channel();
         let broker = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             stream
@@ -488,29 +528,53 @@ mod tests {
             stream
                 .set_write_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
-            let socket = tungstenite::accept(stream).unwrap();
-            // Keep the peer open: only local cancellation can unblock the read.
-            released.recv_timeout(Duration::from_secs(30)).unwrap();
-            drop(socket);
+            tungstenite::accept(stream).unwrap()
         });
         let cancellation = Cancellation::default();
-        let worker_token = cancellation.clone();
-        let (ready, readiness) = mpsc::channel();
+        let mut records = fixture_connect_cancellable(address, &cancellation).unwrap();
+        // The parent owns the peer until the result is captured. A peer-side
+        // timer must never make a failed local cancellation look successful.
+        let peer = broker.join().unwrap();
+        let (events, observed) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        match records.socket.get_mut() {
+            MaybeTlsStream::Plain(stream) => {
+                stream.read_probe = Some(ReadProbe {
+                    events,
+                    resume: gate_read.then_some(resumed),
+                })
+            }
+            _ => unreachable!(),
+        }
         let (done, completed) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let mut records = fixture_connect_cancellable(address, &worker_token).unwrap();
-            ready.send(()).unwrap();
             let result = records.receive(Instant::now() + Duration::from_secs(120));
-            done.send(result.is_err()).unwrap();
+            // Preserve the actual outcome even when the parent hang guard fired.
+            let _ = done.send(result);
         });
-        readiness.recv_timeout(Duration::from_secs(30)).unwrap();
-        cancellation.cancel();
-        assert!(completed
-            .recv_timeout(Duration::from_secs(30))
-            .expect("cancelled record read did not finish"));
-        worker.join().unwrap();
-        release.send(()).unwrap();
-        broker.join().unwrap();
+        let read_entry = observed.recv_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        let shutdown = cancellation.cancel_observed();
+        if gate_read {
+            let _ = resume.send(());
+        }
+        let outcome = completed.recv_timeout(Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        // Cleanup precedes assertions: failure must not detach a blocked worker.
+        let _ = peer.get_ref().shutdown(Shutdown::Both);
+        drop(peer);
+        let joined = worker.join();
+        let trace = observed.try_iter().collect::<Vec<_>>();
+        assert!(
+            read_entry.is_ok(),
+            "read never entered: {read_entry:?}; shutdown={shutdown:?}; trace={trace:?}"
+        );
+        assert!(
+            joined.is_ok(),
+            "read worker panicked: {joined:?}; shutdown={shutdown:?}; trace={trace:?}"
+        );
+        assert!(matches!(outcome, Ok(Err(_))), "cancelled record read did not fail before peer cleanup: {outcome:?}; elapsed={elapsed:?}; shutdown={shutdown:?}; entry={read_entry:?}; trace={trace:?}");
+        assert!(trace.iter().any(|(phase, _, _)| *phase == "after socket read"), "probe gate failed before socket read: shutdown={shutdown:?}; entry={read_entry:?}; trace={trace:?}");
     }
 
     #[test]
