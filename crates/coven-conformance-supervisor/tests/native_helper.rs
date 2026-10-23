@@ -39,8 +39,16 @@ fn node24_four_pipe_helper_success_and_refusal_matrix() {
 #[test]
 #[ignore = "child entrypoint; exercised by the Node24 matrix parent"]
 fn subject() {
-    fs::write("entered.pending", std::process::id().to_string()).unwrap();
-    fs::rename("entered.pending", "entered.marker").unwrap();
+    // Publish the complete pid first, then create the empty marker that
+    // signals entry. Renaming a just-closed file can fail on Windows with a
+    // sharing violation while another process (such as a file scanner) still
+    // has it open; creating a new file cannot.
+    fs::write("entered.pid", std::process::id().to_string()).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("entered.marker")
+        .unwrap();
     let mode = fs::read_to_string("mode").unwrap();
     if mode == "hold" {
         loop {
@@ -97,8 +105,9 @@ fn subject() {
 #[test]
 #[ignore = "descendant entrypoint; exercised by the Node24 matrix parent"]
 fn descendant() {
-    fs::write("descendant.pending", std::process::id().to_string()).unwrap();
-    fs::rename("descendant.pending", "descendant.pid").unwrap();
+    // The subject polls until this file holds the complete pid, so a direct
+    // write needs no rename (which a file scanner can block on Windows).
+    fs::write("descendant.pid", std::process::id().to_string()).unwrap();
     loop {
         std::thread::park();
     }

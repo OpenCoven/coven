@@ -11,6 +11,8 @@ const [helper, subject, cwd] = process.argv.slice(2);
 const abi = 'coven.automations.windows-job-supervisor.v1';
 const digest = createHash('sha256').update(readFileSync(subject)).digest('hex');
 const marker = join(cwd, 'entered.marker');
+// Written and closed before the marker is created; read only once the marker exists.
+const enteredPid = join(cwd, 'entered.pid');
 const body = Buffer.from([0, 255, 13, 10, 128, 42]);
 // Failure context only: the fixture subject's own libtest panic site and the
 // first line of its message, with any absolute path replaced. Never the
@@ -29,7 +31,7 @@ function checkedPid(value) {
   return pid;
 }
 async function run(mode, options = {}) {
-  rmSync(marker, { force: true });
+  rmSync(marker, { force: true }); rmSync(enteredPid, { force: true });
   rmSync(join(cwd, 'descendant.pid'), { force: true });
   writeFileSync(join(cwd, 'mode'), mode);
   const nonce = 'ab'.repeat(16);
@@ -122,7 +124,7 @@ async function run(mode, options = {}) {
       assert.equal(injected, true, 'failure was not injected at the observed phase');
       assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'refused']);
       assert.equal(frames[1].failure, 'controller_lost');
-      const pid = checkedPid(readFileSync(marker, 'utf8'));
+      const pid = checkedPid(readFileSync(enteredPid, 'utf8'));
       assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'subject survived controller loss');
     } else if (options.surplus || options.truncated || mode === 'overflow' || mode === 'stderr-overflow') {
       assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'refused']);
@@ -146,7 +148,7 @@ async function run(mode, options = {}) {
   console.log(JSON.stringify({ case: mode, options: Object.keys(options).sort(), helperExit: code, frames: frames.map(frame => frame.kind) }));
 }
 async function controller() {
-  rmSync(marker, { force: true }); writeFileSync(join(cwd, 'mode'), 'hold');
+  rmSync(marker, { force: true }); rmSync(enteredPid, { force: true }); writeFileSync(join(cwd, 'mode'), 'hold');
   const nonce = 'cd'.repeat(16);
   const child = spawn(helper, [subject, cwd], { cwd, stdio: ['overlapped', 'overlapped', 'overlapped', 'overlapped'], windowsHide: true });
   process.send({ kind: 'spawned', helperPid: child.pid });
@@ -163,7 +165,7 @@ async function controller() {
   child.stdin.end(JSON.stringify({ schemaVersion: abi, kind: 'launch', nonce, subjectSha256: digest,
     args: ['--exact', 'subject', '--ignored', '--nocapture'], inputBytes: 0, timeoutMs: 60000 }) + '\n');
   while (!existsSync(marker)) { assert.equal(child.exitCode, null); await delay(10); }
-  process.send({ kind: 'entered', subjectPid: checkedPid(readFileSync(marker, 'utf8')) });
+  process.send({ kind: 'entered', subjectPid: checkedPid(readFileSync(enteredPid, 'utf8')) });
   // Outer driver terminates this actual controller process while the target runs.
   await new Promise(() => {});
 }
@@ -220,7 +222,7 @@ await controllerDeath();
 const runnerPath = process.argv[6];
 const { invokeWindowsHelper, createWindowsRunnerArtifact, validateWindowsRunnerBinding, digestBytes, digestCanonical } = await import(pathToFileURL(runnerPath).href);
 for (const mode of ['consumer', 'success']) {
-  rmSync(marker, { force: true }); writeFileSync(join(cwd, 'mode'), mode);
+  rmSync(marker, { force: true }); rmSync(enteredPid, { force: true }); writeFileSync(join(cwd, 'mode'), mode);
   const result = await invokeWindowsHelper({ helper, target: subject, directory: cwd, subjectSha256: digest,
     args: ['--exact', 'subject', '--ignored', '--nocapture', '--test-threads=1'], input: body, timeoutMs: 30000 });
   if (mode === 'consumer') {
@@ -259,7 +261,7 @@ const binding = { source: { commit: sourceCommit }, environment: { os: process.p
   runner: { name: 'coven-automations-conformance-runner', version: runnerArtifact.version, artifactSha256: runnerArtifact.sha256, vectorSetSha256: digestCanonical([]).value },
   subjectArtifact: { platform: { os: process.platform, arch: process.arch }, sha256: digest } };
 assert.deepEqual(validateWindowsRunnerBinding(binding, { runnerBytes, helperBytes, subjectBytes }), runnerArtifact);
-rmSync(marker, { force: true }); writeFileSync(join(cwd, 'mode'), 'consumer');
+rmSync(marker, { force: true }); rmSync(enteredPid, { force: true }); writeFileSync(join(cwd, 'mode'), 'consumer');
 const producedResult = await invokeWindowsHelper({ helper: produced.helperPath, target: subject, directory: cwd, subjectSha256: digest,
   args: ['--exact', 'subject', '--ignored', '--nocapture', '--test-threads=1'], input: body, timeoutMs: 30000 });
 assert.equal(producedResult.error, undefined); assert.equal(producedResult.status, 0); assert.ok(producedResult.stdout.endsWith('{"inputBytes":6}'));
