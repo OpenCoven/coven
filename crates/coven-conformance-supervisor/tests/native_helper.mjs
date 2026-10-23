@@ -12,6 +12,17 @@ const abi = 'coven.automations.windows-job-supervisor.v1';
 const digest = createHash('sha256').update(readFileSync(subject)).digest('hex');
 const marker = join(cwd, 'entered.marker');
 const body = Buffer.from([0, 255, 13, 10, 128, 42]);
+// Failure context only: the fixture subject's own libtest panic site and the
+// first line of its message, with any absolute path replaced. Never the
+// subject payload, which this fixture does not echo on its panic path.
+function subjectPanic(...buffers) {
+  for (const buffer of buffers) {
+    const text = buffer.toString('latin1');
+    const match = /panicked at [^\r\n]*?([A-Za-z0-9_]+\.rs:\d+:\d+):\r?\n([^\r\n]{0,240})/.exec(text);
+    if (match) return `${match[1]}: ${match[2].replace(/[A-Za-z]:\\[^\s'"]*/g, '<path>').replace(/\/[^\s'"]+/g, '<path>')}`;
+  }
+  return 'no subject panic site in captured output';
+}
 function checkedPid(value) {
   const pid = Number(value);
   assert.ok(Number.isSafeInteger(pid) && pid > 0, 'invalid fixture process identity');
@@ -87,45 +98,50 @@ async function run(mode, options = {}) {
   const code = await new Promise(resolve => child.on('close', resolve));
   await injectLoss;
   clearTimeout(guard); if (failure) throw failure;
-  assert.equal(pending.length, 0, 'partial terminal frame');
-  if (options.badHeader || options.headerStall) {
-    assert.equal(code, 2); assert.deepEqual(frames, []); assert.equal(existsSync(marker), false);
-  } else if (options.badDigest || options.badImage || options.badCwd) {
-    assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['refused']);
-    assert.equal(frames[0].failure, options.badCwd ? 'containment_unavailable' : 'launch_invalid'); assert.equal(existsSync(marker), false);
-  } else if (options.badAck) {
-    assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'refused']);
-    assert.equal(frames[1].failure, 'controller_lost'); assert.equal(existsSync(marker), false);
-  } else if (options.noAck || options.deadline) {
-    assert.equal(code, 2);
-    // The genuine total deadline also covers suspended preparation. Heavy host
-    // load may refuse before ready; report that phase instead of fabricating
-    // ACK-stall coverage. Success cases separately prove pre-ACK entry gating.
-    assert.ok(frames.length === 1 || frames.length === 2);
-    assert.deepEqual(frames.map(frame => frame.kind), frames.length === 2 ? ['ready', 'refused'] : ['refused']);
-    assert.equal(frames.at(-1).failure, 'deadline_exceeded');
-    if (options.noAck) assert.equal(existsSync(marker), false);
-    console.log(JSON.stringify({ case: options.noAck ? 'no-ack-deadline' : 'running-deadline', readyObserved: frames.length === 2, targetEntered: existsSync(marker) }));
-  } else if (options.leaseLoss) {
-    assert.equal(injected, true, 'failure was not injected at the observed phase');
-    assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'refused']);
-    assert.equal(frames[1].failure, 'controller_lost');
-    const pid = checkedPid(readFileSync(marker, 'utf8'));
-    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'subject survived controller loss');
-  } else if (options.surplus || options.truncated || mode === 'overflow' || mode === 'stderr-overflow') {
-    assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'refused']);
-    assert.equal(frames[1].failure, options.surplus || options.truncated ? 'launch_invalid' : 'output_limit_exceeded');
-  } else {
-    assert.equal(code, 0); assert.equal(ack, true);
-    assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'exited']);
-    assert.equal(frames[1].exitCode, mode === 'nonzero' ? 23 : 0);
-    if (mode === 'descendants') {
-      const pid = checkedPid(readFileSync(join(cwd, 'descendant.pid'), 'utf8'));
-      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'descendant survived root exit cleanup');
+  try {
+    assert.equal(pending.length, 0, 'partial terminal frame');
+    if (options.badHeader || options.headerStall) {
+      assert.equal(code, 2); assert.deepEqual(frames, []); assert.equal(existsSync(marker), false);
+    } else if (options.badDigest || options.badImage || options.badCwd) {
+      assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['refused']);
+      assert.equal(frames[0].failure, options.badCwd ? 'containment_unavailable' : 'launch_invalid'); assert.equal(existsSync(marker), false);
+    } else if (options.badAck) {
+      assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'refused']);
+      assert.equal(frames[1].failure, 'controller_lost'); assert.equal(existsSync(marker), false);
+    } else if (options.noAck || options.deadline) {
+      assert.equal(code, 2);
+      // The genuine total deadline also covers suspended preparation. Heavy host
+      // load may refuse before ready; report that phase instead of fabricating
+      // ACK-stall coverage. Success cases separately prove pre-ACK entry gating.
+      assert.ok(frames.length === 1 || frames.length === 2);
+      assert.deepEqual(frames.map(frame => frame.kind), frames.length === 2 ? ['ready', 'refused'] : ['refused']);
+      assert.equal(frames.at(-1).failure, 'deadline_exceeded');
+      if (options.noAck) assert.equal(existsSync(marker), false);
+      console.log(JSON.stringify({ case: options.noAck ? 'no-ack-deadline' : 'running-deadline', readyObserved: frames.length === 2, targetEntered: existsSync(marker) }));
+    } else if (options.leaseLoss) {
+      assert.equal(injected, true, 'failure was not injected at the observed phase');
+      assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'refused']);
+      assert.equal(frames[1].failure, 'controller_lost');
+      const pid = checkedPid(readFileSync(marker, 'utf8'));
+      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'subject survived controller loss');
+    } else if (options.surplus || options.truncated || mode === 'overflow' || mode === 'stderr-overflow') {
+      assert.equal(code, 2); assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'refused']);
+      assert.equal(frames[1].failure, options.surplus || options.truncated ? 'launch_invalid' : 'output_limit_exceeded');
     } else {
-      assert.ok(output.includes(body), 'binary output lost'); assert.deepEqual(error, Buffer.from([0, 255, 7]));
+      assert.equal(code, 0); assert.equal(ack, true);
+      assert.deepEqual(frames.map(frame => frame.kind), ['ready', 'exited']);
+      assert.equal(frames[1].exitCode, mode === 'nonzero' ? 23 : 0);
+      if (mode === 'descendants') {
+        const pid = checkedPid(readFileSync(join(cwd, 'descendant.pid'), 'utf8'));
+        assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'descendant survived root exit cleanup');
+      } else {
+        assert.ok(output.includes(body), 'binary output lost'); assert.deepEqual(error, Buffer.from([0, 255, 7]));
+      }
+      assert.equal(existsSync(marker), true);
     }
-    assert.equal(existsSync(marker), true);
+  } catch (cause) {
+    throw new Error(`native case ${mode} ${JSON.stringify(Object.keys(options).sort())}: helperExit=${code} ` +
+      `frames=${JSON.stringify(frames)} subject=${subjectPanic(output, error)}`, { cause });
   }
   console.log(JSON.stringify({ case: mode, options: Object.keys(options).sort(), helperExit: code, frames: frames.map(frame => frame.kind) }));
 }
