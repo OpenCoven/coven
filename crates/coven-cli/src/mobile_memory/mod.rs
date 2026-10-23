@@ -8,6 +8,7 @@ pub mod gateway;
 pub mod grant;
 pub mod identity;
 pub mod introduction;
+pub mod owner_policy;
 pub mod pairing;
 pub mod registry;
 

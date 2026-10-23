@@ -20,6 +20,7 @@ use super::grant::{
     validate_scope_set, AssuranceLevel, DeviceActionIntent, DeviceGrant, DeviceScope,
     GrantTransportConstraint, DEVICE_ACTION_VERSION,
 };
+use super::owner_policy::OwnerPolicyStore;
 use super::registry::{DeviceAuthorizationRecord, DeviceRecord, DeviceRegistry};
 
 pub(super) const MAX_INTRODUCTIONS: usize = 128;
@@ -47,7 +48,7 @@ pub struct IntroductionPolicy {
 }
 
 impl IntroductionPolicy {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         if self.required_approvals != 1 {
             bail!("unsupported introduction approval threshold");
         }
@@ -66,12 +67,12 @@ impl IntroductionPolicy {
         Ok(())
     }
 
-    fn digest(&self) -> Result<String> {
+    pub(super) fn digest(&self) -> Result<String> {
         self.validate()?;
         Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(serde_jcs::to_vec(self)?)))
     }
 
-    fn minimum_assurance(&self) -> AssuranceLevel {
+    pub(super) fn minimum_assurance(&self) -> AssuranceLevel {
         match self.required_assurance {
             RequestedAssurance::FreshUserVerification => AssuranceLevel::FreshUserVerification,
             RequestedAssurance::FreshBiometric => AssuranceLevel::FreshBiometric,
@@ -168,6 +169,9 @@ pub struct IntroductionAuthority {
     home: PathBuf,
     audience: [u8; 32],
     policy: IntroductionPolicy,
+    /// Set when policy came from the protected store; each check re-reads the
+    /// head so a replacement retires requests bound to the previous policy.
+    installed: Option<(OwnerPolicyStore, String)>,
     registry: DeviceRegistry,
     challenges: AssuranceChallengeStore,
 }
@@ -187,9 +191,21 @@ impl IntroductionAuthority {
             home: home.to_owned(),
             audience,
             policy,
+            installed: None,
             registry: DeviceRegistry::load(home)?,
             challenges: AssuranceChallengeStore::load(home)?,
         })
+    }
+
+    /// Loads policy only from the owner-root anchored store.
+    pub fn load_installed(home: &Path, audience: [u8; 32]) -> Result<Self> {
+        let store = OwnerPolicyStore::open(home, audience)?;
+        let current = store
+            .current()?
+            .context("introduction policy is not installed")?;
+        let mut authority = Self::load(home, audience, Some(current.policy))?;
+        authority.installed = Some((store, current.digest));
+        Ok(authority)
     }
 
     pub fn policy_digest(&self) -> Result<String> {
@@ -334,6 +350,11 @@ impl IntroductionAuthority {
         request.validate()?;
         if request.audience != self.audience || request.policy_digest != self.policy.digest()? {
             bail!("introduction audience or owner policy mismatch");
+        }
+        if let Some((store, digest)) = &self.installed {
+            if store.current()?.map(|head| head.digest).as_ref() != Some(digest) {
+                bail!("introduction owner policy was replaced");
+            }
         }
         if self
             .policy
