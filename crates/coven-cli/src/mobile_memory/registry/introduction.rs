@@ -1,6 +1,14 @@
 use super::*;
 use crate::mobile_memory::introduction::{IntroductionCommitUncertain, MAX_INTRODUCTIONS};
 
+/// The device a nonce-consuming commit adds, and which operation consumed it.
+pub(in crate::mobile_memory) struct PendingEnrollment {
+    pub device: DeviceRecord,
+    pub grant: DeviceGrant,
+    pub nonce_digest: String,
+    pub kind: crate::mobile_memory::introduction::TransitionKind,
+}
+
 impl DeviceRegistry {
     pub(in crate::mobile_memory) fn with_introducer<T>(
         &self,
@@ -17,12 +25,16 @@ impl DeviceRegistry {
     pub(in crate::mobile_memory) fn commit_introduction(
         &self,
         source_ids: &[Uuid],
-        device: DeviceRecord,
-        grant: DeviceGrant,
-        nonce_digest: String,
+        enrollment: PendingEnrollment,
         now: DateTime<Utc>,
         verify: impl FnOnce(&[(DeviceAuthorizationRecord, DeviceAuthorizationKeyRecord)]) -> Result<()>,
     ) -> Result<(DeviceAuthorizationRecord, IntroductionTransition)> {
+        let PendingEnrollment {
+            device,
+            grant,
+            nonce_digest,
+            kind,
+        } = enrollment;
         let _lock = DeviceRegistryStoreLock::acquire(&self.path)?;
         let mut loaded = read_registry(&self.path)?;
         if loaded
@@ -47,6 +59,7 @@ impl DeviceRegistry {
         validate_devices(&loaded.devices)?;
         let transition = IntroductionTransition {
             transition_id: Uuid::new_v4(),
+            kind,
             nonce_digest,
             occurred_at: now,
             audited_at: None,
