@@ -137,7 +137,7 @@ mod tests {
         let valid = nonce();
         for invalid in [
             String::new(),
-            "PRIVATE_CONTROLLER".to_string(),
+            valid.replacen('a', "g", 1),
             valid.to_uppercase(),
             format!("{}\n", &valid[..31]),
             format!("{valid}0"),
