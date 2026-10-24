@@ -17,24 +17,24 @@ fn sign(key: &SigningKey, bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes())
 }
 
-struct Approver {
-    id: Uuid,
+pub(in crate::mobile_memory) struct Approver {
+    pub(in crate::mobile_memory) id: Uuid,
     grant: DeviceGrant,
     possession: SigningKey,
     step_up: SigningKey,
 }
 
-struct Fixture {
-    home: tempfile::TempDir,
-    now: DateTime<Utc>,
-    approvers: Vec<Approver>,
-    destination: SigningKey,
-    policy: IntroductionPolicy,
+pub(in crate::mobile_memory) struct Fixture {
+    pub(in crate::mobile_memory) home: tempfile::TempDir,
+    pub(in crate::mobile_memory) now: DateTime<Utc>,
+    pub(in crate::mobile_memory) approvers: Vec<Approver>,
+    pub(in crate::mobile_memory) destination: SigningKey,
+    pub(in crate::mobile_memory) policy: IntroductionPolicy,
 }
 
 impl Fixture {
     /// Three eligible introducers; the third holds only `memory_read`.
-    fn new(required_approvals: u16) -> Self {
+    pub(in crate::mobile_memory) fn new(required_approvals: u16) -> Self {
         let home = tempfile::tempdir().unwrap();
         let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
         let registry = DeviceRegistry::load(home.path()).unwrap();
@@ -95,11 +95,14 @@ impl Fixture {
         }
     }
 
-    fn authority(&self) -> IntroductionAuthority {
+    pub(in crate::mobile_memory) fn authority(&self) -> IntroductionAuthority {
         IntroductionAuthority::load(self.home.path(), AUDIENCE, Some(self.policy.clone())).unwrap()
     }
 
-    fn request(&self, named: &[usize]) -> ThresholdIntroductionRequest {
+    pub(in crate::mobile_memory) fn request(
+        &self,
+        named: &[usize],
+    ) -> ThresholdIntroductionRequest {
         let destination_id = Uuid::from_u128(50);
         let mut grant = DeviceGrant::for_device(
             destination_id,
@@ -125,6 +128,7 @@ impl Fixture {
             destination_public_key: public(&self.destination),
             device_name: "Threshold desktop".into(),
             device_context: "Self-hosted build approved by two trusted devices".into(),
+            passkey_approver: None,
             grant,
             nonce: [9; 32],
             issued_at: self.now,
@@ -132,7 +136,10 @@ impl Fixture {
         }
     }
 
-    fn destination_signature(&self, request: &ThresholdIntroductionRequest) -> String {
+    pub(in crate::mobile_memory) fn destination_signature(
+        &self,
+        request: &ThresholdIntroductionRequest,
+    ) -> String {
         sign(&self.destination, &request.possession_bytes().unwrap())
     }
 
@@ -195,7 +202,7 @@ impl Fixture {
         }
     }
 
-    fn genuine(
+    pub(in crate::mobile_memory) fn genuine(
         &self,
         authority: &IntroductionAuthority,
         request: &ThresholdIntroductionRequest,
@@ -204,7 +211,7 @@ impl Fixture {
         self.approval(authority, request, index, &self.approvers[index].step_up)
     }
 
-    fn enrolled(&self) -> bool {
+    pub(in crate::mobile_memory) fn enrolled(&self) -> bool {
         DeviceRegistry::load(self.home.path())
             .unwrap()
             .device(Uuid::from_u128(50))
@@ -488,6 +495,7 @@ mod ledger {
         let envelope = IntroductionEnvelope {
             destination_signature: fixture.destination_signature(&request),
             request: IntroductionTranscript::Threshold(request),
+            passkey_assertion: None,
         };
         (
             IntroductionLedger::new(fixture.home.path(), AUDIENCE),

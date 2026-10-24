@@ -1043,6 +1043,11 @@ enum DeviceCommand {
         #[arg(long, help = "Skip the typed confirmation after the review is printed")]
         yes: bool,
     },
+    #[command(about = "Register or list optional passkey recovery factors")]
+    Passkey {
+        #[command(subcommand)]
+        command: PasskeyCommand,
+    },
     #[command(about = "Manage the offline owner-root credential")]
     OwnerRoot {
         #[command(subcommand)]
@@ -1052,6 +1057,37 @@ enum DeviceCommand {
     IntroductionPolicy {
         #[command(subcommand)]
         command: IntroductionPolicyCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PasskeyCommand {
+    #[command(
+        about = "Register a passkey as a recovery factor (owner-root signed)",
+        long_about = "Register a passkey as a recovery factor, signed by the owner root.\n\n\
+                      Reads the registration and the passkey's possession assertion that the \
+                      client produced, prints every signed field, and signs only after you type \
+                      `register`. A passkey is never a device: it can fill at most one approval \
+                      of a threshold introduction that still needs a trusted device."
+    )]
+    Register {
+        #[arg(long, value_name = "REGISTRATION_JSON")]
+        registration: PathBuf,
+        #[arg(long, value_name = "ASSERTION_JSON")]
+        assertion: PathBuf,
+        #[arg(
+            long,
+            value_name = "PEM",
+            help = "Owner-root private key file (outside COVEN_HOME)"
+        )]
+        root_key: PathBuf,
+        #[arg(long, help = "Skip the typed confirmation after the review is printed")]
+        yes: bool,
+    },
+    #[command(about = "List registered passkeys and whether each is synced")]
+    List {
+        #[arg(long, help = "Print passkeys as JSON (machine-readable)")]
+        json: bool,
     },
 }
 
@@ -2157,6 +2193,17 @@ fn run_cli(cli: Cli) -> Result<()> {
                 root_key,
                 yes,
             } => mobile_memory::recovery::run_recover(&request, &root_key, yes),
+            DeviceCommand::Passkey { command } => match command {
+                PasskeyCommand::Register {
+                    registration,
+                    assertion,
+                    root_key,
+                    yes,
+                } => {
+                    mobile_memory::passkey::run_register(&registration, &assertion, &root_key, yes)
+                }
+                PasskeyCommand::List { json } => mobile_memory::passkey::run_list(json),
+            },
             DeviceCommand::OwnerRoot { command } => match command {
                 OwnerRootCommand::Generate { out } => {
                     mobile_memory::policy_cli::run_generate_owner_root(&out)

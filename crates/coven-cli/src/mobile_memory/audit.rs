@@ -65,6 +65,8 @@ pub enum MobileAuditEvent {
     AccessRecoveryUncertain,
     OwnerRootRotated,
     OwnerRootRotationRejected,
+    PasskeyRegistered,
+    PasskeyRegistrationRejected,
     DeviceRenamed,
     DeviceSuspended,
     DeviceResumed,

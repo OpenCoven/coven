@@ -21,6 +21,7 @@ use super::grant::{
     GrantTransportConstraint, DEVICE_ACTION_VERSION,
 };
 use super::owner_policy::OwnerPolicyStore;
+use super::passkey::{action_challenge, PasskeyAssertion, PasskeyStore};
 use super::registry::{DeviceAuthorizationRecord, DeviceRecord, DeviceRegistry, PendingEnrollment};
 
 pub(super) const MAX_INTRODUCTIONS: usize = 128;
@@ -143,6 +144,7 @@ impl IntroductionRequest {
                 grant_id: self.introducer_grant_id,
                 revocation_epoch: self.introducer_revocation_epoch,
             }],
+            passkey_approver: None,
             destination_id: self.destination_id,
             destination_public_key: &self.destination_public_key,
             device_name: &self.device_name,
@@ -174,6 +176,10 @@ pub struct ThresholdIntroductionRequest {
     pub audience: [u8; 32],
     pub policy_digest: String,
     pub approvers: Vec<IntroductionApprover>,
+    /// A registered passkey filling one of the N approvals. Never sole: at
+    /// least one device approver is always required alongside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passkey_approver: Option<String>,
     pub destination_id: Uuid,
     pub destination_public_key: String,
     pub device_name: String,
@@ -196,7 +202,9 @@ impl ThresholdIntroductionRequest {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.version != 2 || self.approvers.len() < 2 {
+        if self.version != 2
+            || self.approvers.len() + usize::from(self.passkey_approver.is_some()) < 2
+        {
             bail!("invalid threshold introduction request");
         }
         self.terms().validate()
@@ -207,6 +215,7 @@ impl ThresholdIntroductionRequest {
             audience: self.audience,
             policy_digest: &self.policy_digest,
             approvers: self.approvers.clone(),
+            passkey_approver: self.passkey_approver.as_deref(),
             destination_id: self.destination_id,
             destination_public_key: &self.destination_public_key,
             device_name: &self.device_name,
@@ -309,6 +318,7 @@ struct IntroductionTerms<'a> {
     audience: [u8; 32],
     policy_digest: &'a str,
     approvers: Vec<IntroductionApprover>,
+    passkey_approver: Option<&'a str>,
     destination_id: Uuid,
     destination_public_key: &'a str,
     device_name: &'a str,
@@ -527,6 +537,7 @@ impl IntroductionAuthority {
                 &action,
                 destination_signature,
                 &[(request.introducer_id, approval)],
+                None,
                 now,
             )
         })
@@ -541,6 +552,19 @@ impl IntroductionAuthority {
         approvals: &[(Uuid, &IntroductionApproval)],
         now: DateTime<Utc>,
     ) -> Result<DeviceAuthorizationRecord> {
+        self.introduce_threshold_with_passkey(request, destination_signature, approvals, None, now)
+    }
+
+    /// As `introduce_threshold`, with the named passkey's WebAuthn assertion
+    /// over the same exact action filling its one approval.
+    pub fn introduce_threshold_with_passkey(
+        &self,
+        request: &ThresholdIntroductionRequest,
+        destination_signature: &str,
+        approvals: &[(Uuid, &IntroductionApproval)],
+        passkey: Option<&PasskeyAssertion>,
+        now: DateTime<Utc>,
+    ) -> Result<DeviceAuthorizationRecord> {
         let action = request.action()?;
         self.audited_introduce(now, || {
             self.introduce_terms(
@@ -548,6 +572,7 @@ impl IntroductionAuthority {
                 &action,
                 destination_signature,
                 approvals,
+                passkey,
                 now,
             )
         })
@@ -574,19 +599,28 @@ impl IntroductionAuthority {
         transcript: &IntroductionTranscript,
         destination_signature: &str,
         approvals: &[(Uuid, &IntroductionApproval)],
+        passkey: Option<&PasskeyAssertion>,
         now: DateTime<Utc>,
     ) -> Result<DeviceAuthorizationRecord> {
         match transcript {
             IntroductionTranscript::Single(request) => match approvals {
-                [(id, approval)] if *id == request.introducer_id => {
+                [(id, approval)] if *id == request.introducer_id && passkey.is_none() => {
                     self.introduce(request, destination_signature, approval, now)
                 }
                 _ => bail!("introduction approvals do not match the named approvers"),
             },
-            IntroductionTranscript::Threshold(request) => {
-                self.introduce_threshold(request, destination_signature, approvals, now)
-            }
+            IntroductionTranscript::Threshold(request) => self.introduce_threshold_with_passkey(
+                request,
+                destination_signature,
+                approvals,
+                passkey,
+                now,
+            ),
         }
+    }
+
+    pub fn passkey_approver(transcript: &IntroductionTranscript) -> Option<&str> {
+        transcript.terms().passkey_approver
     }
 
     fn admit_terms(
@@ -672,8 +706,12 @@ impl IntroductionAuthority {
         action: &DeviceActionIntent,
         destination_signature: &str,
         approvals: &[(Uuid, &IntroductionApproval)],
+        passkey: Option<&PasskeyAssertion>,
         now: DateTime<Utc>,
     ) -> Result<(DeviceAuthorizationRecord, IntroductionTransition)> {
+        if passkey.map(|assertion| assertion.credential_id.as_str()) != terms.passkey_approver {
+            bail!("introduction passkey approval does not match the named passkey");
+        }
         // Exactly one approval per named approver; nothing more, nothing less.
         let mut approval_ids: Vec<_> = approvals.iter().map(|(id, _)| *id).collect();
         approval_ids.sort_unstable();
@@ -716,6 +754,11 @@ impl IntroductionAuthority {
                             .find(|(id, _)| *id == approver.device_id)
                             .context("introduction approval is missing")?;
                         self.verify_approval(terms, action, approver, source, key, approval, now)?;
+                    }
+                    // Passkey store lock is last in the commit's lock order.
+                    if let Some(assertion) = passkey {
+                        PasskeyStore::open(&self.home, self.audience)?
+                            .verify_and_advance(assertion, &action_challenge(action)?)?;
                     }
                     #[cfg(test)]
                     BEFORE_INTRODUCTION_WRITE
@@ -802,7 +845,8 @@ impl IntroductionAuthority {
                 bail!("introduction owner policy was replaced");
             }
         }
-        if terms.approvers.len() != usize::from(self.policy.required_approvals)
+        if terms.approvers.len() + usize::from(terms.passkey_approver.is_some())
+            != usize::from(self.policy.required_approvals)
             || terms.approvers.iter().any(|approver| {
                 self.policy
                     .eligible_introducers
@@ -949,4 +993,4 @@ mod tests;
 
 #[cfg(test)]
 #[path = "../../tests/fixtures/trusted-device-introduction/threshold.rs"]
-mod threshold_tests;
+pub(super) mod threshold_tests;
