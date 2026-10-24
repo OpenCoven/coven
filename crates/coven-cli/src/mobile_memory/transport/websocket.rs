@@ -172,12 +172,7 @@ pub fn connect_cancellable(
         "relay port mismatch"
     );
     let socket = network::connect(address, &attempt, deadline)?;
-    let stream = DeadlineStream {
-        socket,
-        deadline,
-        #[cfg(test)]
-        read_probe: None,
-    };
+    let stream = DeadlineStream::new(socket, deadline, &attempt)?;
     let mut url = endpoint.url.clone();
     url.query_pairs_mut()
         .append_pair("v", "1")
@@ -225,46 +220,129 @@ struct ReadProbe {
 }
 
 struct DeadlineStream {
-    socket: TcpStream,
+    socket: mio::net::TcpStream,
+    poll: mio::Poll,
+    events: mio::Events,
+    cancellation: Cancellation,
     deadline: Instant,
     #[cfg(test)]
     read_probe: Option<ReadProbe>,
 }
 
-impl Read for DeadlineStream {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.socket
-            .set_read_timeout(Some(remaining(self.deadline)?))?;
-        #[cfg(test)]
-        if let Some(probe) = &mut self.read_probe {
-            let _ = probe
-                .events
-                .send(("before socket read", Instant::now(), String::new()));
-            if let Some(resume) = probe.resume.take() {
-                resume
-                    .recv_timeout(std::time::Duration::from_secs(30))
-                    .map_err(|error| io::Error::other(format!("read probe gate: {error}")))?;
-            }
-        }
-        let result = self.socket.read(bytes);
+impl DeadlineStream {
+    fn new(socket: TcpStream, deadline: Instant, attempt: &Attempt) -> Result<Self> {
+        socket.set_nonblocking(true)?;
+        let mut socket = mio::net::TcpStream::from_std(socket);
+        let poll = mio::Poll::new()?;
+        poll.registry()
+            .register(&mut socket, mio::Token(0), mio::Interest::READABLE)?;
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1))?);
+        let cancellation = attempt.register_io_waker(waker)?;
+        Ok(Self {
+            socket,
+            poll,
+            events: mio::Events::with_capacity(2),
+            cancellation,
+            deadline,
+            #[cfg(test)]
+            read_probe: None,
+        })
+    }
+
+    fn check_active(&self) -> io::Result<()> {
+        self.cancellation.ensure_active().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "transport attempt cancelled",
+            )
+        })?;
+        remaining(self.deadline)?;
+        Ok(())
+    }
+
+    fn wait_ready(&mut self, interest: mio::Interest) -> io::Result<()> {
+        self.check_active()?;
+        self.poll
+            .registry()
+            .reregister(&mut self.socket, mio::Token(0), interest)?;
         #[cfg(test)]
         if let Some(probe) = &self.read_probe {
-            let _ = probe
-                .events
-                .send(("after socket read", Instant::now(), format!("{result:?}")));
+            let _ = probe.events.send((
+                "waiting for socket readiness",
+                Instant::now(),
+                String::new(),
+            ));
         }
-        result
+        loop {
+            self.check_active()?;
+            match self
+                .poll
+                .poll(&mut self.events, Some(remaining(self.deadline)?))
+            {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            }
+            self.check_active()?;
+            if !self.events.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            self.check_active()?;
+            #[cfg(test)]
+            if let Some(probe) = &mut self.read_probe {
+                let _ = probe
+                    .events
+                    .send(("before socket read", Instant::now(), String::new()));
+                if let Some(resume) = probe.resume.take() {
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .map_err(|error| io::Error::other(format!("read probe gate: {error}")))?;
+                }
+            }
+            let result = self.socket.read(bytes);
+            #[cfg(test)]
+            if let Some(probe) = &self.read_probe {
+                let _ =
+                    probe
+                        .events
+                        .send(("after socket read", Instant::now(), format!("{result:?}")));
+            }
+            self.check_active()?;
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(mio::Interest::READABLE)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
     }
 }
 impl Write for DeadlineStream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.socket
-            .set_write_timeout(Some(remaining(self.deadline)?))?;
-        self.socket.write(bytes)
+        loop {
+            self.check_active()?;
+            let result = self.socket.write(bytes);
+            self.check_active()?;
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(mio::Interest::WRITABLE)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
-        remaining(self.deadline)?;
-        self.socket.flush()
+        self.check_active()?;
+        self.socket.flush()?;
+        self.check_active()
     }
 }
 
@@ -343,12 +421,9 @@ fn fixture_connect_cancellable(
     let attempt = cancellation.begin()?;
     super::diagnostics::initialize()?;
     let deadline = Instant::now() + std::time::Duration::from_secs(30);
-    let stream = DeadlineStream {
-        socket: TcpStream::connect_timeout(&address, remaining(deadline)?)?,
-        deadline,
-        read_probe: None,
-    };
-    attempt.register(&stream.socket)?;
+    let socket = TcpStream::connect_timeout(&address, remaining(deadline)?)?;
+    attempt.register(&socket)?;
+    let stream = DeadlineStream::new(socket, deadline, &attempt)?;
     let (socket, _) = tungstenite::client::client_with_config(
         format!("ws://{address}/ws"),
         MaybeTlsStream::Plain(stream),
@@ -552,7 +627,26 @@ mod tests {
             // Preserve the actual outcome even when the parent hang guard fired.
             let _ = done.send(result);
         });
-        let read_entry = observed.recv_timeout(Duration::from_secs(30));
+        let observation_deadline = Instant::now() + Duration::from_secs(30);
+        let mut initial_trace = Vec::new();
+        let read_entry = loop {
+            let event = observed
+                .recv_timeout(observation_deadline.saturating_duration_since(Instant::now()));
+            match event {
+                Ok(event) => {
+                    let ready = if gate_read {
+                        event.0 == "before socket read"
+                    } else {
+                        event.0 == "waiting for socket readiness"
+                    };
+                    initial_trace.push(event.clone());
+                    if ready {
+                        break Ok(event);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
         let started = Instant::now();
         let shutdown = cancellation.cancel_observed();
         if gate_read {
@@ -564,7 +658,8 @@ mod tests {
         let _ = peer.get_ref().shutdown(Shutdown::Both);
         drop(peer);
         let joined = worker.join();
-        let trace = observed.try_iter().collect::<Vec<_>>();
+        let mut trace = initial_trace;
+        trace.extend(observed.try_iter());
         assert!(
             read_entry.is_ok(),
             "read never entered: {read_entry:?}; shutdown={shutdown:?}; trace={trace:?}"
@@ -575,6 +670,69 @@ mod tests {
         );
         assert!(matches!(outcome, Ok(Err(_))), "cancelled record read did not fail before peer cleanup: {outcome:?}; elapsed={elapsed:?}; shutdown={shutdown:?}; entry={read_entry:?}; trace={trace:?}");
         assert!(trace.iter().any(|(phase, _, _)| *phase == "after socket read"), "probe gate failed before socket read: shutdown={shutdown:?}; entry={read_entry:?}; trace={trace:?}");
+    }
+
+    #[test]
+    fn cancellation_interrupts_backpressured_socket_write() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let cancellation = Cancellation::default();
+        let attempt = cancellation.begin().unwrap();
+        attempt.register(&socket).unwrap();
+        let mut stream =
+            DeadlineStream::new(socket, Instant::now() + Duration::from_secs(120), &attempt)
+                .unwrap();
+        let (events, observed) = mpsc::channel();
+        stream.read_probe = Some(ReadProbe {
+            events,
+            resume: None,
+        });
+        let (done, completed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let bytes = [0_u8; 65536];
+            let result = (|| -> io::Result<()> {
+                // Bound fixture traffic; the idle peer must backpressure before this cap.
+                for _ in 0..1024 {
+                    stream.write_all(&bytes)?;
+                }
+                Err(io::Error::other("fixture did not reach write backpressure"))
+            })();
+            let _ = done.send(result);
+        });
+        let waiting = observed.recv_timeout(Duration::from_secs(30));
+        let shutdown = cancellation.cancel_observed();
+        let outcome = completed.recv_timeout(Duration::from_secs(30));
+        let _ = peer.shutdown(std::net::Shutdown::Both);
+        drop(peer);
+        let joined = worker.join();
+        assert!(
+            waiting.is_ok(),
+            "no write readiness wait: {waiting:?}; outcome={outcome:?}"
+        );
+        assert!(joined.is_ok(), "write worker panicked: {joined:?}");
+        assert!(matches!(&outcome, Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionAborted), "write did not observe cancellation before peer cleanup: {outcome:?}; shutdown={shutdown:?}");
+    }
+
+    #[test]
+    fn idle_nonblocking_read_expires_at_its_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let cancellation = Cancellation::default();
+        let attempt = cancellation.begin().unwrap();
+        attempt.register(&socket).unwrap();
+        // This is the timeout under test, not a sequencing or promptness bound.
+        let deadline = Instant::now() + std::time::Duration::from_millis(50);
+        let mut stream = DeadlineStream::new(socket, deadline, &attempt).unwrap();
+        let error = stream.read(&mut [0; 1]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(
+            stream.deadline, deadline,
+            "read reset its absolute deadline"
+        );
     }
 
     #[test]

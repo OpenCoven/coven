@@ -9,7 +9,7 @@ enum State {
     #[default]
     Fresh,
     Connecting(Option<Arc<mio::Waker>>),
-    Connected(TcpStream),
+    Connected(TcpStream, Option<Arc<mio::Waker>>),
     Finished,
     Cancelled(Option<Arc<mio::Waker>>),
 }
@@ -34,22 +34,36 @@ impl Cancellation {
 
     fn cancel_inner(&self) -> Option<std::io::Result<()>> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let shutdown = if let State::Connected(socket) = &*state {
+        let shutdown = if let State::Connected(socket, _) = &*state {
             Some(socket.shutdown(Shutdown::Both))
         } else {
             None
         };
-        if let State::Connecting(Some(waker)) = &*state {
+        if let State::Connecting(Some(waker)) | State::Connected(_, Some(waker)) = &*state {
             let _ = waker.wake();
         }
         // Keep the wake source alive until Attempt drops after its poller exits.
         // Dropping the last Waker here can discard a pending event on Linux.
         let previous = std::mem::replace(&mut *state, State::Cancelled(None));
         *state = match previous {
-            State::Connecting(waker) | State::Cancelled(waker) => State::Cancelled(waker),
+            State::Connecting(waker) | State::Connected(_, waker) | State::Cancelled(waker) => {
+                State::Cancelled(waker)
+            }
             _ => State::Cancelled(None),
         };
         shutdown
+    }
+
+    pub(super) fn ensure_active(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transport cancellation unavailable"))?;
+        ensure!(
+            matches!(*state, State::Connected(_, _)),
+            "transport attempt cancelled"
+        );
+        Ok(())
     }
 
     pub(super) fn ensure_pending(&self) -> Result<()> {
@@ -113,16 +127,20 @@ impl Attempt {
     }
 
     pub(super) fn ensure_active(&self) -> Result<()> {
-        let state = self
+        self.cancellation.ensure_active()
+    }
+
+    pub(super) fn register_io_waker(&self, waker: Arc<mio::Waker>) -> Result<Cancellation> {
+        let mut state = self
             .cancellation
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("transport cancellation unavailable"))?;
-        ensure!(
-            matches!(*state, State::Connected(_)),
-            "transport attempt cancelled"
-        );
-        Ok(())
+        match &mut *state {
+            State::Connected(_, registered) if registered.is_none() => *registered = Some(waker),
+            _ => anyhow::bail!("transport attempt cancelled or I/O already registered"),
+        }
+        Ok(self.cancellation.clone())
     }
 
     pub(super) fn register(&self, socket: &TcpStream) -> Result<()> {
@@ -139,6 +157,7 @@ impl Attempt {
             socket
                 .try_clone()
                 .map_err(|_| anyhow::anyhow!("transport cancellation unavailable"))?,
+            None,
         );
         Ok(())
     }
@@ -205,6 +224,48 @@ mod tests {
             "finished attempt retained its wake source"
         );
         assert!(cancellation.begin().is_err());
+    }
+
+    #[test]
+    fn connected_io_waker_survives_repeated_cancellation_until_attempt_finishes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let cancellation = Cancellation::default();
+        let attempt = cancellation.begin().unwrap();
+        attempt.register(&socket).unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
+        let lifetime = Arc::downgrade(&waker);
+        attempt.register_io_waker(waker).unwrap();
+        cancellation.cancel();
+        cancellation.cancel();
+        assert!(
+            lifetime.upgrade().is_some(),
+            "cancel dropped the connected wake source"
+        );
+        assert!(attempt.ensure_active().is_err());
+        drop(attempt);
+        assert!(
+            lifetime.upgrade().is_none(),
+            "finished attempt retained the wake source"
+        );
+    }
+
+    #[test]
+    fn cancellation_before_connected_waker_installation_refuses_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let cancellation = Cancellation::default();
+        let attempt = cancellation.begin().unwrap();
+        attempt.register(&socket).unwrap();
+        cancellation.cancel();
+        let poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(1)).unwrap());
+        let lifetime = Arc::downgrade(&waker);
+        assert!(attempt.register_io_waker(waker).is_err());
+        assert!(lifetime.upgrade().is_none());
     }
 
     #[test]
