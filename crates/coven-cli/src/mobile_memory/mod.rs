@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod contract;
 pub mod device;
+pub mod enrollment;
 pub mod gateway;
 pub mod grant;
 pub mod identity;

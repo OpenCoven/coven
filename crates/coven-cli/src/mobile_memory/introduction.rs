@@ -208,6 +208,27 @@ impl IntroductionAuthority {
         Ok(authority)
     }
 
+    /// Admission check before an introducer is asked to approve: the request
+    /// is current under trusted policy and the destination proved possession.
+    /// Consumes nothing; `introduce` re-runs every check at commit.
+    pub fn admit(
+        &self,
+        request: &IntroductionRequest,
+        destination_signature: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.registry
+            .with_introducer(request.introducer_id, |source, key| {
+                self.validate_authority(request, source, key, now)?;
+                verify_assurance_signature(
+                    &request.destination_public_key,
+                    &request.possession_bytes()?,
+                    destination_signature,
+                )?;
+                Ok(())
+            })
+    }
+
     pub fn policy_digest(&self) -> Result<String> {
         self.policy.digest()
     }

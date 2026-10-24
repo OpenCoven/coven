@@ -1,0 +1,399 @@
+{
+  "profile": "coven.automations.scoped-read.vectors.v1",
+  "about": "Exact-file reads under the scoped read service (coven#857). Paths and grants are lexical; filesystem cases build a tree under a scratch directory with sibling folders root/ and outside/, bind root/ as the project root, and may change the tree at one step of the read. Every outside or protected file holds the word SENTINEL, and no successful read may return it. In the requests and filesystem sections a scope is written `<access>:<path>` for a non-recursive project scope, with a `recursive-` or `workspace-` prefix for the other forms; a filesystem request is a project path unless `requestRoot` says otherwise. An expectation with `filesystem: false` must refuse before any filesystem access, and one with `lastStep` must stop at that step of the read, so a refusal named as happening before an open really does.",
+  "paths": [
+    { "id": "plain-file", "path": "notes/today.md", "expect": "ok" },
+    { "id": "top-level-file", "path": "README.md", "expect": "ok" },
+    { "id": "unicode-name", "path": "caf\u00e9/men\u00fc.md", "expect": "ok" },
+    { "id": "multi-byte-near-byte-three", "path": "a\u20acx", "expect": "ok" },
+    { "id": "com-without-digit", "path": "COMx.md", "expect": "ok" },
+    { "id": "dots-inside-a-name", "path": "notes/v1.2.md", "expect": "ok" },
+    { "id": "empty", "path": "", "expect": "path_encoding_unsupported" },
+    { "id": "absolute", "path": "/etc/hosts", "expect": "path_absolute" },
+    { "id": "drive-absolute", "path": "C:/Windows/win.ini", "expect": "path_absolute" },
+    { "id": "drive-relative", "path": "C:notes.md", "expect": "path_absolute" },
+    { "id": "parent", "path": "..", "expect": "path_traversal" },
+    { "id": "parent-first", "path": "../outside/secret.txt", "expect": "path_traversal" },
+    { "id": "parent-inside", "path": "notes/../../outside/secret.txt", "expect": "path_traversal" },
+    { "id": "backslash-separator", "path": "notes\\today.md", "expect": "path_encoding_unsupported" },
+    { "id": "backslash-traversal", "path": "..\\outside\\secret.txt", "expect": "path_encoding_unsupported" },
+    { "id": "repeated-separator", "path": "notes//today.md", "expect": "path_encoding_unsupported" },
+    { "id": "trailing-separator", "path": "notes/", "expect": "path_encoding_unsupported" },
+    { "id": "dot-component", "path": "./notes/today.md", "expect": "path_encoding_unsupported" },
+    { "id": "dot-inside", "path": "notes/./today.md", "expect": "path_encoding_unsupported" },
+    { "id": "embedded-nul", "path": "notes/today.md\u0000.txt", "expect": "path_encoding_unsupported" },
+    { "id": "control-character", "path": "notes/to\u0007day.md", "expect": "path_encoding_unsupported" },
+    { "id": "newline", "path": "notes/today.md\nsecret", "expect": "path_encoding_unsupported" },
+    { "id": "alternate-data-stream", "path": "notes/today.md:secret", "expect": "path_encoding_unsupported" },
+    { "id": "trailing-dot", "path": "notes/today.md.", "expect": "path_encoding_unsupported" },
+    { "id": "trailing-space", "path": "notes/today.md ", "expect": "path_encoding_unsupported" },
+    { "id": "device-con", "path": "CON", "expect": "path_encoding_unsupported" },
+    { "id": "device-lowercase-with-extension", "path": "notes/nul.txt", "expect": "path_encoding_unsupported" },
+    { "id": "device-com", "path": "COM1", "expect": "path_encoding_unsupported" },
+    { "id": "device-com-superscript", "path": "com\u00b9.log", "expect": "path_encoding_unsupported" },
+    { "id": "device-lpt", "path": "logs/LPT9.log", "expect": "path_encoding_unsupported" },
+    { "id": "device-conin", "path": "CONIN$", "expect": "path_encoding_unsupported" }
+  ],
+  "grants": [
+    { "id": "exact-file", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/today.md", "access": "read", "recursive": false }], "expect": "ok" },
+    { "id": "recursive-directory", "scopes": [{ "kind": "filesystem", "root": "project", "path": "docs/guides", "access": "read", "recursive": true }], "expect": "ok" },
+    { "id": "write-only", "scopes": [{ "kind": "filesystem", "root": "workspace", "path": "out/report.md", "access": "write", "recursive": false }], "expect": "ok" },
+    { "id": "non-filesystem-kinds-are-ignored", "scopes": [{ "kind": "network", "scheme": "https", "host": "example.com", "port": 443, "path_prefix": "/api", "methods": ["GET"] }], "expect": "ok" },
+    { "id": "no-scopes", "scopes": [], "expect": "ok" },
+    { "id": "unknown-kind", "scopes": [{ "kind": "process", "path": "bin/sh" }], "expect": "grant_unsupported" },
+    { "id": "not-an-object", "scopes": ["notes/today.md"], "expect": "grant_unsupported" },
+    { "id": "missing-field", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/today.md", "access": "read" }], "expect": "grant_unsupported" },
+    { "id": "extra-field", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/today.md", "access": "read", "recursive": false, "follow": true }], "expect": "grant_unsupported" },
+    { "id": "unknown-root", "scopes": [{ "kind": "filesystem", "root": "home", "path": "notes/today.md", "access": "read", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "unknown-access", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/today.md", "access": "execute", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "recursive-not-boolean", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/today.md", "access": "read", "recursive": "false" }], "expect": "grant_unsupported" },
+    { "id": "root-wide", "scopes": [{ "kind": "filesystem", "root": "project", "path": ".", "access": "read", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "shallow-recursive", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes", "access": "read", "recursive": true }], "expect": "grant_unsupported" },
+    { "id": "wildcard", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/*.md", "access": "read", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "double-dot-inside-a-name", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/a..b.md", "access": "read", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "backslash-path", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes\\today.md", "access": "read", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "repeated-separator-path", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes//today.md", "access": "read", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "dot-component-path", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/./today.md", "access": "read", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "trailing-separator-path", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/", "access": "read", "recursive": false }], "expect": "grant_unsupported" },
+    { "id": "one-bad-scope-refuses-the-grant", "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/today.md", "access": "read", "recursive": false }, { "kind": "filesystem", "root": "project", "path": "/etc/hosts", "access": "read", "recursive": false }], "expect": "grant_unsupported" }
+  ],
+  "requests": [
+    { "id": "exact-match", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "notes/today.md" }, "expect": "authorized" },
+    { "id": "read-and-write-scopes", "scopes": ["write:notes/today.md", "read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "notes/today.md" }, "expect": "authorized" },
+    { "id": "sibling", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "notes/tomorrow.md" }, "expect": "scope_missing" },
+    { "id": "parent-directory", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "notes" }, "expect": "scope_missing" },
+    { "id": "child-of-a-file-grant", "scopes": ["read:notes"], "request": { "operation": "read_file", "root": "project", "path": "notes/today.md" }, "expect": "scope_missing" },
+    { "id": "other-root", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "workspace", "path": "notes/today.md" }, "expect": "scope_missing" },
+    { "id": "case-alias", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "Notes/today.md" }, "expect": "scope_missing" },
+    { "id": "unicode-alias", "scopes": ["read:caf\u00e9/menu.md"], "request": { "operation": "read_file", "root": "project", "path": "cafe\u0301/menu.md" }, "expect": "scope_missing" },
+    { "id": "write-does-not-imply-read", "scopes": ["write:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "notes/today.md" }, "expect": "scope_access_denied" },
+    { "id": "beneath-a-recursive-scope", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/setup.md" }, "expect": "operation_unmapped" },
+    { "id": "the-recursive-scope-itself", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides" }, "expect": "operation_unmapped" },
+    { "id": "beside-a-recursive-scope", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides-old/setup.md" }, "expect": "scope_missing" },
+    { "id": "no-scopes", "scopes": [], "request": { "operation": "read_file", "root": "project", "path": "notes/today.md" }, "expect": "scope_missing" },
+    { "id": "listing", "scopes": ["read:notes/today.md"], "request": { "operation": "list_directory", "root": "project", "path": "notes" }, "expect": "operation_unmapped" },
+    { "id": "search", "scopes": ["read:notes/today.md"], "request": { "operation": "search", "root": "project", "path": "notes", "pattern": "todo" }, "expect": "operation_unmapped" },
+    { "id": "unknown-operation", "scopes": ["read:notes/today.md"], "request": { "operation": "write_file", "root": "project", "path": "notes/today.md" }, "expect": "request_invalid" },
+    { "id": "missing-operation", "scopes": ["read:notes/today.md"], "request": { "root": "project", "path": "notes/today.md" }, "expect": "request_invalid" },
+    { "id": "extra-field", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "notes/today.md", "grant": "everything" }, "expect": "request_invalid" },
+    { "id": "missing-path", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project" }, "expect": "request_invalid" },
+    { "id": "path-not-a-string", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": ["notes", "today.md"] }, "expect": "request_invalid" },
+    { "id": "unknown-root", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "home", "path": "notes/today.md" }, "expect": "request_invalid" },
+    { "id": "not-an-object", "scopes": ["read:notes/today.md"], "request": "notes/today.md", "expect": "request_invalid" },
+    { "id": "traversal-is-refused-before-the-scope", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "notes/../notes/today.md" }, "expect": "path_traversal" },
+    { "id": "absolute", "scopes": ["read:notes/today.md"], "request": { "operation": "read_file", "root": "project", "path": "/etc/hosts" }, "expect": "path_absolute" }
+  ],
+  "filesystem": [
+    {
+      "id": "exact-file-is-read",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "root/notes/other.md", "text": "not granted" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "text": "granted notes", "lastStep": "read" }
+    },
+    {
+      "id": "top-level-file-is-read",
+      "tree": [{ "file": "root/README.md", "text": "readme" }],
+      "scopes": ["read:README.md"],
+      "request": "README.md",
+      "expect": { "text": "readme", "lastStep": "read" }
+    },
+    {
+      "id": "empty-file-is-read",
+      "tree": [{ "file": "root/notes/empty.md", "text": "" }],
+      "scopes": ["read:notes/empty.md"],
+      "request": "notes/empty.md",
+      "expect": { "text": "" }
+    },
+    {
+      "id": "sibling-is-refused-without-access",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "root/notes/other.md", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/other.md",
+      "expect": { "refusal": "scope_missing", "filesystem": false }
+    },
+    {
+      "id": "traversal-is-refused-without-access",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "outside/secret.txt", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/../../outside/secret.txt",
+      "expect": { "refusal": "path_traversal", "filesystem": false }
+    },
+    {
+      "id": "write-scope-is-refused-without-access",
+      "tree": [{ "file": "root/notes/today.md", "text": "SENTINEL" }],
+      "scopes": ["write:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "scope_access_denied", "filesystem": false }
+    },
+    {
+      "id": "recursive-scope-is-refused-without-access",
+      "tree": [{ "file": "root/docs/guides/setup.md", "text": "SENTINEL" }],
+      "scopes": ["recursive-read:docs/guides"],
+      "request": "docs/guides/setup.md",
+      "expect": { "refusal": "operation_unmapped", "filesystem": false }
+    },
+    {
+      "id": "unbound-root-is-refused-without-access",
+      "tree": [{ "file": "root/notes/today.md", "text": "SENTINEL" }],
+      "scopes": ["workspace-read:notes/today.md"],
+      "request": "notes/today.md",
+      "requestRoot": "workspace",
+      "expect": { "refusal": "root_unbound", "filesystem": false }
+    },
+    {
+      "id": "missing-file",
+      "tree": [{ "dir": "root/notes" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_not_found", "lastStep": "directory:0" }
+    },
+    {
+      "id": "file-where-a-directory-is-expected",
+      "tree": [{ "file": "root/notes", "text": "not a directory" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_not_found", "lastStep": "root" }
+    },
+    {
+      "id": "directory-under-a-file-scope",
+      "tree": [{ "file": "root/notes/today.md", "text": "SENTINEL" }],
+      "scopes": ["read:notes"],
+      "request": "notes",
+      "expect": { "refusal": "resource_directory", "lastStep": "root" }
+    },
+    {
+      "id": "file-symlink-to-outside",
+      "tree": [{ "file": "outside/secret.txt", "text": "SENTINEL" }, { "symlink": "root/notes/today.md", "target": "../../outside/secret.txt" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_symlink", "lastStep": "directory:0" }
+    },
+    {
+      "id": "file-symlink-inside-the-root",
+      "tree": [{ "file": "root/notes/real.md", "text": "SENTINEL" }, { "symlink": "root/notes/today.md", "target": "real.md" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_symlink", "lastStep": "directory:0" }
+    },
+    {
+      "id": "directory-symlink-to-outside",
+      "tree": [{ "file": "outside/today.md", "text": "SENTINEL" }, { "symlink": "root/notes", "target": "../outside" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_symlink", "lastStep": "root" }
+    },
+    {
+      "id": "hard-link-to-outside",
+      "tree": [{ "file": "outside/secret.txt", "text": "SENTINEL" }, { "dir": "root/notes" }, { "hardlink": "root/notes/today.md", "target": "outside/secret.txt" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_multiply_linked", "lastStep": "directory:0" }
+    },
+    {
+      "id": "hard-link-inside-the-root",
+      "tree": [{ "file": "root/notes/real.md", "text": "SENTINEL" }, { "hardlink": "root/notes/today.md", "target": "root/notes/real.md" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_multiply_linked", "lastStep": "directory:0" }
+    },
+    {
+      "id": "fifo",
+      "tree": [{ "dir": "root/notes" }, { "fifo": "root/notes/today.md" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_special", "lastStep": "directory:0" }
+    },
+    {
+      "id": "socket",
+      "tree": [{ "dir": "root/notes" }, { "socket": "root/notes/today.md" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_special", "lastStep": "directory:0" }
+    },
+    {
+      "id": "protected-directory",
+      "tree": [{ "file": "root/.claude/settings.json", "text": "SENTINEL" }],
+      "protected": ["root/.claude"],
+      "scopes": ["read:.claude/settings.json"],
+      "request": ".claude/settings.json",
+      "expect": { "refusal": "resource_protected", "lastStep": "root" }
+    },
+    {
+      "id": "protected-file",
+      "tree": [{ "file": "root/notes/today.md", "text": "SENTINEL" }],
+      "protected": ["root/notes/today.md"],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "refusal": "resource_protected", "lastStep": "directory:0" }
+    },
+    {
+      "id": "protected-directory-by-case-alias",
+      "tree": [{ "file": "root/.claude/settings.json", "text": "SENTINEL" }],
+      "protected": ["root/.claude"],
+      "scopes": ["read:.CLAUDE/settings.json"],
+      "request": ".CLAUDE/settings.json",
+      "alias": "case",
+      "expect": { "refusal": "resource_protected" }
+    },
+    {
+      "id": "protected-directory-by-unicode-alias",
+      "tree": [{ "file": "root/caf\u00e9/settings.json", "text": "SENTINEL" }],
+      "protected": ["root/caf\u00e9"],
+      "scopes": ["read:cafe\u0301/settings.json"],
+      "request": "cafe\u0301/settings.json",
+      "alias": "unicode",
+      "expect": { "refusal": "resource_protected" }
+    },
+    {
+      "id": "root-is-protected",
+      "tree": [{ "file": "root/notes/today.md", "text": "SENTINEL" }],
+      "protected": ["root"],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "bind": "root_protected" }
+    },
+    {
+      "id": "root-is-inside-a-protected-directory",
+      "tree": [{ "file": "root/notes/today.md", "text": "SENTINEL" }],
+      "protected": ["."],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "expect": { "bind": "root_protected" }
+    },
+    {
+      "id": "largest-file",
+      "tree": [{ "file": "root/data.txt", "size": 1048576 }],
+      "scopes": ["read:data.txt"],
+      "request": "data.txt",
+      "expect": { "length": 1048576 }
+    },
+    {
+      "id": "oversized-file",
+      "tree": [{ "file": "root/data.txt", "size": 1048577 }],
+      "scopes": ["read:data.txt"],
+      "request": "data.txt",
+      "expect": { "refusal": "limit_file_too_large", "lastStep": "file" }
+    },
+    {
+      "id": "root-renamed-away",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "root", "do": [{ "rename": ["root", "moved"] }] },
+      "expect": { "refusal": "root_moved" }
+    },
+    {
+      "id": "root-replaced",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "outside/notes/today.md", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "root", "do": [{ "rename": ["root", "old-root"] }, { "rename": ["outside", "root"] }] },
+      "expect": { "refusal": "root_moved" }
+    },
+    {
+      "id": "directory-replaced-by-a-symlink-before-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "outside/today.md", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "before_directory:0", "do": [{ "rename": ["root/notes", "root/notes-old"] }, { "symlink": "root/notes", "target": "../outside" }] },
+      "expect": { "refusal": "resource_symlink" }
+    },
+    {
+      "id": "directory-replaced-by-another-before-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "outside/stash/today.md", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "before_directory:0", "do": [{ "rename": ["root/notes", "root/notes-old"] }, { "rename": ["outside/stash", "root/notes"] }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "directory-renamed-out-after-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "dir": "outside" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "directory:0", "do": [{ "rename": ["root/notes", "outside/notes"] }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "directory-swapped-after-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "outside/stash/today.md", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "directory:0", "do": [{ "rename": ["root/notes", "root/notes-old"] }, { "rename": ["outside/stash", "root/notes"] }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "deeper-directory-renamed-out-after-its-open",
+      "tree": [{ "file": "root/a/b/c/today.md", "text": "granted notes" }, { "dir": "outside" }],
+      "scopes": ["read:a/b/c/today.md"],
+      "request": "a/b/c/today.md",
+      "race": { "at": "directory:2", "do": [{ "rename": ["root/a/b", "outside/b"] }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "file-replaced-by-a-symlink-before-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "outside/secret.txt", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "before_file", "do": [{ "remove": "root/notes/today.md" }, { "symlink": "root/notes/today.md", "target": "../../outside/secret.txt" }] },
+      "expect": { "refusal": "resource_symlink" }
+    },
+    {
+      "id": "file-replaced-by-a-hard-link-before-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "outside/secret.txt", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "before_file", "do": [{ "remove": "root/notes/today.md" }, { "hardlink": "root/notes/today.md", "target": "outside/secret.txt" }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "file-hard-linked-before-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "dir": "outside" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "before_file", "do": [{ "hardlink": "outside/copy.md", "target": "root/notes/today.md" }] },
+      "expect": { "refusal": "resource_multiply_linked" }
+    },
+    {
+      "id": "file-replaced-by-a-fifo-before-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "before_file", "do": [{ "remove": "root/notes/today.md" }, { "fifo": "root/notes/today.md" }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "file-removed-before-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "before_file", "do": [{ "remove": "root/notes/today.md" }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "file-renamed-out-after-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "dir": "outside" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "file", "do": [{ "rename": ["root/notes/today.md", "outside/today.md"] }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "file-replaced-after-its-open",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "file": "outside/secret.txt", "text": "SENTINEL" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "file", "do": [{ "rename": ["outside/secret.txt", "root/notes/today.md"] }] },
+      "expect": { "refusal": "resource_moved" }
+    },
+    {
+      "id": "directory-renamed-out-after-the-file-opened",
+      "tree": [{ "file": "root/notes/today.md", "text": "granted notes" }, { "dir": "outside" }],
+      "scopes": ["read:notes/today.md"],
+      "request": "notes/today.md",
+      "race": { "at": "file", "do": [{ "rename": ["root/notes", "outside/notes"] }] },
+      "expect": { "refusal": "resource_moved" }
+    }
+  ]
+}

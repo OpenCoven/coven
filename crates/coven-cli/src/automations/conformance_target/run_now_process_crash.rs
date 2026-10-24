@@ -56,6 +56,8 @@ pub(super) const RESEND: i64 = 3_710;
 pub(super) const REPLAY: i64 = 3_800;
 /// The occurrence's reason once a pass recovers its expired claim.
 const LEASE_EXPIRED: &str = "lease expired";
+const HOLD_EXPIRED: &str = "no operator retry was opened before the run's deadline";
+use crate::automations::runner::MANUAL_CLAIM_RESTART_REASON;
 /// The attempt's and the occurrence's reason once the deadline settles a run.
 const TIMED_OUT: &str = "automation run timed out";
 
@@ -178,9 +180,22 @@ pub(super) enum Launch {
     /// `failed` with no lease, each with the deadline's reason where it has
     /// one, and the session `killed`.
     TimedOut,
+    /// The restart contained the previous daemon's launch, as it does a
+    /// scheduled one (#1502): the session `killed`, the attempt settled
+    /// `failed`, and the run held for an operator retry, the occurrence still
+    /// `claimed` or `running` with no failure reason.
+    Held,
+    /// The held run's deadline passed with no retry opened: the run, the
+    /// attempt and the occurrence `failed`, the occurrence with no lease and
+    /// the hold's reason, and the session `killed`.
+    HeldExpired,
     /// The claim's lease expired before any launch: the occurrence `failed`
     /// with the lease's reason and no lease, and no run, attempt or session.
     Expired,
+    /// The restart found the claim unlaunched and failed it at once: the
+    /// occurrence `failed` with the restart's reason and no lease, and no
+    /// run, attempt or session (#1502).
+    Abandoned,
     /// Anything else, including a partial claim or launch.
     Mixed,
 }
@@ -215,10 +230,10 @@ enum Answer {
 /// What the restart, the re-sent request, the pass before the deadline, the
 /// pass after it and the pass after the lease leave of what the worker
 /// committed. A request that finds nothing claims and launches afresh, and that
-/// run ends cleanly. A stored claim that never launched stays claimed until
-/// its lease expires: the scheduler never dispatches a manual claim. A manual
-/// launch has no containment receipt here, so a restart leaves it running,
-/// orphaning an owned session, until its deadline stops it.
+/// run ends cleanly. The restart fails a stored claim that never launched at
+/// once, and contains a launch the previous daemon made as it does a
+/// scheduled one, holding the run for an operator retry until its deadline
+/// (#1502).
 pub(super) fn launch_path(committed: Launch) -> (Launch, Launch, Launch, Launch, Launch) {
     match committed {
         Launch::Absent => (
@@ -229,25 +244,18 @@ pub(super) fn launch_path(committed: Launch) -> (Launch, Launch, Launch, Launch,
             Launch::Succeeded,
         ),
         Launch::Claimed => (
-            Launch::Claimed,
-            Launch::Claimed,
-            Launch::Claimed,
-            Launch::Claimed,
-            Launch::Expired,
-        ),
-        Launch::Launching => (
-            Launch::Launching,
-            Launch::Launching,
-            Launch::Launching,
-            Launch::TimedOut,
-            Launch::TimedOut,
+            Launch::Abandoned,
+            Launch::Abandoned,
+            Launch::Abandoned,
+            Launch::Abandoned,
+            Launch::Abandoned,
         ),
         _ => (
-            Launch::Orphaned,
-            Launch::Orphaned,
-            Launch::Orphaned,
-            Launch::TimedOut,
-            Launch::TimedOut,
+            Launch::Held,
+            Launch::Held,
+            Launch::Held,
+            Launch::HeldExpired,
+            Launch::HeldExpired,
         ),
     }
 }
@@ -515,6 +523,7 @@ pub(super) fn launch(conn: &Connection) -> Result<Launch, &'static str> {
             return Ok(match occurrence {
                 ("claimed", "manual", None) => Launch::Claimed,
                 ("failed", "none", Some(LEASE_EXPIRED)) => Launch::Expired,
+                ("failed", "none", Some(MANUAL_CLAIM_RESTART_REASON)) => Launch::Abandoned,
                 _ => Launch::Mixed,
             })
         }
@@ -619,6 +628,28 @@ pub(super) fn launch(conn: &Connection) -> Result<Launch, &'static str> {
                 "killed",
                 ("failed", "none", Some(TIMED_OUT)),
             ) => Launch::TimedOut,
+            (
+                "running",
+                false,
+                "failed",
+                _,
+                _,
+                _,
+                true,
+                "killed",
+                ("claimed" | "running", _, None),
+            ) => Launch::Held,
+            (
+                "failed",
+                true,
+                "failed",
+                _,
+                _,
+                _,
+                true,
+                "killed",
+                ("failed", "none", Some(HOLD_EXPIRED)),
+            ) => Launch::HeldExpired,
             _ => Launch::Mixed,
         },
     )
@@ -1042,7 +1073,7 @@ mod tests {
             (3, "launchAfterLease", json!("claimed")),
             (4, "launches", json!(1)),
             (5, "launchAfterRestart", json!("timed_out")),
-            (5, "stops", json!(0)),
+            (5, "stops", json!(1)),
             (6, "launchAfterDeadline", json!("launching")),
             (7, "launchAfterRestart", json!("owned")),
             (7, "restartIsNoop", json!(true)),
@@ -1271,7 +1302,7 @@ mod tests {
         case["storePath"] = json!("private-input");
         assert_eq!(worker(&case).unwrap_err(), INVALID);
         let mut case = vectors()["cases"][5].clone();
-        case["expected"]["stops"] = json!(0);
+        case["expected"]["stops"] = json!(1);
         assert_eq!(worker(&case).unwrap_err(), INVALID);
         let mut case = vectors()["cases"][8].clone();
         case["boundary"] = json!("after_claim");

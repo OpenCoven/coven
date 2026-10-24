@@ -728,12 +728,16 @@ fn abrupt_daemon_stop_kills_live_piped_descendants() -> Result<()> {
     let status = wait_for_daemon_status(&coven_home, &path)?;
     let launch_stream = send_launch_request(&status, &project, "hold descendant for stop")?;
 
+    // Wait for a parseable pid, not just the path: a file observed between
+    // its creation and its write reads as an empty string.
+    let mut descendant_pid = None;
     wait_until("Windows daemon descendant pid", || {
-        Ok(descendant_pid_file.exists())
+        descendant_pid = std::fs::read_to_string(&descendant_pid_file)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok());
+        Ok(descendant_pid.is_some())
     })?;
-    let descendant_pid = std::fs::read_to_string(&descendant_pid_file)?
-        .trim()
-        .parse::<u32>()?;
+    let descendant_pid = descendant_pid.context("descendant pid was not published")?;
     assert!(process_is_alive(descendant_pid));
 
     let started = Instant::now();
