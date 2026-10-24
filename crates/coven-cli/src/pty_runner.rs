@@ -1968,15 +1968,120 @@ fn resume_suspended_child(child: &std::process::Child) -> bool {
 #[cfg(unix)]
 fn configure_child_process_tree_command(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
+    // Prepared before fork: neither `sysconf` nor allocation is
+    // async-signal-safe.
+    let mut inherited = InheritedDescriptorSweep::prepare();
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             // Isolate this turn in a fresh process group. A timeout can then
             // kill the npm/Node/native Codex tree in one signal.
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
+            inherited.mark_close_on_exec();
             Ok(())
         });
+    }
+}
+
+/// Marks every descriptor from 3 up close-on-exec in a child about to exec.
+///
+/// A child forked from a multithreaded process inherits every descriptor that
+/// exists at that instant. On macOS, std creates pipes, sockets and accepted
+/// connections first and marks them close-on-exec only afterwards, because
+/// there is no `pipe2` or `accept4`. A fork landing in that gap gave a harness
+/// tree another session's pipe write end, so that session's output never
+/// reached EOF and its quiescence wait failed (#1067). A harness tree inherits
+/// nothing past stdio. The protocol descriptors used before exec are already
+/// close-on-exec, so marking the rest leaves them working until exec.
+#[cfg(unix)]
+struct InheritedDescriptorSweep {
+    max_fd: libc::c_int,
+    // `_SC_OPEN_MAX` can be 1,048,576, so on Apple the child lists its open
+    // descriptors into this buffer instead of probing every number.
+    #[cfg(target_vendor = "apple")]
+    listed: Vec<libc::proc_fdinfo>,
+}
+
+#[cfg(unix)]
+impl InheritedDescriptorSweep {
+    fn prepare() -> Self {
+        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
+            .clamp(64, libc::c_int::MAX as libc::c_long) as libc::c_int;
+        #[cfg(target_vendor = "apple")]
+        let listed = {
+            let needed = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            let open =
+                usize::try_from(needed).unwrap_or(0) / std::mem::size_of::<libc::proc_fdinfo>();
+            // Room for descriptors opened before fork; a full buffer may be
+            // truncated, so the child then falls back to the bounded probe.
+            Vec::with_capacity(open * 2 + 1024)
+        };
+        Self {
+            max_fd,
+            #[cfg(target_vendor = "apple")]
+            listed,
+        }
+    }
+
+    /// Runs in the forked child and is async-signal-safe.
+    unsafe fn mark_close_on_exec(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let marked = unsafe {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    3_u32,
+                    u32::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                )
+            } == 0;
+            if marked {
+                return;
+            }
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            let entry = std::mem::size_of::<libc::proc_fdinfo>();
+            let capacity = (self.listed.capacity() * entry).min(libc::c_int::MAX as usize);
+            let written = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    self.listed.as_mut_ptr().cast(),
+                    capacity as libc::c_int,
+                )
+            };
+            if written > 0 && (written as usize) < capacity {
+                for index in 0..written as usize / entry {
+                    let fd = unsafe { (*self.listed.as_ptr().add(index)).proc_fd };
+                    if fd >= 3 {
+                        unsafe { mark_descriptor_close_on_exec(fd) };
+                    }
+                }
+                return;
+            }
+        }
+        for fd in 3..self.max_fd {
+            unsafe { mark_descriptor_close_on_exec(fd) };
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe fn mark_descriptor_close_on_exec(fd: libc::c_int) {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
     }
 }
 
@@ -8857,6 +8962,86 @@ exit 1
             !handler.contains("libc::kill"),
             "the async signal handler must only record cancellation"
         );
+    }
+
+    /// Lists the descriptors a child configured by `configure` holds after
+    /// exec, while a non-close-on-exec pipe sits at descriptors 200+: the
+    /// state another thread's pipe is in between creation and its
+    /// close-on-exec flag (#1067). Returns the strays and the listing.
+    #[cfg(unix)]
+    fn child_descriptors_beside_stray_pipe(
+        configure: impl FnOnce(&mut std::process::Command),
+    ) -> Result<([libc::c_int; 2], Vec<libc::c_int>)> {
+        let mut created = [0; 2];
+        assert_eq!(unsafe { libc::pipe(created.as_mut_ptr()) }, 0);
+        let strays = created.map(|fd| unsafe { libc::fcntl(fd, libc::F_DUPFD, 200) });
+        for fd in created {
+            unsafe { libc::close(fd) };
+        }
+        assert!(strays.iter().all(|fd| *fd >= 200), "{strays:?}");
+        let mut command = std::process::Command::new("/bin/ls");
+        command
+            .arg("/dev/fd")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        configure(&mut command);
+        let output = command.output();
+        for fd in strays {
+            unsafe { libc::close(fd) };
+        }
+        let output = output?;
+        assert!(output.status.success(), "{output:?}");
+        let listed = String::from_utf8(output.stdout)?
+            .split_whitespace()
+            .filter_map(|fd| fd.parse().ok())
+            .collect();
+        Ok((strays, listed))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_tree_children_inherit_no_descriptor_caught_before_close_on_exec() -> Result<()> {
+        let (strays, listed) =
+            child_descriptors_beside_stray_pipe(configure_child_process_tree_command)?;
+        for fd in strays {
+            assert!(
+                !listed.contains(&fd),
+                "a process-tree child inherited stray descriptor {fd}: {listed:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bounded_descriptor_probe_also_marks_strays_close_on_exec() -> Result<()> {
+        // The path a child takes when the descriptor listing does not fit its
+        // buffer (Apple) or `close_range` is unavailable (older Linux).
+        let (strays, listed) = child_descriptors_beside_stray_pipe(|command| {
+            use std::os::unix::process::CommandExt;
+            let mut probe = InheritedDescriptorSweep::prepare();
+            probe.max_fd = 1024;
+            #[cfg(target_vendor = "apple")]
+            {
+                probe.listed = Vec::new();
+            }
+            unsafe {
+                command.pre_exec(move || {
+                    for fd in 3..probe.max_fd {
+                        mark_descriptor_close_on_exec(fd);
+                    }
+                    Ok(())
+                });
+            }
+        })?;
+        for fd in strays {
+            assert!(
+                !listed.contains(&fd),
+                "probe left stray descriptor {fd}: {listed:?}"
+            );
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
