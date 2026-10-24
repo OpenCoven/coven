@@ -133,6 +133,7 @@ jobs:
       - run: python3 scripts/cloud/provision-test.py
       - run: python3 scripts/cloud/bootstrap-test.py
       - run: python3 scripts/cloud/readiness-test.py
+      - run: python3 scripts/delivery/checkpoint-test.py
       - run: bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh
       - run: python3 scripts/dev-verify-test.py
       - run: npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund

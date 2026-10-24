@@ -17,6 +17,7 @@ Canonical Coven-wide skills live here. Each skill is a directory with a `SKILL.m
 | `familiar-board-stewardship` | Keep familiar-owned Coven board cards current, routed, and evidence-backed |
 | `opencoven-design` | OpenCoven design system and visual language reference |
 | `higgsfield` | Runtime-portable image and video generation via Higgsfield API (curl + jq only) |
+| `coven-cloud-maintainer` | Coordinate, checkpoint and resume OpenCoven/coven issue work across worktrees, Cloud VMs and later sessions through GitHub |
 
 ## OpenClaw Skill Migration
 
