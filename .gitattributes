@@ -4,3 +4,7 @@ spec/coven-session-policy/v2/fixtures/*.json text eol=lf
 
 # Release store dumps are loaded byte for byte by the upgrade tests.
 crates/coven-cli/tests/fixtures/automations-release-stores/*.sql text eol=lf
+
+# The Windows runner artifact digest binds these exact bytes; a CRLF checkout
+# would make the CI workspace copy differ from a pinned clone of the same commit.
+conformance/automations/runner/conformance.mjs text eol=lf

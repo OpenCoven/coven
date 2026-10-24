@@ -1083,3 +1083,43 @@ test("native binary metadata keeps Mach-O and ELF recognition", () => {
   elf.writeUInt32LE(1, 20);
   assert.deepEqual(nativePlatform(elf), { os: "linux", arch: "x64" });
 });
+
+test("Windows helper producer verifies locked source artifact metadata before exclusive publication", async () => {
+  const { buildWindowsHelper } = await import("./audit.mjs");
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "coven-helper-build-fixture-")));
+  try {
+    const source = path.join(root, "source"); const target = path.join(root, "target"); const output = path.join(root, "output");
+    const manifest = path.join(source, "crates/coven-conformance-supervisor/Cargo.toml");
+    write(manifest, '[package]\nname="coven-conformance-supervisor"\nversion="0.1.0"\n');
+    const executable = path.join(target, "debug/coven-conformance-supervisor.exe");
+    const bytes = nativePeFixture(); bytes.writeUInt32LE(4096, 0x98 + 56); write(executable, bytes); mkdirSync(output);
+    const artifact = { reason: "compiler-artifact", package_id: "path+file://fixture#coven-conformance-supervisor@0.1.0", manifest_path: manifest,
+      target: { name: "coven-conformance-supervisor", kind: ["bin"] }, profile: { opt_level: "0", debug_assertions: true, test: false }, executable };
+    const commit = "1".repeat(40); let calls = 0;
+    const dependencies = { host: { os: "win32", arch: "x64" }, spawnBuild(command, args, options) {
+      calls += 1; assert.equal(command, "cargo");
+      assert.deepEqual(args, ["build", "--locked", "-p", "coven-conformance-supervisor", "--bin", "coven-conformance-supervisor", "--message-format=json"]);
+      assert.equal(options.cwd, source); assert.equal(options.env.CARGO_TARGET_DIR, target);
+      assert.equal(options.env.COVEN_BUILD_COMMIT, commit);
+      return { status: 0, stdout: JSON.stringify(artifact) + '\n' + JSON.stringify({ reason: "build-finished", success: true }) + '\n' };
+    } };
+    const helper = buildWindowsHelper(source, target, output, commit, dependencies);
+    assert.equal(calls, 1); assert.equal(helper.helperPath, path.join(output, "coven-conformance-supervisor.exe"));
+    assert.deepEqual(readFileSync(helper.helperPath), bytes); assert.equal(helper.sha256, digestBytes(bytes));
+    assert.deepEqual(helper.platform, { os: "win32", arch: "x64" });
+    assert.throws(() => buildWindowsHelper(source, target, output, commit, dependencies)); // Exclusive publication.
+    rmSync(helper.helperPath);
+    for (const mutate of [
+      value => { value.profile.opt_level = "3"; }, value => { value.profile.test = true; },
+      value => { value.manifest_path = path.join(root, "unrelated.toml"); },
+      value => { value.executable = path.join(root, "wrong.exe"); },
+      value => { value.package_id = "path+file://fixture#coven-cli@0.1.0"; },
+    ]) {
+      const wrong = structuredClone(artifact); mutate(wrong);
+      assert.throws(() => buildWindowsHelper(source, target, output, commit, { ...dependencies, spawnBuild: () => ({ status: 0,
+        stdout: JSON.stringify(wrong) + '\n' + JSON.stringify({ reason: "build-finished", success: true }) + '\n' }) }));
+      assert.equal(existsSync(path.join(output, "coven-conformance-supervisor.exe")), false);
+    }
+    assert.throws(() => buildWindowsHelper(source, target, output, commit, { ...dependencies, host: { os: "win32", arch: "arm64" } }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

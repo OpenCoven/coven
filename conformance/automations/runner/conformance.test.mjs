@@ -6,6 +6,8 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const RUNNER = fileURLToPath(new URL("./conformance.mjs", import.meta.url));
@@ -841,4 +843,205 @@ test("Windows runner artifact refuses invalid inputs without echoing them", asyn
     assert.throws(() => createWindowsRunnerArtifact(...args),
       { message: "Windows runner artifact input is invalid" });
   }
+});
+
+test("Windows control accepts fragmented closed frames only after ACK and complete helper closure", async () => {
+  const { createWindowsControlReader } = await import("./conformance.mjs");
+  const nonce = "ab".repeat(16);
+  const frame = (kind, extra = {}) => Buffer.from(JSON.stringify({ schemaVersion: "coven.automations.windows-job-supervisor.v1", nonce, kind, ...extra }) + "\n");
+  const reader = createWindowsControlReader(nonce);
+  const ready = frame("ready");
+  for (const byte of ready) reader.push(Buffer.from([byte]), () => reader.requestAck());
+  reader.push(frame("exited", { exitCode: 4294967295 }));
+  // Terminal delivery can race the ACK write callback, but cannot become proof.
+  assert.throws(() => reader.finish(0), { message: "Windows helper control is invalid" });
+  const valid = createWindowsControlReader(nonce);
+  valid.push(ready, () => { valid.requestAck(); valid.completeAck(); });
+  valid.push(frame("exited", { exitCode: 4294967295 }));
+  assert.deepEqual(valid.finish(0), { kind: "exited", exitCode: 4294967295 });
+  for (const [failure, status] of [["launch_invalid", 2], ["cleanup_unproven", 3]]) {
+    const refused = createWindowsControlReader(nonce);
+    refused.push(frame("refused", { failure }));
+    assert.deepEqual(refused.finish(status), { kind: "refused", failure });
+  }
+});
+
+test("Windows control refuses premature, duplicate, trailing and contradictory evidence", async () => {
+  const { createWindowsControlReader } = await import("./conformance.mjs");
+  const nonce = "ab".repeat(16);
+  const line = (kind, extra = {}) => JSON.stringify({ schemaVersion: "coven.automations.windows-job-supervisor.v1", nonce, kind, ...extra }) + "\n";
+  const invalid = (action) => {
+    const reader = createWindowsControlReader(nonce);
+    assert.throws(() => action(reader), { message: "Windows helper control is invalid" });
+    assert.throws(() => reader.finish(0), { message: "Windows helper control is invalid" });
+  };
+  invalid(reader => reader.push(Buffer.from(line("exited", { exitCode: 0 }))));
+  invalid(reader => reader.push(Buffer.from(line("ready") + line("exited", { exitCode: 0 }))));
+  invalid(reader => reader.push(Buffer.from(line("ready") + line("ready"))));
+  invalid(reader => reader.push(Buffer.from(line("refused", { failure: "io_refused" }) + line("ready"))));
+  invalid(reader => { reader.push(Buffer.from(line("ready")), () => { reader.requestAck(); reader.completeAck(); }); reader.push(Buffer.from(line("exited", { exitCode: 0 }) + "x")); reader.finish(0); });
+  invalid(reader => reader.finish(0));
+  invalid(reader => { reader.push(Buffer.from(line("refused", { failure: "cleanup_unproven" }))); reader.finish(2); });
+  invalid(reader => { reader.push(Buffer.from(line("ready")), () => { reader.requestAck(); reader.completeAck(); }); reader.push(Buffer.from(line("exited", { exitCode: 0 }))); reader.finish(2); });
+});
+
+test("Windows control rejects ambiguous JSON, private fields, oversized data and invalid UTF-8", async () => {
+  const { createWindowsControlReader } = await import("./conformance.mjs");
+  const nonce = "ab".repeat(16);
+  const ready = { schemaVersion: "coven.automations.windows-job-supervisor.v1", nonce, kind: "ready" };
+  for (const bytes of [
+    Buffer.from(JSON.stringify({ ...ready, private: "sensitive fixture" }) + "\n"),
+    Buffer.from(JSON.stringify({ ...ready, nonce: "cd".repeat(16) }) + "\n"),
+    Buffer.from(JSON.stringify(ready).replace('"kind":"ready"', '"kind":"ready","kind":"ready"') + "\n"),
+    Buffer.from(JSON.stringify(ready).replace('"kind":"ready"', '"kind":"ready","\\u006bind":"ready"') + "\n"),
+    Buffer.alloc(256, 0x20), Buffer.alloc(1024 * 1024, 0x20), Buffer.from([0xff, 10]),
+    Buffer.from(JSON.stringify({ ...ready, kind: "exited", exitCode: -1 }) + "\n"),
+    Buffer.from(JSON.stringify({ ...ready, kind: "refused", failure: "sensitive fixture" }) + "\n"),
+  ]) {
+    const reader = createWindowsControlReader(nonce);
+    assert.throws(() => reader.push(bytes), { message: "Windows helper control is invalid" });
+    assert.throws(() => reader.finish(0), { message: "Windows helper control is invalid" });
+  }
+});
+
+
+test("Windows control permits the exact wire cap and buffers one terminal until ACK completion", async () => {
+  const { createWindowsControlReader } = await import("./conformance.mjs");
+  const nonce = "ab".repeat(16);
+  const line = kind => JSON.stringify({ schemaVersion: "coven.automations.windows-job-supervisor.v1", nonce, kind });
+  const padded = line("ready").padEnd(255, " ");
+  const reader = createWindowsControlReader(nonce);
+  reader.push(Buffer.from(padded));
+  reader.push(Buffer.from("\n"), () => reader.requestAck());
+  reader.push(Buffer.from(JSON.stringify({ schemaVersion: "coven.automations.windows-job-supervisor.v1", nonce, kind: "exited", exitCode: 0 }) + "\n"));
+  reader.completeAck();
+  assert.deepEqual(reader.finish(0), { kind: "exited", exitCode: 0 });
+  const oversized = createWindowsControlReader(nonce);
+  assert.throws(() => oversized.push(Buffer.from(padded + " \n")), { message: "Windows helper control is invalid" });
+});
+
+test("Windows helper consumer services ACK while a large body is backpressured", async () => {
+  const { invokeWindowsHelper } = await import("./conformance.mjs");
+  const directory = await mkdtemp(join(tmpdir(), "coven-windows-consumer-"));
+  try {
+    const fixture = join(directory, "helper.mjs");
+    await writeFile(fixture, `
+      import { readSync, writeSync } from 'node:fs';
+      let header; let bytes = Buffer.alloc(0); let count = 0; let ended = false; let ackBeforeEOF = false;
+      const frame = (kind, extra = {}) => writeSync(3, JSON.stringify({schemaVersion:header.schemaVersion,nonce:header.nonce,kind,...extra})+'\\n');
+
+      process.stdin.on('data', chunk => {
+        if (header) { count += chunk.length; return; }
+        bytes = Buffer.concat([bytes, chunk]); const end = bytes.indexOf(10); if (end < 0) return;
+        header = JSON.parse(bytes.subarray(0,end)); count = bytes.length-end-1; bytes = Buffer.alloc(0);
+        process.stdin.pause(); frame('ready');
+        const ack = Buffer.alloc(36); let received = 0;
+        while(received < ack.length) { const count = readSync(3, ack, received, ack.length-received); if(count===0)process.exit(3); received += count; }
+        if(ack.toString()!=='GO '+header.nonce+'\\n')process.exit(3);
+        ackBeforeEOF = !ended; process.stdin.resume();
+      });
+      process.stdin.on('end', () => { ended = true; writeSync(1, JSON.stringify({ackBeforeEOF,bodyBytes:count})); frame('exited',{exitCode:23}); process.exit(0); });
+    `);
+    const result = await invokeWindowsHelper({ helper: process.execPath, target: fixture, directory,
+      subjectSha256: SHA_A, args: [], input: Buffer.alloc(4 * 1024 * 1024, 0x41), timeoutMs: 30000 });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 23);
+    assert.deepEqual(JSON.parse(result.stdout), { ackBeforeEOF: true, bodyBytes: 4 * 1024 * 1024 });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("Windows helper consumer rejects execution without valid terminal and helper status", async () => {
+  const { invokeWindowsHelper } = await import("./conformance.mjs");
+  const directory = await mkdtemp(join(tmpdir(), "coven-windows-consumer-invalid-"));
+  try {
+    const fixture = join(directory, "helper.mjs");
+    await writeFile(fixture, `
+      import { readSync, writeSync } from 'node:fs';
+      let bytes=''; let header;
+      const frame = (kind,extra={}) => writeSync(3,JSON.stringify({schemaVersion:header.schemaVersion,nonce:header.nonce,kind,...extra})+'\\n');
+      process.stdin.on('data', chunk => { bytes+=chunk; if(header||!bytes.includes('\\n'))return; header=JSON.parse(bytes.split('\\n')[0]);
+        if(process.env.COVEN_WINDOWS_FIXTURE_MODE==='refused'){frame('refused',{failure:'launch_invalid'});process.exit(2);}
+        if(process.env.COVEN_WINDOWS_FIXTURE_MODE==='premature'){frame('exited',{exitCode:0});process.exit(0);}
+        frame('ready');
+        const ack=Buffer.alloc(36); let count=0; while(count<36){const size=readSync(3,ack,count,36-count);if(size===0)process.exit(3);count+=size;} frame('exited',{exitCode:0});process.exit(2);
+      });
+    `);
+    for (const mode of ["refused", "premature", "status-mismatch"]) {
+      const result = await invokeWindowsHelper({ helper: process.execPath, target: fixture, directory,
+        subjectSha256: SHA_A, args: [], input: Buffer.alloc(0), timeoutMs: 30000,
+        env: { ...process.env, COVEN_WINDOWS_FIXTURE_MODE: mode } });
+      assert.ok(result.error);
+      assert.equal(result.status, null);
+      assert.equal(result.stdout, "");
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test("Windows helper consumer releases owned streams and loop reference when kill never closes", async () => {
+  const { invokeWindowsHelper } = await import("./conformance.mjs");
+  const child = new EventEmitter();
+  const streams = Array.from({ length: 4 }, () => new PassThrough());
+  [child.stdin, child.stdout, child.stderr] = streams;
+  child.stdio = streams;
+  let kills = 0; let unrefs = 0;
+  child.kill = () => { kills += 1; return false; };
+  child.unref = () => { unrefs += 1; };
+  const timers = [];
+  const result = invokeWindowsHelper({ helper: process.execPath, target: RUNNER, directory: tmpdir(),
+    subjectSha256: SHA_A, args: [], input: Buffer.alloc(0), timeoutMs: 30000 }, {
+    spawnHelper: () => child,
+    schedule: callback => { const timer = { callback, cleared: false }; timers.push(timer); return timer; },
+    cancel: timer => { if (timer) timer.cleared = true; },
+  });
+  assert.equal(timers.length, 1);
+  timers[0].callback(); // Watchdog: failed kill and no child close event.
+  assert.equal(kills, 1); assert.equal(timers.length, 2);
+  timers[1].callback(); // Exhaust the separate unproven-cleanup close guard.
+  const execution = await result;
+  assert.ok(execution.error); assert.equal(execution.status, null); assert.equal(execution.stdout, "");
+  assert.equal(unrefs, 1);
+  assert.ok(streams.every(stream => stream.destroyed));
+  assert.ok(timers.every(timer => timer.cleared));
+  child.emit("close", 0); // Late events cannot convert failure into evidence.
+  assert.equal(execution.status, null);
+});
+
+function windowsPeFixture(marker) {
+  const bytes = Buffer.alloc(64 + 24 + 112 + 40 + 1);
+  bytes.write("MZ"); bytes.writeUInt32LE(64, 60); bytes.write("PE\0\0", 64);
+  bytes.writeUInt16LE(0x8664, 68); bytes.writeUInt16LE(1, 70);
+  bytes.writeUInt16LE(112, 84); bytes.writeUInt16LE(2, 86);
+  bytes.writeUInt16LE(0x20b, 88); bytes.writeUInt32LE(4096, 144);
+  bytes[bytes.length - 1] = marker;
+  return bytes;
+}
+
+test("Windows binding recomputes runner/helper/source roles and independently binds native subject", async () => {
+  const { createWindowsRunnerArtifact, validateWindowsRunnerBinding } = await import("./conformance.mjs");
+  const bytes = { runnerBytes: Buffer.from("runner fixture"), helperBytes: windowsPeFixture(1), subjectBytes: windowsPeFixture(2) };
+  const artifact = createWindowsRunnerArtifact(bytes.runnerBytes, bytes.helperBytes, "1".repeat(40));
+  const job = { source: { commit: "1".repeat(40) }, runner: { name: "coven-automations-conformance-runner", version: artifact.version,
+    artifactSha256: artifact.sha256, vectorSetSha256: sha256(canonicalize([])) }, suites: [],
+    subjectArtifact: { platform: { os: "win32", arch: "x64" }, sha256: sha256(bytes.subjectBytes) }, environment: { os: "win32", arch: "x64" } };
+  assert.deepEqual(validateWindowsRunnerBinding(job, bytes, { os: "win32", arch: "x64" }), artifact);
+  for (const mutate of [
+    copy => { copy.source.commit = "2".repeat(40); },
+    copy => { copy.runner.version = "0.1.0"; },
+    copy => { copy.runner.artifactSha256 = sha256(bytes.runnerBytes); },
+    copy => { copy.runner.vectorSetSha256 = SHA_B; },
+    copy => { copy.subjectArtifact.sha256 = sha256(bytes.helperBytes); },
+    copy => { copy.environment.os = "linux"; },
+    copy => { copy.subjectArtifact.platform.arch = "arm64"; },
+  ]) {
+    const copy = structuredClone(job); mutate(copy);
+    assert.throws(() => validateWindowsRunnerBinding(copy, bytes, { os: "win32", arch: "x64" }), { message: "Windows runner artifact binding is invalid" });
+  }
+  for (const changed of [
+    { ...bytes, runnerBytes: Buffer.concat([bytes.runnerBytes, Buffer.from("changed")]) },
+    { ...bytes, helperBytes: bytes.subjectBytes, subjectBytes: bytes.helperBytes },
+    { ...bytes, helperBytes: Buffer.from("PRIVATE fixture") },
+    { ...bytes, subjectBytes: Buffer.from("PRIVATE fixture") },
+  ]) assert.throws(() => validateWindowsRunnerBinding(job, changed, { os: "win32", arch: "x64" }), { message: "Windows runner artifact binding is invalid" });
+  assert.throws(() => validateWindowsRunnerBinding(job, bytes, { os: "win32", arch: "arm64" }), { message: "Windows runner artifact binding is invalid" });
 });

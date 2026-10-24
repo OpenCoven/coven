@@ -20,7 +20,7 @@ import {
   packageAutomationsProtocol,
   verifyAutomationsProtocolBundle,
 } from "../../../scripts/package-automations-protocol.mjs";
-import { canonicalize, digestBytes, digestCanonical } from "./conformance.mjs";
+import { canonicalize, createWindowsRunnerArtifact, digestBytes, digestCanonical, isWindowsX64Executable } from "./conformance.mjs";
 
 const RUNNER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(RUNNER_DIR, "../../..");
@@ -312,18 +312,57 @@ function buildSubject(sourceRoot, targetDir, outputDir, commit) {
     "Cargo artifact is not the pinned snapshot's conventional debug coven-cli binary",
   );
   requireAudit(
-    realpathSync(artifact.executable) === path.join(realpathSync(targetDir), "debug/coven") &&
+    realpathSync(artifact.executable) === path.join(realpathSync(targetDir), process.platform === "win32" ? "debug/coven.exe" : "debug/coven") &&
       lstatSync(artifact.executable).isFile(),
     "Cargo executable is outside the expected debug target",
   );
   const bytes = readFileSync(artifact.executable);
   const platform = nativePlatform(bytes);
   requireAudit(platform.os === process.platform, "native binary platform does not match the audit host");
-  const subjectPath = path.join(outputDir, "coven");
+  const subjectPath = path.join(outputDir, process.platform === "win32" ? "coven.exe" : "coven");
   writeFileSync(subjectPath, bytes, { flag: "wx", mode: 0o700 });
   chmodSync(subjectPath, 0o700);
   return { subjectPath, sha256: digestBytes(bytes), version, platform };
 }
+
+const HELPER_BUILD_ARGS = ["build", "--locked", "-p", "coven-conformance-supervisor", "--bin", "coven-conformance-supervisor", "--message-format=json"];
+
+export function buildWindowsHelper(sourceRoot, targetDir, outputDir, commit, {
+  host = { os: process.platform, arch: process.arch }, spawnBuild = spawnSync,
+} = {}) {
+  try {
+    requireAudit(host.os === "win32" && host.arch === "x64" && /^[0-9a-f]{40}$/.test(commit), "unsupported helper build input");
+    const build = spawnBuild("cargo", HELPER_BUILD_ARGS, {
+      cwd: sourceRoot, env: { ...process.env, CARGO_TARGET_DIR: targetDir,
+        COVEN_BUILD_COMMIT: commit, COVEN_BUILD_VERSION: `audit-${commit}` },
+      encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"],
+    });
+    requireAudit(!build.error && build.status === 0, "helper Cargo build failed");
+    const messages = build.stdout.split("\n").filter(Boolean).map(line => JSON.parse(line));
+    const artifacts = messages.filter(message => message.reason === "compiler-artifact" &&
+      message.target?.name === "coven-conformance-supervisor" && message.target.kind?.includes("bin") && message.executable != null);
+    requireAudit(messages.some(message => message.reason === "build-finished" && message.success === true) && artifacts.length === 1,
+      "helper Cargo artifact missing or ambiguous");
+    const artifact = artifacts[0];
+    requireAudit(typeof artifact.package_id === "string" && /#(?:coven-conformance-supervisor@)?0\.1\.0$/.test(artifact.package_id) &&
+      typeof artifact.manifest_path === "string" && realpathSync(artifact.manifest_path) === path.join(sourceRoot, "crates/coven-conformance-supervisor/Cargo.toml") &&
+      artifact.profile?.opt_level === "0" && artifact.profile.debug_assertions === true && artifact.profile.test === false &&
+      typeof artifact.executable === "string" && path.isAbsolute(artifact.executable) &&
+      realpathSync(artifact.executable) === path.join(realpathSync(targetDir), "debug/coven-conformance-supervisor.exe"), "helper Cargo metadata invalid");
+    const info = lstatSync(artifact.executable);
+    requireAudit(info.isFile() && info.size >= 64 && info.size <= 256 * 1024 * 1024, "helper executable invalid");
+    const bytes = readFileSync(artifact.executable);
+    requireAudit(isWindowsX64Executable(bytes), "helper native metadata invalid");
+    const platform = nativePlatform(bytes);
+    requireAudit(same(platform, host), "helper native host mismatch");
+    const helperPath = path.join(outputDir, "coven-conformance-supervisor.exe");
+    writeFileSync(helperPath, bytes, { flag: "wx", mode: 0o700 });
+    chmodSync(helperPath, 0o700);
+    return { helperPath, sha256: digestBytes(bytes), platform,
+      build: { command: ["cargo", ...HELPER_BUILD_ARGS], profile: "debug", locked: true } };
+  } catch { throw new AuditError("Windows helper artifact build or binding failed"); }
+}
+
 
 function isDigest(value) {
   return exactKeys(value, ["algorithm", "canonicalization", "value"]) &&
@@ -454,9 +493,13 @@ export function runAudit({ outputDir }) {
       : (privateTarget = mkdtempSync(path.join(realpathSync(tmpdir()), "coven-automations-build-")));
     assertExternal(targetDir, sourceRoots);
     const subject = buildSubject(sourceRoot, targetDir, output, commit);
+    const helper = process.platform === "win32" ? buildWindowsHelper(sourceRoot, targetDir, output, commit) : undefined;
     assertCleanSource(commit);
     assertCleanSource(commit, sourceRoot);
     const runnerPath = path.join(sourceRunnerDir, "conformance.mjs");
+    const runnerArtifact = helper ? createWindowsRunnerArtifact(readFileSync(runnerPath), readFileSync(helper.helperPath), commit) : undefined;
+    const runnerManifestPath = runnerArtifact ? path.join(output, "windows-runner-artifact.json") : undefined;
+    if (runnerArtifact) writeFileSync(runnerManifestPath, runnerArtifact.bytes, { flag: "wx", mode: 0o600 });
     const job = {
       schemaVersion: "coven.automations.conformance-job.v1",
       resultId: `native-audit-${commit}`,
@@ -465,8 +508,8 @@ export function runAudit({ outputDir }) {
       protocolArtifact: { bundleSchemaVersion: "coven.automations.bundle.v1", ...verified },
       runner: {
         name: "coven-automations-conformance-runner",
-        version: "0.1.0",
-        artifactSha256: digestBytes(readFileSync(runnerPath)),
+        version: runnerArtifact?.version ?? "0.1.0",
+        artifactSha256: runnerArtifact?.sha256 ?? digestBytes(readFileSync(runnerPath)),
         vectorSetSha256: digestCanonical(suites).value,
       },
       subjectArtifact: {
@@ -504,6 +547,11 @@ export function runAudit({ outputDir }) {
         toolchainAttested: false,
         reproducibility: "not_assessed",
       },
+      ...(helper ? { containmentHelper: {
+        fileName: "coven-conformance-supervisor.exe", abi: "coven.automations.windows-job-supervisor.v1",
+        sha256: helper.sha256, platform: helper.platform,
+        build: { ...helper.build, sourceInput: "private_pinned_git_checkout", trust: "caller_environment", hermetic: false, toolchainAttested: false },
+      } } : {}),
       protocolArtifact: job.protocolArtifact,
       runner: job.runner,
       subjectArtifact: job.subjectArtifact,
@@ -511,6 +559,7 @@ export function runAudit({ outputDir }) {
     const provenanceSha256 = digestBytes(readFileSync(provenancePath));
     const execution = spawnSync(process.execPath, [
       runnerPath, "--job", jobPath, "--target-command", subject.subjectPath,
+      ...(helper ? ["--containment-helper", helper.helperPath] : []),
     ], {
       cwd: output,
       encoding: "utf8",
@@ -533,7 +582,11 @@ export function runAudit({ outputDir }) {
     requireAudit(passed === (execution.status === 0), "independent runner exit status disagrees with suite results");
     requireAudit(
       digestBytes(readFileSync(subject.subjectPath)) === subject.sha256 &&
-        digestBytes(readFileSync(runnerPath)) === job.runner.artifactSha256 &&
+        (helper ? (
+          digestBytes(readFileSync(helper.helperPath)) === helper.sha256 &&
+          digestBytes(readFileSync(runnerManifestPath)) === runnerArtifact.sha256 &&
+          createWindowsRunnerArtifact(readFileSync(runnerPath), readFileSync(helper.helperPath), commit).sha256 === job.runner.artifactSha256
+        ) : digestBytes(readFileSync(runnerPath)) === job.runner.artifactSha256) &&
         digestBytes(readFileSync(packaged.manifestPath)) === manifestSha256 &&
         digestBytes(readFileSync(packaged.bundlePath)) === verified.bundleSha256 &&
         digestBytes(readFileSync(provenancePath)) === provenanceSha256 &&
