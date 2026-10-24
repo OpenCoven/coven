@@ -138,6 +138,13 @@ These extractions are complete and remain the model for bounded movement:
    budget, never an authorization decision. Typed proposal decoding, revision
    serialization, audit reservation, file reads, claims, recovery, and final
    policy checks remain with the coordinator. No unchecked decoding API is added.
+6. **Proposal revision digest.** Private `api::proposal_revision` owns the
+   canonical JSON digest behind `ProposalEnvelopeDocument::revision`: objects
+   hash with sorted, re-encoded keys, arrays keep their order, and scalars hash
+   as written. It exposes only `hash_canonical_json` to the coordinator and does
+   no I/O. Envelope decoding, authority bytes, and every revision comparison
+   remain with the coordinator. `tests/proposal_revision_boundary.rs` rejects
+   new dependencies, state, and exposed helpers.
 
 These seams preserve the public HTTP API, daemon socket protocol, and existing
 caller entry points. They do not complete #806's broader highest-risk module
@@ -229,6 +236,9 @@ the delivering PR; historical dossier acceptance does not substitute for it.
   a helper that bypasses the gate.
 - **Proposal-envelope syntax and resource validation**: private
   `api::proposal_preflight`; keep authority decisions and I/O outside it.
+- **Proposal revision canonicalization**: private `api::proposal_revision`.
+  Changing the digest re-keys every stored proposal and recorded decision
+  request, so it is a behavior change and never part of a structural move.
 - **Validation and domain policy**: the module that owns the domain
   (`ward.rs`, `threads_gate.rs`, `harness.rs`, `session_launch.rs`) rather than
   inline transport code where a characterized seam exists.
