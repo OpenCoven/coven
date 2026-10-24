@@ -1996,19 +1996,19 @@ fn configure_child_process_tree_command(command: &mut std::process::Command) {
 /// close-on-exec, so marking the rest leaves them working until exec.
 #[cfg(unix)]
 struct InheritedDescriptorSweep {
+    // The probe's bound. Linux needs no probe; see `mark_close_on_exec`.
+    #[cfg(any(not(target_os = "linux"), test))]
     max_fd: libc::c_int,
-    // `_SC_OPEN_MAX` can be 1,048,576, so on Apple the child lists its open
+    // `_SC_OPEN_MAX` can be 1,048,576, so on macOS the child lists its open
     // descriptors into this buffer instead of probing every number.
-    #[cfg(target_vendor = "apple")]
+    #[cfg(target_os = "macos")]
     listed: Vec<libc::proc_fdinfo>,
 }
 
 #[cfg(unix)]
 impl InheritedDescriptorSweep {
     fn prepare() -> Self {
-        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
-            .clamp(64, libc::c_int::MAX as libc::c_long) as libc::c_int;
-        #[cfg(target_vendor = "apple")]
+        #[cfg(target_os = "macos")]
         let listed = {
             let needed = unsafe {
                 libc::proc_pidinfo(
@@ -2026,51 +2026,68 @@ impl InheritedDescriptorSweep {
             Vec::with_capacity(open * 2 + 1024)
         };
         Self {
-            max_fd,
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(not(target_os = "linux"), test))]
+            max_fd: unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
+                .clamp(64, libc::c_int::MAX as libc::c_long) as libc::c_int,
+            #[cfg(target_os = "macos")]
             listed,
         }
     }
 
     /// Runs in the forked child and is async-signal-safe.
     unsafe fn mark_close_on_exec(&mut self) {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let marked = unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    3_u32,
-                    u32::MAX,
-                    libc::CLOSE_RANGE_CLOEXEC,
-                )
-            } == 0;
-            if marked {
-                return;
+        // std already creates descriptors close-on-exec atomically on Linux
+        // (`pipe2`, `accept4`, `SOCK_CLOEXEC`), so this is defence in depth.
+        // Where `CLOSE_RANGE_CLOEXEC` is missing (before 5.11, or filtered by
+        // seccomp) skip it rather than probe up to RLIMIT_NOFILE per spawn.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3_u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        if unsafe { self.mark_listed() } {
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            self.probe()
+        };
+    }
+
+    /// Marks each descriptor `proc_pidinfo` lists, or returns false when the
+    /// listing failed or may have been truncated.
+    #[cfg(target_os = "macos")]
+    unsafe fn mark_listed(&mut self) -> bool {
+        let entry = std::mem::size_of::<libc::proc_fdinfo>();
+        let capacity = (self.listed.capacity() * entry).min(libc::c_int::MAX as usize);
+        let written = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                self.listed.as_mut_ptr().cast(),
+                capacity as libc::c_int,
+            )
+        };
+        if written <= 0 || written as usize >= capacity {
+            return false;
+        }
+        for index in 0..written as usize / entry {
+            let fd = unsafe { (*self.listed.as_ptr().add(index)).proc_fd };
+            if fd >= 3 {
+                unsafe { mark_descriptor_close_on_exec(fd) };
             }
         }
-        #[cfg(target_vendor = "apple")]
-        {
-            let entry = std::mem::size_of::<libc::proc_fdinfo>();
-            let capacity = (self.listed.capacity() * entry).min(libc::c_int::MAX as usize);
-            let written = unsafe {
-                libc::proc_pidinfo(
-                    libc::getpid(),
-                    libc::PROC_PIDLISTFDS,
-                    0,
-                    self.listed.as_mut_ptr().cast(),
-                    capacity as libc::c_int,
-                )
-            };
-            if written > 0 && (written as usize) < capacity {
-                for index in 0..written as usize / entry {
-                    let fd = unsafe { (*self.listed.as_ptr().add(index)).proc_fd };
-                    if fd >= 3 {
-                        unsafe { mark_descriptor_close_on_exec(fd) };
-                    }
-                }
-                return;
-            }
-        }
+        true
+    }
+
+    #[cfg(any(not(target_os = "linux"), test))]
+    unsafe fn probe(&self) {
         for fd in 3..self.max_fd {
             unsafe { mark_descriptor_close_on_exec(fd) };
         }
@@ -9013,24 +9030,43 @@ exit 1
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_fast_descriptor_path_marks_strays_past_the_probe_bound() -> Result<()> {
+        // A probe bound below the strays leaves only `close_range` (Linux) or
+        // the `proc_pidinfo` listing (macOS) able to mark them.
+        let (strays, listed) = child_descriptors_beside_stray_pipe(|command| {
+            use std::os::unix::process::CommandExt;
+            let mut fast = InheritedDescriptorSweep::prepare();
+            fast.max_fd = 64;
+            unsafe {
+                command.pre_exec(move || {
+                    fast.mark_close_on_exec();
+                    Ok(())
+                });
+            }
+        })?;
+        for fd in strays {
+            assert!(
+                !listed.contains(&fd),
+                "fast path left stray descriptor {fd}: {listed:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_bounded_descriptor_probe_also_marks_strays_close_on_exec() -> Result<()> {
-        // The path a child takes when the descriptor listing does not fit its
-        // buffer (Apple) or `close_range` is unavailable (older Linux).
+        // The path a macOS child takes when its descriptor listing may be
+        // truncated, and the only path on other Unix systems.
         let (strays, listed) = child_descriptors_beside_stray_pipe(|command| {
             use std::os::unix::process::CommandExt;
             let mut probe = InheritedDescriptorSweep::prepare();
             probe.max_fd = 1024;
-            #[cfg(target_vendor = "apple")]
-            {
-                probe.listed = Vec::new();
-            }
             unsafe {
                 command.pre_exec(move || {
-                    for fd in 3..probe.max_fd {
-                        mark_descriptor_close_on_exec(fd);
-                    }
+                    probe.probe();
                     Ok(())
                 });
             }
