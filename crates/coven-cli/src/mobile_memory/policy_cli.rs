@@ -326,6 +326,10 @@ pub(super) fn render_review(
         "maximum step-up age",
         format!("{} seconds", policy.maximum_step_up_age_seconds),
     );
+    field(
+        "minimum attestation",
+        policy.minimum_attestation.as_str().into(),
+    );
     field("nonce", action.nonce.clone());
     field("issued at", timestamp(action.issued_at));
     field("expires at", timestamp(action.expires_at));

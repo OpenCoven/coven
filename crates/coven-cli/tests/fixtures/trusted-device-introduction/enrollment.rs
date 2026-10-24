@@ -40,6 +40,7 @@ fn policy() -> IntroductionPolicy {
         maximum_grant_lifetime_seconds: 86400,
         required_assurance: RequestedAssurance::FreshBiometric,
         maximum_step_up_age_seconds: 30,
+        minimum_attestation: Default::default(),
     }
 }
 
@@ -126,6 +127,7 @@ impl Fixture {
             destination_signature: sign(&destination, &request.possession_bytes().unwrap()),
             request: IntroductionTranscript::Single(request),
             passkey_assertion: None,
+            attestation: None,
         };
         Self {
             ledger: IntroductionLedger::new(home.path(), AUDIENCE),
@@ -141,8 +143,19 @@ impl Fixture {
 
     /// What a genuine introducer app produces after rendering the request.
     pub(in crate::mobile_memory) fn approval(&self) -> MobileIntroductionApproval {
+        self.approval_for(&self.envelope)
+    }
+
+    pub(in crate::mobile_memory) fn policy_digest(&self) -> String {
+        v1(&self.envelope).policy_digest.clone()
+    }
+
+    pub(in crate::mobile_memory) fn approval_for(
+        &self,
+        envelope: &IntroductionEnvelope,
+    ) -> MobileIntroductionApproval {
         let authority = IntroductionAuthority::load_installed(self.home.path(), AUDIENCE).unwrap();
-        let request = v1(&self.envelope);
+        let request = v1(envelope);
         let challenge = authority.issue_challenge(request, self.now).unwrap();
         let key = DeviceRegistry::load(self.home.path())
             .unwrap()

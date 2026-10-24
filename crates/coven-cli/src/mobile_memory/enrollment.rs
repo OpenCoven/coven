@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::assurance::{AssuranceContextMode, PresentedAssuranceProof, RequestedAssurance};
+use super::attestation::{
+    attestation_challenge, evaluate, AttestationRecord, AttestationRecords, AttestationTrust,
+    DeviceAttestation,
+};
 use super::grant::{DeviceActionIntent, GrantTransportConstraint};
 use super::introduction::{
     IntroductionApproval, IntroductionAuthority, IntroductionCommitUncertain,
@@ -37,6 +41,10 @@ pub struct IntroductionEnvelope {
     /// passkey never approves alone; device approvals are still collected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passkey_assertion: Option<super::passkey::PasskeyAssertion>,
+    /// Optional platform evidence for the destination key. It can only raise
+    /// the device's assurance attribute, never grant anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<super::attestation::AttestationEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +79,7 @@ pub struct IntroductionStatus {
     /// fresh step-up on the same request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub step_up_expired: Vec<Uuid>,
+    pub attestation: DeviceAttestation,
 }
 
 /// Everything the introducer must render before it signs: the complete request
@@ -127,6 +136,7 @@ struct TrackedIntroduction {
     /// inside the single commit that runs once all named approvers have signed.
     approvals: Vec<(Uuid, MobileIntroductionApproval)>,
     step_up_expired: Vec<Uuid>,
+    attestation: DeviceAttestation,
 }
 
 impl TrackedIntroduction {
@@ -139,6 +149,7 @@ impl TrackedIntroduction {
             approvals_received: self.approvals.len(),
             approvals_required: self.envelope.request.approvers().len(),
             step_up_expired: self.step_up_expired.clone(),
+            attestation: self.attestation,
         }
     }
 }
@@ -184,6 +195,14 @@ impl IntroductionLedger {
         {
             bail!("introduction passkey assertion does not match the named passkey");
         }
+        let attestation = evaluate(
+            envelope.attestation.as_ref(),
+            &AttestationTrust::load(&self.home)?,
+            envelope.request.destination_public_key(),
+            &attestation_challenge(&envelope.request.possession_bytes()?),
+            now,
+        );
+        authority.require_attestation(attestation)?;
         if super::registry::DeviceRegistry::load(&self.home)?
             .device(envelope.request.destination_id())?
             .is_some()
@@ -218,6 +237,7 @@ impl IntroductionLedger {
             device_id: None,
             approvals: Vec::new(),
             step_up_expired: Vec::new(),
+            attestation,
         };
         let status = entry.status(id);
         entries.insert(id, entry);
@@ -334,7 +354,9 @@ impl IntroductionLedger {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let approvals: Vec<_> = approvals.iter().map(|(id, a)| (*id, a)).collect();
-            authority?.introduce_transcript(
+            let authority = authority?;
+            authority.require_attestation(entry.attestation)?;
+            authority.introduce_transcript(
                 &entry.envelope.request,
                 &entry.envelope.destination_signature,
                 &approvals,
@@ -346,6 +368,16 @@ impl IntroductionLedger {
             Ok(record) => {
                 entry.state = IntroductionState::Introduced;
                 entry.device_id = Some(record.device.id);
+                // Best effort: a missing record only lowers the attribute to
+                // unattested_device, the fail-safe direction.
+                let _ = AttestationRecords::open(&self.home).and_then(|records| {
+                    records.record(AttestationRecord {
+                        device_id: record.device.id,
+                        public_key_x963: record.device.public_key_x963.clone(),
+                        attestation: entry.attestation,
+                        evaluated_at: now,
+                    })
+                });
                 Ok(entry.status(id))
             }
             Err(error) => {
@@ -431,6 +463,10 @@ pub(super) fn render_introduction_review(
     );
     field("new device name", request.device_name().to_owned());
     field("new device context", request.device_context().to_owned());
+    field(
+        "policy minimum attestation",
+        policy.policy.minimum_attestation.as_str().into(),
+    );
     field("grant id", grant.id.to_string());
     field("grant scopes", scopes(&grant.scopes));
     field(
@@ -557,3 +593,7 @@ fn timestamp(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 #[path = "../../tests/fixtures/trusted-device-introduction/enrollment.rs"]
 pub(super) mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/fixtures/device-attestation/admission.rs"]
+mod attestation_tests;

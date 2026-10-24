@@ -85,6 +85,7 @@ impl Fixture {
             maximum_grant_lifetime_seconds: 86400,
             required_assurance: RequestedAssurance::FreshBiometric,
             maximum_step_up_age_seconds: 60,
+            minimum_attestation: Default::default(),
         };
         Self {
             home,
@@ -496,6 +497,7 @@ mod ledger {
             destination_signature: fixture.destination_signature(&request),
             request: IntroductionTranscript::Threshold(request),
             passkey_assertion: None,
+            attestation: None,
         };
         (
             IntroductionLedger::new(fixture.home.path(), AUDIENCE),

@@ -39,6 +39,7 @@ fn base_policy(device_id: Uuid) -> IntroductionPolicy {
         maximum_grant_lifetime_seconds: 86400,
         required_assurance: RequestedAssurance::FreshUserVerification,
         maximum_step_up_age_seconds: 60,
+        minimum_attestation: Default::default(),
     }
 }
 
