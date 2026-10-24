@@ -8446,6 +8446,10 @@ fn hash_canonical_json(raw: &[u8], hasher: &mut Sha256, depth: usize) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "api/proposal_revision/tests.rs"]
+mod proposal_revision_tests;
+
 impl ProposalEnvelopeDocument {
     fn parse_preflighted(raw: &[u8]) -> Result<Self> {
         let wire: ProposalEnvelopeWire =
