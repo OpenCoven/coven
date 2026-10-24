@@ -152,9 +152,10 @@ last-connection checkpoint and reopen. Its one explicit final close runs on a
 separate thread once the API accept loop is entered, so readiness never waits
 for the startup WAL checkpoint (#1227): on contended hosted Windows disks that
 checkpoint took about 3.5 s of the 5 s startup budget. Every commit is already
-durable in the WAL; if a request connection is open when the startup
-connection closes, SQLite leaves the checkpoint to the last connection that
-closes later. A startup that fails before readiness still closes the
+durable in the WAL. That close first runs a PASSIVE checkpoint, which neither
+waits on nor blocks readers and writers, so the initialization frames reach
+the main file soon after readiness even while request and scheduler
+connections are open, and are not left for a graceful `daemon stop`. A startup that fails before readiness still closes the
 connection, and logs the same two checkpoints, before it returns. There is no
 lifetime-long keeper connection or deferred shutdown checkpoint.
 `store-close-begin` marks that final close; it and `daemon-store-end` now

@@ -5882,13 +5882,20 @@ fn initialize_daemon_store_with_observer(
     Ok(conn)
 }
 
-/// The one last-connection close of the startup store, normally after
-/// readiness (see [`StartupStore`]).
+/// The one final close of the startup store, normally after readiness (see
+/// [`StartupStore`]).
 fn close_startup_store(
     conn: rusqlite::Connection,
     mut observe: impl FnMut(StartupCheckpoint),
 ) -> Result<()> {
     observe(StartupCheckpoint::StoreCloseBegin);
+    // After readiness, request and scheduler connections are usually open, so
+    // this close is not the last and would leave the initialization frames for
+    // whichever close comes last, possibly a graceful `daemon stop`. A PASSIVE
+    // checkpoint moves them now and never waits on or blocks readers and
+    // writers. It is advisory: a busy or failed attempt leaves the frames to a
+    // later checkpoint, as before.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
     conn.close()
         .map_err(|(_, error)| error)
         .context("failed to close Coven startup store")?;
@@ -16732,6 +16739,30 @@ mod tests {
             !wal.exists(),
             "the last connection's close must still checkpoint and remove the WAL"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_close_checkpoints_initialization_while_other_connections_are_open() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("coven.sqlite3");
+        let store = initialize_daemon_store(home.path())?;
+        // A request connection open across the close, as after readiness.
+        let request = crate::store::open_initialized_store(&path)?;
+        let before = std::fs::metadata(&path)?.len();
+        store.close()?;
+        let after = std::fs::metadata(&path)?.len();
+        let page_size: i64 = request.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let page_count: i64 = request.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let full = u64::try_from(page_size * page_count)?;
+        // Initialization commits to the WAL, so the main file starts short of
+        // the schema; the close's checkpoint backfills every page into it.
+        assert!(
+            before < full,
+            "initialization was already checkpointed: {before} bytes"
+        );
+        assert_eq!(after, full, "main file was not backfilled");
+        drop(request);
         Ok(())
     }
 
