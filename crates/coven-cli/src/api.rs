@@ -14327,6 +14327,10 @@ fn persist_proposal_applying_state(
     crate::proposal_store::replace_existing(claim_path, &body)
 }
 
+#[cfg(test)]
+#[path = "api/proposal_apply_intent/tests.rs"]
+mod proposal_apply_intent_tests;
+
 // Preserve the borrowed apply-intent inputs while passing the decision's captured time.
 #[allow(clippy::too_many_arguments)]
 fn append_proposal_apply_intent(
