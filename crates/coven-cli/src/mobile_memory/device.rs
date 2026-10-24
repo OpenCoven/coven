@@ -582,7 +582,7 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use chrono::{DateTime, Duration, Utc};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use uuid::Uuid;
 
     use super::*;
@@ -595,7 +595,7 @@ mod tests {
 
     fn public_key(seed: u8) -> String {
         let signing_key = p256::SecretKey::from_slice(&[seed; 32]).unwrap();
-        URL_SAFE_NO_PAD.encode(signing_key.public_key().to_encoded_point(false).as_bytes())
+        URL_SAFE_NO_PAD.encode(signing_key.public_key().to_sec1_point(false).as_bytes())
     }
 
     fn device(id: Uuid, name: &str, key_seed: u8, now: DateTime<Utc>) -> DeviceRecord {
