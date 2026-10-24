@@ -3,8 +3,7 @@ use super::*;
 fn fixture() -> (tempfile::TempDir, Connection) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("coven.sqlite3");
-    crate::store::initialize_store(&path).unwrap();
-    let conn = crate::store::open_store(&path).unwrap();
+    let conn = crate::store::open_store_from_initialized_template(&path).unwrap();
     (root, conn)
 }
 
