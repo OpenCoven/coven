@@ -31,8 +31,7 @@ fn definition(id: &str, status: &str) -> RoutineDefinition {
 fn store() -> (tempfile::TempDir, Connection) {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("store.sqlite");
-    crate::store::initialize_store(&path).unwrap();
-    let conn = crate::store::open_store(&path).unwrap();
+    let conn = crate::store::open_store_from_initialized_template(&path).unwrap();
     (temp, conn)
 }
 
