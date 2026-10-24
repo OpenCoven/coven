@@ -1,5 +1,5 @@
 {
-  "policy_sha256": "ae8cde7d5bc9aaa7e1018494a68bb5e2a33bd43cee51bcf7fd26da3e57aa9068",
+  "policy_sha256": "79321e24b3cfb8b37c1140805f0a0ab6b61073eb73b301a7cc8aa25f5c33c742",
   "commands": [
     [
       "python3",
@@ -88,6 +88,14 @@
     [
       "python3",
       "scripts/cloud/readiness-test.py"
+    ],
+    [
+      "python3",
+      "scripts/delivery/checkpoint-test.py"
+    ],
+    [
+      "python3",
+      "scripts/delivery/preflight-test.py"
     ],
     [
       "bash",
