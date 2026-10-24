@@ -153,6 +153,11 @@ These extractions are complete and remain the model for bounded movement:
    recovery, policy, and every revision comparison remain with the coordinator.
    `tests/proposal_document_boundary.rs` rejects new dependencies, wider
    visibility, and any exposed wire or stored form.
+8. **Proposal scheduler batch selection.** The durable scheduler cursor and the
+   bounded, wrap-around candidate batch live in `proposal_store.rs` beside the
+   other pending-directory persistence. They choose which proposals a pass
+   visits and in what order; every decision about a candidate, quarantine
+   logging, and cursor advancement policy remain with the coordinator.
 
 These seams preserve the public HTTP API, daemon socket protocol, and existing
 caller entry points. They do not complete #806's broader highest-risk module
