@@ -494,6 +494,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_delivery_checkpoint_fixtures_run_in_required_policy_guard(self) -> None:
         policy = ci_job_block("policy-guard")
         self.assertIn("- run: python3 scripts/delivery/checkpoint-test.py", policy)
+        self.assertIn("- run: python3 scripts/delivery/preflight-test.py", policy)
 
     def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
         release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
