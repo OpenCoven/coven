@@ -342,13 +342,29 @@ jobs:
         run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock --test threads_identity_invariants --test threads_protected_intake --test threads_terminal_recovery --no-fail-fast
 
   rust-test-windows:
-    name: Rust tests (Windows)
+    name: Rust tests (Windows, ${{ matrix.shard }})
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
     # Keep the two build profiles in separate required jobs so feature
     # evidence cannot be cancelled after the workspace consumes its budget.
     timeout-minutes: 30
+    # One libtest name predicate splits `cargo test --workspace` across two
+    # runners (#1227). `named` runs every test whose name contains one of the
+    # tokens and `rest` skips exactly those, so each test runs in exactly one
+    # shard, and a new test lands in one without editing this list. Unsplit,
+    # the `coven` unit suite alone took 622-1,192 s of a 30-minute budget;
+    # these tokens divide it roughly evenly, and `rest` also carries the
+    # integration targets. `fail-fast: false` keeps one shard's failure from
+    # cancelling the other's evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: named
+            test-args: 'automations:: api::tests::threads'
+          - shard: rest
+            test-args: '--skip automations:: --skip api::tests::threads'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -370,7 +386,7 @@ jobs:
           key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-test-
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}
 
   threads-test-windows:
     name: Threads daemon tests (Windows)
