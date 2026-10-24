@@ -11200,6 +11200,10 @@ fn read_pending_proposal_file(path: &Path) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
+#[cfg(test)]
+#[path = "proposal_store/scheduler_tests.rs"]
+mod proposal_scheduler_batch_tests;
+
 fn scheduler_cursor_path(coven_home: &Path) -> PathBuf {
     coven_home.join("pending").join(".scheduler-cursor")
 }
