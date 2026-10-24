@@ -8266,6 +8266,10 @@ struct StoredScheduledProposalRef<'a> {
     decision_state: Option<&'a ProposalApplyingState>,
 }
 
+#[cfg(test)]
+#[path = "api/proposal_document/tests.rs"]
+mod proposal_document_tests;
+
 impl ProposalEnvelopeDocument {
     fn parse_preflighted(raw: &[u8]) -> Result<Self> {
         let wire: ProposalEnvelopeWire =
