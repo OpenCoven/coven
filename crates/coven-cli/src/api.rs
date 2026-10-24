@@ -13440,6 +13440,10 @@ struct ProposalDecisionRequest {
     decision_actor: Option<String>,
 }
 
+#[cfg(test)]
+#[path = "api/proposal_decision_origin/tests.rs"]
+mod proposal_decision_origin_tests;
+
 #[derive(Debug)]
 struct InvalidProposalDecisionOrigin(String);
 
