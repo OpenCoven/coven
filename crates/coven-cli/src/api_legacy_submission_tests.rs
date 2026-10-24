@@ -499,16 +499,15 @@ fn legacy_submission_cannot_relabel_a_scheduled_receipt() -> Result<()> {
         time::OffsetDateTime::now_utc(),
     )?;
     let document = read_pending_proposal_document(&path)?;
-    let review_kind = "coherence".to_string();
-    let legacy = StoredLegacyProposalRef {
-        pending: document.pending(),
-        review_kind: Some(&review_kind),
-        identity_evidence: document.identity_evidence,
-        auto_regression_evidence: None,
-        probes: document.probes.as_deref(),
-        decision_request: None,
-        decision_state: None,
-    };
+    // The legacy stored shape: the bare pending proposal plus review metadata.
+    let mut legacy = serde_json::to_value(document.pending())?;
+    legacy["reviewKind"] = "coherence".into();
+    if let Some(evidence) = document.identity_evidence {
+        legacy["identityEvidence"] = serde_json::to_value(evidence)?;
+    }
+    if let Some(probes) = document.probes.as_deref() {
+        legacy["probes"] = serde_json::from_str(probes.get())?;
+    }
     let bytes = serde_json::to_vec_pretty(&legacy)?;
     std::fs::write(&path, &bytes)?;
     let response = decide_threads_proposal(home, &id, "approve", Some("{}"))?;
