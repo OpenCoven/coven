@@ -144,6 +144,50 @@ Older free-form checkpoints predate the block. `checkpoint.py audit <file>`
 lists which fields one names and which it lacks; treat a missing field as
 unknown, never as "none".
 
+## Delivery path
+
+Check it before long work, so a missing remote or credential surfaces before
+hours of work depend on it, and again before publishing:
+
+```sh
+python3 scripts/delivery/preflight.py --issue '#<N>'
+```
+
+It reads git, `gh auth status` and GitHub REST, nothing else; it never pushes,
+creates, merges or deletes, never calls GraphQL, and never prints tool output.
+The verdict is one of:
+
+- `delivery: pr`: publish normally, with the [`pr-agent`](../pr-agent/SKILL.md) packet.
+- `delivery: pr-degraded`: a PR is still possible, but only through the printed
+  fallback.
+- `delivery: handoff` (exit 5): no PR can be opened from here. Hand off.
+
+| State | Level | Recovery it prints |
+| --- | --- | --- |
+| `missing-remote` | block | add `origin`, or deliver the patch and bundle |
+| `missing-tool` (no `gh`) | block, or degraded with `COVEN_PUBLICATION_INTEGRATION` set | `git push` plus the compare URL, or the declared integration |
+| `missing-auth`, `missing-push-permission` | block | `gh auth login` by someone with push access; never a broad token |
+| `graphql-rate-limit` | degraded | REST PR creation and check-run reads; `gh pr ready`/`merge` wait for the reset |
+| `rest-rate-limit` | block | wait for the printed reset, then rerun |
+| `merge-queue-405` | degraded | `gh pr merge <n> --match-head-commit <sha>`, never a REST merge |
+| `missing-workflow-scope` | block | `gh auth refresh -h github.com -s workflow`, or push over SSH |
+| `detached-head`, `on-default-branch` | block | `git switch -c <task-branch> <sha>`; never publish from `main` |
+| `non-fast-forward`, `network`, `unknown-failure` | block | reconcile, retry, or hand off as printed |
+
+`merge-queue-required` and `existing-pr` are informational: queue through
+`--match-head-commit`, and push to the PR that already exists.
+
+When a publish fails, save its output and rerun with `--observed <file>`: the
+failure is classified, not echoed. For any verdict other than `pr`, add
+`--handoff-dir <directory outside the worktree>`. That writes `<sha12>.patch`
+and `<sha12>.bundle` with their SHA-256 and prints a checkpoint whose BLOCKERS
+are the states and whose NEXT is the exact commands. Validate it, post it on
+the issue with the location of the patch and bundle, and stop. Set
+`COVEN_ENVIRONMENT` so the checkpoint names where it ran.
+
+Never delete the head branch in the same step as a merge request: deleting it
+closes the pull request.
+
 ## Pausing
 
 1. Push the branch only if the AGENTS.md gates pass; otherwise leave it local
