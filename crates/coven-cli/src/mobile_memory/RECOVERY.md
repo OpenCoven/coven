@@ -121,7 +121,10 @@ is never treated as evidence of one physical device.
   challenge is the SHA-256 of the same action's canonical bytes
 
 Credentials are self-verifying against the **current** root. Rotating the
-root retires every registration, and the owner re-registers.
+root retires every registration, and the owner re-registers. Registration reads
+the root and writes the credential under one policy lock (policy store →
+passkey store), so a rotation lands either before it, which then refuses the
+old root's signature, or after it, which retires the new credential.
 
 **What a passkey may do.** It may fill **at most one** of the N approvals of
 a v2 threshold introduction (`passkeyApprover`). The request must still name

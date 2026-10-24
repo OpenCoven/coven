@@ -35,6 +35,13 @@ const FLAG_BACKUP_ELIGIBLE: u8 = 0x08;
 const FLAG_BACKUP_STATE: u8 = 0x10;
 static PASSKEY_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[cfg(test)]
+thread_local! {
+    /// Runs inside registration after every check passes, before the store write.
+    static BEFORE_PASSKEY_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// One WebAuthn `navigator.credentials.get()` result, as the client returns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -180,47 +187,56 @@ impl PasskeyStore {
         root_signature: &str,
         now: DateTime<Utc>,
     ) -> Result<PasskeyCredential> {
-        let result = (|| {
-            let _lock = PasskeyStoreLock::acquire(self.lock_dir()?)?;
-            let mut credentials = self.read()?;
-            let action = self.registration_action(registration)?;
-            if action.issued_at > now || now >= action.expires_at {
-                bail!("passkey registration is outside its validity window");
-            }
-            let bytes = action.canonical_bytes()?;
-            verify_assurance_signature(&self.owner_root()?, &bytes, root_signature)
-                .context("passkey registration requires the owner-root signature")?;
-            let public = spki_to_x963(&registration.public_key_spki)?;
-            let mut credential = PasskeyCredential {
-                credential_id: registration.credential_id.clone(),
-                rp_id: registration.rp_id.clone(),
-                origins: registration.origins.clone(),
-                public_key_x963: public,
-                backup_eligible: false,
-                backed_up: false,
-                sign_count: 0,
-                registered_at: now,
-                registration_action: action,
-                root_signature: root_signature.to_owned(),
-            };
-            let verified =
-                verify_assertion(&credential, possession, &Sha256::digest(&bytes).into())?;
-            credential.backup_eligible = verified.backup_eligible;
-            credential.backed_up = verified.backed_up;
-            credential.sign_count = verified.sign_count;
-            if credentials
-                .iter()
-                .any(|existing| existing.credential_id == credential.credential_id)
-            {
-                bail!("passkey is already registered");
-            }
-            if credentials.len() >= MAX_PASSKEYS {
-                bail!("too many passkeys are registered");
-            }
-            credentials.push(credential.clone());
-            self.write(&credentials)?;
-            Ok(credential)
-        })();
+        // Policy → passkey: the root is read and the registration written under
+        // one policy lock, so a rotation cannot land between them.
+        let result = self.policy_store().and_then(|policy| {
+            policy.with_current_locked(|head| {
+                let root = &head
+                    .context("passkeys require an installed owner policy and root")?
+                    .owner_root_key;
+                let _lock = PasskeyStoreLock::acquire(self.lock_dir()?)?;
+                let mut credentials = self.read()?;
+                let action = self.registration_action(registration)?;
+                if action.issued_at > now || now >= action.expires_at {
+                    bail!("passkey registration is outside its validity window");
+                }
+                let bytes = action.canonical_bytes()?;
+                verify_assurance_signature(root, &bytes, root_signature)
+                    .context("passkey registration requires the owner-root signature")?;
+                let public = spki_to_x963(&registration.public_key_spki)?;
+                let mut credential = PasskeyCredential {
+                    credential_id: registration.credential_id.clone(),
+                    rp_id: registration.rp_id.clone(),
+                    origins: registration.origins.clone(),
+                    public_key_x963: public,
+                    backup_eligible: false,
+                    backed_up: false,
+                    sign_count: 0,
+                    registered_at: now,
+                    registration_action: action,
+                    root_signature: root_signature.to_owned(),
+                };
+                let verified =
+                    verify_assertion(&credential, possession, &Sha256::digest(&bytes).into())?;
+                credential.backup_eligible = verified.backup_eligible;
+                credential.backed_up = verified.backed_up;
+                credential.sign_count = verified.sign_count;
+                if credentials
+                    .iter()
+                    .any(|existing| existing.credential_id == credential.credential_id)
+                {
+                    bail!("passkey is already registered");
+                }
+                if credentials.len() >= MAX_PASSKEYS {
+                    bail!("too many passkeys are registered");
+                }
+                credentials.push(credential.clone());
+                #[cfg(test)]
+                BEFORE_PASSKEY_WRITE.with(|hook| hook.borrow_mut().take().map(|hook| hook()));
+                self.write(&credentials)?;
+                Ok(credential)
+            })
+        });
         let event = if result.is_ok() {
             MobileAuditEvent::PasskeyRegistered
         } else {
@@ -251,12 +267,17 @@ impl PasskeyStore {
         Ok(result)
     }
 
-    fn owner_root(&self) -> Result<String> {
+    fn policy_store(&self) -> Result<OwnerPolicyStore> {
         let audience: [u8; 32] = URL_SAFE_NO_PAD
             .decode(&self.audience)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid passkey store audience"))?;
-        Ok(OwnerPolicyStore::open(&self.home, audience)?
+        OwnerPolicyStore::open(&self.home, audience)
+    }
+
+    fn owner_root(&self) -> Result<String> {
+        Ok(self
+            .policy_store()?
             .current()?
             .context("passkeys require an installed owner policy and root")?
             .owner_root_key)

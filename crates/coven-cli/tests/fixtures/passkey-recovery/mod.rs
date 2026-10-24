@@ -184,6 +184,32 @@ fn registration_needs_the_owner_root_and_passkey_possession() {
 }
 
 #[test]
+fn the_policy_lock_is_held_from_root_check_through_the_passkey_write() {
+    let fixture = Threshold::new(2);
+    let root = install(&fixture);
+    let mut authenticator = Authenticator::synced();
+    let store = OwnerPolicyStore::open(fixture.home.path(), AUDIENCE).unwrap();
+    assert!(!store.is_locked().unwrap());
+
+    // Every check has passed and nothing is written yet: a root rotation here
+    // would retire the registration, so it must not be able to land.
+    let home = fixture.home.path().to_owned();
+    let observed = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = observed.clone();
+    BEFORE_PASSKEY_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let store = OwnerPolicyStore::open(&home, AUDIENCE).unwrap();
+            seen.set(Some(store.is_locked().unwrap()));
+        }));
+    });
+    register(&fixture, &mut authenticator, &root).unwrap();
+    assert_eq!(observed.get(), Some(true));
+    assert!(!store.is_locked().unwrap());
+    let passkeys = PasskeyStore::open(fixture.home.path(), AUDIENCE).unwrap();
+    assert_eq!(passkeys.list().unwrap().len(), 1);
+}
+
+#[test]
 fn passkey_counts_as_one_approval_beside_a_trusted_device() {
     let fixture = Threshold::new(2);
     let root = install(&fixture);
