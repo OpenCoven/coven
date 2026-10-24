@@ -46,7 +46,10 @@ The owner-root key signs a `COVEN-ACTION/1` intent with operation
 destination signs the same intent with operation
 `owner.access_recovery.accept`, proving it holds the key being enrolled.
 
-Commit checks run under the registry lock:
+Commit checks run under the policy lock and then the registry lock, in the
+documented policy store → device registry order. The head is read and the
+enrollment written under that one policy lock, so a rotation or replacement
+cannot land between them:
 
 - the installed policy head is still the one named
 - the request is inside its validity window
