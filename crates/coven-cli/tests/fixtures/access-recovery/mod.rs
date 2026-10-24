@@ -163,6 +163,34 @@ fn owner_root_recovers_access_as_a_distinct_audited_event() {
 }
 
 #[test]
+fn the_policy_lock_is_held_from_head_check_through_the_recovery_write() {
+    let fixture = Fixture::new();
+    let request = fixture.request();
+    let (destination, root) = fixture.signatures(&request, &fixture.root);
+    let store = OwnerPolicyStore::open(fixture.home.path(), AUDIENCE).unwrap();
+    assert!(!store.is_locked().unwrap());
+
+    // Every check has passed and nothing is written yet: a root rotation or
+    // policy replacement here would retire the request, so it must not land.
+    let home = fixture.home.path().to_owned();
+    let observed = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = observed.clone();
+    BEFORE_RECOVERY_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let store = OwnerPolicyStore::open(&home, AUDIENCE).unwrap();
+            seen.set(Some(store.is_locked().unwrap()));
+        }));
+    });
+    fixture
+        .authority
+        .recover(&request, &destination, &root, fixture.now)
+        .unwrap();
+    assert!(fixture.enrolled());
+    assert_eq!(observed.get(), Some(true));
+    assert!(!store.is_locked().unwrap());
+}
+
+#[test]
 fn recovery_cannot_be_replayed() {
     let fixture = Fixture::new();
     let request = fixture.request();

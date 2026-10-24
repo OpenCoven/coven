@@ -19,6 +19,13 @@ use super::introduction::{validate_destination, IntroductionCommitUncertain, Tra
 use super::owner_policy::{InstalledPolicy, OwnerPolicyStore};
 use super::registry::{DeviceAuthorizationRecord, DeviceRecord, DeviceRegistry, PendingEnrollment};
 
+#[cfg(test)]
+thread_local! {
+    /// Runs inside the commit after every check passes, before the registry write.
+    static BEFORE_RECOVERY_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 const APPROVE_OPERATION: &str = "owner.access_recovery.approve";
 const ACCEPT_OPERATION: &str = "owner.access_recovery.accept";
 
@@ -174,34 +181,41 @@ impl AccessRecoveryAuthority {
             scopes: request.grant.scopes.clone(),
         };
         let nonce_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(request.nonce));
-        // No source device: the owner-root key is the sole approver, so the
-        // commit locks no introducer state and shares the one nonce ledger.
-        self.registry.commit_introduction(
-            &[],
-            PendingEnrollment {
-                device: record,
-                grant: request.grant.clone(),
-                nonce_digest,
-                kind: TransitionKind::AccessRecovery,
-            },
-            now,
-            |_| {
-                let head = self.current_policy()?;
-                self.validate_against(request, &head, now)?;
-                verify_assurance_signature(
-                    &request.destination_public_key,
-                    &request.possession_bytes()?,
-                    destination_signature,
-                )?;
-                verify_assurance_signature(
-                    &head.owner_root_key,
-                    &action.canonical_bytes()?,
-                    root_signature,
-                )
-                .context("access recovery requires the installed owner-root signature")?;
-                Ok(())
-            },
-        )
+        // Policy → registry: the head is read and the enrollment written under
+        // one policy lock, so a rotation or replacement cannot land between them.
+        self.store.with_current_locked(|head| {
+            let head = head
+                .context("introduction policy is not installed; recovery needs its owner root")?;
+            // No source device: the owner-root key is the sole approver, so the
+            // commit locks no introducer state and shares the one nonce ledger.
+            self.registry.commit_introduction(
+                &[],
+                PendingEnrollment {
+                    device: record,
+                    grant: request.grant.clone(),
+                    nonce_digest,
+                    kind: TransitionKind::AccessRecovery,
+                },
+                now,
+                |_| {
+                    self.validate_against(request, head, now)?;
+                    verify_assurance_signature(
+                        &request.destination_public_key,
+                        &request.possession_bytes()?,
+                        destination_signature,
+                    )?;
+                    verify_assurance_signature(
+                        &head.owner_root_key,
+                        &action.canonical_bytes()?,
+                        root_signature,
+                    )
+                    .context("access recovery requires the installed owner-root signature")?;
+                    #[cfg(test)]
+                    BEFORE_RECOVERY_WRITE.with(|hook| hook.borrow_mut().take().map(|hook| hook()));
+                    Ok(())
+                },
+            )
+        })
     }
 
     fn validate_against(
