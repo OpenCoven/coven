@@ -3,7 +3,7 @@
 
 use serde_json::{json, Value};
 
-use super::scope::{Grants, ReadRequest, RelativePath};
+use super::scope::{Coverage, Grants, RelativePath, Request};
 use super::{Refusal, R0_READ_POLICY};
 
 const VECTORS: &str = include_str!("vectors.json");
@@ -82,11 +82,13 @@ fn request_vectors() {
     for case in cases(&vectors, "requests") {
         let grants = Grants::from_scopes(&scopes(case), &R0_READ_POLICY)
             .unwrap_or_else(|refusal| panic!("vector {} grant: {}", case["id"], refusal.code()));
-        let got = outcome(
-            ReadRequest::parse(&case["request"], &R0_READ_POLICY)
-                .and_then(|request| grants.authorize(&request)),
-            "authorized",
-        );
+        let got = match Request::parse(&case["request"], &R0_READ_POLICY)
+            .and_then(|request| grants.authorize(&request))
+        {
+            Ok(Coverage::Exact) => "exact",
+            Ok(Coverage::Subtree) => "subtree",
+            Err(refusal) => refusal.code(),
+        };
         assert_eq!(got, text(case, "expect"), "request vector {}", case["id"]);
     }
 }
@@ -113,6 +115,25 @@ fn the_r0_policy_is_the_designs() {
     assert_eq!(R0_READ_POLICY.attempt_bytes, 8 << 20);
     assert_eq!(R0_READ_POLICY.calls, 1024);
     assert_eq!(R0_READ_POLICY.depth, 32);
+    assert_eq!(R0_READ_POLICY.scan_bytes, 64 << 20);
+    assert_eq!(R0_READ_POLICY.page_entries, 256);
+    assert_eq!(R0_READ_POLICY.page_matches, 256);
+}
+
+#[test]
+fn a_pattern_is_at_most_its_bytes() {
+    let grants =
+        Grants::from_scopes(&[scope("recursive-read:docs/guides")], &R0_READ_POLICY).unwrap();
+    let search = |pattern: String| {
+        Request::parse(
+            &json!({"operation": "search", "root": "project", "path": "docs/guides", "pattern": pattern}),
+            &R0_READ_POLICY,
+        )
+        .and_then(|request| grants.authorize(&request))
+    };
+    let longest = "a".repeat(R0_READ_POLICY.pattern_bytes);
+    assert_eq!(search(longest.clone()), Ok(Coverage::Subtree));
+    assert_eq!(search(format!("{longest}a")), Err(Refusal::RequestInvalid));
 }
 
 #[cfg(not(unix))]
@@ -140,11 +161,11 @@ mod filesystem {
 
     use serde_json::{json, Value};
 
-    use super::super::open::{ScopedReader, Step};
+    use super::super::open::{Body, Response, ScopedReader, Step};
     use super::super::scope::RootKind;
-    use super::super::{Refusal, R0_READ_POLICY};
+    use super::super::{ReadPolicy, Refusal, R0_READ_POLICY};
     use super::{cases, scope, scopes, text, vectors};
-    use crate::automations::contract::canonical_json::sha256_hex;
+    use crate::automations::contract::canonical_json::{canonicalize, sha256_hex};
 
     /// A short scratch base: a socket path has to fit in about 100 bytes.
     fn scratch() -> tempfile::TempDir {
@@ -173,9 +194,15 @@ mod filesystem {
         } else if entry.get("file").is_some() {
             let path = at("file");
             parent(&path);
-            let content = match entry.get("size").and_then(Value::as_u64) {
-                Some(size) => vec![b'a'; size as usize],
-                None => text(entry, "text").as_bytes().to_vec(),
+            let content = if let Some(size) = entry.get("size").and_then(Value::as_u64) {
+                vec![b'a'; size as usize]
+            } else if let Some(hex) = entry.get("hex").and_then(Value::as_str) {
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex bytes"))
+                    .collect()
+            } else {
+                text(entry, "text").as_bytes().to_vec()
             };
             fs::write(&path, content).expect("tree file");
         } else if entry.get("symlink").is_some() {
@@ -230,8 +257,8 @@ mod filesystem {
         };
         match at {
             "root" => Step::Root,
-            "before_file" => Step::BeforeFile,
-            "file" => Step::File,
+            "before_open" => Step::BeforeOpen,
+            "opened" => Step::Opened,
             "read" => Step::Read,
             _ => index("before_directory:")
                 .map(Step::BeforeDirectory)
@@ -288,18 +315,31 @@ mod filesystem {
                 _ => expect.get("refusal").and_then(Value::as_str),
             };
 
-            let request = json!({
-                "operation": "read_file",
+            let mut request = json!({
+                "operation": case.get("operation").cloned().unwrap_or(json!("read_file")),
                 "root": case.get("requestRoot").cloned().unwrap_or(json!("project")),
                 "path": case["request"],
             });
+            for field in ["after", "pattern"] {
+                if let Some(value) = case.get(field) {
+                    request[field] = value.clone();
+                }
+            }
             let race = case.get("race");
-            let race_at = race.map(|race| step(text(race, "at")));
+            // `opened#2` is the second time the read reaches `opened`.
+            let race_at = race.map(|race| {
+                let at = text(race, "at");
+                let (at, occurrence) = at.split_once('#').map_or((at, 1), |(at, n)| {
+                    (at, n.parse::<usize>().expect("a step occurrence"))
+                });
+                (step(at), occurrence)
+            });
             let mut steps = Vec::new();
             let mut fired = false;
-            let result = reader.read_with(&request, &mut |reached| {
+            let result = reader.serve_with(&request, &mut |reached| {
                 steps.push(reached);
-                if Some(reached) == race_at && !fired {
+                let reached_count = steps.iter().filter(|step| **step == reached).count();
+                if race_at == Some((reached, reached_count)) && !fired {
                     fired = true;
                     for action in race
                         .and_then(|race| race["do"].as_array())
@@ -328,40 +368,87 @@ mod filesystem {
             match (result, refusal) {
                 (Err(got), Some(code)) => assert_eq!(got.code(), code, "vector {id}"),
                 (Err(got), None) => panic!("vector {id} refused: {}", got.code()),
-                (Ok(read), Some(code)) => panic!(
-                    "vector {id} read {} bytes instead of refusing {code}",
-                    read.content.len()
-                ),
-                (Ok(read), None) => {
-                    assert_eq!(read.digest, sha256_hex(&read.content), "vector {id} digest");
-                    assert!(
-                        !String::from_utf8_lossy(&read.content).contains("SENTINEL"),
-                        "vector {id} disclosed a sentinel"
-                    );
-                    if let Some(want) = expect.get("text") {
-                        assert_eq!(
-                            read.content,
-                            want.as_str().unwrap().as_bytes(),
-                            "vector {id}"
-                        );
-                    }
-                    if let Some(want) = expect.get("length").and_then(Value::as_u64) {
-                        assert_eq!(read.content.len() as u64, want, "vector {id} length");
-                    }
+                (Ok(response), Some(code)) => {
+                    panic!(
+                        "vector {id} answered {} instead of refusing {code}",
+                        response.to_json()
+                    )
+                }
+                (Ok(response), None) => check_response(id, &response, expect),
+            }
+        }
+    }
+
+    /// Checks a vector's successful response: no sentinel anywhere in it, a
+    /// digest of its JCS text, and the body the vector expects.
+    fn check_response(id: &Value, response: &Response, expect: &Value) {
+        let json = response.to_json();
+        assert!(
+            !json.to_string().contains("SENTINEL"),
+            "vector {id} disclosed a sentinel: {json}"
+        );
+        assert_eq!(
+            response.digest(),
+            sha256_hex(&canonicalize(&json).unwrap()),
+            "vector {id} digest"
+        );
+        match &response.body {
+            Body::File { content } => {
+                if let Some(want) = expect.get("text") {
+                    assert_eq!(content, want.as_str().unwrap(), "vector {id}");
+                }
+                if let Some(want) = expect.get("length").and_then(Value::as_u64) {
+                    assert_eq!(content.len() as u64, want, "vector {id} length");
+                }
+            }
+            Body::Listing { .. } => {
+                let entries: Vec<Value> = json["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| json!([entry["name"], entry["kind"]]))
+                    .collect();
+                assert_eq!(
+                    Value::from(entries),
+                    expect["entries"],
+                    "vector {id} entries"
+                );
+                assert_eq!(json["next"], expect["next"], "vector {id} next");
+            }
+            Body::Search { .. } => {
+                let matches: Vec<Value> = json["matches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|found| json!([found["path"], found["line"], found["text"]]))
+                    .collect();
+                assert_eq!(
+                    Value::from(matches),
+                    expect["matches"],
+                    "vector {id} matches"
+                );
+                for field in ["next", "skipped", "complete"] {
+                    assert_eq!(json[field], expect[field], "vector {id} {field}");
                 }
             }
         }
     }
 
     fn reader(base: &Path, scopes: &[Value]) -> ScopedReader {
+        reader_with(base, scopes, R0_READ_POLICY)
+    }
+
+    fn reader_with(base: &Path, scopes: &[Value], policy: ReadPolicy) -> ScopedReader {
         let root = base.join("root");
-        ScopedReader::new(
-            scopes,
-            &[(RootKind::Project, root.as_path())],
-            &[],
-            R0_READ_POLICY,
-        )
-        .unwrap_or_else(|refusal| panic!("binds: {}", refusal.code()))
+        ScopedReader::new(scopes, &[(RootKind::Project, root.as_path())], &[], policy)
+            .unwrap_or_else(|refusal| panic!("binds: {}", refusal.code()))
+    }
+
+    fn content(response: Response) -> String {
+        match response.body {
+            Body::File { content } => content,
+            other => panic!("not a file: {other:?}"),
+        }
     }
 
     fn read_request(path: &str) -> Value {
@@ -382,14 +469,14 @@ mod filesystem {
             } else {
                 "notes/other.md"
             };
-            let _ = reader.read(&read_request(path));
+            let _ = reader.serve(&read_request(path));
         }
         assert_eq!(
-            reader.read(&read_request("notes/today.md")).err(),
+            reader.serve(&read_request("notes/today.md")).err(),
             Some(Refusal::LimitCalls)
         );
         assert_eq!(
-            reader.read(&json!("not even a request")).err(),
+            reader.serve(&json!("not even a request")).err(),
             Some(Refusal::LimitCalls)
         );
     }
@@ -408,20 +495,22 @@ mod filesystem {
         );
         let reads = R0_READ_POLICY.attempt_bytes / R0_READ_POLICY.file_bytes;
         for _ in 0..reads {
-            let read = reader
-                .read(&read_request("data.txt"))
-                .expect("within the total");
-            assert_eq!(read.content.len() as u64, R0_READ_POLICY.file_bytes);
+            let read = content(
+                reader
+                    .serve(&read_request("data.txt"))
+                    .expect("within the total"),
+            );
+            assert_eq!(read.len() as u64, R0_READ_POLICY.file_bytes);
         }
         // Refused before any of the file is read.
         let mut steps = Vec::new();
         assert_eq!(
             reader
-                .read_with(&read_request("small.txt"), &mut |step| steps.push(step))
+                .serve_with(&read_request("small.txt"), &mut |step| steps.push(step))
                 .err(),
             Some(Refusal::LimitAttemptDisclosure)
         );
-        assert_eq!(steps.last(), Some(&Step::File), "stopped at {steps:?}");
+        assert_eq!(steps.last(), Some(&Step::Opened), "stopped at {steps:?}");
     }
 
     #[test]
@@ -435,7 +524,7 @@ mod filesystem {
         )
         .unwrap_or_else(|refusal| panic!("binds /: {}", refusal.code()));
         assert_eq!(
-            reader.read(&read_request("dev/null")).err(),
+            reader.serve(&read_request("dev/null")).err(),
             Some(Refusal::ResourceMountCrossing)
         );
     }
@@ -460,5 +549,207 @@ mod filesystem {
                 path.display()
             );
         }
+    }
+
+    fn list_request(path: &str, after: Option<&str>) -> Value {
+        let mut request = json!({"operation": "list_directory", "root": "project", "path": path});
+        if let Some(after) = after {
+            request["after"] = json!(after);
+        }
+        request
+    }
+
+    fn search_request(path: &str, pattern: &str, after: Option<Value>) -> Value {
+        let mut request =
+            json!({"operation": "search", "root": "project", "path": path, "pattern": pattern});
+        if let Some(after) = after {
+            request["after"] = after;
+        }
+        request
+    }
+
+    #[test]
+    fn a_listing_pages_through_a_large_directory() {
+        let scratch = scratch();
+        let directory = scratch.path().join("root/docs/many");
+        fs::create_dir_all(&directory).expect("directory");
+        let count = R0_READ_POLICY.page_entries + 44;
+        for index in 0..count {
+            fs::write(directory.join(format!("{index:04}.md")), b"x").expect("file");
+        }
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/many")]);
+        let first = reader
+            .serve(&list_request("docs/many", None))
+            .expect("first page")
+            .to_json();
+        let entries = first["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), R0_READ_POLICY.page_entries);
+        assert_eq!(entries[0]["name"], "0000.md");
+        assert_eq!(first["next"], "0255.md");
+        let second = reader
+            .serve(&list_request("docs/many", Some("0255.md")))
+            .expect("second page")
+            .to_json();
+        let entries = second["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 44);
+        assert_eq!(entries[0]["name"], "0256.md");
+        assert_eq!(second["next"], Value::Null);
+    }
+
+    #[test]
+    fn a_search_pages_through_many_matches() {
+        let scratch = scratch();
+        let file = scratch.path().join("root/docs/guides/a.md");
+        parent(&file);
+        let count = R0_READ_POLICY.page_matches + 44;
+        fs::write(&file, "TODO\n".repeat(count)).expect("file");
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let first = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("first page")
+            .to_json();
+        assert_eq!(
+            first["matches"].as_array().unwrap().len(),
+            R0_READ_POLICY.page_matches
+        );
+        assert_eq!(
+            first["next"],
+            json!({"path": "docs/guides/a.md", "line": 256})
+        );
+        assert_eq!(first["complete"], false);
+        let second = reader
+            .serve(&search_request(
+                "docs/guides",
+                "TODO",
+                Some(first["next"].clone()),
+            ))
+            .expect("second page")
+            .to_json();
+        let matches = second["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 44);
+        assert_eq!(matches[0]["line"], 257);
+        assert_eq!(second["next"], Value::Null);
+        assert_eq!(second["complete"], true);
+    }
+
+    #[test]
+    fn a_search_stops_at_the_scan_total() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).expect("directory");
+        fs::write(guides.join("a.md"), "TODO a\n").expect("file");
+        fs::write(guides.join("b.md"), "TODO b\n").expect("file");
+        // The two names (8 bytes) and a.md (7 bytes), and nothing for b.md.
+        let policy = ReadPolicy {
+            scan_bytes: 8 + 7,
+            ..R0_READ_POLICY
+        };
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            policy,
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("a partial search")
+            .to_json();
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a.md", "line": 1, "text": "TODO a"}])
+        );
+        assert_eq!(found["complete"], false);
+        assert_eq!(found["next"], Value::Null);
+        // The scan total is spent, so listings and searches are refused. A
+        // read scans nothing and is still served.
+        assert_eq!(
+            reader
+                .serve(&search_request("docs/guides", "TODO", None))
+                .err(),
+            Some(Refusal::LimitScan)
+        );
+        assert_eq!(
+            reader.serve(&list_request("docs/guides", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+        assert!(reader.serve(&read_request("docs/guides/b.md")).is_ok());
+    }
+
+    #[test]
+    fn a_search_discloses_at_most_the_attempt_total() {
+        let scratch = scratch();
+        let file = scratch.path().join("root/docs/guides/a.md");
+        parent(&file);
+        fs::write(&file, "TODO one\nTODO two\n").expect("file");
+        let policy = ReadPolicy {
+            attempt_bytes: "TODO one".len() as u64,
+            ..R0_READ_POLICY
+        };
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            policy,
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("a search")
+            .to_json();
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a.md", "line": 1, "text": "TODO one"}])
+        );
+        assert_eq!(found["complete"], false);
+        assert_eq!(
+            reader.serve(&read_request("docs/guides/a.md")).err(),
+            Some(Refusal::LimitAttemptDisclosure)
+        );
+    }
+
+    #[test]
+    fn a_search_descends_at_most_the_policy_depth() {
+        let scratch = scratch();
+        let policy = ReadPolicy {
+            depth: 4,
+            ..R0_READ_POLICY
+        };
+        // docs/guides/a/b.md is four components; docs/guides/a/b/c.md is five.
+        let shallow = scratch.path().join("root/docs/guides/a/b.md");
+        let deep = scratch.path().join("root/docs/guides/a/b/c.md");
+        parent(&deep);
+        fs::write(&shallow, "TODO shallow").expect("file");
+        fs::write(&deep, "TODO deep").expect("file");
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            policy,
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("a search")
+            .to_json();
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a/b.md", "line": 1, "text": "TODO shallow"}])
+        );
+    }
+
+    #[test]
+    fn a_long_line_is_cut_on_a_character_boundary() {
+        let scratch = scratch();
+        let file = scratch.path().join("root/docs/guides/a.md");
+        parent(&file);
+        // 511 ASCII bytes then a two-byte character straddling the limit.
+        let line = format!(
+            "TODO{}\u{e9}tail",
+            "a".repeat(R0_READ_POLICY.match_bytes - 5)
+        );
+        fs::write(&file, &line).expect("file");
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("a search")
+            .to_json();
+        let text = found["matches"][0]["text"].as_str().unwrap();
+        assert_eq!(text.len(), R0_READ_POLICY.match_bytes - 1);
+        assert!(line.starts_with(text));
     }
 }
