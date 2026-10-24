@@ -1967,7 +1967,7 @@ mod tests {
         assert_eq!(envelope_data(&approved.body)["state"], "introduced");
         assert!(state
             .registry
-            .device(fixture.envelope.request.destination_id)
+            .device(fixture.envelope.request.destination_id())
             .unwrap()
             .is_some());
     }

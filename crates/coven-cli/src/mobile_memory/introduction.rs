@@ -1,5 +1,5 @@
-//! Transport-independent local authorization checkpoint; no enrollment route.
-//! Trusted inputs are the owner's explicit policy and instance fingerprint.
+//! Transport-independent introduction authorization. Ingress is the local
+//! enrollment route; trusted inputs are the owner's policy and instance key.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +24,16 @@ use super::owner_policy::OwnerPolicyStore;
 use super::registry::{DeviceAuthorizationRecord, DeviceRecord, DeviceRegistry};
 
 pub(super) const MAX_INTRODUCTIONS: usize = 128;
+/// Upper bound on N for threshold approval; each approver is a separate lock
+/// and step-up verification inside one commit.
+pub(super) const MAX_INTRODUCTION_APPROVERS: usize = 16;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs inside the commit after every check passes, before the registry write.
+    pub(super) static BEFORE_INTRODUCTION_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug)]
 pub(super) struct IntroductionCommitUncertain;
@@ -36,6 +46,7 @@ impl std::fmt::Display for IntroductionCommitUncertain {
 
 /// Owner-provided local configuration. There is deliberately no Default or
 /// Deserialize implementation: this is never an enrollment request field.
+/// `required_approvals` is always explicit; there is no default threshold.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntroductionPolicy {
@@ -49,8 +60,11 @@ pub struct IntroductionPolicy {
 
 impl IntroductionPolicy {
     pub(super) fn validate(&self) -> Result<()> {
-        if self.required_approvals != 1 {
-            bail!("unsupported introduction approval threshold");
+        if self.required_approvals == 0
+            || usize::from(self.required_approvals) > self.eligible_introducers.len()
+            || usize::from(self.required_approvals) > MAX_INTRODUCTION_APPROVERS
+        {
+            bail!("invalid introduction approval threshold");
         }
         if self.eligible_introducers.is_empty()
             || self.eligible_introducers.len() > 128
@@ -82,6 +96,7 @@ impl IntroductionPolicy {
 
 /// All fields are material, including the complete destination grant and
 /// presentation. Both possession signatures and the step-up action bind them.
+/// Version 1 names exactly one introducer and is valid only when N = 1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct IntroductionRequest {
@@ -104,44 +119,232 @@ pub struct IntroductionRequest {
 impl IntroductionRequest {
     pub fn action(&self) -> Result<DeviceActionIntent> {
         self.validate()?;
-        let mut material = b"COVEN-INTRODUCTION/1\0".to_vec();
-        material.extend(serde_jcs::to_vec(self)?);
-        Ok(DeviceActionIntent {
-            version: DEVICE_ACTION_VERSION,
-            scope: DeviceScope::DeviceAdmin,
-            operation: "devices.introduction.approve".into(),
-            target: URL_SAFE_NO_PAD.encode(self.audience),
-            effect_digest: URL_SAFE_NO_PAD.encode(Sha256::digest(material)),
-            nonce: URL_SAFE_NO_PAD.encode(self.nonce),
-            issued_at: self.issued_at,
-            expires_at: self.expires_at,
-        })
+        exact_action(b"COVEN-INTRODUCTION/1\0", self, &self.terms())
     }
 
     /// The destination signs a distinct exact action with its possession key.
     pub fn possession_bytes(&self) -> Result<Vec<u8>> {
-        let mut action = self.action()?;
-        action.operation = "devices.introduction.accept".into();
-        Ok(action.canonical_bytes()?)
+        accept_bytes(self.action()?)
     }
 
     fn validate(&self) -> Result<()> {
-        if self.version != 1
-            || self.audience == [0; 32]
+        if self.version != 1 {
+            bail!("invalid introduction request");
+        }
+        self.terms().validate()
+    }
+
+    fn terms(&self) -> IntroductionTerms<'_> {
+        IntroductionTerms {
+            audience: self.audience,
+            policy_digest: &self.policy_digest,
+            approvers: vec![IntroductionApprover {
+                device_id: self.introducer_id,
+                grant_id: self.introducer_grant_id,
+                revocation_epoch: self.introducer_revocation_epoch,
+            }],
+            destination_id: self.destination_id,
+            destination_public_key: &self.destination_public_key,
+            device_name: &self.device_name,
+            device_context: &self.device_context,
+            grant: &self.grant,
+            nonce: self.nonce,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+/// One approver named by a threshold request, bound to the exact grant and
+/// revocation epoch it approves under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IntroductionApprover {
+    pub device_id: Uuid,
+    pub grant_id: Uuid,
+    pub revocation_epoch: u64,
+}
+
+/// Version 2: exactly N named approvers (N ≥ 2, sorted by device ID) under
+/// its own domain separator. Every other field matches version 1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ThresholdIntroductionRequest {
+    pub version: u16,
+    pub audience: [u8; 32],
+    pub policy_digest: String,
+    pub approvers: Vec<IntroductionApprover>,
+    pub destination_id: Uuid,
+    pub destination_public_key: String,
+    pub device_name: String,
+    pub device_context: String,
+    pub grant: DeviceGrant,
+    pub nonce: [u8; 32],
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl ThresholdIntroductionRequest {
+    /// Every approver signs this same action with its own keys.
+    pub fn action(&self) -> Result<DeviceActionIntent> {
+        self.validate()?;
+        exact_action(b"COVEN-INTRODUCTION/2\0", self, &self.terms())
+    }
+
+    pub fn possession_bytes(&self) -> Result<Vec<u8>> {
+        accept_bytes(self.action()?)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.version != 2 || self.approvers.len() < 2 {
+            bail!("invalid threshold introduction request");
+        }
+        self.terms().validate()
+    }
+
+    fn terms(&self) -> IntroductionTerms<'_> {
+        IntroductionTerms {
+            audience: self.audience,
+            policy_digest: &self.policy_digest,
+            approvers: self.approvers.clone(),
+            destination_id: self.destination_id,
+            destination_public_key: &self.destination_public_key,
+            device_name: &self.device_name,
+            device_context: &self.device_context,
+            grant: &self.grant,
+            nonce: self.nonce,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+/// Either request version, as carried by an enrollment envelope. Untagged:
+/// `deny_unknown_fields` on each version keeps the two shapes disjoint, so a
+/// v1 envelope parses exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IntroductionTranscript {
+    Single(IntroductionRequest),
+    Threshold(ThresholdIntroductionRequest),
+}
+
+impl IntroductionTranscript {
+    pub fn action(&self) -> Result<DeviceActionIntent> {
+        match self {
+            Self::Single(request) => request.action(),
+            Self::Threshold(request) => request.action(),
+        }
+    }
+
+    pub fn possession_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Single(request) => request.possession_bytes(),
+            Self::Threshold(request) => request.possession_bytes(),
+        }
+    }
+
+    fn terms(&self) -> IntroductionTerms<'_> {
+        match self {
+            Self::Single(request) => request.terms(),
+            Self::Threshold(request) => request.terms(),
+        }
+    }
+
+    pub fn approvers(&self) -> Vec<IntroductionApprover> {
+        self.terms().approvers
+    }
+
+    pub fn names_approver(&self, device_id: Uuid) -> bool {
+        self.terms()
+            .approvers
+            .iter()
+            .any(|a| a.device_id == device_id)
+    }
+
+    pub fn audience(&self) -> [u8; 32] {
+        self.terms().audience
+    }
+
+    pub fn policy_digest(&self) -> &str {
+        self.terms().policy_digest
+    }
+
+    pub fn destination_id(&self) -> Uuid {
+        self.terms().destination_id
+    }
+
+    pub fn destination_public_key(&self) -> &str {
+        self.terms().destination_public_key
+    }
+
+    pub fn device_name(&self) -> &str {
+        self.terms().device_name
+    }
+
+    pub fn device_context(&self) -> &str {
+        self.terms().device_context
+    }
+
+    pub fn grant(&self) -> &DeviceGrant {
+        self.terms().grant
+    }
+
+    pub fn nonce(&self) -> [u8; 32] {
+        self.terms().nonce
+    }
+
+    pub fn issued_at(&self) -> DateTime<Utc> {
+        self.terms().issued_at
+    }
+
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        self.terms().expires_at
+    }
+}
+
+/// Version-independent view used for every authority check, so v1 and v2
+/// cannot drift apart. Signatures always cover the versioned original.
+struct IntroductionTerms<'a> {
+    audience: [u8; 32],
+    policy_digest: &'a str,
+    approvers: Vec<IntroductionApprover>,
+    destination_id: Uuid,
+    destination_public_key: &'a str,
+    device_name: &'a str,
+    device_context: &'a str,
+    grant: &'a DeviceGrant,
+    nonce: [u8; 32],
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+impl IntroductionTerms<'_> {
+    fn validate(&self) -> Result<()> {
+        if self.audience == [0; 32]
             || self.nonce == [0; 32]
-            || self.introducer_id.is_nil()
             || self.destination_id.is_nil()
-            || self.destination_id == self.introducer_id
+            || self.approvers.is_empty()
+            || self.approvers.len() > MAX_INTRODUCTION_APPROVERS
+            || self
+                .approvers
+                .windows(2)
+                .any(|w| w[0].device_id >= w[1].device_id)
+            || self.approvers.iter().any(|approver| {
+                approver.device_id.is_nil()
+                    || approver.grant_id.is_nil()
+                    || approver.device_id == self.destination_id
+            })
             || self.grant.id.is_nil()
             || self.grant.revocation_epoch != 0
             || self.grant.issued_at != self.issued_at
         {
             bail!("invalid introduction request");
         }
-        validate_digest(&self.policy_digest)?;
-        validate_public_key(&self.destination_public_key)?;
-        self.grant.validate(&self.destination_public_key)?;
-        for (text, limit) in [(&self.device_name, 80), (&self.device_context, 512)] {
+        validate_digest(self.policy_digest)?;
+        validate_public_key(self.destination_public_key)?;
+        self.grant.validate(self.destination_public_key)?;
+        for (text, limit) in [(self.device_name, 80), (self.device_context, 512)] {
             if text.is_empty()
                 || text.trim() != text
                 || text.chars().count() > limit
@@ -158,13 +361,37 @@ impl IntroductionRequest {
     }
 }
 
+fn exact_action(
+    domain: &[u8],
+    request: &impl Serialize,
+    terms: &IntroductionTerms<'_>,
+) -> Result<DeviceActionIntent> {
+    let mut material = domain.to_vec();
+    material.extend(serde_jcs::to_vec(request)?);
+    Ok(DeviceActionIntent {
+        version: DEVICE_ACTION_VERSION,
+        scope: DeviceScope::DeviceAdmin,
+        operation: "devices.introduction.approve".into(),
+        target: URL_SAFE_NO_PAD.encode(terms.audience),
+        effect_digest: URL_SAFE_NO_PAD.encode(Sha256::digest(material)),
+        nonce: URL_SAFE_NO_PAD.encode(terms.nonce),
+        issued_at: terms.issued_at,
+        expires_at: terms.expires_at,
+    })
+}
+
+fn accept_bytes(mut action: DeviceActionIntent) -> Result<Vec<u8>> {
+    action.operation = "devices.introduction.accept".into();
+    Ok(action.canonical_bytes()?)
+}
+
 pub struct IntroductionApproval {
     pub possession_signature: String,
     pub step_up: PresentedAssuranceProof,
 }
 
-/// Local Rust seam only. Future ingress must obtain policy/audience from the
-/// owner authority, never from a remote request or an account/relay service.
+/// The only ingress is local enrollment, which obtains policy and audience
+/// from the owner authority, never from a remote request or relay service.
 pub struct IntroductionAuthority {
     home: PathBuf,
     audience: [u8; 32],
@@ -208,29 +435,43 @@ impl IntroductionAuthority {
         Ok(authority)
     }
 
-    /// Admission check before an introducer is asked to approve: the request
-    /// is current under trusted policy and the destination proved possession.
-    /// Consumes nothing; `introduce` re-runs every check at commit.
+    pub fn policy_digest(&self) -> Result<String> {
+        self.policy.digest()
+    }
+
+    pub(super) fn maximum_step_up_age(&self) -> chrono::Duration {
+        chrono::Duration::seconds(i64::from(self.policy.maximum_step_up_age_seconds))
+    }
+
+    /// Admission check before approvers are asked: the request is current under
+    /// trusted policy for every named approver and the destination proved
+    /// possession. Consumes nothing; commit re-runs every check.
     pub fn admit(
         &self,
         request: &IntroductionRequest,
         destination_signature: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        self.registry
-            .with_introducer(request.introducer_id, |source, key| {
-                self.validate_authority(request, source, key, now)?;
-                verify_assurance_signature(
-                    &request.destination_public_key,
-                    &request.possession_bytes()?,
-                    destination_signature,
-                )?;
-                Ok(())
-            })
+        self.admit_terms(
+            &request.terms(),
+            &request.possession_bytes()?,
+            destination_signature,
+            now,
+        )
     }
 
-    pub fn policy_digest(&self) -> Result<String> {
-        self.policy.digest()
+    pub fn admit_threshold(
+        &self,
+        request: &ThresholdIntroductionRequest,
+        destination_signature: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.admit_terms(
+            &request.terms(),
+            &request.possession_bytes()?,
+            destination_signature,
+            now,
+        )
     }
 
     pub fn issue_challenge(
@@ -238,9 +479,133 @@ impl IntroductionAuthority {
         request: &IntroductionRequest,
         now: DateTime<Utc>,
     ) -> Result<IssuedAssuranceChallenge> {
+        request.validate()?;
+        self.issue_challenge_for(&request.terms(), request.introducer_id, now)
+    }
+
+    pub fn issue_threshold_challenge(
+        &self,
+        request: &ThresholdIntroductionRequest,
+        approver: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<IssuedAssuranceChallenge> {
+        request.validate()?;
+        self.issue_challenge_for(&request.terms(), approver, now)
+    }
+
+    pub fn introduce(
+        &self,
+        request: &IntroductionRequest,
+        destination_signature: &str,
+        approval: &IntroductionApproval,
+        now: DateTime<Utc>,
+    ) -> Result<DeviceAuthorizationRecord> {
+        let action = request.action()?;
+        self.audited_introduce(now, || {
+            self.introduce_terms(
+                &request.terms(),
+                &action,
+                destination_signature,
+                &[(request.introducer_id, approval)],
+                now,
+            )
+        })
+    }
+
+    /// Commits only with an approval from every named approver, all verified
+    /// and consumed inside one registry commit.
+    pub fn introduce_threshold(
+        &self,
+        request: &ThresholdIntroductionRequest,
+        destination_signature: &str,
+        approvals: &[(Uuid, &IntroductionApproval)],
+        now: DateTime<Utc>,
+    ) -> Result<DeviceAuthorizationRecord> {
+        let action = request.action()?;
+        self.audited_introduce(now, || {
+            self.introduce_terms(
+                &request.terms(),
+                &action,
+                destination_signature,
+                approvals,
+                now,
+            )
+        })
+    }
+
+    pub fn admit_transcript(
+        &self,
+        transcript: &IntroductionTranscript,
+        destination_signature: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        match transcript {
+            IntroductionTranscript::Single(request) => {
+                self.admit(request, destination_signature, now)
+            }
+            IntroductionTranscript::Threshold(request) => {
+                self.admit_threshold(request, destination_signature, now)
+            }
+        }
+    }
+
+    pub fn introduce_transcript(
+        &self,
+        transcript: &IntroductionTranscript,
+        destination_signature: &str,
+        approvals: &[(Uuid, &IntroductionApproval)],
+        now: DateTime<Utc>,
+    ) -> Result<DeviceAuthorizationRecord> {
+        match transcript {
+            IntroductionTranscript::Single(request) => match approvals {
+                [(id, approval)] if *id == request.introducer_id => {
+                    self.introduce(request, destination_signature, approval, now)
+                }
+                _ => bail!("introduction approvals do not match the named approvers"),
+            },
+            IntroductionTranscript::Threshold(request) => {
+                self.introduce_threshold(request, destination_signature, approvals, now)
+            }
+        }
+    }
+
+    fn admit_terms(
+        &self,
+        terms: &IntroductionTerms<'_>,
+        possession_bytes: &[u8],
+        destination_signature: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.validate_request(terms, now)?;
+        for approver in &terms.approvers {
+            self.registry
+                .with_introducer(approver.device_id, |source, key| {
+                    self.validate_source(terms, approver, source, key, now)
+                })?;
+        }
+        verify_assurance_signature(
+            terms.destination_public_key,
+            possession_bytes,
+            destination_signature,
+        )?;
+        Ok(())
+    }
+
+    fn issue_challenge_for(
+        &self,
+        terms: &IntroductionTerms<'_>,
+        approver_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<IssuedAssuranceChallenge> {
+        self.validate_request(terms, now)?;
+        let approver = terms
+            .approvers
+            .iter()
+            .find(|approver| approver.device_id == approver_id)
+            .context("device is not an approver of this introduction")?;
         self.registry
-            .with_introducer(request.introducer_id, |source, key| {
-                self.validate_authority(request, source, key, now)?;
+            .with_introducer(approver.device_id, |source, key| {
+                self.validate_source(terms, approver, source, key, now)?;
                 Ok(self.challenges.issue(
                     ChallengeBinding {
                         device_id: source.device.id,
@@ -254,28 +619,25 @@ impl IntroductionAuthority {
             })
     }
 
-    pub fn introduce(
+    fn audited_introduce(
         &self,
-        request: &IntroductionRequest,
-        destination_signature: &str,
-        approval: &IntroductionApproval,
         now: DateTime<Utc>,
+        commit: impl FnOnce() -> Result<(DeviceAuthorizationRecord, IntroductionTransition)>,
     ) -> Result<DeviceAuthorizationRecord> {
-        let (destination, transition) =
-            match self.introduce_inner(request, destination_signature, approval, now) {
-                Ok(committed) => committed,
-                Err(error) => {
-                    let event = if error.is::<IntroductionCommitUncertain>() {
-                        MobileAuditEvent::DeviceIntroductionUncertain
-                    } else {
-                        MobileAuditEvent::DeviceIntroductionRejected
-                    };
-                    append_event(&self.home, now, event, None).context(format!(
-                        "introduction failed ({error}); audit delivery failed"
-                    ))?;
-                    return Err(error);
-                }
-            };
+        let (destination, transition) = match commit() {
+            Ok(committed) => committed,
+            Err(error) => {
+                let event = if error.is::<IntroductionCommitUncertain>() {
+                    MobileAuditEvent::DeviceIntroductionUncertain
+                } else {
+                    MobileAuditEvent::DeviceIntroductionRejected
+                };
+                append_event(&self.home, now, event, None).context(format!(
+                    "introduction failed ({error}); audit delivery failed"
+                ))?;
+                return Err(error);
+            }
+        };
         let receipt = append_introduction_event(&self.home, &transition)
             .context("introduction committed; audit delivery pending")?;
         self.registry
@@ -284,70 +646,115 @@ impl IntroductionAuthority {
         Ok(destination)
     }
 
-    fn introduce_inner(
+    fn introduce_terms(
         &self,
-        request: &IntroductionRequest,
+        terms: &IntroductionTerms<'_>,
+        action: &DeviceActionIntent,
         destination_signature: &str,
-        approval: &IntroductionApproval,
+        approvals: &[(Uuid, &IntroductionApproval)],
         now: DateTime<Utc>,
     ) -> Result<(DeviceAuthorizationRecord, IntroductionTransition)> {
+        // Exactly one approval per named approver; nothing more, nothing less.
+        let mut approval_ids: Vec<_> = approvals.iter().map(|(id, _)| *id).collect();
+        approval_ids.sort_unstable();
+        let approver_ids: Vec<_> = terms.approvers.iter().map(|a| a.device_id).collect();
+        if approval_ids != approver_ids {
+            bail!("introduction approvals do not match the named approvers");
+        }
         let record = DeviceRecord {
-            id: request.destination_id,
-            display_name: request.device_name.clone(),
-            public_key_x963: request.destination_public_key.clone(),
-            paired_at: request.issued_at,
+            id: terms.destination_id,
+            display_name: terms.device_name.to_owned(),
+            public_key_x963: terms.destination_public_key.to_owned(),
+            paired_at: terms.issued_at,
             revoked_at: None,
             suspended_at: None,
-            scopes: request.grant.scopes.clone(),
+            scopes: terms.grant.scopes.clone(),
         };
-        let nonce_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(request.nonce));
-        self.registry.commit_introduction(
-            request.introducer_id,
-            record,
-            request.grant.clone(),
-            nonce_digest,
+        let nonce_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(terms.nonce));
+        let mut possession = action.clone();
+        possession.operation = "devices.introduction.accept".into();
+        let commit = || {
+            self.registry.commit_introduction(
+                &approver_ids,
+                record,
+                terms.grant.clone(),
+                nonce_digest,
+                now,
+                |sources| {
+                    self.validate_request(terms, now)?;
+                    verify_assurance_signature(
+                        terms.destination_public_key,
+                        &possession.canonical_bytes()?,
+                        destination_signature,
+                    )?;
+                    for ((source, key), approver) in sources.iter().zip(&terms.approvers) {
+                        let (_, approval) = approvals
+                            .iter()
+                            .find(|(id, _)| *id == approver.device_id)
+                            .context("introduction approval is missing")?;
+                        self.verify_approval(terms, action, approver, source, key, approval, now)?;
+                    }
+                    #[cfg(test)]
+                    BEFORE_INTRODUCTION_WRITE
+                        .with(|hook| hook.borrow_mut().take().map(|hook| hook()));
+                    Ok(())
+                },
+            )
+        };
+        match &self.installed {
+            // Policy → registry: the head is checked and the enrollment written
+            // under one policy lock, so a replacement retires this request
+            // atomically rather than racing its commit.
+            Some((store, digest)) => store.with_current_locked(|head| {
+                if head.map(|head| &head.digest) != Some(digest) {
+                    bail!("introduction owner policy was replaced");
+                }
+                commit()
+            }),
+            None => commit(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // each input is a distinct bound value
+    fn verify_approval(
+        &self,
+        terms: &IntroductionTerms<'_>,
+        action: &DeviceActionIntent,
+        approver: &IntroductionApprover,
+        source: &DeviceAuthorizationRecord,
+        key: &DeviceAuthorizationKeyRecord,
+        approval: &IntroductionApproval,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.validate_source(terms, approver, source, key, now)?;
+        verify_assurance_signature(
+            &source.device.public_key_x963,
+            &action.canonical_bytes()?,
+            &approval.possession_signature,
+        )?;
+        if approval.step_up.issued_at < terms.issued_at
+            || now - approval.step_up.issued_at > self.maximum_step_up_age()
+        {
+            bail!("introduction step-up is not fresh");
+        }
+        let verified = verify_and_consume_assurance(
+            &self.challenges,
+            key,
+            source.grant.id,
+            source.grant.revocation_epoch,
+            &approval.step_up,
+            AssuranceContext::Action(action),
             now,
-            |source, key| {
-                self.validate_authority(request, source, key, now)?;
-                let action = request.action()?;
-                verify_assurance_signature(
-                    &request.destination_public_key,
-                    &request.possession_bytes()?,
-                    destination_signature,
-                )?;
-                verify_assurance_signature(
-                    &source.device.public_key_x963,
-                    &action.canonical_bytes()?,
-                    &approval.possession_signature,
-                )?;
-                if approval.step_up.issued_at < request.issued_at
-                    || now - approval.step_up.issued_at
-                        > chrono::Duration::seconds(i64::from(
-                            self.policy.maximum_step_up_age_seconds,
-                        ))
-                {
-                    bail!("introduction step-up is not fresh");
-                }
-                let verified = verify_and_consume_assurance(
-                    &self.challenges,
-                    key,
-                    source.grant.id,
-                    source.grant.revocation_epoch,
-                    &approval.step_up,
-                    AssuranceContext::Action(&action),
-                    now,
-                )?;
-                if verified.effective_assurance < self.policy.minimum_assurance() {
-                    bail!("introduction requires stronger verified assurance");
-                }
-                source.grant.authorize(
-                    Some(DeviceScope::DeviceAdmin),
-                    verified.effective_assurance,
-                    now,
-                )?;
-                Ok(())
-            },
-        )
+        )?;
+        if verified.effective_assurance < self.policy.minimum_assurance() {
+            bail!("introduction requires stronger verified assurance");
+        }
+        source.grant.authorize(
+            Some(DeviceScope::DeviceAdmin),
+            verified.effective_assurance,
+            now,
+        )?;
+        Ok(())
     }
 
     /// Reconcile only committed outbox records. Never retry enrollment or infer
@@ -361,15 +768,10 @@ impl IntroductionAuthority {
         Ok(pending.len())
     }
 
-    fn validate_authority(
-        &self,
-        request: &IntroductionRequest,
-        source: &DeviceAuthorizationRecord,
-        key: &DeviceAuthorizationKeyRecord,
-        now: DateTime<Utc>,
-    ) -> Result<()> {
-        request.validate()?;
-        if request.audience != self.audience || request.policy_digest != self.policy.digest()? {
+    /// Request-level checks shared by every approver.
+    fn validate_request(&self, terms: &IntroductionTerms<'_>, now: DateTime<Utc>) -> Result<()> {
+        terms.validate()?;
+        if terms.audience != self.audience || terms.policy_digest != self.policy.digest()? {
             bail!("introduction audience or owner policy mismatch");
         }
         if let Some((store, digest)) = &self.installed {
@@ -377,20 +779,39 @@ impl IntroductionAuthority {
                 bail!("introduction owner policy was replaced");
             }
         }
-        if self
-            .policy
-            .eligible_introducers
-            .binary_search(&source.device.id)
-            .is_err()
-            || source.grant.id != request.introducer_grant_id
-            || source.grant.revocation_epoch != request.introducer_revocation_epoch
+        if terms.approvers.len() != usize::from(self.policy.required_approvals)
+            || terms.approvers.iter().any(|approver| {
+                self.policy
+                    .eligible_introducers
+                    .binary_search(&approver.device_id)
+                    .is_err()
+            })
+            || terms.issued_at > now
+            || now >= terms.expires_at
+        {
+            bail!("introduction authority is not current");
+        }
+        Ok(())
+    }
+
+    /// Checks one approver's current state; the destination grant must be no
+    /// broader than every approver's grant.
+    fn validate_source(
+        &self,
+        terms: &IntroductionTerms<'_>,
+        approver: &IntroductionApprover,
+        source: &DeviceAuthorizationRecord,
+        key: &DeviceAuthorizationKeyRecord,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        if source.device.id != approver.device_id
+            || source.grant.id != approver.grant_id
+            || source.grant.revocation_epoch != approver.revocation_epoch
             || source.device.revoked_at.is_some()
             || source.device.suspended_at.is_some()
-            || request.issued_at > now
-            || now >= request.expires_at
             || key.enrolled_at > now
-            || key.public_key_x963 == request.destination_public_key
-            || source.device.public_key_x963 == request.destination_public_key
+            || key.public_key_x963 == terms.destination_public_key
+            || source.device.public_key_x963 == terms.destination_public_key
         {
             bail!("introduction authority is not current");
         }
@@ -408,7 +829,7 @@ impl IntroductionAuthority {
         if key.assurance_class.ceiling() < self.policy.minimum_assurance() {
             bail!("introduction authorization key cannot satisfy policy");
         }
-        let grant = &request.grant;
+        let grant = terms.grant;
         let expiry = grant.expires_at.context("introduced grant must expire")?;
         if grant.not_before > now
             || now >= expiry
@@ -483,3 +904,7 @@ fn validate_digest(value: &str) -> Result<()> {
 #[cfg(test)]
 #[path = "../../tests/fixtures/trusted-device-introduction/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/fixtures/trusted-device-introduction/threshold.rs"]
+mod threshold_tests;

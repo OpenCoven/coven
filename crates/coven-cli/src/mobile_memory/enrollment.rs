@@ -17,19 +17,21 @@ use uuid::Uuid;
 use super::assurance::{AssuranceContextMode, PresentedAssuranceProof, RequestedAssurance};
 use super::grant::{DeviceActionIntent, GrantTransportConstraint};
 use super::introduction::{
-    IntroductionApproval, IntroductionAuthority, IntroductionCommitUncertain, IntroductionRequest,
+    IntroductionApproval, IntroductionAuthority, IntroductionCommitUncertain,
+    IntroductionTranscript,
 };
 use super::owner_policy::InstalledPolicy;
 
 pub(super) const LOCAL_INTRODUCTION_ROOT: &str = "/api/v1/internal/mobile/introductions";
 const MAX_TRACKED_INTRODUCTIONS: usize = 16;
 
-/// What the new installation hands the owner: the exact request and its
-/// possession signature over `devices.introduction.accept`.
+/// What the new installation hands the owner: the exact request (v1 single
+/// introducer, or v2 naming N approvers) and its possession signature over
+/// `devices.introduction.accept`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct IntroductionEnvelope {
-    pub request: IntroductionRequest,
+    pub request: IntroductionTranscript,
     pub destination_signature: String,
 }
 
@@ -58,6 +60,13 @@ pub struct IntroductionStatus {
     pub state: IntroductionState,
     pub expires_at: DateTime<Utc>,
     pub device_id: Option<Uuid>,
+    pub approvals_received: usize,
+    pub approvals_required: usize,
+    /// Approvers whose step-up aged out before the N-th approval. Their
+    /// approvals were dropped unconsumed; each must approve again with a
+    /// fresh step-up on the same request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub step_up_expired: Vec<Uuid>,
 }
 
 /// Everything the introducer must render before it signs: the complete request
@@ -66,7 +75,7 @@ pub struct IntroductionStatus {
 #[serde(rename_all = "camelCase")]
 pub struct PendingIntroductionView {
     pub id: Uuid,
-    pub request: IntroductionRequest,
+    pub request: IntroductionTranscript,
     pub action: DeviceActionIntent,
 }
 
@@ -110,6 +119,10 @@ struct TrackedIntroduction {
     envelope: IntroductionEnvelope,
     state: IntroductionState,
     device_id: Option<Uuid>,
+    /// Collected but unverified; every approval is verified and consumed only
+    /// inside the single commit that runs once all named approvers have signed.
+    approvals: Vec<(Uuid, MobileIntroductionApproval)>,
+    step_up_expired: Vec<Uuid>,
 }
 
 impl TrackedIntroduction {
@@ -117,8 +130,11 @@ impl TrackedIntroduction {
         IntroductionStatus {
             id,
             state: self.state,
-            expires_at: self.envelope.request.expires_at,
+            expires_at: self.envelope.request.expires_at(),
             device_id: self.device_id,
+            approvals_received: self.approvals.len(),
+            approvals_required: self.envelope.request.approvers().len(),
+            step_up_expired: self.step_up_expired.clone(),
         }
     }
 }
@@ -155,9 +171,9 @@ impl IntroductionLedger {
         now: DateTime<Utc>,
     ) -> Result<IntroductionStatus> {
         let authority = IntroductionAuthority::load_installed(&self.home, self.audience)?;
-        authority.admit(&envelope.request, &envelope.destination_signature, now)?;
+        authority.admit_transcript(&envelope.request, &envelope.destination_signature, now)?;
         if super::registry::DeviceRegistry::load(&self.home)?
-            .device(envelope.request.destination_id)?
+            .device(envelope.request.destination_id())?
             .is_some()
         {
             bail!("introduction destination is already enrolled");
@@ -166,7 +182,7 @@ impl IntroductionLedger {
         expire(&mut entries, now);
         if entries
             .values()
-            .any(|entry| entry.envelope.request.nonce == envelope.request.nonce)
+            .any(|entry| entry.envelope.request.nonce() == envelope.request.nonce())
         {
             bail!("introduction request was already admitted");
         }
@@ -174,7 +190,7 @@ impl IntroductionLedger {
             let oldest_terminal = entries
                 .iter()
                 .filter(|(_, entry)| entry.state.is_terminal())
-                .min_by_key(|(_, entry)| entry.envelope.request.expires_at)
+                .min_by_key(|(_, entry)| entry.envelope.request.expires_at())
                 .map(|(id, _)| *id);
             match oldest_terminal {
                 Some(id) => {
@@ -188,6 +204,8 @@ impl IntroductionLedger {
             envelope,
             state: IntroductionState::AwaitingApproval,
             device_id: None,
+            approvals: Vec::new(),
+            step_up_expired: Vec::new(),
         };
         let status = entry.status(id);
         entries.insert(id, entry);
@@ -213,7 +231,7 @@ impl IntroductionLedger {
         Ok(entry.status(id))
     }
 
-    /// Only the named introducer sees a request; other devices see nothing.
+    /// A request is visible only to named approvers who have not yet approved.
     pub(super) fn pending_for(
         &self,
         introducer: Uuid,
@@ -225,7 +243,8 @@ impl IntroductionLedger {
             .iter()
             .filter(|(_, entry)| {
                 entry.state == IntroductionState::AwaitingApproval
-                    && entry.envelope.request.introducer_id == introducer
+                    && entry.envelope.request.names_approver(introducer)
+                    && !entry.approvals.iter().any(|(id, _)| *id == introducer)
             })
             .map(|(id, entry)| {
                 Ok(PendingIntroductionView {
@@ -235,12 +254,19 @@ impl IntroductionLedger {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        views.sort_by_key(|view| view.request.issued_at);
+        views.sort_by_key(|view| view.request.issued_at());
         Ok(views)
     }
 
-    /// One attempt per admitted request: any failure is terminal, so a bad
-    /// or replayed approval can never be retried into a success.
+    /// Records one named approver's approval; the N-th triggers the single
+    /// commit. That commit is the one attempt per request: any failure is
+    /// terminal, so a bad or replayed approval can never be retried into success.
+    ///
+    /// Before that commit, approvals whose step-up is already older than the
+    /// policy's maximum age are dropped unconsumed and reported in
+    /// `step_up_expired`, and the request keeps awaiting approval. This only
+    /// ever removes approvals: N, assurance and every commit-time check stay
+    /// as they are, and a claimed step-up time is verified at commit.
     pub(super) fn approve(
         &self,
         id: Uuid,
@@ -252,21 +278,54 @@ impl IntroductionLedger {
         expire(&mut entries, now);
         let entry = entries
             .get_mut(&id)
-            .filter(|entry| entry.envelope.request.introducer_id == introducer)
+            .filter(|entry| entry.envelope.request.names_approver(introducer))
             .context("introduction not found")?;
         if entry.state != IntroductionState::AwaitingApproval {
             bail!("introduction is no longer awaiting approval");
         }
+        if entry.approvals.iter().any(|(id, _)| *id == introducer) {
+            bail!("this approver has already approved");
+        }
+        entry.approvals.push((introducer, approval));
+        entry.step_up_expired.retain(|id| *id != introducer);
+        if entry.approvals.len() < entry.envelope.request.approvers().len() {
+            return Ok(entry.status(id));
+        }
+        let authority = IntroductionAuthority::load_installed(&self.home, self.audience);
+        if let Ok(authority) = &authority {
+            let maximum_age = authority.maximum_step_up_age();
+            let expired: Vec<_> = entry
+                .approvals
+                .iter()
+                .filter(|(_, approval)| now - approval.step_up.issued_at > maximum_age)
+                .map(|(id, _)| *id)
+                .collect();
+            if !expired.is_empty() {
+                entry.approvals.retain(|(id, _)| !expired.contains(id));
+                entry.step_up_expired.extend(expired);
+                entry.step_up_expired.sort_unstable();
+                return Ok(entry.status(id));
+            }
+        }
         let outcome = (|| {
-            let approval = IntroductionApproval {
-                possession_signature: approval.possession_signature,
-                step_up: approval.step_up.into_proof()?,
-            };
-            let authority = IntroductionAuthority::load_installed(&self.home, self.audience)?;
-            authority.introduce(
+            let approvals = entry
+                .approvals
+                .iter()
+                .map(|(id, approval)| {
+                    Ok((
+                        *id,
+                        IntroductionApproval {
+                            possession_signature: approval.possession_signature.clone(),
+                            step_up: approval.step_up.clone().into_proof()?,
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let approvals: Vec<_> = approvals.iter().map(|(id, a)| (*id, a)).collect();
+            authority?.introduce_transcript(
                 &entry.envelope.request,
                 &entry.envelope.destination_signature,
-                &approval,
+                &approvals,
                 now,
             )
         })();
@@ -277,7 +336,7 @@ impl IntroductionLedger {
                 Ok(entry.status(id))
             }
             Err(error) => {
-                let destination = entry.envelope.request.destination_id;
+                let destination = entry.envelope.request.destination_id();
                 let committed = super::registry::DeviceRegistry::load(&self.home)
                     .and_then(|registry| registry.device(destination))
                     .map_or(true, |device| device.is_some());
@@ -295,7 +354,7 @@ impl IntroductionLedger {
 fn expire(entries: &mut HashMap<Uuid, TrackedIntroduction>, now: DateTime<Utc>) {
     for entry in entries.values_mut() {
         if entry.state == IntroductionState::AwaitingApproval
-            && now >= entry.envelope.request.expires_at
+            && now >= entry.envelope.request.expires_at()
         {
             entry.state = IntroductionState::Expired;
         }
@@ -307,11 +366,11 @@ fn expire(entries: &mut HashMap<Uuid, TrackedIntroduction>, now: DateTime<Utc>) 
 // Outside tests only the Unix owner-socket CLI renders this review.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(super) fn render_introduction_review(
-    request: &IntroductionRequest,
+    request: &IntroductionTranscript,
     action: &DeviceActionIntent,
     policy: &InstalledPolicy,
 ) -> String {
-    let grant = &request.grant;
+    let grant = request.grant();
     let scopes = |list: &[super::grant::DeviceScope]| {
         if list.is_empty() {
             "(none)".to_owned()
@@ -328,25 +387,37 @@ pub(super) fn render_introduction_review(
     field("installation (audience)", action.target.clone());
     field(
         "owner policy",
-        format!("revision {} ({})", policy.revision, request.policy_digest),
+        format!("revision {} ({})", policy.revision, request.policy_digest()),
     );
-    field("introducer device", request.introducer_id.to_string());
-    field("introducer grant", request.introducer_grant_id.to_string());
+    let approvers = request.approvers();
     field(
-        "introducer revocation epoch",
-        request.introducer_revocation_epoch.to_string(),
+        "required approvals",
+        format!(
+            "{} of {} eligible",
+            approvers.len(),
+            policy.policy.eligible_introducers.len()
+        ),
     );
-    field("new device id", request.destination_id.to_string());
+    for (index, approver) in approvers.iter().enumerate() {
+        field(
+            &format!("approver {}", index + 1),
+            format!(
+                "device {} grant {} epoch {}",
+                approver.device_id, approver.grant_id, approver.revocation_epoch
+            ),
+        );
+    }
+    field("new device id", request.destination_id().to_string());
     field(
         "new device key",
         format!(
             "sha256:{}",
             URL_SAFE_NO_PAD
-                .encode(&Sha256::digest(request.destination_public_key.as_bytes())[..12])
+                .encode(&Sha256::digest(request.destination_public_key().as_bytes())[..12])
         ),
     );
-    field("new device name", request.device_name.clone());
-    field("new device context", request.device_context.clone());
+    field("new device name", request.device_name().to_owned());
+    field("new device context", request.device_context().to_owned());
     field("grant id", grant.id.to_string());
     field("grant scopes", scopes(&grant.scopes));
     field(
@@ -373,11 +444,11 @@ pub(super) fn render_introduction_review(
         grant.expires_at.map_or_else(|| "(never)".into(), timestamp),
     );
     field("nonce", action.nonce.clone());
-    field("issued at", timestamp(request.issued_at));
-    field("expires at", timestamp(request.expires_at));
+    field("issued at", timestamp(request.issued_at()));
+    field("expires at", timestamp(request.expires_at()));
     field("effect digest", action.effect_digest.clone());
     out.push_str(
-        "  The context is display material, not device-identity evidence. The introducer must\n  \
+        "  The context is display material, not device-identity evidence. Every approver must\n  \
          still approve with a fresh step-up on its own device.\n",
     );
     out
@@ -423,9 +494,15 @@ pub fn run_introduce(envelope_path: &Path, assume_yes: bool) -> Result<()> {
     }
     let mut current: IntroductionStatus =
         serde_json::from_str(&body).context("daemon returned an invalid introduction status")?;
+    let approvers: Vec<_> = envelope
+        .request
+        .approvers()
+        .iter()
+        .map(|approver| approver.device_id.to_string())
+        .collect();
     println!(
-        "Waiting for device {} to approve with a fresh step-up (expires {}).",
-        envelope.request.introducer_id,
+        "Waiting for {} to approve with a fresh step-up (expires {}).",
+        approvers.join(", "),
         timestamp(current.expires_at)
     );
     let status_path = format!("{LOCAL_INTRODUCTION_ROOT}/{}/status", current.id);
@@ -441,7 +518,9 @@ pub fn run_introduce(envelope_path: &Path, assume_yes: bool) -> Result<()> {
         IntroductionState::Introduced => {
             println!(
                 "Introduced device {}. The event is in the mobile audit log.",
-                current.device_id.unwrap_or(envelope.request.destination_id)
+                current
+                    .device_id
+                    .unwrap_or(envelope.request.destination_id())
             );
             Ok(())
         }
