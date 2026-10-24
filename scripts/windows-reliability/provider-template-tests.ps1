@@ -1,3 +1,4 @@
+param([string]$OutputFile)
 $ErrorActionPreference='Stop'
 $projector=Join-Path $PSScriptRoot 'provider-template.cs'
 if (-not (Test-Path -LiteralPath $projector)) { throw 'Provider template projector missing' }
@@ -277,9 +278,8 @@ function Assert-TemplateReasons($Views) {
         $codes=[string[]]@($result.Reasons)
         $actual=$codes -join ','
         if ($actual -cne $TemplateReasons[$name]) { throw ('Unexpected rejection reasons: case={0} expected={1} actual={2}' -f $name,$TemplateReasons[$name],$actual) }
-        $canonical=[string[]]@([Linq.Enumerable]::Distinct($codes,[StringComparer]::Ordinal))
-        [Array]::Sort($canonical,[StringComparer]::Ordinal)
-        if (($canonical -join ',') -cne $actual) { throw "Rejection reasons are not canonical: $name" }
+        $canonical=[Collections.Generic.SortedSet[string]]::new($codes,[StringComparer]::Ordinal)
+        if ((@($canonical) -join ',') -cne $actual) { throw "Rejection reasons are not canonical: $name" }
         foreach ($code in $codes) { $observed.Add($code) | Out-Null }
         switch -CaseSensitive ($result.Status) {
             'unsupported' {
@@ -299,4 +299,27 @@ Assert-TemplateReasons $corpusViews
 if ($corpusViews['all-twelve'].Result.Reasons.Count -ne 12) { throw 'Maximum reason cardinality control lost' }
 # UnsupportedCount is not reason cardinality.
 if ($corpusViews['unknown-name-repeated'].Result.UnsupportedCount -ne 2 -or $corpusViews['unknown-name-repeated'].Result.Reasons.Count -ne 1) { throw 'Reason cardinality replaced the unsupported count' }
+
+# Mutants the characterization must kill. Each compiles a changed copy of the
+# projector into its own namespace and replays the corpus against it.
+function Get-TemplateMutantKills([string]$Name,[string]$Find,[string]$Replace) {
+    $source=[IO.File]::ReadAllText($projector)
+    if ([regex]::Matches($source,[regex]::Escape($Find)).Count -ne 1) { throw "Mutant anchor not unique: $Name" }
+    $namespace='CovenTemplateMutant'+($Name -creplace '[^A-Za-z]','')
+    Add-Type -TypeDefinition ("namespace $namespace {`n"+$source.Replace($Find,$Replace)+"`n}")
+    $kills=Get-LegacyTemplateMismatches (Invoke-TemplateCorpus ("$namespace.CovenKernelTemplate" -as [type]))
+    if ($kills.Count -eq 0) { throw "Characterization did not kill mutant: $Name" }
+    $kills
+}
+$kills=Get-TemplateMutantKills 'unconditional seen.Add' 'field.Unsupported = field.KnownName == null || field.KnownType == null || !seen.Add(name) || conflictingBinding;' 'bool added = seen.Add(name); field.Unsupported = field.KnownName == null || field.KnownType == null || !added || conflictingBinding;'
+if ('unknown-type-then-known-type-same-name' -cnotin $kills) { throw 'Unconditional seen.Add mutant survived its discriminating case' }
+$kills=Get-TemplateMutantKills 'reason-derived count' 'result.Reasons.AddRange(reasons);' 'result.Reasons.AddRange(reasons); if (result.Status == "unsupported") result.UnsupportedCount = reasons.Count;'
+foreach ($case in @('unknown-name-repeated','multiple-defects')) { if ($case -cnotin $kills) { throw "Reason-derived count mutant survived: $case" } }
+if ($OutputFile) {
+    # Typed projections for the independent Python validator, serialized with
+    # the encoder's own options (CovenKernelJsonSerializer in provider-public.cs).
+    $options=[Text.Json.JsonSerializerOptions]::new();$options.PropertyNamingPolicy=[Text.Json.JsonNamingPolicy]::CamelCase
+    $records=foreach ($name in $corpusViews.Keys) { '{"name":'+[Text.Json.JsonSerializer]::Serialize([string]$name,[string])+',"template":'+[Text.Json.JsonSerializer]::Serialize($corpusViews[$name].Result,[CovenKernelTemplateResult],$options)+'}' }
+    [IO.File]::WriteAllText($OutputFile,'['+($records -join ',')+']',[Text.UTF8Encoding]::new($false))
+}
 'provider template controlled privacy/bounds PASS (no native API invocation)'

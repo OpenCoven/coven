@@ -1,4 +1,5 @@
 """Controlled integration-schema tests; no native calls or publication."""
+import base64
 import copy
 import subprocess
 import sys
@@ -379,6 +380,69 @@ class VersionedEnvelopeTests(unittest.TestCase):
                 self.assertEqual(code,0);self.assertEqual(result['bytes'],(out/'receipt.json').stat().st_size)
                 self.assertEqual(published['schemaVersion'],f'coven.kernel-file-metadata.v{version}')
                 self.assertEqual('reasons' in published['collector']['events'][0]['template'],version==2)
+
+
+@unittest.skipUnless(shutil.which('pwsh'),'typed C# serialization requires PowerShell')
+class TypedFixtureTests(unittest.TestCase):
+    def run_control(self,script,*arguments):
+        result=subprocess.run(['pwsh','-NoProfile','-File',str(Path(__file__).with_name(script)),*arguments],capture_output=True,timeout=600)
+        self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+
+    def test_typed_template_projections_satisfy_the_v2_validator(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output=Path(folder)/'templates.json'
+            self.run_control('provider-template-tests.ps1','-OutputFile',str(output))
+            data=output.read_bytes()
+        self.assertNotIn(b'PRIVATE_SENTINEL',data);self.assertNotIn(b'urn:private',data)
+        records=json.loads(data);seen=set()
+        self.assertEqual(len(records),55)
+        for record in records:
+            value=record['template'];seen.update(value['reasons'])
+            with self.subTest(case=record['name']):
+                with self.assertRaises(ValueError):receipt.template(copy.deepcopy(value),1)
+                if value['utf16CodeUnits'] is not None and value['utf16CodeUnits']>32768:
+                    # The reader never retains an oversized template; receipts cannot carry one.
+                    self.assertEqual(value['reasons'],['size-limit'])
+                    with self.assertRaises(ValueError):receipt.template(value,2)
+                else:receipt.template(value,2)
+        self.assertEqual(seen,receipt.REASONS|receipt.TERMINAL_REASONS['invalid']|receipt.TERMINAL_REASONS['limit'])
+
+    def test_typed_encoder_outputs_satisfy_the_v2_decoders(self):
+        with tempfile.TemporaryDirectory() as folder:
+            collectors=Path(folder)/'collectors.json';probes=Path(folder)/'probes.json'
+            self.run_control('provider-public-tests.ps1','-OutputFile',str(collectors),'-ProbeOutputFile',str(probes))
+            collector_records=json.loads(collectors.read_bytes());probe_records=json.loads(probes.read_bytes())
+        kinds=set()
+        for record in collector_records:
+            payload=base64.b64decode(record['payloadBase64'])
+            self.assertNotIn(b'PRIVATE_SENTINEL',payload)
+            if not payload:
+                kinds.add('withheld');self.assertEqual(record['exitCode'],1);continue
+            value=receipt.decode_output(payload,2);receipt.validate_exit(value,record['exitCode'],2)
+            if 'kind' in value:kinds.add('export-failure');receipt.decode_output(payload,1)
+            elif value['events']:
+                kinds.add('collector')
+                with self.assertRaises(ValueError):receipt.decode_output(payload,1)
+            else:
+                # No template, so nothing distinguishes the versions here: the
+                # envelope's schemaVersion, never key presence, selects one.
+                kinds.add('empty-collector');receipt.decode_output(payload,1)
+        self.assertEqual(kinds,{'collector','empty-collector','export-failure','withheld'})
+        private=[base64.b64decode(r['payloadBase64']) for r in collector_records if b'reasons' in base64.b64decode(r['payloadBase64'])]
+        self.assertIn(['field-name','field-type'],[json.loads(p)['events'][0]['template']['reasons'] for p in private])
+        normal=0
+        for record in probe_records:
+            payload=base64.b64decode(record['payloadBase64'])
+            self.assertNotIn(b'PRIVATE_SENTINEL',payload)
+            wire=parse_probe(payload);self.assertEqual(wire['schemaVersion'],'coven.kernel-file-probe.v2')
+            validate_probe(wire,source(),host())
+            value={'schemaVersion':'coven.kernel-file-metadata.v2','captureAttempted':False,'metadataComplete':False,
+                   'source':source(),'host':host(),'query':query_for(payload,record['exitCode']),'collector':wire['collector']}
+            validate_envelope(value,source(),host(),payload,PHASE_SOURCE)
+            v1=copy.deepcopy(value);v1['schemaVersion']='coven.kernel-file-metadata.v1'
+            with self.assertRaises(ValueError):validate_envelope(v1,source(),host(),payload,PHASE_SOURCE)
+            normal+='kind' not in wire['collector']
+        self.assertGreaterEqual(normal,3)
 
 
 if __name__=='__main__':unittest.main()
