@@ -5773,6 +5773,8 @@ struct StartupStore {
     conn: Option<rusqlite::Connection>,
     observer: StartupCheckpointObserver,
     coven_home: PathBuf,
+    /// The store's Ward-audit WAL limit, read at startup.
+    wal_limit_bytes: u64,
 }
 
 impl StartupStore {
@@ -5788,7 +5790,20 @@ impl StartupStore {
         self.close_after_readiness_with(|| {});
     }
 
-    fn close_after_readiness_with(self, before_close: impl FnOnce() + Send + 'static) {
+    fn close_after_readiness_with(mut self, before_close: impl FnOnce() + Send + 'static) {
+        // Ward-audit admission truncates a WAL past its limit before admitting a
+        // write, and that truncate fails while this checkpoint runs. A WAL
+        // already past the limit, as a large migration can leave, is therefore
+        // checkpointed here, before the accept loop serves requests, as startup
+        // did before #1227.
+        let wal = self.coven_home.join("coven.sqlite3-wal");
+        if std::fs::metadata(&wal).map_or(0, |metadata| metadata.len()) >= self.wal_limit_bytes {
+            before_close();
+            if let Err(error) = self.close_now() {
+                append_daemon_recovery_log(&self.coven_home, &format!("{error:#}"));
+            }
+            return;
+        }
         let coven_home = self.coven_home.clone();
         let spawned = std::thread::Builder::new()
             .name("coven-startup-store-close".to_owned())
@@ -5807,7 +5822,7 @@ impl StartupStore {
             // which closed the connection on this thread.
             append_daemon_recovery_log(
                 &coven_home,
-                &format!("startup store closed before readiness: no close thread: {error}"),
+                &format!("startup store closed on the accept thread: no close thread: {error}"),
             );
         }
     }
@@ -5833,10 +5848,20 @@ fn initialize_daemon_store(coven_home: &Path) -> Result<StartupStore> {
     let conn = initialize_daemon_store_with_observer(coven_home, |phase| {
         observer.append(coven_home, phase);
     })?;
+    let wal_limit_bytes = conn
+        .query_row(
+            "SELECT wal_limit_bytes FROM coven_ward_audit_capacity WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .and_then(|limit| u64::try_from(limit).ok())
+        .unwrap_or(crate::store::WARD_AUDIT_WAL_LIMIT_BYTES);
     Ok(StartupStore {
         conn: Some(conn),
         observer,
         coven_home: coven_home.to_path_buf(),
+        wal_limit_bytes,
     })
 }
 
@@ -5879,6 +5904,12 @@ fn initialize_daemon_store_with_observer(
         }
     }
     observe(StartupCheckpoint::StorageHealthReturned);
+    // Writable connections commit with `synchronous = NORMAL`, so a commit is
+    // on disk only once the WAL is synced. The checkpoint that used to run
+    // here did that before readiness; it now runs after readiness, so sync the
+    // WAL itself. What readiness exposes, such as a fresh home's hub identity,
+    // then survives an OS crash or power loss, without the page copy.
+    crate::store::sync_wal(&store_path)?;
     Ok(conn)
 }
 
@@ -16714,7 +16745,18 @@ mod tests {
         caller
             .recv_timeout(Duration::from_secs(60))
             .context("closing the startup store after readiness blocked its caller")?;
-        assert!(wal.exists(), "the held close checkpointed anyway");
+        let path = home.path().join("coven.sqlite3");
+        let held_size = std::fs::metadata(&path)?.len();
+        let (page_size, page_count) = {
+            let reader = crate::store::open_initialized_store(&path)?;
+            let page_size: i64 = reader.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+            let page_count: i64 = reader.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+            (page_size, page_count)
+        };
+        assert!(
+            held_size < u64::try_from(page_size * page_count)?,
+            "the held close checkpointed anyway: {held_size} bytes"
+        );
         assert!(!phases().iter().any(|phase| phase == "store-close-begin"));
 
         release.send(()).expect("close thread waits for release");
@@ -16763,6 +16805,32 @@ mod tests {
         );
         assert_eq!(after, full, "main file was not backfilled");
         drop(request);
+        Ok(())
+    }
+
+    #[test]
+    fn a_startup_wal_past_the_ward_audit_limit_closes_before_serving() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let mut store = initialize_daemon_store(home.path())?;
+        assert_eq!(
+            store.wal_limit_bytes,
+            crate::store::WARD_AUDIT_WAL_LIMIT_BYTES
+        );
+        // Any initialization WAL exceeds a one-byte limit.
+        store.wal_limit_bytes = 1;
+        store.close_after_readiness_with(|| {});
+        // No thread to wait for: the close completed before this returned.
+        let log = std::fs::read_to_string(daemon_recovery_log_path(home.path()))?;
+        let phases: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once("startup_checkpoint phase="))
+            .map(|(_, rest)| rest.split(' ').next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            phases[phases.len() - 2..],
+            ["store-close-begin", "daemon-store-end"]
+        );
+        assert!(!home.path().join("coven.sqlite3-wal").exists());
         Ok(())
     }
 

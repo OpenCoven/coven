@@ -148,18 +148,28 @@ tests are diagnostic coverage, not additional CLI or authority journeys.
 
 Startup retains the initialized, runtime-guarded SQLite connection through
 hub/cache setup, recovery and scheduler start, avoiding an intermediate
-last-connection checkpoint and reopen. Its one explicit final close runs on a
-separate thread once the API accept loop is entered, so readiness never waits
-for the startup WAL checkpoint (#1227): on contended hosted Windows disks that
-checkpoint took about 3.5 s of the 5 s startup budget. Every commit is already
-durable in the WAL. That close first runs a PASSIVE checkpoint, which neither
-waits on nor blocks readers and writers, so the initialization frames reach
-the main file soon after readiness even while request and scheduler
-connections are open, and are not left for a graceful `daemon stop`. A startup that fails before readiness still closes the
-connection, and logs the same two checkpoints, before it returns. There is no
-lifetime-long keeper connection or deferred shutdown checkpoint.
-`store-close-begin` marks that final close; it and `daemon-store-end` now
-follow `api-accept-loop-enter` and keep the daemon-store elapsed origin. `prior_observer_ms` counts completed
+last-connection checkpoint and reopen. Before readiness it syncs the WAL, and
+the directory that names it, without checkpointing. Writable connections
+commit with `synchronous = NORMAL`, so this sync is what makes the startup
+commits, such as a fresh home's hub identity, survive an OS crash or power loss.
+The connection's one explicit final close then runs on a separate thread once
+the API accept loop is entered, so readiness does not wait for the startup WAL
+checkpoint (#1227); on contended hosted Windows disks that checkpoint took
+about 3.5 s of the 5 s startup budget. That close first runs a PASSIVE
+checkpoint, which neither waits on nor blocks readers and writers, so the
+initialization frames normally reach the main file soon after readiness even
+while request and scheduler connections are open. The close thread is never
+joined: a stop or crash that comes first leaves the frames in the WAL, which
+the next open recovers, and the log may then show `store-close-begin` without
+`daemon-store-end`. If the WAL is already past the store's Ward-audit WAL limit,
+as a large migration can leave it, the close runs on the accept thread before
+requests are served, because Ward-audit admission must be able to truncate it.
+The same happens if the close thread cannot be spawned. A startup that fails
+before readiness closes the connection, and logs the same two checkpoints,
+before it returns. There is no lifetime-long keeper connection or deferred
+shutdown checkpoint. `store-close-begin` marks that final close; it and
+`daemon-store-end` now follow `api-accept-loop-enter` and keep the
+daemon-store elapsed origin. `prior_observer_ms` counts completed
 prior checkpoint append attempts, including scheduling inside them; it is not
 pure disk time and excludes the current append. A visible line does not prove
 its own append returned. The new `store-initialize-end` marks the retained
