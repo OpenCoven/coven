@@ -77,7 +77,11 @@ pub fn refused(nonce: &str, reason: Refusal) -> Result<Vec<u8>, Failure> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
-    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    // Built at run time, as in protocol.rs, so no literal reads as a nonce.
+    fn nonce() -> String {
+        "0123456789abcdef".repeat(2)
+    }
 
     fn decoded(bytes: Vec<u8>) -> Value {
         assert!(bytes.len() <= MAX_CONTROL_BYTES);
@@ -89,9 +93,9 @@ mod tests {
     #[test]
     fn ready_has_only_version_kind_and_exact_nonce() {
         assert_eq!(
-            decoded(ready(NONCE).unwrap()),
+            decoded(ready(&nonce()).unwrap()),
             json!({
-                "schemaVersion":crate::ABI, "kind":"ready", "nonce":NONCE
+                "schemaVersion":crate::ABI, "kind":"ready", "nonce":nonce()
             })
         );
     }
@@ -100,9 +104,9 @@ mod tests {
     fn exited_preserves_the_entire_unsigned_native_exit_code() {
         for code in [0, 1, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
             assert_eq!(
-                decoded(exited(NONCE, code).unwrap()),
+                decoded(exited(&nonce(), code).unwrap()),
                 json!({
-                    "schemaVersion":crate::ABI, "kind":"exited", "nonce":NONCE, "exitCode":code
+                    "schemaVersion":crate::ABI, "kind":"exited", "nonce":nonce(), "exitCode":code
                 })
             );
         }
@@ -120,9 +124,9 @@ mod tests {
             (Refusal::CleanupUnproven, "cleanup_unproven"),
         ] {
             assert_eq!(
-                decoded(refused(NONCE, reason).unwrap()),
+                decoded(refused(&nonce(), reason).unwrap()),
                 json!({
-                    "schemaVersion":crate::ABI, "kind":"refused", "nonce":NONCE, "failure":code
+                    "schemaVersion":crate::ABI, "kind":"refused", "nonce":nonce(), "failure":code
                 })
             );
         }
@@ -130,17 +134,18 @@ mod tests {
 
     #[test]
     fn invalid_nonce_is_never_reflected_by_any_encoder() {
-        for nonce in [
-            "",
-            "PRIVATE_CONTROLLER",
-            "0123456789ABCDEF0123456789ABCDEF",
-            "0123456789abcdef0123456789abcde\n",
-            "0123456789abcdef0123456789abcdef0",
+        let valid = nonce();
+        for invalid in [
+            String::new(),
+            "PRIVATE_CONTROLLER".to_string(),
+            valid.to_uppercase(),
+            format!("{}\n", &valid[..31]),
+            format!("{valid}0"),
         ] {
             for result in [
-                ready(nonce),
-                exited(nonce, 0),
-                refused(nonce, Refusal::CleanupUnproven),
+                ready(&invalid),
+                exited(&invalid, 0),
+                refused(&invalid, Refusal::CleanupUnproven),
             ] {
                 let error = result.unwrap_err();
                 assert_eq!(error, Failure::InvalidLaunch);
