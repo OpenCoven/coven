@@ -20,7 +20,7 @@ silently performs another.
 | Enroll a device through a trusted device | adds one device and grant | N named introducers, each with fresh step-up | `device_introduced` | owner root, policy, familiars |
 | **Recover access** | adds one device and grant | owner-root signature over the exact request | `access_recovered` | owner root, policy, other devices, familiars |
 | Rotate or replace a device | moves a grant to an already-paired device | local owner (`coven device rotate`) | `device_authorization_reenrolled` | owner root, policy, familiars |
-| Rotate the owner root | replaces the root key in the policy chain | old *and* new root keys (#788 slice 4b) | `owner_root_rotated` | devices, grants, familiars |
+| Rotate the owner root | replaces the root key in the policy chain | old *and* new root keys | `owner_root_rotated` | policy, devices, grants, familiars |
 | Rotate a familiar identity | — | no such operation exists | — | — |
 
 ## Recovering access
@@ -72,6 +72,37 @@ audited as its own event.
 field, plus what recovery will *not* do. It signs only after the owner types
 `recover`. The root key must be the installed one and must live outside
 `COVEN_HOME`.
+
+## Rotating the owner root
+
+`OwnerPolicyStore::rotate_root` appends one chain revision that keeps the
+exact current policy and changes only the owner-root key. The outgoing key
+signs for succession, and the incoming key signs to prove possession. Both
+sign the same `COVEN-ACTION/1` intent, with operation `owner.root.rotate`
+and the new record's digest, which binds the incoming key. A signature for
+one successor therefore can never install another.
+
+The rotation is refused if it:
+
+- does not extend the current head
+- keeps the same key
+- changes the policy
+- lacks either signature
+- falls outside its validity window (at most 300 seconds)
+
+The stored head re-verifies both signatures on every load, so editing in a
+different incoming key is refused. Success is audited as
+`owner_root_rotated`; failure as `owner_root_rotation_rejected`.
+
+After rotation, the old key approves nothing. Every signature bound to the
+old head digest is retired, including unused access-recovery approvals.
+Devices, grants and familiars are unchanged.
+
+`coven device owner-root rotate --root-key OLD --new-root-key NEW` prints both
+key fingerprints and every signed field, and signs only after the owner types
+`rotate`. A lost root key cannot be rotated. Recovering from that is an
+explicit owner trust-domain reset: remove `mobile/introduction-policy.json`
+and install a new policy. This is never automatic.
 
 ## Why a compromised service cannot recover access
 
