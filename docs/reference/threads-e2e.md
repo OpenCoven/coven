@@ -147,10 +147,18 @@ command result, and reports missing or delayed data explicitly. Its six helper
 tests are diagnostic coverage, not additional CLI or authority journeys.
 
 Startup retains the initialized, runtime-guarded SQLite connection through
-hub/cache setup, avoiding an intermediate last-connection checkpoint and
-reopen. Its one explicit final close still completes before readiness. There
-is no lifetime-long keeper connection or deferred shutdown checkpoint.
-`store-close-begin` marks that final close. `prior_observer_ms` counts completed
+hub/cache setup, recovery and scheduler start, avoiding an intermediate
+last-connection checkpoint and reopen. Its one explicit final close runs on a
+separate thread once the API accept loop is entered, so readiness never waits
+for the startup WAL checkpoint (#1227): on contended hosted Windows disks that
+checkpoint took about 3.5 s of the 5 s startup budget. Every commit is already
+durable in the WAL; if a request connection is open when the startup
+connection closes, SQLite leaves the checkpoint to the last connection that
+closes later. A startup that fails before readiness still closes the
+connection, and logs the same two checkpoints, before it returns. There is no
+lifetime-long keeper connection or deferred shutdown checkpoint.
+`store-close-begin` marks that final close; it and `daemon-store-end` now
+follow `api-accept-loop-enter` and keep the daemon-store elapsed origin. `prior_observer_ms` counts completed
 prior checkpoint append attempts, including scheduling inside them; it is not
 pure disk time and excludes the current append. A visible line does not prove
 its own append returned. The new `store-initialize-end` marks the retained
