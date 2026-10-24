@@ -207,4 +207,96 @@ foreach ($budget in @(-1,2049)) {
     try { $null=[CovenKernelTemplate]::Project($valid,$budget) } catch { $refused=$true }
     if (-not $refused) { throw 'Field budget precondition lost' }
 }
+
+# Rejection reasons: the frozen closed codes of the branches each projection
+# executed (docs/superpowers/plans/2026-10-24-provider-template-rejection-reasons.md).
+$NonTerminalReasons=[string[]]@('child-element','data-namespace','field-attribute','field-count','field-duplicate','field-length','field-name','field-type','nested-element','root-attribute','root-content','root-name','root-namespace','text','win-namespace')
+$TerminalReasons=@{invalid=[string[]]@('utf16-invalid','xml-invalid');limit=[string[]]@('depth-limit','field-budget','field-limit','node-limit','size-limit')}
+$TemplateReasons=[ordered]@{
+    'supported-two'=''
+    'unknown-name-and-type'='field-name,field-type'
+    'literal-cardinality'=''
+    'cardinality-bounds'='field-count,field-length'
+    'dynamic-count'='field-count'
+    'dynamic-length'='field-length'
+    'struct-nesting'='child-element,nested-element'
+    'userdata-text'='child-element,text'
+    'wrong-root-text'='root-name,text'
+    'wrong-root-and-namespace'='root-name'
+    'wrong-root-with-data'='root-content,root-name'
+    'root-namespace'='root-content,root-namespace'
+    'root-tid'=''
+    'root-attribute'='root-attribute'
+    'root-namespaced-attribute'='root-attribute'
+    'duplicate'='field-duplicate'
+    'unknown-type-then-known-type-same-name'='field-type'
+    'unknown-name-repeated'='field-name'
+    'conflicting-binding-then-duplicate'='field-duplicate,win-namespace'
+    'root-conflicting-binding'='win-namespace'
+    'field-conflicting-binding'='win-namespace'
+    'manifest-binding'=''
+    'multiple-defects'='field-attribute,field-count,field-length,field-name,field-type'
+    'field-extra-attribute'='field-attribute'
+    'field-namespaced-attribute'='field-attribute'
+    'empty-data'='field-name,field-type'
+    'data-namespace'='data-namespace'
+    'nested-in-data'='nested-element'
+    'nested-in-unsupported-data'='field-name,nested-element'
+    'text-in-data'='text'
+    'nested-then-text-in-data'='nested-element,text'
+    'text-after-data-end'='text'
+    'text-before-data'='text'
+    'cdata'='text'
+    'whitespace-comments-pi'=''
+    'all-twelve'='child-element,data-namespace,field-attribute,field-count,field-duplicate,field-length,field-name,field-type,nested-element,root-attribute,text,win-namespace'
+    'invalid-xml'='xml-invalid'
+    'dtd'='xml-invalid'
+    'second-root'='xml-invalid'
+    'unpaired-surrogate'='utf16-invalid'
+    'empty'=''
+    'missing'=''
+    'size-limit'='size-limit'
+    'size-boundary'=''
+    'field-limit-after-reasons'='field-limit'
+    'field-limit-boundary'='field-duplicate'
+    'field-limit-before-budget'='field-limit'
+    'field-budget'='field-budget'
+    'field-budget-zero'='field-budget'
+    'field-budget-boundary'='field-duplicate'
+    'depth-limit-after-reasons'='depth-limit'
+    'depth-boundary'='child-element,nested-element'
+    'node-limit-comments'='node-limit'
+    'node-limit-before-depth'='node-limit'
+    'depth-limit-at-node-boundary'='depth-limit'
+}
+function Assert-TemplateReasons($Views) {
+    $observed=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($name in $TemplateReasons.Keys) {
+        $result=$Views[$name].Result
+        if ($null -eq $result.Reasons) { throw "Projection has no reasons member: $name" }
+        $codes=[string[]]@($result.Reasons)
+        $actual=$codes -join ','
+        if ($actual -cne $TemplateReasons[$name]) { throw ('Unexpected rejection reasons: case={0} expected={1} actual={2}' -f $name,$TemplateReasons[$name],$actual) }
+        $canonical=[string[]]@([Linq.Enumerable]::Distinct($codes,[StringComparer]::Ordinal))
+        [Array]::Sort($canonical,[StringComparer]::Ordinal)
+        if (($canonical -join ',') -cne $actual) { throw "Rejection reasons are not canonical: $name" }
+        foreach ($code in $codes) { $observed.Add($code) | Out-Null }
+        switch -CaseSensitive ($result.Status) {
+            'unsupported' {
+                if ($codes.Count -lt 1 -or $codes.Count -gt 12 -or @($codes | Where-Object { $_ -cnotin $NonTerminalReasons }).Count -ne 0) { throw "Unsupported reasons out of bounds: $name" }
+            }
+            { $_ -cin @('invalid','limit') } {
+                if ($codes.Count -ne 1 -or $codes[0] -cnotin $TerminalReasons[$_]) { throw "Terminal projection kept other reasons: $name" }
+            }
+            default { if ($codes.Count -ne 0) { throw "Accepted projection carries reasons: $name" } }
+        }
+    }
+    $closed=@($NonTerminalReasons)+@($TerminalReasons.invalid)+@($TerminalReasons.limit)
+    if ($closed.Count -ne 22 -or $observed.Count -ne 22 -or @($closed | Where-Object { -not $observed.Contains($_) }).Count -ne 0) { throw 'A frozen rejection reason has no discriminating case' }
+}
+if ($TemplateReasons.Count -ne $TemplateCorpus.Count) { throw 'Reason expectations and corpus drifted' }
+Assert-TemplateReasons $corpusViews
+if ($corpusViews['all-twelve'].Result.Reasons.Count -ne 12) { throw 'Maximum reason cardinality control lost' }
+# UnsupportedCount is not reason cardinality.
+if ($corpusViews['unknown-name-repeated'].Result.UnsupportedCount -ne 2 -or $corpusViews['unknown-name-repeated'].Result.Reasons.Count -ne 1) { throw 'Reason cardinality replaced the unsupported count' }
 'provider template controlled privacy/bounds PASS (no native API invocation)'

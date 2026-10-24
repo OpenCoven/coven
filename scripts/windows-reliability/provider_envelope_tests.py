@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 import unittest
 from provider_schema_receipt import validate_probe, validate_envelope, parse_probe
-from provider_schema_receipt_tests import valid
+from provider_schema_receipt_tests import valid, valid_v2
 
 PHASE_SOURCE=Path(__file__).with_name('public_receipt.py').read_bytes()
 IDS=sorted('workflow runner probe binding binding-tests reader template public-encoder metadata-tests controlled-api template-tests adapter-tests encoder-tests controlled-encoder query-helper query-summary source-stability phase-validator validator validator-tests envelope-tests'.split())
@@ -28,13 +28,24 @@ def host():
             'nativeLibraryKind':'wevtapi-system32','nativeLibrarySha256':'4'*64,'beforeAfterMatch':True}
 
 
-def probe():
-    return {'schemaVersion':'coven.kernel-file-probe.v1','captureAttempted':False,'metadataComplete':False,
-            'source':source(),'host':host(),'collector':valid()}
+def probe(version=1):
+    return {'schemaVersion':f'coven.kernel-file-probe.v{version}','captureAttempted':False,'metadataComplete':False,
+            'source':source(),'host':host(),'collector':valid() if version==1 else valid_v2()}
 
 
-def envelope():
-    wire=probe();encoded=json.dumps(wire,separators=(',',':')).encode()
+def query_for(encoded,exit_code=0):
+    names=('startCallEnteredTicks startCallReturnedTicks stdinCloseEnteredTicks stdinCloseReturnedTicks readerSetupEnteredTicks readerSetupReturnedTicks monitorEnteredTicks timeoutObservedTicks cleanupEnteredTicks killCallEnteredTicks killCallReturnedTicks rootWaitEnteredTicks rootWaitReturnedTicks initialReaderWaitEnteredTicks initialReaderWaitReturnedTicks fallbackReaderWaitEnteredTicks fallbackReaderWaitReturnedTicks readerDisposalAttemptsEnteredTicks readerDisposalAttemptsFinishedTicks cleanupFinishedTicks').split()
+    phases={'unit':'stopwatch-elapsed-ticks','frequency':1000,**dict.fromkeys(names)}
+    present=[n for n in names if n not in {'timeoutObservedTicks','killCallEnteredTicks','killCallReturnedTicks','fallbackReaderWaitEnteredTicks','fallbackReaderWaitReturnedTicks'}]
+    phases.update({name:i for i,name in enumerate(present)})
+    return {'kind':'kernel-file-metadata','stdoutDigestScope':'decoded-text-utf8','started':True,'timedOut':False,'outputLimited':False,
+            'rootExited':True,'readersSettled':True,'reaped':True,'exitCode':exit_code,'elapsedMs':20,'phases':phases,
+            'hasFailure':False,'hasCleanupFailure':False,'hasReaderFailure':False,'stdoutChars':len(encoded),'stderrChars':0,
+            'stdoutSha256':hashlib.sha256(encoded).hexdigest(),'stderrSha256':hashlib.sha256(b'').hexdigest()}
+
+
+def envelope(version=1):
+    wire=probe(version);encoded=json.dumps(wire,separators=(',',':')).encode()
     names=('startCallEnteredTicks startCallReturnedTicks stdinCloseEnteredTicks stdinCloseReturnedTicks readerSetupEnteredTicks readerSetupReturnedTicks monitorEnteredTicks timeoutObservedTicks cleanupEnteredTicks killCallEnteredTicks killCallReturnedTicks rootWaitEnteredTicks rootWaitReturnedTicks initialReaderWaitEnteredTicks initialReaderWaitReturnedTicks fallbackReaderWaitEnteredTicks fallbackReaderWaitReturnedTicks readerDisposalAttemptsEnteredTicks readerDisposalAttemptsFinishedTicks cleanupFinishedTicks').split()
     phases={'unit':'stopwatch-elapsed-ticks','frequency':1000,**dict.fromkeys(names)}
     present=[n for n in names if n not in {'timeoutObservedTicks','killCallEnteredTicks','killCallReturnedTicks','fallbackReaderWaitEnteredTicks','fallbackReaderWaitReturnedTicks'}]
@@ -43,7 +54,7 @@ def envelope():
            'rootExited':True,'readersSettled':True,'reaped':True,'exitCode':0,'elapsedMs':20,'phases':phases,
            'hasFailure':False,'hasCleanupFailure':False,'hasReaderFailure':False,'stdoutChars':len(encoded),'stderrChars':0,
            'stdoutSha256':hashlib.sha256(encoded).hexdigest(),'stderrSha256':hashlib.sha256(b'').hexdigest()}
-    return {'schemaVersion':'coven.kernel-file-metadata.v1','captureAttempted':False,'metadataComplete':False,
+    return {'schemaVersion':f'coven.kernel-file-metadata.v{version}','captureAttempted':False,'metadataComplete':False,
             'source':source(),'host':host(),'query':query,'collector':wire['collector']},encoded
 
 
@@ -324,5 +335,50 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaises(ValueError):parse_probe(b' '*524289)
         with self.assertRaises(ValueError):parse_probe(b'{"schemaVersion":1,"schemaVersion":2}')
         with self.assertRaises(ValueError):parse_probe(b'\xef\xbb\xbf{}')
+
+class VersionedEnvelopeTests(unittest.TestCase):
+    def test_v2_probe_and_envelope_validate(self):
+        validate_probe(probe(2),source(),host())
+        validate_probe(parse_probe(json.dumps(probe(2)).encode()),source(),host())
+        value,wire=envelope(2);validate_envelope(value,source(),host(),wire,PHASE_SOURCE)
+
+    def test_versions_are_selected_only_by_exact_schema(self):
+        mixed=probe(1);mixed['collector']=valid_v2()
+        bare=probe(2);bare['collector']=valid()
+        for value in [mixed,bare]:
+            with self.assertRaises(ValueError):parse_probe(json.dumps(value).encode())
+        for schema in ['coven.kernel-file-probe.v3','coven.kernel-file-probe.V2','coven.kernel-file-metadata.v2',['coven.kernel-file-probe.v2'],None,2]:
+            value=probe(2);value['schemaVersion']=schema
+            with self.subTest(schema=schema):
+                with self.assertRaises(ValueError):parse_probe(json.dumps(value).encode())
+        for metadata,wire_version in [(1,2),(2,1)]:
+            value,unused=envelope(metadata);raw=json.dumps(probe(wire_version),separators=(',',':')).encode()
+            value['collector']=probe(wire_version)['collector'];value['query']=query_for(raw)
+            with self.subTest(metadata=metadata,wire=wire_version):
+                with self.assertRaises(ValueError):validate_envelope(value,source(),host(),raw,PHASE_SOURCE)
+        value,wire=envelope(2);value['schemaVersion']=['coven.kernel-file-metadata.v2']
+        with self.assertRaises(ValueError):validate_envelope(value,source(),host(),wire,PHASE_SOURCE)
+
+    def test_finalizer_keeps_the_decoded_probe_version(self):
+        for version in [1,2]:
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder).resolve();tree=root/'checkout';tree.mkdir()
+                expected=source()
+                for item in expected['files']:
+                    path=tree/receipt.SOURCE_PATHS[item['id']];path.parent.mkdir(parents=True,exist_ok=True)
+                    data=PHASE_SOURCE if item['id']=='phase-validator' else b'controlled source'
+                    path.write_bytes(data);item['sha256']=hashlib.sha256(data).hexdigest()
+                wire=probe(version);wire['source']=expected;raw=json.dumps(wire,separators=(',',':')).encode()
+                private=root/'coven-provider-probe-control'/'private';private.mkdir(parents=True)
+                bundle=private/'bundle.json'
+                bundle.write_bytes(json.dumps({'source':expected,'host':host(),'query':query_for(raw),'probe':raw.decode('ascii')}).encode())
+                out=root/'windows-reliability-provider-control'/'public';out.mkdir(parents=True)
+                with patch.object(receipt,'check_source_commit'):
+                    result,code=receipt.finalize_provider_bundle(bundle,root,out,tree)
+                published=json.loads((out/'receipt.json').read_bytes())
+                self.assertEqual(code,0);self.assertEqual(result['bytes'],(out/'receipt.json').stat().st_size)
+                self.assertEqual(published['schemaVersion'],f'coven.kernel-file-metadata.v{version}')
+                self.assertEqual('reasons' in published['collector']['events'][0]['template'],version==2)
+
 
 if __name__=='__main__':unittest.main()
