@@ -60,6 +60,7 @@ Changing any field under the same adoption key is `ADOPTION_REPLAY_MISMATCH`.
 | `task.prompt` | What the familiar is asked to do | 1 byte to 32 KiB |
 | `limits.timeoutMinutes` | Hard run timeout | 1–60 in M0 |
 | `validUntil` | Dispatch must **begin** before this instant | After `requestedAt`, at most 15 minutes later |
+| `scopes` (optional) | The project files and folders the familiar may read: 1–32 profile filesystem scopes, each `{ kind: "filesystem", root: "project", path, access: "read", recursive }`. Absent means none. | At submit, by the scoped read service's own rules (`Grants::from_scopes` under the R0 read policy), and each must be a `read` of the `project` root. See *Mission scopes*. |
 
 ## Commands
 
@@ -80,6 +81,15 @@ interface MissionSubmitPayload {
   task: { statement: string; prompt: string };
   limits: { timeoutMinutes: number };
   validUntil: Timestamp;
+  scopes?: MissionScope[];  // 1–32 when present; absent means none
+}
+
+interface MissionScope {
+  kind: "filesystem";
+  root: "project";
+  path: string;             // relative to the project root
+  access: "read";
+  recursive: boolean;
 }
 
 interface MissionSubmitResult {
@@ -123,6 +133,38 @@ interface MissionCancelResult {
   Events do not carry the mission state. Each one raises the view's `revision`,
   and the client reads the state with `mission.get`.
 
+## Mission scopes
+
+Decided by Val on 2026-10-20 (coven#857, decision 1): a mission says what the
+familiar may read with an optional `scopes` list of profile filesystem scopes
+on the project root. Implemented for #1597 as contract and storage only.
+Nothing reads the scopes yet, and a mission with scopes still settles
+`unavailable` / `authority_unavailable` without a launch.
+
+- **One rule set.** The daemon validates each scope with the scoped read
+  service's `Grants::from_scopes` under the R0 read policy, the rules the
+  service will enforce. That refuses a malformed or non-closed item, a
+  root-wide path (`.`, `/`, or a recursive scope on a single top-level
+  folder), an absolute or drive-qualified path, a path containing `..` or
+  `*`, and a spelling the service does not interpret.
+- **Narrower than the service.** The read service also accepts `workspace`
+  roots, `write` access and scope kinds that grant no filesystem access. A
+  mission binds only its project, so the submit also requires `kind:
+  "filesystem"`, `root: "project"` and `access: "read"`.
+- **Bounds.** At most 32 scopes (`maxItems`). An empty list is refused:
+  absent already means none, so a present list must name something.
+- **Refusals.** Every refusal is `VALIDATION_FAILED`, with a message naming
+  the item (`scopes[i]`) and the rule it breaks. As for every submit refusal,
+  it is adopted under its key and records no mission.
+- **Storage.** The validated list is stored as canonical JSON (RFC 8785) in
+  the mission row's `scopes_json` column and returned as `scopes` by every
+  mission view. A mission without scopes stores `NULL`, and its view has no
+  `scopes` key, exactly as before. The request digest covers the payload, so
+  the same adoption key with different scopes is `ADOPTION_REPLAY_MISMATCH`.
+- **Compatibility.** `missionSubmit` is a closed object, so a daemon from
+  before this field refuses it. SDK and Chat must not send `scopes` until a
+  daemon that accepts it is released (coordinated on sdk#80).
+
 ## Mission view and states
 
 ```ts
@@ -141,6 +183,7 @@ interface MissionView {
   familiar: { rootId: string; revisionId: string };
   envelope: { id: string; descriptorDigest: Digest };
   project: { cwd: string };
+  scopes?: MissionScope[];                // as submitted, canonical; absent when none
   task: { statement: string };            // the prompt is not echoed
   submittedAt: Timestamp;
   validUntil: Timestamp;
@@ -249,7 +292,7 @@ a clock and a transport, a command sequence produces exact responses and
 `MissionView` states. In the table, "the key" means the mission's adoption key.
 
 The `mission-commands` suite holds the vectors M0 can reach: M-01 to M-06,
-M-09, M-11 (a) and M-15. M-03 (c) commits a second mission, because M0's first
+M-09, M-11 (a), M-15, M-17 and M-18. M-03 (c) commits a second mission, because M0's first
 has already settled. M-07, M-08, M-10, M-12, M-13 and M-14 need a mission that
 launches, or one still queued, and wait for Runtime Authority (#857); unit
 tests hold M-08 with a mission kept queued. M-11 (b) is a client vector, and
@@ -273,6 +316,8 @@ M-16 is held by the transport authority tests.
 | M-14 | restart recovery | The client restarts during `running` and calls `mission.get` with the stored id | The same view and `revision`; the event cursor resumes or returns `CURSOR_EXPIRED` with a fresh view |
 | M-15 | bounds | The prompt is over 32 KiB, the timeout over 60, or `validUntil` more than 15 minutes out | `PAYLOAD_TOO_LARGE` or `VALIDATION_FAILED`, nothing created |
 | M-16 | transport | Any mission command over TCP | Refused before the store opens |
+| M-17 | read scopes | A submit names project read scopes; the client reads the mission, replays the submit, then reuses the key with other scopes | Committed with the scopes in the view, and `mission.get` returns them on the `unavailable` settlement. The replay is `replayed`; the changed scopes are `ADOPTION_REPLAY_MISMATCH`. |
+| M-18 | scope refusals | An empty or over-limit list, or a root-wide, absolute, `..`, glob, `workspace`-root, `write` or malformed scope | `VALIDATION_FAILED`, adopted, nothing created |
 
 ## Surfaces
 
@@ -348,7 +393,9 @@ what.
   create, activate and revise commands by CHECK constraint. Rather than widen
   that table with a migration, the immutable `automation_missions` row records
   the grant's evidence: the owner-local principal, the adoption key, the request
-  digest and `submittedAt`. Triggers refuse any update or delete of it.
+  digest and `submittedAt`. Triggers refuse any update or delete of it. Its
+  nullable `scopes_json` column is added by an idempotent migration, never by
+  the `CREATE TABLE`, so fresh and upgraded stores share one table form.
 - **No launch until Runtime Authority exists.** Production dispatch is still the
   base v1 path, which launches with ambient authority. M0 refuses to launch any
   mission until the R0 envelope is enforced (#857). Once the submit has
@@ -363,7 +410,8 @@ what.
   record that nothing launched. Once missions dispatch, a refusal at dispatch
   writes the runner's existing no-launch receipt.
 - **Validation order.** `validUntil` (in the future, at most 15 minutes ahead),
-  then the envelope (`r0-read.1` and its descriptor digest), then the project
+  then the envelope (`r0-read.1` and its descriptor digest), then `scopes`
+  (see *Mission scopes*), then the project
   directory (exists, canonical, not inside `COVEN_HOME`), then the familiar
   (unknown root `NOT_FOUND`; a revision that is not the root's active head
   `REVISION_CONFLICT` with `details.currentRevisionId`), then concurrency.

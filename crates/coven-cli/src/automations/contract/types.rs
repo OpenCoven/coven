@@ -2892,6 +2892,15 @@ pub struct MissionSubmitPayload {
     pub task: MissionTask,
     pub limits: MissionLimits,
     pub valid_until: Timestamp,
+    /// Profile filesystem scopes on the project root that the mission asks to
+    /// read (#1597). Kept as the submitted objects: the daemon validates them
+    /// with the scoped read service's own rules, and absent means none.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scopes: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -841,6 +841,844 @@
           }
         }
       ]
+    },
+    {
+      "caseId": "m17-a-mission-names-project-read-scopes",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m17",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/lib",
+                "access": "read",
+                "recursive": true
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "README.md",
+                "access": "read",
+                "recursive": false
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/lib",
+                "access": "read",
+                "recursive": true
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "README.md",
+                "access": "read",
+                "recursive": false
+              }
+            ]
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m17",
+          "expect": {
+            "outcome": "committed",
+            "state": "unavailable",
+            "reason": "authority_unavailable",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/lib",
+                "access": "read",
+                "recursive": true
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "README.md",
+                "access": "read",
+                "recursive": false
+              }
+            ]
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m17",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/lib",
+                "access": "read",
+                "recursive": true
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "README.md",
+                "access": "read",
+                "recursive": false
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "replayed",
+            "replays": 0
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m17",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/lib",
+                "access": "read",
+                "recursive": true
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "ADOPTION_REPLAY_MISMATCH",
+            "conflictOutcome": "committed",
+            "writes": "nothing"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m18-the-daemon-refuses-scopes-it-cannot-enforce",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-empty",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": []
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-over-limit",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-0.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-1.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-2.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-3.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-4.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-5.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-6.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-7.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-8.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-9.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-10.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-11.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-12.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-13.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-14.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-15.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-16.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-17.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-18.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-19.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-20.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-21.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-22.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-23.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-24.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-25.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-26.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-27.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-28.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-29.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-30.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-31.rs",
+                "access": "read",
+                "recursive": false
+              },
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/file-32.rs",
+                "access": "read",
+                "recursive": false
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-root-wide",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": ".",
+                "access": "read",
+                "recursive": true
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-top-level-subtree",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src",
+                "access": "read",
+                "recursive": true
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-absolute",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "/etc/passwd",
+                "access": "read",
+                "recursive": false
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-parent",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/../secrets/key.pem",
+                "access": "read",
+                "recursive": false
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-glob",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/*.rs",
+                "access": "read",
+                "recursive": false
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-workspace-root",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "workspace",
+                "path": "src/lib",
+                "access": "read",
+                "recursive": true
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-write",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/lib",
+                "access": "write",
+                "recursive": true
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m18-malformed",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}",
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "src/lib",
+                "access": "read"
+              }
+            ]
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "VALIDATION_FAILED",
+            "writes": "adoption"
+          }
+        }
+      ]
     }
   ]
 }

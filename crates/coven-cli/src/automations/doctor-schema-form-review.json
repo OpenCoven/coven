@@ -3,9 +3,9 @@
   "metadataRecipe": "coven.automations.doctor-schema-object.v1",
   "disposition": "review_only",
   "scope": "Known per-object forms; does not establish whole-schema compatibility, integrity, authority, or release eligibility.",
-  "sourceRevision": "1450f97f0a37bf734860eb529a76200f9b0770ee",
-  "sourceRevisionScope": "Base revision; capture helper and doctor changes are uncommitted worktree changes.",
-  "captureSha256": "ddd5d7854e77dddd69e988462082ec361c767fcdde636565cb6b3dbd37704dae",
+  "sourceRevision": "16847827f8629a8d7421777f72183ccff660cccf",
+  "sourceRevisionScope": "Base revision; the automation_missions scopes_json column (#1597) is an uncommitted worktree change.",
+  "captureSha256": "de51deccacc137b9381da24076a03f8b06fc45597960ec6f90708dc482a81f16",
   "captureTest": "automations::doctor::tests::capture_supported_schema_forms_from_production_initialization",
   "preparation": "Production initialize_store on fresh and historical fixture stores; no daemon or dispatcher.",
   "platformCoverage": "Local macOS capture only; other bundled SQLite versions and platforms remain unverified.",
@@ -113,7 +113,7 @@
         "sha256": "e28f69f319f9c6ac00390c7c560ff2d62c930f066c7289a984e32c85b4c0c918"
       },
       "table:automation_missions": {
-        "sha256": "8d8c42b605a28cc8605587025fa9e1be70bdad696b297e29c0a60dd26debfd59"
+        "sha256": "14adc41371ab4dafdd0276315b02c960defd2a72dce4cfaef349c0ee41a60317"
       },
       "table:automation_occurrences": {
         "sha256": "9d95240b2b615a9e4e85e8b8623216e342f8dec7cc47826a669e97845c9389ea"
@@ -334,7 +334,7 @@
         "sha256": "e28f69f319f9c6ac00390c7c560ff2d62c930f066c7289a984e32c85b4c0c918"
       },
       "table:automation_missions": {
-        "sha256": "8d8c42b605a28cc8605587025fa9e1be70bdad696b297e29c0a60dd26debfd59"
+        "sha256": "14adc41371ab4dafdd0276315b02c960defd2a72dce4cfaef349c0ee41a60317"
       },
       "table:automation_occurrences": {
         "sha256": "16993a118eab3e3a3cb6367eea0c5448eab1380fceb8255ff537de362f0ab299"
@@ -555,7 +555,7 @@
         "sha256": "e28f69f319f9c6ac00390c7c560ff2d62c930f066c7289a984e32c85b4c0c918"
       },
       "table:automation_missions": {
-        "sha256": "8d8c42b605a28cc8605587025fa9e1be70bdad696b297e29c0a60dd26debfd59"
+        "sha256": "14adc41371ab4dafdd0276315b02c960defd2a72dce4cfaef349c0ee41a60317"
       },
       "table:automation_occurrences": {
         "sha256": "130d6ef8dc1ed03cd6c7a88b1bb311cc5953d0eea333b9f1cf41a0db40044e3b"
@@ -776,7 +776,7 @@
         "sha256": "e28f69f319f9c6ac00390c7c560ff2d62c930f066c7289a984e32c85b4c0c918"
       },
       "table:automation_missions": {
-        "sha256": "8d8c42b605a28cc8605587025fa9e1be70bdad696b297e29c0a60dd26debfd59"
+        "sha256": "14adc41371ab4dafdd0276315b02c960defd2a72dce4cfaef349c0ee41a60317"
       },
       "table:automation_occurrences": {
         "sha256": "130d6ef8dc1ed03cd6c7a88b1bb311cc5953d0eea333b9f1cf41a0db40044e3b"
@@ -3267,7 +3267,7 @@
         ]
       ]
     },
-    "8d8c42b605a28cc8605587025fa9e1be70bdad696b297e29c0a60dd26debfd59": {
+    "14adc41371ab4dafdd0276315b02c960defd2a72dce4cfaef349c0ee41a60317": {
       "columns": [
         [
           0,
@@ -3412,6 +3412,15 @@
           null,
           0,
           0
+        ],
+        [
+          16,
+          "scopes_json",
+          "TEXT",
+          0,
+          null,
+          0,
+          0
         ]
       ],
       "definition": [
@@ -3419,7 +3428,7 @@
           "table",
           "automation_missions",
           "automation_missions",
-          "CREATE TABLE automation_missions (\n        mission_id TEXT PRIMARY KEY NOT NULL,\n        automation_id TEXT NOT NULL UNIQUE,\n        occurrence_id TEXT NOT NULL UNIQUE,\n        adoption_key TEXT NOT NULL UNIQUE,\n        request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),\n        authority TEXT NOT NULL CHECK (authority = 'owner_local'),\n        principal_id TEXT NOT NULL,\n        familiar_root_id TEXT NOT NULL,\n        familiar_revision_id TEXT NOT NULL,\n        envelope_id TEXT NOT NULL,\n        envelope_descriptor_digest TEXT NOT NULL CHECK (length(envelope_descriptor_digest) = 64),\n        project_cwd TEXT NOT NULL,\n        statement TEXT NOT NULL,\n        timeout_minutes INTEGER NOT NULL CHECK (timeout_minutes BETWEEN 1 AND 60),\n        submitted_at TEXT NOT NULL,\n        valid_until TEXT NOT NULL\n    )"
+          "CREATE TABLE automation_missions (\n        mission_id TEXT PRIMARY KEY NOT NULL,\n        automation_id TEXT NOT NULL UNIQUE,\n        occurrence_id TEXT NOT NULL UNIQUE,\n        adoption_key TEXT NOT NULL UNIQUE,\n        request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),\n        authority TEXT NOT NULL CHECK (authority = 'owner_local'),\n        principal_id TEXT NOT NULL,\n        familiar_root_id TEXT NOT NULL,\n        familiar_revision_id TEXT NOT NULL,\n        envelope_id TEXT NOT NULL,\n        envelope_descriptor_digest TEXT NOT NULL CHECK (length(envelope_descriptor_digest) = 64),\n        project_cwd TEXT NOT NULL,\n        statement TEXT NOT NULL,\n        timeout_minutes INTEGER NOT NULL CHECK (timeout_minutes BETWEEN 1 AND 60),\n        submitted_at TEXT NOT NULL,\n        valid_until TEXT NOT NULL\n    , scopes_json TEXT)"
         ]
       ],
       "foreignKeys": [],
@@ -3565,7 +3574,7 @@
           "main",
           "automation_missions",
           "table",
-          16,
+          17,
           0,
           0
         ]

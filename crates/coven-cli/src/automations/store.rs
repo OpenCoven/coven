@@ -44,6 +44,8 @@ pub const AUTOMATION_DEFINITIONS_SCHEMA_SQL: &str = "
 
     -- A mission's internal definition (see `missions`). The row marks the
     -- definition as not a routine, and records the one-run owner grant.
+    -- `scopes_json` is added by `ensure_mission_columns`, never here, so a
+    -- fresh store and one created before the column share one table form.
     CREATE TABLE IF NOT EXISTS automation_missions (
         mission_id TEXT PRIMARY KEY NOT NULL,
         automation_id TEXT NOT NULL UNIQUE,
@@ -157,6 +159,27 @@ pub(crate) fn ensure_definition_command_columns(conn: &Connection) -> Result<()>
             [],
         )
         .context("failed to add automation definition rich body column")?;
+    }
+    Ok(())
+}
+
+/// Adds the columns `automation_missions` gained after the table was created.
+/// Each is nullable: adding one rewrites no recorded mission, and a mission
+/// recorded before the column reads as one without the field.
+pub(crate) fn ensure_mission_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(automation_missions)")
+        .context("failed to inspect automation_missions schema")?
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to enumerate automation_missions columns")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read automation_missions columns")?;
+    if !columns.iter().any(|column| column == "scopes_json") {
+        conn.execute(
+            "ALTER TABLE automation_missions ADD COLUMN scopes_json TEXT",
+            [],
+        )
+        .context("failed to add automation mission scopes column")?;
     }
     Ok(())
 }
