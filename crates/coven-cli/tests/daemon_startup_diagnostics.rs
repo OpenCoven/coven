@@ -365,6 +365,19 @@ fn exercise_background_failure(action: &str) -> Result<()> {
         assert!(message.contains(expected), "missing {expected}: {message}");
     }
     assert!(!message.contains("192.168.1.10"), "{message}");
+    // The failure is reported only once the startup store is closed, so the
+    // corrected start below cannot meet this daemon still closing it.
+    let log = fs::read_to_string(home.join("daemon-recovery.log"))?;
+    let closed = log
+        .find("phase=daemon-store-end")
+        .context("startup store closed")?;
+    let reported = log
+        .find("startup_failure ")
+        .context("startup failure recorded")?;
+    assert!(
+        closed < reported,
+        "startup failure reported before its store closed"
+    );
 
     // Explicit operator correction, retaining the rejected file for recovery.
     let rejected = mobile.join("gateway.rejected.json");

@@ -5827,6 +5827,16 @@ impl StartupStore {
         }
     }
 
+    /// Closes the connection before a startup failure is recorded. The launching
+    /// CLI reports the failure as soon as it is recorded, and an operator can
+    /// start another daemon at once; that daemon must not find this one still
+    /// checkpointing under the serve lock and refuse to start.
+    fn close_before_reporting_failure(&mut self) {
+        if let Err(error) = self.close_now() {
+            append_daemon_recovery_log(&self.coven_home, &format!("{error:#}"));
+        }
+    }
+
     fn close_now(&mut self) -> Result<()> {
         let Some(conn) = self.conn.take() else {
             return Ok(());
@@ -5955,7 +5965,7 @@ pub fn serve_forever(
     // catching the wedged-but-alive incumbent the socket guard can't, and the
     // direct `daemon serve` path that bypasses ensure_background_server.
     let serve_lock = acquire_serve_lock(coven_home)?;
-    let startup_store = initialize_daemon_store(coven_home)?;
+    let mut startup_store = initialize_daemon_store(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -6035,7 +6045,10 @@ pub fn serve_forever(
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
     let mobile_gateway = crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)
-        .inspect_err(|error| startup_failure::record(coven_home, &status, error))?;
+        .inspect_err(|error| {
+            startup_store.close_before_reporting_failure();
+            startup_failure::record(coven_home, &status, error);
+        })?;
     startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     let (tcp_thread, active_tcp_connection) = if let Some(tcp_listener) = tcp_listener {
@@ -7203,7 +7216,7 @@ fn serve_forever_with_lifetime_job_installer(
     // Claim the pipe before mutating shared daemon/session state. A duplicate
     // daemon must fail at bind without replacing the incumbent's daemon.json
     // or marking sessions owned by that live daemon orphaned.
-    let startup_store = initialize_daemon_store(coven_home)?;
+    let mut startup_store = initialize_daemon_store(coven_home)?;
     write_startup_status(coven_home, &status)?;
     // Match the Unix runtime interval; status publication is not readiness.
     let mut startup = StartupCheckpointObserver::new(Instant::now());
@@ -7228,9 +7241,13 @@ fn serve_forever_with_lifetime_job_installer(
     let _automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
-    let _mobile_gateway =
-        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)
-            .inspect_err(|error| startup_failure::record(coven_home, &status, error))?;
+    let _mobile_gateway = crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(
+        coven_home,
+    )
+    .inspect_err(|error| {
+        startup_store.close_before_reporting_failure();
+        startup_failure::record(coven_home, &status, error);
+    })?;
     startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     const MAX_INFLIGHT: usize = 64;
