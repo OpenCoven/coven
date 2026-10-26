@@ -1110,11 +1110,11 @@ mod tests {
     use chrono::Duration;
     use p256::ecdsa::signature::{Signer, Verifier};
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
 
     fn public_key(seed: u8) -> String {
         let signing_key = p256::SecretKey::from_slice(&[seed; 32]).unwrap();
-        URL_SAFE_NO_PAD.encode(signing_key.public_key().to_encoded_point(false).as_bytes())
+        URL_SAFE_NO_PAD.encode(signing_key.public_key().to_sec1_point(false).as_bytes())
     }
 
     fn new_key(
@@ -1619,12 +1619,8 @@ mod tests {
         let now = DateTime::from_timestamp(1_785_326_400, 0).unwrap();
         let store = AssuranceChallengeStore::load(temp.path()).unwrap();
         let signing_key = SigningKey::from_slice(&[2; 32]).unwrap();
-        let public_key_x963 = URL_SAFE_NO_PAD.encode(
-            signing_key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes(),
-        );
+        let public_key_x963 =
+            URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_sec1_point(false).as_bytes());
         let key = DeviceAuthorizationKeyRecord {
             device_id: Uuid::from_u128(1),
             subject_key_id: authorization_key_id(&public_key_x963).unwrap(),

@@ -3930,16 +3930,20 @@ fn each_run_past_its_deadline_names_what_reconciliation_does_with_it() {
                 [Some("failed"), Some("recovery_required")],
             )
         },
+        // Reconciling an expired stopping cancellation holds the run for
+        // recovery before timeout enforcement reaches it.
         TimeoutShape {
+            name: "stopping-expired",
             extra: &[
                 LATE_CANCELLATION,
                 "UPDATE automation_cancellations SET state = 'stopping',
                      execution_expires_at = '2026-10-22T09:00:00.000Z';",
             ],
-            ..in_flight(
-                "stopping-expired",
-                [Some("recovery_required"), Some("recovery_required")],
-            )
+            code: WorkCode::CancellationExpired,
+            next_step: NextStep::AwaitCancellation,
+            deadline_at: None,
+            after: [Some("recovery_required"), Some("recovery_required")],
+            ..TIMED_OUT
         },
         TimeoutShape {
             name: "cancellation-rejected",
@@ -5119,6 +5123,810 @@ fn each_abandoned_launch_names_what_reconciliation_does_with_it() {
                 shape.deadline_at.map(str::to_string),
                 shape.after.map(|state| state.map(str::to_string)),
                 contained.map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(seen, expected);
+}
+
+/// A cancellation of the run under test's attempt 1, in `$state`, whose
+/// execution lease expired at 09:59:30.
+macro_rules! expired_cancellation {
+    ($state:literal) => {
+        concat!(
+            "INSERT INTO automation_cancellations
+                (adoption_key, request_digest, automation_id, run_id, attempt_id, session_id,
+                 scope, requested_by_json, reason, state, requested_at, execution_expires_at)
+             VALUES ('cancel-late', 'digest', 'daily', 'r-late', 'a-late-19', 's-late', 'run',
+                     '{\"principalId\":\"operator\"}', 'stop', '",
+            $state,
+            "', '2026-10-22T09:59:00.000Z', '2026-10-22T09:59:30.000Z');"
+        )
+    };
+}
+
+/// The stop fence a stopping cancellation holds, expired with it.
+const CANCELLATION_FENCE: &str = "
+    INSERT INTO automation_stop_fences
+        (run_id, session_id, owner, operation_key, acquired_at, execution_expires_at)
+    VALUES ('r-late', 's-late', 'cancellation', 'cancel-late', '2026-10-22T09:59:00.000Z',
+            '2026-10-22T09:59:30.000Z');";
+
+/// The occurrence, its run's latest attempt and the run's cancellation after
+/// the daemon's reconciliation at 10:00 with `runtime`, or `None` when the pass
+/// fails. A stop is claimed at the pass's own instant.
+fn cancellation_after_pass(
+    temp: &tempfile::TempDir,
+    conn: &Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+) -> Option<String> {
+    crate::automations::cancellation::set_stop_fence_clock_test_hook(Some(Box::new(now)));
+    let launch = launch_after_pass(temp, conn, runtime);
+    crate::automations::cancellation::set_stop_fence_clock_test_hook(None);
+    launch.map(|launch| {
+        let cancellation: Option<String> = conn
+            .query_row(
+                "SELECT state FROM automation_cancellations WHERE run_id = 'r-late'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        format!("{launch}/{}", cancellation.as_deref().unwrap_or("none"))
+    })
+}
+
+const CANCELLING: TimeoutShape = TimeoutShape {
+    name: "requested",
+    lease: Some("2099-01-01T00:00:00.000Z"),
+    deadline: None,
+    extra: &[expired_cancellation!("requested")],
+    code: WorkCode::CancellationExpired,
+    next_step: NextStep::AwaitCancellation,
+    deadline_at: None,
+    after: [
+        Some("cancelled/cancelled/cancelled"),
+        Some("recovery_required/ambiguous/recovery_required"),
+    ],
+    ..TIMED_OUT
+};
+
+/// A stopping cancellation, whose stop's outcome was never recorded.
+const STOPPING: TimeoutShape = TimeoutShape {
+    name: "stopping",
+    extra: &[expired_cancellation!("stopping"), CANCELLATION_FENCE],
+    after: [
+        Some("recovery_required/ambiguous/recovery_required"),
+        Some("recovery_required/ambiguous/recovery_required"),
+    ],
+    ..CANCELLING
+};
+
+/// What the daemon's reconciliation does with a run whose cancellation's
+/// execution lease has expired, one store per shape and runtime so that a
+/// failing pass hides nothing. Each shape gives the occurrence, the run's
+/// latest attempt and its cancellation after each pass.
+#[test]
+fn each_expired_cancellation_names_what_reconciliation_does_with_it() {
+    let in_flight = |name, after| TimeoutShape {
+        name,
+        code: WorkCode::InFlight,
+        next_step: NextStep::InspectOccurrence,
+        after,
+        ..CANCELLING
+    };
+    let held = Some("recovery_required/ambiguous/recovery_required");
+    let left = Some("claimed/started/requested");
+    let shapes = [
+        CANCELLING,
+        TimeoutShape {
+            name: "running",
+            occurrence: "running",
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "authority",
+            authority: true,
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [Some("recovery_required/started/recovery_required"), held],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "dispatching",
+            attempts: &[(1, "dispatching", false)],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "bound-dispatching",
+            attempts: &[(1, "dispatching", true)],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "observing",
+            attempts: &[(1, "observing", true)],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "deadline-ahead",
+            deadline: Some("2026-10-22T10:00:00.001Z"),
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "expiring-now",
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations
+                    SET execution_expires_at = '2026-10-22T10:00:00.000Z';",
+            ],
+            ..CANCELLING
+        },
+        // Reconciliation compares the expiry as stored text.
+        TimeoutShape {
+            name: "expiry-sorting-behind",
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations
+                    SET execution_expires_at = '2026-10-22T09:59:00-01:00';",
+            ],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations
+                    SET execution_expires_at = '2026-10-22T10:30:00+01:00';",
+            ],
+            ..in_flight("expiry-sorting-ahead", [left, left])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations
+                    SET execution_expires_at = '2026-10-22T10:00:00.001Z';",
+            ],
+            ..in_flight("expiry-ahead", [left, left])
+        },
+        TimeoutShape {
+            name: "requester-spaced",
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations
+                    SET requested_by_json = ' { \"principalId\" :\n \"operator\" } ';",
+            ],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "no-reason",
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET reason = NULL;",
+            ],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "requester-as-array",
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET requested_by_json = '[\"operator\"]';",
+            ],
+            ..CANCELLING
+        },
+        // Only this request's answer, a stop of this run and another running
+        // run on this occurrence keep it from being named.
+        TimeoutShape {
+            name: "other-request-answered",
+            extra: &[
+                expired_cancellation!("requested"),
+                "INSERT INTO automation_command_adoptions
+                    (adoption_key, request_digest, command, outcome, response_json,
+                     adopted_at)
+                 VALUES ('cancel-other', 'digest', 'run.cancel.v1', 'committed',
+                         '{\"result\":{}}', '2026-10-22T09:59:10.000Z');",
+            ],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "other-run-fenced",
+            extra: &[
+                expired_cancellation!("requested"),
+                OTHER_RUN,
+                OTHER_ATTEMPT,
+                "INSERT INTO automation_stop_fences
+                    (run_id, session_id, owner, acquired_at, execution_expires_at)
+                 VALUES ('r-other', 's-other', 'timeout', '2026-10-22T09:00:00.000Z',
+                         '2099-01-01T00:00:00.000Z');",
+            ],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "other-run-cancelled-first",
+            extra: &[
+                OTHER_RUN,
+                OTHER_ATTEMPT,
+                "INSERT INTO automation_cancellations
+                    (adoption_key, request_digest, automation_id, run_id, attempt_id,
+                     session_id, scope, requested_by_json, reason, state, requested_at,
+                     execution_expires_at)
+                 VALUES ('cancel-other', 'digest', 'daily', 'r-other', 'a-other', 's-other',
+                         'run', '{\"principalId\":\"operator\"}', 'stop', 'requested',
+                         '2026-10-22T09:59:00.000Z', '2026-10-22T09:59:30.000Z');",
+                expired_cancellation!("requested"),
+            ],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "settled-rival",
+            extra: &[
+                expired_cancellation!("requested"),
+                "INSERT INTO automation_runs
+                    (id, automation_id, occurrence_id, runtime, status, started_at,
+                     finished_at)
+                 VALUES ('r-stray', 'other', 'o-late', 'coven-code', 'failed',
+                         '2026-10-21T09:00:00.000Z', '2026-10-21T09:10:00.000Z');",
+            ],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "settled-session-sharer",
+            extra: &[
+                expired_cancellation!("requested"),
+                "INSERT INTO automation_runs
+                    (id, automation_id, occurrence_id, session_id, runtime, status,
+                     started_at, finished_at)
+                 VALUES ('r-stray', 'other', 'o-late', 's-late', 'coven-code', 'failed',
+                         '2026-10-21T09:00:00.000Z', '2026-10-21T09:10:00.000Z');",
+            ],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "authority-dispatching",
+            authority: true,
+            attempts: &[(1, "dispatching", false)],
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [Some("recovery_required/dispatching/recovery_required"), held],
+            ..CANCELLING
+        },
+        TimeoutShape {
+            name: "authority-observing",
+            authority: true,
+            attempts: &[(1, "observing", true)],
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [Some("recovery_required/observing/recovery_required"), held],
+            ..CANCELLING
+        },
+        STOPPING,
+        TimeoutShape {
+            name: "stopping-unfenced",
+            extra: &[expired_cancellation!("stopping")],
+            ..STOPPING
+        },
+        TimeoutShape {
+            name: "authority-stopping",
+            authority: true,
+            next_step: NextStep::AwaitRuntimeAuthority,
+            ..STOPPING
+        },
+        TimeoutShape {
+            name: "stopping-dispatching",
+            attempts: &[(1, "dispatching", false)],
+            ..STOPPING
+        },
+        // A stopping cancellation binds no dispatch, and does not claim a
+        // stop fence.
+        TimeoutShape {
+            name: "stopping-dispatch-beside-bound",
+            attempts: &[(1, "dispatching", false), (2, "ambiguous", true)],
+            ..STOPPING
+        },
+        TimeoutShape {
+            name: "stopping-timeout-fence",
+            extra: &[
+                expired_cancellation!("stopping"),
+                late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
+            ],
+            ..STOPPING
+        },
+        // A stopping cancellation does not compare its run's deadline, which
+        // reconciliation still parses whole.
+        TimeoutShape {
+            name: "stopping-past-deadline",
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            ..STOPPING
+        },
+        TimeoutShape {
+            name: "stopping-deadline-sorting-behind",
+            deadline: Some("2026-10-22T09:01:00-01:00"),
+            ..STOPPING
+        },
+        TimeoutShape {
+            deadline: Some("soon"),
+            extra: &[expired_cancellation!("stopping"), CANCELLATION_FENCE],
+            ..in_flight("stopping-deadline-unparseable", [None, None])
+        },
+        // A requested cancellation is rejected once its run's deadline has
+        // passed, and the stop it claims compares the deadline as text.
+        TimeoutShape {
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            ..in_flight(
+                "past-deadline",
+                [
+                    Some("failed/timed_out/rejected"),
+                    Some("recovery_required/ambiguous/rejected"),
+                ],
+            )
+        },
+        TimeoutShape {
+            deadline: Some("2026-10-22T10:00:00.000Z"),
+            ..in_flight(
+                "deadline-now",
+                [
+                    Some("failed/timed_out/rejected"),
+                    Some("recovery_required/ambiguous/rejected"),
+                ],
+            )
+        },
+        TimeoutShape {
+            deadline: Some("2026-10-22T09:01:00-01:00"),
+            ..in_flight("deadline-sorting-behind", [left, left])
+        },
+        TimeoutShape {
+            deadline: Some("2026-10-22T11:00:00+02:00"),
+            ..in_flight(
+                "deadline-sorting-ahead",
+                [
+                    Some("failed/timed_out/rejected"),
+                    Some("recovery_required/ambiguous/rejected"),
+                ],
+            )
+        },
+        TimeoutShape {
+            deadline: Some("soon"),
+            ..in_flight("deadline-unparseable", [None, None])
+        },
+        // Restart containment can act on a session that is not running first,
+        // and a finished one is settled from its own evidence.
+        TimeoutShape {
+            session: "created",
+            ..in_flight(
+                "created",
+                [
+                    Some("cancelled/cancelled/cancelled"),
+                    Some("recovery_required/ambiguous/recovery_required"),
+                ],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            ..in_flight(
+                "completed",
+                [Some("failed/failed/rejected"), Some("failed/failed/rejected")],
+            )
+        },
+        // The stop needs the targeted attempt to be the only one live on the
+        // run's session.
+        TimeoutShape {
+            attempts: &[(1, "ambiguous", true)],
+            ..in_flight(
+                "ambiguous",
+                [
+                    Some("claimed/ambiguous/recovery_required"),
+                    Some("claimed/ambiguous/recovery_required"),
+                ],
+            )
+        },
+        TimeoutShape {
+            attempts: &[(1, "started", true), (2, "dispatching", false)],
+            ..in_flight(
+                "two-live",
+                [None, Some("recovery_required/dispatching/recovery_required")],
+            )
+        },
+        TimeoutShape {
+            attempts: &[(1, "observing", true), (2, "dispatching", false)],
+            ..in_flight(
+                "observing-two-live",
+                [None, Some("recovery_required/dispatching/recovery_required")],
+            )
+        },
+        // Settling a plain run binds the dispatch to its session, which
+        // another attempt already holds.
+        TimeoutShape {
+            attempts: &[(1, "dispatching", false), (2, "ambiguous", true)],
+            ..in_flight("dispatch-beside-bound", [None, held])
+        },
+        TimeoutShape {
+            attempts: &[(1, "failed", true), (2, "dispatching", false)],
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET attempt_id = 'a-late-18';",
+            ],
+            ..in_flight("dispatch-after-bound", [None, held])
+        },
+        TimeoutShape {
+            attempts: &[(1, "dispatching", false)],
+            extra: &[
+                expired_cancellation!("requested"),
+                OTHER_RUN,
+                OTHER_ATTEMPT,
+                "UPDATE automation_attempts SET session_id = 's-late' WHERE id = 'a-other';",
+            ],
+            ..in_flight("dispatch-beside-taken-session", [None, held])
+        },
+        // A stopping cancellation is held to the same conditions, though its
+        // pass stops nothing.
+        TimeoutShape {
+            attempts: &[(1, "started", true), (2, "dispatching", false)],
+            extra: &[expired_cancellation!("stopping"), CANCELLATION_FENCE],
+            ..in_flight(
+                "stopping-two-live",
+                [
+                    Some("recovery_required/dispatching/recovery_required"),
+                    Some("recovery_required/dispatching/recovery_required"),
+                ],
+            )
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("stopping"),
+                CANCELLATION_FENCE,
+                OTHER_RUN,
+                "UPDATE automation_runs SET session_id = 's-late' WHERE id = 'r-other';",
+            ],
+            ..in_flight("stopping-session-shared", [held, held])
+        },
+        TimeoutShape {
+            attempts: &[(1, "failed", false), (2, "started", true)],
+            ..in_flight(
+                "targets-settled-attempt",
+                [Some("cancelled/cancelled/cancelled"), None],
+            )
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                OTHER_RUN,
+                OTHER_ATTEMPT,
+                "UPDATE automation_attempts SET state = 'dispatching', session_id = NULL
+                    WHERE id = 'a-other';
+                 UPDATE automation_cancellations SET attempt_id = 'a-other';",
+            ],
+            ..in_flight(
+                "targets-other-runs-attempt",
+                [Some("cancelled/cancelled/cancelled"), None],
+            )
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET session_id = 's-gone';",
+            ],
+            ..in_flight("other-session", [left, left])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                OTHER_RUN,
+                "UPDATE automation_runs SET session_id = 's-late' WHERE id = 'r-other';",
+            ],
+            ..in_flight(
+                "session-shared",
+                [Some("cancelled/cancelled/cancelled"), held],
+            )
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "INSERT INTO sessions
+                    (id, project_root, harness, title, status, created_at, updated_at)
+                 VALUES ('s-stray', '/PRIVATE', 'codex', 'PRIVATE', 'running',
+                         '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z');
+                 INSERT INTO automation_runs
+                    (id, automation_id, occurrence_id, session_id, runtime, status,
+                     started_at)
+                 VALUES ('r-stray', 'other', 'o-late', 's-stray', 'coven-code', 'running',
+                         '2026-10-21T09:00:00.000Z');",
+            ],
+            ..in_flight("rival", [Some("cancelled/cancelled/cancelled"), held])
+        },
+        TimeoutShape {
+            authority: true,
+            attempts: &[(1, "ambiguous", false), (2, "started", true)],
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET attempt_id = 'a-late-18';",
+            ],
+            ..in_flight("authority-unresolved", [None, held])
+        },
+        // A requested cancellation is left to another stop, and a stored
+        // answer is replayed.
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
+            ],
+            ..in_flight("timeout-fence", [left, left])
+        },
+        TimeoutShape {
+            extra: &[expired_cancellation!("requested"), CANCELLATION_FENCE],
+            ..in_flight("own-fence", [held, held])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "INSERT INTO automation_command_adoptions
+                    (adoption_key, request_digest, command, outcome, response_json,
+                     adopted_at)
+                 VALUES ('cancel-late', 'digest', 'run.cancel.v1', 'committed',
+                         '{\"result\":{}}', '2026-10-22T09:59:10.000Z');",
+            ],
+            ..in_flight("answered", [left, left])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("stopping"),
+                "INSERT INTO automation_command_adoptions
+                    (adoption_key, request_digest, command, outcome, response_json,
+                     adopted_at)
+                 VALUES ('cancel-late', 'other', 'run.cancel.v1', 'committed',
+                         '{\"result\":{}}', '2026-10-22T09:59:10.000Z');",
+            ],
+            ..in_flight(
+                "stopping-answered-differently",
+                [
+                    Some("claimed/started/stopping"),
+                    Some("claimed/started/stopping"),
+                ],
+            )
+        },
+        // Reconciliation reads the cancellation's values as text and its
+        // requester as a requester.
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET requested_by_json = '{}';",
+            ],
+            ..in_flight("requester-without-principal", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations
+                    SET requested_by_json = '{\"principalId\":\"operator\",\"role\":\"x\"}';",
+            ],
+            ..in_flight("requester-with-unknown-field", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations
+                    SET requested_by_json = CAST('{\"principalId\":\"operator\"}' AS BLOB);",
+            ],
+            ..in_flight("blob-requester", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET reason = CAST('stop' AS BLOB);",
+            ],
+            ..in_flight("blob-reason", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET reason = CAST(X'FF' AS TEXT);",
+            ],
+            ..in_flight("invalid-reason", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations
+                    SET execution_expires_at = '2026-10-22T09:59:30' || CAST(X'FF' AS TEXT);",
+            ],
+            ..in_flight("invalid-expiry", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET adoption_key = CAST(adoption_key AS BLOB);",
+            ],
+            ..in_flight("blob-adoption-key", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET adoption_key = adoption_key || CAST(X'FF' AS TEXT);",
+            ],
+            ..in_flight("invalid-adoption-key", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET request_digest = CAST(request_digest AS BLOB);",
+            ],
+            ..in_flight("blob-request-digest", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET request_digest = request_digest || CAST(X'FF' AS TEXT);",
+            ],
+            ..in_flight("invalid-request-digest", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET automation_id = CAST(automation_id AS BLOB);",
+            ],
+            ..in_flight("blob-automation-id", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET automation_id = automation_id || CAST(X'FF' AS TEXT);",
+            ],
+            ..in_flight("invalid-automation-id", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET requested_at = CAST(requested_at AS BLOB);",
+            ],
+            ..in_flight("blob-requested-at", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_cancellations SET requested_at = requested_at || CAST(X'FF' AS TEXT);",
+            ],
+            ..in_flight("invalid-requested-at", [None, None])
+        },
+        // The values it compares with the run's own are read as text too.
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                late_session_id!("CAST('s-late' AS BLOB)"),
+                "UPDATE automation_cancellations SET session_id = CAST(session_id AS BLOB);",
+            ],
+            ..in_flight("blob-session-id", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE automation_attempts SET id = CAST(id AS BLOB);
+                 UPDATE automation_cancellations SET attempt_id = CAST(attempt_id AS BLOB);
+                 PRAGMA foreign_keys = ON;",
+            ],
+            ..in_flight("blob-attempt-id", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE automation_runs SET id = CAST(id AS BLOB);
+                 UPDATE automation_attempts SET run_id = CAST(run_id AS BLOB);
+                 UPDATE automation_cancellations SET run_id = CAST(run_id AS BLOB);
+                 PRAGMA foreign_keys = ON;",
+            ],
+            ..in_flight("blob-run-id", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                late_session_id!("'s-late' || CAST(X'FF' AS TEXT)"),
+                "UPDATE automation_cancellations SET session_id = session_id || CAST(X'FF' AS TEXT);",
+            ],
+            ..in_flight("invalid-session-id", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE automation_attempts SET id = id || CAST(X'FF' AS TEXT);
+                 UPDATE automation_cancellations SET attempt_id = attempt_id || CAST(X'FF' AS TEXT);
+                 PRAGMA foreign_keys = ON;",
+            ],
+            ..in_flight("invalid-attempt-id", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE automation_runs SET id = id || CAST(X'FF' AS TEXT);
+                 UPDATE automation_attempts SET run_id = run_id || CAST(X'FF' AS TEXT);
+                 UPDATE automation_cancellations SET run_id = run_id || CAST(X'FF' AS TEXT);
+                 PRAGMA foreign_keys = ON;",
+            ],
+            ..in_flight("invalid-run-id", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                "UPDATE automation_runs SET definition_json = CAST('{}' AS BLOB);",
+            ],
+            ..in_flight("blob-definition", [None, held])
+        },
+        TimeoutShape {
+            occurrence: "recovery_required",
+            code: WorkCode::RecoveryRequired,
+            next_step: NextStep::AwaitCancellation,
+            after: [
+                Some("recovery_required/started/requested"),
+                Some("recovery_required/started/requested"),
+            ],
+            ..in_flight("recovery", [None, None])
+        },
+        TimeoutShape {
+            occurrence: "recovery_required",
+            authority: true,
+            code: WorkCode::RecoveryRequired,
+            next_step: NextStep::AwaitRuntimeAuthority,
+            after: [
+                Some("recovery_required/started/requested"),
+                Some("recovery_required/started/requested"),
+            ],
+            ..in_flight("authority-recovery", [None, None])
+        },
+    ];
+    let mut seen = Vec::new();
+    for shape in &shapes {
+        let (_temp, conn) = timeout_store(shape);
+        let item = found(&conn, "daily").work.into_iter().next().unwrap();
+        // TEMP tables cannot change what the run reads as.
+        let explained = work_of(&conn, "daily");
+        conn.execute_batch(
+            "CREATE TEMP TABLE automation_cancellations AS
+                 SELECT * FROM main.automation_cancellations;
+             UPDATE temp.automation_cancellations SET
+                 state = CASE state WHEN 'requested' THEN 'stopping' ELSE 'requested' END,
+                 execution_expires_at = CASE
+                     WHEN execution_expires_at <= '2026-10-22T10:00:00.000Z'
+                     THEN '2099-01-01T00:00:00.000Z' ELSE '2026-10-22T09:00:00.000Z' END,
+                 requested_by_json = '{}', attempt_id = 'shadow', session_id = 'shadow';
+             INSERT INTO temp.automation_cancellations (run_id, state, execution_expires_at)
+                 VALUES ('r-late', 'requested', '2026-10-22T09:00:00.000Z');
+             CREATE TEMP TABLE automation_command_adoptions AS
+                 SELECT * FROM main.automation_command_adoptions WHERE 0;
+             INSERT INTO temp.automation_command_adoptions (adoption_key)
+                 VALUES ('cancel-late');
+             CREATE TEMP TABLE automation_stop_fences AS
+                 SELECT * FROM main.automation_stop_fences WHERE 0;
+             INSERT INTO temp.automation_stop_fences (run_id) VALUES ('r-late');
+             CREATE TEMP TABLE sessions AS SELECT * FROM main.sessions;
+             UPDATE temp.sessions SET status = CASE status
+                 WHEN 'running' THEN 'created' ELSE 'running' END;
+             CREATE TEMP TABLE automation_attempts AS SELECT * FROM main.automation_attempts;
+             UPDATE temp.automation_attempts SET id = 'shadow-' || id, session_id = NULL,
+                 state = CASE state WHEN 'started' THEN 'failed' ELSE 'started' END;
+             INSERT INTO temp.automation_attempts (id, run_id, state)
+                 VALUES ('shadow-extra', 'r-late', 'observing');
+             CREATE TEMP TABLE automation_runs AS SELECT * FROM main.automation_runs;
+             UPDATE temp.automation_runs SET timeout_at = 'never', authority_profile =
+                 CASE WHEN authority_profile IS NULL THEN 'shadow' END;
+             INSERT INTO temp.automation_runs (id, occurrence_id, session_id, status)
+                 VALUES ('r-shadow', 'o-late', 's-late', 'running');",
+        )
+        .unwrap();
+        assert_eq!(work_of(&conn, "daily"), explained, "{}", shape.name);
+        let after = [
+            &ConfirmedKill as &dyn crate::api::SessionRuntime,
+            &UnconfirmedKill,
+        ]
+        .map(|runtime| {
+            let (temp, conn) = timeout_store(shape);
+            cancellation_after_pass(&temp, &conn, runtime)
+        });
+        seen.push((shape.name, item.code, item.next_step, after));
+    }
+    let expected: Vec<_> = shapes
+        .iter()
+        .map(|shape| {
+            (
+                shape.name,
+                shape.code,
+                shape.next_step,
+                shape.after.map(|state| state.map(str::to_string)),
             )
         })
         .collect();

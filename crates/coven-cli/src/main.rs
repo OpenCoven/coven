@@ -1323,6 +1323,21 @@ enum AutomationsCommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Retry a run held after a failure, before its deadline")]
+    Retry {
+        run_id: String,
+        /// The run's latest attempt, which the retry follows
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        prior_attempt: u16,
+        /// How that attempt settled
+        #[arg(long, value_enum)]
+        prior_disposition: automations::retry_cli::PriorDisposition,
+        /// A note recorded with the new attempt
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Inspect occurrence lease metadata through the owner-local daemon")]
     Leases {
         #[arg(long)]
@@ -1846,6 +1861,7 @@ fn main() -> Result<()> {
                 | AutomationsCommand::Run { .. }
                 | AutomationsCommand::Attempts { .. }
                 | AutomationsCommand::Explain { .. }
+                | AutomationsCommand::Retry { .. }
         })
     ) || matches!(
         &cli.command,
@@ -4351,6 +4367,19 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
             automation_id,
             json,
         } => run(View::Explain(&automation_id), json),
+        AutomationsCommand::Retry {
+            run_id,
+            prior_attempt,
+            prior_disposition,
+            note,
+            json,
+        } => automations::retry_cli::run(
+            &run_id,
+            prior_attempt,
+            prior_disposition,
+            note.as_deref(),
+            json,
+        ),
         AutomationsCommand::Leases {
             automation_id,
             limit,

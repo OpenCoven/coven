@@ -685,18 +685,19 @@ scheduler pass would claim from, given the store at `observedAt`: the eligible
 queue and a due slot that planning has yet to create. Before claiming, a pass
 settles retries and held failed attempts once their deadlines pass, settles
 runs whose session has finished, stops runs whose session is still running past
-their deadline or has not started when their claim's lease expires, and returns
-or fails stale and expired claims (`retry_expired`, `retry_held`,
-`session_finished`, `timeout_expired`, `launch_abandoned`, `claim_stale` and
-`lease_expired`, below). Each releases the hold it lists, except where the pass
-holds the run, as described below. Reconciliation also acts on other runs
+their deadline or has not started when their claim's lease expires, finishes
+cancellations left past their execution lease, and returns or fails stale and
+expired claims (`retry_expired`, `retry_held`, `session_finished`,
+`timeout_expired`, `launch_abandoned`, `cancellation_expired`, `claim_stale`
+and `lease_expired`, below). Each releases the hold it lists, except where the
+pass holds the run, as described below. Reconciliation also acts on other runs
 before claiming, which are listed as `running_run` or `in_flight` and not named
 yet (#1523): it stops or settles other runs past their deadline or lease, and
-reconciles expired cancellations. It holds at most 20 items: those that hold
-claims first, then by code in the order below, with each code that replaces
-another item sorted as that item, then by stored scheduled time and ids.
-`workTruncated` is `true` when more exist. All
-reads, `conditions` included, come from one read transaction. Each item has a
+reconciles other expired cancellations. It holds at most 20 items: those that
+hold claims first, then by code in the order below, with each code that
+replaces another item sorted as that item, then by stored scheduled time and
+ids. `workTruncated` is `true` when more exist. All reads, `conditions`
+included, come from one read transaction. Each item has a
 `code`, `holdsClaims` and a `nextStep`, and `occurrenceId`, `runId` and `at`
 (the occurrence's scheduled time, in canonical millisecond form) when each
 exists and is readable. A retry item also carries `notBefore` and
@@ -718,6 +719,7 @@ is longer than 64 bytes or is not a readable timestamp.
 | `session_finished` | a claimed or running occurrence whose run's session has finished, described below; it replaces the occurrence's `in_flight` item | until the next pass settles the run, unless settlement holds the run | `await_settlement`, or `await_runtime_authority` for a Runtime Authority run |
 | `timeout_expired` | a claimed or running occurrence whose run's session is still running past the run's deadline, described below; it replaces the occurrence's `in_flight` item | until the next pass settles the run `failed`, unless it holds the run for recovery | `await_settlement`, or `await_runtime_authority` for a Runtime Authority run |
 | `launch_abandoned` | a claimed occurrence whose run's session has not started when the claim's lease expires, described below; it replaces the occurrence's `in_flight` item | until the next pass settles the run `failed`, unless it holds the run for an operator retry or for recovery | `await_settlement`, or `await_runtime_authority` for a Runtime Authority run |
+| `cancellation_expired` | a claimed or running occurrence whose run's cancellation was left `requested` or `stopping` past its execution lease, described below; it replaces the occurrence's `in_flight` item | until the next pass settles the run `cancelled`, unless it holds the run for recovery | `await_cancellation`, or `await_runtime_authority` for a Runtime Authority run |
 | `eligible_now` | a planned occurrence the scheduler's eligible queue selects now, unless misfire policy skips it first | never | `await_scheduler_pass` |
 | `due_unplanned` | the slot the next pass plans for the routine, with no `occurrenceId`; `at` is the slot | never | `await_scheduler_pass` |
 | `recovery_required` | a `recovery_required` occurrence; `runId` is its running run, if any | while a running run keyed to the routine is on it | the step recovery takes, below |
@@ -764,6 +766,10 @@ Among them:
   when the session's creation time or the occurrence's kind or lease owner
   cannot be read, or the session id is not readable text or contains a NUL
   byte, on which restart containment fails;
+- a `requested` or `stopping` cancellation of any run whose stored execution
+  lease is not after `observedAt`, when one of its values is not readable text,
+  its requester cannot be read, or its run has a deadline that cannot be read,
+  on which cancellation reconciliation fails;
 - a run whose session is still `created` on a `claimed` occurrence whose
   stored lease is not after `observedAt`, with no stored deadline at or before
   it, holding its own recovery stop fence whose expiry cannot be read, or has
@@ -787,10 +793,11 @@ has no authority profile and its latest attempt failed. The run holds the
 routine's claims until a pass settles it and its occurrence `failed`: the first
 pass at or after the run's deadline, or the next pass if it has none. An
 operator can open a retry first with `coven.automations.attempt.retry.v1`,
-which has no CLI command yet and refuses in several cases, among them a run
-with no deadline or past it, and one with no attempt left. The retry returns
-the occurrence to `planned`, and the run, still holding the claims, is then
-listed as `running_run`, and as `eligible_now` while the queue can claim it.
+which `coven automations retry` sends. It refuses in several cases, among them
+a run with no deadline or past it, and one with no attempt left. The retry
+returns the occurrence to `planned`, and the run, still holding the claims, is
+then listed as `running_run`, and as `eligible_now` while the queue can claim
+it.
 
 These held runs are listed as `in_flight` instead:
 
@@ -863,7 +870,8 @@ These runs past their deadline are listed as `in_flight` instead:
   a session another attempt holds, or a Runtime Authority run with another
   unresolved attempt, on which the stop can fail the pass;
 - one with a requested or stopping cancellation, which the pass leaves to that
-  cancellation, or reconciles first once it expires;
+  cancellation, or reconciles first once it expires; an expired stopping one can
+  be named `cancellation_expired` instead, below;
 - one with a stop fence, which the pass leaves to that stop, holds for recovery
   when its own timeout stop expired, or fails on when that stop's expiry cannot
   be read;
@@ -921,6 +929,57 @@ These launches past their lease are listed as `in_flight` instead:
 
 A launch past its lease whose occurrence awaits recovery is listed as
 `recovery_required`; abandoned-launch recovery does not stop it.
+
+A `cancellation_expired` item is a run whose cancellation is still `requested`
+or `stopping` when its execution lease has expired: the command that took it
+stopped before finishing it. Reconciliation compares the lease as stored text.
+It finishes the cancellation after restart containment, and before
+abandoned-launch recovery, timeout enforcement and settlement. A requested
+cancellation stops the session. When the stop is confirmed, a plain run is
+settled `cancelled` with its attempt and occurrence, and a Runtime Authority run
+is held for recovery. When it is not, the attempt is marked ambiguous and the
+occurrence is held for recovery. A stopping cancellation never recorded its
+stop's outcome, so the next pass marks the attempt ambiguous and holds the
+occurrence for recovery, whatever the runtime. An occurrence held for recovery
+is then listed as `recovery_required`.
+
+These runs with an expired cancellation are listed as `in_flight` instead:
+
+- one whose session is not `running`: restart containment can act on a
+  `created` or `orphaned` one first, from containment receipts outside the
+  store, and a finished one is settled from its own evidence;
+- one whose requested cancellation's run has a parsed deadline not after
+  `observedAt`, which reconciliation rejects before timeout enforcement stops
+  the run, or a stored deadline not after it, which the stop compares as text
+  and does not claim;
+- one whose cancellation targets another session, or an attempt other than
+  the run's only one live on its session, where a dispatch needs none, on which
+  a requested cancellation's stop does nothing or can fail the pass;
+- a Runtime Authority run with another unresolved attempt, on which that stop
+  can fail the pass;
+- a plain run whose requested cancellation targets a dispatch while another
+  attempt holds the run's session: settling a confirmed stop binds the dispatch
+  to that session, which fails the pass;
+- one whose session another running run shares, which that stop also ends;
+- one whose request already has a stored answer, which reconciliation replays
+  without acting;
+- one whose requested cancellation's run has a stop fence, which
+  reconciliation leaves to that stop, or holds for recovery when it is the
+  cancellation's own expired stop;
+- one sharing its occurrence with another running run, which can settle the
+  occurrence first;
+- one with a value the pass cannot read, such as the cancellation's own values
+  or requester, the run's deadline or a plain run's pinned definition, which
+  can fail the pass.
+
+A stopping cancellation stops no session and binds no dispatch, but explain
+still lists it as `in_flight` under the conditions above on its session and
+attempt, a Runtime Authority run's other attempts, and a shared session. A
+passed deadline or a stop fence on its run does not keep it from being named.
+
+A run with an expired cancellation whose occurrence awaits recovery is listed
+as `recovery_required`, with next step `await_cancellation`, or
+`await_runtime_authority` for a Runtime Authority run.
 
 Claim releases describe the next pass of the daemon holding the scheduler
 authority on record, if that pass completes. It first returns to `planned`
