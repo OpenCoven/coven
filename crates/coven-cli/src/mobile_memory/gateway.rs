@@ -1319,7 +1319,7 @@ mod tests {
     use base64::Engine;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, ClientConnection, RootCertStore};
     use sha2::Digest;
@@ -1426,7 +1426,7 @@ mod tests {
         let public_key_x963 = URL_SAFE_NO_PAD.encode(
             possession_key
                 .verifying_key()
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes(),
         );
         let record = super::super::registry::DeviceRecord {
@@ -1454,7 +1454,7 @@ mod tests {
                     public_key_x963: URL_SAFE_NO_PAD.encode(
                         authorization_key
                             .verifying_key()
-                            .to_encoded_point(false)
+                            .to_sec1_point(false)
                             .as_bytes(),
                     ),
                     assurance_class: super::super::assurance::AssuranceClass::BiometricOnly,
@@ -2073,7 +2073,7 @@ mod tests {
 
     fn sample_pairing_request(nonce: [u8; 32]) -> super::super::contract::MobilePairingRequest {
         let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
-        let public_key = signing_key.public_key().to_encoded_point(false);
+        let public_key = signing_key.public_key().to_sec1_point(false);
         super::super::contract::MobilePairingRequest {
             protocol_version: super::super::MOBILE_PROTOCOL_VERSION,
             pairing_nonce: URL_SAFE_NO_PAD.encode(nonce),
