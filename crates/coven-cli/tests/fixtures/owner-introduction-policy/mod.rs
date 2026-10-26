@@ -12,7 +12,7 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 const AUDIENCE: [u8; 32] = [7; 32];
 
 fn public(key: &SigningKey) -> String {
-    URL_SAFE_NO_PAD.encode(key.verifying_key().to_encoded_point(false).as_bytes())
+    URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_point(false).as_bytes())
 }
 
 fn sign(key: &SigningKey, bytes: &[u8]) -> String {
