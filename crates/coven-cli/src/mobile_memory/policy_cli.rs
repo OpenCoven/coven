@@ -338,7 +338,7 @@ fn load_root_key(path: &Path) -> Result<SigningKey> {
 }
 
 pub(super) fn public_key(key: &SigningKey) -> String {
-    URL_SAFE_NO_PAD.encode(key.verifying_key().to_encoded_point(false).as_bytes())
+    URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_point(false).as_bytes())
 }
 
 fn key_fingerprint(public_key: &str) -> String {
