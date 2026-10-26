@@ -864,7 +864,7 @@ mod tests {
     use chrono::Duration;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use rand::random;
     use std::collections::HashSet;
 
@@ -902,7 +902,7 @@ mod tests {
                 .begin_pairing_with_id(pairing_id, pairing_nonce, now + Duration::minutes(5))
                 .unwrap();
             let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
-            let public_key = signing_key.public_key().to_encoded_point(false);
+            let public_key = signing_key.public_key().to_sec1_point(false);
             Self {
                 _temp: temp,
                 manager,
@@ -934,12 +934,8 @@ mod tests {
             self.use_v2();
             let signing_key = SigningKey::from_slice(&[seed; 32]).unwrap();
             self.request.step_up_authorization = Some(StepUpAuthorizationEnrollment {
-                public_key: URL_SAFE_NO_PAD.encode(
-                    signing_key
-                        .verifying_key()
-                        .to_encoded_point(false)
-                        .as_bytes(),
-                ),
+                public_key: URL_SAFE_NO_PAD
+                    .encode(signing_key.verifying_key().to_sec1_point(false).as_bytes()),
                 assurance_class,
                 enrollment_signature: String::new(),
             });
@@ -1490,7 +1486,7 @@ mod tests {
         let expired_now = Utc::now() - Duration::minutes(6);
         let pairing_nonce = [7; 32];
         let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
-        let public_key = signing_key.public_key().to_encoded_point(false);
+        let public_key = signing_key.public_key().to_sec1_point(false);
         let request = MobilePairingRequest {
             protocol_version: MOBILE_PROTOCOL_VERSION,
             pairing_nonce: URL_SAFE_NO_PAD.encode(pairing_nonce),
