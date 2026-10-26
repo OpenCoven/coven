@@ -2127,7 +2127,7 @@ impl InheritedDescriptorSweep {
         let directory = loop {
             let fd = unsafe {
                 libc::open(
-                    b"/proc/self/fd\0".as_ptr().cast(),
+                    c"/proc/self/fd".as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
                 )
             };
