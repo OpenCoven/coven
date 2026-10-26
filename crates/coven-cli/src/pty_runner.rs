@@ -1968,8 +1968,7 @@ fn resume_suspended_child(child: &std::process::Child) -> bool {
 #[cfg(unix)]
 fn configure_child_process_tree_command(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
-    // Prepared before fork: neither `sysconf` nor allocation is
-    // async-signal-safe.
+    // Prepared before fork: allocation is not async-signal-safe.
     let mut inherited = InheritedDescriptorSweep::prepare();
     unsafe {
         command.pre_exec(move || {
@@ -1978,8 +1977,9 @@ fn configure_child_process_tree_command(command: &mut std::process::Command) {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            inherited.mark_close_on_exec();
-            Ok(())
+            // A descriptor left unmarked would reach the harness, so a sweep
+            // that cannot finish fails the spawn before the target executes.
+            inherited.mark_close_on_exec()
         });
     }
 }
@@ -1994,15 +1994,35 @@ fn configure_child_process_tree_command(command: &mut std::process::Command) {
 /// reached EOF and its quiescence wait failed (#1067). A harness tree inherits
 /// nothing past stdio. The protocol descriptors used before exec are already
 /// close-on-exec, so marking the rest leaves them working until exec.
+///
+/// The sweep is exhaustive or it fails. A numeric probe is not: a descriptor
+/// opened before the soft `RLIMIT_NOFILE` was lowered sits above any bound
+/// `sysconf` reports. Linux therefore uses `close_range`, or lists
+/// `/proc/self/fd` where that is unavailable, and macOS lists the process's
+/// descriptors. Elsewhere no complete listing is known and the spawn fails.
 #[cfg(unix)]
 struct InheritedDescriptorSweep {
-    // The probe's bound. Linux needs no probe; see `mark_close_on_exec`.
-    #[cfg(any(not(target_os = "linux"), test))]
-    max_fd: libc::c_int,
-    // `_SC_OPEN_MAX` can be 1,048,576, so on macOS the child lists its open
-    // descriptors into this buffer instead of probing every number.
+    // On macOS the child lists its open descriptors into this buffer.
     #[cfg(target_os = "macos")]
     listed: Vec<libc::proc_fdinfo>,
+    #[cfg(test)]
+    fault: SweepFault,
+}
+
+/// Faults a test injects into the sweeps its thread prepares.
+#[cfg(all(unix, test))]
+#[derive(Clone, Copy, Debug, Default)]
+struct SweepFault {
+    /// Take the `/proc/self/fd` path as if `close_range` were unavailable.
+    #[cfg(target_os = "linux")]
+    close_range_unavailable: bool,
+    /// Fail marking this descriptor with EPERM.
+    mark_fails: Option<libc::c_int>,
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static SWEEP_FAULT: std::cell::Cell<SweepFault> = std::cell::Cell::new(SweepFault::default());
 }
 
 #[cfg(unix)]
@@ -2021,48 +2041,59 @@ impl InheritedDescriptorSweep {
             };
             let open =
                 usize::try_from(needed).unwrap_or(0) / std::mem::size_of::<libc::proc_fdinfo>();
-            // Room for descriptors opened before fork; a full buffer may be
-            // truncated, so the child then falls back to the bounded probe.
+            // Room for descriptors opened before fork. A listing that fills
+            // the buffer may be truncated, and the spawn then fails.
             Vec::with_capacity(open * 2 + 1024)
         };
         Self {
-            #[cfg(any(not(target_os = "linux"), test))]
-            max_fd: unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
-                .clamp(64, libc::c_int::MAX as libc::c_long) as libc::c_int,
             #[cfg(target_os = "macos")]
             listed,
+            #[cfg(test)]
+            fault: SWEEP_FAULT.with(std::cell::Cell::get),
         }
     }
 
-    /// Runs in the forked child and is async-signal-safe.
-    unsafe fn mark_close_on_exec(&mut self) {
-        // std already creates descriptors close-on-exec atomically on Linux
-        // (`pipe2`, `accept4`, `SOCK_CLOEXEC`), so this is defence in depth.
-        // Where `CLOSE_RANGE_CLOEXEC` is missing (before 5.11, or filtered by
-        // seccomp) skip it rather than probe up to RLIMIT_NOFILE per spawn.
+    /// Runs in the forked child and is async-signal-safe: an error carries
+    /// the raw errno and allocates nothing.
+    unsafe fn mark_close_on_exec(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                3_u32,
-                u32::MAX,
-                libc::CLOSE_RANGE_CLOEXEC,
-            );
+        {
+            // std already creates descriptors close-on-exec atomically on
+            // Linux (`pipe2`, `accept4`, `SOCK_CLOEXEC`); this marks what the
+            // daemon inherited or a library opened without the flag.
+            #[cfg(test)]
+            let close_range_available = !self.fault.close_range_unavailable;
+            #[cfg(not(test))]
+            let close_range_available = true;
+            if close_range_available
+                && unsafe {
+                    libc::syscall(
+                        libc::SYS_close_range,
+                        3_u32,
+                        u32::MAX,
+                        libc::CLOSE_RANGE_CLOEXEC,
+                    )
+                } == 0
+            {
+                return Ok(());
+            }
+            // Before 5.11, or where seccomp filters `close_range`.
+            unsafe { self.mark_proc_listed() }
         }
         #[cfg(target_os = "macos")]
-        if unsafe { self.mark_listed() } {
-            return;
+        {
+            unsafe { self.mark_listed() }
         }
-        #[cfg(not(target_os = "linux"))]
-        unsafe {
-            self.probe()
-        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        }
     }
 
-    /// Marks each descriptor `proc_pidinfo` lists, or returns false when the
-    /// listing failed or may have been truncated.
+    /// Marks each descriptor `proc_pidinfo` lists, failing when the listing
+    /// failed or may have been truncated.
     #[cfg(target_os = "macos")]
-    unsafe fn mark_listed(&mut self) -> bool {
+    unsafe fn mark_listed(&mut self) -> io::Result<()> {
         let entry = std::mem::size_of::<libc::proc_fdinfo>();
         let capacity = (self.listed.capacity() * entry).min(libc::c_int::MAX as usize);
         let written = unsafe {
@@ -2074,32 +2105,143 @@ impl InheritedDescriptorSweep {
                 capacity as libc::c_int,
             )
         };
-        if written <= 0 || written as usize >= capacity {
-            return false;
+        if written <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written as usize >= capacity {
+            return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
         }
         for index in 0..written as usize / entry {
             let fd = unsafe { (*self.listed.as_ptr().add(index)).proc_fd };
             if fd >= 3 {
-                unsafe { mark_descriptor_close_on_exec(fd) };
+                unsafe { self.mark(fd) }?;
             }
         }
-        true
+        Ok(())
     }
 
-    #[cfg(any(not(target_os = "linux"), test))]
-    unsafe fn probe(&self) {
-        for fd in 3..self.max_fd {
-            unsafe { mark_descriptor_close_on_exec(fd) };
+    /// Marks each descriptor `/proc/self/fd` lists. It is read with raw
+    /// `getdents64` into a stack buffer, because `opendir` allocates.
+    #[cfg(target_os = "linux")]
+    unsafe fn mark_proc_listed(&self) -> io::Result<()> {
+        let directory = loop {
+            let fd = unsafe {
+                libc::open(
+                    b"/proc/self/fd\0".as_ptr().cast(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return Err(error);
+            }
+        };
+        let marked = unsafe { self.mark_directory_entries(directory) };
+        unsafe { libc::close(directory) };
+        marked
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn mark_directory_entries(&self, directory: libc::c_int) -> io::Result<()> {
+        // linux_dirent64: d_ino (8), d_off (8), d_reclen (2), d_type (1), then
+        // the NUL-terminated name.
+        const NAME_OFFSET: usize = 19;
+        #[repr(C, align(8))]
+        struct Entries([u8; 4096]);
+        let mut entries = Entries([0; 4096]);
+        loop {
+            let read = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    directory,
+                    entries.0.as_mut_ptr(),
+                    entries.0.len(),
+                )
+            };
+            if read == 0 {
+                return Ok(());
+            }
+            if read < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+            let filled = &entries.0[..read as usize];
+            let mut offset = 0;
+            while offset < filled.len() {
+                let record = &filled[offset..];
+                let length = match record.get(16..18) {
+                    Some(&[low, high]) => usize::from(u16::from_ne_bytes([low, high])),
+                    _ => 0,
+                };
+                let Some(name) = record.get(NAME_OFFSET..length) else {
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                };
+                if let Some(fd) = listed_descriptor(name) {
+                    if fd >= 3 && fd != directory {
+                        unsafe { self.mark(fd) }?;
+                    }
+                }
+                offset += length;
+            }
+        }
+    }
+
+    /// Marks `fd` close-on-exec. EBADF means it is not open, so nothing can
+    /// be inherited through it; any other failure is returned.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    unsafe fn mark(&self, fd: libc::c_int) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fault.mark_fails == Some(fd) {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+        let flags = loop {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags >= 0 {
+                break flags;
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::EBADF) => return Ok(()),
+                _ => return Err(error),
+            }
+        };
+        if flags & libc::FD_CLOEXEC != 0 {
+            return Ok(());
+        }
+        loop {
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return Err(error);
+            }
         }
     }
 }
 
-#[cfg(all(unix, any(not(target_os = "linux"), test)))]
-unsafe fn mark_descriptor_close_on_exec(fd: libc::c_int) {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
-        unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+/// The descriptor a `/proc/self/fd` entry names, or None for `.` and `..`.
+#[cfg(target_os = "linux")]
+fn listed_descriptor(name: &[u8]) -> Option<libc::c_int> {
+    let mut fd: libc::c_int = 0;
+    let mut digits = 0;
+    for &byte in name.iter().take_while(|byte| **byte != 0) {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        fd = fd
+            .checked_mul(10)?
+            .checked_add(libc::c_int::from(byte - b'0'))?;
+        digits += 1;
     }
+    (digits > 0).then_some(fd)
 }
 
 #[cfg(any(windows, test))]
@@ -9030,53 +9172,222 @@ exit 1
         Ok(())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Sets the fault the sweeps this thread prepares inject, until dropped.
+    #[cfg(unix)]
+    struct InjectedSweepFault;
+
+    #[cfg(unix)]
+    impl InjectedSweepFault {
+        fn install(fault: SweepFault) -> Self {
+            SWEEP_FAULT.with(|cell| cell.set(fault));
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for InjectedSweepFault {
+        fn drop(&mut self) {
+            SWEEP_FAULT.with(|cell| cell.set(SweepFault::default()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn the_fast_descriptor_path_marks_strays_past_the_probe_bound() -> Result<()> {
-        // A probe bound below the strays leaves only `close_range` (Linux) or
-        // the `proc_pidinfo` listing (macOS) able to mark them.
-        let (strays, listed) = child_descriptors_beside_stray_pipe(|command| {
-            use std::os::unix::process::CommandExt;
-            let mut fast = InheritedDescriptorSweep::prepare();
-            fast.max_fd = 64;
-            unsafe {
-                command.pre_exec(move || {
-                    fast.mark_close_on_exec();
-                    Ok(())
-                });
-            }
-        })?;
+    fn the_proc_listing_marks_strays_where_close_range_is_unavailable() -> Result<()> {
+        let _fault = InjectedSweepFault::install(SweepFault {
+            close_range_unavailable: true,
+            ..SweepFault::default()
+        });
+        let (strays, listed) =
+            child_descriptors_beside_stray_pipe(configure_child_process_tree_command)?;
         for fd in strays {
             assert!(
                 !listed.contains(&fd),
-                "fast path left stray descriptor {fd}: {listed:?}"
+                "the /proc/self/fd sweep left stray descriptor {fd}: {listed:?}"
             );
         }
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn the_bounded_descriptor_probe_also_marks_strays_close_on_exec() -> Result<()> {
-        // The path a macOS child takes when its descriptor listing may be
-        // truncated, and the only path on other Unix systems.
-        let (strays, listed) = child_descriptors_beside_stray_pipe(|command| {
-            use std::os::unix::process::CommandExt;
-            let mut probe = InheritedDescriptorSweep::prepare();
-            probe.max_fd = 1024;
-            unsafe {
-                command.pre_exec(move || {
-                    probe.probe();
-                    Ok(())
-                });
-            }
-        })?;
-        for fd in strays {
-            assert!(
-                !listed.contains(&fd),
-                "probe left stray descriptor {fd}: {listed:?}"
-            );
+    fn proc_fd_entry_names_parse_as_descriptors() {
+        assert_eq!(listed_descriptor(b"0\0"), Some(0));
+        assert_eq!(listed_descriptor(b"4096\0\0\0"), Some(4096));
+        assert_eq!(listed_descriptor(b".\0"), None);
+        assert_eq!(listed_descriptor(b"..\0"), None);
+        assert_eq!(listed_descriptor(b"99999999999\0"), None);
+    }
+
+    /// Runs `spawn` on a target that records that it executed, while a
+    /// non-close-on-exec pipe sits at descriptor 200+ and marking it fails.
+    /// Returns the spawn result and whether the target executed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_beside_unmarkable_stray<T>(
+        spawn: impl FnOnce(&Path, Vec<String>) -> T,
+    ) -> Result<(T, bool)> {
+        let temp_dir = tempfile::tempdir()?;
+        let marker = temp_dir.path().join("target-executed");
+        let mut created = [0; 2];
+        assert_eq!(unsafe { libc::pipe(created.as_mut_ptr()) }, 0);
+        let stray = unsafe { libc::fcntl(created[1], libc::F_DUPFD, 200) };
+        for fd in created {
+            unsafe { libc::close(fd) };
         }
+        assert!(stray >= 200, "{stray}");
+        let spawned = {
+            let _fault = InjectedSweepFault::install(SweepFault {
+                // The descriptor is marked one by one only on the listing path.
+                #[cfg(target_os = "linux")]
+                close_range_unavailable: true,
+                mark_fails: Some(stray),
+            });
+            spawn(
+                temp_dir.path(),
+                vec![
+                    "-c".to_owned(),
+                    "echo ran > \"$0\"".to_owned(),
+                    marker.display().to_string(),
+                ],
+            )
+        };
+        unsafe { libc::close(stray) };
+        Ok((spawned, marker.exists()))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_descriptor_that_cannot_be_marked_fails_the_spawn_before_the_target_runs() -> Result<()> {
+        let (spawned, executed) = spawn_beside_unmarkable_stray(|_, args| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            spawn_strict_child_process_tree(&mut command).map(|_| ())
+        })?;
+        let error = spawned.expect_err("a sweep that cannot mark a descriptor must fail the spawn");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error}");
+        assert!(!executed, "the target executed with an unmarked descriptor");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_process_supervisor_reports_a_failed_sweep_without_running_its_target() -> Result<()> {
+        let (spawned, executed) = spawn_beside_unmarkable_stray(|cwd, args| {
+            spawn_process_supervisor_target(&ProcessSupervisorRequest {
+                version: 1,
+                program: "/bin/sh".to_owned(),
+                args,
+                cwd: cwd.display().to_string(),
+            })
+            .map(|_| ())
+        })?;
+        let error = spawned.expect_err("the supervisor must report the failed sweep");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::EPERM),
+            "{error:#}"
+        );
+        assert!(
+            !executed,
+            "the supervisor target executed with an unmarked descriptor"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_descriptor_above_a_lowered_open_file_limit_is_still_marked() -> Result<()> {
+        // Lowering RLIMIT_NOFILE is process-wide, so the scenario runs alone
+        // in a child test process.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "pty_runner::tests::lowered_open_file_limit_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("COVEN_LOWERED_OPEN_FILE_LIMIT_HELPER", "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("lowered-limit scenario ran"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lowered_open_file_limit_helper() -> Result<()> {
+        if std::env::var_os("COVEN_LOWERED_OPEN_FILE_LIMIT_HELPER").is_none() {
+            return Ok(());
+        }
+        const HIGH: libc::c_int = 4096;
+        const LOWERED: libc::rlim_t = 128;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        anyhow::ensure!(
+            limit.rlim_max > HIGH as libc::rlim_t,
+            "the hard limit {} cannot hold descriptor {HIGH}",
+            limit.rlim_max
+        );
+        let raised = libc::rlimit {
+            rlim_cur: limit.rlim_cur.max(HIGH as libc::rlim_t + 1),
+            rlim_max: limit.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) }, 0);
+        let mut created = [0; 2];
+        assert_eq!(unsafe { libc::pipe(created.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::dup2(created[1], HIGH) }, HIGH);
+        for fd in created {
+            unsafe { libc::close(fd) };
+        }
+        let lowered = libc::rlimit {
+            rlim_cur: LOWERED,
+            rlim_max: limit.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        // The bound a numeric probe would use now lies below the descriptor.
+        assert_eq!(
+            unsafe { libc::sysconf(libc::_SC_OPEN_MAX) },
+            LOWERED as libc::c_long
+        );
+        #[cfg(target_os = "linux")]
+        let _fault = InjectedSweepFault::install(SweepFault {
+            close_range_unavailable: true,
+            ..SweepFault::default()
+        });
+        let mut command = std::process::Command::new("/bin/ls");
+        command
+            .arg("/dev/fd")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_child_process_tree_command(&mut command);
+        let output = command.output()?;
+        assert!(output.status.success(), "{output:?}");
+        let listed: Vec<libc::c_int> = String::from_utf8(output.stdout)?
+            .split_whitespace()
+            .filter_map(|fd| fd.parse().ok())
+            .collect();
+        assert!(
+            !listed.contains(&HIGH),
+            "descriptor {HIGH} above the lowered limit was inherited: {listed:?}"
+        );
+        println!("lowered-limit scenario ran");
         Ok(())
     }
 
