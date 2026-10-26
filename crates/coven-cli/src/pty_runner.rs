@@ -2094,7 +2094,7 @@ impl InheritedDescriptorSweep {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
 unsafe fn mark_descriptor_close_on_exec(fd: libc::c_int) {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
