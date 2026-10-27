@@ -388,11 +388,11 @@ fn validate_canonical_32_byte_base64url(value: &str) -> Result<(), ActionIntentE
 mod tests {
     use super::*;
     use chrono::Duration;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
 
     fn public_key(seed: u8) -> String {
         let signing_key = p256::SecretKey::from_slice(&[seed; 32]).unwrap();
-        URL_SAFE_NO_PAD.encode(signing_key.public_key().to_encoded_point(false).as_bytes())
+        URL_SAFE_NO_PAD.encode(signing_key.public_key().to_sec1_point(false).as_bytes())
     }
 
     fn intent() -> DeviceActionIntent {
