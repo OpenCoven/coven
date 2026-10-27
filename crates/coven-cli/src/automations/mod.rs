@@ -70,7 +70,6 @@ pub mod store;
 // The production scoped read gate: P, and the immutable commitments it
 // records under the store's write lock (#1603).
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(crate) mod store_gate;
 pub mod stream_observation;
 // Wired into every session ending; it observes only Runtime Authority attempts,
@@ -86,10 +85,8 @@ mod transport_authority_tests;
 // The trusted Runtime Authority adapter (coven#857, slice 6).
 pub mod trusted_authority;
 // Launching a trusted attempt under its decision's scopes (coven#857 slice 6,
-// #1603). The daemon's launch path does not call it yet: that needs the
-// scoped read service's production gate.
+// #1603). The daemon launches the scoped read envelope only through it.
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(crate) mod trusted_launch;
 
 #[allow(unused_imports)]

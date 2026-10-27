@@ -316,10 +316,6 @@ impl StoreGate {
         })
     }
 
-    pub(crate) fn channel_id(&self) -> &str {
-        &self.channel_id
-    }
-
     /// Bounds how long the next transaction waits for the store.
     fn wait_at_most(&self) -> std::result::Result<(), Refusal> {
         let wait = match self.deadline {

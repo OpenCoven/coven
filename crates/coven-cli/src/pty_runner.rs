@@ -28,6 +28,9 @@ pub struct HarnessCommand {
     cwd: PathBuf,
     stdin_prompt: Option<Vec<u8>>,
     env_overrides: HarnessEnvironmentOverrides,
+    /// The child starts from an empty environment, so it holds exactly
+    /// `env_overrides`. Only a scoped read launch sets it.
+    clear_environment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +269,7 @@ impl HarnessCommand {
             cwd,
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         }
     }
 
@@ -297,6 +301,9 @@ impl HarnessCommand {
         let mut builder = CommandBuilder::new(&self.program);
         builder.args(&self.args);
         builder.cwd(self.cwd.as_os_str());
+        if self.clear_environment {
+            builder.env_clear();
+        }
         for (name, value) in &self.env_overrides {
             match value {
                 Some(value) => builder.env(name, value),
@@ -307,6 +314,9 @@ impl HarnessCommand {
     }
 
     fn apply_environment(&self, command: &mut std::process::Command) {
+        if self.clear_environment {
+            command.env_clear();
+        }
         for (name, value) in &self.env_overrides {
             match value {
                 Some(value) => {
@@ -397,6 +407,46 @@ pub fn build_envelope_harness_command(
         cwd: cwd.to_path_buf(),
         stdin_prompt: None,
         env_overrides,
+        clear_environment: false,
+    })
+}
+
+/// The command for a scoped read envelope launch, from its admitted
+/// `prepared` launch alone: the resolved harness in the empty launch folder,
+/// the envelope's arguments and MCP configuration, then the model, the
+/// familiar's preamble and `-- <prompt>`. The child starts from an empty
+/// environment holding exactly the variables the envelope names.
+#[cfg(unix)]
+pub(crate) fn build_scoped_harness_command(
+    harness_id: &str,
+    prepared: &crate::automations::scoped_read::admission::Prepared,
+    prompt: &str,
+    familiar: Option<&crate::harness::FamiliarContext>,
+    model: Option<&str>,
+) -> Result<HarnessCommand> {
+    let envelope_args: Vec<&str> = prepared.args.iter().map(String::as_str).collect();
+    let (_, args) = crate::harness::command_parts_for_envelope(
+        harness_id,
+        &envelope_args,
+        prompt,
+        familiar,
+        model,
+    )?;
+    Ok(HarnessCommand {
+        program: prepared
+            .program
+            .to_str()
+            .context("the admitted harness path is not UTF-8")?
+            .to_owned(),
+        args,
+        cwd: prepared.cwd.clone(),
+        stdin_prompt: None,
+        env_overrides: prepared
+            .environment
+            .iter()
+            .map(|(name, value)| (name.clone(), Some(value.clone())))
+            .collect(),
+        clear_environment: true,
     })
 }
 
@@ -511,6 +561,7 @@ fn build_harness_command_with_conversation_inner(
         cwd: cwd.to_path_buf(),
         stdin_prompt,
         env_overrides,
+        clear_environment: false,
     })
 }
 
@@ -3425,6 +3476,7 @@ pub fn build_stream_harness_command_with_conversation(
         cwd: cwd.to_path_buf(),
         stdin_prompt: None,
         env_overrides,
+        clear_environment: false,
     })
 }
 
@@ -5445,6 +5497,7 @@ pub(crate) fn windows_detached_stub_command(
         cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         stdin_prompt: None,
         env_overrides: Vec::new(),
+        clear_environment: false,
     })
 }
 
@@ -5470,6 +5523,7 @@ pub(crate) fn windows_console_probe_command(build_dir: &Path) -> Result<HarnessC
         cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         stdin_prompt: None,
         env_overrides: Vec::new(),
+        clear_environment: false,
     })
 }
 
@@ -5510,6 +5564,7 @@ pub(crate) fn piped_prompt_probe_command(
         cwd: build_dir.to_path_buf(),
         stdin_prompt: (!prompt.is_empty()).then_some(prompt),
         env_overrides: Vec::new(),
+        clear_environment: false,
     })
 }
 
@@ -7268,6 +7323,7 @@ mod tests {
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides,
+            clear_environment: false,
         };
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_for_output = Arc::clone(&captured);
@@ -7952,6 +8008,7 @@ mod tests {
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         let mut session = spawn_detached_with_observer(&command, None)?;
@@ -7971,6 +8028,7 @@ mod tests {
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let (exit_tx, exit_rx) = mpsc::channel();
         let observer = DetachedPtyObserver {
@@ -8123,6 +8181,7 @@ mod tests {
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides,
+            clear_environment: false,
         };
 
         assert_windows_detached_pty_queries(&command, &trace_file)
@@ -8311,6 +8370,7 @@ printf '%s\n' '{"type":"turn.completed"}'
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let mut assistant = Vec::new();
 
@@ -8367,6 +8427,7 @@ exec sleep 10
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         // The first frame is a readiness barrier; the child is silent after it,
@@ -8418,6 +8479,7 @@ exec sleep 10
             // would block indefinitely because the fake harness never reads.
             stdin_prompt: Some(vec![b'x'; 1024 * 1024]),
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         let outcome =
@@ -8477,6 +8539,7 @@ exit 0
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         let outcome = stream_codex_json_with_budgets(
@@ -8542,6 +8605,7 @@ exit 23
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let mut assistant = Vec::new();
 
@@ -8602,6 +8666,7 @@ exit 0
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         let outcome = stream_codex_json_with_budgets(
@@ -10825,6 +10890,7 @@ exit 0
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: Some(b"hello from stdin\nsecond & unsafe-looking line".to_vec()),
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let callback_output = captured.clone();
@@ -10874,6 +10940,7 @@ exit 0
                 cwd: temp_dir.path().to_path_buf(),
                 stdin_prompt: None,
                 env_overrides: Vec::new(),
+                clear_environment: false,
             };
             let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let callback_output = captured.clone();
@@ -10931,6 +10998,7 @@ exit 0
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: Some(b"first line\nsecond line\n".to_vec()),
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let mut assistant = Vec::new();
 
@@ -11009,6 +11077,7 @@ exit 0
             // covers a blocked prompt writer rather than only stdout reads.
             stdin_prompt: Some(vec![b'x'; 1024 * 1024]),
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         // The shim never reads or exits. As in the Unix blocked-writer case,

@@ -151,8 +151,10 @@ impl Prepared {
     }
 }
 
-/// Admits and prepares one launch.
-pub(crate) fn prepare(
+/// Admits and prepares one launch. Only the automations module calls it: the
+/// daemon's one caller is `trusted_launch::prepare`, which supplies the
+/// store gate.
+pub(in crate::automations) fn prepare(
     request: Request<'_>,
     gate: Box<dyn Gate>,
 ) -> Result<Prepared, AdmissionError> {

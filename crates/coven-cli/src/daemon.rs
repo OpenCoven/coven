@@ -29,6 +29,9 @@ use crate::{
     pty_runner,
 };
 
+#[cfg(all(test, unix))]
+#[path = "daemon_scoped_launch_tests.rs"]
+mod scoped_launch_tests;
 mod startup_failure;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +268,22 @@ pub struct LiveSessionRuntime {
     /// Every session this daemon registered, followed by the liveness sweep
     /// until the store settles it (#1196).
     liveness: Mutex<HashMap<String, TrackedRegistration>>,
+    /// The harness a test's scoped read launches run, in place of the one
+    /// `PATH` resolves.
+    #[cfg(test)]
+    scoped_harness: Option<PathBuf>,
+}
+
+/// What a Runtime Authority launch runs under.
+enum EnvelopeLaunch {
+    /// An envelope whose arguments alone contain the harness: one of
+    /// `runtime_envelope::LAUNCHABLE`.
+    Args(&'static crate::automations::runtime_envelope::RuntimeEnvelope),
+    /// The scoped read envelope, admitted by `trusted_launch::prepare` under
+    /// the store gate. It runs in its empty launch folder with exactly its
+    /// own environment.
+    #[cfg(unix)]
+    Scoped(Box<crate::automations::scoped_read::admission::Prepared>),
 }
 
 /// One registration the liveness sweep follows. Holding the registration
@@ -524,6 +543,11 @@ struct LiveSessionRegistration {
     stream_turns: Mutex<crate::stream_turn_state::StreamTurnState>,
     writer: Mutex<Option<crate::maintenance_gate::WriterLease>>,
     event_order: Mutex<()>,
+    /// A scoped read launch's admitted launch: the attempt's channel and its
+    /// launch folder. The registry owns it for the session's life, and it is
+    /// finished when the session exits, is killed or is stopped by shutdown.
+    #[cfg(unix)]
+    scoped: Mutex<Option<crate::automations::scoped_read::admission::Prepared>>,
 }
 
 impl LiveSessionRegistration {
@@ -533,6 +557,33 @@ impl LiveSessionRegistration {
             stream_turns: Mutex::new(crate::stream_turn_state::StreamTurnState::default()),
             writer: Mutex::new(writer),
             event_order: Mutex::new(()),
+            #[cfg(unix)]
+            scoped: Mutex::new(None),
+        }
+    }
+
+    #[cfg(unix)]
+    fn hold_scoped(&self, prepared: crate::automations::scoped_read::admission::Prepared) {
+        *self
+            .scoped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(prepared);
+    }
+
+    /// Finishes the session's scoped read launch, if it has one: closes the
+    /// channel, so every later call is refused, and removes the launch
+    /// folder. Each committed operation is already in the store.
+    fn finish_scoped(&self) {
+        #[cfg(unix)]
+        {
+            let prepared = self
+                .scoped
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(prepared) = prepared {
+                prepared.finish();
+            }
         }
     }
 
@@ -600,6 +651,7 @@ impl LiveSessionExitCleanup {
         drop(sessions);
         drop(removed);
         self.registration.release_writer();
+        self.registration.finish_scoped();
         if was_poisoned {
             report_poisoned();
         }
@@ -623,7 +675,87 @@ impl LiveSessionRuntime {
             shutting_down: AtomicBool::new(false),
             launch_gate: Arc::default(),
             liveness: Mutex::default(),
+            #[cfg(test)]
+            scoped_harness: None,
         })
+    }
+
+    /// Runs scoped read launches with `harness`, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_scoped_harness(mut self, harness: PathBuf) -> Self {
+        self.scoped_harness = Some(harness);
+        self
+    }
+
+    /// The harness executable a scoped read launch runs: admission runs it
+    /// with nothing on `PATH` but its own folder, so it must be resolved
+    /// here, from the daemon's `PATH`.
+    #[cfg(unix)]
+    fn scoped_harness_program(&self, harness: &str) -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some(program) = &self.scoped_harness {
+            return Ok(program.clone());
+        }
+        let specs = crate::harness::configured_harness_specs()?;
+        let spec = specs
+            .iter()
+            .find(|spec| spec.id == harness)
+            .with_context(|| format!("harness `{harness}` is not configured"))?;
+        let program = PathBuf::from(crate::harness::spawn_executable_for_platform(
+            &spec.executable,
+        ));
+        if program.is_absolute() {
+            return Ok(program);
+        }
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|folder| folder.join(&program))
+                    .find(|candidate| crate::install_conflict::is_runnable(candidate))
+            })
+            .with_context(|| format!("`{}` is not on PATH", program.display()))
+    }
+
+    /// Admits a scoped read launch for `projection` through
+    /// `trusted_launch::prepare`, on the daemon's own store connection. Any
+    /// refusal fails before anything starts.
+    #[cfg(unix)]
+    fn prepare_scoped_launch(
+        &self,
+        launch: &SessionLaunch,
+        projection: &crate::automations::authority_projection::AutomationAuthorityConsumerProjection,
+    ) -> Result<crate::automations::scoped_read::admission::Prepared> {
+        let refused = |why: String| {
+            anyhow::anyhow!(
+                "{}: {why}",
+                crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+            )
+        };
+        let coven_home = self
+            .coven_home
+            .as_deref()
+            .ok_or_else(|| refused("a scoped read launch requires COVEN_HOME".to_owned()))?;
+        let conn = crate::store::open_store(&crate::api::store_path(coven_home))
+            .map_err(|error| refused(format!("{error:#}")))?;
+        let program = self
+            .scoped_harness_program(&launch.harness)
+            .map_err(|error| refused(format!("{error:#}")))?;
+        let relay = std::env::current_exe()
+            .map_err(|error| refused(format!("the relay cannot be located: {error}")))?;
+        let owner_home = dirs_next::home_dir();
+        let scoped = crate::automations::trusted_launch::ScopedLaunch {
+            coven_home,
+            projection,
+            harness: &launch.harness,
+            session_id: &launch.id,
+            project: Path::new(&launch.cwd),
+            program: &program,
+            relay: &relay,
+            owner_home: owner_home.as_deref(),
+            deadline: run_deadline(&conn, projection.attempt_id.as_str()),
+        };
+        crate::automations::trusted_launch::prepare(&conn, &scoped, chrono::Utc::now())
+            .map_err(|refusal| refused(refusal.to_string()))
     }
 
     fn begin_launch(&self) -> Result<LiveLaunchAdmission> {
@@ -907,6 +1039,7 @@ impl LiveSessionRuntime {
             if let Err(error) = result {
                 failures.push(format!("{error:#}"));
             }
+            handle.registration.finish_scoped();
         }
         anyhow::ensure!(
             failures.is_empty(),
@@ -947,6 +1080,30 @@ impl LiveSessionRuntime {
             registration,
         )
     }
+}
+
+/// When the run `attempt_id` belongs to times out, as an instant, if it has a
+/// timeout the store can read.
+#[cfg(unix)]
+fn run_deadline(conn: &rusqlite::Connection, attempt_id: &str) -> Option<Instant> {
+    use rusqlite::OptionalExtension;
+    let timeout_at: String = conn
+        .query_row(
+            "SELECT r.timeout_at FROM automation_runs AS r
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             WHERE a.id = ?1",
+            [attempt_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()?;
+    let timeout_at = chrono::DateTime::parse_from_rfc3339(&timeout_at).ok()?;
+    let remaining = (timeout_at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    Some(Instant::now() + remaining)
 }
 
 fn reject_registration_during_shutdown(killer: &mut dyn RuntimeKiller) -> Result<()> {
@@ -1088,6 +1245,38 @@ impl SessionRuntime for LiveSessionRuntime {
         true
     }
 
+    /// A scoped read envelope also needs an admitted harness version and
+    /// the owner's key, checked as admission will check them.
+    fn preflight_authority_launch(
+        &self,
+        harness: &str,
+        envelope: &'static crate::automations::runtime_envelope::RuntimeEnvelope,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        if envelope.service.is_some() {
+            anyhow::ensure!(
+                harness == envelope.harness,
+                crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+            );
+            let coven_home = self
+                .coven_home
+                .as_deref()
+                .context("a scoped read launch requires COVEN_HOME")?;
+            let program = self.scoped_harness_program(harness)?;
+            return crate::automations::scoped_read::admission::preflight(
+                coven_home, envelope, &program,
+            )
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("{error}"));
+        }
+        let _ = harness;
+        anyhow::ensure!(
+            crate::automations::runtime_envelope::is_launchable(envelope),
+            crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+        );
+        Ok(())
+    }
+
     fn launch_authorized_contained_adopted_session(
         &self,
         launch: &SessionLaunch,
@@ -1097,19 +1286,33 @@ impl SessionRuntime for LiveSessionRuntime {
         writer: Option<crate::maintenance_gate::WriterLease>,
         ownership_established: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        let unsupported = || anyhow::anyhow!(crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED);
         let envelope = match authority {
             None => None,
-            Some(projection) => Some(
+            Some(_)
+                if launch.launch_mode != crate::harness::HarnessLaunchMode::NonInteractive
+                    || launch.conversation.is_some()
+                    || launch.launch_policy.is_some() =>
+            {
+                return Err(unsupported());
+            }
+            // The scoped read envelope never starts from its arguments: only
+            // `trusted_launch::prepare` admits it, under the store gate.
+            #[cfg(unix)]
+            Some(projection)
+                if crate::automations::runtime_envelope::by_descriptor_digest(
+                    projection.runtime.descriptor_digest.value.as_str(),
+                )
+                .is_some_and(|envelope| envelope.service.is_some()) =>
+            {
+                Some(EnvelopeLaunch::Scoped(Box::new(
+                    self.prepare_scoped_launch(launch, projection)?,
+                )))
+            }
+            Some(projection) => Some(EnvelopeLaunch::Args(
                 crate::automations::runtime_envelope::for_projection(projection, &launch.harness)
-                    .filter(|_| {
-                        launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive
-                            && launch.conversation.is_none()
-                            && launch.launch_policy.is_none()
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED)
-                    })?,
-            ),
+                    .ok_or_else(unsupported)?,
+            )),
         };
         self.launch_session_with_envelope(
             launch,
@@ -1380,12 +1583,21 @@ impl LiveSessionRuntime {
         writer: Option<crate::maintenance_gate::WriterLease>,
         ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
         strict_containment: bool,
-        envelope: Option<&'static crate::automations::runtime_envelope::RuntimeEnvelope>,
+        envelope: Option<EnvelopeLaunch>,
     ) -> Result<()> {
         anyhow::ensure!(
             envelope.is_none() || strict_containment,
             "a Runtime Authority envelope launch must be strictly contained"
         );
+        if let Some(EnvelopeLaunch::Args(envelope)) = &envelope {
+            // A scoped read envelope's arguments name a service only an
+            // admitted launch provides.
+            anyhow::ensure!(
+                envelope.service.is_none(),
+                crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+            );
+        }
+        let enveloped = envelope.is_some();
         if self.shutting_down.load(Ordering::Acquire) {
             self.record_no_process_receipt(launch, strict_containment)?;
             return Err(anyhow::Error::new(
@@ -1406,15 +1618,37 @@ impl LiveSessionRuntime {
             launch_policy: launch.launch_policy.as_ref(),
             ..Default::default()
         };
+        #[cfg(unix)]
+        let mut scoped = None;
         let mut command = if let Some(envelope) = envelope {
-            pty_runner::build_envelope_harness_command(
-                &launch.harness,
-                envelope.args,
-                &launch.prompt,
-                Path::new(&launch.cwd),
-                familiar_ctx.as_ref(),
-                launch.model.as_deref(),
-            )?
+            match envelope {
+                EnvelopeLaunch::Args(envelope) => pty_runner::build_envelope_harness_command(
+                    &launch.harness,
+                    envelope.args,
+                    &launch.prompt,
+                    Path::new(&launch.cwd),
+                    familiar_ctx.as_ref(),
+                    launch.model.as_deref(),
+                )?,
+                #[cfg(unix)]
+                EnvelopeLaunch::Scoped(prepared) => {
+                    // Its environment is exactly the envelope's: no writer
+                    // capability joins it.
+                    anyhow::ensure!(
+                        writer.is_none(),
+                        "a scoped read launch takes no maintenance writer"
+                    );
+                    let command = pty_runner::build_scoped_harness_command(
+                        &launch.harness,
+                        &prepared,
+                        &launch.prompt,
+                        familiar_ctx.as_ref(),
+                        launch.model.as_deref(),
+                    )?;
+                    scoped = Some(*prepared);
+                    command
+                }
+            }
         } else if launch.harness == "codex"
             && launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive
         {
@@ -1472,17 +1706,44 @@ impl LiveSessionRuntime {
             );
         }
         Self::apply_writer_participant(&mut command, writer.as_ref())?;
-        self.launch_prepared_session(
+        self.launch_prepared_session_holding(
             launch,
             writer,
             command,
             ownership_established,
             strict_containment,
-            envelope.is_some(),
+            enveloped,
+            #[cfg(unix)]
+            scoped,
         )
     }
 
+    #[cfg(test)]
     fn launch_prepared_session(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        command: pty_runner::HarnessCommand,
+        ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
+        strict_containment: bool,
+        wrap_stderr: bool,
+    ) -> Result<()> {
+        self.launch_prepared_session_holding(
+            launch,
+            writer,
+            command,
+            ownership_established,
+            strict_containment,
+            wrap_stderr,
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    /// [`Self::launch_prepared_session`], with the registration owning a
+    /// scoped read launch's `scoped` admitted launch.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_prepared_session_holding(
         &self,
         launch: &SessionLaunch,
         writer: Option<crate::maintenance_gate::WriterLease>,
@@ -1490,9 +1751,17 @@ impl LiveSessionRuntime {
         mut ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
         strict_containment: bool,
         wrap_stderr: bool,
+        #[cfg(unix)] scoped: Option<crate::automations::scoped_read::admission::Prepared>,
     ) -> Result<()> {
         let (observer, registration) =
             self.observer_for_session_with_writer(launch.id.clone(), writer);
+        // From here the registration owns the scoped launch: the session's
+        // exit, kill or shutdown finishes it, and a launch that fails before
+        // then drops it, which closes the channel and removes the folder.
+        #[cfg(unix)]
+        if let Some(prepared) = scoped {
+            registration.hold_scoped(prepared);
+        }
         let startup = self
             .main_session_starts
             .lock()
@@ -1898,6 +2167,7 @@ impl LiveSessionRuntime {
             }
             return Err(error);
         }
+        handle.registration.finish_scoped();
         Ok(())
     }
 }
