@@ -63,7 +63,11 @@ names but read none of them. Recursion stops 32 components from the root.
 **A search** matches a literal pattern of 1 to 256 bytes against each line, and
 never shells out. It walks in path order and reads every file through the same
 checked read, from the root. A file that cannot be read, is too large or is not
-text is counted in `skipped`. Matched lines are cut to 512 bytes and count
+text is counted in `skipped`. A directory beneath the searched one that cannot
+be opened or listed, or an entry that cannot be examined, is also counted in
+`skipped`, and because the files beneath it went unscanned the result says
+`complete: false`; the walk continues past it. A searched directory that
+cannot itself be listed refuses the search rather than answering empty. Matched lines are cut to 512 bytes and count
 against the attempt's disclosure total. Each page holds up to 256 matches, and
 `after` resumes after a file and line.
 

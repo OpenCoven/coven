@@ -1184,4 +1184,87 @@ mod filesystem {
         );
         assert_env_unlisted_and_unsearched(&mut reader);
     }
+
+    /// Whether this process ignores permission bits, as root does.
+    fn privileged() -> bool {
+        // SAFETY: geteuid() only reads the effective uid and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("permissions");
+    }
+
+    #[test]
+    fn a_search_that_cannot_open_a_subdirectory_is_incomplete() {
+        if privileged() {
+            eprintln!("skipped: permission bits do not bind a privileged process");
+            return;
+        }
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(guides.join("locked")).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("locked/x.md"), "TODO x").unwrap();
+        fs::write(guides.join("z.md"), "TODO z").unwrap();
+        set_mode(&guides.join("locked"), 0o000);
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let found = reader.serve(&search_request("docs/guides", "TODO", None));
+        set_mode(&guides.join("locked"), 0o755);
+        let found = found.expect("a search").to_json();
+        assert_eq!(
+            found["matches"],
+            json!([
+                {"path": "docs/guides/a.md", "line": 1, "text": "TODO a"},
+                {"path": "docs/guides/z.md", "line": 1, "text": "TODO z"},
+            ]),
+            "the walk continues past the unopenable directory"
+        );
+        assert_eq!(found["skipped"], 1);
+        assert_eq!(found["complete"], false);
+        assert_eq!(found["next"], Value::Null);
+    }
+
+    #[test]
+    fn a_search_that_cannot_examine_a_subdirectorys_entries_is_incomplete() {
+        if privileged() {
+            eprintln!("skipped: permission bits do not bind a privileged process");
+            return;
+        }
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(guides.join("opaque")).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("opaque/x.md"), "TODO x").unwrap();
+        // Readable but not searchable: its names list, but none can be examined.
+        set_mode(&guides.join("opaque"), 0o400);
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let found = reader.serve(&search_request("docs/guides", "TODO", None));
+        set_mode(&guides.join("opaque"), 0o755);
+        let found = found.expect("a search").to_json();
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a.md", "line": 1, "text": "TODO a"}])
+        );
+        assert_ne!(found["skipped"], 0);
+        assert_eq!(found["complete"], false);
+    }
+
+    #[test]
+    fn a_search_whose_directory_cannot_be_listed_is_refused() {
+        if privileged() {
+            eprintln!("skipped: permission bits do not bind a privileged process");
+            return;
+        }
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        set_mode(&guides, 0o000);
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let refused = reader.serve(&search_request("docs/guides", "TODO", None));
+        set_mode(&guides, 0o755);
+        assert_eq!(refused.err(), Some(Refusal::ResourceUnavailable));
+    }
 }

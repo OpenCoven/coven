@@ -133,9 +133,13 @@ pub(crate) enum Body {
         matches: Vec<Match>,
         /// Where the next page starts, when the page filled.
         next: Option<SearchPosition>,
-        /// Files left unscanned: too large, not text, or refused by the read.
+        /// Entries left unscanned: files too large, not text, or refused by
+        /// the read, and entries or directories beneath the searched one that
+        /// could not be examined, opened or listed.
         skipped: u64,
-        /// False when the page filled or a limit stopped the scan.
+        /// False when the page filled, a limit stopped the scan, or a
+        /// directory beneath the searched one could not be walked, so files
+        /// in it may have gone unscanned.
         complete: bool,
     },
 }
@@ -326,7 +330,7 @@ impl ScopedReader {
                 if scan == 0 {
                     return Err(Refusal::LimitScan);
                 }
-                let found = platform::search_beneath(
+                let found = match platform::search_beneath(
                     &platform::Scope {
                         root,
                         protected: &protected,
@@ -338,11 +342,17 @@ impl ScopedReader {
                     scan,
                     disclosure,
                     probe,
-                )?;
+                ) {
+                    Ok(found) => found,
+                    Err(error) => {
+                        self.scanned += error.scanned;
+                        return Err(error.refusal);
+                    }
+                };
                 self.scanned += found.scanned;
                 self.disclosed += found.disclosed;
                 Body::Search {
-                    complete: !found.stopped && found.next.is_none(),
+                    complete: !found.stopped && !found.partial && found.next.is_none(),
                     pattern,
                     matches: found.matches,
                     next: found.next,
@@ -407,6 +417,9 @@ struct Found {
     skipped: u64,
     /// A limit stopped the scan.
     stopped: bool,
+    /// Something beneath the searched directory could not be examined or
+    /// walked, so the files it holds were not all scanned.
+    partial: bool,
     scanned: u64,
     disclosed: u64,
 }
@@ -803,7 +816,7 @@ mod platform {
         scan: u64,
         disclosure: u64,
         probe: &mut dyn FnMut(Step),
-    ) -> Result<Found, Refusal> {
+    ) -> Result<Found, ScanError> {
         let directory =
             open_directory_beneath(scope.root, start.components(), scope.protected, probe)?;
         probe(Step::Read);
@@ -816,7 +829,14 @@ mod platform {
             found: Found::default(),
             probe,
         };
-        search.visit(&directory, start);
+        // A searched directory that cannot be listed refuses: an empty result
+        // would claim there was nothing to find.
+        if let Err(refusal) = search.visit(&directory, start) {
+            return Err(ScanError {
+                refusal,
+                scanned: search.found.scanned,
+            });
+        }
         Ok(search.found)
     }
 
@@ -837,7 +857,17 @@ mod platform {
             self.found.stopped || self.found.next.is_some()
         }
 
-        fn visit(&mut self, directory: &Dir, path: &RelativePath) {
+        /// Something beneath the search could not be examined or walked:
+        /// count it, and report the search as incomplete.
+        fn unexamined(&mut self) {
+            self.found.skipped += 1;
+            self.found.partial = true;
+        }
+
+        /// Searches `directory`, which is `path`. Fails only when the
+        /// directory itself cannot be listed for a reason other than the scan
+        /// limit; the names it did scan are charged either way.
+        fn visit(&mut self, directory: &Dir, path: &RelativePath) -> Result<(), Refusal> {
             let remaining = self.scan - self.found.scanned;
             let names = match names(directory, self.scope.policy, remaining) {
                 Ok((names, scanned)) => {
@@ -846,13 +876,16 @@ mod platform {
                 }
                 Err(error) => {
                     self.found.scanned += error.scanned;
-                    self.found.stopped = error.refusal == Refusal::LimitScan;
-                    return;
+                    if error.refusal == Refusal::LimitScan {
+                        self.found.stopped = true;
+                        return Ok(());
+                    }
+                    return Err(error.refusal);
                 }
             };
             for name in names {
                 if self.done() {
-                    return;
+                    return Ok(());
                 }
                 let Ok(child) = path.child(&name, self.scope.policy) else {
                     continue;
@@ -875,14 +908,22 @@ mod platform {
                     Some((EntryKind::Directory, listed))
                         if child.components().len() < self.scope.policy.depth =>
                     {
-                        if let Some(next) = enter_child(directory, &name, listed, self.scope.root) {
-                            self.visit(&next, &child);
+                        let walked = enter_child(directory, &name, listed, self.scope.root)
+                            .is_some_and(|next| self.visit(&next, &child).is_ok());
+                        if !walked {
+                            self.unexamined();
                         }
                     }
                     Some((EntryKind::File, _)) => self.scan(&child),
-                    _ => {}
+                    // A directory at the depth limit.
+                    Some(_) => {}
+                    None if unexaminable(directory, &name) => self.unexamined(),
+                    // Left out on purpose, as a listing leaves it out, or gone
+                    // since the directory was listed.
+                    None => {}
                 }
             }
+            Ok(())
         }
 
         fn scan(&mut self, path: &RelativePath) {
@@ -1026,6 +1067,15 @@ mod platform {
     #[cfg(not(target_os = "linux"))]
     fn entry_on_mount(_directory: &Dir, _name: &str, _listed: Identity, root: &BoundRoot) -> bool {
         root.mount.is_none()
+    }
+
+    /// Whether `name` was left out of a walk only because it could not be
+    /// examined at all, as in a directory that can be read but not searched.
+    /// An entry that is gone since the listing was not missed.
+    fn unexaminable(directory: &Dir, name: &str) -> bool {
+        directory
+            .symlink_metadata(name)
+            .is_err_and(|error| error.kind() != io::ErrorKind::NotFound)
     }
 
     /// Opens a subdirectory a search found, only if it is still what was
@@ -1286,7 +1336,7 @@ mod platform {
         _scan: u64,
         _disclosure: u64,
         _probe: &mut dyn FnMut(Step),
-    ) -> Result<Found, Refusal> {
-        Err(Refusal::PlatformUnsupported)
+    ) -> Result<Found, ScanError> {
+        Err(Refusal::PlatformUnsupported.into())
     }
 }
