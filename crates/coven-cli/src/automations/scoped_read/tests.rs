@@ -675,6 +675,56 @@ mod filesystem {
     }
 
     #[test]
+    fn excluded_names_are_charged_to_the_scan_total() {
+        let scratch = scratch();
+        let repo = scratch.path().join("root/work/repo");
+        fs::create_dir_all(repo.join(".git")).expect("directory");
+        fs::write(repo.join(".git/config"), "TODO SENTINEL").expect("file");
+        fs::write(repo.join(".env"), "TODO SENTINEL").expect("file");
+        fs::write(repo.join(".env.local"), "TODO SENTINEL").expect("file");
+        fs::write(repo.join("a.md"), "TODO a").expect("file");
+        // `.git`, `.env` and `.env.local` (18 bytes) and `a.md` (4 bytes):
+        // the excluded names are charged before they are left out.
+        let names = 4 + 4 + 10 + 4;
+        let scoped = |scan_bytes| {
+            reader_with(
+                scratch.path(),
+                &[scope("recursive-read:work/repo")],
+                ReadPolicy {
+                    scan_bytes,
+                    ..R0_READ_POLICY
+                },
+            )
+        };
+
+        let mut reader = scoped(names - 1);
+        assert_eq!(
+            reader.serve(&list_request("work/repo", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+        let mut reader = scoped(names - 1);
+        let found = reader
+            .serve(&search_request("work/repo", "TODO", None))
+            .expect("a partial search")
+            .to_json();
+        assert_eq!(found["matches"], json!([]));
+        assert_eq!(found["complete"], false);
+        assert_eq!(found["next"], Value::Null);
+
+        // Exactly the names: the listing is served and spends the total.
+        let mut reader = scoped(names);
+        let listed = reader
+            .serve(&list_request("work/repo", None))
+            .expect("a listing")
+            .to_json();
+        assert_eq!(listed["entries"], json!([{"name": "a.md", "kind": "file"}]));
+        assert_eq!(
+            reader.serve(&list_request("work/repo", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+    }
+
+    #[test]
     fn a_search_reports_incomplete_when_content_uses_the_exact_scan_budget() {
         let scratch = scratch();
         let file = scratch.path().join("root/docs/guides/a");
