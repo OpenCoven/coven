@@ -143,11 +143,16 @@ from #1217:
 - a widened definition, a different launch folder, another binding and a
   tampered request are refused.
 
-Still open: wiring `prepare` into the daemon's launch, so the channel opens and
-closes with the session, and the production gate for response commitment
-under the daemon's revocation fence. Until both land, `r0-read.2` is not
-launchable, and definitions keep refusing an `authority` block.
-[The gate proposal](coven-automations-scoped-read-gate-proposal.md) covers both, for decision. Also open: the mission switch, receipts
+**The daemon launches it under the production gate** (#1604). The
+[gate proposal](coven-automations-scoped-read-gate-proposal.md) is approved
+and implemented:
+- the channel opens with the session and closes when it ends;
+- each result is committed under the store's write lock before a byte of it
+  is written;
+- stale channels are swept at startup.
+
+`r0-read.2` still never starts from its arguments alone. Still open: the
+mission switch, receipts
 of the service's operations, and Windows. The vectors are engineering
 evidence, not containment certification.
 

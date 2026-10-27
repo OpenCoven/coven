@@ -10,7 +10,9 @@ source_adjacent_reason: "Proposes the gate and launch wiring left open by the sc
 
 # Automations scoped read gate proposal
 
-Status: Proposed — awaiting maintainer decision
+Status: Approved as written and implemented (#1604). Val approved it on #857
+(comment 6446181451), with two decisions: the `workspace` root stays refused
+for v1, and the execution binding carries no scope digest.
 
 Tracks: #1603 (draft PR #1604), #857. Builds on the
 [scoped read service design](coven-automations-scoped-read-service.md) and the
@@ -249,6 +251,35 @@ seen failing first and then passing. Pause points use test hooks, like
 
 Lifting opt-in does not advertise Runtime Authority or certify containment.
 Those stay with #858 and #854.
+
+## As implemented
+
+The code follows the recommendation. Where the proposal left a detail open,
+the implementation chose:
+
+- `store_gate::authorized` is P. The launch, `admit` and `commit` evaluate
+  it, and nothing else decides whether an attempt may still read. P also
+  checks the attempt's session, so a gate held for one session refuses
+  another.
+- `trusted_launch::prepare` takes no gate. It always builds the `StoreGate`
+  from what `launch_scopes` verified, with the envelope's operation time as
+  its store wait and the run's deadline. Tests that pause the gate use a
+  test-only `prepare_with_gate`.
+- `Gate::commit` takes a `Committing` value: the sequence, the tool, the
+  reader's refusal if any, the digest, and the result's length.
+- `EnvelopeLaunch::Scoped` boxes its `Prepared`. `admission::prepare` is
+  visible only inside the automations module.
+- The harness gets exactly the envelope's five variables. As for every
+  piped launch, the containment receipt path stays with the supervisor.
+- The startup sweep removes only a channel's socket and configuration, then
+  its directory.
+
+Left for follow-up, because this proposal does not cover them:
+
+- persisting `Prepared::finish`'s operation list, and comparing it with the
+  committed rows at settlement;
+- sweeping launch folders that a crash leaves in the system temporary
+  folder.
 
 ## What this proposal does not decide
 

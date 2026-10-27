@@ -6,9 +6,11 @@ source_adjacent_reason: "Records the runtime authority trust decisions alongside
 
 Status: maintainer decisions recorded 2026-10-03; slices 1 to 6
 implemented. The trusted adapter constructs Runtime Authority for routines
-that declare it, under the scoped read envelope only. The daemon does not yet
-launch that envelope, so definitions still refuse an `authority` block, and
-the capability is not advertised.
+that declare it, under the scoped read envelope only. The daemon launches
+that envelope only through `trusted_launch::prepare`, under the store gate
+([gate proposal](coven-automations-scoped-read-gate-proposal.md)), so
+definitions may declare an `authority` block. The capability is not
+advertised, and containment is not certified (#858, #854).
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
 OpenCoven/coven-runtimes#48 (terminal observations), #858 (certification)
@@ -410,17 +412,21 @@ unadvertised until slice 6.
    decision's signed request. A definition changed after the decision cannot
    widen them.
 
-   Still open: the daemon's launch path does not call `prepare` yet. It needs
-   the scoped read service's production gate, which commits each response
-   under the daemon's revocation fence. Until then:
-   - `r0-read.2` stays out of the daemon's launchable envelopes, because
-     launching it from its arguments alone would start it without the scoped
-     read service;
-   - the daemon would refuse an `r0-read.2` launch only after dispatch has
-     consumed a decision, so definition validation keeps refusing an
-     `authority` block, on create and revise alike. No production routine
-     can reach the adapter, and tests build such routines on their own
-     thread.
+   The daemon launches `r0-read.2` only through `prepare`, as the approved
+   [gate proposal](coven-automations-scoped-read-gate-proposal.md) describes:
+   - `r0-read.2` stays out of the daemon's launchable envelopes. The
+     arguments-only path refuses any envelope with a scoped read service.
+   - The daemon opens its own store connection and calls `prepare`. The
+     harness runs in its empty launch folder with exactly the envelope's
+     environment. The session registry owns the admitted launch until the
+     session exits, is killed or is stopped by shutdown.
+   - Every operation runs under a `StoreGate`. `admit` checks P and records
+     nothing. `commit` checks P again and records one immutable row, inside
+     one `BEGIN IMMEDIATE` transaction. If a revocation commits first, the
+     result is withheld. A busy store also withholds it.
+   - At startup the daemon sweeps channel directories that a crash left
+     behind.
+   - Definition validation admits an `authority` block.
 
    Before the launch transaction decides anything, dispatch preflights what
    needs no decision: the runtime takes authority projections and can launch
