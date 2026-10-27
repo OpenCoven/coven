@@ -46,6 +46,7 @@ use super::runner::{
     AutomationAuthorityRequest, AutomationDispatchAuthority, AutomationTerminalAuthorityRequest,
 };
 use super::runtime_envelope::{self, RuntimeEnvelope};
+use super::scoped_read::scope::{Grants, RootKind};
 use super::threads_decisions::{self, Ed25519, ThreadsDecision};
 use crate::familiar_issuer::{self, BindingPurpose, BindingRequest, IssueRefusal, TargetType};
 
@@ -151,9 +152,12 @@ impl<'a> TrustedAuthority<'a> {
             }
         };
 
-        // 2. The envelope that enforces the declared grant.
+        // 2. The envelope that enforces the declared grant: the scoped read
+        // envelope, whose only file tools are the daemon's scoped read
+        // service, and only for scopes that service can enforce as written.
         let capabilities: Vec<&str> = authority.capabilities.iter().map(String::as_str).collect();
-        let Some(envelope) = runtime_envelope::for_grant(&definition.runtime, &capabilities) else {
+        let Some(envelope) = runtime_envelope::for_scoped_grant(&definition.runtime, &capabilities)
+        else {
             return refuse(
                 AuthorityProfileErrorCode::RuntimeDowngrade,
                 format!(
@@ -162,6 +166,15 @@ impl<'a> TrustedAuthority<'a> {
                 ),
             );
         };
+        if let Err(reason) = enforceable_scopes(envelope, &authority.scopes) {
+            return refuse(
+                AuthorityProfileErrorCode::RuntimeDowngrade,
+                format!(
+                    "the `{}` envelope cannot enforce the declared scopes: {reason}",
+                    envelope.descriptor_version
+                ),
+            );
+        }
 
         // 3. The familiar embodiment binding. The contract's opaque ids carry a
         // namespace, which Coven's attempt ids do not.
@@ -729,8 +742,38 @@ fn current_definition(conn: &Connection, automation_id: &str) -> Result<Option<R
         .transpose()
 }
 
+/// Whether `envelope`'s scoped read service enforces `scopes` exactly as
+/// declared. Each must be a read of a file or folder beneath the routine's
+/// project folder, the only root a launch binds, in the spelling the service
+/// interprets. A scope the envelope could not exercise, a write or another
+/// root or kind, is refused rather than left silently unusable.
+fn enforceable_scopes(
+    envelope: &RuntimeEnvelope,
+    scopes: &[Value],
+) -> std::result::Result<(), String> {
+    let service = envelope
+        .service
+        .as_ref()
+        .ok_or("the envelope has no scoped read service")?;
+    for scope in scopes {
+        let field = |name: &str| scope.get(name).and_then(Value::as_str);
+        if field("kind") != Some("filesystem") {
+            return Err(format!("{scope} is not a filesystem scope"));
+        }
+        if field("root") != Some(RootKind::Project.name()) {
+            return Err(format!("{scope} is not on the project root"));
+        }
+        if field("access") != Some("read") {
+            return Err(format!("{scope} does not grant reading"));
+        }
+    }
+    Grants::from_scopes(scopes, &service.policy)
+        .map(|_| ())
+        .map_err(|refusal| refusal.code().to_owned())
+}
+
 /// A stable opaque identifier for a working directory.
-fn opaque_id(kind: &str, cwd: &str) -> String {
+pub(crate) fn opaque_id(kind: &str, cwd: &str) -> String {
     format!("{kind}:{}", &sha256_hex(cwd.as_bytes())[..32])
 }
 
@@ -788,7 +831,7 @@ mod tests {
         json!({
             "actionType": "analysis.read", "riskClass": "R0",
             "capabilities": ["analysis.read"],
-            "scopes": [{ "kind": "filesystem", "root": "workspace", "path": "notes/today.md",
+            "scopes": [{ "kind": "filesystem", "root": "project", "path": "notes/today.md",
                          "access": "read", "recursive": false }],
             "proposalSafe": true
         })
@@ -882,10 +925,13 @@ mod tests {
             binding["risk"],
             json!({ "riskClass": "R0", "sideEffectClass": "local_read" })
         );
+        // The scoped read envelope, whose only file tools are the daemon's
+        // scoped read service: never the native read tools of r0-read.1.
         assert_eq!(
             binding["runtime"]["descriptorDigest"]["value"],
-            json!(runtime_envelope::CLAUDE_R0_READ.descriptor_digest())
+            json!(runtime_envelope::CLAUDE_R0_SCOPED_READ.descriptor_digest())
         );
+        assert_eq!(binding["runtime"]["descriptorVersion"], json!("r0-read.2"));
         assert_eq!(binding["approval"]["requirement"], json!("not_required"));
         transaction.commit().unwrap();
     }
@@ -961,6 +1007,83 @@ mod tests {
         assert_eq!(
             refusal(&home, &request(&home, "stale")),
             AuthorityProfileErrorCode::FamiliarStale
+        );
+    }
+
+    fn decisions(home: &Home) -> i64 {
+        home.conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_threads_decisions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_scope_the_scoped_reader_cannot_enforce_is_refused_before_deciding() {
+        let home = home();
+        let before = decisions(&home);
+        let scope = |root: &str, path: &str, access: &str, recursive: bool| {
+            json!({ "kind": "filesystem", "root": root, "path": path,
+                    "access": access, "recursive": recursive })
+        };
+        for (id, scopes) in [
+            // Only the routine's project folder is bound to a launch.
+            (
+                "workspace",
+                json!([scope("workspace", "notes/today.md", "read", false)]),
+            ),
+            // A read envelope cannot exercise a write grant.
+            (
+                "write",
+                json!([scope("project", "notes/today.md", "write", false)]),
+            ),
+            // Nothing in the envelope reaches the network.
+            (
+                "network",
+                json!([{ "kind": "network", "root": "project", "path": "example.com",
+                         "access": "read", "recursive": false }]),
+            ),
+            // Broader than the profile's breadth rule.
+            ("broad", json!([scope("project", "notes", "read", true)])),
+            (
+                "traversal",
+                json!([scope("project", "../notes/today.md", "read", false)]),
+            ),
+            (
+                "absolute",
+                json!([scope("project", "/etc/hosts", "read", false)]),
+            ),
+        ] {
+            let mut declared = r0();
+            declared["scopes"] = scopes;
+            create(&home, id, declared, "ACTIVE");
+            assert_eq!(
+                refusal(&home, &request_for(&home, id, id)),
+                AuthorityProfileErrorCode::RuntimeDowngrade,
+                "{id}"
+            );
+        }
+        assert_eq!(decisions(&home), before, "nothing was decided or consumed");
+    }
+
+    #[test]
+    fn runtime_authority_stays_unadvertised() {
+        let advertised = [
+            serde_json::to_string(&crate::api_health::health_response(None)).unwrap(),
+            serde_json::to_string(crate::automations::capability_negotiation::capability_profile())
+                .unwrap(),
+            crate::automations::missions::advertised_envelopes().to_string(),
+        ];
+        for text in advertised {
+            assert!(!text.contains(RUNTIME_AUTHORITY_CAPABILITY), "{text}");
+            assert!(!text.contains("r0-read.2"), "{text}");
+        }
+        // Missions keep launching r0-read.1; only the adapter pins r0-read.2.
+        assert_eq!(
+            runtime_envelope::for_grant("claude", &["analysis.read"]),
+            Some(&runtime_envelope::CLAUDE_R0_READ)
         );
     }
 }

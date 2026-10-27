@@ -12241,119 +12241,59 @@ mod tests {
         assert!(outcome.error.as_deref().unwrap().contains("no cwd"));
     }
 
-    /// Records the authority projection a launch carried.
-    struct ProjectionRecordingRuntime {
-        projected: std::sync::Mutex<Vec<(String, String)>>,
-    }
-
-    impl SessionRuntime for ProjectionRecordingRuntime {
-        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
-            unreachable!("automation dispatch must use strict containment")
-        }
-
-        fn accepts_automation_authority_projection(&self) -> bool {
-            true
-        }
-
-        fn launch_authorized_contained_adopted_session(
-            &self,
-            launch: &SessionLaunch,
-            authority: Option<&AutomationAuthorityConsumerProjection>,
-            _writer: Option<crate::maintenance_gate::WriterLease>,
-            ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
-        ) -> anyhow::Result<()> {
-            let authority =
-                authority.ok_or_else(|| anyhow::anyhow!("launched without a projection"))?;
-            self.projected.lock().unwrap().push((
-                launch.harness.clone(),
-                authority
-                    .runtime
-                    .descriptor_digest
-                    .value
-                    .as_str()
-                    .to_owned(),
-            ));
-            ownership_established()
-        }
-
-        fn send_input(
-            &self,
-            _session_id: &str,
-            _payload: &serde_json::Value,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
+    // The scoped read launch is Unix-only.
+    #[cfg(unix)]
     #[test]
     fn a_routine_that_declares_authority_dispatches_only_under_runtime_authority() {
-        use crate::automations::owner_grants::CommandAuthority;
-        let home = crate::familiar_ledger::tests::Home::new();
-        home.register("adopt:ledger:register");
-        let routine = json!({
-            "schemaVersion": 1, "id": "notes", "name": "Notes", "status": "ACTIVE",
-            "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
-            "overlap": "forbid", "timeoutMinutes": 30, "runtime": "claude",
-            "familiarId": "sage", "cwd": home.path().display().to_string(),
-            "prompt": "Summarise the notes.",
-            "authority": {
-                "actionType": "analysis.read", "riskClass": "R0",
-                "capabilities": ["analysis.read"],
-                "scopes": [{ "kind": "filesystem", "root": "workspace", "path": "notes/today.md",
-                             "access": "read", "recursive": false }],
-                "proposalSafe": true
-            }
-        });
-        let (status, response) = crate::control_plane::route_action_with_authority(
-            json!({ "action": "coven.automations.definition.create.v1",
-                    "adoptionKey": "adopt:notes:create", "definition": routine }),
-            &home.conn,
-            &crate::api::NoopSessionRuntime,
-            CommandAuthority::OwnerLocal,
-        );
-        assert!(status == 200 && response.accepted, "{response:?}");
-        let now =
-            chrono::DurationRound::duration_trunc(Utc::now(), chrono::TimeDelta::milliseconds(1))
-                .unwrap();
-        assert!(crate::automations::occurrences::insert_claimed_occurrence(
-            &home.conn,
-            "occurrence.notes-1",
-            "notes",
-            "daemon",
-            60,
-            now,
-        )
-        .unwrap());
-
-        let runtime = ProjectionRecordingRuntime {
-            projected: std::sync::Mutex::new(Vec::new()),
+        use crate::automations::scoped_read::service::Open;
+        use crate::automations::trusted_launch::{
+            self,
+            test_support::{r0, read, read_through, scope, Fixture, GRANTED},
         };
-        let report =
-            dispatch_claimed_occurrences_with_clock(&home.conn, &runtime, now, || now).unwrap();
-        assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
-        assert_eq!(
-            runtime.projected.lock().unwrap().as_slice(),
-            [(
-                "claude".to_owned(),
-                crate::automations::runtime_envelope::CLAUDE_R0_READ.descriptor_digest()
-            )]
-        );
+        let fixture = Fixture::new();
+        fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
+        let conn = &fixture.home.conn;
 
-        // The session ends cleanly: its stream accounts for everything, and the
-        // writer that ends it records the terminal observer's evidence.
-        let session_id: String = home
-            .conn
+        // Dispatch: the owner grant, the familiar binding and the signed
+        // Threads decision, verified and consumed inside the launch
+        // transaction, pin the scoped read envelope.
+        let (run_id, launched) = fixture.dispatch("notes", "occurrence.notes-1");
+        assert_eq!(launched.harness, "claude");
+        assert_eq!(
+            launched.projection.runtime.descriptor_digest.value.as_str(),
+            crate::automations::runtime_envelope::CLAUDE_R0_SCOPED_READ.descriptor_digest()
+        );
+        let decision_id: String = conn
             .query_row(
-                "SELECT session_id FROM automation_runs WHERE id = ?1",
-                [&report.dispatched[0]],
+                "SELECT decision_id FROM automation_threads_decisions",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
-        let ended = now + chrono::TimeDelta::seconds(30);
+        assert!(crate::automations::threads_decisions::consumed(conn, &decision_id).unwrap());
+
+        // Launch: admitted under exactly the decision's scopes.
+        let prepared =
+            trusted_launch::prepare(conn, &fixture.launch(&launched), Box::new(Open), Utc::now())
+                .expect("the granted launch is admitted");
+        let results = read_through(prepared, &[read("notes/today.md"), read("note.txt")]);
+        assert_eq!(results[0].0["content"], GRANTED);
+        assert!(
+            results[1].1,
+            "the sibling the grant does not name is refused"
+        );
+        assert_eq!(results[1].0["refusal"], "scope_missing");
+
+        // The session ends cleanly: its stream accounts for everything, and
+        // the writer that ends it records the terminal observer's evidence.
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE id = ?1",
+                [&run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ended = Utc::now() + chrono::TimeDelta::seconds(30);
         let event = |kind: &str, payload: serde_json::Value| crate::store::EventRecord {
             seq: 0,
             id: uuid::Uuid::new_v4().to_string(),
@@ -12363,9 +12303,9 @@ mod tests {
             created_at: ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
         let stream = crate::automations::stream_observation::test_support::stream(
-            &crate::automations::stream_observation::test_support::read_run(),
+            &crate::automations::stream_observation::test_support::scoped_read_run(),
         );
-        let transaction = home.conn.unchecked_transaction().unwrap();
+        let transaction = conn.unchecked_transaction().unwrap();
         crate::store::insert_event(&transaction, &event("output", json!({ "data": stream })))
             .unwrap();
         assert!(crate::store::update_session_terminal_if_active(
@@ -12394,22 +12334,29 @@ mod tests {
 
         // Settlement consumes the evidence and settles the run through the
         // adapter, with the launched receipt and its authority evidence.
-        let settled = settle_finished_runs(&home.conn, ended).unwrap();
+        let settled = settle_finished_runs(conn, ended).unwrap();
         assert_eq!(settled.succeeded, 1, "{settled:?}");
-        let status: String = home
-            .conn
+        let status: String = conn
             .query_row(
                 "SELECT status FROM automation_runs WHERE id = ?1",
-                [&report.dispatched[0]],
+                [&run_id],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(status, "succeeded");
 
+        // The decision was consumed once; a second consumption refuses.
+        let decided = crate::automations::threads_decisions::recorded(conn, &decision_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::automations::threads_decisions::consume_in(conn, &decided, ended).unwrap(),
+            Err(crate::automations::threads_decisions::DecisionRefusal::Replayed)
+        );
+
         // A manual run carries no owner grant of its own yet.
         let definition: RoutineDefinition = serde_json::from_str(
-            &home
-                .conn
+            &conn
                 .query_row(
                     "SELECT definition_json FROM automation_definitions WHERE id = 'notes'",
                     [],
@@ -12419,14 +12366,68 @@ mod tests {
         )
         .unwrap();
         let error = dispatch_occurrence(
-            &home.conn,
-            &runtime,
+            conn,
+            &crate::api::NoopSessionRuntime,
             &definition,
             "occurrence.manual",
-            home.path().to_str().unwrap(),
-            now,
+            &fixture.project_text(),
+            Utc::now(),
         )
         .unwrap_err();
         assert!(error.contains("runs only on its schedule"), "{error}");
+    }
+
+    // The scoped read launch is Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_routine_without_authority_still_dispatches_as_base_v1() {
+        use crate::automations::trusted_launch::test_support::Fixture;
+        let fixture = Fixture::new();
+        let routine = json!({
+            "schemaVersion": 1, "id": "plain", "name": "Plain", "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
+            "overlap": "forbid", "timeoutMinutes": 30, "runtime": "claude",
+            "cwd": fixture.project_text(), "prompt": "Summarise the notes."
+        });
+        let (status, response) = crate::control_plane::route_action_with_authority(
+            json!({ "action": "coven.automations.definition.create.v1",
+                    "adoptionKey": "adopt:plain:create", "definition": routine }),
+            &fixture.home.conn,
+            &crate::api::NoopSessionRuntime,
+            crate::automations::owner_grants::CommandAuthority::OwnerLocal,
+        );
+        assert!(status == 200 && response.accepted, "{response:?}");
+        let now =
+            chrono::DurationRound::duration_trunc(Utc::now(), chrono::TimeDelta::milliseconds(1))
+                .unwrap();
+        assert!(crate::automations::occurrences::insert_claimed_occurrence(
+            &fixture.home.conn,
+            "occurrence.plain-1",
+            "plain",
+            "daemon",
+            60,
+            now,
+        )
+        .unwrap());
+        let runtime = crate::automations::trusted_launch::test_support::RecordingRuntime::default();
+        let report =
+            dispatch_claimed_occurrences_with_clock(&fixture.home.conn, &runtime, now, || now)
+                .unwrap();
+        assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
+        assert_eq!(*runtime.base.lock().unwrap(), 1);
+        assert!(
+            runtime.launched.lock().unwrap().is_empty(),
+            "a routine without authority never carries a projection"
+        );
+        let decided: i64 = fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'automation_threads_decisions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decided, 0, "no Threads decision is made for it");
     }
 }

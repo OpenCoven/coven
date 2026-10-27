@@ -76,10 +76,16 @@ pub mod terminal_observer;
 #[allow(dead_code)]
 pub mod threads_decisions;
 pub mod transition_events;
-// The trusted Runtime Authority adapter (coven#857, slice 6).
 #[cfg(test)]
 mod transport_authority_tests;
+// The trusted Runtime Authority adapter (coven#857, slice 6).
 pub mod trusted_authority;
+// Launching a trusted attempt under its decision's scopes (coven#857 slice 6,
+// #1603). The daemon's launch path does not call it yet: that needs the
+// scoped read service's production gate.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) mod trusted_launch;
 
 #[allow(unused_imports)]
 pub use definition::RoutineDefinition;
