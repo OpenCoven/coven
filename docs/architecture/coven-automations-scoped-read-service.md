@@ -146,7 +146,8 @@ from #1217:
 Still open: wiring `prepare` into the daemon's launch, so the channel opens and
 closes with the session, and the production gate for response commitment
 under the daemon's revocation fence. Until both land, `r0-read.2` is not
-launchable, and definitions keep refusing an `authority` block. Also open: the mission switch, receipts
+launchable, and definitions keep refusing an `authority` block.
+[The gate proposal](coven-automations-scoped-read-gate-proposal.md) covers both, for decision. Also open: the mission switch, receipts
 of the service's operations, and Windows. The vectors are engineering
 evidence, not containment certification.
 
