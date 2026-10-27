@@ -7,7 +7,8 @@ source_adjacent_reason: "Records the runtime authority trust decisions alongside
 Status: maintainer decisions recorded 2026-10-03; slices 1 to 6
 implemented. The trusted adapter constructs Runtime Authority for routines
 that declare it, under the scoped read envelope only. The daemon does not yet
-launch that envelope, and the capability is not advertised.
+launch that envelope, so definitions still refuse an `authority` block, and
+the capability is not advertised.
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
 OpenCoven/coven-runtimes#48 (terminal observations), #858 (certification)
@@ -411,12 +412,23 @@ unadvertised until slice 6.
 
    Still open: the daemon's launch path does not call `prepare` yet. It needs
    the scoped read service's production gate, which commits each response
-   under the daemon's revocation fence. Until then the daemon refuses
-   `r0-read.2` projections, so an authority run fails closed at launch.
-   Manual runs remain refused until the Runtime Authority grant integration
-   for `occurrence.runNow.v1` lands. Settlement verifies terminal evidence
-   with the terminal-observer keys, so a clean run settles from its own
-   evidence with a signed receipt.
+   under the daemon's revocation fence. Until then:
+   - `r0-read.2` stays out of the daemon's launchable envelopes, because
+     launching it from its arguments alone would start it without the scoped
+     read service;
+   - the daemon would refuse an `r0-read.2` launch only after dispatch has
+     consumed a decision, so definition validation keeps refusing an
+     `authority` block, on create and revise alike. No production routine
+     can reach the adapter, and tests build such routines on their own
+     thread.
+
+   A refusal before launch records its profile code on the occurrence.
+   Manual occurrences, including run-now and claimed manual ones, stay
+   refused until the Runtime Authority grant integration for
+   `occurrence.runNow.v1` lands. Settlement reads the terminal-observer keys
+   only when a Runtime Authority run is waiting, so a bad key record never
+   stops ordinary settlement. It verifies terminal evidence with those keys,
+   so a clean run settles from its own evidence with a signed receipt.
 7. **Held commands, then approvals.** The five versioned commands #1054
    holds for #857:
    - `occurrence.runNow.v1`;
