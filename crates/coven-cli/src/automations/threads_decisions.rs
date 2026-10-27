@@ -8,15 +8,17 @@
 //! (Decision 1), so the daemon signs requests on the owner's behalf with its
 //! `owner-principal` key.
 //!
-//! [`decide`] takes an unsigned request draft and a policy snapshot. It stamps
-//! the owner principal and the daemon's clock, signs the request, evaluates it
-//! with the pinned evaluator, and signs the decision. It then verifies the pair
-//! as an independent verifier would, and only then records both. The profile
+//! [`decide`] takes an unsigned request draft, a policy snapshot and the
+//! daemon's clock, which the caller supplies as `now` like the daemon's other
+//! producers; slice 6 must pass the wall clock. It stamps the owner principal
+//! and that time, signs the request, evaluates it with the pinned evaluator,
+//! and signs the decision. It then verifies the pair as an independent
+//! verifier would, and only then records both. The profile
 //! keyring is built from the daemon's key records, so a revoked key, or one
 //! used outside its validity window, authenticates nothing. [`recorded`] reads
 //! a decision back and verifies it again under the keyring as it stood when the
-//! decision was made, and [`valid_at`] also holds it to the decision's own
-//! validity window.
+//! decision was signed (its `issued_at`), and [`valid_at`] also holds it to
+//! the decision's own validity window.
 //!
 //! Nothing in production calls this module yet. The trusted adapter (slice 6)
 //! has two jobs left. It composes the inputs: the definition's declared action,
@@ -293,15 +295,20 @@ pub(crate) fn recorded(
         )
         .optional()
         .context("failed to read the Threads decision")?;
-    let Some((request, decision, policy, decided_at)) = row else {
+    // `decided_at` is unsigned and only for operators; the keyring time is
+    // the decision's signed `issued_at`.
+    let Some((request, decision, policy, _decided_at)) = row else {
         return Ok(Err(DecisionRefusal::Unknown));
     };
     let request: Value = serde_json::from_str(&request).context("recorded request is JSON")?;
     let decision: Value = serde_json::from_str(&decision).context("recorded decision is JSON")?;
     let policy: Value = serde_json::from_str(&policy).context("recorded policy is JSON")?;
-    let decided_at = DateTime::parse_from_rfc3339(&decided_at)
-        .context("recorded decision time is RFC 3339")?
-        .with_timezone(&Utc);
+    let Some(decided_at) = decision["issued_at"].as_str().and_then(profile_instant) else {
+        return Ok(Err(DecisionRefusal::Invalid {
+            code: ErrorCode::SchemaTimestamp.as_str(),
+            message: "the recorded decision has no RFC 3339 UTC issued_at".to_owned(),
+        }));
+    };
     let owner = owner_grants::owner_principal_id(conn, &timestamp(decided_at))?;
     let keyring = keyring_at(conn, &owner, decided_at)?;
     let outcome = match verify_decision_bundle(&request, &decision, &policy, &keyring, &Ed25519) {
@@ -322,8 +329,10 @@ pub(crate) fn recorded(
 /// [`recorded`], and also inside the decision's own `validity` window at
 /// `now`. The window and its codes are the profile's: `verify_dispatch` holds
 /// a decision to the same `not_before <= now < not_after` interval with
-/// `decision_not_yet_valid` and `decision_expired`. This checks the window
-/// only; consumption and the rest of dispatch verification stay with slice 6.
+/// `decision_not_yet_valid` and `decision_expired`, comparing whole
+/// milliseconds as `Date.parse` does, so this truncates all three the same
+/// way. This checks the window only; consumption and the rest of dispatch
+/// verification stay with slice 6.
 pub(crate) fn valid_at(
     conn: &Connection,
     decision_id: &str,
@@ -335,13 +344,12 @@ pub(crate) fn valid_at(
     };
     let validity = &decided.decision["validity"];
     let bound = |name: &str| -> Result<DateTime<Utc>> {
-        let text = validity[name]
+        validity[name]
             .as_str()
-            .with_context(|| format!("a verified Threads decision carries validity.{name}"))?;
-        Ok(DateTime::parse_from_rfc3339(text)
-            .with_context(|| format!("validity.{name} is RFC 3339"))?
-            .with_timezone(&Utc))
+            .and_then(profile_instant)
+            .with_context(|| format!("a verified Threads decision carries validity.{name}"))
     };
+    let now = whole_millis(now);
     let window = if now < bound("not_before")? {
         Some((ErrorCode::DecisionNotYetValid, "has not started"))
     } else if now >= bound("not_after")? {
@@ -462,6 +470,18 @@ fn digest_value(prefixed: &str) -> Result<Value> {
         .strip_prefix("sha256:")
         .context("a profile digest is sha256-prefixed")?;
     Ok(json!({ "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": value }))
+}
+
+/// A profile timestamp as the profile reads it: RFC 3339 UTC, truncated to
+/// whole milliseconds as `Date.parse` keeps only three fraction digits.
+fn profile_instant(text: &str) -> Option<DateTime<Utc>> {
+    let parsed = DateTime::parse_from_rfc3339(text).ok()?;
+    Some(whole_millis(parsed.with_timezone(&Utc)))
+}
+
+/// `value` truncated toward the past to a whole millisecond.
+fn whole_millis(value: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(value.timestamp_millis()).unwrap_or(value)
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
@@ -989,5 +1009,209 @@ mod tests {
             at(9, 0)
         )
         .is_err());
+    }
+
+    /// A row edited behind the store's back: the immutability trigger is
+    /// dropped first, as only a writer bypassing this module could.
+    fn edit_row(conn: &Connection, column: &str, value: &str) {
+        conn.execute_batch("DROP TRIGGER IF EXISTS automation_threads_decisions_immutable;")
+            .unwrap();
+        conn.execute(
+            &format!("UPDATE automation_threads_decisions SET {column} = ?1"),
+            [value],
+        )
+        .unwrap();
+    }
+
+    fn instant(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn the_validity_window_is_compared_in_whole_milliseconds() {
+        let (temp, conn) = store();
+        let owner = owner(&conn);
+        let mut request = draft("precision");
+        request["replay"]["expires_at"] = json!("2026-10-04T10:00:00.0009Z");
+        let decided = decide(&conn, temp.path(), &request, &policy(&owner), at(9, 0))
+            .unwrap()
+            .unwrap();
+        let decision_id = decided.decision["decision_id"].as_str().unwrap();
+        // Upstream reads both as 10:00:00.000, so the decision has expired.
+        assert_eq!(
+            refusal_code(
+                valid_at(&conn, decision_id, instant("2026-10-04T10:00:00.0005Z")).unwrap()
+            ),
+            "decision_expired"
+        );
+        assert!(
+            valid_at(&conn, decision_id, instant("2026-10-04T09:59:59.9995Z"))
+                .unwrap()
+                .is_ok()
+        );
+        // The start: `decide` stamps whole milliseconds, so 08:59:59.9995 is
+        // still before it and 09:00:00.0005 is inside it.
+        assert_eq!(
+            refusal_code(
+                valid_at(&conn, decision_id, instant("2026-10-04T08:59:59.9995Z")).unwrap()
+            ),
+            "decision_not_yet_valid"
+        );
+        assert!(
+            valid_at(&conn, decision_id, instant("2026-10-04T09:00:00.0005Z"))
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn read_back_uses_the_signed_issue_time_not_the_unsigned_column() {
+        let (temp, conn) = store();
+        let decided = decided(&conn, temp.path(), "issued", "R0");
+        let decision_id = decided.decision["decision_id"].as_str().unwrap();
+        // The decision key's window closes at 09:30.
+        authority_keys::rotate_signing_key(
+            &conn,
+            temp.path(),
+            AuthorityKeyRole::ThreadsDecision,
+            at(9, 30),
+        )
+        .unwrap();
+        // Moving the unsigned column outside the key's window changes nothing:
+        // the signed `issued_at` picks the keyring.
+        for moved in ["2026-10-04T09:45:00.000Z", "2026-10-04T08:00:00.000Z"] {
+            edit_row(&conn, "decided_at", moved);
+            assert_eq!(
+                recorded(&conn, decision_id).unwrap(),
+                Ok(decided.clone()),
+                "{moved}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_signature_over_the_correct_digest_refuses() {
+        use base64::Engine as _;
+        let (temp, conn) = store();
+        let owner = owner(&conn);
+        let decided = decided(&conn, temp.path(), "signature", "R0");
+        let key = authority_keys::current_signing_key(
+            &conn,
+            temp.path(),
+            AuthorityKeyRole::ThreadsDecision,
+            at(9, 0),
+        )
+        .unwrap();
+        // The right key and the right digest, but a signature over other bytes.
+        let mut forged = decided.decision.clone();
+        forged["integrity"]["signature_b64"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(key.sign(&[7; 32])));
+        let keyring = keyring_at(&conn, &owner, at(9, 0)).unwrap();
+        let error = verify_decision_bundle(
+            &decided.request,
+            &forged,
+            &decided.policy,
+            &keyring,
+            &Ed25519,
+        )
+        .unwrap_err();
+        assert_eq!(error.code.as_str(), "integrity_signature_invalid");
+        edit_row(&conn, "decision_json", &forged.to_string());
+        let decision_id = decided.decision["decision_id"].as_str().unwrap();
+        assert_eq!(
+            refusal_code(recorded(&conn, decision_id).unwrap()),
+            "integrity_signature_invalid"
+        );
+    }
+
+    #[test]
+    fn a_tampered_request_row_refuses() {
+        let (temp, conn) = store();
+        let decided = decided(&conn, temp.path(), "request-row", "R0");
+        let decision_id = decided.decision["decision_id"].as_str().unwrap();
+        let mut request = decided.request.clone();
+        request["scopes"][0]["path"] = json!("inputs/other.json");
+        edit_row(&conn, "request_json", &request.to_string());
+        assert_eq!(
+            refusal_code(recorded(&conn, decision_id).unwrap()),
+            "integrity_digest_mismatch"
+        );
+    }
+
+    #[test]
+    fn a_tampered_policy_row_refuses() {
+        let (temp, conn) = store();
+        let decided = decided(&conn, temp.path(), "policy-row", "R0");
+        let decision_id = decided.decision["decision_id"].as_str().unwrap();
+        // Without the grant, the same request no longer evaluates to a permit.
+        let mut policy = decided.policy.clone();
+        policy["recurring_grants"] = json!([]);
+        edit_row(&conn, "policy_json", &policy.to_string());
+        assert_eq!(
+            refusal_code(recorded(&conn, decision_id).unwrap()),
+            "decision_semantic_mismatch"
+        );
+    }
+
+    #[test]
+    fn a_revoked_owner_principal_key_refuses() {
+        let (temp, conn) = store();
+        let decided = decided(&conn, temp.path(), "owner-revoked", "R0");
+        let decision_id = decided.decision["decision_id"].as_str().unwrap();
+        let key_id = decided.request["integrity"]["key_id"].as_str().unwrap();
+        authority_keys::revoke_key(&conn, temp.path(), key_id, "test", at(10, 0)).unwrap();
+        assert_eq!(
+            refusal_code(recorded(&conn, decision_id).unwrap()),
+            "integrity_key_unknown"
+        );
+    }
+
+    #[test]
+    fn the_store_rejects_a_duplicate_row_without_the_replay_check() {
+        let (temp, conn) = store();
+        decided(&conn, temp.path(), "unique", "R0");
+        // Copy the row with every unique column fresh except one.
+        let unique = [
+            "decision_id",
+            "decision_digest",
+            "request_id",
+            "request_digest",
+            "nonce",
+            "adoption_key",
+        ];
+        for kept in unique {
+            let columns = unique
+                .iter()
+                .map(|column| match *column {
+                    column if column == kept => column.to_owned(),
+                    column if column.ends_with("digest") => {
+                        format!("'sha256:' || substr('{}', 1, 64)", "f".repeat(64))
+                    }
+                    column => format!("{column} || ':copy'"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let error = conn
+                .execute(
+                    &format!(
+                        "INSERT INTO automation_threads_decisions
+                            ({}, outcome, request_json, decision_json, policy_json, decided_at)
+                         SELECT {columns}, outcome, request_json, decision_json, policy_json,
+                                decided_at
+                         FROM automation_threads_decisions",
+                        unique.join(", ")
+                    ),
+                    [],
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("UNIQUE constraint failed")
+                    && error.to_string().contains(kept),
+                "{kept}: {error}"
+            );
+        }
+        assert_eq!(rows(&conn), 1);
     }
 }

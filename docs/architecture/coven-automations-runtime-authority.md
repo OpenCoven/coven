@@ -239,14 +239,17 @@ These follow from Decision 3, for slice 4.
   for. The daemon therefore holds the `owner-principal` role key, bound to the
   owner principal id from Decision 1. Per-principal keys stay a later
   decision, with multiple principals.
-- **What a decision records.** The daemon stamps the owner principal and its
-  own clock onto each request and policy snapshot, and never takes either from
-  the caller. It signs the request and the decision, then verifies the pair as
-  an independent verifier would, before recording it. Recorded decisions are
+- **What a decision records.** The daemon stamps the owner principal from
+  its own store onto each request, and never takes it from the caller. It
+  stamps the decision time onto each policy snapshot, replacing any `now` the
+  snapshot carries. `decide` takes that time from its caller, as the daemon's
+  other producers take `now`, so slice 6 must pass the daemon's wall clock.
+  It signs the request and the decision, then verifies the pair as an
+  independent verifier would, before recording it. Recorded decisions are
   immutable and retained. A decision id, request id, nonce or adoption key is
   decided at most once. When a decision is read back, it is verified again
-  under the keys as they stood when it was made, so revoking a key invalidates
-  what that key signed. A read at a given time also refuses a decision outside
+  under the keys as they stood at its signed `issued_at`, so revoking a key
+  invalidates what that key signed. A read at a given time also refuses a decision outside
   its own validity window, with the profile's `decision_not_yet_valid` and
   `decision_expired` codes.
 - **Digests stay the profile's.** In the execution binding, the decision and
