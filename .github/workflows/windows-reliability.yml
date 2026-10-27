@@ -7,7 +7,7 @@ on:
         description: Diagnostic stage
         type: choice
         default: samples
-        options: [samples, metadata-preflight, provider-schema]
+        options: [samples, metadata-preflight, provider-schema, token-facts]
   # Temporary metadata-only admission on the owning draft PR.
   # A head push or label removal cannot start another experiment.
   pull_request:
@@ -694,3 +694,223 @@ jobs:
           PUBLIC_RECEIPT: ${{ steps.provider.outputs.public-receipt }}
         run: |
           if ($env:SOURCE_OUTCOME -cne 'success' -or $env:CONTROL_OUTCOME -cne 'success' -or $env:PROVIDER_OUTCOME -cne 'success' -or $env:BINDING_OUTCOME -cne 'success' -or [string]::IsNullOrEmpty($env:PUBLIC_RECEIPT)) { throw 'Provider collection/publication remains incomplete' }
+
+  token-facts:
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'token-facts'
+    name: Windows read-only effective-token facts
+    runs-on: windows-latest
+    # Diagnostic build/collection hang guard, not a production response deadline.
+    timeout-minutes: 10
+    steps:
+      - name: Prepare exclusive source and public evidence directories
+        id: prepare
+        shell: pwsh
+        run: |
+          $temp = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetTempPath())
+          $root = Join-Path $temp "windows-reliability-token-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $root) { throw 'Token evidence directory already exists' }
+          [IO.Directory]::CreateDirectory((Join-Path $root 'public')) | Out-Null
+          "TOKEN_ROOT=$root" >> $env:GITHUB_ENV
+          "TOKEN_TEMP_ROOT=$temp" >> $env:GITHUB_ENV
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Bind manual activation and complete checkout source
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$false
+          $head=git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -cnotmatch '^[0-9a-f]{40}$') { throw 'Token checkout identity unavailable' }
+          $parents=@((git show -s --format=%P HEAD) -split ' ')
+          if ($LASTEXITCODE -ne 0 -or @($parents | Where-Object { $_ -cnotmatch '^[0-9a-f]{40}$' }).Count -ne 0) { throw 'Token parent identity unavailable' }
+          $main=git rev-parse --verify 'refs/remotes/origin/main^{commit}'
+          if ($LASTEXITCODE -ne 0 -or $main -cnotmatch '^[0-9a-f]{40}$') { throw 'Token main identity unavailable' }
+          $shallow=git rev-parse --is-shallow-repository
+          if ($LASTEXITCODE -ne 0) { throw 'Token ancestry unavailable' }
+          $dirty=@(git status --porcelain=v1 --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw 'Token checkout state unavailable' }
+          git merge-base --is-ancestor $main $head
+          $ancestor=$LASTEXITCODE
+          $expectedWorkflow="$env:GITHUB_REPOSITORY/.github/workflows/windows-reliability.yml@$env:GITHUB_REF"
+          $activationMatches=$env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and $env:GITHUB_REF.StartsWith('refs/heads/') -and $head -ceq $env:GITHUB_SHA -and $env:GITHUB_WORKFLOW_SHA -ceq $head -and $env:GITHUB_WORKFLOW_REF -ceq $expectedWorkflow
+          @{stage='token-facts';source=$head;parents=$parents;capturedMain=$main;mainAncestorExit=$ancestor;shallow=$shallow;dirtyCount=$dirty.Count;event=$env:GITHUB_EVENT_NAME;eventSha=$env:GITHUB_SHA;workflowSha=$env:GITHUB_WORKFLOW_SHA;workflowRef=$env:GITHUB_WORKFLOW_REF;ref=$env:GITHUB_REF;activationMatches=$activationMatches;run=$env:GITHUB_RUN_ID;attempt=$env:GITHUB_RUN_ATTEMPT;captureAttempted=$false;metadataComplete=$false} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $env:TOKEN_ROOT 'source-check.json')
+          if (-not $activationMatches -or $dirty.Count -ne 0 -or $shallow -cne 'false' -or $ancestor -ne 0) { throw 'Token manual/source/ancestry binding failed' }
+          # Execute the same bounded private bytes that the closed inventory later names.
+          # A path reread after dot-sourcing would not identify the executed script block.
+          $binderPath=Join-Path $pwd 'scripts/windows-reliability/token-binding.ps1'
+          $binderStream=[IO.File]::Open($binderPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+          try {
+              $binderBuffer=[byte[]]::new(262145)
+              $binderUsed=0
+              while ($binderUsed -lt $binderBuffer.Length) {
+                  $count=$binderStream.Read($binderBuffer,$binderUsed,$binderBuffer.Length-$binderUsed)
+                  if ($count -eq 0) { break }
+                  $binderUsed+=$count
+              }
+              if ($binderUsed -eq 0 -or $binderUsed -gt 262144) { throw 'source' }
+              $binderBytes=$binderBuffer[0..($binderUsed-1)]
+          } finally { $binderStream.Dispose() }
+          $binderHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$binderBytes)).ToLowerInvariant()
+          . ([scriptblock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$binderBytes)))
+          $capture=Get-CovenTokenSourceCapture -Directory ([string]$pwd) -Commit $head
+          $binder=@($capture.Files | Where-Object { $_.Id -ceq 'binding' })[0]
+          if ($binder.Sha256 -cne $binderHash) { throw 'Token executed binder does not match captured source' }
+          $ids=[string[]]@((Get-CovenTokenSourceInventory).Keys);[Array]::Sort($ids,[Collections.IComparer][StringComparer]::Ordinal)
+          $files=@(foreach($id in $ids){$file=@($capture.Files|Where-Object {$_.Id -ceq $id})[0];@{id=$file.Id;sha256=$file.Sha256}})
+          $source=@{commit=$head;beforeAfterMatch=$true;files=$files}
+          $text=$source | ConvertTo-Json -Depth 6 -Compress
+          [IO.File]::WriteAllText((Join-Path $env:TOKEN_ROOT 'source.json'),$text,[Text.UTF8Encoding]::new($false))
+          "TOKEN_SOURCE_SHA256=$((Get-FileHash -LiteralPath (Join-Path $env:TOKEN_ROOT 'source.json') -Algorithm SHA256).Hash)" >> $env:GITHUB_ENV
+      - name: Verify controlled metadata, binding, encoding and publication boundaries
+        id: controls
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$false
+          $hostExecutable=[Environment]::ProcessPath
+          foreach ($name in @('token-privileges-tests.ps1','token-reader-tests.ps1','token-native-tests.ps1','token-public-tests.ps1','token-binding-types-tests.ps1','token-binding-tests.ps1','token-runtime-tests.ps1')) {
+            & $hostExecutable -NoProfile -File (Join-Path 'scripts/windows-reliability' $name)
+            if ($LASTEXITCODE -ne 0) { throw 'Token controlled PowerShell verification failed' }
+          }
+          foreach ($name in @('token_result_tests.py','token_receipt_tests.py','token_envelope_tests.py','token-workflow-tests.py')) {
+            python -B (Join-Path 'scripts/windows-reliability' $name)
+            if ($LASTEXITCODE -ne 0) { throw 'Token controlled Python verification failed' }
+          }
+      - name: Collect and independently publish bounded read-only token metadata
+        id: token
+        if: steps.source.outcome == 'success' && steps.controls.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$false
+          $binderPath=Join-Path $pwd 'scripts/windows-reliability/token-binding.ps1'
+          $stream=[IO.File]::Open($binderPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+          try {
+            $buffer=[byte[]]::new(262145);$used=0
+            while($used -lt $buffer.Length){$count=$stream.Read($buffer,$used,$buffer.Length-$used);if($count -eq 0){break};$used+=$count}
+            if($used -eq 0 -or $used -gt 262144){throw 'Token source size'}
+            $bytes=[byte[]]$buffer[0..($used-1)]
+          } finally {$stream.Dispose()}
+          $hash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+          . ([scriptblock]::Create([Text.UTF8Encoding]::new($false,$true).GetString($bytes)))
+          $capture=Get-CovenTokenSourceCapture -Directory ([string]$pwd) -Commit $env:GITHUB_SHA
+          $binder=@($capture.Files|Where-Object {$_.Id -ceq 'binding'})[0]
+          if($binder.Sha256 -cne $hash){throw 'Token executed binder mismatch'}
+          $executable=[Environment]::ProcessPath
+          $invocation=New-CovenTokenRunnerInvocation -Capture $capture -Executable $executable -OutputDirectory (Join-Path $env:TOKEN_ROOT 'public') -TemporaryRoot $env:TOKEN_TEMP_ROOT
+          & $executable @($invocation.Arguments)
+          exit $LASTEXITCODE
+      - name: Independently recheck source before artifact admission
+        id: binding
+        if: always() && steps.source.outcome == 'success'
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          EXECUTION_JSON: ${{ steps.token.outputs.execution }}
+          PUBLIC_RECEIPT: ${{ steps.token.outputs.public-receipt }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$false
+          $admitted=$false
+          $sourcePath=Join-Path $env:TOKEN_ROOT 'source.json'
+          $sourceMatches=(Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash -ceq $env:TOKEN_SOURCE_SHA256
+          $source=Get-Content -LiteralPath $sourcePath -Raw | ConvertFrom-Json
+          $head=git rev-parse HEAD
+          $headMatches=$LASTEXITCODE -eq 0 -and $head -ceq $env:GITHUB_SHA -and $head -ceq $source.commit
+          $dirty=@(git status --porcelain=v1 --untracked-files=all)
+          $clean=$LASTEXITCODE -eq 0 -and $dirty.Count -eq 0
+          # Execute the same bounded private bytes that the closed inventory later names.
+          # A path reread after dot-sourcing would not identify the executed script block.
+          $binderPath=Join-Path $pwd 'scripts/windows-reliability/token-binding.ps1'
+          $binderStream=[IO.File]::Open($binderPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+          try {
+              $binderBuffer=[byte[]]::new(262145)
+              $binderUsed=0
+              while ($binderUsed -lt $binderBuffer.Length) {
+                  $count=$binderStream.Read($binderBuffer,$binderUsed,$binderBuffer.Length-$binderUsed)
+                  if ($count -eq 0) { break }
+                  $binderUsed+=$count
+              }
+              if ($binderUsed -eq 0 -or $binderUsed -gt 262144) { throw 'source' }
+              $binderBytes=$binderBuffer[0..($binderUsed-1)]
+          } finally { $binderStream.Dispose() }
+          $binderHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$binderBytes)).ToLowerInvariant()
+          . ([scriptblock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$binderBytes)))
+          $capture=Get-CovenTokenSourceCapture -Directory ([string]$pwd) -Commit $head
+          $ids=[string[]]@((Get-CovenTokenSourceInventory).Keys);[Array]::Sort($ids,[Collections.IComparer][StringComparer]::Ordinal)
+          $current=@(foreach($id in $ids){@($capture.Files|Where-Object {$_.Id -ceq $id})[0]})
+          $sameFiles=$current.Count -eq $source.files.Count
+          for ($i=0;$i -lt $current.Count -and $sameFiles;$i++) {
+            $sameFiles=$current[$i].Id -ceq $source.files[$i].id -and $current[$i].Sha256 -ceq $source.files[$i].sha256
+          }
+          $binder=@($capture.Files | Where-Object { $_.Id -ceq 'binding' })[0]
+          $bound=$sourceMatches -and $headMatches -and $clean -and $binder.Sha256 -ceq $binderHash -and $sameFiles
+          if(-not $bound){throw 'Token source changed before artifact admission'}
+          if(-not [string]::IsNullOrEmpty($env:PUBLIC_RECEIPT)){
+            $pythonCommands=@(Get-Command python -CommandType Application -ErrorAction Stop)
+            $python=$pythonCommands[0].Source
+            $snapshotHash=$env:TOKEN_SOURCE_SHA256
+            $snapshotHash=$snapshotHash.ToLowerInvariant()
+            $invocation=New-CovenTokenArtifactInvocation -Capture $capture -Executable $python -SourcePath $sourcePath -SnapshotHash $snapshotHash -TemporaryRoot $env:TOKEN_TEMP_ROOT -OutputDirectory (Join-Path $env:TOKEN_ROOT 'public')
+            $result=& $python @($invocation.Arguments)
+            if($LASTEXITCODE -ne 0 -or $result -cne 'token-artifact-admission-pass'){throw 'Token artifact admission failed'}
+            $admitted=$true
+          }
+          @{sourceBound=$bound;sourceSnapshotMatches=$sourceMatches;headMatches=$headMatches;clean=$clean;checkedFiles=$capture.Files.Count;publicReceiptAdmitted=$admitted;captureAttempted=$false;metadataComplete=$false} | ConvertTo-Json | Set-Content (Join-Path $env:TOKEN_ROOT 'binding.json')
+          "receipt-admitted=$($admitted.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+      - name: Record separate source, controls, execution and binding outcomes
+        if: always() && steps.prepare.outcome == 'success'
+        shell: pwsh
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          CONTROL_OUTCOME: ${{ steps.controls.outcome }}
+          TOKEN_OUTCOME: ${{ steps.token.outcome }}
+          BINDING_OUTCOME: ${{ steps.binding.outcome }}
+          RECEIPT_ADMITTED: ${{ steps.binding.outputs.receipt-admitted }}
+          EXECUTION_JSON: ${{ steps.token.outputs.execution }}
+          PUBLIC_RECEIPT: ${{ steps.token.outputs.public-receipt }}
+        run: |
+          $execution=$null
+          if (-not [string]::IsNullOrEmpty($env:EXECUTION_JSON)) { $execution=$env:EXECUTION_JSON | ConvertFrom-Json }
+          @{source=$env:SOURCE_OUTCOME;controls=$env:CONTROL_OUTCOME;collector=$env:TOKEN_OUTCOME;binding=$env:BINDING_OUTCOME;execution=$execution;publicReceiptAdmitted=($env:BINDING_OUTCOME -ceq 'success' -and $env:RECEIPT_ADMITTED -ceq 'true');captureAttempted=$false;metadataComplete=$false} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $env:TOKEN_ROOT 'outcome.json')
+      - name: Retain explicit token source and outcome evidence
+        if: always() && steps.prepare.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-reliability-token-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TOKEN_ROOT }}/source-check.json
+            ${{ env.TOKEN_ROOT }}/source.json
+            ${{ env.TOKEN_ROOT }}/binding.json
+            ${{ env.TOKEN_ROOT }}/outcome.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain independently validated public token receipt only
+        if: always() && steps.binding.outcome == 'success' && steps.binding.outputs.receipt-admitted == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-reliability-token-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TOKEN_ROOT }}/public/receipt.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Require complete collection and protected publication
+        if: always() && steps.prepare.outcome == 'success'
+        shell: pwsh
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          CONTROL_OUTCOME: ${{ steps.controls.outcome }}
+          TOKEN_OUTCOME: ${{ steps.token.outcome }}
+          BINDING_OUTCOME: ${{ steps.binding.outcome }}
+          RECEIPT_ADMITTED: ${{ steps.binding.outputs.receipt-admitted }}
+          PUBLIC_RECEIPT: ${{ steps.token.outputs.public-receipt }}
+        run: |
+          if ($env:SOURCE_OUTCOME -cne 'success' -or $env:CONTROL_OUTCOME -cne 'success' -or $env:TOKEN_OUTCOME -cne 'success' -or $env:BINDING_OUTCOME -cne 'success' -or $env:RECEIPT_ADMITTED -cne 'true' -or [string]::IsNullOrEmpty($env:PUBLIC_RECEIPT)) { throw 'Token collection/publication remains incomplete' }

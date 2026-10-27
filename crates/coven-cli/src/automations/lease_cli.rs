@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use super::leases::{Expiry, Page, ACTION, SCHEMA};
 
-fn valid_id(value: &str) -> bool {
+pub(super) fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 512
         && value.trim() == value

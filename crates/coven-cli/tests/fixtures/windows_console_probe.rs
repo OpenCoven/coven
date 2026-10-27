@@ -24,6 +24,16 @@ extern "system" {
     fn GenerateConsoleCtrlEvent(event: u32, process_group_id: u32) -> i32;
 }
 
+/// Publishes a pid file in one step. `fs::write` creates the file before it
+/// writes the digits, so a test polling for the path can open it in between
+/// and read an empty string; renaming a fully written sibling closes that gap.
+fn publish_pid(path: &std::path::Path, pid: u32) -> std::io::Result<()> {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".partial");
+    std::fs::write(&staged, pid.to_string())?;
+    std::fs::rename(&staged, path)
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -111,8 +121,7 @@ fn main() {
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("failed to spawn descendant fixture");
-            std::fs::write(pid_file, child.id().to_string())
-                .expect("failed to write descendant pid");
+            publish_pid(pid_file.as_ref(), child.id()).expect("failed to write descendant pid");
             println!("descendant={}", child.id());
             std::io::stdout().flush().expect("failed to flush fixture output");
             loop {
@@ -231,7 +240,7 @@ fn main() {
                     .stderr(Stdio::null())
                     .spawn()
                     .expect("failed to spawn Codex-style descendant fixture");
-                std::fs::write(pid_file, child.id().to_string())
+                publish_pid(pid_file.as_ref(), child.id())
                     .expect("failed to write Codex-style descendant pid");
                 println!("codex-descendant={}", child.id());
                 std::io::stdout()

@@ -991,8 +991,11 @@ each case requires depends on how far the cancellation got:
 
 - **Nothing committed:** the restart's containment marks the lost session
   `killed`, and its startup pass settles the attempt `failed`, which holds the
-  run for an operator retry. The re-sent request stores an
-  `ILLEGAL_TRANSITION` refusal, and later requests replay it.
+  run for an operator retry. The re-sent request releases the held run as a
+  fresh one would (#1486): in one transaction it reserves, settles the run
+  and the occurrence `cancelled`, leaves the failed attempt and its `killed`
+  session as they are, and stores a `cancelled` answer, which later requests
+  replay.
 - **Reserved, without the fence:** the same containment and hold. The request
   inside the lease is answered `CANCEL_PENDING` and writes nothing. The pass
   rejects the cancellation with `ILLEGAL_TRANSITION`, which later requests
@@ -1112,7 +1115,8 @@ It does not cover an eligible or planned slot, a waiting retry attempt (see
 `waiting-retry-cancellation-process-crash-recovery` for an automatic one), a
 request first sent to a run already held for an operator retry, a kill inside
 an `occurrence.cancel.v1` request that delegates a running attempt's stop
-(tracked in #1486), the run-cancellation envelope, a delegation waiting on
+(native unit tests cover its delegation window, #1486), the run-cancellation
+envelope, a delegation waiting on
 runtime ownership, Runtime Authority runs, a stop the runtime fails to confirm,
 a graceful daemon restart, a real runtime process, power loss, load, complete
 profiles or release eligibility.
@@ -1157,9 +1161,10 @@ the enforcement got:
   fence as a stop whose outcome is unknown: the attempt settles `ambiguous` and
   the occurrence `recovery_required`, and the fence stays. The next pass
   settles the run and occurrence `failed` on the ended session and releases
-  the fence. That exit from `recovery_required` is the one #1461 asks about,
-  and #1489 asks whether an expired `timeout` fence should settle by the
-  deadline instead.
+  the fence. That exit from `recovery_required` is the scheduler's
+  `terminal_evidence_after_ambiguous_stop` transition, ratified by #1461.
+  #1489 asks whether an expired `timeout` fence should settle by the deadline
+  instead.
 - **The settlement committed,** and the control: the restart changes no row,
   and every pass leaves the run timed out.
 
@@ -1516,24 +1521,20 @@ they make. What each case requires depends on what the worker committed:
   launches the routine once, the passes settle that run `succeeded`, and later
   requests replay the claim.
 - **The claim, killed after it commits or inside the launch:** the restart
-  changes no row. Startup restores only daemon claims, and the scheduler never
-  dispatches a manual one. Every request replays the stored claim without a
-  launch. The occurrence stays claimed until the pass after its lease fails it
-  `lease expired`, with no run, attempt or session.
-- **The launch, killed after it commits or inside ownership:** the restart
-  changes no row. Restart containment treats a missing receipt as the previous
-  daemon's containment only for a daemon-owned scheduled launch, so the manual
-  launch's `created` session stays ambiguous and is never relaunched: it stays
-  until the run's deadline. Every request replays the claim. The pass after
-  the deadline stops the session once and settles the run timed out.
-- **Ownership,** killed after it commits, and the control: the restart orphans
-  the `running` session and leaves the run, attempt and occurrence as they
-  were. Every request replays the claim, and the pass after the run's deadline
-  stops the session once and settles the run timed out.
-
-A run settled timed out has its attempt `timed_out` with the `timeout` class,
-its run `failed`, its occurrence `failed` with no lease, the deadline's reason
-on the attempt and the occurrence, and its session `killed`.
+  fails the claim at once, `daemon restarted before launch`, with no lease and
+  no run, attempt or session (#1502). The claim and the launch commit
+  separately and the launch writes its run before anything starts, so a claim
+  with no run launched nothing. Every request replays the failed occurrence
+  without a launch.
+- **The launch, killed after it commits or inside ownership, ownership killed
+  after it commits, and the control:** restart containment treats a missing
+  receipt as the previous daemon's containment for a run-now launch created
+  before the startup cutoff, as it does for a daemon-owned scheduled one
+  (#1502). It marks the session `killed` without a stop, and the startup pass
+  settles the attempt `failed` and holds the run for an operator retry. Every
+  request replays the claim. The pass after the deadline settles the held run
+  and the occurrence `failed`, `no operator retry was opened before the run's
+  deadline`.
 
 Every class pins the whole store: the counts, the one occurrence the owner's key
 names, of the `manual` kind and claimed once, with its lease and reason, and
@@ -1552,9 +1553,8 @@ evidence for a daemon killed while it handles one flat run-now request. It does
 not cover the command envelope, whose claim also reserves a result key and
 whose result is retained in a further transaction (see
 `run-now-envelope-process-crash-recovery`); a manual launch with a
-containment receipt; a manual launch left before ownership whose claim's lease
-expires before the run's deadline, which abandoned-launch recovery stops
-instead; the command's refusals; a graceful daemon restart (#1433);
+containment receipt; a manual launch created after the startup cutoff; the
+command's refusals; a graceful daemon restart (#1433);
 Runtime Authority runs, a real runtime process, power loss, load, complete
 profiles or release eligibility.
 
@@ -1579,11 +1579,10 @@ it after the claim's, the launch's, ownership's and the retention's commits. A
 control with no pause exits after the answer without the graceful shutdown's
 reconciliation or leadership release.
 
-The launch's recovery is the flat request's: a restart changes no row except
-to orphan an owned session, the scheduler never dispatches the manual claim,
-the pass after the lease fails a claim that never launched `lease expired`,
-and the pass after the run's deadline stops a launch once and settles it timed
-out. What the owner is answered depends on what the worker retained:
+The launch's recovery is the flat request's: the restart fails a claim that
+never launched, `daemon restarted before launch`, and contains a launch,
+holding its run until the pass after its deadline settles it `failed` (#1502).
+What the owner is answered depends on what the worker retained:
 
 - **Nothing committed:** the re-sent request claims, launches once and retains
   its result, and later requests replay that result.
@@ -1930,8 +1929,9 @@ passes and the requests make.
   leaves the fence alone. The pass after the lease settles the attempt
   `ambiguous` and the occurrence `recovery_required`, and the second pass
   settles the run and occurrence `failed` and releases the fence. That exit is
-  the one #1461 asks about, and #1489 asks whether an expired `timeout` fence
-  should settle by the deadline instead.
+  the scheduler's `terminal_evidence_after_ambiguous_stop` transition (#1461),
+  and #1489 asks whether an expired `timeout` fence should settle by the
+  deadline instead.
 - **The timeout settled:** the run stays timed out, and every request is
   refused.
 

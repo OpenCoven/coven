@@ -56,6 +56,8 @@ pub enum MobileRoute {
     MemoryDetail,
     DeviceRead,
     DeviceDelete,
+    Introductions,
+    IntroductionApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +80,9 @@ pub fn route_request(method: &str, path: &str) -> RouteDecision {
             return method_route(method, "GET", MobileRoute::MemoryOverview)
         }
         "/api/v1/mobile/memory" => return method_route(method, "GET", MobileRoute::MemoryList),
+        "/api/v1/mobile/introductions" => {
+            return method_route(method, "GET", MobileRoute::Introductions)
+        }
         "/api/v1/mobile/device" => {
             return match method {
                 "GET" => RouteDecision::Route(MobileRoute::DeviceRead),
@@ -94,6 +99,13 @@ pub fn route_request(method: &str, path: &str) -> RouteDecision {
         {
             return method_route(method, "POST", MobileRoute::PairingConfirmation);
         }
+    }
+    if path
+        .strip_prefix("/api/v1/mobile/introductions/")
+        .and_then(|rest| rest.strip_suffix("/approve"))
+        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+    {
+        return method_route(method, "POST", MobileRoute::IntroductionApproval);
     }
     if path
         .strip_prefix("/api/v1/mobile/memory/")
@@ -300,6 +312,7 @@ struct MobileGatewayState {
     pairing: PairingManager,
     authenticator: MobileAuthenticator,
     advertised_endpoint: String,
+    introductions: super::enrollment::IntroductionLedger,
 }
 
 pub fn start_mobile_gateway(coven_home: &Path) -> Result<Option<MobileGatewayHandle>> {
@@ -363,6 +376,10 @@ fn start_mobile_gateway_with_config(
         authenticator: MobileAuthenticator::with_assurance(Arc::clone(&registry), challenges),
         registry,
         advertised_endpoint: config.advertised_endpoint.clone(),
+        introductions: super::enrollment::IntroductionLedger::new(
+            coven_home,
+            identity.public_key_fingerprint,
+        ),
     });
     *ACTIVE_GATEWAY
         .lock()
@@ -790,6 +807,30 @@ fn handle_protected_route(
             );
             Ok(serde_json::Value::Null)
         }
+        // Visible only to the named introducer; authority is checked again,
+        // with its own step-up, when the approval is submitted.
+        MobileRoute::Introductions => state
+            .introductions
+            .pending_for(verified.device_id, Utc::now())
+            .and_then(json_value),
+        MobileRoute::IntroductionApproval => {
+            let id = path
+                .strip_prefix("/api/v1/mobile/introductions/")
+                .and_then(|rest| rest.strip_suffix("/approve"))
+                .and_then(|id| Uuid::parse_str(id).ok());
+            let approval: Option<super::enrollment::MobileIntroductionApproval> =
+                serde_json::from_slice(&request.body).ok();
+            let (Some(id), Some(approval)) = (id, approval) else {
+                return error_response(400, MobileErrorCode::InvalidRequest);
+            };
+            match state
+                .introductions
+                .approve(id, verified.device_id, approval, Utc::now())
+            {
+                Ok(status) => json_value(status),
+                Err(_) => return error_response(409, MobileErrorCode::AssuranceRequired),
+            }
+        }
         _ => return error_response(404, MobileErrorCode::InvalidRequest),
     };
     if route != MobileRoute::DeviceDelete {
@@ -867,10 +908,17 @@ const LOCAL_CONTROL_ROOT: &str = "/api/v1/internal/mobile/pairings";
 /// `handle_local_control` refuse anything it rejects, stops the two from
 /// drifting apart.
 pub(crate) fn claims_local_control(path: &str) -> bool {
-    path == LOCAL_CONTROL_ROOT
-        || path
-            .strip_prefix(LOCAL_CONTROL_ROOT)
-            .is_some_and(|rest| rest.starts_with('/'))
+    [
+        LOCAL_CONTROL_ROOT,
+        super::enrollment::LOCAL_INTRODUCTION_ROOT,
+    ]
+    .iter()
+    .any(|root| {
+        path == *root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 pub(crate) fn handle_local_control(
@@ -881,6 +929,9 @@ pub(crate) fn handle_local_control(
     const ROOT: &str = LOCAL_CONTROL_ROOT;
     if !claims_local_control(path) {
         return None;
+    }
+    if !(path == ROOT || path.starts_with(&(ROOT.to_owned() + "/"))) {
+        return Some(handle_local_introduction(method, path, body));
     }
     if path == ROOT {
         if method != "POST" {
@@ -1003,6 +1054,67 @@ pub(crate) fn handle_local_control(
             _ => crate::api::api_error(404, "not_found", "Route not found.", None),
         }
     })())
+}
+
+/// Owner-socket introduction control. Admission happens only here, so a
+/// relay or account service cannot place a request in front of an introducer.
+fn handle_local_introduction(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<crate::api::ApiResponse> {
+    use super::enrollment::{IntroductionEnvelope, LOCAL_INTRODUCTION_ROOT as ROOT};
+    if method != "POST" {
+        return crate::api::api_error(405, "method_not_allowed", "Method not allowed.", None);
+    }
+    let state = active_gateway()?;
+    let now = Utc::now();
+    if path == ROOT {
+        let envelope: IntroductionEnvelope =
+            match serde_json::from_str(body.context("introduction omitted body")?) {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    return crate::api::api_error(
+                        400,
+                        "invalid_request",
+                        "Introduction envelope is malformed.",
+                        None,
+                    )
+                }
+            };
+        return match state.introductions.admit(envelope, now) {
+            Ok(status) => crate::api::json_response(201, &status),
+            Err(error) => crate::api::api_error(
+                409,
+                "introduction_rejected",
+                &format!("Introduction was not admitted: {error}"),
+                None,
+            ),
+        };
+    }
+    let Some((id, action)) = path
+        .strip_prefix(&(ROOT.to_owned() + "/"))
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return crate::api::api_error(404, "not_found", "Route not found.", None);
+    };
+    let Ok(id) = Uuid::parse_str(id) else {
+        return crate::api::api_error(
+            400,
+            "invalid_request",
+            "Introduction id must be a UUID.",
+            None,
+        );
+    };
+    let result = match action {
+        "status" => state.introductions.status(id, now),
+        "cancel" => state.introductions.cancel(id, now),
+        _ => return crate::api::api_error(404, "not_found", "Route not found.", None),
+    };
+    match result {
+        Ok(status) => crate::api::json_response(200, &status),
+        Err(_) => crate::api::api_error(404, "not_found", "Introduction not found.", None),
+    }
 }
 
 fn json_value(value: impl Serialize) -> Result<serde_json::Value> {
@@ -1360,6 +1472,7 @@ mod tests {
             ),
             registry,
             advertised_endpoint: "https://192.0.2.1:7443".to_owned(),
+            introductions: super::super::enrollment::IntroductionLedger::new(temp.path(), [3; 32]),
         };
         let path = "/api/v1/mobile/assurance/challenge";
         let nonce = URL_SAFE_NO_PAD.encode([7; 32]);
@@ -1662,6 +1775,201 @@ mod tests {
         assert!(start_mobile_gateway_for_daemon(temp.path())
             .unwrap()
             .is_none());
+    }
+
+    fn introduction_gateway(
+        fixture: &super::super::enrollment::tests::Fixture,
+    ) -> MobileGatewayState {
+        let home = fixture.home.path();
+        let registry = Arc::new(DeviceRegistry::load(home).unwrap());
+        MobileGatewayState {
+            coven_home: home.to_path_buf(),
+            host_fingerprint: [7; 32],
+            pairing: PairingManager::new(Arc::clone(&registry)),
+            authenticator: MobileAuthenticator::with_assurance(
+                Arc::clone(&registry),
+                AssuranceChallengeStore::load(home).unwrap(),
+            ),
+            registry,
+            advertised_endpoint: "https://192.0.2.1:7443".to_owned(),
+            introductions: super::super::enrollment::IntroductionLedger::new(home, [7; 32]),
+        }
+    }
+
+    fn signed_device_request(
+        key: &SigningKey,
+        device_id: Uuid,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> MobileHttpRequest {
+        let now = Utc::now();
+        let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+        let body_digest = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(&body));
+        let canonical = super::super::auth::canonical_request(
+            method,
+            path,
+            now.timestamp(),
+            &nonce,
+            &body_digest,
+        )
+        .unwrap();
+        let signature: Signature = key.sign(&canonical);
+        MobileHttpRequest {
+            method: method.to_owned(),
+            target: path.to_owned(),
+            headers: HashMap::from([
+                ("x-coven-protocol".to_owned(), "1".to_owned()),
+                ("x-coven-device".to_owned(), device_id.to_string()),
+                ("x-coven-timestamp".to_owned(), now.timestamp().to_string()),
+                ("x-coven-nonce".to_owned(), nonce),
+                ("x-coven-body-sha256".to_owned(), body_digest),
+                (
+                    "x-coven-signature".to_owned(),
+                    URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+                ),
+            ]),
+            body,
+        }
+    }
+
+    #[test]
+    fn owner_socket_introduction_admission_fails_closed() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let root = "/api/v1/internal/mobile/introductions";
+        let call = |method: &str, path: &str, body: &str| {
+            handle_local_control(method, path, Some(body))
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(call("GET", root, "{}").status, 405);
+        assert_eq!(call("POST", root, "{\"request\":{}}").status, 400);
+
+        // A well-formed envelope is still refused with no installed policy.
+        let fixture = super::super::enrollment::tests::Fixture::new_at(Utc::now());
+        let envelope = serde_json::to_string(&fixture.envelope).unwrap();
+        let refused = call("POST", root, &envelope);
+        assert_eq!(refused.status, 409);
+        assert!(refused.body.contains("introduction_rejected"));
+
+        let unknown = format!("{root}/00000000-0000-0000-0000-000000000009/status");
+        assert_eq!(call("POST", &unknown, "{}").status, 404);
+        assert_eq!(
+            call("POST", &format!("{root}/nope/status"), "{}").status,
+            400
+        );
+        assert!(!temp.path().join("mobile/introduction-policy.json").exists());
+    }
+
+    #[test]
+    fn introduction_routes_are_claimed_and_mapped() {
+        assert!(claims_local_control(
+            "/api/v1/internal/mobile/introductions"
+        ));
+        assert!(claims_local_control(
+            "/api/v1/internal/mobile/introductions/00000000-0000-0000-0000-000000000001/status"
+        ));
+        assert!(!claims_local_control(
+            "/api/v1/internal/mobile/introductionsx"
+        ));
+        assert_eq!(
+            route_request("GET", "/api/v1/mobile/introductions"),
+            RouteDecision::Route(MobileRoute::Introductions)
+        );
+        assert_eq!(
+            route_request(
+                "POST",
+                "/api/v1/mobile/introductions/00000000-0000-0000-0000-000000000001/approve"
+            ),
+            RouteDecision::Route(MobileRoute::IntroductionApproval)
+        );
+        assert_eq!(
+            route_request("POST", "/api/v1/mobile/introductions/not-a-uuid/approve"),
+            RouteDecision::NotFound
+        );
+        // Admission is owner-socket only: the TLS gateway has no admit route.
+        assert_eq!(
+            route_request("POST", "/api/v1/mobile/introductions"),
+            RouteDecision::MethodNotAllowed("GET")
+        );
+    }
+
+    #[test]
+    fn introducer_lists_and_approves_over_the_authenticated_gateway() {
+        // The fixture's synthetic clock is fixed; the gateway checks request
+        // freshness against wall time, so re-anchor the fixture to now.
+        let fixture = super::super::enrollment::tests::Fixture::new_at(Utc::now());
+        let state = introduction_gateway(&fixture);
+        let admitted = state
+            .introductions
+            .admit(fixture.envelope.clone(), fixture.now)
+            .unwrap();
+
+        let list = handle_mobile_request(
+            &state,
+            signed_device_request(
+                &fixture.source,
+                fixture.introducer(),
+                "GET",
+                "/api/v1/mobile/introductions",
+                Vec::new(),
+            ),
+        );
+        assert_eq!(list.status, 200, "{}", list.body);
+        let data = envelope_data(&list.body);
+        assert_eq!(data[0]["id"], admitted.id.to_string());
+        assert_eq!(
+            data[0]["action"]["operation"],
+            "devices.introduction.approve"
+        );
+
+        // A different enrolled device sees nothing and cannot approve.
+        let outsider = SigningKey::from_slice(&[44; 32]).unwrap();
+        let outsider_id = fixture.enroll_outsider(&outsider);
+        let hidden = handle_mobile_request(
+            &state,
+            signed_device_request(
+                &outsider,
+                outsider_id,
+                "GET",
+                "/api/v1/mobile/introductions",
+                Vec::new(),
+            ),
+        );
+        assert_eq!(hidden.status, 200);
+        assert_eq!(envelope_data(&hidden.body), serde_json::json!([]));
+        let path = format!("/api/v1/mobile/introductions/{}/approve", admitted.id);
+        let body = serde_json::to_vec(&fixture.approval()).unwrap();
+        let refused = handle_mobile_request(
+            &state,
+            signed_device_request(&outsider, outsider_id, "POST", &path, body),
+        );
+        assert_eq!(refused.status, 409);
+        assert_eq!(
+            state
+                .introductions
+                .status(admitted.id, fixture.now)
+                .unwrap()
+                .state,
+            super::super::enrollment::IntroductionState::AwaitingApproval
+        );
+
+        let body = serde_json::to_vec(&fixture.approval()).unwrap();
+        let approved = handle_mobile_request(
+            &state,
+            signed_device_request(&fixture.source, fixture.introducer(), "POST", &path, body),
+        );
+        assert_eq!(approved.status, 200, "{}", approved.body);
+        assert_eq!(envelope_data(&approved.body)["state"], "introduced");
+        assert!(state
+            .registry
+            .device(fixture.envelope.request.destination_id)
+            .unwrap()
+            .is_some());
     }
 
     fn test_listener_config() -> Option<(tempfile::TempDir, MobileGatewayConfig, Vec<u8>)> {
