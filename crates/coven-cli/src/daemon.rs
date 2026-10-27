@@ -3077,6 +3077,25 @@ pub fn recover_orphaned_sessions(coven_home: &Path, updated_at: &str) -> Result<
     crate::store::mark_running_sessions_orphaned(&conn, updated_at)
 }
 
+/// Remove the scoped read channel directories a previous daemon left behind.
+/// Each holds an MCP configuration with a token, and no channel survives its
+/// daemon, so none of them can be in use. Never fatal to startup.
+#[cfg(unix)]
+pub(crate) fn recover_stale_scoped_read_channels(coven_home: &Path) {
+    use crate::automations::scoped_read::channel;
+    match channel::sweep_stale(&channel::runtime_dir(coven_home)) {
+        Ok(0) => {}
+        Ok(removed) => append_daemon_recovery_log(
+            coven_home,
+            &format!("removed {removed} stale scoped read channel(s)"),
+        ),
+        Err(error) => append_daemon_recovery_log(
+            coven_home,
+            &format!("could not sweep stale scoped read channels: {error:#}"),
+        ),
+    }
+}
+
 /// Unmount AFS mounts whose owning daemon is gone (DESIGN.md §7).
 ///
 /// Never fatal to startup. A mount we cannot reclaim is a stale mount point,
@@ -6169,6 +6188,7 @@ pub fn serve_forever(
     startup.append(coven_home, StartupCheckpoint::StaleCreatedSessionsEnd);
     recover_orphaned_afs_mounts(coven_home);
     startup.append(coven_home, StartupCheckpoint::AfsRecoveryEnd);
+    recover_stale_scoped_read_channels(coven_home);
     let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
         coven_home.to_path_buf(),
     )?);

@@ -184,7 +184,7 @@ pub(in crate::automations) fn prepare(
         deadline: request.deadline,
     };
     let channel = Channel::open(
-        &request.coven_home.join("runtime").join("scoped-read"),
+        &super::channel::runtime_dir(request.coven_home),
         request.relay,
         |gate| Service::new(reader, gate, limits),
         gate,

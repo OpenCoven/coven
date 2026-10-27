@@ -472,3 +472,91 @@ fn commitments_hold_no_content_path_pattern_or_name() {
         }
     }
 }
+
+/// A store gate whose daemon dies between committing a result and writing
+/// it: the commitment stands, and nothing is written until `hold` lets the
+/// stand-in thread go.
+struct Crashing {
+    inner: StoreGate,
+    crashed: mpsc::Sender<()>,
+    hold: mpsc::Receiver<()>,
+}
+
+impl Gate for Crashing {
+    fn admit(&mut self) -> std::result::Result<(), Refusal> {
+        Gate::admit(&mut self.inner)
+    }
+
+    fn commit(&mut self, committing: &Committing<'_>) -> std::result::Result<(), Refusal> {
+        Gate::commit(&mut self.inner, committing)?;
+        let _ = self.crashed.send(());
+        let _ = self.hold.recv();
+        Err(Refusal::AttemptClosed)
+    }
+}
+
+#[test]
+fn a_crash_after_commit_keeps_the_row_and_restart_sweeps_the_channel() {
+    let dispatched = Dispatched::new();
+    let home = dispatched.fixture.home.path().to_path_buf();
+    let (crash, crashed) = mpsc::channel();
+    let (release, hold) = mpsc::channel::<()>();
+    let gate_home = home.clone();
+    let prepared = prepare_with_gate(
+        dispatched.conn(),
+        &dispatched.fixture.launch(&dispatched.launched),
+        Utc::now(),
+        move |authorized| {
+            Ok(Box::new(Crashing {
+                inner: StoreGate::open(
+                    &gate_home,
+                    authorized.held.clone(),
+                    Duration::from_millis(200),
+                    None,
+                )?,
+                crashed: crash,
+                hold,
+            }))
+        },
+    )
+    .expect("the launch is admitted");
+    let reading = thread::spawn(move || read_through(prepared, &[read("notes/today.md")]));
+    crashed.recv().unwrap();
+
+    // The daemon is gone: the row records that the bytes were authorized,
+    // and the channel's directory, with its token, is still on disk.
+    let served = |rows: &[(i64, String, Option<String>, Option<String>)]| {
+        rows.len() == 1 && rows[0].0 == 1 && rows[0].1 == "served"
+    };
+    assert!(served(&dispatched.rows()), "{:?}", dispatched.rows());
+    let runtime = crate::automations::scoped_read::channel::runtime_dir(&home);
+    let channels = || std::fs::read_dir(&runtime).unwrap().count();
+    assert_eq!(channels(), 1);
+
+    // The next daemon starts.
+    let restarted = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    crate::daemon::recover_orphaned_sessions(&home, &restarted).unwrap();
+    crate::daemon::recover_stale_scoped_read_channels(&home);
+    assert_eq!(channels(), 0, "the stale channel is swept");
+    let (session, attempt): (String, String) = dispatched
+        .conn()
+        .query_row(
+            "SELECT s.status, a.state FROM automation_attempts AS a
+             JOIN sessions AS s ON s.id = ?2
+             WHERE a.id = ?1",
+            rusqlite::params![dispatched.held.attempt_id, dispatched.launched.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (session.as_str(), attempt.as_str()),
+        ("orphaned", "started"),
+        "the attempt is held for recovery"
+    );
+    assert!(served(&dispatched.rows()));
+
+    // No byte of the committed result was ever written.
+    drop(release);
+    let results = reading.join().unwrap();
+    assert_eq!(results, [(json!({ "refusal": "attempt_closed" }), true)]);
+}
