@@ -203,3 +203,55 @@ fn the_args_only_path_refuses_a_scoped_envelope() {
     );
     assert!(runtime.sessions.lock().unwrap().is_empty());
 }
+
+#[test]
+fn a_launch_refused_after_consumption_records_its_profile_code() {
+    let fixture = Fixture::new();
+    // A project inside COVEN_HOME passes dispatch, but admission refuses it
+    // (`root_protected`) only once the decision is consumed.
+    let inside = fixture.home.path().join("inside");
+    fs::create_dir_all(inside.join("notes")).unwrap();
+    fs::write(inside.join("notes/today.md"), GRANTED).unwrap();
+    fixture.create_in(
+        "notes",
+        r0(vec![scope("notes/today.md", false)]),
+        "ACTIVE",
+        inside.to_str().unwrap(),
+    );
+    let occurrence = fixture.schedule("notes");
+    let runtime = LiveSessionRuntime::with_coven_home(fixture.home.path().to_path_buf())
+        .with_scoped_harness(fixture.program.clone());
+    let (report, _runtime) = fixture.dispatch_pass_with(runtime);
+    assert!(report.dispatched.is_empty(), "{report:?}");
+    assert_eq!(
+        fixture.threads_rows(),
+        (1, 1, 1),
+        "the decision was consumed"
+    );
+
+    let expected = "automation authority refused dispatch: AUTHORITY_RUNTIME_DOWNGRADE";
+    let (class, reason): (String, String) = fixture
+        .home
+        .conn
+        .query_row(
+            "SELECT failure_class, state_reason FROM automation_attempts
+             WHERE occurrence_id = ?1",
+            [&occurrence],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (class.as_str(), reason.as_str()),
+        ("launch_refused", expected)
+    );
+    let recorded: String = fixture
+        .home
+        .conn
+        .query_row(
+            "SELECT failure_reason FROM automation_occurrences WHERE id = ?1",
+            [&occurrence],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, expected);
+}

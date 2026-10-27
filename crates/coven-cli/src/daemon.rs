@@ -725,23 +725,28 @@ impl LiveSessionRuntime {
         launch: &SessionLaunch,
         projection: &crate::automations::authority_projection::AutomationAuthorityConsumerProjection,
     ) -> Result<crate::automations::scoped_read::admission::Prepared> {
-        let refused = |why: String| {
-            anyhow::anyhow!(
-                "{}: {why}",
-                crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
-            )
+        use crate::automations::contract::authority::AuthorityProfileErrorCode;
+        let refused = |code, detail: String| {
+            anyhow::Error::new(crate::api::RuntimeAuthorityLaunchRefused { code, detail })
         };
+        let unavailable =
+            |detail| refused(AuthorityProfileErrorCode::TrustedStateUnavailable, detail);
         let coven_home = self
             .coven_home
             .as_deref()
-            .ok_or_else(|| refused("a scoped read launch requires COVEN_HOME".to_owned()))?;
+            .ok_or_else(|| unavailable("a scoped read launch requires COVEN_HOME".to_owned()))?;
         let conn = crate::store::open_store(&crate::api::store_path(coven_home))
-            .map_err(|error| refused(format!("{error:#}")))?;
+            .map_err(|error| unavailable(format!("{error:#}")))?;
         let program = self
             .scoped_harness_program(&launch.harness)
-            .map_err(|error| refused(format!("{error:#}")))?;
+            .map_err(|error| {
+                refused(
+                    AuthorityProfileErrorCode::RuntimeDowngrade,
+                    format!("{error:#}"),
+                )
+            })?;
         let relay = std::env::current_exe()
-            .map_err(|error| refused(format!("the relay cannot be located: {error}")))?;
+            .map_err(|error| unavailable(format!("the relay cannot be located: {error}")))?;
         let owner_home = dirs_next::home_dir();
         let scoped = crate::automations::trusted_launch::ScopedLaunch {
             coven_home,
@@ -755,7 +760,7 @@ impl LiveSessionRuntime {
             deadline: run_deadline(&conn, projection.attempt_id.as_str()),
         };
         crate::automations::trusted_launch::prepare(&conn, &scoped, chrono::Utc::now())
-            .map_err(|refusal| refused(refusal.to_string()))
+            .map_err(|refusal| refused(refusal.code(), refusal.to_string()))
     }
 
     fn begin_launch(&self) -> Result<LiveLaunchAdmission> {

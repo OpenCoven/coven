@@ -110,6 +110,22 @@ impl fmt::Display for LaunchRefusal {
 
 impl std::error::Error for LaunchRefusal {}
 
+impl LaunchRefusal {
+    /// The authority profile code the refusal is recorded with.
+    pub(crate) fn code(&self) -> AuthorityProfileErrorCode {
+        match self {
+            // The pinned envelope cannot run here as the binding requires.
+            Self::NotScoped | Self::Admission(_) => AuthorityProfileErrorCode::RuntimeDowngrade,
+            Self::BindingMismatch(_) | Self::ProjectMismatch => {
+                AuthorityProfileErrorCode::BindingMismatch
+            }
+            Self::DecisionUntrusted(_) => AuthorityProfileErrorCode::AuthenticationUnverifiable,
+            Self::Withdrawn(code, _) => *code,
+            Self::Unavailable(_) => AuthorityProfileErrorCode::TrustedStateUnavailable,
+        }
+    }
+}
+
 /// What a trusted launch was verified to run under.
 #[derive(Debug)]
 pub(crate) struct Authorized {

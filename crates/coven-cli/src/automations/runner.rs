@@ -1546,7 +1546,13 @@ fn dispatch_occurrence_with_clock(
             Ok(DispatchAttempt::Deferred)
         }
         Err(error) => {
-            let reason = format!("{error:#}");
+            // A Runtime Authority launch refused after its decision was
+            // consumed is recorded under its profile code, as a refusal
+            // before launch is.
+            let reason = match error.downcast_ref::<crate::api::RuntimeAuthorityLaunchRefused>() {
+                Some(refused) => format!("{AUTHORITY_REFUSAL_PREFIX}{}", refused.code.as_str()),
+                None => format!("{error:#}"),
+            };
             let failure_class = classify_preownership_failure(&error);
             let failure_at = (control.clock)().max(now);
             let status = settle_rejected_launch(

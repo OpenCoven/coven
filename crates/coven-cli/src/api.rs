@@ -568,6 +568,26 @@ impl std::fmt::Display for RuntimeLaunchAdmissionClosedError {
 
 impl std::error::Error for RuntimeLaunchAdmissionClosedError {}
 
+/// A Runtime Authority launch the runtime refused before starting anything,
+/// with the authority profile code it is recorded under.
+#[derive(Debug)]
+pub(crate) struct RuntimeAuthorityLaunchRefused {
+    pub code: crate::automations::contract::authority::AuthorityProfileErrorCode,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RuntimeAuthorityLaunchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED}: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for RuntimeAuthorityLaunchRefused {}
+
 pub(crate) const RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED: &str =
     "runtime does not accept automation authority projections; no process started";
 
