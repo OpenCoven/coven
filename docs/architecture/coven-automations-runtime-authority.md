@@ -422,6 +422,15 @@ unadvertised until slice 6.
      can reach the adapter, and tests build such routines on their own
      thread.
 
+   Before the launch transaction decides anything, dispatch preflights what
+   needs no decision: the runtime takes authority projections and can launch
+   the envelope, the harness reports an admitted version, and the owner's
+   key is saved. A refusal there records no decision, adoption or
+   consumption. At launch, `prepare` also refuses an attempt whose authority
+   was withdrawn since dispatch: an attempt that is no longer live, a
+   pending stop or cancellation, a retired or revoked familiar revision, or
+   a definition revision that is no longer current and active.
+
    A refusal before launch records its profile code on the occurrence.
    Manual occurrences, including run-now and claimed manual ones, stay
    refused until the Runtime Authority grant integration for
