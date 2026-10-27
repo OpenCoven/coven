@@ -70,6 +70,16 @@ impl Protected {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test fault: the next directory listing on this thread fails once it
+    /// has scanned at least this many name bytes, as a directory that errors
+    /// part way through being read would. No permission change can make a
+    /// directory that has already opened fail to list.
+    pub(crate) static FAIL_LISTING_AFTER: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// A point in serving a request, reported to the reader's probe. Tests use it
 /// to change the filesystem at an exact step; production passes a probe that
 /// does nothing. A search reports the steps of its directory and each file it scans.
@@ -1020,6 +1030,16 @@ mod platform {
                 });
             }
             scanned += bytes;
+            #[cfg(test)]
+            if super::FAIL_LISTING_AFTER
+                .with(|after| after.get().is_some_and(|after| scanned >= after))
+            {
+                super::FAIL_LISTING_AFTER.with(|after| after.set(None));
+                return Err(ScanError {
+                    refusal: Refusal::ResourceUnavailable,
+                    scanned,
+                });
+            }
             if let Some(name) = name
                 .to_str()
                 .filter(|name| RelativePath::is_name(name, policy))

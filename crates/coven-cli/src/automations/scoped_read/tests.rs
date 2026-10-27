@@ -1246,6 +1246,47 @@ mod filesystem {
         assert_moved_withheld(&mut reader, "docs/guides/moved");
     }
 
+    #[test]
+    fn a_search_whose_directory_fails_to_list_is_refused_and_charged() {
+        use super::super::open::FAIL_LISTING_AFTER;
+
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        // Two names of four bytes each, so the fault fires after the first
+        // whichever order the directory returns them in.
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("b.md"), "TODO b").unwrap();
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            ReadPolicy {
+                scan_bytes: 8,
+                ..R0_READ_POLICY
+            },
+        );
+        FAIL_LISTING_AFTER.with(|after| after.set(Some(4)));
+        let mut steps = Vec::new();
+        let refused = reader
+            .serve_with(&search_request("docs/guides", "TODO", None), &mut |step| {
+                steps.push(step)
+            });
+        let fired = FAIL_LISTING_AFTER.with(|after| after.take()).is_none();
+        assert!(fired, "the listing fault fired");
+        assert_eq!(
+            steps.last(),
+            Some(&Step::Read),
+            "the directory opened and its checks passed before the listing failed"
+        );
+        assert_eq!(refused.err(), Some(Refusal::ResourceUnavailable));
+        // The four name bytes scanned before the failure stay charged: a
+        // listing of the same eight bytes no longer fits the scan total.
+        assert_eq!(
+            reader.serve(&list_request("docs/guides", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+    }
+
     /// Whether this process ignores permission bits, as root does.
     fn privileged() -> bool {
         // SAFETY: geteuid() only reads the effective uid and cannot fail.
