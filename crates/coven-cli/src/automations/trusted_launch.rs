@@ -343,10 +343,6 @@ pub(crate) mod test_support {
         pub outside: PathBuf,
         pub program: PathBuf,
         _scratch: tempfile::TempDir,
-        // Production validation refuses a declared authority until the
-        // daemon's launch path runs the scoped read service; the fixture's
-        // thread lifts that for as long as it lives.
-        _admitted: crate::automations::definition::DeclaredAuthorityAdmitted,
     }
 
     /// A filesystem scope on the project root.
@@ -392,7 +388,6 @@ pub(crate) mod test_support {
                 outside,
                 program,
                 _scratch: scratch,
-                _admitted: crate::automations::definition::admit_declared_authority_for_test(),
             }
         }
 

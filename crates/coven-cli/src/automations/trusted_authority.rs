@@ -846,9 +846,6 @@ mod tests {
             "familiarId": "sage", "cwd": home.path().display().to_string(),
             "prompt": "Summarise the notes.", "authority": authority
         });
-        // Production validation refuses a declared authority until the
-        // daemon's launch path runs the scoped read service.
-        let _admitted = crate::automations::definition::admit_declared_authority_for_test();
         let (status, response) = route_action_with_authority(
             json!({ "action": "coven.automations.definition.create.v1",
                     "adoptionKey": format!("adopt:{id}:create"), "definition": routine }),
@@ -1091,15 +1088,15 @@ mod tests {
     }
 
     #[test]
-    fn declaring_authority_is_refused_until_the_launch_gate_lands() {
-        // The daemon refuses r0-read.2 projections until its launch path runs
-        // the scoped read service, after dispatch has consumed a decision. So
-        // no routine may declare authority yet: neither by create nor revise.
+    fn a_routine_may_declare_authority_on_create_and_revise() {
+        // The daemon launches the scoped read envelope only through
+        // trusted_launch under the store gate (#1603), so validation admits
+        // an authority block: on create, and on a revise that adds one.
         let home = Home::new();
         home.register("adopt:ledger:register");
-        let routine = |authority: Option<Value>| {
+        let routine = |id: &str, authority: Option<Value>| {
             let mut routine = json!({
-                "schemaVersion": 1, "id": "notes", "name": "notes", "status": "ACTIVE",
+                "schemaVersion": 1, "id": id, "name": id, "status": "ACTIVE",
                 "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
                 "overlap": "forbid", "timeoutMinutes": 30, "runtime": "claude",
                 "familiarId": "sage", "cwd": home.path().display().to_string(),
@@ -1110,49 +1107,35 @@ mod tests {
             }
             routine
         };
-        let route = |command: Value| {
-            route_action_with_authority(
+        let accepted = |command: Value| {
+            let (status, response) = route_action_with_authority(
                 command,
                 &home.conn,
                 &NoopSessionRuntime,
                 CommandAuthority::OwnerLocal,
-            )
-        };
-        let refused = |(status, response): (u16, crate::control_plane::ControlActionResponse)| {
-            // The same definition without `authority` is accepted below, so
-            // the declaration is what validation refuses. Its message is the
-            // definition module's own test.
-            assert!(!response.accepted, "{status} {response:?}");
-            assert_eq!(
-                response.error.as_ref().map(|error| error["code"].clone()),
-                Some(json!("VALIDATION_FAILED")),
-                "{response:?}"
             );
+            assert!(status == 200 && response.accepted, "{status} {response:?}");
         };
-        refused(route(
-            json!({ "action": "coven.automations.definition.create.v1",
-                              "adoptionKey": "adopt:notes:create",
-                              "definition": routine(Some(r0())) }),
-        ));
-        let (status, response) = route(json!({ "action": "coven.automations.definition.create.v1",
-                                               "adoptionKey": "adopt:notes:create-plain",
-                                               "definition": routine(None) }));
-        assert!(status == 200 && response.accepted, "{response:?}");
-        refused(route(
-            json!({ "action": "coven.automations.definition.revise.v1",
-                              "adoptionKey": "adopt:notes:revise",
-                              "expectedRevision": 1,
-                              "definition": routine(Some(r0())) }),
-        ));
-        let declared: Option<String> = home
-            .conn
-            .query_row(
-                "SELECT json_extract(definition_json, '$.authority') FROM automation_definitions
-                 WHERE id = 'notes'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(declared, None, "no stored routine declares authority");
+        accepted(json!({ "action": "coven.automations.definition.create.v1",
+                         "adoptionKey": "adopt:notes:create",
+                         "definition": routine("notes", Some(r0())) }));
+        accepted(json!({ "action": "coven.automations.definition.create.v1",
+                         "adoptionKey": "adopt:plain:create",
+                         "definition": routine("plain", None) }));
+        accepted(json!({ "action": "coven.automations.definition.revise.v1",
+                         "adoptionKey": "adopt:plain:revise", "expectedRevision": 1,
+                         "definition": routine("plain", Some(r0())) }));
+        for id in ["notes", "plain"] {
+            let declared: Option<String> = home
+                .conn
+                .query_row(
+                    "SELECT json_extract(definition_json, '$.authority')
+                     FROM automation_definitions WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(declared.is_some(), "{id} declares authority");
+        }
     }
 }

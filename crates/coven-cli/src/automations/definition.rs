@@ -464,45 +464,6 @@ pub struct RoutineDefinition {
     pub authority: Option<RoutineAuthority>,
 }
 
-// Tests build routines that declare authority, which validation refuses in
-// production until the daemon's launch path runs the scoped read service
-// (#1603). Only a test thread can lift the refusal, and only while it holds
-// the guard.
-#[cfg(test)]
-thread_local! {
-    static DECLARED_AUTHORITY_ADMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// While held, validation on this test thread admits a declared authority.
-#[cfg(test)]
-pub(crate) struct DeclaredAuthorityAdmitted(());
-
-#[cfg(test)]
-impl Drop for DeclaredAuthorityAdmitted {
-    fn drop(&mut self) {
-        DECLARED_AUTHORITY_ADMITTED.with(|admitted| admitted.set(false));
-    }
-}
-
-fn declared_authority_admitted() -> bool {
-    #[cfg(test)]
-    {
-        DECLARED_AUTHORITY_ADMITTED.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        false
-    }
-}
-
-/// Lifts the declared-authority refusal on this test thread until the guard
-/// drops.
-#[cfg(test)]
-pub(crate) fn admit_declared_authority_for_test() -> DeclaredAuthorityAdmitted {
-    DECLARED_AUTHORITY_ADMITTED.with(|admitted| admitted.set(true));
-    DeclaredAuthorityAdmitted(())
-}
-
 impl RoutineDefinition {
     /// Validates a parsed definition and returns a structured error message
     /// for the control plane. Parsing and validation are one reviewable
@@ -636,15 +597,6 @@ impl RoutineDefinition {
         }
         if let Some(authority) = &self.authority {
             authority.validate()?;
-            // The trusted adapter is built, but the daemon's launch path does
-            // not yet run the scoped read service it pins, and would refuse
-            // the launch only after dispatch consumed a decision (#1603).
-            if !declared_authority_admitted() {
-                return Err(
-                    "authority is not supported until this daemon advertises Runtime Authority"
-                        .to_string(),
-                );
-            }
         }
         Ok(())
     }
@@ -959,15 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_authority_is_refused_until_runtime_authority_is_advertised() {
-        let error = RoutineDefinition::from_json(&with_authority(r0_authority())).unwrap_err();
-        assert!(
-            error.contains("until this daemon advertises Runtime Authority"),
-            "{error}"
-        );
-        // Tests that build an authority routine lift the refusal on their
-        // own thread, and it round-trips.
-        let _admitted = admit_declared_authority_for_test();
+    fn a_declared_authority_is_admitted_and_round_trips() {
         let declared = RoutineDefinition::from_json(&with_authority(r0_authority())).unwrap();
         assert_eq!(
             serde_json::to_value(&declared).unwrap()["authority"],
