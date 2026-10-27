@@ -31,7 +31,7 @@ use super::contract::authority::{
 use super::runtime_envelope::{self, RuntimeEnvelope};
 use super::scoped_read::admission::{self, AdmissionError, Prepared};
 use super::scoped_read::service::Gate;
-use super::store_gate::{self, Held};
+use super::store_gate::{self, Held, StoreGate};
 use super::threads_decisions;
 use super::trusted_authority::{opaque_id, TrustedAuthority};
 
@@ -252,24 +252,56 @@ pub(crate) fn launch_scopes(
     })
 }
 
-/// Admits and prepares one trusted launch under its decision's scopes, with
-/// `gate` admitting and committing each of the service's operations.
+/// Admits and prepares one trusted launch under its decision's scopes. The
+/// service's operations run under a [`StoreGate`] that holds what the launch
+/// verified: no other gate can be supplied.
 pub(crate) fn prepare(
     conn: &Connection,
     launch: &ScopedLaunch<'_>,
-    gate: Box<dyn Gate>,
     now: DateTime<Utc>,
 ) -> Result<Prepared, LaunchRefusal> {
-    let Authorized {
-        envelope, scopes, ..
-    } = launch_scopes(conn, launch, now)?;
+    prepare_gated(conn, launch, now, |authorized| {
+        let service = authorized
+            .envelope
+            .service
+            .as_ref()
+            .context("a scoped envelope binds its service")?;
+        Ok(Box::new(StoreGate::open(
+            launch.coven_home,
+            authorized.held.clone(),
+            service.operation_time,
+            launch.deadline,
+        )?))
+    })
+}
+
+/// [`prepare`] with the gate `gate` builds, so tests can pause it.
+#[cfg(test)]
+pub(crate) fn prepare_with_gate(
+    conn: &Connection,
+    launch: &ScopedLaunch<'_>,
+    now: DateTime<Utc>,
+    gate: impl FnOnce(&Authorized) -> anyhow::Result<Box<dyn Gate>>,
+) -> Result<Prepared, LaunchRefusal> {
+    prepare_gated(conn, launch, now, gate)
+}
+
+fn prepare_gated(
+    conn: &Connection,
+    launch: &ScopedLaunch<'_>,
+    now: DateTime<Utc>,
+    gate: impl FnOnce(&Authorized) -> anyhow::Result<Box<dyn Gate>>,
+) -> Result<Prepared, LaunchRefusal> {
+    let authorized = launch_scopes(conn, launch, now)?;
+    let gate =
+        gate(&authorized).map_err(|error| LaunchRefusal::Unavailable(format!("{error:#}")))?;
     admission::prepare(
         admission::Request {
             coven_home: launch.coven_home,
-            envelope,
+            envelope: authorized.envelope,
             program: launch.program,
             relay: launch.relay,
-            scopes: &scopes,
+            scopes: &authorized.scopes,
             project: launch.project,
             owner_home: launch.owner_home,
             deadline: launch.deadline,
@@ -668,7 +700,6 @@ mod tests {
     use super::test_support::{r0, read, read_through, scope, Fixture, GRANTED};
     use super::*;
     use crate::automations::runtime_envelope::{CLAUDE_R0_READ, CLAUDE_R0_SCOPED_READ};
-    use crate::automations::scoped_read::service::Open;
 
     /// The refusal code a tool result carries, or `None` when it was served.
     fn refused(result: &(Value, bool)) -> Option<String> {
@@ -687,13 +718,8 @@ mod tests {
         let fixture = Fixture::new();
         fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
         let (_run, launched) = fixture.dispatch("notes");
-        let prepared = prepare(
-            &fixture.home.conn,
-            &fixture.launch(&launched),
-            Box::new(Open),
-            Utc::now(),
-        )
-        .expect("the granted launch is admitted");
+        let prepared = prepare(&fixture.home.conn, &fixture.launch(&launched), Utc::now())
+            .expect("the granted launch is admitted");
         assert_eq!(
             &prepared.args[..CLAUDE_R0_SCOPED_READ.args.len()],
             CLAUDE_R0_SCOPED_READ.args
@@ -739,13 +765,8 @@ mod tests {
             "ACTIVE",
         );
         let (_run, launched) = fixture.dispatch("notes");
-        let prepared = prepare(
-            &fixture.home.conn,
-            &fixture.launch(&launched),
-            Box::new(Open),
-            Utc::now(),
-        )
-        .expect("the launch is admitted");
+        let prepared = prepare(&fixture.home.conn, &fixture.launch(&launched), Utc::now())
+            .expect("the launch is admitted");
         let outside = fixture.outside.join("secret.md");
         let results = read_through(
             prepared,
@@ -800,7 +821,7 @@ mod tests {
             [definition.to_string()],
         )
         .unwrap();
-        let prepared = prepare(conn, &fixture.launch(&launched), Box::new(Open), Utc::now())
+        let prepared = prepare(conn, &fixture.launch(&launched), Utc::now())
             .expect("the launch is admitted under the signed scopes");
         let results = read_through(prepared, &[read("notes/today.md"), read("note.txt")]);
         assert_eq!(content(&results[0]), GRANTED);
@@ -816,7 +837,7 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(matches!(
-            prepare(conn, &fixture.launch(&moved), Box::new(Open), Utc::now()),
+            prepare(conn, &fixture.launch(&moved), Utc::now()),
             Err(LaunchRefusal::ProjectMismatch)
         ));
 
@@ -834,14 +855,14 @@ mod tests {
             projection["runtime"]["descriptorVersion"] = json!("r0-read.1");
         });
         assert!(matches!(
-            prepare(conn, &fixture.launch(&unscoped), Box::new(Open), Utc::now()),
+            prepare(conn, &fixture.launch(&unscoped), Utc::now()),
             Err(LaunchRefusal::NotScoped)
         ));
         let other = repinned(|projection| {
             projection["bindingDigest"]["value"] = json!("0".repeat(64));
         });
         assert!(matches!(
-            prepare(conn, &fixture.launch(&other), Box::new(Open), Utc::now()),
+            prepare(conn, &fixture.launch(&other), Utc::now()),
             Err(LaunchRefusal::BindingMismatch(_))
         ));
 
@@ -864,7 +885,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            prepare(conn, &fixture.launch(&launched), Box::new(Open), Utc::now()),
+            prepare(conn, &fixture.launch(&launched), Utc::now()),
             Err(LaunchRefusal::DecisionUntrusted(_))
         ));
     }
@@ -882,12 +903,7 @@ mod tests {
         let mut inside = launched.clone();
         inside.cwd = fixture.home.path().to_str().unwrap().to_owned();
         assert!(matches!(
-            prepare(
-                &fixture.home.conn,
-                &fixture.launch(&inside),
-                Box::new(Open),
-                Utc::now()
-            ),
+            prepare(&fixture.home.conn, &fixture.launch(&inside), Utc::now()),
             Err(LaunchRefusal::ProjectMismatch)
         ));
     }
@@ -905,12 +921,7 @@ mod tests {
         fixture: &Fixture,
         launched: &super::test_support::Launched,
     ) -> AuthorityProfileErrorCode {
-        match prepare(
-            &fixture.home.conn,
-            &fixture.launch(launched),
-            Box::new(Open),
-            Utc::now(),
-        ) {
+        match prepare(&fixture.home.conn, &fixture.launch(launched), Utc::now()) {
             Err(LaunchRefusal::Withdrawn(code, _)) => code,
             Err(other) => panic!("refused for another reason: {other}"),
             Ok(_) => panic!("a withdrawn attempt was admitted"),

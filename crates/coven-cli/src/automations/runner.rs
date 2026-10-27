@@ -12328,7 +12328,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_routine_that_declares_authority_dispatches_only_under_runtime_authority() {
-        use crate::automations::scoped_read::service::Open;
         use crate::automations::trusted_launch::{
             self,
             test_support::{r0, read, read_through, scope, Fixture, GRANTED},
@@ -12356,9 +12355,8 @@ mod tests {
         assert!(crate::automations::threads_decisions::consumed(conn, &decision_id).unwrap());
 
         // Launch: admitted under exactly the decision's scopes.
-        let prepared =
-            trusted_launch::prepare(conn, &fixture.launch(&launched), Box::new(Open), Utc::now())
-                .expect("the granted launch is admitted");
+        let prepared = trusted_launch::prepare(conn, &fixture.launch(&launched), Utc::now())
+            .expect("the granted launch is admitted");
         let results = read_through(prepared, &[read("notes/today.md"), read("note.txt")]);
         assert_eq!(results[0].0["content"], GRANTED);
         assert!(

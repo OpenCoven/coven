@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 
-use super::service::{Gate, Operation, Service, SERVER_NAME};
+use super::service::{Committing, Gate, Operation, Service, SERVER_NAME};
 use super::Refusal;
 
 /// The relay's arguments after the `coven` executable.
@@ -210,11 +210,11 @@ impl Gate for Closing {
         self.inner.admit()
     }
 
-    fn commit(&mut self, tool: Option<&'static str>, digest: &str) -> Result<(), Refusal> {
+    fn commit(&mut self, committing: &Committing<'_>) -> Result<(), Refusal> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(Refusal::AttemptClosed);
         }
-        self.inner.commit(tool, digest)
+        self.inner.commit(committing)
     }
 }
 

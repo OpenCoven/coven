@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use super::contract::authority::AuthorityProfileErrorCode;
 use super::contract::canonical_json::sha256_hex;
-use super::scoped_read::service::Committing;
+use super::scoped_read::service::{Committing, Gate};
 use super::scoped_read::Refusal;
 
 /// One row per committed or withheld operation. Rows are never updated or
@@ -405,6 +405,16 @@ impl StoreGate {
         } else {
             Err(Refusal::AttemptClosed)
         }
+    }
+}
+
+impl Gate for StoreGate {
+    fn admit(&mut self) -> std::result::Result<(), Refusal> {
+        StoreGate::admit(self)
+    }
+
+    fn commit(&mut self, committing: &Committing<'_>) -> std::result::Result<(), Refusal> {
+        StoreGate::commit(self, committing)
     }
 }
 
