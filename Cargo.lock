@@ -811,6 +811,7 @@ dependencies = [
  "fs2",
  "globset",
  "iana-time-zone",
+ "icu_properties",
  "interprocess",
  "json5",
  "jsonschema",

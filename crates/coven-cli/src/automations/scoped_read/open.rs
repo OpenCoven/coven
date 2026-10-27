@@ -30,6 +30,8 @@
 //! catches a bind mount from the same filesystem. Only Unix platforms have the
 //! reviewed walk; elsewhere every request is refused.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -39,34 +41,134 @@ use super::{ReadPolicy, Refusal};
 use crate::automations::contract::canonical_json::{canonicalize, sha256_hex};
 
 /// A filesystem object's identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Identity {
     device: u64,
     inode: u64,
 }
 
-/// What one request may not touch: the identities the protected paths named
-/// when the reader was built, which follow a protected resource renamed to
-/// another name; the identities they name when the request starts, which catch
-/// an alias of an existing protected name; and their paths beneath the root,
-/// which catch whatever a protected name comes to hold during the request,
-/// including a new inode from an atomic save.
+/// What a request may not touch: every protected identity observed during the attempt, and canonical Unicode/case exclusions for the protected paths beneath the root. Matching a protected path records its current identity even when the operation refuses it.
 #[derive(Debug, Default)]
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Protected {
-    identities: Vec<Identity>,
+    identities: RefCell<HashSet<Identity>>,
     paths: Vec<Vec<String>>,
 }
 
 impl Protected {
     #[cfg_attr(not(unix), allow(dead_code))]
     fn holds(&self, identity: Identity, path: &[String]) -> bool {
-        self.identities.contains(&identity)
-            || self
-                .paths
-                .iter()
-                .any(|protected| protected.as_slice() == path)
+        if self.identities.borrow().contains(&identity) {
+            return true;
+        }
+        let matches = self.paths.iter().any(|protected| {
+            protected.len() == path.len()
+                && protected.iter().zip(path).all(|(left, right)| {
+                    left == right || protected_name_key(left) == protected_name_key(right)
+                })
+        });
+        if matches {
+            self.identities.borrow_mut().insert(identity);
+        }
+        matches
+    }
+}
+
+// This is a conservative exclusion key only; grant authorization keeps exact path spelling. Canonical Unicode and full case variants stay excluded even on a case-sensitive filesystem.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn protected_name_key(name: &str) -> String {
+    use unicode_casefold::UnicodeCaseFold;
+    use unicode_normalization::UnicodeNormalization;
+    // The locked casefold table is Unicode 9; the pinned Rust toolchain supplies newer simple case pairs before its full-fold expansions.
+    let ignored =
+        icu_properties::CodePointSetData::new::<icu_properties::props::DefaultIgnorableCodePoint>();
+    name.nfd()
+        .flat_map(char::to_lowercase)
+        .case_fold()
+        // HFS+ uses historical Georgian classes; unify them with their modern folded counterparts without changing grant matching.
+        .map(|character| match character {
+            '\u{2d00}'..='\u{2d25}' => char::from_u32(u32::from(character) - 0x2d00 + 0x10d0)
+                .expect("the historical Georgian range contains only scalar values"),
+            _ => character,
+        })
+        .filter(|character| !ignored.contains(*character))
+        .nfc()
+        .collect()
+}
+
+#[cfg(test)]
+mod protection_contract_tests {
+    use super::{Identity, Protected};
+
+    #[test]
+    fn protected_alias_keys_include_hfs_georgian_equivalence() {
+        for offset in 0..38 {
+            let historic_upper = char::from_u32(0x10a0 + offset).unwrap().to_string();
+            let historic_lower = char::from_u32(0x10d0 + offset).unwrap().to_string();
+            let modern_lower = char::from_u32(0x2d00 + offset).unwrap().to_string();
+            let modern_upper = char::from_u32(0x1c90 + offset).unwrap().to_string();
+            let expected = super::protected_name_key(&historic_lower);
+            for alias in [historic_upper, modern_lower, modern_upper] {
+                assert_eq!(
+                    super::protected_name_key(&alias),
+                    expected,
+                    "HFS and modern Georgian aliases must share an exclusion key: {alias:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_alias_keys_remove_filesystem_ignorable_codepoints() {
+        for ignored in ['\u{200d}', '\u{00ad}', '\u{fe0f}', '\u{034f}', '\u{feff}'] {
+            assert_eq!(
+                super::protected_name_key(&format!(".e{ignored}nv")),
+                super::protected_name_key(".env"),
+                "filesystem-ignorable {ignored:?} must not bypass an exclusion"
+            );
+        }
+        assert_eq!(
+            super::protected_name_key("Straße-é"),
+            super::protected_name_key("STRASSE-\u{200d}e\u{301}")
+        );
+    }
+
+    #[test]
+    fn protected_alias_keys_cover_case_pairs_newer_than_unicode_nine() {
+        for (upper, lower) in [
+            ("\u{1c90}", "\u{10d0}"),
+            ("\u{10570}", "\u{10597}"),
+            ("\u{10d50}", "\u{10d70}"),
+        ] {
+            assert_eq!(
+                super::protected_name_key(upper),
+                super::protected_name_key(lower),
+                "{upper:?} and {lower:?} must have the same exclusion key"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_path_exclusions_match_full_unicode_canonical_case_variants() {
+        let protected = Protected {
+            identities: Default::default(),
+            paths: vec![vec!["secrets".into(), "Straße-é".into()]],
+        };
+        assert!(protected.holds(
+            Identity {
+                device: 1,
+                inode: 2
+            },
+            &["SECRETS".into(), "STRASSE-e\u{301}".into()]
+        ));
+        assert!(!protected.holds(
+            Identity {
+                device: 1,
+                inode: 3
+            },
+            &["secrets".into(), "different".into()]
+        ));
     }
 }
 
@@ -85,7 +187,7 @@ thread_local! {
 /// does nothing. A search reports the steps of its directory and each file it scans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
-    /// The first filesystem access: the root is about to be rechecked.
+    /// The checked walk is about to revalidate the root after protection refresh.
     Root,
     /// Directory component `n` was listed and is about to be opened.
     BeforeDirectory(usize),
@@ -232,10 +334,8 @@ pub(crate) struct ScopedReader {
     /// The protected paths as the daemon supplied them, resolved again for
     /// every request.
     protected: Vec<PathBuf>,
-    /// What the protected paths named when the reader was built. They stay
-    /// refused for the whole attempt, so renaming a protected resource to an
-    /// unprotected name inside a granted scope does not release it.
-    protected_at_build: Vec<Identity>,
+    /// Every protected identity observed during this attempt stays refused, including replacements and identities learned during a refused operation.
+    protected_seen: HashSet<Identity>,
     calls: u32,
     disclosed: u64,
     scanned: u64,
@@ -269,7 +369,7 @@ impl ScopedReader {
             policy,
             roots: bound,
             protected: protected.iter().map(|path| path.to_path_buf()).collect(),
-            protected_at_build: identities,
+            protected_seen: identities.into_iter().collect(),
             calls: 0,
             disclosed: 0,
             scanned: 0,
@@ -300,92 +400,96 @@ impl ScopedReader {
             .iter()
             .find(|root| root.kind == request.root)
             .ok_or(Refusal::RootUnbound)?;
-        let mut protected = platform::protect(&self.protected, root)?;
-        protected
-            .identities
-            .extend_from_slice(&self.protected_at_build);
+        let protected = platform::protect(&self.protected, root, &mut self.protected_seen)?;
         let disclosure = self.policy.attempt_bytes - self.disclosed;
         let scan = self.policy.scan_bytes - self.scanned;
-        let body = match request.operation {
-            Operation::ReadFile => {
-                let content = platform::read_beneath(
-                    root,
-                    request.path.components(),
-                    &protected,
-                    self.policy.file_bytes,
-                    ContentBudget::Disclosure(disclosure),
-                    probe,
-                )
-                .map_err(|error| error.refusal)?;
-                let content = String::from_utf8(content).map_err(|_| Refusal::ResourceNotText)?;
-                self.disclosed += content.len() as u64;
-                Body::File { content }
-            }
-            Operation::ListDirectory { after } => {
-                if scan == 0 {
-                    return Err(Refusal::LimitScan);
-                }
-                let listing = match platform::list_beneath(
-                    root,
-                    &request.path,
-                    &protected,
-                    &self.policy,
-                    after.as_deref(),
-                    scan,
-                    probe,
-                ) {
-                    Ok(listing) => listing,
-                    Err(error) => {
-                        self.scanned += error.scanned;
-                        return Err(error.refusal);
-                    }
-                };
-                self.scanned += listing.scanned;
-                Body::Listing {
-                    entries: listing.entries,
-                    next: listing.next,
-                }
-            }
-            Operation::Search { pattern, after } => {
-                debug_assert_eq!(coverage, Coverage::Subtree);
-                if scan == 0 {
-                    return Err(Refusal::LimitScan);
-                }
-                let found = match platform::search_beneath(
-                    &platform::Scope {
+        let result = (|| {
+            let body = match request.operation {
+                Operation::ReadFile => {
+                    let content = platform::read_beneath(
                         root,
-                        protected: &protected,
-                        policy: &self.policy,
-                    },
-                    &request.path,
-                    &pattern,
-                    after.as_ref(),
-                    scan,
-                    disclosure,
-                    probe,
-                ) {
-                    Ok(found) => found,
-                    Err(error) => {
-                        self.scanned += error.scanned;
-                        return Err(error.refusal);
-                    }
-                };
-                self.scanned += found.scanned;
-                self.disclosed += found.disclosed;
-                Body::Search {
-                    complete: !found.stopped && !found.partial && found.next.is_none(),
-                    pattern,
-                    matches: found.matches,
-                    next: found.next,
-                    skipped: found.skipped,
+                        request.path.components(),
+                        &protected,
+                        self.policy.file_bytes,
+                        ContentBudget::Disclosure(disclosure),
+                        probe,
+                    )
+                    .map_err(|error| error.refusal)?;
+                    let content =
+                        String::from_utf8(content).map_err(|_| Refusal::ResourceNotText)?;
+                    self.disclosed += content.len() as u64;
+                    Body::File { content }
                 }
-            }
-        };
-        Ok(Response {
-            root: request.root,
-            path: request.path,
-            body,
-        })
+                Operation::ListDirectory { after } => {
+                    if scan == 0 {
+                        return Err(Refusal::LimitScan);
+                    }
+                    let listing = match platform::list_beneath(
+                        root,
+                        &request.path,
+                        &protected,
+                        &self.policy,
+                        after.as_deref(),
+                        scan,
+                        probe,
+                    ) {
+                        Ok(listing) => listing,
+                        Err(error) => {
+                            self.scanned += error.scanned;
+                            return Err(error.refusal);
+                        }
+                    };
+                    self.scanned += listing.scanned;
+                    Body::Listing {
+                        entries: listing.entries,
+                        next: listing.next,
+                    }
+                }
+                Operation::Search { pattern, after } => {
+                    debug_assert_eq!(coverage, Coverage::Subtree);
+                    if scan == 0 {
+                        return Err(Refusal::LimitScan);
+                    }
+                    let found = match platform::search_beneath(
+                        &platform::Scope {
+                            root,
+                            protected: &protected,
+                            policy: &self.policy,
+                        },
+                        &request.path,
+                        &pattern,
+                        after.as_ref(),
+                        scan,
+                        disclosure,
+                        probe,
+                    ) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            self.scanned += error.scanned;
+                            return Err(error.refusal);
+                        }
+                    };
+                    self.scanned += found.scanned;
+                    self.disclosed += found.disclosed;
+                    Body::Search {
+                        complete: !found.stopped && !found.partial && found.next.is_none(),
+                        pattern,
+                        matches: found.matches,
+                        next: found.next,
+                        skipped: found.skipped,
+                    }
+                }
+            };
+            Ok(Response {
+                root: request.root,
+                path: request.path,
+                body,
+            })
+        })();
+        // Retain identities learned by successful and refused operations, including a protected path created after this request's snapshot.
+        self.protected_seen
+            .extend(protected.identities.into_inner());
+        result
     }
 }
 
@@ -504,15 +608,25 @@ mod platform {
 
     pub(super) fn protected_identities(paths: &[&Path]) -> Result<Vec<Identity>, Refusal> {
         let mut identities = Vec::with_capacity(paths.len());
+        refresh_protected_identities(paths, |identity| identities.push(identity))?;
+        Ok(identities)
+    }
+
+    fn refresh_protected_identities(
+        paths: &[&Path],
+        mut observe: impl FnMut(Identity),
+    ) -> Result<(), Refusal> {
         for path in paths {
             // Follow a link here: what must not be read is what the path names.
             match std::fs::metadata(path) {
-                Ok(metadata) => identities.push(ambient_identity(&metadata)),
+                Ok(metadata) => {
+                    observe(ambient_identity(&metadata));
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(_) => return Err(Refusal::ResourceUnavailable),
             }
         }
-        Ok(identities)
+        Ok(())
     }
 
     /// Resolves the protected paths for one request beneath `root`: the
@@ -520,9 +634,15 @@ mod platform {
     /// both through its canonical form and through its canonical parent. The
     /// second spelling holds a name that does not exist yet, or a link's own
     /// name, so a protected name stays refused whatever it comes to hold.
-    pub(super) fn protect(paths: &[PathBuf], root: &BoundRoot) -> Result<Protected, Refusal> {
+    pub(super) fn protect(
+        paths: &[PathBuf],
+        root: &BoundRoot,
+        seen: &mut std::collections::HashSet<Identity>,
+    ) -> Result<Protected, Refusal> {
         let borrowed: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-        let identities = protected_identities(&borrowed)?;
+        refresh_protected_identities(&borrowed, |identity| {
+            seen.insert(identity);
+        })?;
         let mut beneath = Vec::new();
         for path in paths {
             for resolved in [std::fs::canonicalize(path).ok(), through_parent(path)]
@@ -540,7 +660,7 @@ mod platform {
                     })
                     .collect();
                 // A name that is not UTF-8 can never be requested, and an empty
-                // path is the root, which binding already checked.
+                // path is the root, whose refreshed identity enter() checks.
                 if let Some(components) = components.filter(|components| !components.is_empty()) {
                     if !beneath.contains(&components) {
                         beneath.push(components);
@@ -549,7 +669,7 @@ mod platform {
             }
         }
         Ok(Protected {
-            identities,
+            identities: seen.clone().into(),
             paths: beneath,
         })
     }
@@ -606,6 +726,12 @@ mod platform {
         protected: &Protected,
         probe: &mut dyn FnMut(Step),
     ) -> Result<(Dir, Vec<Identity>), Refusal> {
+        for ancestor in root.path.ancestors() {
+            let metadata = std::fs::metadata(ancestor).map_err(|_| Refusal::RootMoved)?;
+            if protected.holds(ambient_identity(&metadata), &[]) {
+                return Err(Refusal::RootProtected);
+            }
+        }
         probe(Step::Root);
         let named = Dir::open_ambient_dir(&root.path, ambient_authority())
             .map_err(|_| Refusal::RootMoved)?;
@@ -1320,7 +1446,11 @@ mod platform {
         pub policy: &'a ReadPolicy,
     }
 
-    pub(super) fn protect(_paths: &[PathBuf], _root: &BoundRoot) -> Result<Protected, Refusal> {
+    pub(super) fn protect(
+        _paths: &[PathBuf],
+        _root: &BoundRoot,
+        _seen: &mut std::collections::HashSet<Identity>,
+    ) -> Result<Protected, Refusal> {
         Err(Refusal::PlatformUnsupported)
     }
 

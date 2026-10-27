@@ -1247,6 +1247,132 @@ mod filesystem {
     }
 
     #[test]
+    fn a_replacement_observed_during_an_attempt_stays_protected_after_rename() {
+        for created in [false, true] {
+            let scratch = scratch();
+            let guides = scratch.path().join("root/docs/guides");
+            fs::create_dir_all(&guides).unwrap();
+            fs::write(guides.join("a.md"), "TODO a").unwrap();
+            if !created {
+                fs::write(guides.join(".env"), "original").unwrap();
+            }
+            let mut reader = reader_protecting(
+                scratch.path(),
+                &[scope("recursive-read:docs/guides")],
+                &["root/docs/guides/.env"],
+            );
+            atomic_replace(&guides.join(".env"), "TODO SENTINEL replacement");
+            assert_eq!(
+                content(reader.serve(&read_request("docs/guides/a.md")).unwrap()),
+                "TODO a"
+            );
+            fs::rename(guides.join(".env"), guides.join("moved")).unwrap();
+            assert_moved_withheld(&mut reader, "docs/guides/moved");
+        }
+    }
+
+    #[test]
+    fn a_protected_identity_first_encountered_during_a_refusal_is_retained() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/.env"],
+        );
+        let refused = reader.serve_with(&read_request("docs/guides/.env"), &mut |step| {
+            if step == Step::Root {
+                fs::write(guides.join(".env"), "TODO SENTINEL created").unwrap();
+            }
+        });
+        assert_eq!(refused.err(), Some(Refusal::ResourceProtected));
+        fs::rename(guides.join(".env"), guides.join("moved")).unwrap();
+        assert_moved_withheld(&mut reader, "docs/guides/moved");
+    }
+
+    #[test]
+    fn aliases_of_a_protected_name_created_mid_request_are_refused() {
+        for (alias_kind, protected, alias) in [
+            ("case", ".env", ".ENV"),
+            ("unicode", "secret-é", "secret-e\u{301}"),
+        ] {
+            let scratch = scratch();
+            if !equates(scratch.path(), alias_kind) {
+                continue;
+            }
+            let guides = scratch.path().join("root/docs/guides");
+            fs::create_dir_all(&guides).unwrap();
+            let protected_path = format!("root/docs/guides/{protected}");
+            let mut reader = reader_protecting(
+                scratch.path(),
+                &[scope("recursive-read:docs/guides")],
+                &[&protected_path],
+            );
+            let result = reader.serve_with(
+                &read_request(&format!("docs/guides/{alias}")),
+                &mut |step| {
+                    if step == Step::Root {
+                        fs::write(guides.join(protected), "TODO SENTINEL alias").unwrap();
+                    }
+                },
+            );
+            assert_eq!(
+                result.err(),
+                Some(Refusal::ResourceProtected),
+                "{alias_kind} alias must not disclose protected content"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bound_root_that_becomes_protected_refuses_every_operation() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO SENTINEL private root").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["later-protected"],
+        );
+        std::os::unix::fs::symlink(
+            scratch.path().join("root"),
+            scratch.path().join("later-protected"),
+        )
+        .unwrap();
+        for request in [
+            read_request("docs/guides/a.md"),
+            list_request("docs/guides", None),
+            search_request("docs/guides", "TODO", None),
+        ] {
+            assert_eq!(reader.serve(&request).err(), Some(Refusal::RootProtected));
+        }
+    }
+
+    #[test]
+    fn a_bound_root_inside_a_newly_protected_ancestor_refuses_every_operation() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO SENTINEL private ancestor").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["later-protected"],
+        );
+        std::os::unix::fs::symlink(scratch.path(), scratch.path().join("later-protected")).unwrap();
+        for request in [
+            read_request("docs/guides/a.md"),
+            list_request("docs/guides", None),
+            search_request("docs/guides", "TODO", None),
+        ] {
+            assert_eq!(reader.serve(&request).err(), Some(Refusal::RootProtected));
+        }
+    }
+
+    #[test]
     fn a_search_whose_directory_fails_to_list_is_refused_and_charged() {
         use super::super::open::FAIL_LISTING_AFTER;
 
