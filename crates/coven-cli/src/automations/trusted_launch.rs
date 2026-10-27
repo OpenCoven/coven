@@ -31,6 +31,7 @@ use super::contract::authority::{
 use super::runtime_envelope::{self, RuntimeEnvelope};
 use super::scoped_read::admission::{self, AdmissionError, Prepared};
 use super::scoped_read::service::Gate;
+use super::store_gate::{self, Held};
 use super::threads_decisions;
 use super::trusted_authority::{opaque_id, TrustedAuthority};
 
@@ -40,6 +41,8 @@ pub(crate) struct ScopedLaunch<'a> {
     /// The projection the runner handed the runtime.
     pub projection: &'a AutomationAuthorityConsumerProjection,
     pub harness: &'a str,
+    /// The session the runner launches the attempt as.
+    pub session_id: &'a str,
     /// The routine's project folder, the launch's working directory as the
     /// runner built it.
     pub project: &'a Path,
@@ -107,6 +110,16 @@ impl fmt::Display for LaunchRefusal {
 
 impl std::error::Error for LaunchRefusal {}
 
+/// What a trusted launch was verified to run under.
+#[derive(Debug)]
+pub(crate) struct Authorized {
+    pub envelope: &'static RuntimeEnvelope,
+    /// The scopes the signed decision grants.
+    pub scopes: Vec<Value>,
+    /// What the gate holds for the attempt.
+    pub held: Held,
+}
+
 /// The envelope a trusted launch runs under, and the scopes its signed
 /// decision grants, at `now`.
 ///
@@ -119,6 +132,8 @@ impl std::error::Error for LaunchRefusal {}
 /// 4. The binding's Threads decision must still verify, be inside its
 ///    validity window, match the binding's request and decision digests and
 ///    this attempt, and have been consumed by the dispatch.
+/// 5. P, the predicate the gate evaluates for every operation
+///    ([`store_gate::authorized`]), must hold.
 ///
 /// The scopes are then the decision's signed request's, never the stored
 /// definition's: a definition changed after the decision cannot widen them.
@@ -126,7 +141,7 @@ pub(crate) fn launch_scopes(
     conn: &Connection,
     launch: &ScopedLaunch<'_>,
     now: DateTime<Utc>,
-) -> Result<(&'static RuntimeEnvelope, Vec<Value>), LaunchRefusal> {
+) -> Result<Authorized, LaunchRefusal> {
     let unavailable = |error: anyhow::Error| LaunchRefusal::Unavailable(format!("{error:#}"));
     let projection = launch.projection;
 
@@ -168,7 +183,6 @@ pub(crate) fn launch_scopes(
     let binding = serde_json::to_value(&extension.execution_binding)
         .context("an execution binding serializes")
         .map_err(unavailable)?;
-    still_authorized(conn, &binding).map_err(unavailable)??;
 
     // 3. The project.
     let project = launch
@@ -215,121 +229,27 @@ pub(crate) fn launch_scopes(
         .as_array()
         .cloned()
         .ok_or_else(|| untrusted("the signed request carries no scopes".to_owned()))?;
-    Ok((envelope, scopes))
-}
 
-/// Whether the authority `binding` granted still stands. The predicates are
-/// the ones the runner and owner grants already apply:
-/// - the attempt, run, occurrence and session are live and owned, as
-///   `runner::claim_stop_fence` requires (`Stale`);
-/// - no stop fence is held and no cancellation is requested or stopping
-///   (`FenceStale`);
-/// - the familiar revision is neither retired nor revoked
-///   (`FamiliarStatusInvalid`);
-/// - the definition revision is still current and active, as
-///   `owner_grants::authorize_scheduled_dispatch` requires
-///   (`DefinitionMismatch`).
-fn still_authorized(
-    conn: &Connection,
-    binding: &Value,
-) -> anyhow::Result<Result<(), LaunchRefusal>> {
-    let withdrawn = |code, why: &str| Ok(Err(LaunchRefusal::Withdrawn(code, why.to_owned())));
-    let base = &binding["base"];
-    let text = |value: &Value, name: &str| {
-        value[name]
-            .as_str()
-            .map(str::to_owned)
-            .with_context(|| format!("the binding carries {name}"))
-    };
-    let (run_id, attempt_id) = (text(base, "runId")?, text(base, "attemptId")?);
-
-    let live: bool = conn
-        .query_row(
-            "SELECT EXISTS (
-                SELECT 1
-                FROM automation_runs AS r
-                JOIN sessions AS s ON s.id = r.session_id
-                JOIN automation_attempts AS a
-                  ON a.run_id = r.id
-                 AND (
-                     a.session_id = r.session_id
-                     OR (a.state = 'dispatching' AND a.session_id IS NULL)
-                 )
-                JOIN automation_occurrences AS o ON o.id = r.occurrence_id
-                WHERE r.id = ?1
-                  AND a.id = ?2
-                  AND r.status = 'running'
-                  AND s.status IN ('created', 'running', 'orphaned')
-                  AND a.state IN ('dispatching', 'started', 'observing')
-                  AND o.state IN ('claimed', 'running')
-             )",
-            rusqlite::params![run_id, attempt_id],
-            |row| row.get(0),
-        )
-        .context("failed to read the attempt's liveness")?;
-    if !live {
-        return withdrawn(
-            AuthorityProfileErrorCode::Stale,
-            "the attempt is no longer live and owned",
-        );
+    // 5. P.
+    let held = Held::new(
+        &pinned,
+        &binding,
+        launch.session_id,
+        &decided.decision,
+        request,
+    )
+    .map_err(unavailable)?;
+    if let Err(withdrawal) = store_gate::authorized(conn, &held, now).map_err(unavailable)? {
+        return Err(LaunchRefusal::Withdrawn(
+            withdrawal.code,
+            withdrawal.why.to_owned(),
+        ));
     }
-
-    // Reading creates nothing: a store that has never stopped a run has no
-    // stop tables, and so nothing pending.
-    let table = |name: &str| -> anyhow::Result<bool> {
-        conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [name],
-            |row| row.get(0),
-        )
-        .with_context(|| format!("failed to look for {name}"))
-    };
-    let pending = |sql: &str| -> anyhow::Result<bool> {
-        conn.query_row(sql, [&run_id], |row| row.get(0))
-            .context("failed to read the run's stop state")
-    };
-    let stopping = (table("automation_stop_fences")?
-        && pending("SELECT EXISTS (SELECT 1 FROM automation_stop_fences WHERE run_id = ?1)")?)
-        || (table("automation_cancellations")?
-            && pending(
-                "SELECT EXISTS (SELECT 1 FROM automation_cancellations
-                                WHERE run_id = ?1 AND state IN ('requested', 'stopping'))",
-            )?);
-    if stopping {
-        return withdrawn(
-            AuthorityProfileErrorCode::FenceStale,
-            "a stop or cancellation is pending",
-        );
-    }
-
-    let revision = text(&binding["familiar"], "identityRevisionId")?;
-    let familiar: Option<String> = conn
-        .query_row(
-            "SELECT status FROM familiar_ledger_revisions WHERE revision_id = ?1",
-            [&revision],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("failed to read the familiar revision")?;
-    if !matches!(familiar.as_deref(), Some("active" | "superseded")) {
-        return withdrawn(
-            AuthorityProfileErrorCode::FamiliarStatusInvalid,
-            "the familiar revision is retired, revoked or unknown",
-        );
-    }
-
-    let automation_id = text(base, "automationId")?;
-    let automation_revision = base["automationRevision"]
-        .as_u64()
-        .context("the binding carries automationRevision")?;
-    if super::owner_grants::current_and_active(conn, &automation_id, automation_revision)?.is_err()
-    {
-        return withdrawn(
-            AuthorityProfileErrorCode::DefinitionMismatch,
-            "the definition revision is no longer current and active",
-        );
-    }
-    Ok(Ok(()))
+    Ok(Authorized {
+        envelope,
+        scopes,
+        held,
+    })
 }
 
 /// Admits and prepares one trusted launch under its decision's scopes, with
@@ -340,7 +260,9 @@ pub(crate) fn prepare(
     gate: Box<dyn Gate>,
     now: DateTime<Utc>,
 ) -> Result<Prepared, LaunchRefusal> {
-    let (envelope, scopes) = launch_scopes(conn, launch, now)?;
+    let Authorized {
+        envelope, scopes, ..
+    } = launch_scopes(conn, launch, now)?;
     admission::prepare(
         admission::Request {
             coven_home: launch.coven_home,
@@ -590,6 +512,7 @@ pub(crate) mod test_support {
                 coven_home: self.home.path(),
                 projection: &launched.projection,
                 harness: &launched.harness,
+                session_id: &launched.id,
                 project: Path::new(&launched.cwd),
                 program: &self.program,
                 relay: Path::new("/usr/local/bin/coven"),
@@ -602,6 +525,7 @@ pub(crate) mod test_support {
     /// What a runtime was asked to launch.
     #[derive(Clone)]
     pub(crate) struct Launched {
+        pub id: String,
         pub harness: String,
         pub cwd: String,
         pub projection: AutomationAuthorityConsumerProjection,
@@ -659,6 +583,7 @@ pub(crate) mod test_support {
                 return ownership_established();
             };
             self.launched.lock().unwrap().push(Launched {
+                id: launch.id.clone(),
                 harness: launch.harness.clone(),
                 cwd: launch.cwd.clone(),
                 projection,
@@ -949,11 +874,10 @@ mod tests {
         let fixture = Fixture::new();
         fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
         let (_run, launched) = fixture.dispatch("notes");
-        let (envelope, scopes) =
-            launch_scopes(&fixture.home.conn, &fixture.launch(&launched), Utc::now())
-                .expect("the signed scopes");
-        assert_eq!(envelope, &CLAUDE_R0_SCOPED_READ);
-        assert_eq!(scopes, [scope("notes/today.md", false)]);
+        let authorized = launch_scopes(&fixture.home.conn, &fixture.launch(&launched), Utc::now())
+            .expect("the signed scopes");
+        assert_eq!(authorized.envelope, &CLAUDE_R0_SCOPED_READ);
+        assert_eq!(authorized.scopes, [scope("notes/today.md", false)]);
         // COVEN_HOME is not the project the attempt was authorized for.
         let mut inside = launched.clone();
         inside.cwd = fixture.home.path().to_str().unwrap().to_owned();

@@ -86,6 +86,22 @@ pub(crate) enum Outcome {
     Withheld { refusal: Refusal },
 }
 
+/// What a commit authorizes: one operation's result, named by its digest. It
+/// holds no file content, no path, no pattern and no entry name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Committing<'a> {
+    /// The call's place in the attempt, from 1.
+    pub sequence: u64,
+    /// The tool, when the call named one of the service's.
+    pub tool: Option<&'static str>,
+    /// `None` when the result serves the request, or the reader's refusal.
+    pub refusal: Option<Refusal>,
+    /// The SHA-256 of the result's JCS text.
+    pub digest: &'a str,
+    /// The length of that text in bytes.
+    pub bytes: usize,
+}
+
 type Serve = Box<dyn FnMut(&Value) -> Result<Response, Refusal> + Send>;
 type Job = (Value, mpsc::Sender<Result<Response, Refusal>>);
 
