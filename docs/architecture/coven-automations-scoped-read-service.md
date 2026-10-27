@@ -26,7 +26,8 @@ yet. They cover:
 - the lexical rules for grant and request paths, and authorization before any
   filesystem access;
 - the open walk on Unix;
-- protected resources, held by identity;
+- protected resources, resolved again for every request and matched by
+  identity and by path beneath the root;
 - the recheck from the root after the open;
 - listings and searches that leave out every entry a read would refuse;
 - the per-file, per-attempt, scan, call, page, depth and path-length limits.
@@ -83,7 +84,7 @@ These are the points the design left open. Each is for review:
 | What a retained root means | The directory opened when the reader is built. A request is served only while the root's path still names that directory. A root renamed away or replaced refuses every request (`root_moved`). |
 | A granted filesystem scope the service cannot enforce as written | The whole grant is refused (`grant_unsupported`), not silently narrowed. This covers backslashes, repeated separators, `.` components, and anything the profile's breadth rule refuses. |
 | Spellings that platforms read differently | Refused in grants and requests on every platform: backslash, colon (drive or data stream), control characters, a trailing dot or space, and Windows device names. |
-| How protected resources match | By the identity of what each protected path names, so a case or Unicode alias still matches. A root that is, or is inside, a protected resource refuses the reader (`root_protected`). The daemon supplies the list; choosing it belongs to the service step. |
+| How protected resources match | The reader keeps the protected paths, not what they named at the start, and resolves them again for every request. A component is refused when it has the identity of what a protected path names at that request's start, so a case or Unicode alias still matches, or when its path beneath the root is a protected path's canonical spelling. The path match keeps a protected `.env` refused after an atomic save gives it a new inode, covers a protected path created after the reader was built, and holds when either happens during the request. An alias spelling of a name that did not exist when the request started is not matched. A root that is, or is inside, a protected resource refuses the reader (`root_protected`). The daemon supplies the list; choosing it belongs to the service step. |
 | Mount crossings | Refused by device on Unix. On Linux the mount id is also compared, which catches a bind mount from the same filesystem. A kernel that cannot report the mount id refuses (`platform_unsupported`). |
 | Content that is not text | `read_file` refuses it (`resource_not_text`); a search skips it. |
 | Platforms without a reviewed walk | Every request is refused (`platform_unsupported`). Today that is Windows. |

@@ -7,9 +7,12 @@
 //! component at a time from the root's handle and never follows a link, so no
 //! spelling can leave the root. Each component's identity, checked on the
 //! opened handle and not only on its name, must stay on the root's filesystem
-//! and must not be a protected resource. A protected resource is held by
-//! identity, so a case or Unicode alias of its name on a filesystem that
-//! equates them still matches.
+//! and must not be a protected resource. Protection is resolved again for
+//! every request and matches two ways: by the identity of what each protected
+//! path names, so a case or Unicode alias of its name on a filesystem that
+//! equates them still matches, and by its path beneath the root, so a
+//! protected file replaced by an atomic save, or created after the reader was
+//! built, is still refused even when the replacement lands mid-request.
 //!
 //! After the open, the walk is repeated from the root by name. Every directory
 //! and the target must still be what the root's own names lead to; a
@@ -26,7 +29,7 @@
 //! catches a bind mount from the same filesystem. Only Unix platforms have the
 //! reviewed walk; elsewhere every request is refused.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -40,6 +43,28 @@ use crate::automations::contract::canonical_json::{canonicalize, sha256_hex};
 struct Identity {
     device: u64,
     inode: u64,
+}
+
+/// What one request may not touch, resolved from the protected paths when the
+/// request starts. Identities catch an alias of an existing protected name;
+/// root-relative paths catch whatever a protected name comes to hold during
+/// the request, including a new inode from an atomic save.
+#[derive(Debug, Default)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Protected {
+    identities: Vec<Identity>,
+    paths: Vec<Vec<String>>,
+}
+
+impl Protected {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn holds(&self, identity: Identity, path: &[String]) -> bool {
+        self.identities.contains(&identity)
+            || self
+                .paths
+                .iter()
+                .any(|protected| protected.as_slice() == path)
+    }
 }
 
 /// A point in serving a request, reported to the reader's probe. Tests use it
@@ -187,16 +212,19 @@ pub(crate) struct ScopedReader {
     grants: Grants,
     policy: ReadPolicy,
     roots: Vec<platform::BoundRoot>,
-    protected: Vec<Identity>,
+    /// The protected paths as the daemon supplied them. They are resolved
+    /// again for every request, never held from the build.
+    protected: Vec<PathBuf>,
     calls: u32,
     disclosed: u64,
     scanned: u64,
 }
 
 impl ScopedReader {
-    /// Builds a reader for `scopes` over `roots`. Every protected path that
-    /// exists is held by the identity of what it names. A root that is, or is
-    /// inside, a protected resource refuses the reader.
+    /// Builds a reader for `scopes` over `roots`. A root that is, or is inside,
+    /// a protected resource refuses the reader. The protected paths are kept
+    /// as paths: each request resolves them afresh, so protection follows a
+    /// protected name through replacement and covers one created later.
     pub(crate) fn new(
         scopes: &[Value],
         roots: &[(RootKind, &Path)],
@@ -204,7 +232,7 @@ impl ScopedReader {
         policy: ReadPolicy,
     ) -> Result<Self, Refusal> {
         let grants = Grants::from_scopes(scopes, &policy)?;
-        let protected = platform::protected_identities(protected)?;
+        let identities = platform::protected_identities(protected)?;
         let mut bound = Vec::with_capacity(roots.len());
         for (kind, path) in roots {
             if bound
@@ -213,13 +241,13 @@ impl ScopedReader {
             {
                 return Err(Refusal::GrantUnsupported);
             }
-            bound.push(platform::bind(*kind, path, &protected)?);
+            bound.push(platform::bind(*kind, path, &identities)?);
         }
         Ok(Self {
             grants,
             policy,
             roots: bound,
-            protected,
+            protected: protected.iter().map(|path| path.to_path_buf()).collect(),
             calls: 0,
             disclosed: 0,
             scanned: 0,
@@ -250,6 +278,7 @@ impl ScopedReader {
             .iter()
             .find(|root| root.kind == request.root)
             .ok_or(Refusal::RootUnbound)?;
+        let protected = platform::protect(&self.protected, root)?;
         let disclosure = self.policy.attempt_bytes - self.disclosed;
         let scan = self.policy.scan_bytes - self.scanned;
         let body = match request.operation {
@@ -257,7 +286,7 @@ impl ScopedReader {
                 let content = platform::read_beneath(
                     root,
                     request.path.components(),
-                    &self.protected,
+                    &protected,
                     self.policy.file_bytes,
                     ContentBudget::Disclosure(disclosure),
                     probe,
@@ -274,7 +303,7 @@ impl ScopedReader {
                 let listing = match platform::list_beneath(
                     root,
                     &request.path,
-                    &self.protected,
+                    &protected,
                     &self.policy,
                     after.as_deref(),
                     scan,
@@ -300,7 +329,7 @@ impl ScopedReader {
                 let found = platform::search_beneath(
                     &platform::Scope {
                         root,
-                        protected: &self.protected,
+                        protected: &protected,
                         policy: &self.policy,
                     },
                     &request.path,
@@ -396,16 +425,17 @@ fn excerpt(line: &str, bytes: usize) -> String {
 
 #[cfg(unix)]
 mod platform {
+    use std::ffi::OsStr;
     use std::io::{self, Read};
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
 
     use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::ambient_authority;
     use cap_std::fs::{Dir, Metadata, MetadataExt, OpenOptions, OpenOptionsExt};
 
     use super::{
-        excerpt, ContentBudget, Entry, EntryKind, Found, Identity, Listing, Match, ReadPolicy,
-        Refusal, RelativePath, RootKind, ScanError, SearchPosition, Step,
+        excerpt, ContentBudget, Entry, EntryKind, Found, Identity, Listing, Match, Protected,
+        ReadPolicy, Refusal, RelativePath, RootKind, ScanError, SearchPosition, Step,
     };
 
     pub(super) struct BoundRoot {
@@ -419,7 +449,7 @@ mod platform {
     /// What a search runs under.
     pub(super) struct Scope<'a> {
         pub root: &'a BoundRoot,
-        pub protected: &'a [Identity],
+        pub protected: &'a Protected,
         pub policy: &'a ReadPolicy,
     }
 
@@ -449,6 +479,60 @@ mod platform {
             }
         }
         Ok(identities)
+    }
+
+    /// Resolves the protected paths for one request beneath `root`: the
+    /// identity of what each names now, and each one's path beneath the root,
+    /// both through its canonical form and through its canonical parent. The
+    /// second spelling holds a name that does not exist yet, or a link's own
+    /// name, so a protected name stays refused whatever it comes to hold.
+    pub(super) fn protect(paths: &[PathBuf], root: &BoundRoot) -> Result<Protected, Refusal> {
+        let borrowed: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let identities = protected_identities(&borrowed)?;
+        let mut beneath = Vec::new();
+        for path in paths {
+            for resolved in [std::fs::canonicalize(path).ok(), through_parent(path)]
+                .into_iter()
+                .flatten()
+            {
+                let Ok(relative) = resolved.strip_prefix(&root.path) else {
+                    continue;
+                };
+                let components: Option<Vec<String>> = relative
+                    .components()
+                    .map(|component| match component {
+                        Component::Normal(name) => name.to_str().map(str::to_owned),
+                        _ => None,
+                    })
+                    .collect();
+                // A name that is not UTF-8 can never be requested, and an empty
+                // path is the root, which binding already checked.
+                if let Some(components) = components.filter(|components| !components.is_empty()) {
+                    if !beneath.contains(&components) {
+                        beneath.push(components);
+                    }
+                }
+            }
+        }
+        Ok(Protected {
+            identities,
+            paths: beneath,
+        })
+    }
+
+    /// `path` with its nearest existing ancestor canonicalized and the
+    /// remaining names kept as written, or `None` when it has no such form.
+    fn through_parent(path: &Path) -> Option<PathBuf> {
+        let mut names: Vec<&OsStr> = Vec::new();
+        let mut current = path;
+        loop {
+            names.push(current.file_name()?);
+            current = current.parent()?;
+            if let Ok(mut resolved) = std::fs::canonicalize(current) {
+                resolved.extend(names.iter().rev());
+                return Some(resolved);
+            }
+        }
     }
 
     pub(super) fn bind(
@@ -485,7 +569,7 @@ mod platform {
     fn enter(
         root: &BoundRoot,
         parents: &[String],
-        protected: &[Identity],
+        protected: &Protected,
         probe: &mut dyn FnMut(Step),
     ) -> Result<(Dir, Vec<Identity>), Refusal> {
         probe(Step::Root);
@@ -504,7 +588,7 @@ mod platform {
             if !listed.is_dir() {
                 return Err(Refusal::ResourceNotFound);
             }
-            admit(identity(&listed), root, protected)?;
+            admit(identity(&listed), &parents[..=index], root, protected)?;
             probe(Step::BeforeDirectory(index));
             let next = directory
                 .open_dir_nofollow(component)
@@ -526,7 +610,7 @@ mod platform {
     pub(super) fn read_beneath(
         root: &BoundRoot,
         components: &[String],
-        protected: &[Identity],
+        protected: &Protected,
         file_bytes: u64,
         budget: ContentBudget,
         probe: &mut dyn FnMut(Step),
@@ -548,7 +632,7 @@ mod platform {
         if !file_type.is_file() {
             return Err(Refusal::ResourceSpecial.into());
         }
-        admit(identity(&listed), root, protected)?;
+        admit(identity(&listed), components, root, protected)?;
         if listed.nlink() != 1 {
             return Err(Refusal::ResourceMultiplyLinked.into());
         }
@@ -639,7 +723,7 @@ mod platform {
     fn open_directory_beneath(
         root: &BoundRoot,
         components: &[String],
-        protected: &[Identity],
+        protected: &Protected,
         probe: &mut dyn FnMut(Step),
     ) -> Result<Dir, Refusal> {
         let (name, parents) = components
@@ -653,7 +737,7 @@ mod platform {
         if !listed.is_dir() {
             return Err(Refusal::ResourceNotDirectory);
         }
-        admit(identity(&listed), root, protected)?;
+        admit(identity(&listed), components, root, protected)?;
         probe(Step::BeforeOpen);
         let opened = directory
             .open_dir_nofollow(name)
@@ -673,7 +757,7 @@ mod platform {
     pub(super) fn list_beneath(
         root: &BoundRoot,
         path: &RelativePath,
-        protected: &[Identity],
+        protected: &Protected,
         policy: &ReadPolicy,
         after: Option<&str>,
         scan: u64,
@@ -688,10 +772,11 @@ mod platform {
         let mut entries: Vec<Entry> = Vec::new();
         let mut next = None;
         for name in &names[start..] {
-            if path.child(name, policy).is_err() {
+            let Ok(child) = path.child(name, policy) else {
                 continue;
-            }
-            let Some((kind, _)) = visible(&directory, name, root, protected) else {
+            };
+            let Some((kind, _)) = visible(&directory, name, child.components(), root, protected)
+            else {
                 continue;
             };
             if entries.len() == policy.page_entries {
@@ -780,7 +865,13 @@ mod platform {
                 {
                     continue;
                 }
-                match visible(directory, &name, self.scope.root, self.scope.protected) {
+                match visible(
+                    directory,
+                    &name,
+                    child.components(),
+                    self.scope.root,
+                    self.scope.protected,
+                ) {
                     Some((EntryKind::Directory, listed))
                         if child.components().len() < self.scope.policy.depth =>
                     {
@@ -888,17 +979,19 @@ mod platform {
         Ok((names, scanned))
     }
 
-    /// What a listing or search may show of `name`, with its identity, or
-    /// `None` when a read of it would be refused.
+    /// What a listing or search may show of `name`, which is `path` beneath
+    /// the root, with its identity, or `None` when a read of it would be
+    /// refused.
     fn visible(
         directory: &Dir,
         name: &str,
+        path: &[String],
         root: &BoundRoot,
-        protected: &[Identity],
+        protected: &Protected,
     ) -> Option<(EntryKind, Identity)> {
         let metadata = directory.symlink_metadata(name).ok()?;
         let file_type = metadata.file_type();
-        if file_type.is_symlink() || admit(identity(&metadata), root, protected).is_err() {
+        if file_type.is_symlink() || admit(identity(&metadata), path, root, protected).is_err() {
             return None;
         }
         let kind = if file_type.is_dir() {
@@ -981,11 +1074,18 @@ mod platform {
             })
     }
 
-    fn admit(component: Identity, root: &BoundRoot, protected: &[Identity]) -> Result<(), Refusal> {
+    /// Whether the component at `path` beneath the root, with `component`'s
+    /// identity, may be walked through or read.
+    fn admit(
+        component: Identity,
+        path: &[String],
+        root: &BoundRoot,
+        protected: &Protected,
+    ) -> Result<(), Refusal> {
         if component.device != root.identity.device {
             return Err(Refusal::ResourceMountCrossing);
         }
-        if protected.contains(&component) {
+        if protected.holds(component, path) {
             return Err(Refusal::ResourceProtected);
         }
         Ok(())
@@ -1030,7 +1130,9 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::{bind, identity, read_content, visible, EntryKind, Refusal, RootKind};
+        use super::{
+            bind, identity, read_content, visible, EntryKind, Protected, Refusal, RootKind,
+        };
         use std::os::unix::fs::PermissionsExt;
 
         #[test]
@@ -1070,11 +1172,23 @@ mod platform {
                 );
             }
             assert!(matches!(
-                visible(&root.dir, "file", &root, &[]),
+                visible(
+                    &root.dir,
+                    "file",
+                    &["file".to_owned()],
+                    &root,
+                    &Protected::default()
+                ),
                 Some((EntryKind::File, _))
             ));
             assert!(matches!(
-                visible(&root.dir, "folder", &root, &[]),
+                visible(
+                    &root.dir,
+                    "folder",
+                    &["folder".to_owned()],
+                    &root,
+                    &Protected::default()
+                ),
                 Some((EntryKind::Directory, _))
             ));
             #[cfg(target_os = "linux")]
@@ -1083,8 +1197,22 @@ mod platform {
                 "the real statx mount ID must be available"
             );
             root.mount = Some(root.mount.map_or(1, |id| id.wrapping_add(1)));
-            assert!(visible(&root.dir, "file", &root, &[]).is_none());
-            assert!(visible(&root.dir, "folder", &root, &[]).is_none());
+            assert!(visible(
+                &root.dir,
+                "file",
+                &["file".to_owned()],
+                &root,
+                &Protected::default()
+            )
+            .is_none());
+            assert!(visible(
+                &root.dir,
+                "folder",
+                &["folder".to_owned()],
+                &root,
+                &Protected::default()
+            )
+            .is_none());
         }
     }
 }
@@ -1093,8 +1221,11 @@ mod platform {
 mod platform {
     use std::path::Path;
 
+    use std::path::PathBuf;
+
     use super::{
-        ContentBudget, Found, Identity, Listing, ReadPolicy, Refusal, RelativePath, RootKind,
+        ContentBudget, Found, Identity, Listing, Protected, ReadPolicy, Refusal, RelativePath,
+        RootKind,
     };
     use super::{ScanError, SearchPosition, Step};
 
@@ -1104,8 +1235,12 @@ mod platform {
 
     pub(super) struct Scope<'a> {
         pub root: &'a BoundRoot,
-        pub protected: &'a [Identity],
+        pub protected: &'a Protected,
         pub policy: &'a ReadPolicy,
+    }
+
+    pub(super) fn protect(_paths: &[PathBuf], _root: &BoundRoot) -> Result<Protected, Refusal> {
+        Err(Refusal::PlatformUnsupported)
     }
 
     pub(super) fn protected_identities(_paths: &[&Path]) -> Result<Vec<Identity>, Refusal> {
@@ -1123,7 +1258,7 @@ mod platform {
     pub(super) fn read_beneath(
         _root: &BoundRoot,
         _components: &[String],
-        _protected: &[Identity],
+        _protected: &Protected,
         _file_bytes: u64,
         _budget: ContentBudget,
         _probe: &mut dyn FnMut(Step),
@@ -1134,7 +1269,7 @@ mod platform {
     pub(super) fn list_beneath(
         _root: &BoundRoot,
         _path: &RelativePath,
-        _protected: &[Identity],
+        _protected: &Protected,
         _policy: &ReadPolicy,
         _after: Option<&str>,
         _scan: u64,

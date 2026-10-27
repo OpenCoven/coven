@@ -1028,4 +1028,160 @@ mod filesystem {
         assert_eq!(text.len(), R0_READ_POLICY.match_bytes - 1);
         assert!(line.starts_with(text));
     }
+
+    /// A reader over `base/root` that protects each of `protected`, given
+    /// relative to `base`.
+    fn reader_protecting(base: &Path, scopes: &[Value], protected: &[&str]) -> ScopedReader {
+        let root = base.join("root");
+        let protected: Vec<PathBuf> = protected.iter().map(|path| base.join(path)).collect();
+        let protected: Vec<&Path> = protected.iter().map(PathBuf::as_path).collect();
+        ScopedReader::new(
+            scopes,
+            &[(RootKind::Project, root.as_path())],
+            &protected,
+            R0_READ_POLICY,
+        )
+        .unwrap_or_else(|refusal| panic!("binds: {}", refusal.code()))
+    }
+
+    /// Replaces `path` the way an editor's atomic save does: a new file is
+    /// written beside it and renamed over it, so the name gets a new inode.
+    fn atomic_replace(path: &Path, content: &str) {
+        let temporary = path.with_extension("tmp-save");
+        fs::write(&temporary, content).expect("replacement");
+        fs::rename(&temporary, path).expect("atomic rename");
+    }
+
+    /// Reads, lists and searches `docs/guides`, asserting that the protected
+    /// `.env` is refused, left out of the listing, and never searched.
+    fn assert_env_withheld(reader: &mut ScopedReader) {
+        assert_eq!(
+            reader.serve(&read_request("docs/guides/.env")).err(),
+            Some(Refusal::ResourceProtected),
+            "a read of the protected .env"
+        );
+        assert_env_unlisted_and_unsearched(reader);
+    }
+
+    fn assert_env_unlisted_and_unsearched(reader: &mut ScopedReader) {
+        let listing = reader
+            .serve(&list_request("docs/guides", None))
+            .expect("a listing")
+            .to_json();
+        assert_eq!(
+            listing["entries"],
+            json!([{"name": "a.md", "kind": "file"}]),
+            "the listing leaves the protected .env out"
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("a search")
+            .to_json();
+        assert!(
+            !found.to_string().contains("SENTINEL"),
+            "the search disclosed the protected .env: {found}"
+        );
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a.md", "line": 1, "text": "TODO a"}])
+        );
+        assert_eq!(found["skipped"], 0);
+        assert_eq!(found["complete"], true);
+    }
+
+    #[test]
+    fn a_protected_file_replaced_by_an_atomic_save_stays_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join(".env"), "TODO SENTINEL original").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/.env"],
+        );
+        assert_env_withheld(&mut reader);
+        atomic_replace(&guides.join(".env"), "TODO SENTINEL replaced");
+        assert_env_withheld(&mut reader);
+    }
+
+    #[test]
+    fn a_protected_file_replaced_during_a_request_stays_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join(".env"), "TODO SENTINEL original").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/.env"],
+        );
+        let env = guides.join(".env");
+        let mut replaced = 0;
+        let mut replace_at_root = |step: Step| {
+            if step == Step::Root {
+                replaced += 1;
+                atomic_replace(&env, &format!("TODO SENTINEL replaced {replaced}"));
+            }
+        };
+        assert_eq!(
+            reader
+                .serve_with(&read_request("docs/guides/.env"), &mut replace_at_root)
+                .err(),
+            Some(Refusal::ResourceProtected)
+        );
+        let listing = reader
+            .serve_with(&list_request("docs/guides", None), &mut replace_at_root)
+            .expect("a listing")
+            .to_json();
+        assert_eq!(
+            listing["entries"],
+            json!([{"name": "a.md", "kind": "file"}])
+        );
+        let found = reader
+            .serve_with(
+                &search_request("docs/guides", "TODO", None),
+                &mut replace_at_root,
+            )
+            .expect("a search")
+            .to_json();
+        assert!(!found.to_string().contains("SENTINEL"), "{found}");
+    }
+
+    #[test]
+    fn a_protected_path_created_after_the_reader_is_built_is_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/.env"],
+        );
+        fs::write(guides.join(".env"), "TODO SENTINEL created").unwrap();
+        assert_env_withheld(&mut reader);
+    }
+
+    #[test]
+    fn a_protected_directory_created_after_the_reader_is_built_is_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/.env"],
+        );
+        fs::create_dir(guides.join(".env")).unwrap();
+        fs::write(guides.join(".env/key"), "TODO SENTINEL created").unwrap();
+        assert_eq!(
+            reader.serve(&read_request("docs/guides/.env/key")).err(),
+            Some(Refusal::ResourceProtected)
+        );
+        assert_env_unlisted_and_unsearched(&mut reader);
+    }
 }
