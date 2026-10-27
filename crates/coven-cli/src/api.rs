@@ -634,6 +634,22 @@ pub trait SessionRuntime {
     fn accepts_automation_authority_projection(&self) -> bool {
         false
     }
+    /// Checks, before any Threads decision is made or consumed, that this
+    /// runtime could launch `envelope` on `harness` now, so a refusal burns
+    /// no decision. By default only an envelope the daemon launches from its
+    /// arguments passes; a runtime that runs the scoped read service also
+    /// checks what admission needs before a decision.
+    fn preflight_authority_launch(
+        &self,
+        _harness: &str,
+        envelope: &'static crate::automations::runtime_envelope::RuntimeEnvelope,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            crate::automations::runtime_envelope::is_launchable(envelope),
+            RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+        );
+        Ok(())
+    }
     /// Launches an automation session with the bounded authority evidence that
     /// the execution consumer is permitted to observe.
     ///

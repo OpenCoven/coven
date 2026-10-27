@@ -261,6 +261,11 @@ impl RuntimeEnvelope {
     }
 }
 
+/// Whether the daemon launches `envelope` from its arguments.
+pub(crate) fn is_launchable(envelope: &RuntimeEnvelope) -> bool {
+    LAUNCHABLE.contains(&envelope)
+}
+
 /// The envelope whose descriptor has `digest`.
 pub(crate) fn by_descriptor_digest(digest: &str) -> Option<&'static RuntimeEnvelope> {
     ENVELOPES

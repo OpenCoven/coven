@@ -201,6 +201,29 @@ pub(crate) fn prepare(
     })
 }
 
+/// What admission checks that needs no grant: the envelope runs the scoped
+/// read service, the installed harness reports an admitted version, and the
+/// owner's API key is saved. The trusted adapter runs this before it decides
+/// and consumes a Threads decision, so a refusal here burns none. Returns
+/// the version the harness reported.
+pub(crate) fn preflight(
+    coven_home: &Path,
+    envelope: &'static RuntimeEnvelope,
+    program: &Path,
+) -> Result<String, AdmissionError> {
+    envelope.service.as_ref().ok_or(AdmissionError::NotScoped)?;
+    let launch = IsolatedLaunch::create(coven_home)?;
+    let version = installed_version(program, &launch.home(), VERSION_TIME)?;
+    if !envelope.harness_versions.contains(&version.as_str()) {
+        return Err(AdmissionError::VersionNotAdmitted {
+            found: version,
+            admitted: envelope.harness_versions,
+        });
+    }
+    credential::load(coven_home)?.ok_or(AdmissionError::KeyMissing)?;
+    Ok(version)
+}
+
 /// The version `program --version` reports, run with nothing in its
 /// environment but its own folder on `PATH`, `home` and no auto-update.
 fn installed_version(

@@ -2515,6 +2515,41 @@ fn dispatch_claimed_occurrences_inner(
                 continue;
             }
         }
+        // What the launch needs that no decision does, checked before the
+        // launch transaction decides and consumes one, so a refusal here
+        // burns none: a runtime that takes authority projections and can
+        // launch the envelope the adapter would pin, with an admitted harness
+        // version and the owner's key. A grant no envelope enforces is left
+        // to the adapter, which refuses it before deciding too.
+        if let Some(authority) = definition.authority.as_ref() {
+            let capabilities: Vec<&str> =
+                authority.capabilities.iter().map(String::as_str).collect();
+            if let Some(envelope) =
+                super::runtime_envelope::for_scoped_grant(&definition.runtime, &capabilities)
+            {
+                let preflight = if runtime.accepts_automation_authority_projection() {
+                    runtime.preflight_authority_launch(&definition.runtime, envelope)
+                } else {
+                    Err(anyhow::anyhow!(
+                        crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+                    ))
+                };
+                if let Err(error) = preflight {
+                    let reason = format!(
+                        "{automation_id}: Runtime Authority launch preflight refused: {error:#}"
+                    );
+                    settle_dispatch_occurrence(
+                        conn,
+                        &occurrence_id,
+                        Some(&reason),
+                        dispatch_now,
+                        scheduler_fence,
+                    )?;
+                    report.failed.push(reason);
+                    continue;
+                }
+            }
+        }
         // A routine that declares authority dispatches only under Runtime
         // Authority, through the trusted adapter, and never as an ordinary run.
         let authority_home = if definition.authority.is_some() {

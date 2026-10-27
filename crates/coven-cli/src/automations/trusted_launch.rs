@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 
 use super::authority_projection::AutomationAuthorityConsumerProjection;
 use super::contract::authority::{
-    AuthorityEvidenceVerifier, AuthorityValidationPhase, AutomationAuthorityExtension,
+    AuthorityEvidenceVerifier, AuthorityProfileErrorCode, AuthorityValidationPhase,
+    AutomationAuthorityExtension,
 };
 use super::runtime_envelope::{self, RuntimeEnvelope};
 use super::scoped_read::admission::{self, AdmissionError, Prepared};
@@ -63,6 +64,11 @@ pub(crate) enum LaunchRefusal {
     /// The binding's Threads decision is unknown, no longer verifies, is
     /// outside its validity, or was not consumed by this dispatch.
     DecisionUntrusted(String),
+    /// The attempt's authority was withdrawn since dispatch: the attempt is
+    /// no longer live, a stop or cancellation is pending, the familiar
+    /// revision was revoked or retired, or the definition revision is no
+    /// longer current and active. Carries the profile code that fits.
+    Withdrawn(AuthorityProfileErrorCode, String),
     /// Scoped read admission refused the launch.
     Admission(AdmissionError),
     /// The store could not be read.
@@ -85,6 +91,13 @@ impl fmt::Display for LaunchRefusal {
             ),
             Self::DecisionUntrusted(why) => {
                 write!(f, "the attempt's Threads decision is not trusted: {why}")
+            }
+            Self::Withdrawn(code, why) => {
+                write!(
+                    f,
+                    "the attempt's authority was withdrawn ({}): {why}",
+                    code.as_str()
+                )
             }
             Self::Admission(error) => write!(f, "{error}"),
             Self::Unavailable(why) => write!(f, "Runtime Authority state is unreadable: {why}"),
@@ -155,6 +168,7 @@ pub(crate) fn launch_scopes(
     let binding = serde_json::to_value(&extension.execution_binding)
         .context("an execution binding serializes")
         .map_err(unavailable)?;
+    still_authorized(conn, &binding).map_err(unavailable)??;
 
     // 3. The project.
     let project = launch
@@ -202,6 +216,120 @@ pub(crate) fn launch_scopes(
         .cloned()
         .ok_or_else(|| untrusted("the signed request carries no scopes".to_owned()))?;
     Ok((envelope, scopes))
+}
+
+/// Whether the authority `binding` granted still stands. The predicates are
+/// the ones the runner and owner grants already apply:
+/// - the attempt, run, occurrence and session are live and owned, as
+///   `runner::claim_stop_fence` requires (`Stale`);
+/// - no stop fence is held and no cancellation is requested or stopping
+///   (`FenceStale`);
+/// - the familiar revision is neither retired nor revoked
+///   (`FamiliarStatusInvalid`);
+/// - the definition revision is still current and active, as
+///   `owner_grants::authorize_scheduled_dispatch` requires
+///   (`DefinitionMismatch`).
+fn still_authorized(
+    conn: &Connection,
+    binding: &Value,
+) -> anyhow::Result<Result<(), LaunchRefusal>> {
+    let withdrawn = |code, why: &str| Ok(Err(LaunchRefusal::Withdrawn(code, why.to_owned())));
+    let base = &binding["base"];
+    let text = |value: &Value, name: &str| {
+        value[name]
+            .as_str()
+            .map(str::to_owned)
+            .with_context(|| format!("the binding carries {name}"))
+    };
+    let (run_id, attempt_id) = (text(base, "runId")?, text(base, "attemptId")?);
+
+    let live: bool = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM automation_runs AS r
+                JOIN sessions AS s ON s.id = r.session_id
+                JOIN automation_attempts AS a
+                  ON a.run_id = r.id
+                 AND (
+                     a.session_id = r.session_id
+                     OR (a.state = 'dispatching' AND a.session_id IS NULL)
+                 )
+                JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                WHERE r.id = ?1
+                  AND a.id = ?2
+                  AND r.status = 'running'
+                  AND s.status IN ('created', 'running', 'orphaned')
+                  AND a.state IN ('dispatching', 'started', 'observing')
+                  AND o.state IN ('claimed', 'running')
+             )",
+            rusqlite::params![run_id, attempt_id],
+            |row| row.get(0),
+        )
+        .context("failed to read the attempt's liveness")?;
+    if !live {
+        return withdrawn(
+            AuthorityProfileErrorCode::Stale,
+            "the attempt is no longer live and owned",
+        );
+    }
+
+    // Reading creates nothing: a store that has never stopped a run has no
+    // stop tables, and so nothing pending.
+    let table = |name: &str| -> anyhow::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to look for {name}"))
+    };
+    let pending = |sql: &str| -> anyhow::Result<bool> {
+        conn.query_row(sql, [&run_id], |row| row.get(0))
+            .context("failed to read the run's stop state")
+    };
+    let stopping = (table("automation_stop_fences")?
+        && pending("SELECT EXISTS (SELECT 1 FROM automation_stop_fences WHERE run_id = ?1)")?)
+        || (table("automation_cancellations")?
+            && pending(
+                "SELECT EXISTS (SELECT 1 FROM automation_cancellations
+                                WHERE run_id = ?1 AND state IN ('requested', 'stopping'))",
+            )?);
+    if stopping {
+        return withdrawn(
+            AuthorityProfileErrorCode::FenceStale,
+            "a stop or cancellation is pending",
+        );
+    }
+
+    let revision = text(&binding["familiar"], "identityRevisionId")?;
+    let familiar: Option<String> = conn
+        .query_row(
+            "SELECT status FROM familiar_ledger_revisions WHERE revision_id = ?1",
+            [&revision],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read the familiar revision")?;
+    if !matches!(familiar.as_deref(), Some("active" | "superseded")) {
+        return withdrawn(
+            AuthorityProfileErrorCode::FamiliarStatusInvalid,
+            "the familiar revision is retired, revoked or unknown",
+        );
+    }
+
+    let automation_id = text(base, "automationId")?;
+    let automation_revision = base["automationRevision"]
+        .as_u64()
+        .context("the binding carries automationRevision")?;
+    if super::owner_grants::current_and_active(conn, &automation_id, automation_revision)?.is_err()
+    {
+        return withdrawn(
+            AuthorityProfileErrorCode::DefinitionMismatch,
+            "the definition revision is no longer current and active",
+        );
+    }
+    Ok(Ok(()))
 }
 
 /// Admits and prepares one trusted launch under its decision's scopes, with
@@ -391,14 +519,30 @@ pub(crate) mod test_support {
             occurrence
         }
 
+        /// A runtime standing in for a daemon that launches the scoped read
+        /// envelope with this fixture's harness.
+        pub(crate) fn runtime(&self) -> RecordingRuntime {
+            RecordingRuntime {
+                scoped: Some((self.home.path().to_path_buf(), self.program.clone())),
+                ..RecordingRuntime::default()
+            }
+        }
+
         /// Runs one daemon dispatch pass with the production adapter.
         pub(crate) fn dispatch_pass(
             &self,
         ) -> (crate::automations::runner::DispatchReport, RecordingRuntime) {
+            self.dispatch_pass_with(self.runtime())
+        }
+
+        /// [`Self::dispatch_pass`] on `runtime`.
+        pub(crate) fn dispatch_pass_with<R: SessionRuntime>(
+            &self,
+            runtime: R,
+        ) -> (crate::automations::runner::DispatchReport, R) {
             let now = Utc::now()
                 .duration_trunc(TimeDelta::milliseconds(1))
                 .unwrap();
-            let runtime = RecordingRuntime::default();
             let report = crate::automations::runner::dispatch_claimed_occurrences_with_clock(
                 &self.home.conn,
                 &runtime,
@@ -407,6 +551,23 @@ pub(crate) mod test_support {
             )
             .unwrap();
             (report, runtime)
+        }
+
+        /// The Threads store's decision, adoption and consumption rows.
+        pub(crate) fn threads_rows(&self) -> (i64, i64, i64) {
+            let count = |sql: &str| -> i64 {
+                self.home
+                    .conn
+                    .query_row(sql, [], |row| row.get(0))
+                    .unwrap_or(0)
+            };
+            (
+                count("SELECT COUNT(*) FROM automation_threads_decisions"),
+                count("SELECT COUNT(*) FROM automation_threads_store_events WHERE kind = 'adoption'"),
+                count(
+                    "SELECT COUNT(*) FROM automation_threads_store_events WHERE kind = 'consumption'",
+                ),
+            )
         }
 
         /// Schedules and dispatches `id` through the runner with the
@@ -453,6 +614,10 @@ pub(crate) mod test_support {
         pub launched: Mutex<Vec<Launched>>,
         /// Launches that carried no projection: ordinary BaseV1 runs.
         pub base: Mutex<usize>,
+        /// `COVEN_HOME` and the harness, when this runtime stands in for a
+        /// daemon that launches the scoped read envelope. Without them it
+        /// preflights as today's daemon does.
+        pub scoped: Option<(PathBuf, PathBuf)>,
     }
 
     impl SessionRuntime for RecordingRuntime {
@@ -462,6 +627,24 @@ pub(crate) mod test_support {
 
         fn accepts_automation_authority_projection(&self) -> bool {
             true
+        }
+
+        fn preflight_authority_launch(
+            &self,
+            harness: &str,
+            envelope: &'static crate::automations::runtime_envelope::RuntimeEnvelope,
+        ) -> anyhow::Result<()> {
+            let Some((coven_home, program)) = &self.scoped else {
+                anyhow::ensure!(
+                    crate::automations::runtime_envelope::is_launchable(envelope),
+                    crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+                );
+                return Ok(());
+            };
+            anyhow::ensure!(harness == envelope.harness, "another harness");
+            crate::automations::scoped_read::admission::preflight(coven_home, envelope, program)
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!("{error}"))
         }
 
         fn launch_authorized_contained_adopted_session(
@@ -783,5 +966,238 @@ mod tests {
             ),
             Err(LaunchRefusal::ProjectMismatch)
         ));
+    }
+
+    /// The routine `notes`, dispatched, and the launch its runtime received.
+    fn dispatched() -> (Fixture, String, super::test_support::Launched) {
+        let fixture = Fixture::new();
+        fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
+        let (run, launched) = fixture.dispatch("notes");
+        (fixture, run, launched)
+    }
+
+    /// The code a withdrawn launch was refused with.
+    fn withdrawn(
+        fixture: &Fixture,
+        launched: &super::test_support::Launched,
+    ) -> AuthorityProfileErrorCode {
+        match prepare(
+            &fixture.home.conn,
+            &fixture.launch(launched),
+            Box::new(Open),
+            Utc::now(),
+        ) {
+            Err(LaunchRefusal::Withdrawn(code, _)) => code,
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(_) => panic!("a withdrawn attempt was admitted"),
+        }
+    }
+
+    fn session_of(fixture: &Fixture, run: &str) -> String {
+        fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE id = ?1",
+                [run],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_launch_is_refused_once_its_attempt_is_no_longer_live() {
+        let (fixture, run, launched) = dispatched();
+        let session = session_of(&fixture, &run);
+        assert!(crate::store::update_session_terminal_if_active(
+            &fixture.home.conn,
+            &session,
+            "completed",
+            Some(0),
+            &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+        assert_eq!(
+            withdrawn(&fixture, &launched),
+            AuthorityProfileErrorCode::Stale
+        );
+    }
+
+    #[test]
+    fn a_launch_is_refused_under_a_stop_fence() {
+        let (fixture, run, launched) = dispatched();
+        let session = session_of(&fixture, &run);
+        crate::automations::runner::claim_stop_fence(
+            &fixture.home.conn,
+            &run,
+            &session,
+            "timeout",
+            None,
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            withdrawn(&fixture, &launched),
+            AuthorityProfileErrorCode::FenceStale
+        );
+    }
+
+    #[test]
+    fn a_launch_is_refused_while_a_cancellation_is_pending() {
+        for state in ["requested", "stopping"] {
+            let (fixture, run, launched) = dispatched();
+            let session = session_of(&fixture, &run);
+            let conn = &fixture.home.conn;
+            crate::automations::cancellation::ensure_cancellation_schema(conn).unwrap();
+            let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            conn.execute(
+                "INSERT INTO automation_cancellations
+                    (adoption_key, request_digest, automation_id, run_id, attempt_id, session_id,
+                     scope, requested_by_json, state, requested_at, execution_expires_at)
+                 VALUES ('adopt:cancel', ?1, 'notes', ?2, ?3, ?4, 'run', '{}', ?5, ?6, ?6)",
+                rusqlite::params![
+                    "0".repeat(64),
+                    run,
+                    launched.projection.attempt_id.as_str(),
+                    session,
+                    state,
+                    now
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                withdrawn(&fixture, &launched),
+                AuthorityProfileErrorCode::FenceStale,
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_is_refused_once_the_familiar_revision_is_retired_or_revoked() {
+        let (fixture, _run, launched) = dispatched();
+        let conn = &fixture.home.conn;
+        let revision = launched.projection.identity_revision_id.as_str().to_owned();
+        conn.execute(
+            "UPDATE familiar_ledger_revisions SET status = 'retired' WHERE revision_id = ?1",
+            [&revision],
+        )
+        .unwrap();
+        assert_eq!(
+            withdrawn(&fixture, &launched),
+            AuthorityProfileErrorCode::FamiliarStatusInvalid
+        );
+        conn.execute(
+            "UPDATE familiar_ledger_revisions
+             SET status = 'revoked', revoked_at = '2026-10-27T00:00:00.000Z',
+                 revocation_reason = 'compromised'
+             WHERE revision_id = ?1",
+            [&revision],
+        )
+        .unwrap();
+        assert_eq!(
+            withdrawn(&fixture, &launched),
+            AuthorityProfileErrorCode::FamiliarStatusInvalid
+        );
+    }
+
+    #[test]
+    fn a_launch_is_refused_once_the_definition_revision_moves_on() {
+        let (fixture, _run, launched) = dispatched();
+        let mut definition: Value = serde_json::from_str(
+            &fixture
+                .home
+                .conn
+                .query_row(
+                    "SELECT definition_json FROM automation_definitions WHERE id = 'notes'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        definition["prompt"] = json!("Summarise the notes, briefly.");
+        let (status, response) = crate::control_plane::route_action_with_authority(
+            json!({ "action": "coven.automations.definition.revise.v1",
+                    "adoptionKey": "adopt:notes:revise", "expectedRevision": 1,
+                    "definition": definition }),
+            &fixture.home.conn,
+            &crate::api::NoopSessionRuntime,
+            crate::automations::owner_grants::CommandAuthority::OwnerLocal,
+        );
+        assert!(status == 200 && response.accepted, "{response:?}");
+        assert_eq!(
+            withdrawn(&fixture, &launched),
+            AuthorityProfileErrorCode::DefinitionMismatch
+        );
+    }
+
+    /// Dispatches a scheduled `notes` on `runtime` and asserts the preflight
+    /// refused it with nothing decided, adopted or consumed.
+    fn refused_before_deciding<R: crate::api::SessionRuntime>(
+        fixture: &Fixture,
+        runtime: R,
+        why: &str,
+    ) {
+        fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
+        let occurrence = fixture.schedule("notes");
+        let (report, _runtime) = fixture.dispatch_pass_with(runtime);
+        assert!(report.dispatched.is_empty(), "{why}: {report:?}");
+        assert_eq!(
+            fixture.threads_rows(),
+            (0, 0, 0),
+            "{why}: no decision is burned"
+        );
+        let (state, reason): (String, Option<String>) = fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT state, failure_reason FROM automation_occurrences WHERE id = ?1",
+                [&occurrence],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "failed", "{why}");
+        assert!(
+            reason.as_deref().unwrap_or_default().contains("preflight"),
+            "{why}: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn an_unadmitted_harness_version_burns_no_decision() {
+        let fixture = Fixture::new();
+        std::fs::write(
+            &fixture.program,
+            "#!/bin/sh\necho '2.1.306 (Claude Code)'\n",
+        )
+        .unwrap();
+        refused_before_deciding(&fixture, fixture.runtime(), "version");
+    }
+
+    #[test]
+    fn a_missing_owner_key_burns_no_decision() {
+        let fixture = Fixture::new();
+        crate::automations::scoped_read::credential::remove(fixture.home.path()).unwrap();
+        refused_before_deciding(&fixture, fixture.runtime(), "key");
+    }
+
+    #[test]
+    fn an_envelope_the_runtime_cannot_launch_burns_no_decision() {
+        let fixture = Fixture::new();
+        // Today's daemon launches only LAUNCHABLE envelopes, and r0-read.2
+        // is not one.
+        refused_before_deciding(
+            &fixture,
+            super::test_support::RecordingRuntime::default(),
+            "envelope",
+        );
+    }
+
+    #[test]
+    fn a_runtime_without_authority_support_burns_no_decision() {
+        let fixture = Fixture::new();
+        refused_before_deciding(&fixture, crate::api::NoopSessionRuntime, "runtime");
     }
 }
