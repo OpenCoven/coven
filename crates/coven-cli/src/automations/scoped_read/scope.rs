@@ -110,12 +110,9 @@ impl RelativePath {
         &self.components
     }
 
-    /// This path with `name` appended. The caller has checked `name` with
-    /// [`Self::is_name`].
-    pub(crate) fn child(&self, name: &str) -> Self {
-        let mut components = self.components.clone();
-        components.push(name.to_owned());
-        Self { components }
+    /// This path with a name appended, checked against the same complete-path limits as a direct request.
+    pub(crate) fn child(&self, name: &str, policy: &ReadPolicy) -> Result<Self, Refusal> {
+        Self::parse(&format!("{}/{}", self.text(), name), policy)
     }
 
     pub(crate) fn text(&self) -> String {

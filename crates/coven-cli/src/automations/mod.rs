@@ -49,6 +49,7 @@ pub mod receipts;
 pub mod recovery;
 #[cfg(test)]
 mod release_upgrade_tests;
+pub(crate) mod retry_cli;
 pub mod rich_definition;
 pub mod rrule;
 pub mod run_now;

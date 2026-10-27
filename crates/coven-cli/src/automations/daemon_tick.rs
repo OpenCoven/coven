@@ -416,6 +416,10 @@ pub(super) fn reconcile_automation_runs(
     now: chrono::DateTime<chrono::Utc>,
     startup_cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
+    if let Some(startup_cutoff) = startup_cutoff {
+        super::runner::fail_unlaunched_manual_claims(conn, now, startup_cutoff)
+            .map_err(anyhow::Error::msg)?;
+    }
     super::runner::recover_restart_containment(coven_home, conn, now, startup_cutoff)
         .map_err(anyhow::Error::msg)?;
     super::cancellation::reconcile_expired_cancellations(conn, runtime, now)
