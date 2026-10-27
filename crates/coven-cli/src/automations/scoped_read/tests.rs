@@ -1185,6 +1185,67 @@ mod filesystem {
         assert_env_unlisted_and_unsearched(&mut reader);
     }
 
+    /// Reads, lists and searches `docs/guides` after a protected entry was
+    /// renamed to `moved`, asserting `moved` stays refused, hidden and
+    /// unsearched: what was protected at the build stays protected.
+    fn assert_moved_withheld(reader: &mut ScopedReader, read: &str) {
+        assert_eq!(
+            reader.serve(&read_request(read)).err(),
+            Some(Refusal::ResourceProtected),
+            "a read of the renamed protected resource"
+        );
+        let listing = reader
+            .serve(&list_request("docs/guides", None))
+            .expect("a listing")
+            .to_json();
+        assert_eq!(
+            listing["entries"],
+            json!([{"name": "a.md", "kind": "file"}]),
+            "the listing leaves the renamed protected resource out"
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("a search")
+            .to_json();
+        assert!(!found.to_string().contains("SENTINEL"), "{found}");
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a.md", "line": 1, "text": "TODO a"}])
+        );
+    }
+
+    #[test]
+    fn a_protected_directory_renamed_inside_a_scope_stays_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(guides.join("vault")).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("vault/k"), "TODO SENTINEL key").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/vault"],
+        );
+        fs::rename(guides.join("vault"), guides.join("moved")).unwrap();
+        assert_moved_withheld(&mut reader, "docs/guides/moved/k");
+    }
+
+    #[test]
+    fn a_protected_file_renamed_inside_a_scope_stays_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join(".env"), "TODO SENTINEL key").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/.env"],
+        );
+        fs::rename(guides.join(".env"), guides.join("moved")).unwrap();
+        assert_moved_withheld(&mut reader, "docs/guides/moved");
+    }
+
     /// Whether this process ignores permission bits, as root does.
     fn privileged() -> bool {
         // SAFETY: geteuid() only reads the effective uid and cannot fail.

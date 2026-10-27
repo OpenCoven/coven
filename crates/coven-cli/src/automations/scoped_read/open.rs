@@ -7,12 +7,13 @@
 //! component at a time from the root's handle and never follows a link, so no
 //! spelling can leave the root. Each component's identity, checked on the
 //! opened handle and not only on its name, must stay on the root's filesystem
-//! and must not be a protected resource. Protection is resolved again for
-//! every request and matches two ways: by the identity of what each protected
-//! path names, so a case or Unicode alias of its name on a filesystem that
-//! equates them still matches, and by its path beneath the root, so a
-//! protected file replaced by an atomic save, or created after the reader was
-//! built, is still refused even when the replacement lands mid-request.
+//! and must not be a protected resource. Protection matches three ways: by
+//! the identity each protected path named when the reader was built, so a
+//! protected resource renamed away stays refused; by the identity it names
+//! when each request starts, so a case or Unicode alias of its name on a
+//! filesystem that equates them still matches; and by its path beneath the
+//! root, so a protected file replaced by an atomic save, or created after the
+//! reader was built, is still refused even when that happens mid-request.
 //!
 //! After the open, the walk is repeated from the root by name. Every directory
 //! and the target must still be what the root's own names lead to; a
@@ -45,10 +46,12 @@ struct Identity {
     inode: u64,
 }
 
-/// What one request may not touch, resolved from the protected paths when the
-/// request starts. Identities catch an alias of an existing protected name;
-/// root-relative paths catch whatever a protected name comes to hold during
-/// the request, including a new inode from an atomic save.
+/// What one request may not touch: the identities the protected paths named
+/// when the reader was built, which follow a protected resource renamed to
+/// another name; the identities they name when the request starts, which catch
+/// an alias of an existing protected name; and their paths beneath the root,
+/// which catch whatever a protected name comes to hold during the request,
+/// including a new inode from an atomic save.
 #[derive(Debug, Default)]
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Protected {
@@ -216,9 +219,13 @@ pub(crate) struct ScopedReader {
     grants: Grants,
     policy: ReadPolicy,
     roots: Vec<platform::BoundRoot>,
-    /// The protected paths as the daemon supplied them. They are resolved
-    /// again for every request, never held from the build.
+    /// The protected paths as the daemon supplied them, resolved again for
+    /// every request.
     protected: Vec<PathBuf>,
+    /// What the protected paths named when the reader was built. They stay
+    /// refused for the whole attempt, so renaming a protected resource to an
+    /// unprotected name inside a granted scope does not release it.
+    protected_at_build: Vec<Identity>,
     calls: u32,
     disclosed: u64,
     scanned: u64,
@@ -252,6 +259,7 @@ impl ScopedReader {
             policy,
             roots: bound,
             protected: protected.iter().map(|path| path.to_path_buf()).collect(),
+            protected_at_build: identities,
             calls: 0,
             disclosed: 0,
             scanned: 0,
@@ -282,7 +290,10 @@ impl ScopedReader {
             .iter()
             .find(|root| root.kind == request.root)
             .ok_or(Refusal::RootUnbound)?;
-        let protected = platform::protect(&self.protected, root)?;
+        let mut protected = platform::protect(&self.protected, root)?;
+        protected
+            .identities
+            .extend_from_slice(&self.protected_at_build);
         let disclosure = self.policy.attempt_bytes - self.disclosed;
         let scan = self.policy.scan_bytes - self.scanned;
         let body = match request.operation {
