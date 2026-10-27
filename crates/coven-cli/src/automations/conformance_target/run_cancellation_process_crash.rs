@@ -212,6 +212,10 @@ enum Run {
     /// run and occurrence stay `running`, held for an operator retry until the
     /// run's deadline.
     Held,
+    /// A held run that the re-sent request released (#1486): the run and
+    /// occurrence `cancelled`, the occurrence with no lease, the attempt still
+    /// `failed` on its `killed` session, and no stop fence.
+    Released,
     /// The session, the attempt, the run and the occurrence `cancelled`, the
     /// occurrence with no lease, and no stop fence.
     Cancelled,
@@ -263,8 +267,12 @@ enum Answer {
     /// The stored `recovery_required` answer, with no write.
     RecoveryRequired,
     /// The stored `cancelled` answer, acknowledged and reconciled when the
-    /// stop was settled, with no write.
+    /// stop was settled, or when a re-sent request released the held run,
+    /// with no write.
     Cancelled,
+    /// `cancelled`, which this request stored as its answer when it released
+    /// the run held for an operator retry, acknowledged and reconciled then.
+    Released,
     /// Anything else: another code, a write with a replay, or a response
     /// that does not name the store's run.
     Mismatched,
@@ -291,8 +299,9 @@ fn expected_for(boundary: Boundary) -> Expected {
         Stage::Settled | Stage::Answered => Run::Cancelled,
     };
     // Inside the lease, a reserved cancellation is the daemon's to reconcile.
+    // With none reserved, the request releases the held run (#1486).
     let reissue = match stage {
-        Stage::Untouched => Answer::Refused,
+        Stage::Untouched => Answer::Released,
         Stage::Reserved | Stage::Fenced | Stage::Stopped | Stage::Settled => Answer::Pending,
         Stage::Answered => Answer::Cancelled,
     };
@@ -300,7 +309,7 @@ fn expected_for(boundary: Boundary) -> Expected {
     // recovery, and the same pass then settles the ambiguous run on its ended
     // session and releases the cancellation's fence.
     let (run_after_pass, cancellation_after_pass, resend) = match stage {
-        Stage::Untouched => (Run::Held, Cancellation::Refused, Answer::Rejected),
+        Stage::Untouched => (Run::Released, Cancellation::Cancelled, Answer::Cancelled),
         Stage::Reserved => (Run::Held, Cancellation::Rejected, Answer::Rejected),
         Stage::Fenced | Stage::Stopped => (
             Run::Failed,
@@ -459,7 +468,11 @@ fn request(target: &Target) -> Value {
 /// The answer naming the store's run with `status`. A cancellation is
 /// requested, and a confirmed stop settled, at the worker's request time.
 fn payload(target: &Target, status: &str, base: DateTime<Utc>) -> Value {
-    let requested_at = iso(at(base, CANCEL));
+    payload_requested_at(target, status, at(base, CANCEL))
+}
+
+fn payload_requested_at(target: &Target, status: &str, requested_at: DateTime<Utc>) -> Value {
+    let requested_at = iso(requested_at);
     let mut cancellation = json!({"scope": "run", "reason": REASON,
         "requestedBy": {"principalId": PRINCIPAL}, "requestedAt": requested_at});
     if status == "cancelled" {
@@ -691,6 +704,7 @@ fn run(conn: &Connection) -> Result<Run, &'static str> {
                 Run::Contained
             }
             ("running", "daemon", "running", "failed", true, "killed", "none") => Run::Held,
+            ("cancelled", "none", "cancelled", "failed", true, "killed", "none") => Run::Released,
             ("cancelled", "none", "cancelled", "cancelled", true, "cancelled", "none") => {
                 Run::Cancelled
             }
@@ -836,11 +850,20 @@ fn reissue(
         CancellationExecution::Success(success) if !wrote => {
             if success.payload == payload(target, "recovery_required", base) {
                 Answer::RecoveryRequired
-            } else if success.payload == payload(target, "cancelled", base) {
+            } else if success.payload == payload(target, "cancelled", base)
+                || success.payload == payload_requested_at(target, "cancelled", at(base, REISSUE))
+            {
                 Answer::Cancelled
             } else {
                 Answer::Mismatched
             }
+        }
+        CancellationExecution::Success(success)
+            if success.payload == payload_requested_at(target, "cancelled", now)
+                && cancellation(conn)? == Cancellation::Cancelled
+                && run(conn)? == Run::Released =>
+        {
+            Answer::Released
         }
         CancellationExecution::Success(_) => Answer::Mismatched,
     })

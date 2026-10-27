@@ -34,6 +34,26 @@ use super::occurrences::settle_occurrence;
 use super::runs::{record_run_finish, RunFinish};
 use crate::api::SessionRuntime;
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_DELEGATION_COMMIT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Runs once, after a delegation commits and before its run cancellation is
+/// sent: the window #1486 describes.
+#[cfg(test)]
+pub(crate) fn set_after_delegation_commit_test_hook(hook: Option<Box<dyn FnOnce()>>) {
+    AFTER_DELEGATION_COMMIT_TEST_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+fn after_delegation_commit_test_hook() {
+    #[cfg(test)]
+    if let Some(hook) = AFTER_DELEGATION_COMMIT_TEST_HOOK.with(|cell| cell.borrow_mut().take()) {
+        hook();
+    }
+}
+
 pub const OCCURRENCE_CANCEL_ACTION: &str = "coven.automations.occurrence.cancel.v1";
 pub const ATTEMPT_CANCEL_ACTION: &str = "coven.automations.attempt.cancel.v1";
 const REASON_MAX_CHARS: usize = 500;
@@ -305,16 +325,19 @@ fn execute(
         .commit()
         .map_err(|error| format!("failed to commit cancellation: {error}"))?;
     match (plan, answer) {
-        (Ok(Plan::Delegate(run_cancel)), _) => delegate(
-            conn,
-            runtime,
-            target,
-            &body,
-            &run_cancel,
-            now,
-            stop_fence_at,
-            false,
-        ),
+        (Ok(Plan::Delegate(run_cancel)), _) => {
+            after_delegation_commit_test_hook();
+            delegate(
+                conn,
+                runtime,
+                target,
+                &body,
+                &run_cancel,
+                now,
+                stop_fence_at,
+                false,
+            )
+        }
         (_, Some(answer)) => Ok(answer),
         _ => Err("a cancellation produced no answer".to_owned()),
     }
@@ -364,15 +387,24 @@ fn delegate(
             .expect("the pending ownership message satisfies protocol bounds"),
         ));
     }
-    let execution = match stop_fence_at {
-        Some(stop_fence_at) => execute_run_cancellation_at_stop_fence(
+    let execution = match (target, stop_fence_at) {
+        // A failed attempt is never cancellable, so an attempt cancellation
+        // never releases a held run; the occurrence and run commands do.
+        (Target::Attempt, stop_fence_at) => super::cancellation::execute_attempt_run_cancellation(
             conn,
             runtime,
             run_cancel.clone(),
             now,
             stop_fence_at,
         )?,
-        None => execute_run_cancellation(conn, runtime, run_cancel.clone(), now)?,
+        (_, Some(stop_fence_at)) => execute_run_cancellation_at_stop_fence(
+            conn,
+            runtime,
+            run_cancel.clone(),
+            now,
+            stop_fence_at,
+        )?,
+        (_, None) => execute_run_cancellation(conn, runtime, run_cancel.clone(), now)?,
     };
     match execution {
         CancellationExecution::Success(success) => {

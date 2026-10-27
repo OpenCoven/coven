@@ -840,6 +840,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "similar",
+ "syn 2.0.117",
  "sysinfo",
  "tempfile",
  "textwrap",
@@ -923,7 +924,7 @@ dependencies = [
 [[package]]
 name = "coven-threads-core"
 version = "0.2.0"
-source = "git+https://github.com/OpenCoven/coven-threads?rev=78e47c9d2430582128679fd4a54f9966f2f4f976#78e47c9d2430582128679fd4a54f9966f2f4f976"
+source = "git+https://github.com/OpenCoven/coven-threads?rev=7b5a9e688bff46bf9093e6065820921d119c4747#7b5a9e688bff46bf9093e6065820921d119c4747"
 dependencies = [
  "blake3",
  "serde",

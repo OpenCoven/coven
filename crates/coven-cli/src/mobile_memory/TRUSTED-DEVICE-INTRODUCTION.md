@@ -9,9 +9,11 @@ source_adjacent_reason: "Defines the authorization and persistence invariants im
 
 # Local trusted-device introduction
 
-Tracks #1256 under #788. `IntroductionAuthority` is a local Rust authorization
-seam; no CLI command, daemon/API route, relay connection or remote enrollment
-is enabled. Tests use synthetic P-256 keys and disposable local state.
+Tracks #1256 under #788. `IntroductionAuthority` is the Rust authorization
+seam. The only ingress is local enrollment (below): owner-socket admission plus
+the introducer's approval over the authenticated private-network gateway. No
+relay connection or remote enrollment is enabled. Tests use synthetic P-256
+keys and disposable local state.
 
 ## Trusted inputs and explicit policy
 
@@ -188,6 +190,53 @@ head without key material. Device-approved tightening has no CLI; it needs the
 introducer's step-up through the enrollment route. Fixture:
 `tests/fixtures/owner-introduction-policy/cli.rs`.
 
+## Local enrollment
+
+`enrollment.rs` connects the seam to two parties who must both act.
+
+**1. Owner admission.** The local owner runs
+`coven device introduce --request ENVELOPE`. The envelope holds the new
+installation's `IntroductionRequest` and its `devices.introduction.accept`
+signature. The command prints every material field of the request:
+
+- operation and audience
+- owner policy revision and digest
+- introducer device, grant and epoch
+- new device ID, key fingerprint, name and context
+- grant ID, scopes, minimum assurance, fresh-verification scopes, transport,
+  not-before and expiry
+- nonce, issued-at, expiry and effect digest
+
+After the owner types `introduce`, the command posts the envelope to the
+owner-socket route `POST /api/v1/internal/mobile/introductions`.
+
+Admission loads policy and audience only from the protected store and host
+identity. `IntroductionAuthority::admit` re-runs every authority check and
+verifies the destination's possession signature, consuming nothing. A
+destination that is already enrolled is refused. The TLS gateway has no
+admission route, so a relay or account service cannot put a request in front
+of an introducer.
+
+**2. Introducer approval.** `GET /api/v1/mobile/introductions` returns
+pending requests, with their exact action, only to the device each request
+names as introducer. Other devices get an empty list. The introducer app
+renders the request, takes a step-up challenge from the existing
+`/api/v1/mobile/assurance/challenge` route (same binding), and submits
+`POST /api/v1/mobile/introductions/{id}/approve` with its possession signature
+and action step-up proof.
+
+Transport authentication requires no scope here; `introduce` enforces
+`DeviceAdmin`, eligibility and fresh assurance at commit. Each admitted
+request gets one approval attempt. Any failure is terminal (`rejected`, or
+`uncertain` when the destination may have committed), so a forged or replayed
+approval cannot be retried into success.
+
+**Ledger.** The ledger is in memory and bounded at 16. A daemon restart drops
+pending entries, but never committed state. `uncertain` is never presented as
+failure. Owner status and cancel routes are `…/{id}/status` and
+`…/{id}/cancel`. Fixtures: `tests/fixtures/trusted-device-introduction/enrollment.rs`
+and the gateway route tests.
+
 ## Audit and remaining integration
 
 Events distinguish `device_introduced`, `device_introduction_rejected` and
@@ -205,9 +254,9 @@ compiled into the CLI unit tests. Run it with:
 cargo test -p coven-cli --bin coven mobile_memory::introduction --locked
 ```
 
-Transport integration, an owner enrollment route with UI rendering of every
-signed introduction field, passkeys, platform attestation, N-of-M,
-remote recovery and end-to-end #788 acceptance remain pending. The future
+Remote (relay) transport, the mobile client's rendering/signing of the pending
+request, passkeys, platform attestation, N-of-M, remote recovery and end-to-end
+#788 acceptance remain pending. The future
 integration must authenticate its channels, enforce transport restrictions,
 source audience/policy from local authority and expose uncertain outcomes
 without offering automatic retry-as-success. This checkpoint does not close #788.

@@ -1008,6 +1008,21 @@ enum DeviceCommand {
         #[arg(value_name = "REPLACEMENT_DEVICE", value_parser = parse_nonempty_arg)]
         replacement_device: String,
     },
+    #[command(
+        about = "Introduce a new installation through an already trusted device",
+        long_about = "Introduce a new installation through an already trusted device.\n\n\
+                      Reads the new installation's signed introduction envelope, prints every \
+                      signed field, and, after you type `introduce`, admits it over the local \
+                      owner socket. The named introducer must then approve on its own device \
+                      with a fresh step-up. Requires an installed introduction policy and a \
+                      running daemon with the mobile gateway enabled."
+    )]
+    Introduce {
+        #[arg(long, value_name = "ENVELOPE_JSON")]
+        request: PathBuf,
+        #[arg(long, help = "Skip the typed confirmation after the review is printed")]
+        yes: bool,
+    },
     #[command(about = "Manage the offline owner-root credential")]
     OwnerRoot {
         #[command(subcommand)]
@@ -1297,6 +1312,21 @@ enum AutomationsCommand {
     #[command(about = "Explain what decides whether one routine runs next")]
     Explain {
         automation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Retry a run held after a failure, before its deadline")]
+    Retry {
+        run_id: String,
+        /// The run's latest attempt, which the retry follows
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        prior_attempt: u16,
+        /// How that attempt settled
+        #[arg(long, value_enum)]
+        prior_disposition: automations::retry_cli::PriorDisposition,
+        /// A note recorded with the new attempt
+        #[arg(long)]
+        note: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1849,6 +1879,7 @@ fn main() -> Result<()> {
                 | AutomationsCommand::Run { .. }
                 | AutomationsCommand::Attempts { .. }
                 | AutomationsCommand::Explain { .. }
+                | AutomationsCommand::Retry { .. }
         })
     ) || matches!(
         &cli.command,
@@ -2108,6 +2139,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 old_device,
                 replacement_device,
             } => mobile_memory::device::run_rotate(&old_device, &replacement_device),
+            DeviceCommand::Introduce { request, yes } => {
+                mobile_memory::enrollment::run_introduce(&request, yes)
+            }
             DeviceCommand::OwnerRoot {
                 command: OwnerRootCommand::Generate { out },
             } => mobile_memory::policy_cli::run_generate_owner_root(&out),
@@ -4412,6 +4446,19 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
             automation_id,
             json,
         } => run(View::Explain(&automation_id), json),
+        AutomationsCommand::Retry {
+            run_id,
+            prior_attempt,
+            prior_disposition,
+            note,
+            json,
+        } => automations::retry_cli::run(
+            &run_id,
+            prior_attempt,
+            prior_disposition,
+            note.as_deref(),
+            json,
+        ),
         AutomationsCommand::Leases {
             automation_id,
             limit,

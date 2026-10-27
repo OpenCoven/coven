@@ -44,8 +44,7 @@ struct Identity {
 
 /// A point in serving a request, reported to the reader's probe. Tests use it
 /// to change the filesystem at an exact step; production passes a probe that
-/// does nothing. A search reports the steps of its directory, then nothing for
-/// the files it scans.
+/// does nothing. A search reports the steps of its directory and each file it scans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     /// The first filesystem access: the root is about to be rechecked.
@@ -260,9 +259,10 @@ impl ScopedReader {
                     request.path.components(),
                     &self.protected,
                     self.policy.file_bytes,
-                    disclosure,
+                    ContentBudget::Disclosure(disclosure),
                     probe,
-                )?;
+                )
+                .map_err(|error| error.refusal)?;
                 let content = String::from_utf8(content).map_err(|_| Refusal::ResourceNotText)?;
                 self.disclosed += content.len() as u64;
                 Body::File { content }
@@ -271,15 +271,21 @@ impl ScopedReader {
                 if scan == 0 {
                     return Err(Refusal::LimitScan);
                 }
-                let listing = platform::list_beneath(
+                let listing = match platform::list_beneath(
                     root,
-                    request.path.components(),
+                    &request.path,
                     &self.protected,
                     &self.policy,
                     after.as_deref(),
                     scan,
                     probe,
-                )?;
+                ) {
+                    Ok(listing) => listing,
+                    Err(error) => {
+                        self.scanned += error.scanned;
+                        return Err(error.refusal);
+                    }
+                };
                 self.scanned += listing.scanned;
                 Body::Listing {
                     entries: listing.entries,
@@ -331,6 +337,38 @@ struct Listing {
     scanned: u64,
 }
 
+/// A refused read or enumeration still carries the scan budget it consumed.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct ScanError {
+    refusal: Refusal,
+    scanned: u64,
+}
+
+impl From<Refusal> for ScanError {
+    fn from(refusal: Refusal) -> Self {
+        Self {
+            refusal,
+            scanned: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum ContentBudget {
+    Disclosure(u64),
+    Scan(u64),
+}
+
+impl ContentBudget {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn remaining(self) -> u64 {
+        match self {
+            Self::Disclosure(remaining) | Self::Scan(remaining) => remaining,
+        }
+    }
+}
+
 /// A search page and what it cost.
 #[derive(Default)]
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -367,8 +405,8 @@ mod platform {
 
     use super::super::scope::is_excluded_name;
     use super::{
-        excerpt, Entry, EntryKind, Found, Identity, Listing, Match, ReadPolicy, Refusal,
-        RelativePath, RootKind, SearchPosition, Step,
+        excerpt, ContentBudget, Entry, EntryKind, Found, Identity, Listing, Match, ReadPolicy,
+        Refusal, RelativePath, RootKind, ScanError, SearchPosition, Step,
     };
 
     pub(super) struct BoundRoot {
@@ -491,9 +529,10 @@ mod platform {
         components: &[String],
         protected: &[Identity],
         file_bytes: u64,
-        remaining: u64,
+        budget: ContentBudget,
         probe: &mut dyn FnMut(Step),
-    ) -> Result<Vec<u8>, Refusal> {
+    ) -> Result<Vec<u8>, ScanError> {
+        let remaining = budget.remaining();
         let (name, parents) = components
             .split_last()
             .expect("a parsed path has a component");
@@ -502,17 +541,17 @@ mod platform {
         let listed = list(&directory, name)?;
         let file_type = listed.file_type();
         if file_type.is_symlink() {
-            return Err(Refusal::ResourceSymlink);
+            return Err(Refusal::ResourceSymlink.into());
         }
         if file_type.is_dir() {
-            return Err(Refusal::ResourceDirectory);
+            return Err(Refusal::ResourceDirectory.into());
         }
         if !file_type.is_file() {
-            return Err(Refusal::ResourceSpecial);
+            return Err(Refusal::ResourceSpecial.into());
         }
         admit(identity(&listed), root, protected)?;
         if listed.nlink() != 1 {
-            return Err(Refusal::ResourceMultiplyLinked);
+            return Err(Refusal::ResourceMultiplyLinked.into());
         }
         probe(Step::BeforeOpen);
         let mut options = OpenOptions::new();
@@ -525,39 +564,74 @@ mod platform {
             .map_err(|error| classify_open(&directory, name, &error))?;
         let opened = file.metadata().map_err(unavailable)?;
         if identity(&opened) != identity(&listed) || !opened.is_file() {
-            return Err(Refusal::ResourceMoved);
+            return Err(Refusal::ResourceMoved.into());
         }
         if opened.nlink() != 1 {
-            return Err(Refusal::ResourceMultiplyLinked);
+            return Err(Refusal::ResourceMultiplyLinked.into());
         }
         if mount_id(&file)? != root.mount {
-            return Err(Refusal::ResourceMountCrossing);
+            return Err(Refusal::ResourceMountCrossing.into());
         }
         probe(Step::Opened);
         recheck(root, parents, &held, name, identity(&opened))?;
 
         if opened.len() > file_bytes {
-            return Err(Refusal::LimitFileTooLarge);
+            return Err(Refusal::LimitFileTooLarge.into());
         }
         if opened.len() > remaining {
-            return Err(Refusal::LimitAttemptDisclosure);
+            return Err(Refusal::LimitAttemptDisclosure.into());
         }
         probe(Step::Read);
-        // The file can grow after the size check: read one byte past the
-        // limit to tell, and never allocate past it.
+        // Detect growth with one sentinel byte when the scan budget permits it. Otherwise validate the held file length at the boundary.
         let limit = file_bytes.min(remaining);
-        let mut content = Vec::with_capacity(opened.len().min(limit) as usize);
-        (&mut file)
-            .take(limit + 1)
-            .read_to_end(&mut content)
-            .map_err(unavailable)?;
-        if content.len() as u64 > limit {
-            return Err(if limit == file_bytes {
-                Refusal::LimitFileTooLarge
-            } else {
-                Refusal::LimitAttemptDisclosure
+        let read_limit = match budget {
+            ContentBudget::Disclosure(_) => limit + 1,
+            ContentBudget::Scan(_) => remaining.min(limit + 1),
+        };
+        let content = read_content(&mut file, opened.len().min(limit), read_limit)?;
+        let scanned = content.len() as u64;
+        if scanned > limit {
+            return Err(ScanError {
+                refusal: if limit == file_bytes {
+                    Refusal::LimitFileTooLarge
+                } else {
+                    Refusal::LimitAttemptDisclosure
+                },
+                scanned,
             });
         }
+        // A search cannot spend a byte beyond its scan budget to detect growth. At the boundary, recheck the held file's length rather than reading a sentinel byte.
+        if matches!(budget, ContentBudget::Scan(_)) && scanned == remaining {
+            let length = file
+                .metadata()
+                .map_err(|error| ScanError {
+                    refusal: unavailable(error),
+                    scanned,
+                })?
+                .len();
+            if length != scanned {
+                return Err(ScanError {
+                    refusal: Refusal::LimitAttemptDisclosure,
+                    scanned,
+                });
+            }
+        }
+        Ok(content)
+    }
+
+    fn read_content(
+        reader: impl Read,
+        capacity: u64,
+        read_limit: u64,
+    ) -> Result<Vec<u8>, ScanError> {
+        let mut content = Vec::with_capacity(capacity as usize);
+        reader
+            .take(read_limit)
+            .read_to_end(&mut content)
+            .map_err(|error| ScanError {
+                refusal: unavailable(error),
+                scanned: content.len() as u64,
+            })?;
         Ok(content)
     }
 
@@ -599,14 +673,14 @@ mod platform {
 
     pub(super) fn list_beneath(
         root: &BoundRoot,
-        components: &[String],
+        path: &RelativePath,
         protected: &[Identity],
         policy: &ReadPolicy,
         after: Option<&str>,
         scan: u64,
         probe: &mut dyn FnMut(Step),
-    ) -> Result<Listing, Refusal> {
-        let directory = open_directory_beneath(root, components, protected, probe)?;
+    ) -> Result<Listing, ScanError> {
+        let directory = open_directory_beneath(root, path.components(), protected, probe)?;
         probe(Step::Read);
         let (names, scanned) = names(&directory, policy, scan)?;
         let start = after.map_or(0, |after| {
@@ -615,6 +689,9 @@ mod platform {
         let mut entries: Vec<Entry> = Vec::new();
         let mut next = None;
         for name in &names[start..] {
+            if path.child(name, policy).is_err() {
+                continue;
+            }
             let Some((kind, _)) = visible(&directory, name, root, protected) else {
                 continue;
             };
@@ -653,6 +730,7 @@ mod platform {
             scan,
             disclosure,
             found: Found::default(),
+            probe,
         };
         search.visit(&directory, start);
         Ok(search.found)
@@ -667,6 +745,7 @@ mod platform {
         scan: u64,
         disclosure: u64,
         found: Found,
+        probe: &'a mut dyn FnMut(Step),
     }
 
     impl Search<'_> {
@@ -681,17 +760,19 @@ mod platform {
                     self.found.scanned += scanned;
                     names
                 }
-                Err(Refusal::LimitScan) => {
-                    self.found.stopped = true;
+                Err(error) => {
+                    self.found.scanned += error.scanned;
+                    self.found.stopped = error.refusal == Refusal::LimitScan;
                     return;
                 }
-                Err(_) => return,
             };
             for name in names {
                 if self.done() {
                     return;
                 }
-                let child = path.child(&name);
+                let Ok(child) = path.child(&name, self.scope.policy) else {
+                    continue;
+                };
                 // Everything at or beneath `child` comes before the
                 // continuation point, so it was on an earlier page.
                 if self
@@ -715,9 +796,9 @@ mod platform {
         }
 
         fn scan(&mut self, path: &RelativePath) {
-            let first_line = match self.after {
-                Some(after) if after.path == *path => after.line + 1,
-                _ => 1,
+            let after_line = match self.after {
+                Some(after) if after.path == *path => after.line,
+                _ => 0,
             };
             // The file is read again from the root, with every check a read
             // makes, so the walk's handles never decide what is disclosed.
@@ -726,28 +807,29 @@ mod platform {
                 path.components(),
                 self.scope.protected,
                 self.scope.policy.file_bytes,
-                self.scan - self.found.scanned,
-                &mut |_| {},
+                ContentBudget::Scan(self.scan - self.found.scanned),
+                self.probe,
             ) {
                 Ok(content) => content,
-                // The scan budget, passed as the read's remaining total.
-                Err(Refusal::LimitAttemptDisclosure) => {
-                    self.found.stopped = true;
-                    return;
-                }
-                Err(_) => {
-                    self.found.skipped += 1;
+                Err(error) => {
+                    self.found.scanned += error.scanned;
+                    self.found.stopped = self.found.scanned == self.scan
+                        || error.refusal == Refusal::LimitAttemptDisclosure;
+                    if error.refusal != Refusal::LimitAttemptDisclosure {
+                        self.found.skipped += 1;
+                    }
                     return;
                 }
             };
             self.found.scanned += content.len() as u64;
+            self.found.stopped = self.found.scanned == self.scan;
             let Ok(text) = String::from_utf8(content) else {
                 self.found.skipped += 1;
                 return;
             };
             for (index, line) in text.split('\n').enumerate() {
                 let number = index as u64 + 1;
-                if number < first_line || !line.contains(self.pattern) {
+                if number <= after_line || !line.contains(self.pattern) {
                     continue;
                 }
                 if self.found.matches.len() == self.scope.policy.page_matches {
@@ -778,15 +860,24 @@ mod platform {
         directory: &Dir,
         policy: &ReadPolicy,
         scan: u64,
-    ) -> Result<(Vec<String>, u64), Refusal> {
+    ) -> Result<(Vec<String>, u64), ScanError> {
         let mut names = Vec::new();
         let mut scanned = 0u64;
         for entry in directory.entries().map_err(unavailable)? {
-            let name = entry.map_err(unavailable)?.file_name();
-            scanned += name.len() as u64;
-            if scanned > scan {
-                return Err(Refusal::LimitScan);
+            let name = entry
+                .map_err(|error| ScanError {
+                    refusal: unavailable(error),
+                    scanned,
+                })?
+                .file_name();
+            let bytes = name.len() as u64;
+            if bytes > scan - scanned {
+                return Err(ScanError {
+                    refusal: Refusal::LimitScan,
+                    scanned: scan,
+                });
             }
+            scanned += bytes;
             if let Some(name) = name
                 .to_str()
                 .filter(|name| RelativePath::is_name(name, policy) && !is_excluded_name(name))
@@ -811,13 +902,38 @@ mod platform {
         if file_type.is_symlink() || admit(identity(&metadata), root, protected).is_err() {
             return None;
         }
-        if file_type.is_dir() {
-            Some((EntryKind::Directory, identity(&metadata)))
+        let kind = if file_type.is_dir() {
+            EntryKind::Directory
         } else if file_type.is_file() && metadata.nlink() == 1 {
-            Some((EntryKind::File, identity(&metadata)))
+            EntryKind::File
         } else {
-            None
-        }
+            return None;
+        };
+        let listed = identity(&metadata);
+        entry_on_mount(directory, name, listed, root).then_some((kind, listed))
+    }
+
+    /// O_PATH observes metadata without requiring permission to read a file's contents. The no-follow handle must still name the entry just listed.
+    #[cfg(target_os = "linux")]
+    fn entry_on_mount(directory: &Dir, name: &str, listed: Identity, root: &BoundRoot) -> bool {
+        use rustix::fs::{openat, Mode, OFlags};
+        let Ok(handle) = openat(
+            directory,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let file = cap_std::fs::File::from_std(handle.into());
+        file.metadata()
+            .is_ok_and(|metadata| identity(&metadata) == listed)
+            && mount_id(&file).is_ok_and(|mount| mount == root.mount)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn entry_on_mount(_directory: &Dir, _name: &str, _listed: Identity, root: &BoundRoot) -> bool {
+        root.mount.is_none()
     }
 
     /// Opens a subdirectory a search found, only if it is still what was
@@ -912,14 +1028,76 @@ mod platform {
     fn mount_id(_handle: &impl std::os::fd::AsFd) -> Result<Option<u64>, Refusal> {
         Ok(None)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{bind, identity, read_content, visible, EntryKind, Refusal, RootKind};
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn a_partial_io_error_preserves_consumed_content_bytes() {
+            struct FailsAfterPrefix(std::io::Cursor<&'static [u8]>);
+            impl std::io::Read for FailsAfterPrefix {
+                fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                    if self.0.position() == 3 {
+                        return Err(std::io::Error::other("synthetic fixture read failure"));
+                    }
+                    std::io::Read::read(&mut self.0, buffer)
+                }
+            }
+            let error = match read_content(FailsAfterPrefix(std::io::Cursor::new(b"abc")), 3, 8) {
+                Ok(_) => panic!("the injected read must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.refusal, Refusal::ResourceUnavailable);
+            assert_eq!(error.scanned, 3);
+        }
+
+        #[test]
+        fn visible_entries_must_match_the_roots_mount_even_on_the_same_device() {
+            let scratch = tempfile::tempdir().unwrap();
+            std::fs::write(scratch.path().join("file"), "fixture").unwrap();
+            std::fs::set_permissions(
+                scratch.path().join("file"),
+                std::fs::Permissions::from_mode(0o0),
+            )
+            .unwrap();
+            std::fs::create_dir(scratch.path().join("folder")).unwrap();
+            let mut root = bind(RootKind::Project, scratch.path(), &[]).unwrap();
+            for name in ["file", "folder"] {
+                assert_eq!(
+                    identity(&root.dir.symlink_metadata(name).unwrap()).device,
+                    root.identity.device
+                );
+            }
+            assert!(matches!(
+                visible(&root.dir, "file", &root, &[]),
+                Some((EntryKind::File, _))
+            ));
+            assert!(matches!(
+                visible(&root.dir, "folder", &root, &[]),
+                Some((EntryKind::Directory, _))
+            ));
+            #[cfg(target_os = "linux")]
+            assert!(
+                root.mount.is_some(),
+                "the real statx mount ID must be available"
+            );
+            root.mount = Some(root.mount.map_or(1, |id| id.wrapping_add(1)));
+            assert!(visible(&root.dir, "file", &root, &[]).is_none());
+            assert!(visible(&root.dir, "folder", &root, &[]).is_none());
+        }
+    }
 }
 
 #[cfg(not(unix))]
 mod platform {
     use std::path::Path;
 
-    use super::{Found, Identity, Listing, ReadPolicy, Refusal, RelativePath, RootKind};
-    use super::{SearchPosition, Step};
+    use super::{
+        ContentBudget, Found, Identity, Listing, ReadPolicy, Refusal, RelativePath, RootKind,
+    };
+    use super::{ScanError, SearchPosition, Step};
 
     pub(super) struct BoundRoot {
         pub kind: RootKind,
@@ -948,22 +1126,22 @@ mod platform {
         _components: &[String],
         _protected: &[Identity],
         _file_bytes: u64,
-        _remaining: u64,
+        _budget: ContentBudget,
         _probe: &mut dyn FnMut(Step),
-    ) -> Result<Vec<u8>, Refusal> {
-        Err(Refusal::PlatformUnsupported)
+    ) -> Result<Vec<u8>, ScanError> {
+        Err(Refusal::PlatformUnsupported.into())
     }
 
     pub(super) fn list_beneath(
         _root: &BoundRoot,
-        _components: &[String],
+        _path: &RelativePath,
         _protected: &[Identity],
         _policy: &ReadPolicy,
         _after: Option<&str>,
         _scan: u64,
         _probe: &mut dyn FnMut(Step),
-    ) -> Result<Listing, Refusal> {
-        Err(Refusal::PlatformUnsupported)
+    ) -> Result<Listing, ScanError> {
+        Err(Refusal::PlatformUnsupported.into())
     }
 
     pub(super) fn search_beneath(

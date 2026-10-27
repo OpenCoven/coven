@@ -675,6 +675,282 @@ mod filesystem {
     }
 
     #[test]
+    fn a_search_reports_incomplete_when_content_uses_the_exact_scan_budget() {
+        let scratch = scratch();
+        let file = scratch.path().join("root/docs/guides/a");
+        parent(&file);
+        fs::write(&file, "hit").unwrap();
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            ReadPolicy {
+                scan_bytes: 4,
+                ..R0_READ_POLICY
+            },
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "hit", None))
+            .unwrap()
+            .to_json();
+        assert_eq!(
+            found["matches"],
+            json!([{"path":"docs/guides/a", "line":1, "text":"hit"}])
+        );
+        assert_eq!(found["complete"], false);
+        assert_eq!(
+            reader.serve(&list_request("docs/guides", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+    }
+
+    #[test]
+    fn a_search_charges_bytes_consumed_before_a_growing_file_is_refused() {
+        let scratch = scratch();
+        let directory = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("a"), "x").unwrap();
+        fs::write(directory.join("b"), "hit").unwrap();
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            ReadPolicy {
+                file_bytes: 4,
+                scan_bytes: 7,
+                ..R0_READ_POLICY
+            },
+        );
+        let mut reads = 0;
+        let result = reader
+            .serve_with(&search_request("docs/guides", "hit", None), &mut |step| {
+                if step == Step::Read {
+                    reads += 1;
+                    if reads == 2 {
+                        fs::write(directory.join("a"), "grown").unwrap();
+                    }
+                }
+            })
+            .unwrap()
+            .to_json();
+        assert_eq!(
+            reads, 2,
+            "the directory and growing file were read; no later file was read"
+        );
+        assert_eq!(result["matches"], json!([]));
+        assert_eq!(result["complete"], false);
+        assert_eq!(result["skipped"], 1);
+        let mut probed = false;
+        assert_eq!(
+            reader
+                .serve_with(&list_request("docs/guides", None), &mut |_| probed = true)
+                .err(),
+            Some(Refusal::LimitScan)
+        );
+        assert!(
+            !probed,
+            "the exhausted attempt refuses before filesystem access"
+        );
+    }
+
+    #[test]
+    fn a_growing_search_file_cannot_spend_the_scan_boundary_sentinel() {
+        for scan_bytes in [5, 6] {
+            let scratch = scratch();
+            let directory = scratch.path().join("root/docs/guides");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("a"), "x").unwrap();
+            fs::write(directory.join("b"), "hit").unwrap();
+            let mut reader = reader_with(
+                scratch.path(),
+                &[scope("recursive-read:docs/guides")],
+                ReadPolicy {
+                    file_bytes: 4,
+                    scan_bytes,
+                    ..R0_READ_POLICY
+                },
+            );
+            let mut reads = 0;
+            let found = reader
+                .serve_with(&search_request("docs/guides", "hit", None), &mut |step| {
+                    if step == Step::Read {
+                        reads += 1;
+                        if reads == 2 {
+                            fs::write(directory.join("a"), "grown").unwrap();
+                        }
+                    }
+                })
+                .unwrap()
+                .to_json();
+            assert_eq!(reads, 2);
+            assert_eq!(found["matches"], json!([]));
+            assert_eq!(found["complete"], false);
+            assert_eq!(
+                reader.serve(&list_request("docs/guides", None)).err(),
+                Some(Refusal::LimitScan)
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_listing_spends_the_enumeration_scan_budget() {
+        let scratch = scratch();
+        let large = scratch.path().join("root/docs/guides/large");
+        let small = scratch.path().join("root/docs/guides/small");
+        fs::create_dir_all(&large).unwrap();
+        fs::create_dir_all(&small).unwrap();
+        fs::write(large.join("a.md"), "TODO a").unwrap();
+        fs::write(large.join("b.md"), "TODO b").unwrap();
+        fs::write(small.join("x"), "x").unwrap();
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            ReadPolicy {
+                scan_bytes: 7,
+                ..R0_READ_POLICY
+            },
+        );
+        assert_eq!(
+            reader.serve(&list_request("docs/guides/large", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+        let mut steps = Vec::new();
+        assert_eq!(
+            reader
+                .serve_with(&list_request("docs/guides/small", None), &mut |step| steps
+                    .push(step))
+                .err(),
+            Some(Refusal::LimitScan)
+        );
+        assert!(
+            steps.is_empty(),
+            "an exhausted scan must refuse before filesystem access: {steps:?}"
+        );
+        assert_eq!(
+            content(reader.serve(&read_request("docs/guides/small/x")).unwrap()),
+            "x"
+        );
+    }
+
+    #[test]
+    fn a_partial_search_spends_a_refused_enumeration_scan_budget() {
+        let scratch = scratch();
+        let large = scratch.path().join("root/docs/guides/large");
+        let small = scratch.path().join("root/docs/guides/small");
+        fs::create_dir_all(&large).unwrap();
+        fs::create_dir_all(&small).unwrap();
+        fs::write(large.join("a.md"), "TODO a").unwrap();
+        fs::write(large.join("b.md"), "TODO b").unwrap();
+        fs::write(small.join("x"), "x").unwrap();
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            ReadPolicy {
+                scan_bytes: 7,
+                ..R0_READ_POLICY
+            },
+        );
+        let found = reader
+            .serve(&search_request("docs/guides/large", "TODO", None))
+            .unwrap()
+            .to_json();
+        assert_eq!(found["complete"], false);
+        assert_eq!(found["matches"], json!([]));
+        let mut steps = Vec::new();
+        assert_eq!(
+            reader
+                .serve_with(&list_request("docs/guides/small", None), &mut |step| steps
+                    .push(step))
+                .err(),
+            Some(Refusal::LimitScan)
+        );
+        assert!(
+            steps.is_empty(),
+            "an exhausted scan must refuse before filesystem access: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_search_checks_the_complete_child_path_byte_limit() {
+        let scratch = scratch();
+        let directory = scratch.path().join("root/docs/guides/deep");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(scratch.path().join("root/docs/guides/a.md"), "TODO shallow").unwrap();
+        fs::write(directory.join("a.x"), "TODO at limit").unwrap();
+        fs::write(directory.join("b.md"), "TODO outside path limit").unwrap();
+        let policy = ReadPolicy {
+            path_bytes: 20,
+            ..R0_READ_POLICY
+        };
+        assert_eq!("docs/guides/deep/a.x".len(), policy.path_bytes);
+        assert!("docs/guides/deep/b.md".len() > policy.path_bytes);
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            policy,
+        );
+        assert_eq!(
+            reader.serve(&read_request("docs/guides/deep/b.md")).err(),
+            Some(Refusal::PathLimit)
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .unwrap()
+            .to_json();
+        let paths: Vec<_> = found["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["docs/guides/a.md", "docs/guides/deep/a.x"]);
+        assert_eq!(found["complete"], true);
+    }
+
+    #[test]
+    fn a_listing_omits_children_beyond_the_complete_path_byte_limit() {
+        let scratch = scratch();
+        let directory = scratch.path().join("root/docs/guides/deep");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("a.x"), "at limit").unwrap();
+        fs::write(directory.join("b.md"), "outside path limit").unwrap();
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            ReadPolicy {
+                path_bytes: 20,
+                ..R0_READ_POLICY
+            },
+        );
+        let listed = reader
+            .serve(&list_request("docs/guides/deep", None))
+            .unwrap()
+            .to_json();
+        assert_eq!(listed["entries"], json!([{"name":"a.x", "kind":"file"}]));
+    }
+
+    #[test]
+    fn the_largest_continuation_line_skips_that_file_without_overflow() {
+        let scratch = scratch();
+        let directory = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("a.md"), "TODO before cursor").unwrap();
+        fs::write(directory.join("b.md"), "TODO after cursor").unwrap();
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let found = reader
+            .serve(&search_request(
+                "docs/guides",
+                "TODO",
+                Some(json!({"path":"docs/guides/a.md", "line":u64::MAX})),
+            ))
+            .unwrap()
+            .to_json();
+        assert_eq!(
+            found["matches"],
+            json!([{"path":"docs/guides/b.md", "line":1, "text":"TODO after cursor"}])
+        );
+        assert_eq!(found["complete"], true);
+    }
+
+    #[test]
     fn a_search_discloses_at_most_the_attempt_total() {
         let scratch = scratch();
         let file = scratch.path().join("root/docs/guides/a.md");
