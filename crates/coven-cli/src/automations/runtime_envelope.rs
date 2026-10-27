@@ -351,6 +351,16 @@ mod tests {
     }
 
     #[test]
+    fn the_scoped_read_envelope_stays_unlaunchable() {
+        // The daemon launches what LAUNCHABLE lists from the envelope's
+        // arguments alone. r0-read.2 has no file tools of its own: until the
+        // daemon's launch path calls `trusted_launch::prepare`, listing it
+        // here would launch it without the scoped read service, its grant or
+        // its channel.
+        assert!(!LAUNCHABLE.contains(&&CLAUDE_R0_SCOPED_READ));
+    }
+
+    #[test]
     fn the_adapter_pins_only_the_scoped_read_envelope() {
         assert_eq!(
             for_scoped_grant("claude", &["analysis.read"]),

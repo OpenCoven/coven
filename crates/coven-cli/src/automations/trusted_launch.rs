@@ -261,6 +261,10 @@ pub(crate) mod test_support {
         pub outside: PathBuf,
         pub program: PathBuf,
         _scratch: tempfile::TempDir,
+        // Production validation refuses a declared authority until the
+        // daemon's launch path runs the scoped read service; the fixture's
+        // thread lifts that for as long as it lives.
+        _admitted: crate::automations::definition::DeclaredAuthorityAdmitted,
     }
 
     /// A filesystem scope on the project root.
@@ -306,6 +310,7 @@ pub(crate) mod test_support {
                 outside,
                 program,
                 _scratch: scratch,
+                _admitted: crate::automations::definition::admit_declared_authority_for_test(),
             }
         }
 
@@ -333,22 +338,66 @@ pub(crate) mod test_support {
             self.project.to_str().unwrap().to_owned()
         }
 
-        /// Claims an occurrence of `id` and dispatches it through the runner
-        /// with the production adapter, returning the run id and the launch
-        /// the runtime was handed.
-        pub(crate) fn dispatch(&self, id: &str, occurrence: &str) -> (String, Launched) {
+        /// Plans the latest due slot of `id`'s schedule and claims it for the
+        /// daemon, as the scheduler does: a real `scheduled` occurrence.
+        pub(crate) fn schedule(&self, id: &str) -> String {
+            let conn = &self.home.conn;
             let now = Utc::now()
                 .duration_trunc(TimeDelta::milliseconds(1))
                 .unwrap();
-            assert!(crate::automations::occurrences::insert_claimed_occurrence(
-                &self.home.conn,
-                occurrence,
-                id,
-                "daemon",
-                60,
-                now,
+            // The routine was created a moment ago, so no slot of its daily
+            // schedule is due yet: date its revision two days back, as if it
+            // had been active since, so the latest slot is.
+            let since =
+                (now - TimeDelta::days(2)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            conn.execute(
+                "UPDATE automation_definitions SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
+                rusqlite::params![id, since],
             )
-            .unwrap());
+            .unwrap();
+            let definition: crate::automations::definition::RoutineDefinition =
+                serde_json::from_str(
+                    &conn
+                        .query_row(
+                            "SELECT definition_json FROM automation_definitions WHERE id = ?1",
+                            [id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                crate::automations::occurrences::plan_latest_due_occurrence(
+                    conn,
+                    &definition,
+                    now - TimeDelta::days(2),
+                    now,
+                )
+                .unwrap(),
+                crate::automations::occurrences::PlanOutcome::Planned(_)
+            ));
+            let occurrence =
+                crate::automations::occurrences::claim_due_occurrence(conn, id, "daemon", 60, now)
+                    .unwrap()
+                    .expect("the planned slot is claimed");
+            let kind: String = conn
+                .query_row(
+                    "SELECT kind FROM automation_occurrences WHERE id = ?1",
+                    [&occurrence],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(kind, "scheduled");
+            occurrence
+        }
+
+        /// Runs one daemon dispatch pass with the production adapter.
+        pub(crate) fn dispatch_pass(
+            &self,
+        ) -> (crate::automations::runner::DispatchReport, RecordingRuntime) {
+            let now = Utc::now()
+                .duration_trunc(TimeDelta::milliseconds(1))
+                .unwrap();
             let runtime = RecordingRuntime::default();
             let report = crate::automations::runner::dispatch_claimed_occurrences_with_clock(
                 &self.home.conn,
@@ -357,6 +406,15 @@ pub(crate) mod test_support {
                 || now,
             )
             .unwrap();
+            (report, runtime)
+        }
+
+        /// Schedules and dispatches `id` through the runner with the
+        /// production adapter, returning the run id and the launch the
+        /// runtime was handed.
+        pub(crate) fn dispatch(&self, id: &str) -> (String, Launched) {
+            self.schedule(id);
+            let (report, runtime) = self.dispatch_pass();
             assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
             let launched = runtime.launched.into_inner().unwrap();
             assert_eq!(launched.len(), 1);
@@ -520,7 +578,7 @@ mod tests {
     fn a_launch_reads_only_what_the_signed_decision_grants() {
         let fixture = Fixture::new();
         fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
-        let (_run, launched) = fixture.dispatch("notes", "occurrence.notes-1");
+        let (_run, launched) = fixture.dispatch("notes");
         let prepared = prepare(
             &fixture.home.conn,
             &fixture.launch(&launched),
@@ -572,7 +630,7 @@ mod tests {
             ]),
             "ACTIVE",
         );
-        let (_run, launched) = fixture.dispatch("notes", "occurrence.notes-1");
+        let (_run, launched) = fixture.dispatch("notes");
         let prepared = prepare(
             &fixture.home.conn,
             &fixture.launch(&launched),
@@ -612,7 +670,7 @@ mod tests {
     fn a_launch_cannot_widen_the_signed_scopes() {
         let fixture = Fixture::new();
         fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
-        let (_run, launched) = fixture.dispatch("notes", "occurrence.notes-1");
+        let (_run, launched) = fixture.dispatch("notes");
         let conn = &fixture.home.conn;
 
         // The stored definition is rewritten to grant the sibling after the
@@ -707,7 +765,7 @@ mod tests {
     fn the_launch_takes_the_signed_scopes_over_the_bound_project() {
         let fixture = Fixture::new();
         fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
-        let (_run, launched) = fixture.dispatch("notes", "occurrence.notes-1");
+        let (_run, launched) = fixture.dispatch("notes");
         let (envelope, scopes) =
             launch_scopes(&fixture.home.conn, &fixture.launch(&launched), Utc::now())
                 .expect("the signed scopes");
