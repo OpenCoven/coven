@@ -789,7 +789,7 @@ mod tests {
             (2, "resend", json!("replayed")),
             (2, "launchAfterLease", json!("claimed")),
             (3, "storedAfterExit", json!("retained")),
-            (3, "stops", json!(0)),
+            (3, "stops", json!(1)),
             (4, "launchAfterRestart", json!("owned")),
             (4, "reissue", json!("replayed")),
             (5, "storedAfterExit", json!("other")),

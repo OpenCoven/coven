@@ -167,6 +167,43 @@ fn inspection_reads_real_daemon_records_without_mutating_them() -> anyhow::Resul
         );
     }
     assert_eq!(snapshot()?, before);
+    // A retry the daemon refuses says why in fixed words, and leaves the run,
+    // its attempts and its occurrence as they were.
+    let refused = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args([
+            "automations",
+            "retry",
+            "run-1",
+            "--prior-attempt",
+            "1",
+            "--prior-disposition",
+            "failed",
+            "--json",
+        ])
+        .env("COVEN_HOME", &home)
+        .output()?;
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(refused.stderr)?,
+        "Error: the run is not held for a retry: it needs to be running, with a latest attempt \
+         that failed, timed out or was cancelled, an open deadline, an attempt left, and an active \
+         routine that is not quarantined\n"
+    );
+    let held = |rows: Vec<String>| -> Vec<String> {
+        rows.into_iter()
+            .filter(|row| {
+                [
+                    "automation_runs:",
+                    "automation_attempts:",
+                    "automation_occurrences:",
+                ]
+                .iter()
+                .any(|table| row.starts_with(table))
+            })
+            .collect()
+    };
+    assert_eq!(held(snapshot()?), held(before));
     let raw: String = conn.query_row(
         "SELECT log_json FROM automation_runs WHERE id = 'run-1'",
         [],
@@ -186,6 +223,25 @@ fn inspection_refuses_unavailable_daemon_without_creating_home() {
         vec!["run", "run-1", "--json"],
         vec!["attempts", "run-1", "--json"],
         vec!["explain", "routine-1", "--json"],
+        vec![
+            "retry",
+            "run-1",
+            "--prior-attempt",
+            "1",
+            "--prior-disposition",
+            "failed",
+            "--json",
+        ],
+        vec![
+            "retry",
+            "run-1",
+            "--prior-attempt",
+            "2",
+            "--prior-disposition",
+            "timed_out",
+            "--note",
+            "after the outage",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_coven"))
             .arg("automations")
@@ -219,9 +275,89 @@ fn inspection_help_exposes_reads_without_initializing_state() {
         "run",
         "attempts",
         "explain",
+        "Retry a run held after a failure",
         "conformance",
     ] {
         assert!(help.contains(command), "missing {command}");
     }
+    assert!(!home.exists());
+}
+
+#[test]
+fn retry_refuses_bad_arguments_before_reaching_a_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("missing-home");
+    let long_note = "n".repeat(501);
+    for (args, error) in [
+        (
+            vec!["--prior-attempt", "0", "--prior-disposition", "failed"],
+            "invalid value '0'",
+        ),
+        (
+            vec!["--prior-attempt", "1", "--prior-disposition", "timed-out"],
+            "invalid value 'timed-out'",
+        ),
+        (
+            vec!["--prior-attempt", "1", "--prior-disposition", "ambiguous"],
+            "invalid value 'ambiguous'",
+        ),
+        (vec!["--prior-attempt", "1"], "--prior-disposition"),
+        (
+            vec![
+                "--prior-attempt",
+                "1",
+                "--prior-disposition",
+                "failed",
+                "--note",
+                "",
+            ],
+            "automation retry arguments are invalid",
+        ),
+        (
+            vec![
+                "--prior-attempt",
+                "1",
+                "--prior-disposition",
+                "failed",
+                "--note",
+                "two\nlines",
+            ],
+            "automation retry arguments are invalid",
+        ),
+        (
+            vec![
+                "--prior-attempt",
+                "1",
+                "--prior-disposition",
+                "failed",
+                "--note",
+                &long_note,
+            ],
+            "automation retry arguments are invalid",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_coven"))
+            .args(["automations", "retry", "run-1"])
+            .args(&args)
+            .env("COVEN_HOME", &home)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(error), "{args:?}: {stderr}");
+        assert!(!stderr.contains("owner-local"), "{args:?}: {stderr}");
+        assert!(!home.exists(), "retry created home: {args:?}");
+    }
+    let spaced = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["automations", "retry", "run 1", "--prior-attempt", "1"])
+        .args(["--prior-disposition", "failed"])
+        .env("COVEN_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(spaced.stderr).unwrap(),
+        "Error: automation retry arguments are invalid\n"
+    );
     assert!(!home.exists());
 }
