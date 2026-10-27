@@ -65,6 +65,11 @@ pub(crate) enum AdmissionError {
         admitted: &'static [&'static str],
     },
     KeyMissing,
+    /// `COVEN_HOME` is too long for the channel's socket path.
+    HomeTooLong {
+        bytes: usize,
+        limit: usize,
+    },
     /// The grant or the project folder cannot be served.
     Grant(Refusal),
     Setup(anyhow::Error),
@@ -86,6 +91,10 @@ impl fmt::Display for AdmissionError {
             Self::KeyMissing => write!(
                 f,
                 "Runtime Authority runs need the owner's Anthropic API key; save it with `coven automations api-key set`"
+            ),
+            Self::HomeTooLong { bytes, limit } => write!(
+                f,
+                "the scoped read channel's socket path would be {bytes} bytes, and this platform allows {limit}; use a shorter COVEN_HOME"
             ),
             Self::Grant(refusal) => write!(
                 f,
@@ -204,8 +213,9 @@ pub(in crate::automations) fn prepare(
 }
 
 /// What admission checks that needs no grant: the envelope runs the scoped
-/// read service, the installed harness reports an admitted version, and the
-/// owner's API key is saved. The trusted adapter runs this before it decides
+/// read service, `COVEN_HOME` leaves room for the channel's socket path,
+/// the installed harness reports an admitted version, and the owner's API
+/// key is saved. The trusted adapter runs this before it decides
 /// and consumes a Threads decision, so a refusal here burns none. Returns
 /// the version the harness reported.
 pub(crate) fn preflight(
@@ -214,6 +224,10 @@ pub(crate) fn preflight(
     program: &Path,
 ) -> Result<String, AdmissionError> {
     envelope.service.as_ref().ok_or(AdmissionError::NotScoped)?;
+    let (bytes, limit) = super::channel::socket_path_bytes(coven_home);
+    if bytes > limit {
+        return Err(AdmissionError::HomeTooLong { bytes, limit });
+    }
     let launch = IsolatedLaunch::create(coven_home)?;
     let version = installed_version(program, &launch.home(), VERSION_TIME)?;
     if !envelope.harness_versions.contains(&version.as_str()) {

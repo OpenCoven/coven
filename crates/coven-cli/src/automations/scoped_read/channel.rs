@@ -36,6 +36,8 @@ pub(crate) const RELAY_ARGS: &[&str] = &["automations", "scoped-read-relay"];
 pub(crate) const CHANNEL_ENV: &str = "COVEN_SCOPED_READ_CHANNEL";
 /// The relay's environment: the token it presents first.
 pub(crate) const TOKEN_ENV: &str = "COVEN_SCOPED_READ_TOKEN";
+/// The length of a channel directory's random name, in hex characters.
+const DIRECTORY_HEX: usize = 24;
 /// A channel directory's socket.
 const SOCKET_NAME: &str = "s";
 /// A channel directory's MCP configuration.
@@ -75,7 +77,7 @@ impl Channel {
     ) -> Result<Self> {
         private_directory(runtime)?;
         let (directory, token) = loop {
-            let name = random_hex(12)?;
+            let name = random_hex(DIRECTORY_HEX / 2)?;
             let directory = runtime.join(name);
             match DirBuilder::new().mode(0o700).create(&directory) {
                 Ok(()) => break (directory, random_hex(TOKEN_HEX / 2)?),
@@ -220,6 +222,16 @@ impl Gate for Closing {
         }
         self.inner.commit(committing)
     }
+}
+
+/// The length in bytes of the socket path every channel for `coven_home`
+/// gets, and the most this platform allows. Every channel directory's name
+/// has the same length, so this is exact before a channel opens.
+pub(crate) fn socket_path_bytes(coven_home: &Path) -> (usize, usize) {
+    let socket = runtime_dir(coven_home)
+        .join("0".repeat(DIRECTORY_HEX))
+        .join(SOCKET_NAME);
+    (socket.as_os_str().len(), SOCKET_PATH_BYTES)
 }
 
 /// Where the channels of the daemon in `coven_home` live.

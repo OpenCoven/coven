@@ -361,13 +361,19 @@ pub(crate) mod test_support {
 
     impl Fixture {
         pub(crate) fn new() -> Self {
+            Self::with_home_prefix("cth")
+        }
+
+        /// A fixture whose `COVEN_HOME` is a new folder in `/tmp` named
+        /// from `prefix`.
+        pub(crate) fn with_home_prefix(prefix: &str) -> Self {
             let short = |prefix: &str| {
                 tempfile::Builder::new()
                     .prefix(prefix)
                     .tempdir_in("/tmp")
                     .expect("scratch directory")
             };
-            let home = Home::in_dir(short("cth"));
+            let home = Home::in_dir(short(prefix));
             let scratch = short("ctp");
             let project = scratch.path().join("project");
             let outside = scratch.path().join("outside");
@@ -394,11 +400,16 @@ pub(crate) mod test_support {
         /// Creates routine `id` over the project, as the owner, so its
         /// creation is the owner grant.
         pub(crate) fn create(&self, id: &str, authority: Value, status: &str) {
+            self.create_in(id, authority, status, &self.project_text());
+        }
+
+        /// [`Self::create`] over the folder `cwd`.
+        pub(crate) fn create_in(&self, id: &str, authority: Value, status: &str, cwd: &str) {
             let routine = json!({
                 "schemaVersion": 1, "id": id, "name": id, "status": status,
                 "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
                 "overlap": "forbid", "timeoutMinutes": 30, "runtime": "claude",
-                "familiarId": "sage", "cwd": self.project_text(),
+                "familiarId": "sage", "cwd": cwd,
                 "prompt": "Summarise the notes.", "authority": authority
             });
             let (status, response) = crate::control_plane::route_action_with_authority(
@@ -1129,5 +1140,13 @@ mod tests {
     fn a_runtime_without_authority_support_burns_no_decision() {
         let fixture = Fixture::new();
         refused_before_deciding(&fixture, crate::api::NoopSessionRuntime, "runtime");
+    }
+
+    #[test]
+    fn a_coven_home_too_long_for_the_channel_socket_burns_no_decision() {
+        // The channel's socket path must fit in sun_path: about 56 bytes of
+        // COVEN_HOME on macOS.
+        let fixture = Fixture::with_home_prefix(&format!("cth{}", "x".repeat(60)));
+        refused_before_deciding(&fixture, fixture.runtime(), "long home");
     }
 }
