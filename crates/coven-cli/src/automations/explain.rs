@@ -153,7 +153,10 @@ const MAX_WORK: usize = 20;
 /// running run keyed to it, keeps every other occurrence from being claimed.
 /// Rank 0 lists claimed and running occurrences, rank 3 recovery-required
 /// ones, rank 1 every running run of the routine whose occurrence is not
-/// listed by those two. Rank 2 is what a pass claims from: the eligible
+/// listed by those two. A rank 1 run is named only as a retry: the pass
+/// reaches the rest through their occurrence, which is another routine's,
+/// settled, planned or missing, as the contract describes. Rank 2 is what a
+/// pass claims from: the eligible
 /// queue, read through the scheduler's own statement, and the due slot the
 /// pass plans first. Misfire supersession then skips every planned, due
 /// occurrence of the routine without a running run that is earlier than its

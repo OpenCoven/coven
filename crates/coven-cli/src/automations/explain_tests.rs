@@ -5932,3 +5932,707 @@ fn each_expired_cancellation_names_what_reconciliation_does_with_it() {
         .collect();
     assert_eq!(seen, expected);
 }
+
+/// A running run keyed to the routine whose occurrence is not one of the
+/// routine's claimed, running or recovery-required ones: another routine's
+/// occurrence, one of its own that is planned or settled, or no row at all.
+struct StrayShape {
+    name: &'static str,
+    /// The run's occurrence: its routine and its state.
+    occurrence: (&'static str, &'static str),
+    lease: Option<&'static str>,
+    deadline: Option<&'static str>,
+    /// The run's session status; `None` for a run with no session.
+    session: Option<&'static str>,
+    exit_code: Option<i64>,
+    /// (number, state, carries the run's session)
+    attempts: &'static [(i64, &'static str, bool)],
+    authority: bool,
+    /// SQL run against the store before explaining, to add or corrupt rows.
+    extra: &'static [&'static str],
+    code: WorkCode,
+    next_step: NextStep,
+    /// The run's status, its occurrence's state and, when it has one, its
+    /// cancellation's state after the daemon's reconciliation at 10:00 with a
+    /// runtime that confirms the kill, and with one that never does; `None`
+    /// when that pass fails.
+    after: [Option<&'static str>; 2],
+}
+
+/// A run whose session has finished, on another routine's claimed occurrence.
+const STRAY: StrayShape = StrayShape {
+    name: "finished-on-other-claimed",
+    occurrence: ("other", "claimed"),
+    lease: Some("2099-01-01T00:00:00.000Z"),
+    deadline: None,
+    session: Some("failed"),
+    exit_code: Some(1),
+    attempts: &[(1, "started", true)],
+    authority: false,
+    extra: &[],
+    code: WorkCode::RunningRun,
+    next_step: NextStep::InspectRun,
+    after: [Some("failed/failed"), Some("failed/failed")],
+};
+
+/// Deletes the run's occurrence, leaving its id dangling.
+const GONE_OCCURRENCE: &str = "
+    PRAGMA foreign_keys = OFF;
+    DELETE FROM automation_occurrences WHERE id = 'o-late';
+    PRAGMA foreign_keys = ON;";
+
+fn stray_store(shape: &StrayShape) -> (tempfile::TempDir, Connection) {
+    let (temp, conn) = store();
+    for id in ["daily", "other"] {
+        insert_definition_at(&conn, &definition(id, "PAUSED"), "2026-10-01T00:00:00.000Z").unwrap();
+    }
+    let (routine, state) = shape.occurrence;
+    conn.execute(
+        "INSERT INTO automation_occurrences
+            (id, automation_id, scheduled_for, kind, state, attempt, lease_owner,
+             lease_expires_at, created_at, updated_at)
+         VALUES ('o-late', ?1, '2026-10-21T09:00:00.000Z', 'manual', ?2, 1,
+                 'operator', ?3, '2026-10-21T09:00:00.000Z', '2026-10-21T09:00:00.000Z')",
+        rusqlite::params![routine, state, shape.lease],
+    )
+    .unwrap();
+    if let Some(status) = shape.session {
+        session(&conn, "s-late", status);
+        conn.execute(
+            "UPDATE sessions SET exit_code = ?1 WHERE id = 's-late'",
+            [shape.exit_code],
+        )
+        .unwrap();
+    }
+    run_keyed(
+        &conn,
+        "r-late",
+        "daily",
+        Some("o-late"),
+        "running",
+        shape.authority,
+    );
+    conn.execute(
+        "UPDATE automation_runs
+         SET timeout_at = ?1, session_id = CASE WHEN ?2 THEN 's-late' END
+         WHERE id = 'r-late'",
+        rusqlite::params![shape.deadline, shape.session.is_some()],
+    )
+    .unwrap();
+    // Ids that do not sort like attempt numbers. A settled attempt carries
+    // its settlement time from the insert: terminal attempts are immutable.
+    for (number, state, carries) in shape.attempts {
+        let live = matches!(*state, "dispatching" | "started" | "observing");
+        conn.execute(
+            "INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, prior_attempt_number,
+                 prior_disposition, retry_classification, not_before, session_id,
+                 state_reason, opened_at, settled_at)
+             VALUES (?1, 'r-late', 'o-late', ?2, 'PRIVATE-' || ?1, 1, ?3,
+                     CASE WHEN ?2 > 1 THEN ?2 - 1 END, CASE WHEN ?2 > 1 THEN 'failed' END,
+                     CASE WHEN ?2 > 1 THEN 'automatic_retry' ELSE 'initial' END,
+                     '2026-10-21T09:00:00.000Z', CASE WHEN ?4 THEN 's-late' END,
+                     'PRIVATE-REASON', '2026-10-21T09:00:00.000Z',
+                     CASE WHEN NOT ?5 THEN '2026-10-22T09:20:00.000Z' END)",
+            rusqlite::params![
+                format!("a-late-{}", 20 - number),
+                number,
+                state,
+                carries,
+                live
+            ],
+        )
+        .unwrap();
+    }
+    for sql in shape.extra {
+        conn.execute_batch(sql).unwrap();
+    }
+    (temp, conn)
+}
+
+/// The run's status, its occurrence's state and, when it has one, its
+/// cancellation's state after the daemon's reconciliation at 10:00 with
+/// `runtime`, or `None` when the pass fails. A stop is claimed at the pass's
+/// own instant.
+fn stray_after_pass(
+    temp: &tempfile::TempDir,
+    conn: &Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+) -> Option<String> {
+    crate::automations::cancellation::set_stop_fence_clock_test_hook(Some(Box::new(now)));
+    let passed = crate::automations::daemon_tick::reconcile_automation_runs(
+        temp.path(),
+        conn,
+        runtime,
+        now(),
+        None,
+    );
+    crate::automations::cancellation::set_stop_fence_clock_test_hook(None);
+    passed.ok().map(|()| {
+        let run: String = conn
+            .query_row(
+                "SELECT status FROM automation_runs WHERE id = 'r-late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let occurrence: Option<String> = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'o-late'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        let cancellation: Option<String> = conn
+            .query_row(
+                "SELECT state FROM automation_cancellations WHERE run_id = 'r-late'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        let mut after = format!("{run}/{}", occurrence.as_deref().unwrap_or("none"));
+        if let Some(cancellation) = cancellation {
+            after.push('/');
+            after.push_str(&cancellation);
+        }
+        after
+    })
+}
+
+/// What the daemon's reconciliation does with a running run whose occurrence
+/// is not one the routine's pass settles, one store per shape and runtime so
+/// that a failing pass hides nothing. Such a run is listed as `running_run`,
+/// with the retry on a planned occurrence named instead; each shape gives
+/// the run's status and its occurrence's state after each pass.
+#[test]
+fn each_running_run_names_what_reconciliation_does_with_it() {
+    let fails = [None, None];
+    let shapes = [
+        // Settlement settles a run on another routine's live occurrence with
+        // that occurrence, and a run on a settled occurrence alone when its
+        // session gives the occurrence's own state; it fails otherwise.
+        STRAY,
+        StrayShape {
+            name: "finished-on-other-running",
+            occurrence: ("other", "running"),
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-on-other-recovery",
+            occurrence: ("other", "recovery_required"),
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-on-other-planned",
+            occurrence: ("other", "planned"),
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-on-other-failed",
+            occurrence: ("other", "failed"),
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-on-own-planned",
+            occurrence: ("daily", "planned"),
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-on-own-failed",
+            occurrence: ("daily", "failed"),
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-on-own-succeeded",
+            occurrence: ("daily", "succeeded"),
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-on-own-cancelled",
+            occurrence: ("daily", "cancelled"),
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "succeeded-on-own-succeeded",
+            occurrence: ("daily", "succeeded"),
+            session: Some("completed"),
+            exit_code: Some(0),
+            after: [Some("succeeded/succeeded"), Some("succeeded/succeeded")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "succeeded-on-own-failed",
+            occurrence: ("daily", "failed"),
+            session: Some("completed"),
+            exit_code: Some(0),
+            after: fails,
+            ..STRAY
+        },
+        // A session that ended at or after the run's deadline is timed out,
+        // and settles `failed` whatever its exit code.
+        StrayShape {
+            name: "succeeded-late-on-own-succeeded",
+            occurrence: ("daily", "succeeded"),
+            deadline: Some("2026-10-21T08:00:00.000Z"),
+            session: Some("completed"),
+            exit_code: Some(0),
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "succeeded-late-on-own-failed",
+            occurrence: ("daily", "failed"),
+            deadline: Some("2026-10-21T08:00:00.000Z"),
+            session: Some("completed"),
+            exit_code: Some(0),
+            ..STRAY
+        },
+        StrayShape {
+            name: "cancelled-session-on-own-cancelled",
+            occurrence: ("daily", "cancelled"),
+            session: Some("cancelled"),
+            exit_code: None,
+            after: [Some("cancelled/cancelled"), Some("cancelled/cancelled")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-on-missing",
+            occurrence: ("daily", "failed"),
+            extra: &[GONE_OCCURRENCE],
+            after: fails,
+            ..STRAY
+        },
+        // A plain failure before the run's deadline is held for an operator
+        // retry without touching the occurrence; at the deadline, settling
+        // the held run fails the pass.
+        StrayShape {
+            name: "finished-held-on-own-failed",
+            occurrence: ("daily", "failed"),
+            deadline: Some("2099-01-01T00:00:00.000Z"),
+            after: [Some("running/failed"), Some("running/failed")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "finished-held-on-other-planned",
+            occurrence: ("other", "planned"),
+            deadline: Some("2099-01-01T00:00:00.000Z"),
+            after: [Some("running/planned"), Some("running/planned")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "held-on-other-claimed",
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "failed", false)],
+            ..STRAY
+        },
+        StrayShape {
+            name: "held-on-own-failed",
+            occurrence: ("daily", "failed"),
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "failed", false)],
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "held-on-own-planned",
+            occurrence: ("daily", "planned"),
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "failed", false)],
+            after: fails,
+            ..STRAY
+        },
+        // An ambiguous attempt settles from its own settlement time.
+        StrayShape {
+            name: "ambiguous-finished-on-own-failed",
+            occurrence: ("daily", "failed"),
+            attempts: &[(1, "ambiguous", true)],
+            ..STRAY
+        },
+        // A Runtime Authority run is held for recovery, which needs a
+        // claimed, running or recovery-required occurrence.
+        StrayShape {
+            name: "authority-finished-on-other-claimed",
+            authority: true,
+            after: [
+                Some("running/recovery_required"),
+                Some("running/recovery_required"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "authority-finished-on-own-failed",
+            occurrence: ("daily", "failed"),
+            authority: true,
+            after: fails,
+            ..STRAY
+        },
+        // Settlement skips a fenced run whose attempt is live; its own
+        // expired timeout stop holds the run for recovery, which needs a
+        // claimed, running or recovery-required occurrence.
+        StrayShape {
+            name: "fenced-finished-on-own-failed",
+            occurrence: ("daily", "failed"),
+            extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+            after: [Some("running/failed"), Some("running/failed")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "expired-fence-finished-on-own-failed",
+            occurrence: ("daily", "failed"),
+            extra: &[late_fence!("timeout", "2026-10-22T09:30:00.000Z")],
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "expired-fence-finished-on-other-claimed",
+            extra: &[late_fence!("timeout", "2026-10-22T09:30:00.000Z")],
+            after: [
+                Some("running/recovery_required"),
+                Some("running/recovery_required"),
+            ],
+            ..STRAY
+        },
+        // Timeout enforcement stops a run past its deadline on another
+        // routine's claimed or running occurrence, and no other.
+        StrayShape {
+            name: "timeout-on-other-claimed",
+            session: Some("running"),
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            after: [Some("failed/failed"), Some("running/recovery_required")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "timeout-on-other-running",
+            occurrence: ("other", "running"),
+            session: Some("running"),
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            after: [Some("failed/failed"), Some("running/recovery_required")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "timeout-on-other-recovery",
+            occurrence: ("other", "recovery_required"),
+            session: Some("running"),
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            after: [
+                Some("running/recovery_required"),
+                Some("running/recovery_required"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "timeout-on-own-planned",
+            occurrence: ("daily", "planned"),
+            session: Some("running"),
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            after: [Some("running/planned"), Some("running/planned")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "timeout-on-own-failed",
+            occurrence: ("daily", "failed"),
+            session: Some("running"),
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            after: [Some("running/failed"), Some("running/failed")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "timeout-on-missing",
+            session: Some("running"),
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            extra: &[GONE_OCCURRENCE],
+            after: [Some("running/none"), Some("running/none")],
+            ..STRAY
+        },
+        // Abandoned-launch recovery stops a launch past its lease on another
+        // routine's claimed occurrence, and no other.
+        StrayShape {
+            name: "abandoned-on-other-claimed",
+            lease: Some("2026-10-22T09:00:00.000Z"),
+            session: Some("created"),
+            exit_code: None,
+            attempts: &[(1, "dispatching", true)],
+            after: [Some("failed/failed"), Some("running/recovery_required")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "abandoned-on-own-failed",
+            occurrence: ("daily", "failed"),
+            lease: Some("2026-10-22T09:00:00.000Z"),
+            session: Some("created"),
+            exit_code: None,
+            attempts: &[(1, "dispatching", true)],
+            after: [Some("running/failed"), Some("running/failed")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "abandoned-on-own-planned",
+            occurrence: ("daily", "planned"),
+            lease: Some("2026-10-22T09:00:00.000Z"),
+            session: Some("created"),
+            exit_code: None,
+            attempts: &[(1, "dispatching", true)],
+            after: [Some("running/planned"), Some("running/planned")],
+            ..STRAY
+        },
+        // Cancellation reconciliation takes an expired cancellation of any
+        // run. The stop a requested one claims needs a claimed or running
+        // occurrence, so it is refused and the cancellation left requested;
+        // holding the run for a stopping one needs a claimed, running or
+        // recovery-required occurrence, and fails the pass otherwise.
+        StrayShape {
+            name: "cancelled-on-other-claimed",
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("requested")],
+            after: [
+                Some("cancelled/cancelled/cancelled"),
+                Some("running/recovery_required/recovery_required"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "cancelled-on-other-recovery",
+            occurrence: ("other", "recovery_required"),
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("requested")],
+            after: [
+                Some("running/recovery_required/requested"),
+                Some("running/recovery_required/requested"),
+            ],
+            ..STRAY
+        },
+        // A requested cancellation of a run past its deadline is rejected
+        // first, and timeout enforcement then stops the run where it can.
+        StrayShape {
+            name: "cancelled-past-deadline-on-other-claimed",
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("requested")],
+            after: [
+                Some("failed/failed/rejected"),
+                Some("running/recovery_required/rejected"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "cancelled-past-deadline-on-own-failed",
+            occurrence: ("daily", "failed"),
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("requested")],
+            after: [
+                Some("running/failed/rejected"),
+                Some("running/failed/rejected"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "cancelled-on-own-planned",
+            occurrence: ("daily", "planned"),
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("requested")],
+            after: [
+                Some("running/planned/requested"),
+                Some("running/planned/requested"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "cancelled-on-own-failed",
+            occurrence: ("daily", "failed"),
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("requested")],
+            after: [
+                Some("running/failed/requested"),
+                Some("running/failed/requested"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "cancelled-on-missing",
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("requested"), GONE_OCCURRENCE],
+            after: [
+                Some("running/none/requested"),
+                Some("running/none/requested"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "stopping-on-other-claimed",
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("stopping"), CANCELLATION_FENCE],
+            after: [
+                Some("running/recovery_required/recovery_required"),
+                Some("running/recovery_required/recovery_required"),
+            ],
+            ..STRAY
+        },
+        StrayShape {
+            name: "stopping-on-own-failed",
+            occurrence: ("daily", "failed"),
+            session: Some("running"),
+            exit_code: None,
+            extra: &[expired_cancellation!("stopping"), CANCELLATION_FENCE],
+            after: fails,
+            ..STRAY
+        },
+        // An expired retry is named on a planned occurrence of any routine.
+        // Timeout enforcement settles it on a planned or claimed one, and
+        // fails the pass on any other.
+        StrayShape {
+            name: "retry-on-own-planned",
+            occurrence: ("daily", "planned"),
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "adopted", false)],
+            code: WorkCode::RetryExpired,
+            next_step: NextStep::AwaitSettlement,
+            ..STRAY
+        },
+        StrayShape {
+            name: "retry-on-other-planned",
+            occurrence: ("other", "planned"),
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "adopted", false)],
+            code: WorkCode::RetryExpired,
+            next_step: NextStep::AwaitSettlement,
+            ..STRAY
+        },
+        StrayShape {
+            name: "retry-on-other-claimed",
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "adopted", false)],
+            ..STRAY
+        },
+        StrayShape {
+            name: "retry-on-own-failed",
+            occurrence: ("daily", "failed"),
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "adopted", false)],
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "retry-on-other-running",
+            occurrence: ("other", "running"),
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "adopted", false)],
+            after: fails,
+            ..STRAY
+        },
+        StrayShape {
+            name: "retry-on-missing",
+            session: None,
+            exit_code: None,
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            attempts: &[(1, "adopted", false)],
+            extra: &[GONE_OCCURRENCE],
+            after: fails,
+            ..STRAY
+        },
+        // A run no pass acts on stays as it is.
+        StrayShape {
+            name: "live-on-own-failed",
+            occurrence: ("daily", "failed"),
+            session: Some("running"),
+            exit_code: None,
+            after: [Some("running/failed"), Some("running/failed")],
+            ..STRAY
+        },
+        StrayShape {
+            name: "live-on-other-claimed",
+            session: Some("running"),
+            exit_code: None,
+            after: [Some("running/claimed"), Some("running/claimed")],
+            ..STRAY
+        },
+    ];
+    let mut seen = Vec::new();
+    for shape in &shapes {
+        let (temp, conn) = stray_store(shape);
+        let item = found(&conn, "daily").work.into_iter().next().unwrap();
+        assert!(item.holds_claims, "{}", shape.name);
+        // TEMP tables cannot change what the run reads as.
+        let explained = work_of(&conn, "daily");
+        conn.execute_batch(
+            "CREATE TEMP TABLE automation_occurrences AS
+                 SELECT * FROM main.automation_occurrences;
+             UPDATE temp.automation_occurrences SET automation_id = 'daily',
+                 state = CASE state WHEN 'planned' THEN 'claimed' ELSE 'planned' END;
+             INSERT INTO temp.automation_occurrences (id, automation_id, state)
+                 VALUES ('o-late', 'daily', 'claimed');
+             CREATE TEMP TABLE automation_attempts AS SELECT * FROM main.automation_attempts;
+             UPDATE temp.automation_attempts SET id = 'shadow-' || id,
+                 state = CASE state WHEN 'adopted' THEN 'started' ELSE 'adopted' END;
+             CREATE TEMP TABLE automation_runs AS SELECT * FROM main.automation_runs;
+             UPDATE temp.automation_runs SET timeout_at = '2026-10-22T09:00:00.000Z',
+                 session_id = CASE WHEN session_id IS NULL THEN 's-late' END;
+             INSERT INTO temp.automation_runs (id, automation_id, occurrence_id, status)
+                 VALUES ('r-shadow', 'daily', 'o-shadow', 'running');",
+        )
+        .unwrap();
+        assert_eq!(work_of(&conn, "daily"), explained, "{}", shape.name);
+        // The explained store, its shadows gone, takes the first pass.
+        conn.execute_batch(
+            "DROP TABLE temp.automation_occurrences;
+             DROP TABLE temp.automation_attempts;
+             DROP TABLE temp.automation_runs;",
+        )
+        .unwrap();
+        let (never_temp, never_conn) = stray_store(shape);
+        let after = [
+            stray_after_pass(&temp, &conn, &ConfirmedKill),
+            stray_after_pass(&never_temp, &never_conn, &UnconfirmedKill),
+        ];
+        seen.push((shape.name, item.code, item.next_step, after));
+    }
+    let expected: Vec<_> = shapes
+        .iter()
+        .map(|shape| {
+            (
+                shape.name,
+                shape.code,
+                shape.next_step,
+                shape.after.map(|state| state.map(str::to_string)),
+            )
+        })
+        .collect();
+    assert_eq!(seen, expected);
+}
