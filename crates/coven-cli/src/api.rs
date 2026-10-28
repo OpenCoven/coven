@@ -63,6 +63,7 @@ struct DirectApplyPauseState {
     reached: bool,
     released: bool,
     watchdog_expired: bool,
+    fail_audit_directory_sync: bool,
 }
 
 #[cfg(test)]
@@ -136,6 +137,10 @@ impl DirectApplyPauseGuard {
 
     fn release(&self) {
         self.pause.release();
+    }
+
+    fn fail_audit_directory_sync(&self) {
+        self.pause.state.lock().unwrap().fail_audit_directory_sync = true;
     }
 }
 
@@ -348,6 +353,9 @@ fn maybe_pause_direct_apply_before_audit(coven_home: &Path, familiar_id: &str) {
             pause.changed.notify_all();
             return;
         }
+    }
+    if state.fail_audit_directory_sync {
+        crate::durable_fs::fail_next_directory_sync();
     }
 }
 
