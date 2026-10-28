@@ -92,9 +92,10 @@ and so is a run whose session has finished, which the next pass settles or
 holds, is still running past its deadline, or has not started when its claim's
 lease expires, both of which the next pass stops, and so is a run whose
 cancellation was left unfinished past its execution lease, which the next pass
-finishes. Other runs a pass acts on before claiming, such as other runs past
-their deadline or lease, are not named yet (#1523). Principal-scoped reads and
-the remaining operator surface are still tracked by #858.
+finishes. Any other running run whose occurrence is not one of the routine's
+live ones stays `running_run`, whatever the next pass does with it; the
+contract says what that is. Principal-scoped reads and the remaining operator
+surface are still tracked by #858.
 
 `coven automations retry` is the one write command under `coven automations`.
 It retries a run held after a failure, before its deadline; see
