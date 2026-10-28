@@ -1041,12 +1041,12 @@ mod tests {
 
     fn test_device(id: Uuid) -> DeviceRecord {
         let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         DeviceRecord {
             id,
             display_name: "Synthetic phone".to_owned(),
             public_key_x963: URL_SAFE_NO_PAD
-                .encode(signing_key.public_key().to_encoded_point(false).as_bytes()),
+                .encode(signing_key.public_key().to_sec1_point(false).as_bytes()),
             paired_at: Utc::now(),
             revoked_at: None,
             suspended_at: None,
@@ -1080,13 +1080,13 @@ mod tests {
             let public_key_x963 = URL_SAFE_NO_PAD.encode(
                 possession_key
                     .verifying_key()
-                    .to_encoded_point(false)
+                    .to_sec1_point(false)
                     .as_bytes(),
             );
             let authorization_public_key = URL_SAFE_NO_PAD.encode(
                 authorization_key
                     .verifying_key()
-                    .to_encoded_point(false)
+                    .to_sec1_point(false)
                     .as_bytes(),
             );
             let record = DeviceRecord {

@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePrivateKey;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls_pki_types::{pem::PemObject, CertificateDer};
@@ -141,7 +141,7 @@ fn load_key_pair(path: &Path) -> Result<KeyPair> {
 fn fingerprint_for_private_key(private_key_der: &[u8]) -> Result<[u8; 32]> {
     let secret_key = p256::SecretKey::from_pkcs8_der(private_key_der)
         .context("mobile host key is not a valid P-256 PKCS#8 key")?;
-    let encoded = secret_key.public_key().to_encoded_point(false);
+    let encoded = secret_key.public_key().to_sec1_point(false);
     let digest = Sha256::digest(encoded.as_bytes());
     Ok(digest.into())
 }

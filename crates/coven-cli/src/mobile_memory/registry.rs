@@ -1494,7 +1494,7 @@ mod tests {
 
     use super::super::assurance::AssuranceClass;
     use super::*;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
 
     fn device(id: Uuid, name: &str) -> DeviceRecord {
         let mut scalar = [1_u8; 32];
@@ -1506,7 +1506,7 @@ mod tests {
             id,
             display_name: name.to_owned(),
             public_key_x963: URL_SAFE_NO_PAD
-                .encode(signing_key.public_key().to_encoded_point(false).as_bytes()),
+                .encode(signing_key.public_key().to_sec1_point(false).as_bytes()),
             paired_at: Utc::now(),
             revoked_at: None,
             suspended_at: None,
