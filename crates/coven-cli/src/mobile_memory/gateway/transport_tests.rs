@@ -575,3 +575,207 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
         }
     }
 }
+
+/// Two persistent synthetic peers through the production relay router: a
+/// device that misses a rendezvous slot (or runs a clock skewed across a slot
+/// boundary) is never paired and recovers by rejoining the current slot
+/// without re-enrollment; a grant rotation or revocation closes the live
+/// session and blocks reconnection with the stale material; re-provisioned
+/// material reconnects; a daemon restart keeps identity and material; and the
+/// relay's TLS-terminated capture holds no plaintext or stable identifier.
+#[test]
+fn relay_runtime_recovers_a_missed_slot_and_closes_rotated_or_revoked_sessions() {
+    let _guard = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    use super::super::grant::{AssuranceLevel, DeviceGrantRestrictions};
+    use super::super::transport::test_support::{assert_bytes_exclude, stable_identifier_markers};
+    use super::super::transport::{self, test_support::Relay, websocket};
+    let fixture = Fixture::new();
+    let relay = Relay::start();
+    super::super::config::save_mobile_config(
+        &fixture.state.coven_home,
+        &MobileGatewayConfig {
+            enabled: false,
+            bind: "192.168.50.1:7443".parse().unwrap(),
+            advertised_endpoint: "https://192.168.50.1:7443".into(),
+        },
+    )
+    .unwrap();
+    storage::RelayConfig {
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(&fixture.state.coven_home)
+    .unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let device_id = fixture.pairing.device_id;
+    let identity_path = fixture.state.coven_home.join("mobile/host-identity.json");
+    let identity_before = std::fs::read(&identity_path).unwrap();
+    let registry_path = fixture.state.coven_home.join("mobile/devices.json");
+    let current_slot = || u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+    let attempt = |provisioning: &storage::Provisioning, pairing: &Pairing, slot: u64| {
+        let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+        relay
+            .connect(websocket::Role::Client, &room, &credential)
+            .and_then(|records| {
+                transport::connect(
+                    records,
+                    pairing,
+                    &provisioning.binding_signature,
+                    &fixture.device,
+                    &room,
+                    false,
+                )
+            })
+    };
+    let connect_current = |provisioning: &storage::Provisioning, pairing: &Pairing| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match attempt(provisioning, pairing, current_slot()) {
+                Ok(channel) => break channel,
+                Err(error) => {
+                    assert!(Instant::now() < deadline, "relay connect failed: {error}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    };
+    let exchange = |channel: &mut transport::Channel<websocket::WebSocketRecords>| {
+        let wire = fixture.request("GET", "/api/v1/mobile/device", device_id);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        channel
+            .send_message(&wire, MAX_MOBILE_REQUEST_BYTES, deadline)
+            .and_then(|()| channel.receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline))
+    };
+
+    let material = storage::load_existing(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        signer.verifying_key(),
+        device_id,
+    )
+    .unwrap()
+    .unwrap();
+    let provisioning = material.provisioning(&signer).unwrap();
+    let pairing = material.pairing.clone();
+    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+        .unwrap()
+        .unwrap();
+
+    // Missed slot / clock skew across a slot boundary: the previous and next
+    // rooms hold no host, so the relay closes the attempt before any Noise
+    // response. The failure is bounded and leaves durable authority untouched.
+    let registry_before = std::fs::read(&registry_path).unwrap();
+    for skewed in [current_slot() - 1, current_slot() + 1] {
+        let started = Instant::now();
+        assert!(attempt(&provisioning, &pairing, skewed).is_err());
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+    assert_eq!(std::fs::read(&registry_path).unwrap(), registry_before);
+    let mut channel = connect_current(&provisioning, &pairing);
+    assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
+
+    // Grant rotation mid-session: the live channel fails on its next request,
+    // the stale material cannot reconnect, and only re-provisioned material
+    // (obtained over the existing authenticated bootstrap path) reconnects.
+    let record = fixture
+        .state
+        .registry
+        .authorization_record(device_id)
+        .unwrap()
+        .unwrap();
+    let rotated = record
+        .grant
+        .reissue(
+            &record.device.public_key_x963,
+            record.grant.scopes.clone(),
+            DeviceGrantRestrictions::default(),
+            AssuranceLevel::Possession,
+            Utc::now(),
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .unwrap();
+    fixture
+        .state
+        .registry
+        .replace_grant(device_id, rotated)
+        .unwrap();
+    assert!(
+        exchange(&mut channel).is_err(),
+        "rotated grant served a request"
+    );
+    let started = Instant::now();
+    assert!(attempt(&provisioning, &pairing, current_slot()).is_err());
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let rotated_material = storage::load_or_provision(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &signer,
+        device_id,
+    )
+    .unwrap();
+    assert_ne!(rotated_material.pairing.noise_key, pairing.noise_key);
+    let rotated_provisioning = rotated_material.provisioning(&signer).unwrap();
+    let rotated_pairing = rotated_material.pairing.clone();
+    assert_ne!(
+        rotated_provisioning
+            .rendezvous(current_slot(), false)
+            .unwrap()
+            .0,
+        provisioning.rendezvous(current_slot(), false).unwrap().0
+    );
+    let mut channel = connect_current(&rotated_provisioning, &rotated_pairing);
+    assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
+
+    // Restart: the same material reconnects; no identity or material changes.
+    let started = Instant::now();
+    drop(runtime);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(exchange(&mut channel).is_err());
+    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+        .unwrap()
+        .unwrap();
+    let mut channel = connect_current(&rotated_provisioning, &rotated_pairing);
+    assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
+    assert_eq!(std::fs::read(&identity_path).unwrap(), identity_before);
+    let reloaded = storage::load_existing(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        signer.verifying_key(),
+        device_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(reloaded.pairing.noise_key, rotated_pairing.noise_key);
+
+    // Revocation mid-session: the request fails and reconnection is refused.
+    fixture
+        .state
+        .registry
+        .revoke(device_id, Utc::now())
+        .unwrap();
+    assert!(
+        exchange(&mut channel).is_err(),
+        "revoked device served a request"
+    );
+    let started = Instant::now();
+    assert!(attempt(&rotated_provisioning, &rotated_pairing, current_slot()).is_err());
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let started = Instant::now();
+    drop(runtime);
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let captured = relay.captured();
+    assert!(captured
+        .windows(b"room=".len())
+        .any(|part| part == b"room="));
+    let mut markers = stable_identifier_markers(&pairing);
+    markers.extend(stable_identifier_markers(&rotated_pairing));
+    markers.push(("request path", b"/api/v1/mobile/device".to_vec()));
+    markers.push(("request header", b"x-coven-device".to_vec()));
+    markers.push(("response status", b"HTTP/1.1 200".to_vec()));
+    markers.push(("completion plaintext", b"host-finished-v1".to_vec()));
+    assert_bytes_exclude(&captured, &markers);
+}
