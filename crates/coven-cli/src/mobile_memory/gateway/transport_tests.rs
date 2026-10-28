@@ -30,7 +30,7 @@ impl Fixture {
         let id = Uuid::new_v4();
         let now = Utc::now();
         let public_key =
-            URL_SAFE_NO_PAD.encode(device.verifying_key().to_encoded_point(false).as_bytes());
+            URL_SAFE_NO_PAD.encode(device.verifying_key().to_sec1_point(false).as_bytes());
         let record = DeviceRecord {
             id,
             display_name: "Synthetic peer".into(),

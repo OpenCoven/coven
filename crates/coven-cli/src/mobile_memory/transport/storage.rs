@@ -155,13 +155,13 @@ impl Material {
             host_key: self
                 .pairing
                 .host_key
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec(),
             device_key: self
                 .pairing
                 .device_key
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec(),
             noise_public: self.pairing.noise_key,
@@ -195,8 +195,8 @@ impl Provisioning {
             "provisioning device mismatch"
         );
         ensure!(
-            self.host_key == pinned_host.to_encoded_point(false).as_bytes()
-                && self.device_key == device.to_encoded_point(false).as_bytes(),
+            self.host_key == pinned_host.to_sec1_point(false).as_bytes()
+                && self.device_key == device.to_sec1_point(false).as_bytes(),
             "provisioning identity mismatch"
         );
         RelayConfig {
@@ -240,7 +240,7 @@ pub fn load_or_provision(
     let device_key = URL_SAFE_NO_PAD.decode(&record.device.public_key_x963)?;
     let host_key = host
         .verifying_key()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .to_vec();
     let path = directory.join(format!("transport-{device_id}.json"));
@@ -333,7 +333,7 @@ pub fn load_existing(
         "invalid transport state"
     );
     ensure!(
-        stored.host_key == host.to_encoded_point(false).as_bytes(),
+        stored.host_key == host.to_sec1_point(false).as_bytes(),
         "transport host identity changed"
     );
     validate_keypair(&stored)?;

@@ -32,7 +32,7 @@ pub fn check_current(
         .decode(&current.device.public_key_x963)
         .context("invalid stored device key")?;
     ensure!(
-        key == pairing.device_key.to_encoded_point(false).as_bytes(),
+        key == pairing.device_key.to_sec1_point(false).as_bytes(),
         "device key changed"
     );
     current

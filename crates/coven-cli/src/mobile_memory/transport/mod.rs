@@ -71,8 +71,8 @@ impl Pairing {
             bytes(self.device_id.as_bytes()),
             bytes(self.grant_id.as_bytes()),
             Value::Integer(self.revocation_epoch.into()),
-            bytes(self.host_key.to_encoded_point(false).as_bytes()),
-            bytes(self.device_key.to_encoded_point(false).as_bytes()),
+            bytes(self.host_key.to_sec1_point(false).as_bytes()),
+            bytes(self.device_key.to_sec1_point(false).as_bytes()),
             bytes(&self.noise_key),
         ]
     }

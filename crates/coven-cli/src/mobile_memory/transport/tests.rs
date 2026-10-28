@@ -28,11 +28,11 @@ fn signed_preimages_match_independent_cbor_vectors() {
         noise_key: std::array::from_fn(|index| index as u8),
     };
     assert_eq!(
-        hex(pairing.host_key.to_encoded_point(false).as_bytes()),
+        hex(pairing.host_key.to_sec1_point(false).as_bytes()),
         vectors["hostPublic"].as_str().unwrap()
     );
     assert_eq!(
-        hex(pairing.device_key.to_encoded_point(false).as_bytes()),
+        hex(pairing.device_key.to_sec1_point(false).as_bytes()),
         vectors["devicePublic"].as_str().unwrap()
     );
     for case in vectors["bindingAndProofs"].as_array().unwrap() {
@@ -250,7 +250,7 @@ fn reconnect_admission_reads_durable_revocation_and_transport_policy() {
     let (_, public) = generate_noise_key().unwrap();
     let mut trusted = pairing(public);
     let now = Utc::now();
-    let key = URL_SAFE_NO_PAD.encode(trusted.device_key.to_encoded_point(false).as_bytes());
+    let key = URL_SAFE_NO_PAD.encode(trusted.device_key.to_sec1_point(false).as_bytes());
     let device = DeviceRecord {
         id: trusted.device_id,
         display_name: "fixture".into(),
@@ -550,8 +550,7 @@ fn transport_provisioning_survives_restart_and_rotates_opaque_routing() {
     let device = identity(2);
     let id = Uuid::from_u128(5);
     let now = Utc::now();
-    let public_key =
-        URL_SAFE_NO_PAD.encode(device.verifying_key().to_encoded_point(false).as_bytes());
+    let public_key = URL_SAFE_NO_PAD.encode(device.verifying_key().to_sec1_point(false).as_bytes());
     let record = DeviceRecord {
         id,
         display_name: "Synthetic phone".into(),
