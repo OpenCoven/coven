@@ -6664,6 +6664,13 @@ fn apply_familiar_edits(
             }),
         );
     }
+    // Flush both the audit batch and any baseline advances before acknowledging
+    // the installed bytes. Keep their existing failure ordering and retain the
+    // reservation if the WAL or checked namespace barrier cannot be synced.
+    if let Err(error) = store::durable_barrier(audit_reservation.connection()) {
+        audit_reservation.preserve()?;
+        return direct_audit_persist_failed_response(&changes, &error);
+    }
     if let Err(error) = audit_reservation.finish() {
         return json_response(
             500,
