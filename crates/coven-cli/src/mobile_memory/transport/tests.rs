@@ -1,3 +1,4 @@
+use super::test_support::{assert_bytes_exclude, stable_identifier_markers};
 use super::*;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -428,14 +429,98 @@ fn real_wire(attack: WireAttack) {
             "attack {attack:?} admitted an endpoint before disconnect"
         );
     }
+    let mut markers = stable_identifier_markers(&pairing(public));
+    markers.push(("request plaintext", b"wire-request-private-marker".to_vec()));
+    markers.push((
+        "response plaintext",
+        b"wire-response-private-marker".to_vec(),
+    ));
     for frame in frames {
-        for marker in [
-            b"wire-request-private-marker".as_slice(),
-            b"wire-response-private-marker".as_slice(),
-        ] {
-            assert!(!frame.windows(marker.len()).any(|part| part == marker));
-        }
+        assert_bytes_exclude(&frame, &markers);
     }
+}
+
+/// A broker that forwards the complete authentication exchange, then withholds
+/// the first application record while keeping both sockets open. Neither
+/// endpoint may wait past its own deadline, and the withheld record must be
+/// unusable once the channel has failed.
+#[test]
+fn stalling_websocket_relay_cannot_extend_an_authenticated_channel() {
+    use std::net::TcpListener;
+    use tungstenite::Message;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (expired_tx, expired_rx) = mpsc::channel::<()>();
+    let relay = thread::spawn(move || {
+        let accept = || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            tungstenite::accept(stream).unwrap()
+        };
+        let mut host = accept();
+        ready_tx.send(()).unwrap();
+        let mut client = accept();
+        // Noise handshake, both nonces, both proofs and both completions.
+        for from_client in [true, false, false, true, false, true, false, true] {
+            let (source, destination) = if from_client {
+                (&mut client, &mut host)
+            } else {
+                (&mut host, &mut client)
+            };
+            let Message::Binary(frame) = source.read().unwrap() else {
+                panic!("expected binary authentication record");
+            };
+            destination.send(Message::Binary(frame)).unwrap();
+        }
+        let Message::Binary(withheld) = client.read().unwrap() else {
+            panic!("expected application record");
+        };
+        // Release only after the host reports its deadline failure, so the
+        // late delivery targets a channel that has already failed closed.
+        expired_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let _ = host.send(Message::Binary(withheld));
+        let _ = host.flush();
+    });
+    let (private, public) = generate_noise_key().unwrap();
+    let host = thread::spawn(move || -> Result<()> {
+        let records = websocket::fixture_connect(address)?;
+        let mut channel = accept(
+            records,
+            &pairing(public),
+            &private,
+            &identity(1),
+            &[8; 32],
+            false,
+            |_, _| Ok(()),
+        )?;
+        let stalled = channel.receive(Instant::now() + Duration::from_secs(2));
+        ensure!(stalled.is_err(), "stalled receive returned a record");
+        ensure!(!channel.is_open(), "failed channel stayed open");
+        expired_tx.send(()).unwrap();
+        let late = channel.receive(Instant::now() + Duration::from_secs(5));
+        ensure!(late.is_err(), "late record was accepted after failure");
+        Ok(())
+    });
+    ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let trusted = pairing(public);
+    let binding = trusted.sign_noise_binding(&identity(1)).unwrap();
+    let records = websocket::fixture_connect(address).unwrap();
+    let mut channel = connect(records, &trusted, &binding, &identity(2), &[8; 32], false).unwrap();
+    channel
+        .send(b"stalled-request", Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert!(channel
+        .receive(Instant::now() + Duration::from_secs(3))
+        .is_err());
+    assert!(!channel.is_open());
+    host.join().unwrap().unwrap();
+    relay.join().unwrap();
 }
 
 #[test]
