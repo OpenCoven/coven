@@ -494,3 +494,79 @@ fn v1_mut(envelope: &mut IntroductionEnvelope) -> &mut IntroductionRequest {
         IntroductionTranscript::Threshold(_) => panic!("fixture envelopes are v1"),
     }
 }
+
+#[test]
+fn shutdown_releases_approval_and_ledger_readers_without_enrollment() {
+    use fs2::FileExt;
+    use std::sync::mpsc::sync_channel;
+    let fixture = Fixture::new();
+    let admitted = fixture
+        .ledger
+        .admit(fixture.envelope.clone(), fixture.now)
+        .unwrap();
+    let approval = fixture.approval();
+    let before = std::fs::read(fixture.home.path().join("mobile/devices.json")).unwrap();
+    let held = crate::state_lock::open_lock_file(&fixture.home.path().join("mobile/.devices.lock"))
+        .unwrap();
+    held.lock_exclusive().unwrap();
+    let (registry_ready, registry_waiting) = sync_channel(1);
+    fixture.ledger.registry.observe_lock_waits(registry_ready);
+    let (ledger_ready, ledger_waiting) = sync_channel(1);
+    *fixture.ledger.lock_wait_observer.lock().unwrap() = Some(ledger_ready);
+    let fixture_ref = &fixture;
+    std::thread::scope(move |scope| {
+        // Drop the held file lock before scope joins workers if an assertion fails.
+        let _held = held;
+        let fixture = fixture_ref;
+        let (approved, approval_result) = sync_channel(1);
+        scope.spawn(move || {
+            let result =
+                fixture
+                    .ledger
+                    .approve(admitted.id, fixture.introducer(), approval, fixture.now);
+            approved.send(result).unwrap();
+        });
+        // These are hang guards. Actual failed lock attempts establish sequencing.
+        registry_waiting
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        let (read, read_result) = sync_channel(1);
+        scope.spawn(move || {
+            read.send(fixture.ledger.status(admitted.id, fixture.now))
+                .unwrap();
+        });
+        ledger_waiting
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        fixture.ledger.registry.cancel_pending_operations();
+        let error = approval_result
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Uncertain"), "{error:#}");
+        assert!(read_result
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .is_err());
+    });
+    assert_eq!(
+        fixture
+            .ledger
+            .entries
+            .lock()
+            .unwrap()
+            .get(&admitted.id)
+            .unwrap()
+            .state,
+        IntroductionState::Uncertain
+    );
+    assert_eq!(
+        std::fs::read(fixture.home.path().join("mobile/devices.json")).unwrap(),
+        before
+    );
+    let fresh = DeviceRegistry::load(fixture.home.path()).unwrap();
+    assert!(fresh
+        .device(v1(&fixture.envelope).destination_id)
+        .unwrap()
+        .is_none());
+}

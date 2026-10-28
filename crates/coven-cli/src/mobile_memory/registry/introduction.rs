@@ -7,7 +7,7 @@ impl DeviceRegistry {
         device_id: Uuid,
         operation: impl FnOnce(&DeviceAuthorizationRecord, &DeviceAuthorizationKeyRecord) -> Result<T>,
     ) -> Result<T> {
-        let _lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _lock = self.acquire_store_lock()?;
         let loaded = read_registry(&self.path)?;
         let source = introduction_source(&loaded, device_id)?;
         self.authorization_keys
@@ -23,7 +23,7 @@ impl DeviceRegistry {
         now: DateTime<Utc>,
         verify: impl FnOnce(&[(DeviceAuthorizationRecord, DeviceAuthorizationKeyRecord)]) -> Result<()>,
     ) -> Result<(DeviceAuthorizationRecord, IntroductionTransition)> {
-        let _lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _lock = self.acquire_store_lock()?;
         let mut loaded = read_registry(&self.path)?;
         if loaded
             .introduction_transitions
@@ -87,7 +87,7 @@ impl DeviceRegistry {
     pub(in crate::mobile_memory) fn pending_introduction_audits(
         &self,
     ) -> Result<Vec<IntroductionTransition>> {
-        let _lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _lock = self.acquire_store_lock()?;
         Ok(read_registry(&self.path)?
             .introduction_transitions
             .into_iter()
@@ -100,7 +100,7 @@ impl DeviceRegistry {
         receipt: &AuditDeliveryReceipt,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let _lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let _lock = self.acquire_store_lock()?;
         let mut loaded = read_registry(&self.path)?;
         let transition = loaded
             .introduction_transitions
