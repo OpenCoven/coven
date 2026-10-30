@@ -2494,7 +2494,7 @@ fn each_held_retry_names_what_reconciliation_does_with_it() {
             session: Some("failed"),
             attempts: &[(1, "failed", true)],
             fenced: true,
-            code: WorkCode::InFlight,
+            code: WorkCode::StopFenced,
             deadline_at: None,
             after: [Some("claimed"), Some("claimed")],
             ..HELD
@@ -2941,6 +2941,8 @@ fn each_finished_session_names_what_reconciliation_does_with_it() {
         },
         FinishedShape {
             fenced: true,
+            code: WorkCode::StopFenced,
+            next_step: NextStep::AwaitSettlement,
             ..in_flight("fenced", [Some("claimed"), Some("claimed")])
         },
         // Only a pending cancellation of the ambiguous attempt and its session
@@ -3244,6 +3246,8 @@ fn each_finished_session_names_what_reconciliation_does_with_it() {
         FinishedShape {
             attempts: &[],
             fenced: true,
+            code: WorkCode::StopFenced,
+            next_step: NextStep::InspectRun,
             ..in_flight("fenced-no-attempt", [Some("claimed"), Some("claimed")])
         },
         FinishedShape {
@@ -3888,13 +3892,18 @@ fn each_run_past_its_deadline_names_what_reconciliation_does_with_it() {
             )
         },
         // Enforcement leaves a fenced run to that stop, or holds it for
-        // recovery once its own timeout stop has expired.
+        // recovery once its own timeout stop has expired; the run is
+        // `stop_fenced`, whose test says what ends each fence.
         TimeoutShape {
             extra: &[late_fence!("timeout", "2026-10-22T10:00:20.000Z")],
+            code: WorkCode::StopFenced,
+            next_step: NextStep::AwaitSettlement,
             ..in_flight("fenced", [Some("claimed"), Some("claimed")])
         },
         TimeoutShape {
             extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            code: WorkCode::StopFenced,
+            next_step: NextStep::AwaitSettlement,
             ..in_flight(
                 "fence-expired",
                 [Some("recovery_required"), Some("recovery_required")],
@@ -3902,10 +3911,14 @@ fn each_run_past_its_deadline_names_what_reconciliation_does_with_it() {
         },
         TimeoutShape {
             extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+            code: WorkCode::StopFenced,
+            next_step: NextStep::InspectRun,
             ..in_flight("recovery-fence", [Some("claimed"), Some("claimed")])
         },
         TimeoutShape {
             extra: &[late_fence!("timeout", "never")],
+            code: WorkCode::StopFenced,
+            next_step: NextStep::InspectRun,
             ..in_flight("fence-unparseable", [Some("claimed"), Some("claimed")])
         },
         TimeoutShape {
@@ -4645,6 +4658,8 @@ fn each_abandoned_launch_names_what_reconciliation_does_with_it() {
         (
             TimeoutShape {
                 extra: &[late_fence!("recovery", "2099-01-01T00:00:00.000Z")],
+                code: WorkCode::StopFenced,
+                next_step: NextStep::AwaitSettlement,
                 ..in_flight(
                     "recovery-fence",
                     [Some("claimed/dispatching"), Some("claimed/dispatching")],
@@ -4655,6 +4670,8 @@ fn each_abandoned_launch_names_what_reconciliation_does_with_it() {
         (
             TimeoutShape {
                 extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+                code: WorkCode::StopFenced,
+                next_step: NextStep::AwaitSettlement,
                 ..in_flight(
                     "recovery-fence-expired",
                     [
@@ -4668,6 +4685,8 @@ fn each_abandoned_launch_names_what_reconciliation_does_with_it() {
         (
             TimeoutShape {
                 extra: &[late_fence!("recovery", "never")],
+                code: WorkCode::StopFenced,
+                next_step: NextStep::InspectRun,
                 ..in_flight(
                     "recovery-fence-unparseable",
                     [Some("claimed/dispatching"), Some("claimed/dispatching")],
@@ -4687,6 +4706,8 @@ fn each_abandoned_launch_names_what_reconciliation_does_with_it() {
             TimeoutShape {
                 attempts: &[],
                 extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+                code: WorkCode::StopFenced,
+                next_step: NextStep::InspectRun,
                 ..in_flight("recovery-fence-expired-no-attempt", [None, None])
             },
             Some("claimed/none"),
@@ -4694,6 +4715,8 @@ fn each_abandoned_launch_names_what_reconciliation_does_with_it() {
         (
             TimeoutShape {
                 extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+                code: WorkCode::StopFenced,
+                next_step: NextStep::InspectRun,
                 ..in_flight(
                     "timeout-fence",
                     [Some("claimed/dispatching"), Some("claimed/dispatching")],
@@ -5647,10 +5670,14 @@ fn each_expired_cancellation_names_what_reconciliation_does_with_it() {
                 expired_cancellation!("requested"),
                 late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
             ],
+            code: WorkCode::StopFenced,
+            next_step: NextStep::InspectRun,
             ..in_flight("timeout-fence", [left, left])
         },
         TimeoutShape {
             extra: &[expired_cancellation!("requested"), CANCELLATION_FENCE],
+            code: WorkCode::StopFenced,
+            next_step: NextStep::AwaitCancellation,
             ..in_flight("own-fence", [held, held])
         },
         TimeoutShape {
@@ -6624,6 +6651,744 @@ fn each_running_run_names_what_reconciliation_does_with_it() {
             stray_after_pass(&temp, &conn, &ConfirmedKill),
             stray_after_pass(&never_temp, &never_conn, &UnconfirmedKill),
         ];
+        seen.push((shape.name, item.code, item.next_step, after));
+    }
+    let expected: Vec<_> = shapes
+        .iter()
+        .map(|shape| {
+            (
+                shape.name,
+                shape.code,
+                shape.next_step,
+                shape.after.map(|state| state.map(str::to_string)),
+            )
+        })
+        .collect();
+    assert_eq!(seen, expected);
+}
+
+/// A stop fence on the run under test: the session it names, its owner, its
+/// operation key as SQL, and when it expires.
+macro_rules! fence {
+    ($session:literal, $owner:literal, $key:literal, $expires:literal) => {
+        concat!(
+            "INSERT INTO automation_stop_fences
+                (run_id, session_id, owner, operation_key, acquired_at, execution_expires_at)
+             VALUES ('r-late', '",
+            $session,
+            "', '",
+            $owner,
+            "', ",
+            $key,
+            ", '2026-10-22T09:59:00.000Z', '",
+            $expires,
+            "');"
+        )
+    };
+}
+
+/// A fence whose expiry is not text.
+const BLOB_FENCE_EXPIRY: &str =
+    "UPDATE automation_stop_fences SET execution_expires_at = 17 WHERE run_id = 'r-late';";
+
+/// What the daemon's reconciliation does with a run under a stop fence, one
+/// store per shape and runtime so that a failing pass hides nothing. Each
+/// shape gives the occurrence, the run's latest attempt and its cancellation
+/// after each pass.
+#[test]
+fn each_stop_fenced_run_names_what_reconciliation_does_with_it() {
+    let fenced = |name, next_step, after| TimeoutShape {
+        name,
+        code: WorkCode::StopFenced,
+        next_step,
+        deadline_at: None,
+        after,
+        ..TIMED_OUT
+    };
+    let in_flight = |name, after| TimeoutShape {
+        name,
+        code: WorkCode::InFlight,
+        next_step: NextStep::InspectOccurrence,
+        deadline_at: None,
+        after,
+        ..TIMED_OUT
+    };
+    let left = Some("claimed/started/none");
+    let held = Some("recovery_required/ambiguous/none");
+    let launch = Some("claimed/dispatching/none");
+    let shapes = [
+        // Timeout enforcement reaches a dated run whose session has not
+        // finished through its own timeout stop: it waits while the fence is
+        // live, holds the run for recovery once it has expired, and skips the
+        // run when the expiry cannot be read.
+        TimeoutShape {
+            extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+            ..fenced("timeout-live", NextStep::AwaitSettlement, [left, left])
+        },
+        TimeoutShape {
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced("timeout-expired", NextStep::AwaitSettlement, [held, held])
+        },
+        TimeoutShape {
+            extra: &[late_fence!("timeout", "never")],
+            ..fenced("timeout-unreadable", NextStep::InspectRun, [left, left])
+        },
+        TimeoutShape {
+            extra: &[
+                late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
+                BLOB_FENCE_EXPIRY,
+            ],
+            ..fenced("timeout-blob", NextStep::InspectRun, [left, left])
+        },
+        TimeoutShape {
+            authority: true,
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "timeout-expired-authority",
+                NextStep::AwaitRuntimeAuthority,
+                [held, held],
+            )
+        },
+        TimeoutShape {
+            occurrence: "running",
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "timeout-expired-running-occurrence",
+                NextStep::AwaitSettlement,
+                [held, held],
+            )
+        },
+        // Holding the run for recovery needs exactly one live attempt on the
+        // session: the pass fails with two once the fence has expired.
+        TimeoutShape {
+            attempts: &[(1, "started", true), (2, "dispatching", false)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..in_flight("timeout-expired-two-live", [None, None])
+        },
+        TimeoutShape {
+            attempts: &[(1, "started", true), (2, "dispatching", false)],
+            extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+            ..in_flight(
+                "timeout-live-two-live",
+                [
+                    Some("claimed/dispatching/none"),
+                    Some("claimed/dispatching/none"),
+                ],
+            )
+        },
+        // A run with no deadline, no live attempt, a fence on another
+        // session or another stop's fence is reached by no pass.
+        TimeoutShape {
+            deadline: None,
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced("timeout-undated", NextStep::InspectRun, [left, left])
+        },
+        TimeoutShape {
+            attempts: &[(1, "failed", false)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "timeout-expired-failed-latest",
+                NextStep::InspectRun,
+                [Some("claimed/failed/none"), Some("claimed/failed/none")],
+            )
+        },
+        TimeoutShape {
+            extra: &[fence!(
+                "s-other",
+                "timeout",
+                "NULL",
+                "2026-10-22T09:59:00.000Z"
+            )],
+            ..fenced("timeout-other-session", NextStep::InspectRun, [left, left])
+        },
+        TimeoutShape {
+            extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+            ..fenced("recovery-owner-running", NextStep::InspectRun, [left, left])
+        },
+        // The pass at the deadline reaches a fenced run whose deadline is
+        // still ahead.
+        TimeoutShape {
+            deadline: Some("2099-01-01T00:00:00.000Z"),
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "timeout-deadline-ahead",
+                NextStep::AwaitSettlement,
+                [left, left],
+            )
+        },
+        // An ambiguous latest attempt takes settlement past the fence, which
+        // waits for the session to finish.
+        TimeoutShape {
+            attempts: &[(1, "ambiguous", false)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..in_flight(
+                "timeout-expired-ambiguous",
+                [
+                    Some("claimed/ambiguous/none"),
+                    Some("claimed/ambiguous/none"),
+                ],
+            )
+        },
+        // Settlement reaches a finished session with a live latest attempt
+        // through a timeout or recovery stop on it.
+        TimeoutShape {
+            session: "completed",
+            extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+            ..fenced(
+                "finished-timeout-live",
+                NextStep::AwaitSettlement,
+                [left, left],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "finished-timeout-expired",
+                NextStep::AwaitSettlement,
+                [held, held],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "finished-recovery-expired",
+                NextStep::AwaitSettlement,
+                [held, held],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            extra: &[late_fence!("timeout", "never")],
+            ..fenced("finished-unreadable", NextStep::InspectRun, [left, left])
+        },
+        TimeoutShape {
+            session: "completed",
+            extra: &[fence!(
+                "s-late",
+                "cancellation",
+                "NULL",
+                "2026-10-22T09:59:00.000Z"
+            )],
+            ..fenced(
+                "finished-cancellation-orphan",
+                NextStep::InspectRun,
+                [left, left],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            extra: &[fence!(
+                "s-other",
+                "timeout",
+                "NULL",
+                "2026-10-22T09:59:00.000Z"
+            )],
+            ..fenced(
+                "finished-other-session-expired",
+                NextStep::InspectRun,
+                [left, left],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            attempts: &[(1, "started", true), (2, "dispatching", false)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..in_flight("finished-expired-two-live", [None, None])
+        },
+        TimeoutShape {
+            session: "completed",
+            attempts: &[(1, "started", true), (2, "failed", false)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "finished-expired-earlier-live",
+                NextStep::InspectRun,
+                [Some("claimed/failed/none"), Some("claimed/failed/none")],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            attempts: &[(1, "failed", false)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "finished-expired-failed-latest",
+                NextStep::InspectRun,
+                [Some("claimed/failed/none"), Some("claimed/failed/none")],
+            )
+        },
+        // A Runtime Authority run and an ambiguous attempt settle past the
+        // fence, as `session_finished` describes.
+        TimeoutShape {
+            name: "finished-expired-authority",
+            session: "completed",
+            authority: true,
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            code: WorkCode::SessionFinished,
+            next_step: NextStep::AwaitRuntimeAuthority,
+            deadline_at: None,
+            after: [
+                Some("recovery_required/started/none"),
+                Some("recovery_required/started/none"),
+            ],
+            ..TIMED_OUT
+        },
+        TimeoutShape {
+            session: "completed",
+            authority: true,
+            attempts: &[(1, "ambiguous", false), (2, "started", true)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..in_flight("finished-expired-authority-two-unresolved", [None, None])
+        },
+        // Settlement reaches the latest attempt wherever it is live, and
+        // holding the run needs it on the fenced session; it parses no
+        // deadline before the fence.
+        TimeoutShape {
+            session: "completed",
+            attempts: &[(1, "started", false)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..in_flight("finished-expired-live-elsewhere", [None, None])
+        },
+        TimeoutShape {
+            session: "completed",
+            attempts: &[(1, "started", false)],
+            extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+            ..fenced(
+                "finished-live-elsewhere",
+                NextStep::InspectRun,
+                [left, left],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            deadline: Some("soon"),
+            extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+            ..fenced(
+                "finished-deadline-unparseable",
+                NextStep::AwaitSettlement,
+                [left, left],
+            )
+        },
+        TimeoutShape {
+            session: "completed",
+            deadline: Some("soon"),
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "finished-expired-deadline-unparseable",
+                NextStep::AwaitSettlement,
+                [held, held],
+            )
+        },
+        TimeoutShape {
+            name: "finished-ambiguous",
+            session: "completed",
+            attempts: &[(1, "ambiguous", false)],
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            code: WorkCode::SessionFinished,
+            next_step: NextStep::AwaitSettlement,
+            deadline_at: None,
+            after: [Some("failed/ambiguous/none"), Some("failed/ambiguous/none")],
+            ..TIMED_OUT
+        },
+        // Abandoned-launch recovery reaches a launch past its lease through
+        // its own recovery stop, unless its stored deadline has passed, when
+        // it is left to timeout enforcement, whose stop the fence refuses.
+        TimeoutShape {
+            extra: &[late_fence!("recovery", "2099-01-01T00:00:00.000Z")],
+            ..fenced(
+                "launch-recovery-live",
+                NextStep::AwaitSettlement,
+                [launch, launch],
+            )
+        },
+        TimeoutShape {
+            extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "launch-recovery-expired",
+                NextStep::AwaitSettlement,
+                [held, held],
+            )
+        },
+        TimeoutShape {
+            extra: &[late_fence!("recovery", "never")],
+            ..fenced(
+                "launch-recovery-unreadable",
+                NextStep::InspectRun,
+                [launch, launch],
+            )
+        },
+        TimeoutShape {
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "launch-timeout-owner",
+                NextStep::InspectRun,
+                [launch, launch],
+            )
+        },
+        TimeoutShape {
+            attempts: &[(1, "started", true), (2, "dispatching", false)],
+            extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+            ..in_flight("launch-recovery-expired-two-live", [None, None])
+        },
+        TimeoutShape {
+            lease: Some("2099-01-01T00:00:00.000Z"),
+            extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "launch-lease-ahead",
+                NextStep::AwaitSettlement,
+                [launch, launch],
+            )
+        },
+        TimeoutShape {
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            extra: &[late_fence!("recovery", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "launch-recovery-deadline-passed",
+                NextStep::InspectRun,
+                [launch, launch],
+            )
+        },
+        TimeoutShape {
+            deadline: Some("2026-10-22T09:30:00.000Z"),
+            extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
+            ..fenced(
+                "launch-timeout-deadline-passed",
+                NextStep::AwaitSettlement,
+                [held, held],
+            )
+        },
+        // Restart containment reads every launch before the fence matters,
+        // whichever stop reaches it.
+        TimeoutShape {
+            extra: &[
+                late_fence!("recovery", "2099-01-01T00:00:00.000Z"),
+                "UPDATE sessions SET created_at = 'soon' WHERE id = 's-late';",
+            ],
+            ..in_flight("launch-unreadable-creation", [None, None])
+        },
+        TimeoutShape {
+            session: "created",
+            attempts: &[(1, "dispatching", true)],
+            extra: &[
+                late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
+                "UPDATE sessions SET created_at = 'soon' WHERE id = 's-late';",
+            ],
+            ..in_flight("created-unreadable-creation", [None, None])
+        },
+        // A requested cancellation's own fence is finished by that
+        // cancellation: its command, or reconciliation once its lease has
+        // expired, which holds the run for recovery when the fence has
+        // expired too. Once the run's deadline has passed, reconciliation
+        // rejects the cancellation instead, and the timeout stop finds
+        // another's fence.
+        TimeoutShape {
+            deadline: None,
+            extra: &[
+                expired_cancellation!("requested"),
+                fence!(
+                    "s-late",
+                    "cancellation",
+                    "'cancel-late'",
+                    "2099-01-01T00:00:00.000Z"
+                ),
+            ],
+            ..fenced(
+                "cancel-own-live",
+                NextStep::AwaitCancellation,
+                [
+                    Some("cancelled/cancelled/cancelled"),
+                    Some("recovery_required/ambiguous/recovery_required"),
+                ],
+            )
+        },
+        TimeoutShape {
+            deadline: None,
+            extra: &[expired_cancellation!("requested"), CANCELLATION_FENCE],
+            ..fenced(
+                "cancel-own-expired",
+                NextStep::AwaitCancellation,
+                [
+                    Some("recovery_required/ambiguous/recovery_required"),
+                    Some("recovery_required/ambiguous/recovery_required"),
+                ],
+            )
+        },
+        TimeoutShape {
+            deadline: None,
+            extra: &[
+                expired_cancellation!("requested"),
+                fence!("s-late", "cancellation", "'cancel-late'", "never"),
+            ],
+            ..fenced(
+                "cancel-own-unreadable",
+                NextStep::InspectRun,
+                [
+                    Some("claimed/started/requested"),
+                    Some("claimed/started/requested"),
+                ],
+            )
+        },
+        TimeoutShape {
+            deadline: None,
+            extra: &[
+                expired_cancellation!("requested"),
+                fence!(
+                    "s-late",
+                    "cancellation",
+                    "'other-key'",
+                    "2026-10-22T09:59:00.000Z"
+                ),
+            ],
+            ..fenced(
+                "cancel-other-key",
+                NextStep::InspectRun,
+                [
+                    Some("claimed/started/requested"),
+                    Some("claimed/started/requested"),
+                ],
+            )
+        },
+        TimeoutShape {
+            extra: &[expired_cancellation!("requested"), CANCELLATION_FENCE],
+            ..fenced(
+                "cancel-own-deadline-passed",
+                NextStep::AwaitSettlement,
+                [
+                    Some("failed/timed_out/rejected"),
+                    Some("recovery_required/ambiguous/rejected"),
+                ],
+            )
+        },
+        TimeoutShape {
+            authority: true,
+            extra: &[expired_cancellation!("requested"), CANCELLATION_FENCE],
+            ..fenced(
+                "cancel-own-deadline-passed-authority",
+                NextStep::AwaitRuntimeAuthority,
+                [
+                    Some("recovery_required/started/rejected"),
+                    Some("recovery_required/ambiguous/rejected"),
+                ],
+            )
+        },
+        TimeoutShape {
+            attempts: &[(1, "failed", false)],
+            extra: &[expired_cancellation!("requested"), CANCELLATION_FENCE],
+            ..fenced(
+                "cancel-own-deadline-passed-failed-latest",
+                NextStep::AwaitSettlement,
+                [
+                    Some("failed/failed/rejected"),
+                    Some("failed/failed/rejected"),
+                ],
+            )
+        },
+        TimeoutShape {
+            attempts: &[(1, "started", true), (2, "dispatching", false)],
+            extra: &[expired_cancellation!("requested"), CANCELLATION_FENCE],
+            ..in_flight("cancel-own-deadline-passed-two-live", [None, None])
+        },
+        TimeoutShape {
+            extra: &[fence!(
+                "s-late",
+                "cancellation",
+                "'cancel-late'",
+                "2026-10-22T09:59:00.000Z"
+            )],
+            ..fenced(
+                "cancel-fence-no-cancellation",
+                NextStep::InspectRun,
+                [left, left],
+            )
+        },
+        TimeoutShape {
+            deadline: None,
+            session: "completed",
+            extra: &[
+                expired_cancellation!("requested"),
+                fence!(
+                    "s-late",
+                    "cancellation",
+                    "'cancel-late'",
+                    "2099-01-01T00:00:00.000Z"
+                ),
+            ],
+            ..fenced(
+                "cancel-own-live-finished",
+                NextStep::AwaitCancellation,
+                [
+                    Some("failed/failed/rejected"),
+                    Some("failed/ambiguous/recovery_required"),
+                ],
+            )
+        },
+        // A stopping cancellation's fence does not fence the run: its
+        // reconciliation ends it.
+        TimeoutShape {
+            name: "cancel-stopping-own",
+            deadline: None,
+            extra: &[expired_cancellation!("stopping"), CANCELLATION_FENCE],
+            code: WorkCode::CancellationExpired,
+            next_step: NextStep::AwaitCancellation,
+            deadline_at: None,
+            after: [
+                Some("recovery_required/ambiguous/recovery_required"),
+                Some("recovery_required/ambiguous/recovery_required"),
+            ],
+            ..TIMED_OUT
+        },
+        // Another stop's fence refuses a requested cancellation every pass,
+        // and the timeout stop still reaches its own once the cancellation is
+        // rejected at the deadline.
+        TimeoutShape {
+            deadline: None,
+            extra: &[
+                expired_cancellation!("requested"),
+                late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
+            ],
+            ..fenced(
+                "timeout-fence-requested",
+                NextStep::InspectRun,
+                [
+                    Some("claimed/started/requested"),
+                    Some("claimed/started/requested"),
+                ],
+            )
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                late_fence!("timeout", "2026-10-22T09:59:00.000Z"),
+            ],
+            ..fenced(
+                "timeout-expired-requested-deadline-passed",
+                NextStep::AwaitSettlement,
+                [
+                    Some("recovery_required/ambiguous/rejected"),
+                    Some("recovery_required/ambiguous/rejected"),
+                ],
+            )
+        },
+        TimeoutShape {
+            extra: &[
+                expired_cancellation!("requested"),
+                late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
+            ],
+            ..fenced(
+                "timeout-live-requested-deadline-passed",
+                NextStep::AwaitSettlement,
+                [
+                    Some("claimed/started/rejected"),
+                    Some("claimed/started/rejected"),
+                ],
+            )
+        },
+        // Every pass decodes each running run's values and parses a live
+        // run's deadline before any fence matters.
+        TimeoutShape {
+            extra: &[
+                late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
+                "UPDATE automation_runs SET timeout_at = CAST('2026-10-22T09:30:00.000Z' AS BLOB)
+                 WHERE id = 'r-late';",
+            ],
+            ..in_flight("blob-deadline", [None, None])
+        },
+        TimeoutShape {
+            deadline: Some("soon"),
+            extra: &[late_fence!("timeout", "2099-01-01T00:00:00.000Z")],
+            ..in_flight("deadline-unparseable", [None, None])
+        },
+        TimeoutShape {
+            extra: &[
+                late_fence!("timeout", "2099-01-01T00:00:00.000Z"),
+                "UPDATE sessions SET exit_code = 'zero' WHERE id = 's-late';",
+            ],
+            ..in_flight("text-exit-code", [None, None])
+        },
+    ];
+    let mut seen = Vec::new();
+    for shape in &shapes {
+        let shape = &TimeoutShape {
+            // Launch shapes start from an abandoned launch.
+            lease: if shape.name.starts_with("launch-") {
+                shape
+                    .lease
+                    .filter(|_| shape.name != "launch-lease-ahead")
+                    .map(|_| "2026-10-22T09:00:00.000Z")
+                    .or(shape.lease)
+            } else {
+                shape.lease
+            },
+            deadline: if shape.name.starts_with("launch-")
+                && !shape.name.ends_with("deadline-passed")
+            {
+                None
+            } else {
+                shape.deadline
+            },
+            session: if shape.name.starts_with("launch-") {
+                "created"
+            } else {
+                shape.session
+            },
+            attempts: if shape.name.starts_with("launch-") && shape.attempts.len() == 1 {
+                &[(1, "dispatching", true)]
+            } else {
+                shape.attempts
+            },
+            ..*shape
+        };
+        let (_temp, conn) = timeout_store(shape);
+        let item = found(&conn, "daily").work.into_iter().next().unwrap();
+        assert!(item.holds_claims, "{}", shape.name);
+        // TEMP tables cannot change what the run reads as.
+        let explained = work_of(&conn, "daily");
+        conn.execute_batch(
+            "CREATE TEMP TABLE automation_stop_fences AS
+                 SELECT * FROM main.automation_stop_fences;
+             UPDATE temp.automation_stop_fences SET
+                 owner = CASE owner WHEN 'timeout' THEN 'cancellation' ELSE 'timeout' END,
+                 session_id = 'shadow', operation_key = 'shadow',
+                 execution_expires_at = CASE
+                     WHEN execution_expires_at <= '2026-10-22T10:00:00.000Z'
+                     THEN '2099-01-01T00:00:00.000Z' ELSE 'never' END;
+             INSERT INTO temp.automation_stop_fences (run_id, session_id, owner)
+                 VALUES ('r-late', 's-late', 'timeout');
+             CREATE TEMP TABLE automation_cancellations AS
+                 SELECT * FROM main.automation_cancellations;
+             UPDATE temp.automation_cancellations SET
+                 state = CASE state WHEN 'requested' THEN 'stopping' ELSE 'requested' END,
+                 execution_expires_at = '2026-10-22T09:00:00.000Z';
+             INSERT INTO temp.automation_cancellations
+                 (adoption_key, run_id, session_id, state, execution_expires_at)
+                 VALUES ('cancel-late', 'r-late', 's-late', 'requested',
+                         '2026-10-22T09:00:00.000Z');
+             CREATE TEMP TABLE sessions AS SELECT * FROM main.sessions;
+             UPDATE temp.sessions SET status = CASE status
+                 WHEN 'running' THEN 'completed' WHEN 'created' THEN 'running'
+                 ELSE 'created' END, created_at = 'soon';
+             CREATE TEMP TABLE automation_attempts AS SELECT * FROM main.automation_attempts;
+             UPDATE temp.automation_attempts SET id = 'shadow-' || id,
+                 state = CASE state WHEN 'started' THEN 'ambiguous' ELSE 'started' END;
+             INSERT INTO temp.automation_attempts (id, run_id, state, session_id)
+                 VALUES ('shadow-extra', 'r-late', 'observing', 's-late');
+             CREATE TEMP TABLE automation_runs AS SELECT * FROM main.automation_runs;
+             UPDATE temp.automation_runs SET timeout_at = 'never', session_id = 'shadow',
+                 authority_profile = CASE WHEN authority_profile IS NULL THEN 'shadow' END;
+             CREATE TEMP TABLE automation_occurrences AS
+                 SELECT * FROM main.automation_occurrences;
+             UPDATE temp.automation_occurrences SET state = 'running', lease_expires_at = NULL;",
+        )
+        .unwrap();
+        assert_eq!(work_of(&conn, "daily"), explained, "{}", shape.name);
+        let after = [
+            &ConfirmedKill as &dyn crate::api::SessionRuntime,
+            &UnconfirmedKill,
+        ]
+        .map(|runtime| {
+            let (temp, conn) = timeout_store(shape);
+            cancellation_after_pass(&temp, &conn, runtime)
+        });
         seen.push((shape.name, item.code, item.next_step, after));
     }
     let expected: Vec<_> = shapes
