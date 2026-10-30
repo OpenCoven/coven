@@ -11,6 +11,14 @@ NAMES=frozenset('Irp IrpPtr FileObject FileKey IssuingThreadId ThreadId Status E
 TYPES=frozenset('win:Pointer win:UInt8 win:UInt16 win:UInt32 win:UInt64 win:Int8 win:Int16 win:Int32 win:Int64 win:UnicodeString win:AnsiString win:HexInt32 win:HexInt64 win:Binary'.split())
 ERRORS=frozenset('none unsupported-platform api-unavailable host-binding-failed source-binding-failed provider-open-failed provider-guid-failed provider-mismatch enumeration-open-failed enumeration-failed event-limit property-probe-failed property-size-limit total-size-limit property-read-failed property-size-changed variant-invalid descriptor-range template-limit projection-failed public-size-limit collector-failed'.split())
 STAGES=frozenset('none platform host source provider-open provider-guid enumeration-open enumeration-next event-property template public-encoding'.split())
+# Frozen #1413 rejection reasons. See
+# docs/superpowers/plans/2026-10-24-provider-template-rejection-reasons.md.
+FIELD_REASONS=frozenset('field-name field-type field-duplicate win-namespace field-count field-length field-attribute'.split())
+REASONS=FIELD_REASONS|frozenset('root-name root-namespace root-attribute root-content child-element data-namespace nested-element text'.split())
+TERMINAL_REASONS={'invalid':frozenset({'utf16-invalid','xml-invalid'}),'limit':frozenset({'size-limit','node-limit','depth-limit','field-limit','field-budget'})}
+MAX_REASONS=12
+PROBE_VERSIONS={'coven.kernel-file-probe.v1':1,'coven.kernel-file-probe.v2':2}
+METADATA_VERSIONS={'coven.kernel-file-metadata.v1':1,'coven.kernel-file-metadata.v2':2}
 
 
 def require(ok):
@@ -38,8 +46,45 @@ def enum(value,values):
     require(type(value) is str and value in values)
 
 
-def template(value):
-    obj(value,'status sha256 utf16CodeUnits fields unsupportedCount')
+def wire_version(version):
+    require(type(version) is int and version in (1,2))
+    return version
+
+
+def selected_version(value,versions):
+    """Select a version only from its exact schema string, never from present keys."""
+    require(type(value) is str and value in versions)
+    return versions[value]
+
+
+def _reasons(value):
+    reasons=value['reasons'];state=value['status'];fields=value['fields']
+    require(type(reasons) is list and all(type(code) is str for code in reasons))
+    require(reasons==sorted(set(reasons)))
+    if state in {'missing','empty','supported-flat'}:
+        require(reasons==[]);return
+    if state!='unsupported':
+        require(len(reasons)==1 and reasons[0] in TERMINAL_REASONS[state]);return
+    codes=set(reasons)
+    require(1<=len(reasons)<=MAX_REASONS and codes<=REASONS)
+    # Only an unsupported root yields root-content, and it projects no field.
+    root=codes&{'root-name','root-namespace'}
+    require(len(root)<=1)
+    require(bool(root) or 'root-content' not in codes)
+    if root:require(not fields and codes<=root|{'root-attribute','root-content','text'})
+    # Exported known-name/type nulls and the codes that produce them agree.
+    require(('field-name' in codes)==any(field['knownName'] is None for field in fields))
+    require(bool(codes&{'field-type','win-namespace'})==any(field['knownType'] is None for field in fields))
+    unsupported=any(field['unsupported'] for field in fields)
+    require(unsupported or not codes&FIELD_REASONS)
+    require(not unsupported or bool(codes&(FIELD_REASONS|{'nested-element','text'})))
+    # Codes are not counts; each still accounts for at least one increment.
+    creation=sum(field['knownName'] is None or field['knownType'] is None for field in fields)
+    require(value['unsupportedCount']>=len(codes-FIELD_REASONS)+creation)
+
+
+def template(value,version=1):
+    obj(value,'status sha256 utf16CodeUnits fields unsupportedCount'+(' reasons' if wire_version(version)==2 else ''))
     enum(value['status'],{'missing','empty','supported-flat','unsupported','invalid','limit'})
     digest(value['sha256'],True)
     if value['utf16CodeUnits'] is not None:integer(value['utf16CodeUnits'],32768)
@@ -66,6 +111,7 @@ def template(value):
     elif state=='supported-flat':require(value['sha256'] is not None and value['utf16CodeUnits'] is not None and value['utf16CodeUnits']>0 and value['unsupportedCount']==0)
     elif state=='unsupported':require(value['sha256'] is not None and value['utf16CodeUnits'] is not None and value['utf16CodeUnits']>0 and value['unsupportedCount']>0)
     else:require(not fields and value['unsupportedCount']==0)
+    if version==2:_reasons(value)
     return len(fields)
 
 
@@ -110,7 +156,8 @@ def _validate_state(value):
     return retained
 
 
-def validate_collector(value):
+def validate_collector(value,version=1):
+    wire_version(version)
     obj(value,'providerCode providerMatched enumerationComplete descriptorScope templateScope observedEventHandles retainedEventCount privateBufferBytes totalProjectedFields truncated operation cleanup events')
     require(value['providerCode']=='kernel-file' and value['descriptorScope']=='numeric-event-metadata' and value['templateScope']=='template-data-only-no-userdata')
     retained=_validate_state(value)
@@ -121,7 +168,7 @@ def validate_collector(value):
         for key,maximum in [('id',65535),('version',255),('channel',255),('level',255),('opcode',255),('task',65535)]:integer(event[key],maximum)
         for key in ['keywordsRawHex','keywordsProviderHex']:require(type(event[key]) is str and re.fullmatch('[0-9a-f]{16}',event[key]) is not None)
         require(int(event['keywordsProviderHex'],16)==int(event['keywordsRawHex'],16)&0xffffffffffff)
-        fields+=template(event['template'])
+        fields+=template(event['template'],version)
     require(fields==value['totalProjectedFields'] and fields<=2048)
     return value
 
@@ -137,11 +184,12 @@ def _constant(_):
     raise ValueError('Invalid bounded provider metadata component')
 
 
-def decode_collector(data):
+def decode_collector(data,version=1):
+    wire_version(version)
     require(type(data) is bytes and len(data)<=524288)
     try:value=json.loads(data.decode('utf-8'),object_pairs_hook=_pairs,parse_constant=_constant)
     except (UnicodeError,ValueError,RecursionError) as error:raise ValueError('Invalid bounded provider metadata component') from None
-    return validate_collector(value)
+    return validate_collector(value,version)
 
 
 def validate_export_failure(value):
@@ -155,23 +203,25 @@ def validate_export_failure(value):
     return value
 
 
-def decode_output(data):
+def decode_output(data,version=1):
+    wire_version(version)
     require(type(data) is bytes and len(data)<=524288)
     try:value=json.loads(data.decode('utf-8'),object_pairs_hook=_pairs,parse_constant=_constant)
     except (UnicodeError,ValueError,RecursionError):raise ValueError('Invalid bounded provider metadata component') from None
     if type(value) is dict and 'kind' in value:
         require(len(data)<=8192)
         return validate_export_failure(value)
-    return validate_collector(value)
+    return validate_collector(value,version)
 
 
-def validate_exit(value,code):
+def validate_exit(value,code,version=1):
+    wire_version(version)
     integer(code,2)
     if type(value) is dict and 'kind' in value:
         validate_export_failure(value)
         require(code==(2 if value['exportError']=='public-size-limit' else 1))
     else:
-        validate_collector(value)
+        validate_collector(value,version)
         expected=1 if value['operation']['errorClass']=='collector-failed' else 0 if value['operation']['errorClass']=='none' and value['cleanup']['complete'] else 2
         require(code==expected)
     return value
@@ -239,11 +289,12 @@ def validate_host(value):
 
 def _probe(value):
     obj(value,'schemaVersion captureAttempted metadataComplete source host collector')
-    require(value['schemaVersion']=='coven.kernel-file-probe.v1' and value['captureAttempted'] is False and value['metadataComplete'] is False)
+    version=selected_version(value['schemaVersion'],PROBE_VERSIONS)
+    require(value['captureAttempted'] is False and value['metadataComplete'] is False)
     validate_source(value['source']);validate_host(value['host'])
     collector=value['collector']
     if type(collector) is dict and 'kind' in collector:validate_export_failure(collector)
-    else:validate_collector(collector)
+    else:validate_collector(collector,version)
     return value
 
 
@@ -277,14 +328,16 @@ def _phase_validator(captured,expected_hash):
 
 def validate_envelope(value,expected_source,expected_host,probe_data,phase_source):
     obj(value,'schemaVersion captureAttempted metadataComplete source host query collector')
-    require(value['schemaVersion']=='coven.kernel-file-metadata.v1' and value['captureAttempted'] is False and value['metadataComplete'] is False)
+    version=selected_version(value['schemaVersion'],METADATA_VERSIONS)
+    require(value['captureAttempted'] is False and value['metadataComplete'] is False)
     wire=parse_probe(probe_data);validate_probe(wire,expected_source,expected_host)
+    require(PROBE_VERSIONS[wire['schemaVersion']]==version)
     require(value['source']==wire['source'] and value['host']==wire['host'] and value['collector']==wire['collector'])
     # Independently validate both sides; Python equality alone equates bool/int.
     validate_source(value['source']);validate_host(value['host'])
     collector=value['collector']
     if type(collector) is dict and 'kind' in collector:validate_export_failure(collector)
-    else:validate_collector(collector)
+    else:validate_collector(collector,version)
     query=value['query']
     obj(query,'kind stdoutDigestScope started timedOut outputLimited rootExited readersSettled reaped exitCode elapsedMs phases hasFailure hasCleanupFailure hasReaderFailure stdoutChars stderrChars stdoutSha256 stderrSha256')
     require(query['kind']=='kernel-file-metadata' and query['stdoutDigestScope']=='decoded-text-utf8')
@@ -294,7 +347,7 @@ def validate_envelope(value,expected_source,expected_host,probe_data,phase_sourc
     digest(query['stdoutSha256']);digest(query['stderrSha256'])
     require(query['stdoutChars']==len(probe_data) and query['stdoutSha256']==hashlib.sha256(probe_data).hexdigest())
     require(query['stderrChars']==0 and query['stderrSha256']==hashlib.sha256(b'').hexdigest())
-    validate_exit(collector,query['exitCode'])
+    validate_exit(collector,query['exitCode'],version)
     phases=query['phases'];obj(phases,'unit frequency '+' '.join(PHASE_NAMES))
     require(phases['unit']=='stopwatch-elapsed-ticks');integer(phases['frequency'],0x7fffffffffffffff);require(phases['frequency']>0)
     for name in PHASE_NAMES:
@@ -490,7 +543,10 @@ def finalize_provider_bundle(bundle_path,temporary_root,output_directory,source_
     phase=capture_source_tree(source_root,packet['source'])
     probe_data=packet['probe'].encode('ascii')
     wire=parse_probe(probe_data);validate_probe(wire,packet['source'],packet['host'])
-    value={'schemaVersion':'coven.kernel-file-metadata.v1','captureAttempted':False,'metadataComplete':False,
+    # The receipt keeps the version of the probe wire it decoded.
+    version=PROBE_VERSIONS[wire['schemaVersion']]
+    metadata={number:name for name,number in METADATA_VERSIONS.items()}[version]
+    value={'schemaVersion':metadata,'captureAttempted':False,'metadataComplete':False,
         'source':packet['source'],'host':packet['host'],'query':packet['query'],'collector':wire['collector']}
     validate_envelope(value,packet['source'],packet['host'],probe_data,phase)
     # Recheck captured source before the only public publication operation.
