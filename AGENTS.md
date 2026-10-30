@@ -61,6 +61,8 @@ must share one worktree.
 
 Task allocation must use `scripts/task-worktree.py create`; do not bypass its shared allocation lock or budget refusal with raw `git worktree add`. It caps task worktrees at 12, local task branches at 32 and origin task branches at 48, excluding `main` and origin's symbolic `HEAD`. Existing work may continue above the cap, but new allocation stops until safe cleanup brings the counts within budget. Follow [the pruning procedure](docs/development/worktree-lifecycle.md); never delete uncertain work to make room. A budget change requires an issue-backed reviewed policy change, not an ad hoc command-line override.
 
+Publish task branches with `python3 scripts/task-worktree.py publish --issue <N>` after required checks. It reads live origin heads under the same lock, refuses main/detached publication and new remote growth above 48, and keeps existing updates fast-forward-only. A necessary one-branch publication exception requires `--exception-issue <open-issue> --reason <reason>`; the helper records the exact branch, SHA and counts on that issue before pushing. This records a bounded exception, not a limit change or release authorization. Do not bypass publication checks with raw pushes.
+
 ## Durable work tracking
 
 GitHub issues in the owning repository are the sole work tracker. Record

@@ -236,18 +236,18 @@ echo ""
 # ── Step 3 — delete MERGED + SUPERSEDED ──────────────────────────────────────
 log "Deleting MERGED and SUPERSEDED branches…"
 delete_branch() {
-  local branch="$1" expected_oid="$2" current_open_heads
+  local branch="$1" expected_oid="$2" current_open_refs
   if [[ "$DRY" == "true" ]]; then
     log "[dry-run] would delete: $branch"
   else
     # Refresh every page immediately before deletion. A PR opened after the
     # classification snapshot must protect its branch too. API failure holds
     # the ref; an exact lease protects pushes that race the final check.
-    if ! current_open_heads=$(gh api --paginate 'repos/{owner}/{repo}/pulls?state=open&per_page=100' --jq '.[].head.ref'); then
-      warn "  held remote: $branch (could not refresh open PR heads)"
+    if ! current_open_refs=$(gh api --paginate 'repos/{owner}/{repo}/pulls?state=open&per_page=100' --jq '.[] | .head.ref, .base.ref'); then
+      warn "  held remote: $branch (could not refresh open PR references)"
       return
     fi
-    if echo "$current_open_heads" | grep -qxF "$branch"; then
+    if echo "$current_open_refs" | grep -qxF "$branch"; then
       warn "  held remote: $branch (open PR)"
       return
     fi
@@ -343,7 +343,9 @@ if [[ ${#OPEN_LIST[@]} -gt 0 ]]; then
     # the merge API refuse when the PR head is no longer $gated_oid, so a push
     # landing between the gate and the merge cannot ride the earlier green
     # result onto $BASE.
-    if gh pr merge "$pr" "$merge_flag" --match-head-commit "$gated_oid" --delete-branch 2>&1; then
+    # gh's --delete-branch also deletes local branches. Leave remote cleanup
+    # to a later pass with confirmed delivery evidence and a deletion lease.
+    if gh pr merge "$pr" "$merge_flag" --match-head-commit "$gated_oid" 2>&1; then
       log "  $(green '✓') merged #$pr"
       (( merged_count++ )) || true
     else

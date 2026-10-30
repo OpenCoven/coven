@@ -126,7 +126,7 @@ Use a throwaway repository for smoke runs. Do not run untrusted prompts or harne
 
 ## Recommended Daily Workflow
 
-Before allocating a task checkout, fetch current main, inspect `coven claim status` and open PRs, then use `python3 scripts/task-worktree.py create --issue <N> --branch <branch> --path <path>`. The shared allocator enforces branch/worktree budgets. Follow the [worktree lifecycle and pruning procedure](docs/development/worktree-lifecycle.md) when allocation is refused and after delivery.
+Before allocating a task checkout, fetch current main, inspect `coven claim status` and open PRs, then use `python3 scripts/task-worktree.py create --issue <N> --branch <branch> --path <path>`. After the required checks, publish with `python3 scripts/task-worktree.py publish --issue <N>`. These commands share a lock and enforce task worktree/local branch allocation and live remote publication budgets. Follow the [worktree lifecycle and pruning procedure](docs/development/worktree-lifecycle.md) when a budget is exceeded and after delivery.
 
 1. Keep one clean checkout for running tests and release checks.
 2. Use one feature branch/worktree per change.

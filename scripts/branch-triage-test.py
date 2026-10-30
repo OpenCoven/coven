@@ -86,22 +86,36 @@ class RemotePreservationTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(['git', '-C', str(self.repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
 
-    def run_triage(self, move=False, merged_oid=None, late_open=False, api_error=False):
+    def run_triage(self, move=False, merged_oid=None, late_open=False, api_error=False, open_pr=False, late_base=False):
         tools = self.root / 'tools'
         tools.mkdir()
         gh = tools / 'gh'
         gh.write_text('''#!/usr/bin/env python3
 import json, os, subprocess, sys
-if sys.argv[1] == 'api':
+if sys.argv[1:3] == ['pr', 'merge']:
+    # Match gh's documented local side effect with a real Git deletion.
+    if '--delete-branch' in sys.argv:
+        subprocess.run(['git', 'branch', '-D', 'candidate'], check=True, stdout=subprocess.DEVNULL)
+elif sys.argv[1:3] == ['pr', 'view']:
+    print(json.dumps({'isDraft': False, 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN', 'reviewDecision': 'APPROVED', 'statusCheckRollup': [{'conclusion': 'SUCCESS', 'status': 'COMPLETED'}]}))
+elif sys.argv[1] == 'api':
     if os.environ.get('API_ERROR'):
         sys.exit(1)
-    print('candidate' if os.environ.get('LATE_OPEN') else '')
+    values=json.loads(os.environ.get('LIVE_OPEN_JSON', '[]'))
+    query=sys.argv[sys.argv.index('--jq')+1]
+    if query=='length':
+        print(len(values))
+    else:
+        for value in values:
+            print(value['head']['ref'])
+            if '.base.ref' in query:
+                print(value['base']['ref'])
 elif '--state' in sys.argv and sys.argv[sys.argv.index('--state')+1] == 'merged':
     if os.environ.get('MOVE_REMOTE'):
         subprocess.run(['git', '--git-dir', os.environ['TEST_REMOTE'], 'update-ref', 'refs/heads/candidate', os.environ['MOVE_REMOTE']], check=True)
     print(os.environ['MERGED_JSON'])
 else:
-    print('[]')
+    print(os.environ.get('OPEN_JSON', '[]'))
 ''')
         gh.chmod(0o755)
         merged = [{'headRefName': 'candidate', 'headRefOid': self.head,
@@ -109,10 +123,15 @@ else:
                    'mergeCommit': {'oid': merged_oid or self.merge}}]
         env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
                    DRY_RUN='false', MERGED_JSON=json.dumps(merged), TEST_REMOTE=str(self.remote))
+        if open_pr:
+            env['MERGED_JSON'] = '[]'
+            env['OPEN_JSON'] = json.dumps([{'number': 1, 'title': 'candidate', 'headRefName': 'candidate', 'headRefOid': self.head, 'headRepositoryOwner': {'login': 'fixture'}}])
         if move:
             env['MOVE_REMOTE'] = self.merge
         if late_open:
-            env['LATE_OPEN'] = 'true'
+            env['LIVE_OPEN_JSON'] = json.dumps([{'head': {'ref': 'candidate'}, 'base': {'ref': 'main'}}])
+        if late_base:
+            env['LIVE_OPEN_JSON'] = json.dumps([{'head': {'ref': 'another-task'}, 'base': {'ref': 'candidate'}}])
         if api_error:
             env['API_ERROR'] = 'true'
         result = subprocess.run(['bash', str(TRIAGE)], cwd=self.repo, env=env, capture_output=True, text=True)
@@ -150,10 +169,22 @@ else:
         self.assertIn(self.head + '\trefs/heads/candidate', self.remote_refs())
         self.assertIn('deleted=0', result.stdout)
 
+    def test_open_stacked_pr_base_holds_the_ref(self):
+        result = self.run_triage(late_base=True)
+        self.assertIn(self.head + '\trefs/heads/candidate', self.remote_refs())
+        self.assertIn('deleted=0', result.stdout)
+
     def test_open_pr_refresh_failure_holds_the_ref(self):
         result = self.run_triage(api_error=True)
         self.assertIn(self.head + '\trefs/heads/candidate', self.remote_refs())
-        self.assertIn('could not refresh open PR heads', result.stdout)
+        self.assertIn('could not refresh open PR references', result.stdout)
+
+    def test_eligible_open_pr_merge_preserves_the_local_head_branch(self):
+        marker = self.repo / 'retained.txt'
+        marker.write_text('retained local task data')
+        self.run_triage(open_pr=True)
+        self.assertIn('refs/heads/candidate ' + self.head, self.git('for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads'))
+        self.assertEqual(marker.read_text(), 'retained local task data')
 
 
 if __name__ == '__main__':

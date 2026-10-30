@@ -17,8 +17,8 @@ branches and need periodic cleanup.
    | SUPERSEDED | No PR, 0 unique commits vs base | Delete |
    | REVIEW | No PR, >0 unique commits | Skip — report only |
 
-2. **Deletes** MERGED and SUPERSEDED remote branches after refreshing every page of open PR heads. Exact origin-head and delivered-merge evidence is required for MERGED; a reused name, changed head, fork PR or merge into another base is insufficient. Deletion uses an expected-SHA lease so a concurrent push is preserved. Failed deletions are held and are not counted as deleted. Local branches remain untouched.
-3. **Merges** each OPEN-PR branch that clears the merge gate.
+2. **Deletes** MERGED and SUPERSEDED remote branches after refreshing every page of open PR heads and bases, preserving stacked PR prerequisites. Exact origin-head and delivered-merge evidence is required for MERGED; a reused name, changed head, fork PR or merge into another base is insufficient. Deletion uses an expected-SHA lease so a concurrent push is preserved. Failed deletions are held and are not counted as deleted. Local branches remain untouched.
+3. **Merges** each OPEN-PR branch that clears the merge gate without requesting CLI branch deletion. Remote cleanup waits for a later pass with confirmed delivery evidence and an expected-SHA lease; local refs remain untouched.
 4. **Skips** REVIEW branches — reports them in the job summary so a human can decide.
 5. **Writes** a Markdown summary to the GitHub job summary.
 
