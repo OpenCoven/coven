@@ -330,6 +330,72 @@ fn encrypted_gateway_keeps_per_request_signatures_and_shared_replay_state() {
     assert!(handle_transport_message(&fixture.state, &fixture.pairing, false, &wire).is_err());
 }
 
+/// Direct ingress answers a query-string target with 404 before routing. The
+/// encrypted transport must reject the same validly signed target instead of
+/// stripping it: no route is dispatched, the verifier never sees the request
+/// (its nonce stays unspent), and later requests keep per-request semantics.
+#[test]
+fn encrypted_gateway_rejects_query_targets_before_routing_or_verification() {
+    let fixture = Fixture::new();
+    let device_id = fixture.pairing.device_id;
+    let direct = read_mobile_request(
+        &mut fixture
+            .request("GET", "/api/v1/mobile/device?probe=1", device_id)
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(handle_mobile_request(&fixture.state, direct).status, 404);
+
+    // A stripped signed DELETE would revoke the paired device.
+    let delete = fixture.request("DELETE", "/api/v1/mobile/device?probe=1", device_id);
+    let Err(error) = handle_transport_message(&fixture.state, &fixture.pairing, false, &delete)
+    else {
+        panic!("query DELETE was served");
+    };
+    assert_eq!(
+        error.to_string(),
+        "transport request target has a query string"
+    );
+    let record = fixture
+        .state
+        .registry
+        .authorization_record(device_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        record.device.revoked_at.is_none(),
+        "query DELETE dispatched"
+    );
+
+    let target = "/api/v1/mobile/device?probe=1";
+    let wire = fixture.request("GET", target, device_id);
+    for direct in [true, false] {
+        assert!(handle_transport_message(&fixture.state, &fixture.pairing, direct, &wire).is_err());
+    }
+    let request = read_mobile_request(&mut wire.as_slice()).unwrap();
+    let auth = parse_auth_headers(&request.headers).unwrap();
+    fixture
+        .state
+        .authenticator
+        .verify_with_assurance(
+            "GET",
+            target,
+            &request.body,
+            &auth,
+            parse_assurance_headers(&request.headers),
+            Utc::now(),
+        )
+        .expect("rejected query request reached the verifier");
+
+    let wire = fixture.request("GET", "/api/v1/mobile/device", device_id);
+    let (response, close) =
+        handle_transport_message(&fixture.state, &fixture.pairing, false, &wire).unwrap();
+    assert_eq!((response.status, close), (200, false));
+    let (replay, _) =
+        handle_transport_message(&fixture.state, &fixture.pairing, false, &wire).unwrap();
+    assert_eq!(replay.status, 409);
+}
+
 #[test]
 fn relay_shutdown_cancels_contended_registry_lock_without_mutating_authority() {
     use fs2::FileExt;
@@ -674,6 +740,21 @@ fn relay_runtime_recovers_a_missed_slot_and_closes_rotated_or_revoked_sessions()
         assert!(started.elapsed() < Duration::from_secs(30));
     }
     assert_eq!(std::fs::read(&registry_path).unwrap(), registry_before);
+    let mut channel = connect_current(&provisioning, &pairing);
+    assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
+
+    // A signed query-string target closes the live session with no response,
+    // matching direct ingress's rejection; the same material reconnects.
+    let query = fixture.request("GET", "/api/v1/mobile/device?probe=1", device_id);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    assert!(
+        channel
+            .send_message(&query, MAX_MOBILE_REQUEST_BYTES, deadline)
+            .and_then(|()| channel.receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline))
+            .is_err(),
+        "query-string target was served"
+    );
+    assert!(exchange(&mut channel).is_err());
     let mut channel = connect_current(&provisioning, &pairing);
     assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
 
