@@ -229,7 +229,7 @@ fn explicit_threshold_bounds_are_enforced() {
 }
 
 #[test]
-fn two_of_three_commits_once_with_both_named_approvals() {
+fn two_of_three_commits_once_and_replays_enroll_no_new_destination() {
     let fixture = Fixture::new(2);
     let authority = fixture.authority();
     let request = fixture.request(&[0, 1]);
@@ -261,7 +261,68 @@ fn two_of_three_commits_once_with_both_named_approvals() {
             fixture.now,
         )
         .unwrap_err();
-    assert!(format!("{error:#}").contains("already consumed"));
+    assert!(
+        format!("{error:#}").contains("already consumed"),
+        "{error:#}"
+    );
+
+    // Reusing the consumed nonce for a different destination must not enroll
+    // that destination, even with fresh signatures from both approvers.
+    let replay_key = SigningKey::from_slice(&[41; 32]).unwrap();
+    let mut replay = request.clone();
+    replay.destination_id = Uuid::from_u128(51);
+    replay.destination_public_key = public(&replay_key);
+    replay.grant = DeviceGrant::for_device(
+        replay.destination_id,
+        &replay.destination_public_key,
+        vec![DeviceScope::MemoryRead],
+        fixture.now,
+    )
+    .unwrap();
+    replay.grant.expires_at = Some(fixture.now + chrono::Duration::hours(1));
+    let signature = sign(&replay_key, &replay.possession_bytes().unwrap());
+    authority
+        .admit_threshold(&replay, &signature, fixture.now)
+        .unwrap();
+    let a = fixture.genuine(&authority, &replay, 0);
+    let b = fixture.genuine(&authority, &replay, 1);
+    let error = authority
+        .introduce_threshold(
+            &replay,
+            &signature,
+            &[(fixture.approvers[0].id, &a), (fixture.approvers[1].id, &b)],
+            fixture.now,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("already consumed"),
+        "{error:#}"
+    );
+    assert!(DeviceRegistry::load(fixture.home.path())
+        .unwrap()
+        .device(replay.destination_id)
+        .unwrap()
+        .is_none());
+
+    // The destination and grant are otherwise valid: changing only the nonce
+    // and refreshing the signatures permits a new threshold introduction.
+    replay.nonce = [10; 32];
+    let signature = sign(&replay_key, &replay.possession_bytes().unwrap());
+    let a = fixture.genuine(&authority, &replay, 0);
+    let b = fixture.genuine(&authority, &replay, 1);
+    authority
+        .introduce_threshold(
+            &replay,
+            &signature,
+            &[(fixture.approvers[0].id, &a), (fixture.approvers[1].id, &b)],
+            fixture.now,
+        )
+        .unwrap();
+    assert!(DeviceRegistry::load(fixture.home.path())
+        .unwrap()
+        .device(replay.destination_id)
+        .unwrap()
+        .is_some());
 }
 
 #[test]
@@ -506,6 +567,114 @@ mod ledger {
         let authority =
             IntroductionAuthority::load_installed(fixture.home.path(), AUDIENCE).unwrap();
         mobile(fixture.genuine(&authority, request, index))
+    }
+
+    #[test]
+    fn lowering_n_from_two_requires_the_owner_root() {
+        let fixture = Fixture::new(2);
+        let (ledger, envelope) = installed(&fixture);
+        let store = OwnerPolicyStore::open(fixture.home.path(), AUDIENCE).unwrap();
+        let head = store.current().unwrap().unwrap();
+        let mut lower = fixture.policy.clone();
+        lower.required_approvals = 1;
+        let proposal = PolicyProposal {
+            revision: 2,
+            previous_digest: Some(head.digest.clone()),
+            policy: lower,
+            nonce: [5; 32],
+            issued_at: fixture.now,
+            expires_at: fixture.now + chrono::Duration::seconds(60),
+        };
+        let approver = &fixture.approvers[0];
+        let challenge = store
+            .issue_replacement_challenge(approver.id, fixture.now)
+            .unwrap();
+        let key = DeviceRegistry::load(fixture.home.path())
+            .unwrap()
+            .authorization_key(approver.id)
+            .unwrap()
+            .unwrap();
+        let action = store.replace_action(&proposal).unwrap();
+        let mut device_action = action.clone();
+        device_action.operation = "devices.introduction_policy.replace".into();
+        let mut step_up = PresentedAssuranceProof {
+            context_mode: AssuranceContextMode::Action,
+            challenge: challenge.challenge,
+            issued_at: fixture.now,
+            expires_at: challenge.expires_at,
+            requested_assurance: RequestedAssurance::FreshBiometric,
+            signature: String::new(),
+        };
+        step_up.signature = sign(
+            &approver.step_up,
+            &CanonicalAssuranceProof::for_action(
+                AssuranceProofBinding {
+                    device_id: approver.id,
+                    grant_id: approver.grant.id,
+                    revocation_epoch: 0,
+                    authorization_key_id: key.subject_key_id,
+                },
+                &step_up,
+                &device_action,
+            )
+            .unwrap()
+            .canonical_bytes(),
+        );
+        let error = store
+            .replace(
+                &proposal,
+                &PolicyApproval::Introducer {
+                    device_id: approver.id,
+                    possession_signature: sign(
+                        &approver.possession,
+                        &device_action.canonical_bytes().unwrap(),
+                    ),
+                    step_up,
+                },
+                fixture.now,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("downgrade requires owner-root"));
+        let unchanged = store.current().unwrap().unwrap();
+        assert_eq!(unchanged.digest, head.digest);
+        assert_eq!(unchanged.policy.required_approvals, 2);
+
+        // The refused downgrade leaves the installed threshold effective.
+        let admitted = ledger.admit(envelope.clone(), fixture.now).unwrap();
+        let first = ledger
+            .approve(
+                admitted.id,
+                approver.id,
+                approval(&fixture, &envelope, 0),
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(first.state, IntroductionState::AwaitingApproval);
+        assert_eq!((first.approvals_received, first.approvals_required), (1, 2));
+        assert!(!fixture.enrolled());
+        let done = ledger
+            .approve(
+                admitted.id,
+                fixture.approvers[1].id,
+                approval(&fixture, &envelope, 1),
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(done.state, IntroductionState::Introduced);
+        assert!(fixture.enrolled());
+
+        // The same proposal is valid when approved by the registered root.
+        let root = SigningKey::from_slice(&[90; 32]).unwrap();
+        let replaced = store
+            .replace(
+                &proposal,
+                &PolicyApproval::OwnerRoot {
+                    signature: sign(&root, &action.canonical_bytes().unwrap()),
+                },
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(replaced.policy.required_approvals, 1);
     }
 
     #[test]
