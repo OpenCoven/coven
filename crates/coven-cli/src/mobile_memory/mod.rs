@@ -12,6 +12,7 @@ pub mod introduction;
 pub mod owner_policy;
 pub mod pairing;
 pub mod policy_cli;
+pub mod recovery;
 pub mod registry;
 pub mod relay;
 pub mod transport;

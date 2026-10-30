@@ -1,6 +1,7 @@
 mod introduction;
 #[cfg(test)]
 pub(super) use introduction::fail_after_introduction_write;
+pub(in crate::mobile_memory) use introduction::PendingEnrollment;
 
 use std::fs;
 use std::io;

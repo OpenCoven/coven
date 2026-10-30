@@ -329,6 +329,16 @@ fn refuse_inside_home(home: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Loads the owner-root key for one signature, refusing any path in `COVEN_HOME`.
+pub(super) fn load_owner_root(home: &Path, path: &Path) -> Result<SigningKey> {
+    refuse_inside_home(home, path)?;
+    load_root_key(path)
+}
+
+pub(super) fn sign_action(key: &SigningKey, action: &DeviceActionIntent) -> Result<String> {
+    Ok(sign(key, &action.canonical_bytes()?))
+}
+
 fn load_root_key(path: &Path) -> Result<SigningKey> {
     let pem = Zeroizing::new(
         std::fs::read_to_string(path)
