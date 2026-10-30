@@ -35,6 +35,8 @@ use super::pairing::{PairingError, PairingLifecycleState, PairingManager, Pairin
 use super::registry::DeviceRegistry;
 use super::{MAX_MOBILE_REQUEST_BYTES, MAX_MOBILE_RESPONSE_BYTES};
 
+mod relay_runtime;
+
 const MOBILE_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE_BYTES: usize = 4 * 1024;
 const MAX_HEADER_COUNT: usize = 32;
@@ -51,6 +53,7 @@ pub enum MobileRoute {
     Pairings,
     PairingConfirmation,
     AssuranceChallenge,
+    TransportBootstrap,
     MemoryOverview,
     MemoryList,
     MemoryDetail,
@@ -73,6 +76,9 @@ pub fn route_request(method: &str, path: &str) -> RouteDecision {
             return method_route(method, "GET", MobileRoute::Capabilities)
         }
         "/api/v1/mobile/pairings" => return method_route(method, "POST", MobileRoute::Pairings),
+        "/api/v1/mobile/transport/bootstrap" => {
+            return method_route(method, "POST", MobileRoute::TransportBootstrap)
+        }
         "/api/v1/mobile/assurance/challenge" => {
             return method_route(method, "POST", MobileRoute::AssuranceChallenge)
         }
@@ -287,6 +293,13 @@ pub struct MobileGatewayHandle {
     local_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    state: Arc<MobileGatewayState>,
+}
+
+/// Stop relay workers before dropping the HTTPS listener and shared authority.
+pub struct MobileRuntimeHandle {
+    _relay: Option<relay_runtime::RelayHandle>,
+    _direct: Option<MobileGatewayHandle>,
 }
 
 impl MobileGatewayHandle {
@@ -311,7 +324,7 @@ struct MobileGatewayState {
     registry: Arc<DeviceRegistry>,
     pairing: PairingManager,
     authenticator: MobileAuthenticator,
-    advertised_endpoint: String,
+    advertised_endpoint: Option<String>,
     introductions: super::enrollment::IntroductionLedger,
 }
 
@@ -329,7 +342,7 @@ pub fn start_mobile_gateway(coven_home: &Path) -> Result<Option<MobileGatewayHan
 /// optional config is quarantined to the mobile surface so the owner-only
 /// local daemon remains available; a valid enabled config that cannot bind or
 /// initialize still fails startup instead of silently disabling remote access.
-pub fn start_mobile_gateway_for_daemon(coven_home: &Path) -> Result<Option<MobileGatewayHandle>> {
+pub fn start_mobile_gateway_for_daemon(coven_home: &Path) -> Result<Option<MobileRuntimeHandle>> {
     let config = match load_mobile_config_unvalidated(coven_home) {
         Ok(config) => config,
         Err(error) => {
@@ -337,13 +350,73 @@ pub fn start_mobile_gateway_for_daemon(coven_home: &Path) -> Result<Option<Mobil
             return Ok(None);
         }
     };
-    let Some(config) = config else {
-        return Ok(None);
+    let relay = match super::transport::storage::RelayConfig::load(coven_home) {
+        Ok(config) => config.filter(|config| config.enabled),
+        Err(_) => {
+            eprintln!("coven mobile relay disabled: invalid private configuration");
+            None
+        }
     };
-    if !config.enabled {
+    if !config.as_ref().is_some_and(|config| config.enabled) && relay.is_none() {
         return Ok(None);
     }
-    start_mobile_gateway_with_config(coven_home, &config).map(Some)
+    let direct = config
+        .as_ref()
+        .filter(|config| config.enabled)
+        .map(|config| start_mobile_gateway_with_config(coven_home, config))
+        .transpose()?;
+    let relay = if relay.is_some() {
+        use p256::pkcs8::DecodePrivateKey;
+        let identity = super::identity::load_existing_host_identity(coven_home)?;
+        let state = match &direct {
+            Some(handle) => Arc::clone(&handle.state),
+            None => create_gateway_state(coven_home, None, identity.public_key_fingerprint)?,
+        };
+        anyhow::ensure!(
+            state.host_fingerprint == identity.public_key_fingerprint,
+            "mobile host identity changed during startup"
+        );
+        let signer = p256::ecdsa::SigningKey::from_pkcs8_der(&identity.private_key_der)?;
+        let relay = relay_runtime::RelayHandle::start(Arc::clone(&state), Arc::new(signer))?;
+        // Owner-socket controls belong to the runtime, including relay-only mode.
+        *ACTIVE_GATEWAY
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mobile gateway control lock was poisoned"))? =
+            Some(Arc::downgrade(&state));
+        Some(relay)
+    } else {
+        None
+    };
+    Ok(Some(MobileRuntimeHandle {
+        _relay: relay,
+        _direct: direct,
+    }))
+}
+
+fn create_gateway_state(
+    coven_home: &Path,
+    config: Option<&MobileGatewayConfig>,
+    host_fingerprint: [u8; 32],
+) -> Result<Arc<MobileGatewayState>> {
+    let registry = Arc::new(DeviceRegistry::load(coven_home)?);
+    let challenges = Arc::new(AssuranceChallengeStore::load(coven_home)?);
+    Ok(Arc::new(MobileGatewayState {
+        coven_home: coven_home.to_path_buf(),
+        host_fingerprint,
+        pairing: PairingManager::new(Arc::clone(&registry)),
+        authenticator: MobileAuthenticator::with_assurance(
+            Arc::clone(&registry),
+            Arc::clone(&challenges),
+        ),
+        registry: Arc::clone(&registry),
+        advertised_endpoint: config.map(|config| config.advertised_endpoint.clone()),
+        introductions: super::enrollment::IntroductionLedger::with_stores(
+            coven_home,
+            host_fingerprint,
+            registry,
+            challenges,
+        ),
+    }))
 }
 
 fn start_mobile_gateway_with_config(
@@ -367,20 +440,7 @@ fn start_mobile_gateway_with_config(
         .set_nonblocking(true)
         .context("failed to configure mobile gateway listener")?;
     let local_addr = listener.local_addr()?;
-    let registry = Arc::new(DeviceRegistry::load(coven_home)?);
-    let challenges = AssuranceChallengeStore::load(coven_home)?;
-    let state = Arc::new(MobileGatewayState {
-        coven_home: coven_home.to_path_buf(),
-        host_fingerprint: identity.public_key_fingerprint,
-        pairing: PairingManager::new(Arc::clone(&registry)),
-        authenticator: MobileAuthenticator::with_assurance(Arc::clone(&registry), challenges),
-        registry,
-        advertised_endpoint: config.advertised_endpoint.clone(),
-        introductions: super::enrollment::IntroductionLedger::new(
-            coven_home,
-            identity.public_key_fingerprint,
-        ),
-    });
+    let state = create_gateway_state(coven_home, Some(config), identity.public_key_fingerprint)?;
     *ACTIVE_GATEWAY
         .lock()
         .map_err(|_| anyhow::anyhow!("mobile gateway control lock was poisoned"))? =
@@ -389,6 +449,7 @@ fn start_mobile_gateway_with_config(
     let thread_shutdown = Arc::clone(&shutdown);
     let thread_home = coven_home.to_path_buf();
     let inflight = Arc::new(AtomicUsize::new(0));
+    let handle_state = Arc::clone(&state);
     let thread = std::thread::Builder::new()
         .name("coven-mobile-memory".to_owned())
         .spawn(move || {
@@ -454,6 +515,7 @@ fn start_mobile_gateway_with_config(
         local_addr,
         shutdown,
         thread: Some(thread),
+        state: handle_state,
     })
 }
 
@@ -496,6 +558,10 @@ struct MobileHttpRequest {
 
 fn read_mobile_request(stream: &mut impl Read) -> Result<MobileHttpRequest> {
     let mut reader = BufReader::new(stream);
+    read_mobile_request_buffered(&mut reader)
+}
+
+fn read_mobile_request_buffered(reader: &mut impl BufRead) -> Result<MobileHttpRequest> {
     let mut request_line = String::new();
     reader
         .by_ref()
@@ -586,14 +652,12 @@ fn handle_mobile_request(
     state: &MobileGatewayState,
     request: MobileHttpRequest,
 ) -> MobileHttpResponse {
+    // No mobile route takes a query string. Encrypted transport ingress
+    // rejects the same targets in `handle_transport_message`.
     if request.target.contains('?') {
         return error_response(404, MobileErrorCode::InvalidRequest);
     }
-    let path = request
-        .target
-        .split_once('?')
-        .map_or(request.target.as_str(), |value| value.0)
-        .to_owned();
+    let path = request.target.clone();
     match route_request(&request.method, &path) {
         RouteDecision::NotFound => error_response(404, MobileErrorCode::InvalidRequest),
         RouteDecision::MethodNotAllowed(allow) => MobileHttpResponse {
@@ -701,6 +765,89 @@ fn handle_pairing_confirmation(
     }
 }
 
+/// Admit one logical request from an already-authenticated endpoint channel.
+/// The same authenticator instance services TLS and relay traffic, sharing nonce
+/// replay/rate state and retaining per-request signatures and assurance checks.
+pub fn serve_authenticated_transport<R: super::transport::Records>(
+    channel: &mut super::transport::Channel<R>,
+) -> Result<()> {
+    let result = serve_authenticated_transport_inner(channel);
+    if result.is_err() {
+        channel.close();
+    }
+    result
+}
+
+fn serve_authenticated_transport_inner<R: super::transport::Records>(
+    channel: &mut super::transport::Channel<R>,
+) -> Result<()> {
+    let state = active_gateway()?;
+    serve_transport_with_state(&state, channel)
+}
+
+fn serve_transport_with_state<R: super::transport::Records>(
+    state: &MobileGatewayState,
+    channel: &mut super::transport::Channel<R>,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + MOBILE_IO_TIMEOUT;
+    let encoded = channel.receive_message(
+        MAX_MOBILE_REQUEST_BYTES + MAX_HEADER_LINE_BYTES * (MAX_HEADER_COUNT + 1),
+        deadline,
+    )?;
+    let (response, close) =
+        handle_transport_message(state, channel.pairing(), channel.is_direct(), &encoded)?;
+    channel.send_message(
+        &response.to_http(),
+        MAX_MOBILE_RESPONSE_BYTES + MAX_HEADER_LINE_BYTES,
+        deadline,
+    )?;
+    if close {
+        channel.close();
+    }
+    Ok(())
+}
+
+fn handle_transport_message(
+    state: &MobileGatewayState,
+    pairing: &super::transport::Pairing,
+    direct: bool,
+    encoded: &[u8],
+) -> Result<(MobileHttpResponse, bool)> {
+    super::transport::authority::check_current(&state.registry, pairing, direct, Utc::now())?;
+    let mut reader = BufReader::new(std::io::Cursor::new(encoded));
+    let request = read_mobile_request_buffered(&mut reader)?;
+    if !reader.fill_buf()?.is_empty() {
+        bail!("trailing transport request data");
+    }
+    // Match direct ingress: a query string is rejected before routing or
+    // verification, never stripped, so it closes the channel undispatched.
+    if request.target.contains('?') {
+        bail!("transport request target has a query string");
+    }
+    let auth = parse_auth_headers(&request.headers)
+        .map_err(|_| anyhow::anyhow!("invalid signed transport request"))?;
+    if auth.device_id != pairing.device_id {
+        bail!("request identity differs from channel identity");
+    }
+    let path = request.target.clone();
+    let RouteDecision::Route(route) = route_request(&request.method, &path) else {
+        bail!("unsupported transport route");
+    };
+    if matches!(
+        route,
+        MobileRoute::Capabilities | MobileRoute::Pairings | MobileRoute::PairingConfirmation
+    ) {
+        bail!("transport requires a protected route");
+    }
+    let response = handle_protected_route(state, route, &path, request);
+    // Device deletion already revokes the channel's identity. Return its signed-
+    // request result once; the scheduler must close that channel afterward.
+    if route != MobileRoute::DeviceDelete {
+        super::transport::authority::check_current(&state.registry, pairing, direct, Utc::now())?;
+    }
+    Ok((response, route == MobileRoute::DeviceDelete))
+}
+
 fn handle_protected_route(
     state: &MobileGatewayState,
     route: MobileRoute,
@@ -773,6 +920,30 @@ fn handle_protected_route(
                 }),
                 Err(error) => return auth_error_response(error),
             }
+        }
+        MobileRoute::TransportBootstrap => {
+            use p256::pkcs8::DecodePrivateKey;
+            (|| -> Result<serde_json::Value> {
+                let identity = super::identity::load_existing_host_identity(&state.coven_home)?;
+                if identity.public_key_fingerprint != state.host_fingerprint {
+                    bail!("host identity changed");
+                }
+                let host = p256::ecdsa::SigningKey::from_pkcs8_der(&identity.private_key_der)?;
+                let material = super::transport::storage::load_or_provision(
+                    &state.coven_home,
+                    &state.registry,
+                    &host,
+                    verified.device_id,
+                )?;
+                let mut provisioning = material.provisioning(&host)?;
+                if let Some(config) =
+                    super::transport::storage::RelayConfig::load(&state.coven_home)?
+                        .filter(|config| config.enabled)
+                {
+                    provisioning.relay_endpoints = config.endpoints;
+                }
+                json_value(provisioning)
+            })()
         }
         MobileRoute::MemoryOverview => mobile_overview(&state.coven_home).and_then(json_value),
         MobileRoute::MemoryList => mobile_list(&state.coven_home).and_then(json_value),
@@ -944,14 +1115,15 @@ pub(crate) fn handle_local_control(
         }
         return Some((|| {
             let state = active_gateway()?;
+            let endpoint = state
+                .advertised_endpoint
+                .as_deref()
+                .context("private mobile listener is not running")?;
             let invitation = state
                 .pairing
                 .begin_pairing(rand::random(), Utc::now() + PAIRING_LIFETIME)?;
-            let url = super::pairing::build_pairing_url(
-                &invitation,
-                &state.advertised_endpoint,
-                state.host_fingerprint,
-            )?;
+            let url =
+                super::pairing::build_pairing_url(&invitation, endpoint, state.host_fingerprint)?;
             let terminal_output =
                 super::pairing::render_pairing_invitation(&url, invitation.expires_at)?;
             append_event(
@@ -1313,6 +1485,9 @@ fn reason(status: u16) -> &'static str {
 }
 
 #[cfg(test)]
+mod transport_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1327,7 +1502,7 @@ mod tests {
     use std::net::{IpAddr, UdpSocket};
     use std::sync::Barrier;
 
-    static TEST_GATEWAY_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static TEST_GATEWAY_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn mobile_route_table_never_forwards_local_api_paths() {
@@ -1471,7 +1646,7 @@ mod tests {
                 AssuranceChallengeStore::load(temp.path()).unwrap(),
             ),
             registry,
-            advertised_endpoint: "https://192.0.2.1:7443".to_owned(),
+            advertised_endpoint: Some("https://192.0.2.1:7443".to_owned()),
             introductions: super::super::enrollment::IntroductionLedger::new(temp.path(), [3; 32]),
         };
         let path = "/api/v1/mobile/assurance/challenge";
@@ -1782,17 +1957,20 @@ mod tests {
     ) -> MobileGatewayState {
         let home = fixture.home.path();
         let registry = Arc::new(DeviceRegistry::load(home).unwrap());
+        let challenges = Arc::new(AssuranceChallengeStore::load(home).unwrap());
         MobileGatewayState {
             coven_home: home.to_path_buf(),
             host_fingerprint: [7; 32],
             pairing: PairingManager::new(Arc::clone(&registry)),
             authenticator: MobileAuthenticator::with_assurance(
                 Arc::clone(&registry),
-                AssuranceChallengeStore::load(home).unwrap(),
+                Arc::clone(&challenges),
             ),
-            registry,
-            advertised_endpoint: "https://192.0.2.1:7443".to_owned(),
-            introductions: super::super::enrollment::IntroductionLedger::new(home, [7; 32]),
+            registry: Arc::clone(&registry),
+            advertised_endpoint: Some("https://192.0.2.1:7443".to_owned()),
+            introductions: super::super::enrollment::IntroductionLedger::with_stores(
+                home, [7; 32], registry, challenges,
+            ),
         }
     }
 
@@ -1831,6 +2009,86 @@ mod tests {
             ]),
             body,
         }
+    }
+
+    #[test]
+    fn relay_only_runtime_exposes_owner_introduction_controls_without_qr_listener() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        for disabled_config in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let identity = load_or_create_host_identity(home.path(), "192.168.50.1").unwrap();
+            if disabled_config {
+                super::super::config::save_mobile_config(
+                    home.path(),
+                    &MobileGatewayConfig {
+                        enabled: false,
+                        bind: "192.168.50.1:7443".parse().unwrap(),
+                        advertised_endpoint: "https://192.168.50.1:7443".into(),
+                    },
+                )
+                .unwrap();
+            }
+            super::super::transport::storage::RelayConfig {
+                version: 1,
+                enabled: true,
+                endpoints: vec![super::super::transport::websocket::EndpointConfig {
+                    url: "wss://relay.example.test/ws".into(),
+                    ca_certificates: vec![],
+                }],
+            }
+            .save(home.path())
+            .unwrap();
+            // No enrolled peers: the manager must not attempt any network connection.
+            let runtime = start_mobile_gateway_for_daemon(home.path())
+                .unwrap()
+                .unwrap();
+            let state = active_gateway().expect("relay-only owner controls have no active state");
+            assert_eq!(state.host_fingerprint, identity.public_key_fingerprint);
+            assert!(
+                state.advertised_endpoint.is_none(),
+                "disabled listener advertised a QR endpoint"
+            );
+            let response =
+                handle_local_control("POST", "/api/v1/internal/mobile/introductions", Some("{}"))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(response.status, 400);
+            assert!(handle_local_control("POST", LOCAL_CONTROL_ROOT, None)
+                .unwrap()
+                .is_err());
+            drop(state);
+            drop(runtime);
+            assert!(
+                active_gateway().is_err(),
+                "stopped relay retained owner control state"
+            );
+        }
+    }
+
+    #[test]
+    fn introduction_approval_observes_runtime_registry_cancellation() {
+        let fixture = super::super::enrollment::tests::Fixture::new_at(Utc::now());
+        let state = introduction_gateway(&fixture);
+        let admitted = state
+            .introductions
+            .admit(fixture.envelope.clone(), fixture.now)
+            .unwrap();
+        let approval = fixture.approval();
+        // Model shutdown after request authentication, before approval dispatch.
+        state.registry.cancel_pending_operations();
+        let result =
+            state
+                .introductions
+                .approve(admitted.id, fixture.introducer(), approval, fixture.now);
+        assert!(
+            result.is_err(),
+            "approval ignored runtime shutdown and enrolled a device"
+        );
+        let fresh = DeviceRegistry::load(fixture.home.path()).unwrap();
+        assert!(fresh
+            .device(fixture.envelope.request.destination_id())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1967,7 +2225,7 @@ mod tests {
         assert_eq!(envelope_data(&approved.body)["state"], "introduced");
         assert!(state
             .registry
-            .device(fixture.envelope.request.destination_id)
+            .device(fixture.envelope.request.destination_id())
             .unwrap()
             .is_some());
     }

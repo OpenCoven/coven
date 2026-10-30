@@ -4,6 +4,9 @@
 //! step. Only the mission executors commit, replay or refuse; this suite
 //! compares what they answer and what a refusal leaves behind.
 //!
+//! M-17 and M-18 cover a submit's `scopes` (#1597): accepted, returned by the
+//! view and bound by the adoption key, or refused before anything is recorded.
+//!
 //! M0 launches nothing, so the vectors that need a launched or still-queued
 //! mission (M-07, M-08, M-10, M-12, M-13 and M-14) wait for Runtime Authority
 //! (#857). M-16 is a transport rule, held by the transport authority tests.
@@ -108,6 +111,9 @@ struct Expect {
     state: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    /// The scopes that view must return, compared whole.
+    #[serde(default)]
+    scopes: Option<Value>,
     /// The earlier, identical step whose answer this one repeats.
     #[serde(default)]
     replays: Option<usize>,
@@ -294,6 +300,10 @@ fn case_matches(case: &Case) -> Result<bool, &'static str> {
                 .reason
                 .as_deref()
                 .is_none_or(|reason| view["reason"].as_str() == Some(reason))
+            && expect
+                .scopes
+                .as_ref()
+                .is_none_or(|scopes| view.get("scopes") == Some(scopes))
             && repeat_matches
             && writes_match;
         answers.push((outcome, answer));

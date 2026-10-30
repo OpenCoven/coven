@@ -128,7 +128,7 @@ pub struct MobileAuthenticator {
     registry: Arc<DeviceRegistry>,
     replay: Mutex<HashMap<(Uuid, [u8; 32]), i64>>,
     rates: Mutex<HashMap<Uuid, VecDeque<i64>>>,
-    challenges: Option<AssuranceChallengeStore>,
+    challenges: Option<Arc<AssuranceChallengeStore>>,
 }
 
 impl MobileAuthenticator {
@@ -143,13 +143,13 @@ impl MobileAuthenticator {
 
     pub fn with_assurance(
         registry: Arc<DeviceRegistry>,
-        challenges: AssuranceChallengeStore,
+        challenges: impl Into<Arc<AssuranceChallengeStore>>,
     ) -> Self {
         Self {
             registry,
             replay: Mutex::new(HashMap::new()),
             rates: Mutex::new(HashMap::new()),
-            challenges: Some(challenges),
+            challenges: Some(challenges.into()),
         }
     }
 

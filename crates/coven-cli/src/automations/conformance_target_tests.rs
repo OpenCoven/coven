@@ -1393,13 +1393,13 @@ fn mission_commands_suite_executes_the_checked_in_vectors() {
     let response = evaluate(&request_for("mission-commands", vectors)).unwrap();
 
     assert_eq!(response.status, TargetSuiteStatus::Passed);
-    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 10);
-    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 10);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 12);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 12);
 }
 
 #[test]
 fn mission_commands_suite_fails_when_the_executors_disagree() {
-    let wrong_expectations: [fn(&mut Value); 8] = [
+    let wrong_expectations: [fn(&mut Value); 11] = [
         // A lost acknowledgement would have to commit a second time.
         |vectors| {
             vectors["cases"][1]["steps"][1]["expect"] =
@@ -1429,6 +1429,21 @@ fn mission_commands_suite_fails_when_the_executors_disagree() {
         // A 61-minute timeout would have to pass.
         |vectors| {
             vectors["cases"][8]["steps"][1]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+        // The view would have to return scopes other than the ones submitted.
+        |vectors| {
+            vectors["cases"][10]["steps"][1]["expect"]["scopes"] = json!([{ "kind": "filesystem", "root": "project", "path": "src/lib",
+                         "access": "read", "recursive": true }]);
+        },
+        // Changed scopes under the same key would have to commit again.
+        |vectors| {
+            vectors["cases"][10]["steps"][3]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+        // A workspace-root scope would have to be accepted.
+        |vectors| {
+            vectors["cases"][11]["steps"][7]["expect"] =
                 json!({ "outcome": "committed", "state": "queued" });
         },
     ];

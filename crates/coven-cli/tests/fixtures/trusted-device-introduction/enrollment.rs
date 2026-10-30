@@ -5,7 +5,7 @@ use crate::mobile_memory::assurance::{
     AssuranceClass, AssuranceProofBinding, CanonicalAssuranceProof, NewAuthorizationKey,
 };
 use crate::mobile_memory::grant::{DeviceGrant, DeviceScope};
-use crate::mobile_memory::introduction::IntroductionPolicy;
+use crate::mobile_memory::introduction::{IntroductionPolicy, IntroductionRequest};
 use crate::mobile_memory::owner_policy::{OwnerPolicyStore, PolicyApproval, PolicyProposal};
 use crate::mobile_memory::registry::{DeviceRecord, DeviceRegistry};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -124,7 +124,7 @@ impl Fixture {
         };
         let envelope = IntroductionEnvelope {
             destination_signature: sign(&destination, &request.possession_bytes().unwrap()),
-            request,
+            request: IntroductionTranscript::Single(request),
         };
         Self {
             ledger: IntroductionLedger::new(home.path(), AUDIENCE),
@@ -141,7 +141,7 @@ impl Fixture {
     /// What a genuine introducer app produces after rendering the request.
     pub(in crate::mobile_memory) fn approval(&self) -> MobileIntroductionApproval {
         let authority = IntroductionAuthority::load_installed(self.home.path(), AUDIENCE).unwrap();
-        let request = &self.envelope.request;
+        let request = v1(&self.envelope);
         let challenge = authority.issue_challenge(request, self.now).unwrap();
         let key = DeviceRegistry::load(self.home.path())
             .unwrap()
@@ -211,13 +211,13 @@ impl Fixture {
     fn enrolled(&self) -> bool {
         DeviceRegistry::load(self.home.path())
             .unwrap()
-            .device(self.envelope.request.destination_id)
+            .device(v1(&self.envelope).destination_id)
             .unwrap()
             .is_some()
     }
 
     pub(in crate::mobile_memory) fn introducer(&self) -> Uuid {
-        self.envelope.request.introducer_id
+        v1(&self.envelope).introducer_id
     }
 }
 
@@ -255,10 +255,7 @@ fn owner_admission_then_introducer_approval_enrolls_once() {
         )
         .unwrap();
     assert_eq!(done.state, IntroductionState::Introduced);
-    assert_eq!(
-        done.device_id,
-        Some(fixture.envelope.request.destination_id)
-    );
+    assert_eq!(done.device_id, Some(v1(&fixture.envelope).destination_id));
     assert!(fixture.enrolled());
 
     // Replay of the approval, or of the whole request, cannot enroll again.
@@ -287,11 +284,11 @@ fn owner_admission_then_introducer_approval_enrolls_once() {
 fn tampered_or_unsigned_requests_are_never_admitted() {
     let fixture = Fixture::new();
     let mut tampered = fixture.envelope.clone();
-    tampered.request.grant.scopes = vec![DeviceScope::MemoryRead, DeviceScope::DeviceAdmin];
+    v1_mut(&mut tampered).grant.scopes = vec![DeviceScope::MemoryRead, DeviceScope::DeviceAdmin];
     assert!(fixture.ledger.admit(tampered, fixture.now).is_err());
 
     let mut renamed = fixture.envelope.clone();
-    renamed.request.device_name = "Owner's phone".into();
+    v1_mut(&mut renamed).device_name = "Owner's phone".into();
     assert!(fixture.ledger.admit(renamed, fixture.now).is_err());
 
     // A relay holding its own key cannot sign for the destination.
@@ -301,7 +298,7 @@ fn tampered_or_unsigned_requests_are_never_admitted() {
     assert!(fixture.ledger.admit(forged, fixture.now).is_err());
 
     let mut foreign = fixture.envelope.clone();
-    foreign.request.audience = [8; 32];
+    v1_mut(&mut foreign).audience = [8; 32];
     assert!(fixture.ledger.admit(foreign, fixture.now).is_err());
 
     assert!(fixture
@@ -365,7 +362,7 @@ fn expiry_cancellation_and_policy_replacement_fail_closed() {
         .ledger
         .admit(fixture.envelope.clone(), fixture.now)
         .unwrap();
-    let later = fixture.envelope.request.expires_at;
+    let later = v1(&fixture.envelope).expires_at;
     assert_eq!(
         fixture.ledger.status(admitted.id, later).unwrap().state,
         IntroductionState::Expired
@@ -450,14 +447,14 @@ fn admission_requires_an_installed_policy() {
 #[test]
 fn review_renders_every_signed_field() {
     let fixture = Fixture::new();
-    let request = &fixture.envelope.request;
+    let request = v1(&fixture.envelope);
     let action = request.action().unwrap();
     let head = OwnerPolicyStore::open(fixture.home.path(), AUDIENCE)
         .unwrap()
         .current()
         .unwrap()
         .unwrap();
-    let review = render_introduction_review(request, &action, &head);
+    let review = render_introduction_review(&fixture.envelope.request, &action, &head);
     for expected in [
         "devices.introduction.approve".to_owned(),
         action.target.clone(),
@@ -482,4 +479,94 @@ fn review_renders_every_signed_field() {
             "review omits {expected}:\n{review}"
         );
     }
+}
+
+fn v1(envelope: &IntroductionEnvelope) -> &IntroductionRequest {
+    match &envelope.request {
+        IntroductionTranscript::Single(request) => request,
+        IntroductionTranscript::Threshold(_) => panic!("fixture envelopes are v1"),
+    }
+}
+
+fn v1_mut(envelope: &mut IntroductionEnvelope) -> &mut IntroductionRequest {
+    match &mut envelope.request {
+        IntroductionTranscript::Single(request) => request,
+        IntroductionTranscript::Threshold(_) => panic!("fixture envelopes are v1"),
+    }
+}
+
+#[test]
+fn shutdown_releases_approval_and_ledger_readers_without_enrollment() {
+    use fs2::FileExt;
+    use std::sync::mpsc::sync_channel;
+    let fixture = Fixture::new();
+    let admitted = fixture
+        .ledger
+        .admit(fixture.envelope.clone(), fixture.now)
+        .unwrap();
+    let approval = fixture.approval();
+    let before = std::fs::read(fixture.home.path().join("mobile/devices.json")).unwrap();
+    let held = crate::state_lock::open_lock_file(&fixture.home.path().join("mobile/.devices.lock"))
+        .unwrap();
+    held.lock_exclusive().unwrap();
+    let (registry_ready, registry_waiting) = sync_channel(1);
+    fixture.ledger.registry.observe_lock_waits(registry_ready);
+    let (ledger_ready, ledger_waiting) = sync_channel(1);
+    *fixture.ledger.lock_wait_observer.lock().unwrap() = Some(ledger_ready);
+    let fixture_ref = &fixture;
+    std::thread::scope(move |scope| {
+        // Drop the held file lock before scope joins workers if an assertion fails.
+        let _held = held;
+        let fixture = fixture_ref;
+        let (approved, approval_result) = sync_channel(1);
+        scope.spawn(move || {
+            let result =
+                fixture
+                    .ledger
+                    .approve(admitted.id, fixture.introducer(), approval, fixture.now);
+            approved.send(result).unwrap();
+        });
+        // These are hang guards. Actual failed lock attempts establish sequencing.
+        registry_waiting
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        let (read, read_result) = sync_channel(1);
+        scope.spawn(move || {
+            read.send(fixture.ledger.status(admitted.id, fixture.now))
+                .unwrap();
+        });
+        ledger_waiting
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        fixture.ledger.registry.cancel_pending_operations();
+        let error = approval_result
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Uncertain"), "{error:#}");
+        assert!(read_result
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .is_err());
+    });
+    assert_eq!(
+        fixture
+            .ledger
+            .entries
+            .lock()
+            .unwrap()
+            .get(&admitted.id)
+            .unwrap()
+            .state,
+        IntroductionState::Uncertain
+    );
+    assert_eq!(
+        std::fs::read(fixture.home.path().join("mobile/devices.json")).unwrap(),
+        before
+    );
+    let fresh = DeviceRegistry::load(fixture.home.path()).unwrap();
+    assert!(fresh
+        .device(v1(&fixture.envelope).destination_id)
+        .unwrap()
+        .is_none());
 }

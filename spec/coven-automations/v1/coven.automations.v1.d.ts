@@ -515,6 +515,26 @@ export interface MissionSubmitPayload {
   limits: { timeoutMinutes: number };
   /** Dispatch must begin before this instant, at most 15 minutes after the request. */
   validUntil: Timestamp;
+  /**
+   * Optional: 1-32 project read scopes; absent means none. Each is validated
+   * with the scoped read service's rules. Older daemons reject the field.
+   */
+  scopes?: MissionScope[];
+}
+
+/** A profile filesystem read scope on the project root. */
+export interface MissionScope {
+  kind: "filesystem";
+  root: "project";
+  /**
+   * Relative to the project root, "/"-separated, at most 32 components and 4096
+   * bytes. Not ".", absolute, or containing ".." or "*". A recursive scope names
+   * a folder at least two levels deep.
+   */
+  path: string;
+  access: "read";
+  /** true covers the folder and what is beneath it; false covers exactly one file or folder. */
+  recursive: boolean;
 }
 
 export type MissionState =
@@ -577,6 +597,8 @@ export interface MissionView {
   familiar: FamiliarRevisionRef;
   envelope: MissionEnvelopeRef;
   project: { cwd: string };
+  /** The scopes the submit named, in canonical form; absent when it named none. */
+  scopes?: MissionScope[];
   task: { statement: string };
   submittedAt: Timestamp;
   validUntil: Timestamp;

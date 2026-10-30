@@ -18,32 +18,89 @@ human-review, merged-dependency-pin, adapter, receipt or certification gates.
 
 ## Implementation status
 
-The first increment, exact-file reads, is in
-`crates/coven-cli/src/automations/scoped_read/`. Its deterministic vectors are
-in `vectors.json` beside it. Nothing calls it yet. It covers:
+The service's operations are in `crates/coven-cli/src/automations/scoped_read/`:
+reading a file, listing a directory and searching the files beneath one. Their
+deterministic vectors are in `vectors.json` beside them. Nothing calls them
+yet. They cover:
 
 - the lexical rules for grant and request paths, and authorization before any
   filesystem access;
 - the open walk on Unix;
-- protected resources, held by identity;
+- protected resources, matched by the identity held when the reader is
+  built, by the identity and by the path beneath the root resolved again for
+  every request;
 - the recheck from the root after the open;
-- the per-file, per-attempt, call, depth and path-length limits.
+- the `.git` and `.env` exclusions beneath recursive scopes;
+- listings and searches that leave out every entry a read would refuse;
+- the per-file, per-attempt, scan, call, page, depth and path-length limits.
 
-Still open: the service channel, harness admission, response commitment under
-the revocation fence, directory listing and search, the adapter and receipts,
-and Windows. The vectors are engineering evidence, not containment
-certification.
+Still open: the service channel and tool schema, harness admission, response
+commitment under the revocation fence, the per-operation time limit, the
+adapter and receipts, and Windows. The vectors are engineering evidence, not
+containment certification.
 
-The increment settles these points the design left open. Each is for review:
+### Scope operations
 
-| Question | Increment's answer |
+Val decided the mapping on 2026-10-20 (#857). OpenCoven/coven-threads#90
+records it in the profile as an additive consumer note.
+
+| Scope | `read_file` | `list_directory` | `search` |
+| --- | --- | --- | --- |
+| Recursive read scope on directory D | Any file at or beneath D | D or any directory beneath it | D or any directory beneath it |
+| Non-recursive read scope on path P | P, if it is a file | P, if it is a directory | Refused (`scope_operation_denied`) |
+| Write scope only | Refused (`scope_access_denied`) | Refused | Refused |
+| No scope covers the path | Refused (`scope_missing`) | Refused | Refused |
+
+A non-recursive scope on a directory lets the model see the directory's entry
+names but read none of them. Recursion stops 32 components from the root.
+
+**Excluded names.** Val decided on 2026-10-20 (#857) that a recursive scope leaves out every `.git` folder and every `.env` or `.env.*` file beneath its directory because project secrets usually sit there. Classification uses the same conservative Unicode/case/ignorable-character key as protected paths, including aliases such as `.e\u{200D}nv` and `.g\u{200D}it`, even on filesystems that distinguish those names. This key never broadens exact grant matching. Enumeration still charges the original filename bytes before filtering.
+
+- A read, listing or search whose path passes through one beneath the scope's directory is refused before any filesystem access (`scope_excluded`).
+- A scope whose own path names one covers it. A non-recursive scope on `.env` can read it, and a recursive scope on `repo/.git` covers what is beneath.
+- Listings and searches never show an excluded name, even when another scope names it.
+
+**Listings and searches show only what a read would admit.** They leave out:
+- links, special files and hard-linked files;
+- entries on another filesystem and protected resources;
+- excluded names;
+- names a request could never spell.
+
+**A listing** returns entry names and kinds, never sizes. Each page holds up to
+256 entries in byte order, and `after` resumes after a name.
+
+**A search** matches a literal pattern of 1 to 256 bytes against each line, and
+never shells out. It walks in path order and reads every file through the same
+checked read, from the root. A file that cannot be read, is too large or is not
+text is counted in `skipped`. A directory beneath the searched one that cannot
+be opened or listed, or an entry that cannot be examined, is also counted in
+`skipped`, and because the files beneath it went unscanned the result says
+`complete: false`; the walk continues past it. A searched directory that
+cannot itself be listed refuses the search rather than answering empty. Matched lines are cut to 512 bytes and count
+against the attempt's disclosure total. Each page holds up to 256 matches, and
+`after` resumes after a file and line.
+
+A continuation only says where to resume. Every page is authorized afresh.
+Entry names and searched file content count against a 64 MiB scan total per
+attempt. When the total runs out, a search returns what it found with
+`complete: false`, and later listings and searches are refused (`limit_scan`).
+
+Every response is one closed JSON object with a digest of its JCS text, ready
+for the commitment step.
+
+### Points this implementation settles
+
+These are the points the design left open. Each is for review:
+
+| Question | Answer |
 | --- | --- |
-| What a retained root means | The directory opened when the reader is built. A request is served only while the root's path still names that directory. A root renamed away or replaced refuses every read (`root_moved`). |
+| What a retained root means | The directory opened when the reader is built. A request is served only while the root's path still names that directory. A root renamed away or replaced refuses every request (`root_moved`). |
 | A granted filesystem scope the service cannot enforce as written | The whole grant is refused (`grant_unsupported`), not silently narrowed. This covers backslashes, repeated separators, `.` components, and anything the profile's breadth rule refuses. |
 | Spellings that platforms read differently | Refused in grants and requests on every platform: backslash, colon (drive or data stream), control characters, a trailing dot or space, and Windows device names. |
-| How protected resources match | By the identity of what each protected path names, so a case or Unicode alias still matches. A root that is, or is inside, a protected resource refuses the reader (`root_protected`). The daemon supplies the list; choosing it belongs to the service step. |
+| How protected resources match | The reader keeps every protected identity observed during the attempt, including refreshed replacements, resources created after construction, and identities encountered by refused operations. Renaming an observed protected resource to an unprotected name never releases it. Each request resolves the daemon-supplied protected paths again, preserving identities learned even if refresh later refuses. Protected path components also compare with canonical Unicode normalization, modern simple case mappings followed by full case folding, and removal of Unicode Default_Ignorable_Code_Point characters, covering Linux casefold and HFS+ ignored-format aliases. The 38 historical HFS+ Georgian case pairs are unified transitively with their modern case classes. These exclusions conservatively apply on case-sensitive filesystems too; grant authorization keeps exact path spelling. The path exclusion covers creation or atomic replacement during a request, including alias spellings, and records any encountered replacement identity. Before traversal, the root and its ancestors are checked against refreshed and retained protection; a root that is, or is inside, a protected resource refuses (`root_protected`). The daemon supplies the protected paths; choosing them belongs to the service step. |
 | Mount crossings | Refused by device on Unix. On Linux the mount id is also compared, which catches a bind mount from the same filesystem. A kernel that cannot report the mount id refuses (`platform_unsupported`). |
-| Platforms without a reviewed walk | Every read is refused (`platform_unsupported`). Today that is Windows. |
+| Content that is not text | `read_file` refuses it (`resource_not_text`); a search skips it. |
+| Platforms without a reviewed walk | Every request is refused (`platform_unsupported`). Today that is Windows. |
 | What counts against the call limit | Every call, refused ones included. Paths are limited to 32 components and 4,096 bytes. |
 
 ## Problem and chosen boundary
@@ -209,10 +266,11 @@ pins remain prerequisites for production adapter integration.
 ## Scope interpretation and opened-resource review contract
 
 This section is a review proposal. It adds no accepted grant vocabulary and
-provides no executed containment evidence. Threads #84 at
-`7ccae83f3449694eba6d21832f5afa2336931fbf` is pending review; Coven's merged
-pin remains `78e47c9d2430582128679fd4a54f9966f2f4f976`. Reconcile this contract
-with the final reviewed dependency before integrating the production adapter.
+provides no executed containment evidence. Threads #84 merged as `c8e67f7`
+and its erratum, #89, as `7b5a9e6`; Coven's merged pin remains
+`78e47c9d2430582128679fd4a54f9966f2f4f976`. The production adapter pins
+`7b5a9e6` or later. Reconcile this contract with that dependency before
+integrating it.
 
 ### Preserve authenticated bytes
 
@@ -252,6 +310,8 @@ mandatory. Before implementing those operations, the upstream review must map
 scope fields to each operation, its depth, accessible entries, protected
 exclusions, and continuation semantics. Keep unsupported operations closed
 until that mapping is reviewed; do not advertise partial service as complete.
+Val decided the mapping on 2026-10-20. *Scope operations* above states it, and
+OpenCoven/coven-threads#90 records it upstream.
 
 ### Review the actual open and disclosure order
 

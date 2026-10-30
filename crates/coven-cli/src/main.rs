@@ -908,6 +908,11 @@ enum MemoryCommand {
 
 #[derive(Subcommand, Debug)]
 enum MobileMemoryCommand {
+    #[command(about = "Configure outbound relay access for already-paired devices")]
+    Relay {
+        #[command(subcommand)]
+        command: MobileRelayCommand,
+    },
     #[command(about = "Enable the private-network TLS mobile gateway")]
     Enable {
         #[arg(long, value_name = "PRIVATE_ADDRESS:PORT")]
@@ -934,6 +939,35 @@ enum MobileMemoryCommand {
         #[command(subcommand)]
         command: Option<MobileDeviceCommand>,
         #[arg(long, help = "Print devices as JSON (machine-readable)")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MobileRelayCommand {
+    #[command(about = "Add or update one WSS relay endpoint, preserving current enablement")]
+    Add {
+        #[arg(long, value_name = "WSS_URL")]
+        endpoint: String,
+        #[arg(
+            long,
+            value_name = "PEM_FILE",
+            help = "Explicit certificate authorities for this endpoint (replaces public roots)"
+        )]
+        ca_certificate: Vec<PathBuf>,
+    },
+    #[command(about = "Remove a configured relay endpoint")]
+    Remove {
+        #[arg(long, value_name = "WSS_URL")]
+        endpoint: String,
+    },
+    #[command(about = "Enable configured relays using the existing host identity")]
+    Enable,
+    #[command(about = "Disable relay access while retaining paired devices and endpoint settings")]
+    Disable,
+    #[command(about = "Show relay configuration status (not connection status)")]
+    Status {
+        #[arg(long)]
         json: bool,
     },
 }
@@ -1080,6 +1114,14 @@ struct IntroductionPolicyArgs {
     introducers: Vec<Uuid>,
     #[arg(
         long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u16).range(1..=16),
+        help = "Approvals a new device needs from distinct introducers (1 to the number of \
+                introducers; there is no default)"
+    )]
+    required_approvals: u16,
+    #[arg(
+        long,
         value_enum,
         value_delimiter = ',',
         required = true,
@@ -1121,7 +1163,7 @@ impl IntroductionPolicyArgs {
         }
         let policy = mobile_memory::introduction::IntroductionPolicy {
             eligible_introducers: introducers,
-            required_approvals: 1,
+            required_approvals: self.required_approvals,
             allowed_scopes: canonical_device_scopes(self.scope)?,
             maximum_grant_lifetime_seconds: u32::from(self.max_grant_days) * 86_400,
             required_assurance: match self.assurance {
@@ -2134,6 +2176,18 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Memory { command, json }) => match command {
             Some(MemoryCommand::Open) => memory_dashboard::run_open(),
             Some(MemoryCommand::Mobile { command }) => match command {
+                MobileMemoryCommand::Relay { command } => match command {
+                    MobileRelayCommand::Add {
+                        endpoint,
+                        ca_certificate,
+                    } => mobile_memory::relay::run_add(&endpoint, &ca_certificate),
+                    MobileRelayCommand::Remove { endpoint } => {
+                        mobile_memory::relay::run_remove(&endpoint)
+                    }
+                    MobileRelayCommand::Enable => mobile_memory::relay::run_enable(),
+                    MobileRelayCommand::Disable => mobile_memory::relay::run_disable(),
+                    MobileRelayCommand::Status { json } => mobile_memory::relay::run_status(json),
+                },
                 MobileMemoryCommand::Enable { bind, endpoint } => {
                     mobile_memory::run_enable(bind, &endpoint)
                 }

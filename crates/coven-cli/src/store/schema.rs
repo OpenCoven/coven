@@ -544,6 +544,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::automations::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
         .context("failed to initialize automation_definitions schema")?;
     crate::automations::store::ensure_definition_command_columns(conn)?;
+    crate::automations::store::ensure_mission_columns(conn)?;
     conn.execute_batch(
         crate::automations::command_adoption::AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL,
     )

@@ -126,6 +126,29 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn('timeout-minutes: 30', windows)
         self.assertNotIn('timeout-minutes: 20', windows)
 
+    def test_windows_workspace_shards_partition_one_name_predicate(self) -> None:
+        # The Windows workspace suite runs as two shards of one predicate
+        # (#1227): `named` keeps the tests whose names contain a token and
+        # `rest` skips exactly those. If the lists drift apart, a test either
+        # runs twice or, worse, in neither shard, and every guard still passes.
+        windows = ci_job_block('rust-test-windows')
+        self.assertIn('name: Rust tests (Windows, ${{ matrix.shard }})', windows)
+        self.assertIn('\n      fail-fast: false\n', windows)
+        self.assertIn(
+            '\n      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}\n',
+            windows,
+        )
+        self.assertEqual(windows.count('run: cargo test'), 1)
+        shards = dict(re.findall(r"- shard: (\S+)\n\s+test-args: '([^'\n]+)'\n", windows))
+        self.assertEqual(sorted(shards), ['named', 'rest'])
+        named = shards['named'].split()
+        rest = shards['rest'].split()
+        self.assertTrue(named)
+        self.assertFalse([token for token in named if token.startswith('-')])
+        self.assertEqual(rest[0::2], ['--skip'] * len(named))
+        self.assertEqual(rest[1::2], named)
+        self.assertEqual(len(rest), 2 * len(named))
+
     def test_windows_rust_gate_restores_without_post_job_cache_packing(self) -> None:
         for job in ('rust-test-windows', 'threads-test-windows'):
             windows = ci_job_block(job)

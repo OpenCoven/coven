@@ -73,7 +73,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.x'
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -136,6 +136,8 @@ jobs:
       - run: python3 scripts/delivery/checkpoint-test.py
       - run: bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh
       - run: python3 scripts/dev-verify-test.py
+      - run: python3 scripts/task-worktree-test.py
+      - run: python3 scripts/branch-triage-test.py
       - run: npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund
       - run: node --test scripts/browser-capability.test.mjs
       - run: node --test scripts/package-github-release-test.mjs
@@ -343,13 +345,29 @@ jobs:
         run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock --test threads_identity_invariants --test threads_protected_intake --test threads_terminal_recovery --no-fail-fast
 
   rust-test-windows:
-    name: Rust tests (Windows)
+    name: Rust tests (Windows, ${{ matrix.shard }})
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: windows-latest
     # Keep the two build profiles in separate required jobs so feature
     # evidence cannot be cancelled after the workspace consumes its budget.
     timeout-minutes: 30
+    # One libtest name predicate splits `cargo test --workspace` across two
+    # runners (#1227). `named` runs every test whose name contains one of the
+    # tokens and `rest` skips exactly those, so each test runs in exactly one
+    # shard, and a new test lands in one without editing this list. Unsplit,
+    # the `coven` unit suite alone took 622-1,192 s of a 30-minute budget;
+    # these tokens divide it roughly evenly, and `rest` also carries the
+    # integration targets. `fail-fast: false` keeps one shard's failure from
+    # cancelling the other's evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: named
+            test-args: 'automations:: api::tests::threads'
+          - shard: rest
+            test-args: '--skip automations:: --skip api::tests::threads'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -371,7 +389,7 @@ jobs:
           key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-test-
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}
 
   threads-test-windows:
     name: Threads daemon tests (Windows)
@@ -849,7 +867,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.x'
       - name: Run exact-source fresh distro contract

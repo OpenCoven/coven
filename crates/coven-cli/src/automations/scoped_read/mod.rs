@@ -2,22 +2,22 @@
 //!
 //! The design is `docs/architecture/coven-automations-scoped-read-service.md`:
 //! the daemon, not the harness, interprets the granted filesystem scopes and
-//! opens the files a model asks for. This module is that contract's first
-//! increment, the exact-file read:
+//! opens the files a model asks for. This module holds that contract's
+//! operations: reading a file, listing a directory and searching the files
+//! beneath one.
 //!
 //! - [`scope`] holds the lexical rules. It derives an enforcement form from
-//!   validated profile scopes without rewriting them, parses a read request
-//!   under the same rules, and authorizes it before any filesystem access.
-//! - [`open`] opens an authorized file beneath a held root, one component at a
-//!   time and never through a link. It refuses hard links, special files, mount
-//!   crossings and protected resources, then rechecks from the root after the
-//!   open so a concurrent rename cannot move the file out of the root
-//!   undetected. It reads at most the policy's bytes.
+//!   validated profile scopes without rewriting them, parses a request under
+//!   the same rules, and authorizes it before any filesystem access.
+//! - [`open`] opens what a request names beneath a held root, one component at
+//!   a time and never through a link. It refuses hard links, special files,
+//!   mount crossings and protected resources, then rechecks from the root
+//!   after the open so a concurrent rename cannot move it out of the root
+//!   undetected. Listings and searches leave out every entry a read would
+//!   refuse. Everything is bounded by the policy.
 //!
-//! Directory listing and content search stay refused until the upstream scope
-//! vocabulary maps them (the design's "Separate capability, access, resource,
-//! and operation"). Nothing launches this yet: the service channel, harness
-//! admission and response commitment are later steps of the same design.
+//! Nothing launches this yet: the service channel, harness admission and
+//! response commitment are later steps of the same design.
 
 pub(crate) mod open;
 pub(crate) mod scope;
@@ -30,8 +30,9 @@ mod tests;
 pub(crate) enum Refusal {
     /// The request is not a closed object of known fields and types.
     RequestInvalid,
-    /// The operation is known but no reviewed scope mapping authorizes it yet.
-    OperationUnmapped,
+    /// A read scope covers the path, but not for this operation: search needs
+    /// a recursive scope.
+    ScopeOperationDenied,
     /// The path is absolute or drive-qualified.
     PathAbsolute,
     /// The path has a `..` component.
@@ -54,12 +55,19 @@ pub(crate) enum Refusal {
     ScopeMissing,
     /// A scope names this file, but not for reading.
     ScopeAccessDenied,
+    /// Only a recursive scope covers the path, and the path passes through a
+    /// `.git` folder or a `.env` file beneath that scope's directory.
+    ScopeExcluded,
     /// The file or one of its parent directories does not exist.
     ResourceNotFound,
     /// A component is a symbolic link.
     ResourceSymlink,
-    /// The file is a directory.
+    /// A file was asked for, and this is a directory.
     ResourceDirectory,
+    /// A directory was asked for, and this is not one.
+    ResourceNotDirectory,
+    /// The file is not UTF-8 text.
+    ResourceNotText,
     /// The file is a FIFO, socket or device.
     ResourceSpecial,
     /// The file has more than one hard link.
@@ -78,6 +86,8 @@ pub(crate) enum Refusal {
     LimitAttemptDisclosure,
     /// The attempt has used all of its service calls.
     LimitCalls,
+    /// The attempt has scanned all the names and file content it may.
+    LimitScan,
     /// This platform has no reviewed race-safe open for the service.
     PlatformUnsupported,
 }
@@ -86,7 +96,7 @@ impl Refusal {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::RequestInvalid => "request_invalid",
-            Self::OperationUnmapped => "operation_unmapped",
+            Self::ScopeOperationDenied => "scope_operation_denied",
             Self::PathAbsolute => "path_absolute",
             Self::PathTraversal => "path_traversal",
             Self::PathEncodingUnsupported => "path_encoding_unsupported",
@@ -97,9 +107,12 @@ impl Refusal {
             Self::RootMoved => "root_moved",
             Self::ScopeMissing => "scope_missing",
             Self::ScopeAccessDenied => "scope_access_denied",
+            Self::ScopeExcluded => "scope_excluded",
             Self::ResourceNotFound => "resource_not_found",
             Self::ResourceSymlink => "resource_symlink",
             Self::ResourceDirectory => "resource_directory",
+            Self::ResourceNotDirectory => "resource_not_directory",
+            Self::ResourceNotText => "resource_not_text",
             Self::ResourceSpecial => "resource_special",
             Self::ResourceMultiplyLinked => "resource_multiply_linked",
             Self::ResourceMountCrossing => "resource_mount_crossing",
@@ -109,6 +122,7 @@ impl Refusal {
             Self::LimitFileTooLarge => "limit_file_too_large",
             Self::LimitAttemptDisclosure => "limit_attempt_disclosure",
             Self::LimitCalls => "limit_calls",
+            Self::LimitScan => "limit_scan",
             Self::PlatformUnsupported => "platform_unsupported",
         }
     }
@@ -120,21 +134,38 @@ impl Refusal {
 pub(crate) struct ReadPolicy {
     /// The most one file response carries.
     pub file_bytes: u64,
-    /// The most file content one attempt discloses in total.
+    /// The most file content one attempt discloses in total: file reads and
+    /// matched search lines.
     pub attempt_bytes: u64,
+    /// The most one attempt scans: directory entry names, and the content of
+    /// every file a search reads.
+    pub scan_bytes: u64,
     /// The most service calls one attempt makes, refused calls included.
     pub calls: u32,
     /// The most components a path may have.
     pub depth: usize,
     /// The most bytes a path may have.
     pub path_bytes: usize,
+    /// The most entries one listing page carries.
+    pub page_entries: usize,
+    /// The most matches one search page carries.
+    pub page_matches: usize,
+    /// The most bytes a search pattern may have.
+    pub pattern_bytes: usize,
+    /// The most bytes of one matched line a search returns.
+    pub match_bytes: usize,
 }
 
 /// The design's proposed limits for the R0 read envelope.
 pub(crate) const R0_READ_POLICY: ReadPolicy = ReadPolicy {
     file_bytes: 1024 * 1024,
     attempt_bytes: 8 * 1024 * 1024,
+    scan_bytes: 64 * 1024 * 1024,
     calls: 1024,
     depth: 32,
     path_bytes: 4096,
+    page_entries: 256,
+    page_matches: 256,
+    pattern_bytes: 256,
+    match_bytes: 512,
 };

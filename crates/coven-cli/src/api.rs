@@ -1,8 +1,9 @@
+mod proposal_document;
 mod proposal_preflight;
+mod proposal_revision;
+use proposal_document::{ProposalAuthority, ProposalEnvelopeDocument};
 pub(crate) use proposal_preflight::validate_proposal_envelope_preflight;
-use proposal_preflight::{
-    PROPOSAL_ENVELOPE_MAX_BYTES, PROPOSAL_ENVELOPE_SYNTAX_MAX_BYTES, PROPOSAL_JSON_MAX_DEPTH,
-};
+use proposal_preflight::{PROPOSAL_ENVELOPE_MAX_BYTES, PROPOSAL_ENVELOPE_SYNTAX_MAX_BYTES};
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -63,6 +64,7 @@ struct DirectApplyPauseState {
     reached: bool,
     released: bool,
     watchdog_expired: bool,
+    fail_audit_directory_sync: bool,
 }
 
 #[cfg(test)]
@@ -136,6 +138,10 @@ impl DirectApplyPauseGuard {
 
     fn release(&self) {
         self.pause.release();
+    }
+
+    fn fail_audit_directory_sync(&self) {
+        self.pause.state.lock().unwrap().fail_audit_directory_sync = true;
     }
 }
 
@@ -348,6 +354,9 @@ fn maybe_pause_direct_apply_before_audit(coven_home: &Path, familiar_id: &str) {
             pause.changed.notify_all();
             return;
         }
+    }
+    if state.fail_audit_directory_sync {
+        crate::durable_fs::fail_next_directory_sync();
     }
 }
 
@@ -6656,6 +6665,13 @@ fn apply_familiar_edits(
             }),
         );
     }
+    // Flush both the audit batch and any baseline advances before acknowledging
+    // the installed bytes. Keep their existing failure ordering and retain the
+    // reservation if the WAL or checked namespace barrier cannot be synced.
+    if let Err(error) = store::durable_barrier(audit_reservation.connection()) {
+        audit_reservation.preserve()?;
+        return direct_audit_persist_failed_response(&changes, &error);
+    }
     if let Err(error) = audit_reservation.finish() {
         return json_response(
             500,
@@ -8137,465 +8153,6 @@ fn coherence_decision_evidence(
             reports: None,
             degraded_reason: Some("proposal-probes-stale"),
         },
-    }
-}
-
-struct PresentField<T>(Option<T>);
-
-impl<T> Default for PresentField<T> {
-    fn default() -> Self {
-        Self(None)
-    }
-}
-
-impl<'de, T> Deserialize<'de> for PresentField<T>
-where
-    T: Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        T::deserialize(deserializer).map(|value| Self(Some(value)))
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProposalEnvelopeWire {
-    #[serde(default)]
-    schema: Option<String>,
-    #[serde(default)]
-    pending: Option<coven_threads_core::PendingProposal>,
-    #[serde(default)]
-    classification: Option<coven_threads_core::ProposalClassification>,
-    #[serde(default)]
-    materialized_diff: Option<coven_threads_core::MaterializedDiff>,
-    #[serde(default)]
-    region_evidence: Option<Vec<coven_threads_core::RegionEvidence>>,
-    #[serde(default)]
-    lifecycle: Option<crate::proposal_scheduler::ProposalLifecycle>,
-    #[serde(default)]
-    veto_deadline: PresentField<Option<time::OffsetDateTime>>,
-    #[serde(default)]
-    earliest_close: PresentField<Option<time::OffsetDateTime>>,
-    #[serde(default)]
-    id: Option<coven_threads_core::ProposalId>,
-    #[serde(default)]
-    familiar_id: Option<coven_threads_core::FamiliarId>,
-    #[serde(default)]
-    writer: Option<coven_threads_core::WriterId>,
-    #[serde(default)]
-    channel: Option<coven_threads_core::Channel>,
-    #[serde(default)]
-    thread_id: Option<coven_threads_core::ThreadId>,
-    #[serde(default)]
-    fray: Option<coven_threads_core::FrayOrSnap>,
-    #[serde(default)]
-    edits: Option<Vec<coven_threads_core::StagedEdit>>,
-    #[serde(default)]
-    staged_at: Option<time::OffsetDateTime>,
-    #[serde(rename = "reviewKind", default)]
-    review_kind: PresentField<String>,
-    #[serde(rename = "identityEvidence", default)]
-    identity_evidence: PresentField<[u8; 32]>,
-    #[serde(rename = "autoRegressionEvidence", default)]
-    auto_regression_evidence: PresentField<[u8; 32]>,
-    #[serde(default)]
-    probes: PresentField<Box<serde_json::value::RawValue>>,
-    #[serde(rename = "decisionRequest", default)]
-    decision_request: PresentField<ProposalDecisionRequest>,
-    #[serde(rename = "decisionState", default)]
-    decision_state: PresentField<ProposalApplyingState>,
-}
-
-enum ProposalAuthority {
-    Legacy(coven_threads_core::PendingProposal),
-    Scheduled(Box<crate::proposal_scheduler::ScheduledProposal>),
-}
-
-struct ProposalEnvelopeDocument {
-    authority: ProposalAuthority,
-    review_kind: Option<String>,
-    identity_evidence: Option<[u8; 32]>,
-    auto_regression_evidence: Option<[u8; 32]>,
-    probes: Option<Box<serde_json::value::RawValue>>,
-    decision_request: Option<ProposalDecisionRequest>,
-    decision_state: Option<ProposalApplyingState>,
-}
-
-#[derive(Serialize)]
-struct StoredLegacyProposalRef<'a> {
-    #[serde(flatten)]
-    pending: &'a coven_threads_core::PendingProposal,
-    #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
-    review_kind: Option<&'a String>,
-    #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
-    identity_evidence: Option<[u8; 32]>,
-    #[serde(
-        rename = "autoRegressionEvidence",
-        skip_serializing_if = "Option::is_none"
-    )]
-    auto_regression_evidence: Option<[u8; 32]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    probes: Option<&'a serde_json::value::RawValue>,
-    #[serde(rename = "decisionRequest", skip_serializing_if = "Option::is_none")]
-    decision_request: Option<&'a ProposalDecisionRequest>,
-    #[serde(rename = "decisionState", skip_serializing_if = "Option::is_none")]
-    decision_state: Option<&'a ProposalApplyingState>,
-}
-
-#[derive(Serialize)]
-struct StoredScheduledProposalRef<'a> {
-    #[serde(flatten)]
-    scheduled: &'a crate::proposal_scheduler::ScheduledProposal,
-    #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
-    review_kind: Option<&'a String>,
-    #[serde(rename = "identityEvidence", skip_serializing_if = "Option::is_none")]
-    identity_evidence: Option<[u8; 32]>,
-    #[serde(
-        rename = "autoRegressionEvidence",
-        skip_serializing_if = "Option::is_none"
-    )]
-    auto_regression_evidence: Option<[u8; 32]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    probes: Option<&'a serde_json::value::RawValue>,
-    #[serde(rename = "decisionRequest", skip_serializing_if = "Option::is_none")]
-    decision_request: Option<&'a ProposalDecisionRequest>,
-    #[serde(rename = "decisionState", skip_serializing_if = "Option::is_none")]
-    decision_state: Option<&'a ProposalApplyingState>,
-}
-
-fn json_value_end(raw: &[u8], start: usize, depth: usize) -> Result<usize> {
-    anyhow::ensure!(
-        depth <= PROPOSAL_JSON_MAX_DEPTH,
-        "canonical proposal JSON exceeded the validated depth"
-    );
-    let mut offset = start;
-    while raw
-        .get(offset)
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
-        offset += 1;
-    }
-    match raw.get(offset).copied() {
-        Some(b'"') => {
-            offset += 1;
-            loop {
-                match raw.get(offset).copied() {
-                    Some(b'"') => return Ok(offset + 1),
-                    Some(b'\\') => {
-                        offset += 2;
-                    }
-                    Some(_) => offset += 1,
-                    None => {
-                        anyhow::bail!("canonical proposal JSON contains an unterminated string")
-                    }
-                }
-            }
-        }
-        Some(b'{') => {
-            offset += 1;
-            loop {
-                while raw
-                    .get(offset)
-                    .is_some_and(|byte| byte.is_ascii_whitespace())
-                {
-                    offset += 1;
-                }
-                if raw.get(offset) == Some(&b'}') {
-                    return Ok(offset + 1);
-                }
-                offset = json_value_end(raw, offset, depth + 1)?;
-                while raw
-                    .get(offset)
-                    .is_some_and(|byte| byte.is_ascii_whitespace())
-                {
-                    offset += 1;
-                }
-                anyhow::ensure!(
-                    raw.get(offset) == Some(&b':'),
-                    "canonical proposal JSON object is missing `:`"
-                );
-                offset = json_value_end(raw, offset + 1, depth + 1)?;
-                while raw
-                    .get(offset)
-                    .is_some_and(|byte| byte.is_ascii_whitespace())
-                {
-                    offset += 1;
-                }
-                match raw.get(offset) {
-                    Some(b',') => offset += 1,
-                    Some(b'}') => return Ok(offset + 1),
-                    _ => anyhow::bail!("canonical proposal JSON object is not terminated"),
-                }
-            }
-        }
-        Some(b'[') => {
-            offset += 1;
-            loop {
-                while raw
-                    .get(offset)
-                    .is_some_and(|byte| byte.is_ascii_whitespace())
-                {
-                    offset += 1;
-                }
-                if raw.get(offset) == Some(&b']') {
-                    return Ok(offset + 1);
-                }
-                offset = json_value_end(raw, offset, depth + 1)?;
-                while raw
-                    .get(offset)
-                    .is_some_and(|byte| byte.is_ascii_whitespace())
-                {
-                    offset += 1;
-                }
-                match raw.get(offset) {
-                    Some(b',') => offset += 1,
-                    Some(b']') => return Ok(offset + 1),
-                    _ => anyhow::bail!("canonical proposal JSON array is not terminated"),
-                }
-            }
-        }
-        Some(_) => {
-            while raw.get(offset).is_some_and(|byte| {
-                !byte.is_ascii_whitespace() && !matches!(byte, b',' | b']' | b'}')
-            }) {
-                offset += 1;
-            }
-            anyhow::ensure!(
-                offset > start,
-                "canonical proposal JSON contains an empty scalar"
-            );
-            Ok(offset)
-        }
-        None => anyhow::bail!("canonical proposal JSON ended before a value"),
-    }
-}
-
-fn hash_canonical_json(raw: &[u8], hasher: &mut Sha256, depth: usize) -> Result<()> {
-    anyhow::ensure!(
-        depth <= PROPOSAL_JSON_MAX_DEPTH,
-        "canonical proposal JSON exceeded the validated depth"
-    );
-    let start = raw
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .context("canonical proposal JSON is empty")?;
-    let end = raw
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map(|index| index + 1)
-        .context("canonical proposal JSON is empty")?;
-    let raw = &raw[start..end];
-    match raw.first().copied() {
-        Some(b'{') => {
-            let object: BTreeMap<String, &serde_json::value::RawValue> =
-                serde_json::from_slice(raw).context("parsing canonical proposal object")?;
-            hasher.update(b"{");
-            for (index, (key, value)) in object.into_iter().enumerate() {
-                if index != 0 {
-                    hasher.update(b",");
-                }
-                hasher.update(
-                    &serde_json::to_vec(&key).context("serializing canonical proposal key")?,
-                );
-                hasher.update(b":");
-                hash_canonical_json(value.get().as_bytes(), hasher, depth + 1)?;
-            }
-            hasher.update(b"}");
-        }
-        Some(b'[') => {
-            hasher.update(b"[");
-            let mut offset = 1;
-            let mut index = 0;
-            loop {
-                while raw
-                    .get(offset)
-                    .is_some_and(|byte| byte.is_ascii_whitespace())
-                {
-                    offset += 1;
-                }
-                if raw.get(offset) == Some(&b']') {
-                    break;
-                }
-                let value_end = json_value_end(raw, offset, depth + 1)?;
-                if index != 0 {
-                    hasher.update(b",");
-                }
-                hash_canonical_json(&raw[offset..value_end], hasher, depth + 1)?;
-                index += 1;
-                offset = value_end;
-                while raw
-                    .get(offset)
-                    .is_some_and(|byte| byte.is_ascii_whitespace())
-                {
-                    offset += 1;
-                }
-                match raw.get(offset) {
-                    Some(b',') => offset += 1,
-                    Some(b']') => break,
-                    _ => anyhow::bail!("canonical proposal array is not terminated"),
-                }
-            }
-            hasher.update(b"]");
-        }
-        Some(_) => hasher.update(raw),
-        None => anyhow::bail!("canonical proposal JSON is empty"),
-    }
-    Ok(())
-}
-
-impl ProposalEnvelopeDocument {
-    fn parse_preflighted(raw: &[u8]) -> Result<Self> {
-        let wire: ProposalEnvelopeWire =
-            serde_json::from_slice(raw).context("parsing typed proposal envelope")?;
-        let scheduled_shape = wire.schema.is_some()
-            || wire.pending.is_some()
-            || wire.classification.is_some()
-            || wire.materialized_diff.is_some()
-            || wire.region_evidence.is_some()
-            || wire.lifecycle.is_some()
-            || wire.veto_deadline.0.is_some()
-            || wire.earliest_close.0.is_some();
-
-        let authority = if scheduled_shape {
-            anyhow::ensure!(
-                wire.id.is_none()
-                    && wire.familiar_id.is_none()
-                    && wire.writer.is_none()
-                    && wire.channel.is_none()
-                    && wire.thread_id.is_none()
-                    && wire.fray.is_none()
-                    && wire.edits.is_none(),
-                "scheduled proposal mixes legacy authority fields"
-            );
-            ProposalAuthority::Scheduled(Box::new(
-                crate::proposal_scheduler::ScheduledProposal::from_persisted_parts(
-                    wire.schema
-                        .as_deref()
-                        .context("scheduled proposal is missing schema")?,
-                    wire.pending
-                        .context("scheduled proposal is missing pending")?,
-                    wire.classification
-                        .context("scheduled proposal is missing classification")?,
-                    wire.materialized_diff
-                        .context("scheduled proposal is missing materialized_diff")?,
-                    wire.region_evidence
-                        .context("scheduled proposal is missing region_evidence")?,
-                    wire.lifecycle
-                        .context("scheduled proposal is missing lifecycle")?,
-                    wire.staged_at
-                        .context("scheduled proposal is missing staged_at")?,
-                    wire.veto_deadline
-                        .0
-                        .context("scheduled proposal is missing veto_deadline")?,
-                    wire.earliest_close
-                        .0
-                        .context("scheduled proposal is missing earliest_close")?,
-                )?,
-            ))
-        } else {
-            ProposalAuthority::Legacy(coven_threads_core::PendingProposal {
-                id: wire.id.context("pending proposal is missing id")?,
-                familiar_id: wire
-                    .familiar_id
-                    .context("pending proposal is missing familiar_id")?,
-                writer: wire.writer.context("pending proposal is missing writer")?,
-                channel: wire
-                    .channel
-                    .context("pending proposal is missing channel")?,
-                thread_id: wire
-                    .thread_id
-                    .context("pending proposal is missing thread_id")?,
-                fray: wire.fray.context("pending proposal is missing fray")?,
-                edits: wire.edits.context("pending proposal is missing edits")?,
-                staged_at: wire
-                    .staged_at
-                    .context("pending proposal is missing staged_at")?,
-            })
-        };
-        let review_kind = wire.review_kind.0;
-        let probes = wire.probes.0;
-        let decision_request = wire.decision_request.0;
-        if let Some(request) = decision_request.as_ref() {
-            request.validate_replacement_intent()?;
-        }
-        let decision_state = wire.decision_state.0;
-        Ok(Self {
-            authority,
-            review_kind,
-            identity_evidence: wire.identity_evidence.0,
-            auto_regression_evidence: wire.auto_regression_evidence.0,
-            probes,
-            decision_request,
-            decision_state,
-        })
-    }
-
-    fn pending(&self) -> &coven_threads_core::PendingProposal {
-        match &self.authority {
-            ProposalAuthority::Legacy(pending) => pending,
-            ProposalAuthority::Scheduled(scheduled) => scheduled.pending(),
-        }
-    }
-
-    fn scheduled(&self) -> Option<&crate::proposal_scheduler::ScheduledProposal> {
-        match &self.authority {
-            ProposalAuthority::Legacy(_) => None,
-            ProposalAuthority::Scheduled(scheduled) => Some(scheduled),
-        }
-    }
-
-    fn serialize_with_decision(
-        &self,
-        decision_request: Option<&ProposalDecisionRequest>,
-        decision_state: Option<&ProposalApplyingState>,
-    ) -> Result<Vec<u8>> {
-        let bytes = match &self.authority {
-            ProposalAuthority::Legacy(pending) => serde_json::to_vec(&StoredLegacyProposalRef {
-                pending,
-                review_kind: self.review_kind.as_ref(),
-                identity_evidence: self.identity_evidence,
-                auto_regression_evidence: self.auto_regression_evidence,
-                probes: self.probes.as_deref(),
-                decision_request,
-                decision_state,
-            }),
-            ProposalAuthority::Scheduled(scheduled) => {
-                serde_json::to_vec(&StoredScheduledProposalRef {
-                    scheduled,
-                    review_kind: self.review_kind.as_ref(),
-                    identity_evidence: self.identity_evidence,
-                    auto_regression_evidence: self.auto_regression_evidence,
-                    probes: self.probes.as_deref(),
-                    decision_request,
-                    decision_state,
-                })
-            }
-        }
-        .context("serializing proposal envelope")?;
-        let attempted_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if attempted_bytes > PROPOSAL_ENVELOPE_MAX_BYTES {
-            return Err(ward::WardEditBudgetFailure::ProposalEnvelopeBytes {
-                attempted_bytes,
-                max_bytes: PROPOSAL_ENVELOPE_MAX_BYTES,
-            }
-            .into());
-        }
-        Ok(bytes)
-    }
-
-    fn authority_bytes(&self) -> Result<Vec<u8>> {
-        self.serialize_with_decision(None, None)
-    }
-
-    fn revision(&self) -> Result<String> {
-        let authority = self.authority_bytes()?;
-        let mut digest = Sha256::new();
-        hash_canonical_json(&authority, &mut digest, 0)?;
-        let digest = digest.finalize();
-        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 }
 
@@ -33014,7 +32571,7 @@ tier = 1
 
     #[test]
     fn proposal_parser_keeps_probe_evidence_raw_until_bounded_decode() {
-        let source = include_str!("api.rs");
+        let source = include_str!("api/proposal_document.rs");
         let wire_start = source.find("struct ProposalEnvelopeWire").unwrap();
         let wire_end = source[wire_start..]
             .find("enum ProposalAuthority")

@@ -157,7 +157,15 @@ impl RoleSigningKey {
     /// authority and terminal-evidence contracts are authenticated, and returns
     /// the 128-character lowercase hex signature they carry.
     pub(crate) fn sign_digest(&self, signed_digest: &[u8; 32]) -> String {
-        encode_lower_hex(self.key_pair.sign(signed_digest).as_ref())
+        encode_lower_hex(&self.sign(signed_digest))
+    }
+
+    /// Signs the raw 32 bytes of a digest and returns the raw signature, as
+    /// the Threads automation-authority profile carries it (in base64).
+    pub(crate) fn sign(&self, digest: &[u8; 32]) -> [u8; 64] {
+        let mut signature = [0_u8; 64];
+        signature.copy_from_slice(self.key_pair.sign(digest).as_ref());
+        signature
     }
 }
 
