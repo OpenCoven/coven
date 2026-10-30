@@ -57,6 +57,8 @@ class RuntimeTests(unittest.TestCase):
         diagnostics = (
             ("Native dependency privilege blocker: run in a root setup phase or grant noninteractive sudo.", "native_privilege"),
             ("Unsupported OS: native dependencies require Debian or Ubuntu", "native_distribution"),
+            ("Native dependency download did not finish within the bounded retry budget", "native_download"),
+            ("Native dependency download bounds must be positive integers", "native_download_bounds"),
         )
         with tempfile.TemporaryDirectory() as folder:
             for message, expected in diagnostics:

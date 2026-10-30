@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 
-use super::service::{Gate, Operation, Service, SERVER_NAME};
+use super::service::{Gate, Operation, Service, Worker, SERVER_NAME};
 use super::Refusal;
 
 /// The relay's arguments after the `coven` executable.
@@ -57,8 +57,10 @@ pub(crate) struct Channel {
     socket_created: bool,
     config_created: bool,
     closed: Arc<AtomicBool>,
+    fence: Arc<Mutex<()>>,
     connection: Arc<Mutex<Option<UnixStream>>>,
     thread: Option<JoinHandle<Vec<Operation>>>,
+    worker: Option<Arc<Worker>>,
 }
 
 impl Channel {
@@ -98,8 +100,10 @@ impl Channel {
             socket_created: false,
             config_created: false,
             closed: Arc::clone(&closed),
+            fence: Arc::new(Mutex::new(())),
             connection: Arc::new(Mutex::new(None)),
             thread: None,
+            worker: None,
         };
         if channel.socket.as_os_str().len() > SOCKET_PATH_BYTES {
             bail!(
@@ -122,8 +126,10 @@ impl Channel {
 
         let service = build(Box::new(Closing {
             closed: Arc::clone(&closed),
+            fence: Arc::clone(&channel.fence),
             inner: gate,
         }));
+        channel.worker = Some(service.worker());
         let socket = channel.socket.clone();
         let connection = Arc::clone(&channel.connection);
         channel.thread = Some(
@@ -172,8 +178,8 @@ impl Channel {
     }
 
     /// Closes the channel and returns what each tool call did. Every later
-    /// call is refused (`attempt_closed`). An operation already running
-    /// finishes, but its result is withheld.
+    /// call is refused (`attempt_closed`). A result not yet entering its
+    /// commitment is withheld; a commitment already holding the fence wins.
     pub(crate) fn close(mut self) -> Vec<Operation> {
         self.shut()
     }
@@ -181,8 +187,16 @@ impl Channel {
     fn shut(&mut self) -> Vec<Operation> {
         // Drop also covers partial initialization; a consumed close must not
         // attempt the same path cleanup again.
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Vec::new();
+        {
+            // The close transition and the inner gate's commitment share one
+            // linearization fence. Release it before joining service threads.
+            let _fence = self
+                .fence
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if self.closed.swap(true, Ordering::SeqCst) {
+                return Vec::new();
+            }
         }
         if let Some(stream) = self
             .connection
@@ -197,6 +211,11 @@ impl Channel {
             .take()
             .and_then(|thread| thread.join().ok())
             .unwrap_or_default();
+        // The response loop can end on a timeout while a read is still in
+        // progress. Keep every attempt resource until that reader is drained.
+        if let Some(worker) = self.worker.take() {
+            worker.join();
+        }
         // Only what the channel created, one entry at a time.
         if self.socket_created {
             let _ = fs::remove_file(&self.socket);
@@ -219,11 +238,16 @@ impl Drop for Channel {
 /// gate.
 struct Closing {
     closed: Arc<AtomicBool>,
+    fence: Arc<Mutex<()>>,
     inner: Box<dyn Gate>,
 }
 
 impl Gate for Closing {
     fn admit(&mut self) -> Result<(), Refusal> {
+        let _fence = self
+            .fence
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if self.closed.load(Ordering::SeqCst) {
             return Err(Refusal::AttemptClosed);
         }
@@ -231,6 +255,10 @@ impl Gate for Closing {
     }
 
     fn commit(&mut self, tool: Option<&'static str>, digest: &str) -> Result<(), Refusal> {
+        let _fence = self
+            .fence
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if self.closed.load(Ordering::SeqCst) {
             return Err(Refusal::AttemptClosed);
         }

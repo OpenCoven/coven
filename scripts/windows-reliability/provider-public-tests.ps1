@@ -9,7 +9,7 @@ Add-Type -Path @((Join-Path $PSScriptRoot 'provider-template.cs'),(Join-Path $PS
 
 if ($OutputFile) {
     $records=[Collections.Generic.List[object]]::new()
-    foreach ($scenario in @(@{Count=1;Fault=''},@{Count=257;Fault='global-fields'},@{Count=257;Fault='eight-fields'},@{Count=256;Fault='eight-fields'},@{Count=1;Fault='primary-and-cleanup'})) {
+    foreach ($scenario in @(@{Count=1;Fault=''},@{Count=257;Fault='global-fields'},@{Count=257;Fault='eight-fields'},@{Count=256;Fault='eight-fields'},@{Count=1;Fault='primary-and-cleanup'},@{Count=1;Fault='private'})) {
         $api=[ControlledKernelApi]::new();$api.EventCount=$scenario.Count;$api.Fault=$scenario.Fault
         $collector=[CovenKernelReader]::Collect($api,[ControlledKernelBuffers]::new())
         $encoded=[CovenKernelPublic]::Encode($collector,[CovenKernelJsonSerializer]::new())
@@ -28,7 +28,7 @@ if ($OutputFile) {
 if ($ProbeOutputFile) {
     $records=[Collections.Generic.List[object]]::new()
     $phaseHash=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'public_receipt.py') -Algorithm SHA256).Hash.ToLowerInvariant()
-    foreach ($scenario in @(@{Count=1;Fault=''},@{Count=257;Fault='global-fields'},@{Count=257;Fault='eight-fields'},@{Count=256;Fault='eight-fields'})) {
+    foreach ($scenario in @(@{Count=1;Fault=''},@{Count=257;Fault='global-fields'},@{Count=257;Fault='eight-fields'},@{Count=256;Fault='eight-fields'},@{Count=1;Fault='private'},@{Count=2;Fault='eight-fields'})) {
         $api=[ControlledKernelApi]::new();$api.EventCount=$scenario.Count;$api.Fault=$scenario.Fault
         $collector=[CovenKernelReader]::Collect($api,[ControlledKernelBuffers]::new())
         $source=[ControlledPublicTests]::Source($phaseHash);$hostProof=[ControlledPublicTests]::Host()

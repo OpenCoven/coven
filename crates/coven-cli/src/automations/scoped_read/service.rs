@@ -7,16 +7,17 @@
 //! the reader, and the [`Gate`] that admits each call and commits each result
 //! before a byte of it is written.
 //!
-//! Every `tools/call` reaches the reader, an unknown tool or malformed
-//! arguments included, so every call counts against the attempt's limit and
+//! Every `tools/call` request with an ID reaches the reader, an unknown tool
+//! or malformed arguments included, so every call counts against the attempt's limit and
 //! is answered as a refused tool result. Each operation runs on a worker
-//! thread under a time limit: the policy's, or less when the attempt's
+//! thread with a response-wait limit: the policy's, or less when the attempt's
 //! deadline is nearer. One that overruns is refused (`limit_time`) and the
 //! service stops, because the worker cannot be interrupted and no later call
-//! may share the reader with it.
+//! may share the reader with it. The worker remains owned and must drain before
+//! the attempt's resources are removed. Notifications run no read and get no reply.
 
 use std::io::{self, BufRead, Write};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -92,10 +93,39 @@ pub(crate) enum Outcome {
 type Serve = Box<dyn FnMut(&Value) -> Result<Response, Refusal> + Send>;
 type Job = (Value, mpsc::Sender<Result<Response, Refusal>>);
 
+/// Retains the uninterruptible reader until it finishes. A channel holds an
+/// owner beyond the response loop, so a timeout can be answered promptly while
+/// close still drains the reader before removing the attempt's resources.
+#[derive(Default)]
+pub(crate) struct Worker {
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Worker {
+    pub(crate) fn join(&self) {
+        // Keep the lock through join: another owner must not mistake a taken
+        // handle for a worker whose drain has already completed.
+        let mut held = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(thread) = held.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
 pub(crate) struct Service {
     serve: Serve,
     gate: Box<dyn Gate>,
     limits: Limits,
+    worker: Arc<Worker>,
 }
 
 impl Service {
@@ -110,20 +140,30 @@ impl Service {
             serve,
             gate,
             limits,
+            worker: Arc::new(Worker::default()),
         }
+    }
+
+    /// An owner that must be drained before the attempt's resources go away.
+    pub(crate) fn worker(&self) -> Arc<Worker> {
+        Arc::clone(&self.worker)
     }
 
     /// Serves `input` until it ends, the attempt closes or an operation
     /// overruns, attempting to write each answer to `output`. Returns each
     /// call's reader/gate outcome, including commitments whose write failed.
+    /// The last worker owner drains any unfinished read on drop. A channel
+    /// retains that owner until close; the limit bounds response waiting,
+    /// not the duration of uninterruptible filesystem work or draining close.
     pub(crate) fn run(self, mut input: impl BufRead, mut output: impl Write) -> Vec<Operation> {
         let Self {
             mut serve,
             mut gate,
             limits,
+            worker,
         } = self;
         let (jobs, queue) = mpsc::channel::<Job>();
-        let worker = thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("scoped-read".to_owned())
             .spawn(move || {
                 for (request, answer) in queue {
@@ -131,8 +171,13 @@ impl Service {
                     let _ = answer.send(serve(&request));
                 }
             });
+        let available = thread.is_ok();
+        *worker
+            .thread
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = thread.ok();
         let mut session = Session {
-            jobs: worker.is_ok().then_some(jobs),
+            jobs: available.then_some(jobs),
             gate: gate.as_mut(),
             limits,
             initialized: false,
@@ -157,8 +202,12 @@ impl Service {
                 break;
             }
         }
-        // Dropping the queue ends the worker once its operation returns.
-        session.operations
+        let operations = std::mem::take(&mut session.operations);
+        // Close the queue before releasing this owner. The last owner joins
+        // the worker, which exits once its current operation returns.
+        drop(session);
+        drop(worker);
+        operations
     }
 }
 

@@ -1,6 +1,6 @@
 ---
 title: "Ward power-loss durability"
-summary: "Protected proposal commit barriers, recovery guarantees, and platform limits."
+summary: "Ward acknowledgment barriers, proposal recovery guarantees, and platform limits."
 read_when:
   - Changing protected proposal persistence or recovery
   - Investigating missing Ward audit evidence
@@ -28,6 +28,21 @@ terminal retry forces a new FULL commit and checks the database directory again:
 COMMIT may have succeeded even when its following directory barrier failed.
 A reported barrier failure never means that a preceding rename or commit did
 not happen. Retained intent/claims and terminal evidence drive reconciliation.
+
+Direct (non-proposal) Ward writes sync installed targets before persisting their
+Gate-4 audit rows and advancing any applied protected baselines. A checked FULL
+database barrier follows those writes before reservation release and HTTP 200.
+A barrier failure retains the reservation and returns `audit_persist_failed`
+with `writeApplied: true` and `retrySafe: false`. This acknowledgment guarantee
+does not close the pre-audit crash window: an unacknowledged direct write may
+have installed target bytes without audit evidence. The direct API continues
+to refuse Tier-0 edits; these barriers grant no additional write authority.
+
+Legacy staging syncs its pending file, then commits `proposal_submitted` in a
+durable transaction before HTTP 202. A receipt failure may leave a pending file,
+but never acknowledges staging. Existing legacy validation and quarantine rules
+still apply. The separate decision-reservation durability residual tracked in
+[#1618](https://github.com/OpenCoven/coven/issues/1618) is unchanged.
 
 New Coven-owned home/workspace hierarchies use per-parent
 `.coven-directory-publications` registries. A marker precedes each mkdir and is
@@ -91,4 +106,7 @@ intent/terminal survival, exactly-once recovery, and the veto-window census's
 unresolved versus typed-terminal classifications. Additional tests cover
 submission recovery, baseline/terminal atomicity, SQLite sync errors, directory
 sync errors, mode restoration, and retained directory identity after a rename.
+Direct-write cases cover pre-audit and acknowledged cuts, plus failed SQLite
+and database-directory syncs. Legacy staging cases cover acknowledgment,
+receipt-insert failure, and failed receipt sync while retaining the pending file.
 These are deterministic protocol tests, not physical power-cut certification.
