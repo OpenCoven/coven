@@ -174,14 +174,14 @@ fn service_key() -> SigningKey {
 fn recovery_request(
     fixture: &Fixture,
     head: &InstalledPolicy,
-    nonce: u8,
+    seed: u8,
 ) -> (
     crate::mobile_memory::recovery::AccessRecoveryRequest,
     SigningKey,
 ) {
     use crate::mobile_memory::grant::DeviceGrant;
-    let destination = SigningKey::from_slice(&[nonce; 32]).unwrap();
-    let id = Uuid::from_u128(u128::from(nonce));
+    let destination = SigningKey::from_slice(&[seed; 32]).unwrap();
+    let id = Uuid::from_u128(u128::from(seed));
     let mut grant = DeviceGrant::for_device(
         id,
         &public(&destination),
@@ -200,7 +200,8 @@ fn recovery_request(
         device_name: "Replacement phone".into(),
         device_context: "Synthetic recovery".into(),
         grant,
-        nonce: [nonce; 32],
+        // Only uniqueness matters; a fixed value would be a reused nonce.
+        nonce: rand::random(),
         issued_at: fixture.now,
         expires_at: fixture.now + chrono::Duration::seconds(120),
     };
