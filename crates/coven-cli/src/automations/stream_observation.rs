@@ -5,8 +5,8 @@
 //! structured runtime envelope, so every line is the harness's own event and
 //! never model text. Coverage is complete only when the stream accounts for
 //! everything:
-//! - an init event whose tools, MCP servers and permission mode are within the
-//!   envelope;
+//! - an init event whose tools, MCP servers, permission mode and harness
+//!   version are within the envelope;
 //! - every later line a known event;
 //! - every tool call one the envelope classifies;
 //! - exactly one final result;
@@ -82,11 +82,13 @@ pub(crate) fn classify_claude_stream(
                 }
                 initialized = true;
             }
-            // Diagnostics: wrapped stderr and token counts, plus the
-            // separate top-level rate-limit event. Unknown system events
-            // remain partial so a new provider event cannot silently widen
-            // the evidence we treat as complete.
-            (Some("system"), Some("stderr" | "thinking_tokens"))
+            // Diagnostics: wrapped stderr, token counts and the UI render
+            // hint claude 2.1.304 and later emit before init, plus the
+            // separate top-level rate-limit event. None carries model or
+            // tool content. Unknown system events remain partial so a new
+            // provider event cannot silently widen the evidence we treat as
+            // complete.
+            (Some("system"), Some("stderr" | "thinking_tokens" | "ui_invalidate"))
             | (Some("rate_limit_event"), _) => {}
             (Some("assistant"), _) => {
                 observation.complete &= initialized;
@@ -148,8 +150,10 @@ pub(crate) fn classify_claude_stream(
     observation
 }
 
-/// The init event lists no tool outside the envelope, no MCP server, and the
-/// envelope's permission mode.
+/// The init event lists no tool outside the envelope and exactly the
+/// envelope's MCP servers, each connected: none, or its scoped read service.
+/// It reports the envelope's permission mode and, when the envelope was
+/// proven against exact harness versions, one of them.
 fn init_within(envelope: &RuntimeEnvelope, init: &Map<String, Value>) -> bool {
     let tools_within = init
         .get("tools")
@@ -160,12 +164,30 @@ fn init_within(envelope: &RuntimeEnvelope, init: &Map<String, Value>) -> bool {
                     .is_some_and(|name| envelope.tool(name).is_some())
             })
         });
-    let no_mcp = init
+    let expected: &[&str] = envelope
+        .service
+        .as_ref()
+        .map_or(&[], |service| std::slice::from_ref(&service.server));
+    let servers_exact = init
         .get("mcp_servers")
         .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty);
+        .is_some_and(|servers| {
+            servers.len() == expected.len()
+                && servers.iter().zip(expected).all(|(server, name)| {
+                    server.get("name").and_then(Value::as_str) == Some(name)
+                        && server.get("status").and_then(Value::as_str) == Some("connected")
+                })
+        });
+    let version_admitted = envelope.harness_versions.is_empty()
+        || init
+            .get("claude_code_version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| envelope.harness_versions.contains(&version));
     let permission = init.get("permissionMode").and_then(Value::as_str);
-    tools_within && no_mcp && permission == Some(envelope.permission_mode)
+    tools_within
+        && servers_exact
+        && version_admitted
+        && permission == Some(envelope.permission_mode)
 }
 
 /// A message's content blocks, or `None` when they are not a list of
@@ -424,5 +446,94 @@ mod tests {
         let cut = stream(&read_run());
         assert!(!classify_claude_stream(&CLAUDE_R0_READ, &cut[..cut.len() - 1], false).complete);
         assert!(!classify_claude_stream(&CLAUDE_R0_READ, &cut, true).complete);
+    }
+
+    /// A named change to an init event.
+    type InitEdit = (&'static str, fn(&mut Value));
+
+    /// A scoped read run as claude 2.1.305 prints it under `r0-read.2`, with
+    /// `init` edited by `edit`.
+    fn scoped_run(edit: impl FnOnce(&mut Value)) -> Vec<String> {
+        let mut init = json!({
+            "type": "system",
+            "subtype": "init",
+            "tools": ["mcp__coven__read_file", "mcp__coven__list_directory", "mcp__coven__search"],
+            "mcp_servers": [{ "name": "coven", "status": "connected", "source": "dynamic" }],
+            "permissionMode": "default",
+            "claude_code_version": "2.1.305",
+            "apiKeySource": "ANTHROPIC_API_KEY",
+            "session_id": "native-session"
+        });
+        edit(&mut init);
+        vec![
+            json!({ "type": "system", "subtype": "ui_invalidate", "event": "ui.render" })
+                .to_string(),
+            init.to_string(),
+            tool_use("mcp__coven__read_file"),
+            tool_result(),
+            text("It says granted notes."),
+            result("It says granted notes."),
+        ]
+    }
+
+    #[test]
+    fn a_scoped_read_run_is_complete_only_with_exactly_the_service() {
+        use crate::automations::runtime_envelope::CLAUDE_R0_SCOPED_READ;
+
+        let classify_scoped = |lines: &[String]| {
+            classify_claude_stream(&CLAUDE_R0_SCOPED_READ, &stream(lines), false)
+        };
+        let observation = classify_scoped(&scoped_run(|_| {}));
+        assert!(observation.complete);
+        assert_eq!(
+            observation.capabilities.into_iter().collect::<Vec<_>>(),
+            ["analysis.read"]
+        );
+        assert_eq!(observation.side_effects, SideEffectClass::LocalRead);
+        assert_eq!(
+            observation.result,
+            StreamResult::Produced("It says granted notes.".to_owned())
+        );
+
+        let partial: [InitEdit; 8] = [
+            ("another harness version", |init| {
+                init["claude_code_version"] = json!("2.1.306")
+            }),
+            ("no harness version", |init| {
+                init.as_object_mut().unwrap().remove("claude_code_version");
+            }),
+            ("no MCP server", |init| init["mcp_servers"] = json!([])),
+            ("the service not connected", |init| {
+                init["mcp_servers"][0]["status"] = json!("failed")
+            }),
+            ("another MCP server", |init| {
+                init["mcp_servers"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({ "name": "github", "status": "connected" }))
+            }),
+            ("a server under another name", |init| {
+                init["mcp_servers"][0]["name"] = json!("coven-shadow")
+            }),
+            ("a native tool", |init| {
+                init["tools"].as_array_mut().unwrap().push(json!("Read"))
+            }),
+            ("plan mode", |init| init["permissionMode"] = json!("plan")),
+        ];
+        for (case, edit) in partial {
+            assert!(!classify_scoped(&scoped_run(edit)).complete, "{case}");
+        }
+        // A native read under the service's envelope is unclassified.
+        let mut native = scoped_run(|_| {});
+        native[2] = tool_use("Read");
+        assert!(!classify_scoped(&native).complete);
+        // The service under r0-read.1 is a widening, not a read.
+        assert!(
+            !classify(&scoped_run(|init| {
+                init["permissionMode"] = json!("plan");
+                init["tools"] = json!(["Read"]);
+            }))
+            .complete
+        );
     }
 }

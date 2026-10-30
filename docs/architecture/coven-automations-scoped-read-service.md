@@ -77,10 +77,38 @@ billed. On 2.1.305:
 - no memory file from the home folder, the launch folder or its parent reached
   the model.
 
-Still open: harness admission (the envelope descriptor, the exact Claude Code
-version list, the API key, the isolated launch), response commitment under the
-daemon's revocation fence, the adapter and receipts, and Windows. The vectors
-are engineering evidence, not containment certification.
+**The replacement envelope, `r0-read.2`,** is described in
+`automations/runtime_envelope.rs`:
+
+- It launches claude with `--bare`, `--tools ""`, `--setting-sources ""`,
+  `--strict-mcp-config`, no session persistence and no slash commands. Only the
+  service's three tools are allowed, and the launch adds the attempt's
+  `--mcp-config`.
+- Its descriptor uses the `coven.automations.runtime-envelope.v2` profile. It
+  binds:
+  - the exact Claude Code versions proven so far, which is 2.1.305;
+  - the service's server, transport, tools version and policy, including the
+    5-second operation limit;
+  - the launch: an empty working directory, an isolated home, the owner's API
+    key, and the only environment variables passed.
+- The observer reads its stream as complete only when the init event lists
+  exactly the `coven` server, connected, and one of those versions. It also
+  knows the `ui_invalidate` event that Claude Code 2.1.304 and later emit
+  before init.
+- The opt-in claude tests launch with these very arguments. The observer reads
+  the scripted run's real stream as complete evidence of `analysis.read`.
+- **It is not launchable yet.** `for_projection` and `for_grant` still find
+  only `r0-read.1`, whose descriptor and digest are unchanged. Val decided on
+  2026-10-20 that missions, the catalog and the mission-commands conformance
+  vectors move to `r0-read.2` in a separate change, coordinated with Chat and
+  the SDK.
+
+Still open: the daemon's admission for `r0-read.2` (the version check before
+launch, the isolated launch folder and home, the API key command and file, the
+protected paths, and opening and closing the channel with the session),
+response commitment under the daemon's revocation fence, the mission switch,
+the adapter and receipts, and Windows. The vectors are engineering evidence,
+not containment certification.
 
 ### Scope operations
 
