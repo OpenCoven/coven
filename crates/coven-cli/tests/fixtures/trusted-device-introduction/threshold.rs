@@ -731,6 +731,59 @@ mod ledger {
         assert!(!store.is_locked().unwrap());
     }
 
+    /// Owner-root rotation from the installed root to a new key; the policy
+    /// is unchanged, only the head digest moves.
+    fn rotate_root(fixture: &Fixture) {
+        let store = OwnerPolicyStore::open(fixture.home.path(), AUDIENCE).unwrap();
+        let head = store.current().unwrap().unwrap();
+        let old = SigningKey::from_slice(&[90; 32]).unwrap();
+        let new = SigningKey::from_slice(&[91; 32]).unwrap();
+        let proposal = PolicyProposal {
+            revision: 2,
+            previous_digest: Some(head.digest),
+            policy: fixture.policy.clone(),
+            nonce: [6; 32],
+            issued_at: fixture.now,
+            expires_at: fixture.now + chrono::Duration::seconds(60),
+        };
+        let bytes = store
+            .rotation_action(&public(&new), &proposal)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        store
+            .rotate_root(
+                &public(&new),
+                &proposal,
+                &sign(&old, &bytes),
+                &sign(&new, &bytes),
+                fixture.now,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn an_owner_root_rotation_retires_a_fully_approved_introduction() {
+        let fixture = Fixture::new(2);
+        let _ = installed(&fixture);
+        let request = fixture.request(&[0, 1]);
+        let authority =
+            IntroductionAuthority::load_installed(fixture.home.path(), AUDIENCE).unwrap();
+        let a = fixture.genuine(&authority, &request, 0);
+        let b = fixture.genuine(&authority, &request, 1);
+        rotate_root(&fixture);
+        let error = authority
+            .introduce_threshold(
+                &request,
+                &fixture.destination_signature(&request),
+                &[(fixture.approvers[0].id, &a), (fixture.approvers[1].id, &b)],
+                fixture.now,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("owner policy was replaced"));
+        assert!(!fixture.enrolled());
+    }
+
     #[test]
     fn a_tightened_policy_retires_a_fully_approved_introduction() {
         let fixture = Fixture::new(2);
