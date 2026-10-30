@@ -22,12 +22,18 @@ explicit superseded/cancelled disposition. Passing CI or an expired claim is
 not sufficient proof of delivery. Runtime definitions, occurrences, runs,
 attempts, approvals, and receipts remain Coven-owned production state.
 
+Every retained issue needs an issue-specific long-running goal prompt and a follow-up prompt, in its body or a linked comment. Preserve its complete outcome, acceptance criteria, current owner, exact delivery evidence, approval gates, blockers and next unblocked action. Record parent/child rollups separately from true completion blockers; coordinated investigation can proceed while completion is blocked. Reconcile native relationships when a prerequisite lands or a scope is superseded. Do not close distinct acceptance outcomes merely to reduce the issue count.
+
+Use the [bounded task allocator and pruning procedure](development/worktree-lifecycle.md) before allocating work and after delivery. Record retained cleanup blockers and their owners on the owning issue. GitHub remains the durable tracker; allocation locks are temporary coordination only.
+
 The Automations graph is a reviewed GitHub snapshot in
 `roadmaps/coven-automations-v1.mapping.json`. Validate it with
 `node docs/roadmaps/drift-check.mjs --strict` and `--selftest`; optionally compare
 a local GitHub REST issue-array snapshot with `--issues-export PATH`.
 
 ## Migration receipt (2026-10-05)
+
+The table below records migration-time dispositions, not live issue status. Use each linked GitHub issue's current state and acceptance evidence when choosing work or evaluating closure; later delivery does not rewrite the historical receipt.
 
 #1222 owns this migration. All 24 previously non-closed local records have a
 GitHub disposition: 21 new issues and three reused documentation issues.

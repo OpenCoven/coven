@@ -1388,26 +1388,29 @@ fn stage_legacy_pending_proposal(
     let staged_at = pending
         .staged_at
         .format(&time::format_description::well_known::Rfc3339)?;
-    conn.execute(
-        "INSERT INTO ward_audit (
+    crate::store::durable_transaction(conn, || {
+        conn.execute(
+            "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
             tier, decision, approver, diff_hash, files_touched, channel,
             thread_id, submitted_at, decided_at, detail
          ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9, ?10, ?10, NULL)",
-        params![
-            threads::AuditEventType::ProposalSubmitted.tag(),
-            pending.id.to_string(),
-            probe_context.familiar_id,
-            weave_hash,
-            tier,
-            decision,
-            files_touched,
-            format!("{:?}", pending.channel).to_lowercase(),
-            pending.thread_id.0.to_string(),
-            staged_at,
-        ],
-    )
-    .context("appending proposal_submitted audit for legacy staging")?;
+            params![
+                threads::AuditEventType::ProposalSubmitted.tag(),
+                pending.id.to_string(),
+                probe_context.familiar_id,
+                weave_hash,
+                tier,
+                decision,
+                files_touched,
+                format!("{:?}", pending.channel).to_lowercase(),
+                pending.thread_id.0.to_string(),
+                staged_at,
+            ],
+        )
+        .context("appending proposal_submitted audit for legacy staging")?;
+        Ok(())
+    })?;
     Ok((path, pending.id.0.to_string()))
 }
 

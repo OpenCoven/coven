@@ -38,7 +38,7 @@ PRs that a session then has to close. Before you touch code:
    worktree-scoped, so enter the worktree before acquiring the claim:
    ```sh
    git fetch origin main
-   git worktree add -b <branch> /tmp/coven-<branch-slug> origin/main
+   python3 scripts/task-worktree.py create --issue <N> --branch <branch> --path /tmp/coven-<branch-slug>
    cd /tmp/coven-<branch-slug>
    ```
 
@@ -58,6 +58,10 @@ This step is cheap and it is the single thing that prevents duplicate-PR churn.
 Without an explicit `COVEN_AGENT_ID`, Coven identifies the owner as
 `$USER@<worktree-slug>`. Set distinct explicit IDs only when multiple agents
 must share one worktree.
+
+Task allocation must use `scripts/task-worktree.py create`; do not bypass its shared allocation lock or budget refusal with raw `git worktree add`. It caps task worktrees at 12, local task branches at 32 and origin task branches at 48, excluding `main` and origin's symbolic `HEAD`. Existing work may continue above the cap, but new allocation stops until safe cleanup brings the counts within budget. Follow [the pruning procedure](docs/development/worktree-lifecycle.md); never delete uncertain work to make room. A budget change requires an issue-backed reviewed policy change, not an ad hoc command-line override.
+
+Publish task branches with `python3 scripts/task-worktree.py publish --issue <N>` after required checks. It reads live origin heads under the same lock, refuses main/detached publication and new remote growth above 48, and keeps existing updates fast-forward-only. A necessary one-branch publication exception requires `--exception-issue <open-issue> --reason <reason>`; the helper records the exact branch, SHA and counts on that issue before pushing. This records a bounded exception, not a limit change or release authorization. Do not bypass publication checks with raw pushes.
 
 ## Durable work tracking
 
@@ -135,6 +139,8 @@ The Cloud suites need Python 3.11+ on `PATH` as `python3`.
   done
   bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh || fail=1
   python3 scripts/dev-verify-test.py || fail=1
+  python3 scripts/task-worktree-test.py || fail=1
+  python3 scripts/branch-triage-test.py || fail=1
   npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund || fail=1
   node --test scripts/browser-capability.test.mjs || fail=1
 

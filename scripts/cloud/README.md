@@ -30,6 +30,17 @@ uses the native installer to validate Debian/Ubuntu sources. System package
 installation requires root or non-interactive sudo. Readiness never installs
 system packages. Missing prerequisites fail explicitly.
 
+The installer bounds the package download (#1578). Each attempt gets 15 seconds
+plus the time the listed archives need at 1 MiB/s. A slower transfer is
+stopped and retried, up to three attempts, with the next entry of a
+`mirror+file:` list tried first. apt resumes partial files, then installs only
+the downloaded archives, each checked against the signed index. Exhausting the
+attempts fails `native_dependencies` with the `native_download` diagnostic.
+A direct installer run can override these bounds with
+`COVEN_APT_DOWNLOAD_ATTEMPTS`, `COVEN_APT_DOWNLOAD_GRACE_SECONDS` and
+`COVEN_APT_DOWNLOAD_MIN_BYTES_PER_SECOND`. Bootstrap does not forward them, so it
+always uses the defaults.
+
 Bootstrap reads `rust-toolchain.toml`, `.node-version`, and each package's
 `packageManager`. It installs the Rust channel/profile/components/targets with
 rustup, verifies the official Node archive checksum, installs exact package
