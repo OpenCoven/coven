@@ -99,6 +99,7 @@ pub(crate) enum WorkCode {
     TimeoutExpired,
     LaunchAbandoned,
     CancellationExpired,
+    StopFenced,
     EligibleNow,
     DueUnplanned,
     RecoveryRequired,
@@ -147,6 +148,19 @@ const ROUTINE_SELECT: &str = "
 
 /// At most this many work items; `work_truncated` says when more exist.
 const MAX_WORK: usize = 20;
+
+/// The attempts live on the run's session, where a dispatch needs none: a
+/// stop reaches the run through one, and holding it for recovery needs
+/// exactly one.
+const LIVE_ON_SESSION_SQL: &str = "(
+    SELECT COUNT(*) FROM main.automation_attempts AS live
+    WHERE live.run_id = held.id
+      AND live.state IN ('dispatching', 'started', 'observing')
+      AND (
+          live.session_id = held.session_id
+          OR (live.state = 'dispatching' AND live.session_id IS NULL)
+      )
+)";
 
 /// What the claim gate (`ELIGIBLE_OCCURRENCES_SQL` and `claim_due_occurrence`)
 /// counts against the routine: a claimed or running occurrence of it, or a
@@ -344,15 +358,7 @@ fn work_select() -> String {
            -- hold needs that attempt to be the only unresolved one.
            CASE
                WHEN session.status IS NOT 'running'
-                    OR (
-                        SELECT COUNT(*) FROM main.automation_attempts AS live
-                        WHERE live.run_id = held.id
-                          AND live.state IN ('dispatching', 'started', 'observing')
-                          AND (
-                              live.session_id = held.session_id
-                              OR (live.state = 'dispatching' AND live.session_id IS NULL)
-                          )
-                    ) <> 1
+                    OR {LIVE_ON_SESSION_SQL} <> 1
                     OR EXISTS (
                         SELECT 1 FROM main.automation_runs AS sharer
                         WHERE sharer.session_id = held.session_id
@@ -411,15 +417,7 @@ fn work_select() -> String {
                     OR occurrence.lease_expires_at IS NULL
                     OR occurrence.lease_expires_at > ?1
                     OR held.timeout_at <= ?1
-                    OR (
-                        SELECT COUNT(*) FROM main.automation_attempts AS live
-                        WHERE live.run_id = held.id
-                          AND live.state IN ('dispatching', 'started', 'observing')
-                          AND (
-                              live.session_id = held.session_id
-                              OR (live.state = 'dispatching' AND live.session_id IS NULL)
-                          )
-                    ) <> 1
+                    OR {LIVE_ON_SESSION_SQL} <> 1
                     OR EXISTS (
                         SELECT 1 FROM main.automation_runs AS sharer
                         WHERE sharer.session_id = held.session_id
@@ -525,15 +523,7 @@ fn work_select() -> String {
            CASE
                WHEN session.status IS NOT 'running'
                     OR expiring.session_id IS NOT held.session_id
-                    OR (
-                        SELECT COUNT(*) FROM main.automation_attempts AS live
-                        WHERE live.run_id = held.id
-                          AND live.state IN ('dispatching', 'started', 'observing')
-                          AND (
-                              live.session_id = held.session_id
-                              OR (live.state = 'dispatching' AND live.session_id IS NULL)
-                          )
-                    ) > 1
+                    OR {LIVE_ON_SESSION_SQL} > 1
                     OR NOT EXISTS (
                         SELECT 1 FROM main.automation_attempts AS targeted
                         WHERE targeted.id = expiring.attempt_id
@@ -587,7 +577,65 @@ fn work_select() -> String {
            END AS cancelled,
            expiring.state IS 'stopping' AS stopping,
            -- That cancellation's row, which reconciliation reads whole.
-           expiring.rowid AS expiring
+           expiring.rowid AS expiring,
+           -- The run's stop fence, which settlement and every stop defer
+           -- to, unless the latest attempt is ambiguous: terminal evidence
+           -- then settles the stop whose outcome was unknown, fence or not.
+           CASE WHEN latest.state IS NOT 'ambiguous'
+               THEN CAST(fence.owner AS BLOB)
+           END AS fence_owner,
+           -- Its expiry as stored; one that is not text cannot be read.
+           CASE WHEN typeof(fence.execution_expires_at) = 'text'
+               THEN CAST(fence.execution_expires_at AS BLOB)
+           END AS fence_expiry,
+           -- What ends the fence. A fence the run's own stop left on its
+           -- session is reached once it has expired, and the run is then
+           -- held for recovery: 1 by settlement, once the session has
+           -- finished with the latest attempt live, from a timeout or
+           -- recovery stop; 2 by timeout enforcement, at the deadline of a
+           -- dated run whose session has not finished, from a timeout stop;
+           -- 3 by abandoned-launch recovery, at the lease end of a claim
+           -- whose session is still created and whose stored deadline has
+           -- not passed, from a recovery stop. 4 is a fence the requested
+           -- cancellation holding it finishes, by its command or its
+           -- reconciliation; 5 one that does not govern the run: a stopping
+           -- cancellation holds it, whose reconciliation stops nothing and
+           -- ends it, or the run is a Runtime Authority one whose session
+           -- has finished, which settlement handles fence or not; 0 one
+           -- nothing ends.
+           CASE
+               WHEN fence.run_id IS NULL THEN 0
+               WHEN fence.owner = 'cancellation' THEN COALESCE((
+                   SELECT CASE owning.state WHEN 'requested' THEN 4 ELSE 5 END
+                   FROM main.automation_cancellations AS owning
+                   WHERE owning.run_id = held.id
+                     AND owning.session_id IS fence.session_id
+                     AND owning.adoption_key IS fence.operation_key
+                     AND owning.state IN ('requested', 'stopping')
+                   ORDER BY owning.rowid
+                   LIMIT 1
+               ), 0)
+               WHEN fence.session_id IS NOT held.session_id THEN 0
+               WHEN session.status IN ('completed', 'failed', 'cancelled', 'killed', 'idle') THEN
+                   CASE WHEN held.authority_profile IS NOT NULL THEN 5
+                        WHEN latest.state IN ('dispatching', 'started', 'observing') THEN 1
+                        ELSE 0 END
+               WHEN fence.owner = 'timeout' THEN
+                   CASE WHEN held.timeout_at IS NOT NULL
+                             AND session.status IN ('created', 'running', 'orphaned')
+                       THEN 2 ELSE 0 END
+               WHEN fence.owner = 'recovery' THEN
+                   CASE WHEN session.status = 'created'
+                             AND occurrence.state = 'claimed'
+                             AND occurrence.lease_expires_at IS NOT NULL
+                             AND (held.timeout_at IS NULL OR held.timeout_at > ?1)
+                       THEN 3 ELSE 0 END
+               ELSE 0
+           END AS fence_reach,
+           {LIVE_ON_SESSION_SQL} AS fence_live,
+           -- Whether restart containment reads the run's launch first.
+           session.status IS NOT NULL AND session.status IN ('created', 'orphaned') AS launching,
+           held.authority_profile IS NOT NULL AS authority
     FROM main.automation_occurrences AS occurrence
     LEFT JOIN main.automation_runs AS held
       ON held.id = (
@@ -620,6 +668,7 @@ fn work_select() -> String {
           ORDER BY pending.rowid
           LIMIT 1
       )
+    LEFT JOIN main.automation_stop_fences AS fence ON fence.run_id = held.id
     WHERE occurrence.automation_id = ?3
       AND occurrence.state IN ('claimed', 'running', 'recovery_required')
     UNION ALL
@@ -668,7 +717,13 @@ fn work_select() -> String {
            NULL,
            0,
            0,
-           NULL
+           NULL,
+           NULL,
+           NULL,
+           0,
+           0,
+           0,
+           0
     FROM main.automation_runs AS run
     WHERE run.automation_id = ?3
       AND run.status = 'running'
@@ -704,7 +759,13 @@ fn work_select() -> String {
            NULL,
            0,
            0,
-           NULL
+           NULL,
+           NULL,
+           NULL,
+           0,
+           0,
+           0,
+           0
     FROM ({ELIGIBLE_OCCURRENCES_SQL}) AS eligible
     WHERE ?5 IS NULL
        OR eligible.scheduled_for >= ?5
@@ -714,7 +775,7 @@ fn work_select() -> String {
        )
     UNION ALL
     SELECT 2, NULL, 'unplanned', CAST(?5 AS BLOB), NULL, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0,
-           0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL
+           0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0, 0
     WHERE ?5 IS NOT NULL
       AND NOT EXISTS (
           SELECT 1 FROM main.automation_occurrences AS later
@@ -930,6 +991,12 @@ fn work(
                     row.get::<_, i64>(23)?,
                     row.get::<_, bool>(24)?,
                     row.get::<_, Option<i64>>(25)?,
+                    row.get::<_, Option<Vec<u8>>>(26)?,
+                    row.get::<_, Option<Vec<u8>>>(27)?,
+                    row.get::<_, i64>(28)?,
+                    row.get::<_, i64>(29)?,
+                    row.get::<_, bool>(30)?,
+                    row.get::<_, bool>(31)?,
                 ))
             },
         )
@@ -963,6 +1030,12 @@ fn work(
             cancelled,
             stopping,
             expiring,
+            fence_owner,
+            fence_expiry,
+            fence_reach,
+            fence_live,
+            launching,
+            authority,
         ) = row.context("failed to read the routine's work")?;
         // Reconciliation parses the whole stored deadline and settles the
         // retry once it has passed. The eligible queue compares the deadline
@@ -995,6 +1068,46 @@ fn work(
         let deadline_at = deadline
             .flatten()
             .map(|(deadline, _)| deadline.to_rfc3339_opts(SecondsFormat::Millis, true));
+        // A stop fence the pass defers to. Each stop and settlement parse
+        // its expiry whole, and skip the run when they cannot. A fence of a
+        // stopping cancellation does not fence the run: that cancellation's
+        // reconciliation ends it. A requested cancellation's own fence goes
+        // with it once its run's deadline has passed: the cancellation is
+        // rejected, and the run is stopped or settled as if never fenced.
+        // Holding the run for recovery at an expired fence needs exactly one
+        // live attempt on the session, and fails the pass otherwise; a stop
+        // reaches the run only through one, where settlement reaches it
+        // through the latest attempt, wherever that is live. Before any of
+        // that, settlement's scan decodes the run's values, a stop parses
+        // the deadline of a run whose session has not finished, an expired
+        // cancellation is read whole, and restart containment reads a launch;
+        // each fails the pass instead, and the run stays `in_flight`.
+        let launch_read = parses(launched) && contains(receipt, contained);
+        let fence_expiry = fence_expiry
+            .and_then(|expiry| String::from_utf8(expiry).ok())
+            .and_then(|expiry| DateTime::parse_from_rfc3339(&expiry).ok())
+            .map(|expiry| expiry.with_timezone(&Utc));
+        let fence_expired = fence_expiry.is_some_and(|expiry| expiry <= now);
+        let fenced_step = fence_owner
+            .and(match fence_reach {
+                5 => None,
+                _ if fence_expiry.is_none() => Some(NextStep::InspectRun),
+                4 if !expired => Some(NextStep::AwaitCancellation),
+                1..=4 => match fence_live {
+                    0 if fence_reach == 1 && fence_expired => None,
+                    0 if fence_reach != 4 => Some(NextStep::InspectRun),
+                    0 | 1 if authority => Some(NextStep::AwaitRuntimeAuthority),
+                    0 | 1 => Some(NextStep::AwaitSettlement),
+                    _ => None,
+                },
+                _ => Some(NextStep::InspectRun),
+            })
+            .filter(|_| {
+                decodes
+                    && (fence_reach == 1 || !unreadable)
+                    && (expiring.is_none() || cancellation_readable)
+                    && (!launching || launch_read)
+            });
         let mut timing = (None, None);
         let (code, state, next_step) = match (rank, state.as_deref()) {
             // Each pass first settles an adopted retry failed once its
@@ -1044,9 +1157,8 @@ fn work(
             (0, Some("claimed"))
                 if abandoned != 0
                     && decodes
-                    && parses(launched)
+                    && launch_read
                     && parses(exited)
-                    && contains(receipt, contained)
                     && (abandoned == 2 || !unreadable) =>
             {
                 let next_step = if abandoned == 2 {
@@ -1074,6 +1186,14 @@ fn work(
                 };
                 (WorkCode::CancellationExpired, None, next_step)
             }
+            // A stop fence the pass defers to, on a run no pass above
+            // names: the step says what ends it.
+            (0, Some("claimed" | "running")) if fenced_step.is_some() => (
+                WorkCode::StopFenced,
+                None,
+                // Checked by the guard.
+                fenced_step.unwrap_or(NextStep::InspectRun),
+            ),
             (0, Some("claimed")) => match lease_release {
                 0 => (
                     WorkCode::InFlight,
