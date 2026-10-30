@@ -225,3 +225,98 @@ fn root_key_paths_inside_coven_home_are_refused() {
     let elsewhere = tempfile::tempdir().unwrap();
     assert!(refuse_inside_home(home.path(), &elsewhere.path().join("root.pem")).is_ok());
 }
+
+#[test]
+fn rotation_review_shows_both_fingerprints_and_every_signed_field() {
+    let (_home, store, old, now) = setup();
+    apply_root_change(
+        &store,
+        PolicyChangeKind::Install,
+        &old,
+        policy(1),
+        now,
+        rand::random(),
+        &mut answering("install", &mut Vec::new()),
+    )
+    .unwrap();
+    let previous = store.current().unwrap().unwrap();
+    let new = SigningKey::from_slice(&[12; 32]).unwrap();
+    let nonce: [u8; 32] = rand::random();
+    let mut prompts = Vec::new();
+    let head = apply_root_rotation(
+        &store,
+        &old,
+        &new,
+        now,
+        nonce,
+        &mut answering("rotate", &mut prompts),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(prompts.len(), 1);
+    let review = &prompts[0];
+    let proposal = PolicyProposal {
+        revision: 2,
+        previous_digest: Some(previous.digest.clone()),
+        policy: policy(1),
+        nonce,
+        issued_at: now,
+        expires_at: now + chrono::Duration::seconds(ROOT_ACTION_SECONDS),
+    };
+    let action = store.rotation_action(&public_key(&new), &proposal).unwrap();
+    for expected in [
+        action.operation.as_str(),
+        "device_admin",
+        action.target.as_str(),
+        key_fingerprint(&public_key(&old)).as_str(),
+        key_fingerprint(&public_key(&new)).as_str(),
+        previous.digest.as_str(),
+        "00000000-0000-0000-0000-000000000001, 00000000-0000-0000-0000-000000000002",
+        "memory_read, device_admin",
+        "86400 seconds",
+        "fresh_biometric",
+        "30 seconds",
+        action.nonce.as_str(),
+        "2027-01-15T08:00:00.000Z",
+        "2027-01-15T08:02:00.000Z",
+        action.effect_digest.as_str(),
+    ] {
+        assert!(
+            review.contains(expected),
+            "review omits {expected}:\n{review}"
+        );
+    }
+    assert_eq!(head.digest, action.effect_digest);
+    assert_eq!(head.owner_root_key, public_key(&new));
+    assert!(review.ends_with("(anything else cancels): "));
+}
+
+#[test]
+fn rotation_cancels_without_signing_on_anything_but_the_word() {
+    let (_home, store, old, now) = setup();
+    apply_root_change(
+        &store,
+        PolicyChangeKind::Install,
+        &old,
+        policy(1),
+        now,
+        rand::random(),
+        &mut answering("install", &mut Vec::new()),
+    )
+    .unwrap();
+    let before = store.current().unwrap().unwrap();
+    let new = SigningKey::from_slice(&[12; 32]).unwrap();
+    for answer in ["", "y", "yes", "Rotate", "replace"] {
+        let outcome = apply_root_rotation(
+            &store,
+            &old,
+            &new,
+            now,
+            rand::random(),
+            &mut answering(answer, &mut Vec::new()),
+        )
+        .unwrap();
+        assert!(outcome.is_none());
+    }
+    assert_eq!(store.current().unwrap().unwrap().digest, before.digest);
+}
