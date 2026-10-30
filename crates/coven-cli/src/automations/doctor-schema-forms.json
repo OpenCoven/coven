@@ -1,7 +1,7 @@
 {
   "schemaVersion": "coven.automations.doctor-schema-forms.v1",
   "metadataRecipe": "coven.automations.doctor-schema-object.v1",
-  "captureSha256": "ddd5d7854e77dddd69e988462082ec361c767fcdde636565cb6b3dbd37704dae",
+  "captureSha256": "de51deccacc137b9381da24076a03f8b06fc45597960ec6f90708dc482a81f16",
   "fixtureForms": [
     "fresh",
     "v0.4.3",
@@ -105,7 +105,7 @@
       "e28f69f319f9c6ac00390c7c560ff2d62c930f066c7289a984e32c85b4c0c918"
     ],
     "table:automation_missions": [
-      "8d8c42b605a28cc8605587025fa9e1be70bdad696b297e29c0a60dd26debfd59"
+      "14adc41371ab4dafdd0276315b02c960defd2a72dce4cfaef349c0ee41a60317"
     ],
     "table:automation_occurrences": [
       "130d6ef8dc1ed03cd6c7a88b1bb311cc5953d0eea333b9f1cf41a0db40044e3b",

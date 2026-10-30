@@ -347,11 +347,13 @@ the same normalized final state and expected digest.
 `mission-commands` sends `mission.submit.v1`, `mission.get.v1` and
 `mission.cancel.v1` to a store holding one familiar whose first revision has
 been superseded, on a clock that advances a minute per step. It covers the
-vectors M0 can reach (M-01 to M-06, M-09, M-11 and M-15 in
+vectors M0 can reach (M-01 to M-06, M-09, M-11, M-15, M-17 and M-18 in
 `docs/architecture/coven-automations-missions.md`): a replayed submit, a reused
 key, a stale revision, an unenforced envelope, the no-launch settlement, a
-cancel after it, another caller, and every bound. It checks what each refusal
-leaves behind, as `command-envelope-outcomes` does. Values that exist only at
+cancel after it, another caller, every bound, and a submit's project read
+`scopes`, accepted or refused. It checks what each refusal leaves behind, as
+`command-envelope-outcomes` does, and an expected `scopes` must equal the
+view's whole. Values that exist only at
 run time, such as the familiar's ids and `validUntil`, are whole-string tokens
 such as `{{revisionId}}` and `{{start:10m}}`.
 `calendar-schedule-resolution` executes fixed UTC and IANA-timezone cases

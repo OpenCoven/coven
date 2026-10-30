@@ -11,6 +11,11 @@
 //! (`store::AUTOMATION_DEFINITIONS_SCHEMA_SQL`), so every store that can hold a
 //! definition can tell a mission's from a routine.
 //!
+//! A submit may name `scopes`: profile filesystem read scopes on the project
+//! root (#1597). They are validated by the scoped read service's own rules,
+//! stored canonically on the mission row and returned by its view. Nothing
+//! reads them yet.
+//!
 //! M0 launches nothing. The only dispatch path launches with ambient
 //! authority, and Runtime Authority, which would hold the run to the R0 read
 //! envelope, is not constructed yet (#857). So once the submit has committed,
@@ -34,6 +39,8 @@ use super::contract::types::{AdoptionKey, MissionCancelPayload, MissionId, Missi
 use super::occurrences::{insert_claimed_occurrence, settle_occurrence};
 use super::owner_grants::CommandAuthority;
 use super::runtime_envelope::CLAUDE_R0_READ;
+use super::scoped_read::scope::Grants;
+use super::scoped_read::R0_READ_POLICY;
 use crate::api::SessionRuntime;
 
 pub const SUBMIT_ACTION: &str = "coven.automations.mission.submit.v1";
@@ -52,6 +59,8 @@ pub(crate) const AUTHORITY_UNAVAILABLE_REASON: &str =
     "mission not launched: runtime authority is not available on this daemon";
 /// The scheduler's reason for a claim whose lease ran out before dispatch.
 const LEASE_EXPIRED_REASON: &str = "lease expired";
+/// The most filesystem scopes one mission may name (the schema's `maxItems`).
+pub(crate) const MAX_MISSION_SCOPES: usize = 32;
 
 /// The answer to one mission command.
 #[derive(Debug, Clone, PartialEq)]
@@ -478,6 +487,11 @@ fn claim_in(
         return Ok(Err(unsupported_envelope(request.envelope.id.as_str())));
     }
 
+    let scopes_json = match request.scopes.as_deref().map(validated_scopes).transpose() {
+        Ok(scopes) => scopes,
+        Err(message) => return refuse(ErrorCode::ValidationFailed, message),
+    };
+
     let cwd = match canonical_directory(request.project.cwd.as_str()) {
         Ok(cwd) => cwd,
         Err(message) => return refuse(ErrorCode::ValidationFailed, message),
@@ -567,8 +581,9 @@ fn claim_in(
             mission_id, automation_id, occurrence_id, adoption_key, request_digest,
             authority, principal_id, familiar_root_id, familiar_revision_id, envelope_id,
             envelope_descriptor_digest, project_cwd, statement, timeout_minutes,
-            submitted_at, valid_until
-         ) VALUES (?1, ?1, ?2, ?3, ?4, 'owner_local', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            submitted_at, valid_until, scopes_json
+         ) VALUES (?1, ?1, ?2, ?3, ?4, 'owner_local', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   ?15)",
         params![
             mission_id,
             occurrence_id,
@@ -584,6 +599,7 @@ fn claim_in(
             timeout_column,
             submitted_at,
             iso(valid_until),
+            scopes_json,
         ],
     )
     .map_err(|error| format!("failed to record the mission: {error}"))?;
@@ -593,6 +609,46 @@ fn claim_in(
         "occurrenceId": occurrence_id,
         "mission": view,
     })))
+}
+
+/// The canonical JSON of a mission's scopes, or why they are refused. Every
+/// scope must be one the scoped read service would enforce as written
+/// ([`Grants::from_scopes`] under the R0 read policy, the same rules the read
+/// service applies), and also a read of the project root: a mission binds no
+/// workspace root and is never granted a write. Absent scopes mean none, so a
+/// present list must name at least one.
+fn validated_scopes(scopes: &[Value]) -> Result<String, String> {
+    if scopes.is_empty() {
+        return Err("scopes must name at least one filesystem scope; omit it for none".to_owned());
+    }
+    if scopes.len() > MAX_MISSION_SCOPES {
+        return Err(format!(
+            "scopes may name at most {MAX_MISSION_SCOPES} filesystem scopes"
+        ));
+    }
+    for (index, scope) in scopes.iter().enumerate() {
+        if let Err(refusal) = Grants::from_scopes(std::slice::from_ref(scope), &R0_READ_POLICY) {
+            return Err(format!(
+                "scopes[{index}] is not a scope the read service can enforce ({}): it must be a \
+                 closed filesystem scope whose path is relative, not root-wide, and free of `..`, \
+                 globs and spellings the service does not interpret",
+                refusal.code()
+            ));
+        }
+        let field = |name: &str| scope.get(name).and_then(Value::as_str);
+        if field("kind") != Some("filesystem") {
+            return Err(format!("scopes[{index}] must be a `filesystem` scope"));
+        }
+        if field("root") != Some("project") {
+            return Err(format!("scopes[{index}] must be rooted at `project`"));
+        }
+        if field("access") != Some("read") {
+            return Err(format!("scopes[{index}] must grant `read` access"));
+        }
+    }
+    let canonical = canonicalize(scopes)
+        .map_err(|error| format!("scopes cannot be canonicalized: {error:#}"))?;
+    String::from_utf8(canonical).map_err(|_| "scopes are not valid UTF-8".to_owned())
 }
 
 struct FamiliarHead {
@@ -651,7 +707,8 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
                     mission.familiar_revision_id, mission.envelope_id,
                     mission.envelope_descriptor_digest, mission.project_cwd, mission.statement,
                     mission.submitted_at, mission.valid_until,
-                    occurrence.state, occurrence.failure_reason, occurrence.updated_at
+                    occurrence.state, occurrence.failure_reason, occurrence.updated_at,
+                    mission.scopes_json
              FROM automation_missions AS mission
              JOIN automation_occurrences AS occurrence ON occurrence.id = mission.occurrence_id
              WHERE mission.mission_id = ?1",
@@ -673,6 +730,7 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
                     ],
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -682,6 +740,7 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
         [occurrence_id, principal_id, root_id, revision_id, envelope_id, envelope_digest, cwd, statement, submitted_at, valid_until, occurrence_state],
         failure_reason,
         settled_at,
+        scopes_json,
     )) = row
     else {
         return Ok(None);
@@ -761,6 +820,11 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
     });
     if let Some(reason) = reason {
         view["reason"] = json!(reason);
+    }
+    if let Some(scopes_json) = scopes_json {
+        view["scopes"] = serde_json::from_str(&scopes_json).map_err(|error| {
+            format!("stored scopes of mission `{mission_id}` are invalid: {error}")
+        })?;
     }
     if let Some(cancellation) = cancellation {
         view["cancellation"] = cancellation;
@@ -1471,6 +1535,312 @@ mod tests {
             );
         }
         assert_eq!(count(&fixture, "automation_runs"), 0);
+    }
+
+    fn scope(path: &str, recursive: bool) -> Value {
+        json!({
+            "kind": "filesystem",
+            "root": "project",
+            "path": path,
+            "access": "read",
+            "recursive": recursive,
+        })
+    }
+
+    fn with_scopes(fixture: &Fixture, key: &str, scopes: Value) -> Value {
+        let mut body = flat(key, payload(fixture, now()));
+        body["scopes"] = scopes;
+        body
+    }
+
+    #[test]
+    fn submit_records_project_read_scopes_and_get_returns_them() {
+        let fixture = fixture();
+        let key = "adopt:mission:scoped";
+        // Members in a non-canonical order: the row stores the canonical form.
+        let scopes = json!([
+            scope("src/lib", true),
+            { "recursive": false, "access": "read", "path": "README.md", "root": "project", "kind": "filesystem" },
+        ]);
+        let (answer, replayed) = committed(submit(&fixture, with_scopes(&fixture, key, scopes)));
+        assert!(!replayed);
+        let canonical = json!([scope("src/lib", true), scope("README.md", false)]);
+        assert_mission_view(&answer["mission"]);
+        assert_eq!(answer["mission"]["scopes"], canonical);
+
+        let settled = view(&fixture, &mission_id_for(key));
+        assert_mission_view(&settled);
+        assert_eq!(settled["scopes"], canonical);
+        // Scopes launch nothing: the mission still settles unavailable.
+        assert_eq!(
+            (settled["state"].as_str(), settled["reason"].as_str()),
+            (Some("unavailable"), Some("authority_unavailable"))
+        );
+        for table in ["automation_runs", "automation_attempts", "sessions"] {
+            assert_eq!(count(&fixture, table), 0, "{table}");
+        }
+        let stored: String = fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT scopes_json FROM automation_missions WHERE mission_id = ?1",
+                [mission_id_for(key)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.as_bytes(),
+            canonicalize(&canonical).unwrap().as_slice()
+        );
+
+        // Thirty-two scopes is the most a mission holds.
+        let most: Vec<Value> = (0..32)
+            .map(|index| scope(&format!("src/file-{index}.rs"), false))
+            .collect();
+        let mut body = with_scopes(&fixture, "adopt:mission:scoped-most", json!(most));
+        let elsewhere = tempfile::tempdir().unwrap();
+        body["project"]["cwd"] = json!(elsewhere.path().display().to_string());
+        let (answer, _) = committed(submit(&fixture, body));
+        assert_eq!(answer["mission"]["scopes"], json!(most));
+    }
+
+    #[test]
+    fn a_mission_without_scopes_keeps_its_wire_form() {
+        let fixture = fixture();
+        let key = "adopt:mission:unscoped";
+        let sent = payload(&fixture, now());
+        let typed: MissionSubmitPayload = serde_json::from_value(sent.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&typed).unwrap(), sent);
+        let (answer, _) = committed(submit(&fixture, flat(key, sent)));
+        assert!(answer["mission"].get("scopes").is_none(), "{answer}");
+        assert!(view(&fixture, &mission_id_for(key)).get("scopes").is_none());
+        let stored: Option<String> = fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT scopes_json FROM automation_missions WHERE mission_id = ?1",
+                [mission_id_for(key)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    #[test]
+    fn submit_refuses_scopes_it_cannot_honour_and_records_nothing() {
+        let fixture = fixture();
+        let field = |name: &str, value: Value| {
+            let mut item = scope("src/lib", true);
+            item[name] = value;
+            item
+        };
+        let without = |name: &str| {
+            let mut item = scope("src/lib", true);
+            item.as_object_mut().unwrap().remove(name);
+            item
+        };
+        let too_many: Vec<Value> = (0..33)
+            .map(|index| scope(&format!("src/file-{index}.rs"), false))
+            .collect();
+        // Each refusal names the item and the rule it breaks. `None` is a list
+        // that is not a list: the payload parser refuses it before validation.
+        let unenforceable = "is not a scope the read service can enforce (grant_unsupported)";
+        let cases: Vec<(&str, Value, Option<&str>)> = vec![
+            ("empty", json!([]), Some("scopes must name at least one")),
+            ("over-limit", json!(too_many), Some("at most 32")),
+            ("null", Value::Null, None),
+            ("not-a-list", scope("src/lib", true), None),
+            (
+                "root-wide-dot",
+                json!([scope(".", false)]),
+                Some(unenforceable),
+            ),
+            (
+                "root-wide-dot-recursive",
+                json!([scope(".", true)]),
+                Some(unenforceable),
+            ),
+            (
+                "root-wide-slash",
+                json!([scope("/", true)]),
+                Some(unenforceable),
+            ),
+            (
+                "root-wide-top-level-subtree",
+                json!([scope("src", true)]),
+                Some(unenforceable),
+            ),
+            (
+                "absolute",
+                json!([scope("/etc/passwd", false)]),
+                Some(unenforceable),
+            ),
+            (
+                "absolute-drive",
+                json!([scope("C:/project/notes.md", false)]),
+                Some(unenforceable),
+            ),
+            ("parent", json!([scope("..", false)]), Some(unenforceable)),
+            (
+                "parent-inside",
+                json!([scope("src/../secrets/key.pem", false)]),
+                Some(unenforceable),
+            ),
+            (
+                "glob",
+                json!([scope("src/*.rs", false)]),
+                Some(unenforceable),
+            ),
+            (
+                "glob-subtree",
+                json!([scope("src/**", true)]),
+                Some(unenforceable),
+            ),
+            (
+                "workspace-root",
+                json!([field("root", json!("workspace"))]),
+                Some("scopes[0] must be rooted at `project`"),
+            ),
+            (
+                "unknown-root",
+                json!([field("root", json!("home"))]),
+                Some(unenforceable),
+            ),
+            (
+                "write",
+                json!([field("access", json!("write"))]),
+                Some("scopes[0] must grant `read` access"),
+            ),
+            (
+                "unknown-access",
+                json!([field("access", json!("execute"))]),
+                Some(unenforceable),
+            ),
+            (
+                "network-kind",
+                json!([field("kind", json!("network"))]),
+                Some("scopes[0] must be a `filesystem` scope"),
+            ),
+            (
+                "unknown-kind",
+                json!([field("kind", json!("process"))]),
+                Some(unenforceable),
+            ),
+            (
+                "missing-recursive",
+                json!([without("recursive")]),
+                Some(unenforceable),
+            ),
+            (
+                "missing-path",
+                json!([without("path")]),
+                Some(unenforceable),
+            ),
+            (
+                "extra-field",
+                json!([field("note", json!("extra"))]),
+                Some(unenforceable),
+            ),
+            (
+                "string-recursive",
+                json!([field("recursive", json!("true"))]),
+                Some(unenforceable),
+            ),
+            ("empty-path", json!([scope("", false)]), Some(unenforceable)),
+            (
+                "backslash",
+                json!([scope("src\\lib\\mod.rs", false)]),
+                Some(unenforceable),
+            ),
+            ("not-an-object", json!(["src/lib"]), Some(unenforceable)),
+            (
+                "one-bad-among-good",
+                json!([scope("src/lib", true), scope("/etc", false)]),
+                Some("scopes[1] is not a scope"),
+            ),
+        ];
+        for (name, scopes, message) in cases {
+            let key = format!("adopt:mission:scope-{name}");
+            let error = refused(submit(&fixture, with_scopes(&fixture, &key, scopes)));
+            assert_eq!(error["code"], "VALIDATION_FAILED", "{name}: {error}");
+            let text = error["message"].as_str().unwrap();
+            match message {
+                Some(message) => assert!(text.contains(message), "{name}: {error}"),
+                None => assert!(
+                    text.starts_with("invalid mission.submit.v1 payload"),
+                    "{name}: {error}"
+                ),
+            }
+        }
+        for table in [
+            "automation_missions",
+            "automation_occurrences",
+            "automation_runs",
+            "automation_definitions",
+        ] {
+            assert_eq!(count(&fixture, table), 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn a_store_from_before_scopes_gains_the_column_in_the_fresh_form() {
+        let fixture = fixture();
+        let conn = &fixture.home.conn;
+        let form = || -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'automation_missions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let fresh = form();
+        // A store from before the column, holding a mission.
+        let mission_id = hold(&fixture, "adopt:mission:before-scopes");
+        conn.execute(
+            "ALTER TABLE automation_missions DROP COLUMN scopes_json",
+            [],
+        )
+        .unwrap();
+        assert_ne!(form(), fresh);
+        super::super::store::ensure_mission_columns(conn).unwrap();
+        super::super::store::ensure_mission_columns(conn).unwrap();
+        assert_eq!(form(), fresh);
+        let view = view(&fixture, &mission_id);
+        assert_mission_view(&view);
+        assert!(view.get("scopes").is_none());
+    }
+
+    #[test]
+    fn scopes_are_part_of_the_request_an_adoption_key_names() {
+        let fixture = fixture();
+        let key = "adopt:mission:scoped-replay";
+        let body = with_scopes(&fixture, key, json!([scope("src/lib", true)]));
+        let (first, _) = committed(submit(&fixture, body.clone()));
+
+        let (replay, replayed) = committed(submit(&fixture, body.clone()));
+        assert!(replayed);
+        assert_eq!(replay, first);
+
+        for changed_scopes in [
+            Some(json!([scope("src/bin", true)])),
+            Some(json!([scope("src/lib", false)])),
+            Some(json!([scope("src/lib", true), scope("README.md", false)])),
+            None,
+        ] {
+            let mut changed = body.clone();
+            match changed_scopes {
+                Some(scopes) => changed["scopes"] = scopes,
+                None => {
+                    changed.as_object_mut().unwrap().remove("scopes");
+                }
+            }
+            let error = refused(submit(&fixture, changed));
+            assert_eq!(error["code"], "ADOPTION_REPLAY_MISMATCH", "{error}");
+            assert_eq!(error["adoption"]["conflictOutcome"], "committed");
+        }
+        assert_eq!(count(&fixture, "automation_missions"), 1);
+        assert_eq!(count(&fixture, "automation_occurrences"), 1);
     }
 
     #[test]
