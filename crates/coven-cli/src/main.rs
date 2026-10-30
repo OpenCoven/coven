@@ -1380,6 +1380,10 @@ enum AutomationsCommand {
         #[command(subcommand)]
         command: AutomationsConformanceCommand,
     },
+    /// The scoped read service's MCP relay. A Runtime Authority harness
+    /// launches it from the daemon's MCP configuration; it is not run by hand.
+    #[command(hide = true, name = "scoped-read-relay")]
+    ScopedReadRelay,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1881,6 +1885,7 @@ fn main() -> Result<()> {
         Some(Command::Automations {
             command: AutomationsCommand::Doctor { .. }
                 | AutomationsCommand::Conformance { .. }
+                | AutomationsCommand::ScopedReadRelay
                 | AutomationsCommand::Leases { .. }
                 | AutomationsCommand::Status { .. }
                 | AutomationsCommand::Occurrence { .. }
@@ -4393,6 +4398,29 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
     Ok(record.id)
 }
 
+/// Connects the harness's MCP stdio to the attempt's scoped read channel,
+/// named by the environment the daemon's MCP configuration sets.
+#[cfg(unix)]
+fn run_scoped_read_relay() -> Result<()> {
+    use automations::scoped_read::channel;
+    let socket = std::env::var_os(channel::CHANNEL_ENV)
+        .context("the scoped read relay runs only from the daemon's MCP configuration")?;
+    let presented = std::env::var(channel::TOKEN_ENV)
+        .context("the scoped read relay runs only from the daemon's MCP configuration")?;
+    channel::relay(
+        Path::new(&socket),
+        &presented,
+        io::stdin(),
+        io::stdout().lock(),
+    )
+    .context("the scoped read channel closed")
+}
+
+#[cfg(not(unix))]
+fn run_scoped_read_relay() -> Result<()> {
+    anyhow::bail!("the scoped read service is not available on this platform")
+}
+
 fn run_automations_command(command: AutomationsCommand) -> Result<()> {
     use automations::operator_cli::{run, View};
     match command {
@@ -4424,6 +4452,7 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
             cursor,
             json,
         } => automations::lease_cli::run(automation_id.as_deref(), limit, cursor.as_deref(), json),
+        AutomationsCommand::ScopedReadRelay => run_scoped_read_relay(),
         AutomationsCommand::Conformance { command } => match command {
             AutomationsConformanceCommand::CommandCrashWorker => {
                 let payload = read_conformance_request(io::stdin().lock())?;
