@@ -122,6 +122,25 @@ impl RelativePath {
     pub(crate) fn starts_with(&self, prefix: &Self) -> bool {
         self.components.starts_with(&prefix.components)
     }
+
+    /// Whether a component after `prefix` is an excluded name. The caller
+    /// has checked that this path starts with `prefix`.
+    fn excluded_beneath(&self, prefix: &Self) -> bool {
+        self.components[prefix.components.len()..]
+            .iter()
+            .any(|component| is_excluded_name(component))
+    }
+}
+
+/// Whether a recursive scope leaves out an entry named `name`: a `.git`
+/// folder, or a `.env` or `.env.*` file, including the conservative Unicode,
+/// case and ignorable-character aliases used for protected paths. This only
+/// classifies exclusions; grant matching keeps exact spelling. Maintainer decision,
+/// 2026-10-20 (#857): project secrets usually sit there, so a grant includes
+/// one only by naming it. Listings and searches never show one.
+pub(crate) fn is_excluded_name(name: &str) -> bool {
+    let name = super::open::protected_name_key(name);
+    name == ".git" || name == ".env" || name.starts_with(".env.")
 }
 
 /// `CON`, `NUL`, `COM1` and the rest open a device on Windows whatever their
@@ -236,7 +255,9 @@ impl Grants {
 
     /// How `request` is covered, if a read scope covers it for its operation.
     /// A scope covers only its own spelling: a case or Unicode alias of a
-    /// granted name is not covered. Search needs a recursive scope.
+    /// granted name is not covered. Search needs a recursive scope. A
+    /// recursive scope does not cover a path through an excluded name beneath
+    /// its directory; a scope whose own path names one does.
     pub(crate) fn authorize(&self, request: &Request) -> Result<Coverage, Refusal> {
         let applies = |scope: &&FileScope| scope.root == request.root;
         let exact: Vec<&FileScope> = self
@@ -251,10 +272,15 @@ impl Grants {
             .filter(applies)
             .filter(|scope| request.path.starts_with(&scope.path))
             .collect();
-        let coverage = if subtrees.iter().any(|scope| scope.read) {
+        let coverage = if subtrees
+            .iter()
+            .any(|scope| scope.read && !request.path.excluded_beneath(&scope.path))
+        {
             Coverage::Subtree
         } else if exact.iter().any(|scope| scope.read) {
             Coverage::Exact
+        } else if subtrees.iter().any(|scope| scope.read) {
+            return Err(Refusal::ScopeExcluded);
         } else if exact.is_empty() && subtrees.is_empty() {
             return Err(Refusal::ScopeMissing);
         } else {

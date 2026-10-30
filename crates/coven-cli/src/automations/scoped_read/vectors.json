@@ -102,7 +102,24 @@
     { "id": "search-continuing-at-the-directory", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "search", "root": "project", "path": "docs/guides", "pattern": "TODO", "after": { "path": "docs/guides", "line": 3 } }, "expect": "request_invalid" },
     { "id": "search-continuing-at-line-zero", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "search", "root": "project", "path": "docs/guides", "pattern": "TODO", "after": { "path": "docs/guides/a.md", "line": 0 } }, "expect": "request_invalid" },
     { "id": "search-continuing-with-an-extra-field", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "search", "root": "project", "path": "docs/guides", "pattern": "TODO", "after": { "path": "docs/guides/a.md", "line": 3, "grant": "all" } }, "expect": "request_invalid" },
-    { "id": "search-continuing-with-a-traversal", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "search", "root": "project", "path": "docs/guides", "pattern": "TODO", "after": { "path": "docs/guides/../a.md", "line": 3 } }, "expect": "request_invalid" }
+    { "id": "search-continuing-with-a-traversal", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "search", "root": "project", "path": "docs/guides", "pattern": "TODO", "after": { "path": "docs/guides/../a.md", "line": 3 } }, "expect": "request_invalid" },
+    { "id": "read-a-dot-env-beneath-a-recursive-scope", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.env" }, "expect": "scope_excluded" },
+    { "id": "read-a-dot-env-variant-beneath-a-recursive-scope", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.env.local" }, "expect": "scope_excluded" },
+    { "id": "read-through-a-dot-git-folder", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.git/config" }, "expect": "scope_excluded" },
+    { "id": "read-through-a-dot-git-folder-in-another-case", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/sub/.GIT/HEAD" }, "expect": "scope_excluded" },
+    { "id": "list-a-dot-git-folder-beneath-a-recursive-scope", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "list_directory", "root": "project", "path": "docs/guides/.git" }, "expect": "scope_excluded" },
+    { "id": "search-a-dot-git-folder-beneath-a-recursive-scope", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "search", "root": "project", "path": "docs/guides/.git", "pattern": "x" }, "expect": "scope_excluded" },
+    { "id": "read-a-name-that-only-starts-like-dot-env", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.envrc" }, "expect": "subtree" },
+    { "id": "read-a-name-that-only-starts-like-dot-git", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.gitignore" }, "expect": "subtree" },
+    { "id": "read-a-dot-env-named-exactly", "scopes": ["recursive-read:docs/guides", "read:docs/guides/.env"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.env" }, "expect": "exact" },
+    { "id": "list-a-dot-git-folder-named-exactly", "scopes": ["read:repo/.git"], "request": { "operation": "list_directory", "root": "project", "path": "repo/.git" }, "expect": "exact" },
+    { "id": "beneath-a-recursive-scope-on-a-dot-git-folder", "scopes": ["recursive-read:repo/.git"], "request": { "operation": "read_file", "root": "project", "path": "repo/.git/config" }, "expect": "subtree" },
+    { "id": "an-excluded-name-under-a-recursive-write-scope", "scopes": ["recursive-write:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.env" }, "expect": "scope_access_denied" },
+    { "id": "read-a-dot-env-in-upper-case", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.ENV" }, "expect": "scope_excluded" },
+    { "id": "read-a-dot-env-variant-in-mixed-case", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "read_file", "root": "project", "path": "docs/guides/.Env.Prod" }, "expect": "scope_excluded" },
+    { "id": "list-continuing-after-an-excluded-name", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "list_directory", "root": "project", "path": "docs/guides", "after": ".env" }, "expect": "subtree" },
+    { "id": "search-continuing-from-inside-a-dot-git-folder", "scopes": ["recursive-read:docs/guides"], "request": { "operation": "search", "root": "project", "path": "docs/guides", "pattern": "TODO", "after": { "path": "docs/guides/.git/x", "line": 1 } }, "expect": "subtree" },
+    { "id": "read-a-nested-dot-git-beneath-a-recursive-scope-on-a-dot-git-folder", "scopes": ["recursive-read:repo/.git"], "request": { "operation": "read_file", "root": "project", "path": "repo/.git/modules/x/.git/config" }, "expect": "scope_excluded" }
   ],
   "filesystem": [
     {
@@ -426,6 +443,127 @@
       "expect": { "entries": [["a.md", "file"], ["b.md", "file"], ["sub", "directory"]], "next": null }
     },
     {
+      "id": "list-leaves-out-excluded-names",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "operation": "list_directory",
+      "request": "work/repo",
+      "expect": { "entries": [[".envrc", "file"], [".gitignore", "file"], ["a.md", "file"], ["sub", "directory"]], "next": null }
+    },
+    {
+      "id": "list-leaves-out-an-excluded-name-another-scope-names",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "a" }, { "file": "root/work/repo/.env", "text": "KEY=granted" }],
+      "scopes": ["recursive-read:work/repo", "read:work/repo/.env"],
+      "operation": "list_directory",
+      "request": "work/repo",
+      "expect": { "entries": [["a.md", "file"]], "next": null }
+    },
+    {
+      "id": "search-leaves-out-excluded-names",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "operation": "search",
+      "request": "work/repo",
+      "pattern": "TODO",
+      "expect": { "matches": [["work/repo/.envrc", 1, "TODO envrc"], ["work/repo/.gitignore", 1, "TODO ignore"], ["work/repo/a.md", 1, "TODO a"], ["work/repo/sub/b.md", 1, "TODO b"]], "next": null, "skipped": 0, "complete": true }
+    },
+    {
+      "id": "read-a-dot-env-beneath-a-recursive-scope",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "request": "work/repo/.env",
+      "expect": { "refusal": "scope_excluded", "filesystem": false }
+    },
+    {
+      "id": "read-a-dot-env-named-exactly",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "a" }, { "file": "root/work/repo/.env", "text": "KEY=granted" }],
+      "scopes": ["recursive-read:work/repo", "read:work/repo/.env"],
+      "request": "work/repo/.env",
+      "expect": { "text": "KEY=granted", "lastStep": "read" }
+    },
+    {
+      "id": "list-a-dot-git-folder-named-exactly",
+      "tree": [{ "file": "root/work/repo/.git/HEAD", "text": "ref: refs/heads/main" }],
+      "scopes": ["read:work/repo/.git"],
+      "operation": "list_directory",
+      "request": "work/repo/.git",
+      "expect": { "entries": [["HEAD", "file"]], "next": null }
+    },
+    {
+      "id": "read-a-dot-env-in-upper-case",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "request": "work/repo/.ENV",
+      "expect": { "refusal": "scope_excluded", "filesystem": false }
+    },
+    {
+      "id": "read-a-dot-env-variant-in-mixed-case",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "request": "work/repo/.Env.Prod",
+      "expect": { "refusal": "scope_excluded", "filesystem": false }
+    },
+    {
+      "id": "read-through-a-dot-git-folder-in-upper-case",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "request": "work/repo/.GIT/config",
+      "expect": { "refusal": "scope_excluded", "filesystem": false }
+    },
+    {
+      "id": "list-continuing-after-an-excluded-name",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "operation": "list_directory",
+      "request": "work/repo",
+      "after": ".env",
+      "expect": { "entries": [[".envrc", "file"], [".gitignore", "file"], ["a.md", "file"], ["sub", "directory"]], "next": null }
+    },
+    {
+      "id": "search-continuing-from-an-excluded-file",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "operation": "search",
+      "request": "work/repo",
+      "pattern": "TODO",
+      "after": { "path": "work/repo/.env", "line": 1 },
+      "expect": { "matches": [["work/repo/.envrc", 1, "TODO envrc"], ["work/repo/.gitignore", 1, "TODO ignore"], ["work/repo/a.md", 1, "TODO a"], ["work/repo/sub/b.md", 1, "TODO b"]], "next": null, "skipped": 0, "complete": true }
+    },
+    {
+      "id": "search-continuing-from-inside-a-dot-git-folder",
+      "tree": [{ "file": "root/work/repo/a.md", "text": "TODO a" }, { "file": "root/work/repo/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.env.local", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.Env.Prod", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.envrc", "text": "TODO envrc" }, { "file": "root/work/repo/.gitignore", "text": "TODO ignore" }, { "file": "root/work/repo/sub/.git", "text": "gitdir: TODO SENTINEL" }, { "file": "root/work/repo/sub/b.md", "text": "TODO b" }],
+      "scopes": ["recursive-read:work/repo"],
+      "operation": "search",
+      "request": "work/repo",
+      "pattern": "TODO",
+      "after": { "path": "work/repo/sub/.git/x", "line": 1 },
+      "expect": { "matches": [["work/repo/sub/b.md", 1, "TODO b"]], "next": null, "skipped": 0, "complete": true }
+    },
+    {
+      "id": "read-a-nested-dot-git-beneath-a-recursive-scope-on-a-dot-git-folder",
+      "tree": [{ "file": "root/work/repo/.git/HEAD", "text": "TODO head" }, { "file": "root/work/repo/.git/modules/x/HEAD", "text": "TODO x" }, { "file": "root/work/repo/.git/modules/x/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.git/modules/x/.env", "text": "TODO SENTINEL" }],
+      "scopes": ["recursive-read:work/repo/.git"],
+      "request": "work/repo/.git/modules/x/.git/config",
+      "expect": { "refusal": "scope_excluded", "filesystem": false }
+    },
+    {
+      "id": "list-hides-a-nested-dot-git-beneath-a-recursive-scope-on-a-dot-git-folder",
+      "tree": [{ "file": "root/work/repo/.git/HEAD", "text": "TODO head" }, { "file": "root/work/repo/.git/modules/x/HEAD", "text": "TODO x" }, { "file": "root/work/repo/.git/modules/x/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.git/modules/x/.env", "text": "TODO SENTINEL" }],
+      "scopes": ["recursive-read:work/repo/.git"],
+      "operation": "list_directory",
+      "request": "work/repo/.git/modules/x",
+      "expect": { "entries": [["HEAD", "file"]], "next": null }
+    },
+    {
+      "id": "search-hides-a-nested-dot-git-beneath-a-recursive-scope-on-a-dot-git-folder",
+      "tree": [{ "file": "root/work/repo/.git/HEAD", "text": "TODO head" }, { "file": "root/work/repo/.git/modules/x/HEAD", "text": "TODO x" }, { "file": "root/work/repo/.git/modules/x/.git/config", "text": "TODO SENTINEL" }, { "file": "root/work/repo/.git/modules/x/.env", "text": "TODO SENTINEL" }],
+      "scopes": ["recursive-read:work/repo/.git"],
+      "operation": "search",
+      "request": "work/repo/.git",
+      "pattern": "TODO",
+      "expect": { "matches": [["work/repo/.git/HEAD", 1, "TODO head"], ["work/repo/.git/modules/x/HEAD", 1, "TODO x"]], "next": null, "skipped": 0, "complete": true }
+    },
+    {
       "id": "list-beneath-a-recursive-scope",
       "tree": [{ "file": "root/docs/guides/a.md", "text": "alpha TODO\nbeta\nTODO gamma\n" }, { "file": "root/docs/guides/b.md", "text": "no match here" }, { "file": "root/docs/guides/sub/c.md", "text": "x TODO\r\n" }, { "file": "outside/secret.txt", "text": "TODO SENTINEL" }, { "symlink": "root/docs/guides/link.md", "target": "../../../outside/secret.txt" }, { "symlink": "root/docs/guides/linked", "target": "../../../outside" }, { "hardlink": "root/docs/guides/hard.md", "target": "outside/secret.txt" }, { "fifo": "root/docs/guides/pipe" }, { "file": "root/docs/guides/.claude/settings.json", "text": "TODO SENTINEL" }, { "file": "root/docs/guides/back\\slash.md", "text": "TODO SENTINEL" }, { "file": "root/docs/guides/colon:name.md", "text": "TODO SENTINEL" }],
       "protected": ["root/docs/guides/.claude"],
@@ -611,31 +749,31 @@
     },
     {
       "id": "protected-file-replaced-by-an-atomic-save-during-the-read",
-      "tree": [{ "file": "root/docs/guides/.env", "text": "SENTINEL original" }],
-      "protected": ["root/docs/guides/.env"],
+      "tree": [{ "file": "root/docs/guides/secret.cfg", "text": "SENTINEL original" }],
+      "protected": ["root/docs/guides/secret.cfg"],
       "scopes": ["recursive-read:docs/guides"],
-      "request": "docs/guides/.env",
-      "race": { "at": "root", "do": [{ "file": "root/docs/guides/.env.save", "text": "SENTINEL replaced" }, { "rename": ["root/docs/guides/.env.save", "root/docs/guides/.env"] }] },
+      "request": "docs/guides/secret.cfg",
+      "race": { "at": "root", "do": [{ "file": "root/docs/guides/secret.cfg.save", "text": "SENTINEL replaced" }, { "rename": ["root/docs/guides/secret.cfg.save", "root/docs/guides/secret.cfg"] }] },
       "expect": { "refusal": "resource_protected", "lastStep": "directory:1" }
     },
     {
       "id": "protected-file-created-during-the-read",
       "tree": [{ "dir": "root/docs/guides" }],
-      "protected": ["root/docs/guides/.env"],
+      "protected": ["root/docs/guides/secret.cfg"],
       "scopes": ["recursive-read:docs/guides"],
-      "request": "docs/guides/.env",
-      "race": { "at": "root", "do": [{ "file": "root/docs/guides/.env", "text": "SENTINEL created" }] },
+      "request": "docs/guides/secret.cfg",
+      "race": { "at": "root", "do": [{ "file": "root/docs/guides/secret.cfg", "text": "SENTINEL created" }] },
       "expect": { "refusal": "resource_protected", "lastStep": "directory:1" }
     },
     {
       "id": "search-skips-a-protected-file-replaced-during-the-search",
-      "tree": [{ "file": "root/docs/guides/.env", "text": "TODO SENTINEL original" }, { "file": "root/docs/guides/a.md", "text": "TODO a" }],
-      "protected": ["root/docs/guides/.env"],
+      "tree": [{ "file": "root/docs/guides/secret.cfg", "text": "TODO SENTINEL original" }, { "file": "root/docs/guides/a.md", "text": "TODO a" }],
+      "protected": ["root/docs/guides/secret.cfg"],
       "scopes": ["recursive-read:docs/guides"],
       "operation": "search",
       "request": "docs/guides",
       "pattern": "TODO",
-      "race": { "at": "root", "do": [{ "file": "root/docs/guides/.env.save", "text": "TODO SENTINEL replaced" }, { "rename": ["root/docs/guides/.env.save", "root/docs/guides/.env"] }] },
+      "race": { "at": "root", "do": [{ "file": "root/docs/guides/secret.cfg.save", "text": "TODO SENTINEL replaced" }, { "rename": ["root/docs/guides/secret.cfg.save", "root/docs/guides/secret.cfg"] }] },
       "expect": { "matches": [["docs/guides/a.md", 1, "TODO a"]], "next": null, "skipped": 0, "complete": true }
     }
   ]

@@ -77,7 +77,7 @@ impl Protected {
 
 // This is a conservative exclusion key only; grant authorization keeps exact path spelling. Canonical Unicode and full case variants stay excluded even on a case-sensitive filesystem.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn protected_name_key(name: &str) -> String {
+pub(super) fn protected_name_key(name: &str) -> String {
     use unicode_casefold::UnicodeCaseFold;
     use unicode_normalization::UnicodeNormalization;
     // The locked casefold table is Unicode 9; the pinned Rust toolchain supplies newer simple case pairs before its full-fold expansions.
@@ -571,6 +571,7 @@ mod platform {
     use cap_std::ambient_authority;
     use cap_std::fs::{Dir, Metadata, MetadataExt, OpenOptions, OpenOptionsExt};
 
+    use super::super::scope::is_excluded_name;
     use super::{
         excerpt, ContentBudget, Entry, EntryKind, Found, Identity, Listing, Match, Protected,
         ReadPolicy, Refusal, RelativePath, RootKind, ScanError, SearchPosition, Step,
@@ -1132,8 +1133,8 @@ mod platform {
         }
     }
 
-    /// The names in `directory` a request could ever use, sorted by bytes,
-    /// and the name bytes it took to scan them all.
+    /// The names in `directory` a request could ever use, less the excluded
+    /// ones, sorted by bytes, and the name bytes it took to scan them all.
     fn names(
         directory: &Dir,
         policy: &ReadPolicy,
@@ -1168,7 +1169,7 @@ mod platform {
             }
             if let Some(name) = name
                 .to_str()
-                .filter(|name| RelativePath::is_name(name, policy))
+                .filter(|name| RelativePath::is_name(name, policy) && !is_excluded_name(name))
             {
                 names.push(name.to_owned());
             }
