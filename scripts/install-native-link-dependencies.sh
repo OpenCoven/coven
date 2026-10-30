@@ -276,14 +276,9 @@ for ((attempt = 0; ; attempt++)); do
     cp -- "$mirror_plans/$attempt/"* "$mirrors/"
   fi
   status=0
-  # TEMPORARY #1578 evidence: reproduce the ~19 kB/s crawl on attempt 1 only.
-  throttle=()
-  if ((attempt == 0)); then
-    throttle=(-o "Acquire::http::Dl-Limit=20" -o "Acquire::https::Dl-Limit=20")
-  fi
   # timeout(1) signals apt's whole process group; apt keeps partial files.
   run_privileged timeout --kill-after=10 "$download_seconds" \
-    apt-get "${apt_options[@]}" ${throttle[@]+"${throttle[@]}"} "${install_options[@]}" --download-only -- "${packages[@]}" || status=$?
+    apt-get "${apt_options[@]}" "${install_options[@]}" --download-only -- "${packages[@]}" || status=$?
   if ((status == 0)); then
     break
   fi
