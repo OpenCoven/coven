@@ -806,16 +806,31 @@ impl AuthorizationKeyRegistry {
         device_id: Uuid,
         operation: impl FnOnce(&DeviceAuthorizationKeyRecord) -> Result<T>,
     ) -> Result<T> {
+        self.with_active_keys(&[device_id], |keys| operation(&keys[0]))
+    }
+
+    /// One lock holds every listed device's current key, in the given order,
+    /// so a threshold commit cannot race any approver's key rotation.
+    pub(super) fn with_active_keys<T>(
+        &self,
+        device_ids: &[Uuid],
+        operation: impl FnOnce(&[DeviceAuthorizationKeyRecord]) -> Result<T>,
+    ) -> Result<T> {
         let _guard = AUTHORIZATION_KEY_STORE_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
         let keys = read_authorization_keys(&self.path)?;
-        let key = keys
+        let active = device_ids
             .iter()
-            .find(|key| key.device_id == device_id && key.revoked_at.is_none())
-            .context("introduction requires an active authorization key")?;
-        operation(key)
+            .map(|device_id| {
+                keys.iter()
+                    .find(|key| key.device_id == *device_id && key.revoked_at.is_none())
+                    .cloned()
+                    .context("introduction requires an active authorization key")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        operation(&active)
     }
 
     pub fn enroll_initial(

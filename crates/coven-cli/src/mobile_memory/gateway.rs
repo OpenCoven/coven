@@ -2083,7 +2083,7 @@ mod tests {
         );
         let fresh = DeviceRegistry::load(fixture.home.path()).unwrap();
         assert!(fresh
-            .device(fixture.envelope.request.destination_id)
+            .device(fixture.envelope.request.destination_id())
             .unwrap()
             .is_none());
     }
@@ -2222,7 +2222,7 @@ mod tests {
         assert_eq!(envelope_data(&approved.body)["state"], "introduced");
         assert!(state
             .registry
-            .device(fixture.envelope.request.destination_id)
+            .device(fixture.envelope.request.destination_id())
             .unwrap()
             .is_some());
     }
