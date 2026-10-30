@@ -3906,7 +3906,7 @@ fn each_run_past_its_deadline_names_what_reconciliation_does_with_it() {
         },
         TimeoutShape {
             extra: &[late_fence!("timeout", "never")],
-            ..in_flight("fence-unparseable", [None, None])
+            ..in_flight("fence-unparseable", [Some("claimed"), Some("claimed")])
         },
         TimeoutShape {
             extra: &[LATE_CANCELLATION],
@@ -4668,9 +4668,12 @@ fn each_abandoned_launch_names_what_reconciliation_does_with_it() {
         (
             TimeoutShape {
                 extra: &[late_fence!("recovery", "never")],
-                ..in_flight("recovery-fence-unparseable", [None, None])
+                ..in_flight(
+                    "recovery-fence-unparseable",
+                    [Some("claimed/dispatching"), Some("claimed/dispatching")],
+                )
             },
-            None,
+            Some("claimed/dispatching"),
         ),
         (
             TimeoutShape {

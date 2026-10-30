@@ -666,6 +666,88 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unreadable_stop_lease_does_not_block_same_pass_settlement_and_delivery() {
+        for (damage, storage) in [
+            ("CAST(X'80' AS TEXT)", "text"),
+            ("X'80'", "blob"),
+            ("'PRIVATE-DAMAGED-LEASE'", "text"),
+            (
+                "'2026-10-18T09:00:00.000Zxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'",
+                "text",
+            ),
+        ] {
+            let f = fixture();
+            let damaged = routine("damaged", None);
+            let healthy = routine("healthy", main_session());
+            insert_definition(&f.conn, &damaged).unwrap();
+            insert_definition(&f.conn, &healthy).unwrap();
+            insert_definition(&f.conn, &routine("pending", main_session())).unwrap();
+            // A pre-existing terminal obligation and one created by this pass
+            // must both reach the inbox, even when the first run is damaged.
+            start(&f.conn, "pending", "run-pending");
+            assert!(finish(&f.conn, "run-pending", "succeeded"));
+            let (damaged_run, _) = launched_run(&f, &damaged, "", "completed", Some(0));
+            let (healthy_run, finished_at) =
+                launched_run(&f, &healthy, "healthy result", "completed", Some(0));
+            f.conn
+                .execute(
+                    &format!(
+                        "INSERT INTO automation_stop_fences
+                        (run_id, session_id, owner, acquired_at, execution_expires_at)
+                     SELECT id, session_id, 'timeout', started_at, {damage}
+                     FROM automation_runs WHERE id = ?1"
+                    ),
+                    [&damaged_run],
+                )
+                .unwrap();
+            let before: (String, Vec<u8>) = f
+                .conn
+                .query_row(
+                    "SELECT typeof(execution_expires_at), CAST(execution_expires_at AS BLOB)
+                 FROM automation_stop_fences WHERE run_id = ?1",
+                    [&damaged_run],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(before.0, storage, "{damage}");
+
+            crate::automations::daemon_tick::reconcile_automation_runs(
+                &f.home,
+                &f.conn,
+                &NoopSessionRuntime,
+                finished_at,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(run(&f.conn, &damaged_run).status, "running", "{damage}");
+            assert_eq!(run(&f.conn, &healthy_run).status, "succeeded", "{damage}");
+            for delivered in [&healthy_run, "run-pending"] {
+                assert_eq!(
+                    run(&f.conn, delivered).delivery.unwrap().state,
+                    "delivered",
+                    "{damage}"
+                );
+                assert_eq!(notices_for(&f.conn, delivered).len(), 1, "{damage}");
+            }
+            let after: (String, Vec<u8>) = f
+                .conn
+                .query_row(
+                    "SELECT typeof(execution_expires_at), CAST(execution_expires_at AS BLOB)
+                 FROM automation_stop_fences WHERE run_id = ?1",
+                    [&damaged_run],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(after, before, "{damage}: leave the damaged fence intact");
+            let log =
+                std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(&f.home)).unwrap();
+            assert!(log.contains(&damaged_run), "{damage}");
+            assert!(!log.contains("PRIVATE-DAMAGED-LEASE"));
+        }
+    }
+
+    #[test]
     fn delivery_follows_the_pinned_definition_not_a_later_revision() {
         let f = fixture();
         // Started with a target; the target is revised away before it ends.

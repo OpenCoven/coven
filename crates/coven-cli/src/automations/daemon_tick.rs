@@ -434,7 +434,13 @@ pub(super) fn reconcile_automation_runs(
     {
         crate::daemon::append_daemon_recovery_log(coven_home, &failure);
     }
-    super::runner::settle_finished_runs(conn, now).map_err(anyhow::Error::msg)?;
+    let settlement = super::runner::settle_finished_runs(conn, now).map_err(anyhow::Error::msg)?;
+    for skipped in &settlement.skipped {
+        crate::daemon::append_daemon_recovery_log(
+            coven_home,
+            &format!("automation settlement skipped: {skipped}"),
+        );
+    }
     // Settlement committed each run's delivery obligation with its terminal
     // status; discharge them into the main-session inbox (coven#1179). An
     // error leaves the obligations pending for the next tick.
