@@ -45,6 +45,10 @@ def native_diagnostic(stderr):
             ("native_privilege", "Run setup as root or have the environment owner grant noninteractive sudo."),
         "Unsupported OS: native dependencies require Debian or Ubuntu":
             ("native_distribution", "Select a supported Debian or Ubuntu managed base image."),
+        "Native dependency download did not finish within the bounded retry budget":
+            ("native_download", "Retry setup later or have the environment owner check the distribution mirror's throughput."),
+        "Native dependency download bounds must be positive integers":
+            ("native_download_bounds", "Unset or correct the COVEN_APT_DOWNLOAD_* overrides."),
     }
     source_messages = [
         "Malformed os-release metadata", "Malformed os-release value",

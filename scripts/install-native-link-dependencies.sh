@@ -2,6 +2,18 @@
 set -euo pipefail
 
 apt_etc_dir="${COVEN_APT_ETC_DIR:-/etc/apt}"
+# Download bound (#1578): each attempt may take a grace period plus the time
+# the package set needs at a minimum acceptable rate. A slower transfer is
+# stopped and retried with the next mirror first; apt resumes partial files.
+download_attempts="${COVEN_APT_DOWNLOAD_ATTEMPTS:-3}"
+download_grace_seconds="${COVEN_APT_DOWNLOAD_GRACE_SECONDS:-30}"
+download_min_bytes_per_second="${COVEN_APT_DOWNLOAD_MIN_BYTES_PER_SECOND:-262144}"
+for bound in "$download_attempts" "$download_grace_seconds" "$download_min_bytes_per_second"; do
+  if [[ ! "$bound" =~ ^[1-9][0-9]{0,8}$ ]]; then
+    echo "::error::Native dependency download bounds must be positive integers" >&2
+    exit 1
+  fi
+done
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/coven-native-link.XXXXXXXXXX")"
 apt_started=0
 use_sudo=0
@@ -25,15 +37,20 @@ chmod 755 "$workdir"
 
 sourceparts="$workdir/sources.list.d"
 lists="$workdir/lists"
-mkdir -p "$sourceparts" "$lists/partial"
+mirrors="$workdir/mirrors"
+mirror_plans="$workdir/mirror-plans"
+mkdir -p "$sourceparts" "$lists/partial" "$mirrors" "$mirror_plans"
 
-python3 - "$apt_etc_dir" "$sourceparts" "${COVEN_OS_RELEASE_FILE:-/etc/os-release}" <<'PY'
+python3 - "$apt_etc_dir" "$sourceparts" "${COVEN_OS_RELEASE_FILE:-/etc/os-release}" \
+  "$mirrors" "$mirror_plans" "$download_attempts" <<'PY'
 import pathlib
 import re
 import sys
 import shlex
 
-apt_etc_dir, sourceparts, os_release = map(pathlib.Path, sys.argv[1:])
+apt_etc_dir, sourceparts, os_release, mirrors, mirror_plans = map(pathlib.Path, sys.argv[1:6])
+download_attempts = int(sys.argv[6])
+mirror_lists = {}
 archives = {
     "ubuntu": re.compile(r"https?://(?:[a-z0-9-]+\.)*ubuntu\.com/ubuntu(?:-ports)?/?", re.IGNORECASE),
     "debian": re.compile(r"https?://(?:[a-z0-9-]+\.)*debian\.org/debian(?:-security)?/?", re.IGNORECASE),
@@ -83,13 +100,48 @@ def distribution_uri(uri):
         mirror_file = pathlib.Path(uri.removeprefix("mirror+file:"))
         if not mirror_file.is_absolute():
             return False
-        mirrors = [
-            line.split("#", 1)[0].split()
-            for line in mirror_file.read_text(encoding="utf-8").splitlines()
+        entries = [
+            fields for fields in (
+                line.split("#", 1)[0].split()
+                for line in mirror_file.read_text(encoding="utf-8").splitlines()
+            ) if fields
         ]
-        urls = [fields[0] for fields in mirrors if fields]
-        return bool(urls) and all(archive_uri.fullmatch(url) for url in urls)
+        if not entries or not all(archive_uri.fullmatch(fields[0]) for fields in entries):
+            return False
+        mirror_lists.setdefault(str(mirror_file), entries)
+        return True
     return archive_uri.fullmatch(uri) is not None
+
+
+def private_mirror_lists(text):
+    """Point validated mirror+file sources at private lists whose order can rotate.
+
+    Each download attempt k puts mirror k first. Index and archive hashes are
+    still checked against the signed Release file, whichever mirror serves them.
+    A temporary root that is not URI-safe keeps the host list: retries stay
+    bounded but do not rotate.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9._/+-]+", str(mirrors)):
+        return text
+    names = {path: f"{index}.list" for index, path in enumerate(mirror_lists)}
+    for attempt in range(download_attempts):
+        plan = mirror_plans / str(attempt)
+        plan.mkdir()
+        for path, entries in mirror_lists.items():
+            first = attempt % len(entries)
+            lines = []
+            for rank, (url, *metadata) in enumerate(entries[first:] + entries[:first], 1):
+                metadata = [item for item in metadata if not item.startswith("priority:")]
+                lines.append("\t".join([url, " ".join([f"priority:{rank}", *metadata])]))
+            (plan / names[path]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for name in names.values():
+        (mirrors / name).write_bytes((mirror_plans / "0" / name).read_bytes())
+    return re.sub(
+        r"mirror\+file:(\S+)",
+        lambda match: f"mirror+file:{mirrors / names[match.group(1)]}"
+        if match.group(1) in names else match.group(0),
+        text,
+    )
 
 
 def validate_deb822(text):
@@ -138,7 +190,7 @@ try:
     if deb822.exists():
         text = deb822.read_text(encoding="utf-8")
         validate_deb822(text)
-        (sourceparts / f"{distro}.sources").write_text(text, encoding="utf-8")
+        (sourceparts / f"{distro}.sources").write_text(private_mirror_lists(text), encoding="utf-8")
     elif legacy.exists():
         selected = []
         for line in legacy.read_text(encoding="utf-8").splitlines():
@@ -167,7 +219,8 @@ try:
             selected.append(line)
         if not selected:
             raise ValueError(f"{distro.title()} apt source has no deb entries for the host distribution archive")
-        (sourceparts / f"{distro}.list").write_text("\n".join(selected) + "\n", encoding="utf-8")
+        text = "\n".join(selected) + "\n"
+        (sourceparts / f"{distro}.list").write_text(private_mirror_lists(text), encoding="utf-8")
     else:
         raise ValueError(f"Unable to find the {distro.title()} apt distribution source")
 except (OSError, ValueError) as error:
@@ -205,6 +258,40 @@ else
   packages=(libopenblas-dev)
 fi
 
+install_options=(install -y --no-install-recommends)
+
 apt_started=1
 run_privileged apt-get "${apt_options[@]}" update
-run_privileged apt-get "${apt_options[@]}" install -y --no-install-recommends -- "${packages[@]}"
+
+# Size the bound from the signed index; files already in the archive cache are
+# not listed. Field 3 of each --print-uris line is the archive size in bytes.
+download_bytes="$(
+  run_privileged apt-get "${apt_options[@]}" "${install_options[@]}" --print-uris -- "${packages[@]}" |
+    awk 'index($1, "\047") == 1 && $3 ~ /^[0-9]+$/ { total += $3 } END { printf "%d\n", total }'
+)"
+download_seconds=$((download_grace_seconds + download_bytes / download_min_bytes_per_second))
+
+for ((attempt = 0; ; attempt++)); do
+  if ((attempt)) && compgen -G "$mirror_plans/$attempt/*" >/dev/null; then
+    cp -- "$mirror_plans/$attempt/"* "$mirrors/"
+  fi
+  status=0
+  # timeout(1) signals apt's whole process group; apt keeps partial files.
+  run_privileged timeout --kill-after=10 "$download_seconds" \
+    apt-get "${apt_options[@]}" "${install_options[@]}" --download-only -- "${packages[@]}" || status=$?
+  if ((status == 0)); then
+    break
+  fi
+  if ((status != 124 && status != 137)); then
+    exit "$status"
+  fi
+  if ((attempt + 1 >= download_attempts)); then
+    echo "::error::Native dependency download did not finish within the bounded retry budget" >&2
+    exit 1
+  fi
+  echo "::warning::Native dependency download exceeded ${download_seconds}s (attempt $((attempt + 1)) of $download_attempts); retrying with the next mirror first" >&2
+done
+
+# Install only the downloaded archives. apt verifies each one against the
+# signed index and never falls back to another unbounded download.
+run_privileged apt-get "${apt_options[@]}" "${install_options[@]}" --no-download -- "${packages[@]}"
