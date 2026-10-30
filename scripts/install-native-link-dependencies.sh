@@ -6,8 +6,8 @@ apt_etc_dir="${COVEN_APT_ETC_DIR:-/etc/apt}"
 # the package set needs at a minimum acceptable rate. A slower transfer is
 # stopped and retried with the next mirror first; apt resumes partial files.
 download_attempts="${COVEN_APT_DOWNLOAD_ATTEMPTS:-3}"
-download_grace_seconds="${COVEN_APT_DOWNLOAD_GRACE_SECONDS:-30}"
-download_min_bytes_per_second="${COVEN_APT_DOWNLOAD_MIN_BYTES_PER_SECOND:-262144}"
+download_grace_seconds="${COVEN_APT_DOWNLOAD_GRACE_SECONDS:-15}"
+download_min_bytes_per_second="${COVEN_APT_DOWNLOAD_MIN_BYTES_PER_SECOND:-1048576}"
 for bound in "$download_attempts" "$download_grace_seconds" "$download_min_bytes_per_second"; do
   if [[ ! "$bound" =~ ^[1-9][0-9]{0,8}$ ]]; then
     echo "::error::Native dependency download bounds must be positive integers" >&2
