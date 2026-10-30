@@ -1,7 +1,7 @@
 //! The gate's predicate and its commitments, against a dispatched trusted
 //! attempt (proposal §4, tests 1 to 6).
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -559,4 +559,274 @@ fn a_crash_after_commit_keeps_the_row_and_restart_sweeps_the_channel() {
     drop(release);
     let results = reading.join().unwrap();
     assert_eq!(results, [(json!({ "refusal": "attempt_closed" }), true)]);
+}
+
+/// The run's deadline crossing a write lock wait (#1605). A test clock P is
+/// evaluated against, and a trace of what happened in which order.
+#[derive(Clone)]
+struct Timeline {
+    now: Arc<Mutex<DateTime<Utc>>>,
+    trace: Arc<Mutex<Vec<String>>>,
+}
+
+impl Timeline {
+    /// A timeline whose run, `dispatched`'s, ends at a fixed `timeout_at` an
+    /// hour away, and whose clock reads a millisecond before it.
+    fn new(dispatched: &Dispatched) -> (Self, DateTime<Utc>) {
+        let timeout_at = DateTime::parse_from_rfc3339(
+            &(Utc::now() + TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap()
+        .with_timezone(&Utc);
+        dispatched
+            .conn()
+            .execute(
+                "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    dispatched.run,
+                    timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+                ],
+            )
+            .unwrap();
+        let timeline = Self {
+            now: Arc::new(Mutex::new(timeout_at - TimeDelta::milliseconds(1))),
+            trace: Arc::default(),
+        };
+        (timeline, timeout_at)
+    }
+
+    fn set(&self, now: DateTime<Utc>) {
+        *self.now.lock().unwrap() = now;
+    }
+
+    fn note(&self, event: String) {
+        self.trace.lock().unwrap().push(event);
+    }
+
+    fn trace(&self) -> Vec<String> {
+        self.trace.lock().unwrap().clone()
+    }
+
+    /// `gate`, reading this clock and noting each time it does, and calling
+    /// `locking` before it asks for the write lock.
+    fn drive(&self, mut gate: StoreGate, locking: impl FnMut() + Send + 'static) -> StoreGate {
+        let timeline = self.clone();
+        gate.clock.replaced = Some(Box::new(move || {
+            let now = *timeline.now.lock().unwrap();
+            timeline.note(format!(
+                "gate read the time: {}",
+                now.to_rfc3339_opts(SecondsFormat::Millis, true)
+            ));
+            now
+        }));
+        gate.locking = Some(Box::new(locking));
+        gate
+    }
+}
+
+/// Holds the store's write lock from another connection until `release`.
+fn hold_write_lock(dispatched: &Dispatched) -> Connection {
+    let other =
+        crate::store::open_store(&crate::api::store_path(dispatched.fixture.home.path())).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    other
+}
+
+fn committed_at(dispatched: &Dispatched) -> Vec<String> {
+    let mut statement = dispatched
+        .conn()
+        .prepare("SELECT committed_at FROM automation_scoped_read_commitments ORDER BY sequence")
+        .unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The gate asks for the write lock while the run still has time; another
+/// writer holds the lock; the run's `timeout_at` passes; the writer lets go;
+/// the gate takes the lock. P must be evaluated at the serialization point,
+/// so the result is withheld, even though the monotonic deadline is far off.
+#[test]
+fn a_deadline_that_passes_during_the_write_lock_wait_withholds_the_result() {
+    let dispatched = Dispatched::new();
+    let (timeline, timeout_at) = Timeline::new(&dispatched);
+    let deadline = Some(Instant::now() + Duration::from_secs(60));
+    let gate = StoreGate::open(
+        dispatched.fixture.home.path(),
+        dispatched.held.clone(),
+        Duration::from_secs(10),
+        deadline,
+    )
+    .unwrap();
+    let (asked, asking) = mpsc::channel();
+    let noted = timeline.clone();
+    let mut gate = timeline.drive(gate, move || {
+        noted.note("gate asked for the write lock".to_owned());
+        let _ = asked.send(());
+    });
+    assert_eq!(gate.admit(), Ok(()));
+    timeline.trace.lock().unwrap().clear();
+
+    let holder = hold_write_lock(&dispatched);
+    timeline.note("another writer holds the write lock".to_owned());
+    let committing = thread::spawn(move || gate.commit(&served(1)));
+    asking.recv().unwrap();
+    timeline.set(timeout_at);
+    timeline.note(format!(
+        "the run's timeout_at passed: {}",
+        timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+    ));
+    holder.execute_batch("COMMIT").unwrap();
+    timeline.note("the other writer let go".to_owned());
+    let verdict = committing.join().unwrap();
+
+    let trace = timeline.trace();
+    assert_eq!(
+        verdict,
+        Err(Refusal::AttemptClosed),
+        "served after the deadline: {trace:#?}"
+    );
+    assert_eq!(dispatched.rows(), [withheld(1)], "{trace:#?}");
+    let expired = timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+    assert_eq!(committed_at(&dispatched), std::slice::from_ref(&expired));
+    assert_eq!(
+        trace,
+        [
+            "another writer holds the write lock".to_owned(),
+            "gate asked for the write lock".to_owned(),
+            format!("the run's timeout_at passed: {expired}"),
+            "the other writer let go".to_owned(),
+            format!("gate read the time: {expired}"),
+        ],
+        "the gate reads the time only once it holds the lock"
+    );
+}
+
+/// The same ordering over the attempt's channel: no byte of the result
+/// reaches the harness and the service stops.
+#[test]
+fn over_the_channel_a_deadline_that_passes_during_the_wait_writes_no_byte() {
+    let dispatched = Dispatched::new();
+    let (timeline, timeout_at) = Timeline::new(&dispatched);
+    let (asked, asking) = mpsc::channel();
+    let home = dispatched.fixture.home.path().to_path_buf();
+    let driving = timeline.clone();
+    let prepared = prepare_with_gate(
+        dispatched.conn(),
+        &dispatched.fixture.launch(&dispatched.launched),
+        Utc::now(),
+        move |authorized| {
+            let gate = StoreGate::open(
+                &home,
+                authorized.held.clone(),
+                Duration::from_secs(10),
+                None,
+            )?;
+            Ok(Box::new(driving.drive(gate, move || {
+                let _ = asked.send(());
+            })))
+        },
+    )
+    .expect("the launch is admitted");
+    let holder = hold_write_lock(&dispatched);
+    let reading = thread::spawn(move || {
+        read_through(prepared, &[read("notes/today.md"), read("notes/today.md")])
+    });
+    asking.recv().unwrap();
+    timeline.set(timeout_at);
+    holder.execute_batch("COMMIT").unwrap();
+    let results = reading.join().unwrap();
+    assert_eq!(
+        results,
+        [(json!({ "refusal": "attempt_closed" }), true)],
+        "the result is withheld and the second call is never served"
+    );
+    assert!(!format!("{results:?}").contains(GRANTED));
+    assert_eq!(dispatched.rows(), [withheld(1)]);
+}
+
+/// At exactly `timeout_at` the run's time is up; a millisecond before, it is
+/// not. A commitment made in time stands, with its own time, and the next
+/// call after the deadline is refused.
+#[test]
+fn a_commitment_before_the_deadline_stands_and_one_at_it_is_withheld() {
+    let dispatched = Dispatched::new();
+    let (timeline, timeout_at) = Timeline::new(&dispatched);
+    let mut gate = timeline.drive(dispatched.gate(), || {});
+    assert_eq!(gate.admit(), Ok(()));
+    assert_eq!(gate.commit(&served(1)), Ok(()));
+    timeline.set(timeout_at);
+    assert_eq!(gate.admit(), Err(Refusal::AttemptClosed));
+    assert_eq!(gate.commit(&served(2)), Err(Refusal::AttemptClosed));
+    assert_eq!(
+        dispatched.rows(),
+        [
+            (1, "served".to_owned(), None, Some(DIGEST.to_owned())),
+            withheld(2),
+        ]
+    );
+    assert_eq!(
+        committed_at(&dispatched),
+        [
+            (timeout_at - TimeDelta::milliseconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true),
+            timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        ]
+    );
+}
+
+/// A revocation the lock holder commits while the gate waits wins, with the
+/// run's time still left.
+#[test]
+fn a_revocation_committed_during_the_write_lock_wait_withholds_the_result() {
+    let dispatched = Dispatched::new();
+    let (timeline, _timeout_at) = Timeline::new(&dispatched);
+    let (asked, asking) = mpsc::channel();
+    let mut gate = timeline.drive(dispatched.gate_for(dispatched.held.clone()), move || {
+        let _ = asked.send(());
+    });
+    gate.busy = Duration::from_secs(10);
+    let holder = hold_write_lock(&dispatched);
+    let committing = thread::spawn(move || gate.commit(&served(1)));
+    asking.recv().unwrap();
+    holder
+        .execute(
+            "UPDATE familiar_ledger_revisions
+             SET status = 'revoked', revoked_at = '2026-10-27T00:00:00.000Z',
+                 revocation_reason = 'compromised'
+             WHERE revision_id = ?1",
+            [dispatched.launched.projection.identity_revision_id.as_str()],
+        )
+        .unwrap();
+    holder.execute_batch("COMMIT").unwrap();
+    assert_eq!(committing.join().unwrap(), Err(Refusal::AttemptClosed));
+    assert_eq!(dispatched.rows(), [withheld(1)]);
+}
+
+/// A wait never outlasts the run's monotonic deadline: once it has passed
+/// the gate refuses at once, records nothing, and serves nothing, however
+/// long the store stays busy.
+#[test]
+fn a_wait_past_the_run_deadline_refuses_unrecorded_without_waiting() {
+    let dispatched = Dispatched::new();
+    let (timeline, timeout_at) = Timeline::new(&dispatched);
+    let gate = StoreGate::open(
+        dispatched.fixture.home.path(),
+        dispatched.held.clone(),
+        Duration::from_secs(30),
+        Some(Instant::now()),
+    )
+    .unwrap();
+    let mut gate = timeline.drive(gate, || {});
+    let holder = hold_write_lock(&dispatched);
+    timeline.set(timeout_at);
+    let started = Instant::now();
+    assert_eq!(gate.commit(&served(1)), Err(Refusal::AttemptClosed));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the wait is bounded by the deadline, not the 30s busy limit"
+    );
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(dispatched.rows(), []);
 }

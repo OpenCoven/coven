@@ -96,7 +96,8 @@ decision.
    `authorize_scheduled_dispatch`'s. A pause, disable, revise or tombstone
    therefore stops further reads.
 7. **The run's `timeout_at` has not passed.** The service also checks its
-   own deadline.
+   own deadline. `commit()` reads the time once it holds the write lock, so
+   a deadline that passes while it waits for the lock withholds the result.
 
 **`admit()`** evaluates P in a read transaction and records nothing. It is an
 early refusal, not the authority.

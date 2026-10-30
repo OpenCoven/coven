@@ -17,7 +17,9 @@
 //!   evaluates P again and inserts one immutable commitment row. When P fails
 //!   it records a `withheld` row in the same transaction and refuses
 //!   (`attempt_closed`), so whichever of a revocation and a commitment takes
-//!   the write lock first wins. A busy or unreadable store refuses too.
+//!   the write lock first wins. P's time is read after the lock is taken, so
+//!   a run whose `timeout_at` passes while the call waits is withheld too. A
+//!   busy or unreadable store refuses.
 //!
 //! A row holds the result's SHA-256 and length, never its content, the path
 //! asked for, a search pattern or an entry name.
@@ -292,6 +294,12 @@ pub(crate) struct StoreGate {
     busy: Duration,
     /// When the run ends, if it has a deadline. No wait outlasts it.
     deadline: Option<Instant>,
+    /// The wall clock P is evaluated against.
+    clock: Clock,
+    /// Runs just before `commit` asks for the write lock, so a test can
+    /// order a deadline against the wait.
+    #[cfg(test)]
+    locking: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl StoreGate {
@@ -313,6 +321,9 @@ impl StoreGate {
             channel_id: random_hex(16)?,
             busy,
             deadline,
+            clock: Clock::default(),
+            #[cfg(test)]
+            locking: None,
         })
     }
 
@@ -336,7 +347,7 @@ impl StoreGate {
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|_| Refusal::AttemptClosed)?;
-        let verdict = authorized(&transaction, &self.held, Utc::now());
+        let verdict = authorized(&transaction, &self.held, self.clock.now());
         // Read only: the transaction rolls back.
         drop(transaction);
         match verdict {
@@ -355,11 +366,18 @@ impl StoreGate {
         committing: &Committing<'_>,
     ) -> std::result::Result<(), Refusal> {
         self.wait_at_most()?;
-        let now = Utc::now();
+        #[cfg(test)]
+        if let Some(locking) = self.locking.as_mut() {
+            locking();
+        }
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| Refusal::AttemptClosed)?;
+        // The time is read only once the write lock is held: the wait for it
+        // can outlast the run's `timeout_at`, and P must hold when the row
+        // commits, not when the call began to wait (#1605).
+        let now = self.clock.now();
         let authorized = matches!(authorized(&transaction, &self.held, now), Ok(Ok(())));
         let (outcome, refusal, digest, bytes) = match (authorized, committing.refusal) {
             (true, None) => (
@@ -401,6 +419,23 @@ impl StoreGate {
         } else {
             Err(Refusal::AttemptClosed)
         }
+    }
+}
+
+/// The wall clock, which a test can replace to move it.
+#[derive(Default)]
+struct Clock {
+    #[cfg(test)]
+    replaced: Option<Box<dyn Fn() -> DateTime<Utc> + Send>>,
+}
+
+impl Clock {
+    fn now(&self) -> DateTime<Utc> {
+        #[cfg(test)]
+        if let Some(now) = &self.replaced {
+            return now();
+        }
+        Utc::now()
     }
 }
 
