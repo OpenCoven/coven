@@ -39,15 +39,12 @@ The service the harness talks to is beside them, in `service.rs` and
 
 - **An MCP server**, `coven`, with three tools: `read_file`, `list_directory`
   and `search` (`coven.scoped-read.tools.v1`).
-  - Every `tools/call` reaches the reader, an unknown tool included, so every
-    call counts against the attempt.
+  - Every `tools/call` request with an ID reaches the reader, an unknown tool included, so every call counts against the attempt. No-ID notifications perform no read, create no operation record and receive no response.
   - The first terminal call-limit refusal ends the service. Its retained operation records are bounded by the call budget plus that final refusal.
   - Each call is admitted by the attempt's gate before it runs, and its
     result, refusals included, is committed by digest before a byte is
     written. The text the harness receives is exactly the committed JCS text.
-  - Each operation runs under the 5-second limit, or less when the run's
-    deadline is nearer. One that overruns is refused (`limit_time`), and the
-    service stops.
+  - Each operation has a 5-second response-wait limit, or less when the run's deadline is nearer. One that overruns is refused (`limit_time`), and the service stops. Its worker remains owned: channel close drains it before removing attempt resources. This limit does not interrupt filesystem work or bound draining close; a stuck filesystem operation can still hold close open.
 - **A private channel per attempt**, in a new directory under
   `<COVEN_HOME>/runtime/scoped-read`.
   - The directory is readable only by the owner. It holds a Unix socket and
@@ -59,9 +56,7 @@ The service the harness talks to is beside them, in `service.rs` and
   - The channel serves one connection that presents the token, then closes
     its listener.
   - Token authentication has one total two-second deadline. Each byte consumes that same budget; a slow peer cannot restart it or keep channel close waiting beyond the remaining budget.
-  - Closing the channel refuses every later call (`attempt_closed`) and
-    withholds the result of one already running. It then removes only the
-    files it created.
+  - Closing the channel and committing through the attempt's gate share one fence. If close takes it first, the result is withheld (`attempt_closed`); a commitment already holding it wins and cannot be recalled. Close releases the fence before joining the response loop and its retained reader, then removes only the files it created. Commitment still does not establish transport delivery.
   - Failed initialization also removes the attempt entries it created, without removing unrelated entries or the shared runtime directory.
 
 The returned operation records describe reader/gate outcomes and committed response digests. They are not transport delivery receipts: a subsequent write may fail or be partial, and even a completed write does not prove harness receipt. The existing `Served` and `Refused` names refer to the reader/gate result.

@@ -152,5 +152,5 @@ axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Parse authority modules for dependency-direction guards; never linked into the CLI.
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 jsonschema = { version = "0.58.0", default-features = false, features = ["arbitrary-precision"] }

@@ -270,6 +270,29 @@ impl OwnerPolicyStore {
         Ok(self.read()?.map(installed))
     }
 
+    /// Runs `commit` against the head while holding the policy lock, so no
+    /// replacement can land between the caller's head check and its write.
+    /// Callers keep the policy → registry lock order.
+    pub(super) fn with_current_locked<T>(
+        &self,
+        commit: impl FnOnce(Option<&InstalledPolicy>) -> Result<T>,
+    ) -> Result<T> {
+        let _lock = PolicyStoreLock::acquire(self.lock_dir()?)?;
+        commit(self.current()?.as_ref())
+    }
+
+    /// Whether a writer holds this store's file lock, without waiting for it.
+    /// The process mutex is shared by every store, so it is not consulted.
+    #[cfg(test)]
+    pub(super) fn is_locked(&self) -> Result<bool> {
+        let file = crate::state_lock::open_lock_file(&self.lock_dir()?.join(POLICY_LOCK_FILE))?;
+        if file.try_lock_exclusive().is_err() {
+            return Ok(true);
+        }
+        FileExt::unlock(&file)?;
+        Ok(false)
+    }
+
     pub fn install_action(
         &self,
         owner_root_key: &str,

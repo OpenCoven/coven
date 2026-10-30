@@ -332,3 +332,220 @@ fn terminal_retry_does_not_acknowledge_a_failed_directory_barrier() -> Result<()
     assert_eq!(decide()?.status, 200);
     Ok(())
 }
+#[test]
+fn direct_write_survives_loss_of_unsynced_wal_suffix() -> Result<()> {
+    for before_audit in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let database = home.join("coven.sqlite3");
+        let loss = crate::power_loss_tests::PowerLoss::observe(&database);
+        let keeper = store::open_store(&database)?;
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        let target = workspace.join("notes/today.md");
+        std::fs::write(&target, "before")?;
+        keeper.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let apply = || {
+            post_edits(
+                home,
+                r#"{"edits":[{"target":"notes/today.md","contents":"after"}]}"#,
+            )
+        };
+        let images = if before_audit {
+            let pause = set_direct_apply_pause(home, "sage");
+            std::thread::scope(|scope| -> Result<_> {
+                let request = scope.spawn(apply);
+                pause.wait_until_reached("direct write before audit");
+                assert_eq!(std::fs::read(&target)?, b"after");
+                // Freeze the pre-ack crash boundary, then let the thread close
+                // safely. Later syncs must not enter the restored image.
+                let images = loss.synced_images();
+                pause.release();
+                assert_eq!(request.join().unwrap()?.status, 200);
+                Ok(images)
+            })?
+        } else {
+            let response = apply()?;
+            assert_eq!(response.status, 200, "{}", response.body);
+            keeper.execute(
+                "INSERT INTO store_meta(key, value) VALUES ('power-loss-tail', 'lost')",
+                [],
+            )?;
+            loss.synced_images()
+        };
+        drop(keeper);
+        loss.restore(images)?;
+        assert_eq!(std::fs::read(&target)?, b"after");
+        let conn = store::open_store(&database)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_meta WHERE key = 'power-loss-tail'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        let audits: i64 = conn.query_row(
+            r#"SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'
+             AND familiar_id = 'sage' AND proposal_id IS NULL
+             AND files_touched = '["notes/today.md"]'
+             AND decision = 'applied' AND tier = 'tier_2'
+             AND lower(hex(diff_hash)) = 'f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8'
+             AND json_extract(detail, '$.bytes_written') = 5
+             AND json_extract(detail, '$.prev_sha256') = '6db7d803e74f1ffa7d8f5adc0bf95b3e15bf4c8373fffadf546227cc6c6742cb'"#,
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            audits,
+            i64::from(!before_audit),
+            "acknowledged direct write lost its audit evidence (before_audit={before_audit})"
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
+            1
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn direct_write_does_not_acknowledge_failed_audit_sync() -> Result<()> {
+    for directory_failure in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let database = home.join("coven.sqlite3");
+        let loss = crate::power_loss_tests::PowerLoss::observe(&database);
+        let keeper = store::open_store(&database)?;
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        let target = workspace.join("notes/today.md");
+        std::fs::write(&target, "before")?;
+        keeper.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let pause = set_direct_apply_pause(home, "sage");
+        let response = std::thread::scope(|scope| -> Result<_> {
+            let request = scope.spawn(|| {
+                post_edits(
+                    home,
+                    r#"{"edits":[{"target":"notes/today.md","contents":"after"}]}"#,
+                )
+            });
+            pause.wait_until_reached("direct audit sync failure");
+            if directory_failure {
+                // Arm the thread-local fault on the request thread after its
+                // target file and directory have already been synchronized.
+                pause.fail_audit_directory_sync();
+            } else {
+                loss.fail_next_sync();
+            }
+            pause.release();
+            request.join().unwrap()
+        })?;
+        assert_eq!(response.status, 500, "{}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "audit_persist_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], true);
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert_eq!(std::fs::read(&target)?, b"after");
+        assert_eq!(
+            keeper.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE purpose = 'direct-ward-apply'",
+                [], |row| row.get::<_, i64>(0))?,
+            1,
+            "failed audit barrier must retain the applied write's reservation"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn legacy_submission_survives_loss_of_unsynced_wal_suffix() -> Result<()> {
+    for boundary in ["acknowledged", "receipt_refused", "sync_failed"] {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let database = home.join("coven.sqlite3");
+        let loss = crate::power_loss_tests::PowerLoss::observe(&database);
+        let keeper = store::open_store(&database)?;
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        let target = workspace.join("reviewed/skill.md");
+        std::fs::write(&target, "before")?;
+        if boundary == "receipt_refused" {
+            keeper.execute_batch(
+                "CREATE TRIGGER refuse_legacy_receipt BEFORE INSERT ON ward_audit
+                WHEN NEW.event_type = 'proposal_submitted'
+                BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;",
+            )?;
+        }
+        keeper.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        if boundary == "sync_failed" {
+            // NORMAL may sync a newly created WAL's header. Prime it before
+            // arming the fault so it reaches the receipt's FULL commit,
+            // after the pending file has been published.
+            keeper.execute(
+                "INSERT INTO store_meta(key, value) VALUES ('prime-wal', 'normal')",
+                [],
+            )?;
+            loss.fail_next_sync();
+        }
+        let result = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"after"}]}"#,
+        );
+        if boundary == "acknowledged" {
+            let response = result?;
+            assert_eq!(response.status, 202, "{}", response.body);
+        } else {
+            let error = result.expect_err("receipt failure must not acknowledge staging");
+            let expected = if boundary == "receipt_refused" {
+                "injected receipt failure"
+            } else {
+                "committing durable authority evidence"
+            };
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{boundary}: {error:#}"
+            );
+        }
+        let pending = std::fs::read_dir(home.join("pending"))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .context("published legacy proposal")?;
+        let bytes = std::fs::read(&pending)?;
+        let document = read_pending_proposal_document(&pending)?;
+        assert!(document.scheduled().is_none());
+        let id = document.pending().id.to_string();
+        keeper.execute(
+            "INSERT INTO store_meta(key, value) VALUES ('power-loss-tail', 'lost')",
+            [],
+        )?;
+        let images = loss.synced_images();
+        drop(keeper);
+        loss.restore(images)?;
+        assert_eq!(std::fs::read(&pending)?, bytes);
+        assert_eq!(std::fs::read(&target)?, b"before");
+        let conn = store::open_store(&database)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_meta WHERE key = 'power-loss-tail'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        let receipts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+            [&id], |row| row.get(0))?;
+        assert_eq!(
+            receipts,
+            i64::from(boundary == "acknowledged"),
+            "legacy submission receipt durability at {boundary}"
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
+            1
+        );
+    }
+    Ok(())
+}

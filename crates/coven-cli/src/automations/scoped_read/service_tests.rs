@@ -258,6 +258,23 @@ fn a_refusal_is_committed_and_answered_as_a_tool_error() {
 }
 
 #[test]
+fn tool_notifications_neither_read_nor_disclose_and_the_next_request_counts_once() {
+    let (service, seen) = service_with(Ok(file("x")), Box::new(Open), LIMITS);
+    let mut notification = read(1);
+    notification.as_object_mut().unwrap().remove("id");
+    let (replies, operations) = run(service, &[initialize(), notification, read(2)]);
+    assert_eq!(replies.len(), 2, "notifications get no response");
+    assert_eq!(replies[1]["id"], 2);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "only the ID-bearing request reads"
+    );
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].sequence, 1);
+}
+
+#[test]
 fn every_call_reaches_the_reader_however_it_is_spelled() {
     let (service, seen) = service_with(Err(Refusal::RequestInvalid), Box::new(Open), LIMITS);
     let (_, operations) = run(
@@ -364,11 +381,15 @@ fn an_operation_that_overruns_is_refused_and_stops_the_service() {
             deadline: None,
         },
     );
+    // Like Channel, retain ownership beyond the prompt timeout response.
+    let worker = service.worker();
     let started = Instant::now();
     let (replies, operations) = run(service, &[initialize(), read(1), read(2)]);
+    let elapsed = started.elapsed();
+    worker.join();
     assert!(
-        started.elapsed() < Duration::from_millis(300),
-        "the service did not wait"
+        elapsed < Duration::from_millis(300),
+        "the response loop waited for its timed-out reader: {elapsed:?}"
     );
     assert_eq!(replies.len(), 2);
     assert_eq!(
@@ -745,6 +766,141 @@ mod over_the_channel {
         let mut rest = String::new();
         std::io::Read::read_to_string(&mut replies, &mut rest).unwrap();
         assert!(!rest.contains("SENTINEL"), "{rest}");
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn close_waits_for_a_commit_that_already_entered_the_gate() {
+        struct HeldCommit {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Gate for HeldCommit {
+            fn admit(&mut self) -> Result<(), Refusal> {
+                Ok(())
+            }
+            fn commit(&mut self, _: Option<&'static str>, _: &str) -> Result<(), Refusal> {
+                self.entered.send(()).unwrap();
+                // A hang guard; the test releases this after observing close.
+                self.release.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(())
+            }
+        }
+        let scratch = scratch();
+        let (entered, committing) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let channel = Channel::open(
+            &scratch.path().join("runtime"),
+            Path::new("/usr/local/bin/coven"),
+            |gate| Service::with_serve(Box::new(|_| Ok(file("SENTINEL"))), gate, LIMITS),
+            Box::new(HeldCommit {
+                entered,
+                release: released,
+            }),
+        )
+        .unwrap();
+        let directory = channel.config_path().parent().unwrap().to_path_buf();
+        let (socket, channel_token) = relay_env(&channel);
+        let mut peer = UnixStream::connect(socket).unwrap();
+        peer.write_all(format!("{channel_token}\n").as_bytes())
+            .unwrap();
+        let mut replies = BufReader::new(peer.try_clone().unwrap());
+        exchange(&mut peer, &mut replies, &initialize());
+        writeln!(peer, "{}", read(1)).unwrap();
+        committing.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (closing, close_started) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            closing.send(()).unwrap();
+            channel.close()
+        });
+        close_started.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The commit is explicitly held. Close must not shut its socket down
+        // while that earlier gate commitment is still in progress.
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let held = peer.read(&mut [0u8; 1]);
+        release.send(()).unwrap();
+        let operations = closer.join().unwrap();
+        assert!(
+            matches!(held, Err(ref error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "close crossed the held commit: {held:?}"
+        );
+        assert!(matches!(
+            operations.as_slice(),
+            [super::Operation {
+                outcome: Outcome::Served { .. },
+                ..
+            }]
+        ));
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn close_drains_a_timed_out_worker_before_removing_attempt_files() {
+        let scratch = scratch();
+        let runtime = scratch.path().join("runtime");
+        let worker_runtime = runtime.clone();
+        let (started, running) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (finished, drained) = mpsc::channel();
+        let channel = open(&runtime, move |gate| {
+            Service::with_serve(
+                Box::new(move |_| {
+                    started.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(10)).unwrap();
+                    let attempt_present = fs::read_dir(&worker_runtime)
+                        .unwrap()
+                        .any(|entry| entry.unwrap().path().join("mcp.json").exists());
+                    finished.send(attempt_present).unwrap();
+                    Ok(file("SENTINEL"))
+                }),
+                gate,
+                super::Limits {
+                    operation: Duration::from_millis(20),
+                    deadline: None,
+                },
+            )
+        });
+        let directory = channel.config_path().parent().unwrap().to_path_buf();
+        let (socket, channel_token) = relay_env(&channel);
+        let mut peer = UnixStream::connect(socket).unwrap();
+        peer.write_all(format!("{channel_token}\n").as_bytes())
+            .unwrap();
+        let mut replies = BufReader::new(peer.try_clone().unwrap());
+        exchange(&mut peer, &mut replies, &initialize());
+        let refusal = exchange(&mut peer, &mut replies, &read(1));
+        running.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (closed, completed) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            let operations = channel.close();
+            closed.send(()).unwrap();
+            operations
+        });
+        // Negative observation while the worker is explicitly held, not an
+        // assertion that filesystem work has a bounded shutdown duration.
+        let early_close = completed.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        let operations = closer.join().unwrap();
+        let attempt_present = drained.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            tool_text(&refusal),
+            (r#"{"refusal":"limit_time"}"#.to_owned(), true)
+        );
+        assert!(
+            matches!(early_close, Err(mpsc::RecvTimeoutError::Timeout)),
+            "close returned before its worker: {early_close:?}"
+        );
+        assert!(
+            attempt_present,
+            "attempt files disappeared before the worker finished"
+        );
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            operations[0].outcome,
+            Outcome::Refused {
+                refusal: Refusal::LimitTime,
+                ..
+            }
+        ));
         assert!(!directory.exists());
     }
 
