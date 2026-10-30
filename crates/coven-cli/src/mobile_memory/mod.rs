@@ -15,6 +15,8 @@ pub mod passkey;
 pub mod policy_cli;
 pub mod recovery;
 pub mod registry;
+pub mod relay;
+pub mod transport;
 
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -46,6 +48,9 @@ pub const MOBILE_REQUEST_WINDOW_SECONDS: i64 = 300;
 struct MobileGatewayStatus {
     configured: bool,
     enabled: bool,
+    private_listener_enabled: bool,
+    relay_enabled: bool,
+    relay_endpoint_count: usize,
     bind: Option<String>,
     advertised_endpoint: Option<String>,
     device_count: usize,
@@ -80,13 +85,14 @@ pub fn run_disable(forget_devices: bool, confirm_forget_devices: bool) -> Result
         bail!("forgetting devices requires both --forget-devices and --confirm-forget-devices");
     }
     let coven_home = crate::coven_home_dir()?;
+    let relay_was_enabled = transport::storage::RelayConfig::disable(&coven_home)?;
     let was_configured = config::remove_mobile_config(&coven_home)?;
     if forget_devices {
         registry::DeviceRegistry::load(&coven_home)?.forget_all()?;
     }
     println!(
         "Mobile memory access {}.",
-        if was_configured {
+        if was_configured || relay_was_enabled {
             "disabled"
         } else {
             "was already disabled"
@@ -97,12 +103,14 @@ pub fn run_disable(forget_devices: bool, confirm_forget_devices: bool) -> Result
     } else {
         println!("Host identity and paired devices were retained.");
     }
+    println!("Restart the Coven daemon to apply the private listener change.");
     Ok(())
 }
 
 pub fn run_status(json: bool) -> Result<()> {
     let coven_home = crate::coven_home_dir()?;
-    let config = config::load_mobile_config(&coven_home)?;
+    let config = config::load_mobile_config_unvalidated(&coven_home)?;
+    let relay = transport::storage::RelayConfig::load(&coven_home)?;
     let devices = registry::DeviceRegistry::load_if_present(&coven_home)?
         .map(|registry| registry.list_status())
         .transpose()?
@@ -112,8 +120,12 @@ pub fn run_status(json: bool) -> Result<()> {
         .filter(|device| device.revoked_at.is_none() && device.suspended_at.is_none())
         .count();
     let status = MobileGatewayStatus {
-        configured: config.is_some(),
-        enabled: config.as_ref().is_some_and(|config| config.enabled),
+        configured: config.is_some() || relay.is_some(),
+        enabled: config.as_ref().is_some_and(|config| config.enabled)
+            || relay.as_ref().is_some_and(|config| config.enabled),
+        private_listener_enabled: config.as_ref().is_some_and(|config| config.enabled),
+        relay_enabled: relay.as_ref().is_some_and(|config| config.enabled),
+        relay_endpoint_count: relay.as_ref().map_or(0, |config| config.endpoints.len()),
         bind: config.as_ref().map(|config| config.bind.to_string()),
         advertised_endpoint: config
             .as_ref()
@@ -126,12 +138,20 @@ pub fn run_status(json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         println!(
-            "Mobile memory access: {}",
+            "Mobile memory access configuration: {}",
             if status.enabled {
                 "enabled"
             } else {
                 "disabled"
             }
+        );
+        println!(
+            "Private listener configured: {}",
+            status.private_listener_enabled
+        );
+        println!(
+            "Relay configured: {} ({} endpoints)",
+            status.relay_enabled, status.relay_endpoint_count
         );
         if let Some(endpoint) = status.advertised_endpoint {
             println!("Endpoint: {endpoint}");

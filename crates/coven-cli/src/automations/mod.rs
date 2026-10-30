@@ -49,6 +49,7 @@ pub mod receipts;
 pub mod recovery;
 #[cfg(test)]
 mod release_upgrade_tests;
+pub(crate) mod retry_cli;
 pub mod rich_definition;
 pub mod rrule;
 pub mod run_now;
@@ -70,6 +71,10 @@ pub mod stream_observation;
 // Wired into every session ending; it observes only Runtime Authority attempts,
 // which nothing dispatches until the trusted adapter (coven#857 slice 6).
 pub mod terminal_observer;
+// Threads decisions: the trusted adapter (coven#857 slice 6) is their only
+// caller, so nothing in production decides yet.
+#[allow(dead_code)]
+pub mod threads_decisions;
 pub mod transition_events;
 #[cfg(test)]
 mod transport_authority_tests;

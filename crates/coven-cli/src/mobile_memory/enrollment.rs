@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -14,13 +15,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::assurance::{AssuranceContextMode, PresentedAssuranceProof, RequestedAssurance};
+use super::assurance::{
+    AssuranceChallengeStore, AssuranceContextMode, PresentedAssuranceProof, RequestedAssurance,
+};
 use super::grant::{DeviceActionIntent, GrantTransportConstraint};
 use super::introduction::{
     IntroductionApproval, IntroductionAuthority, IntroductionCommitUncertain,
     IntroductionTranscript,
 };
 use super::owner_policy::InstalledPolicy;
+use super::registry::DeviceRegistry;
 
 pub(super) const LOCAL_INTRODUCTION_ROOT: &str = "/api/v1/internal/mobile/introductions";
 const MAX_TRACKED_INTRODUCTIONS: usize = 16;
@@ -149,22 +153,66 @@ impl TrackedIntroduction {
 pub(super) struct IntroductionLedger {
     home: PathBuf,
     audience: [u8; 32],
+    registry: Arc<DeviceRegistry>,
+    challenges: Arc<AssuranceChallengeStore>,
     entries: Mutex<HashMap<Uuid, TrackedIntroduction>>,
+    #[cfg(test)]
+    lock_wait_observer: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 impl IntroductionLedger {
+    #[cfg(test)]
     pub(super) fn new(home: &Path, audience: [u8; 32]) -> Self {
+        Self::with_stores(
+            home,
+            audience,
+            Arc::new(DeviceRegistry::load(home).unwrap()),
+            Arc::new(AssuranceChallengeStore::load(home).unwrap()),
+        )
+    }
+
+    pub(super) fn with_stores(
+        home: &Path,
+        audience: [u8; 32],
+        registry: Arc<DeviceRegistry>,
+        challenges: Arc<AssuranceChallengeStore>,
+    ) -> Self {
         Self {
             home: home.to_owned(),
             audience,
+            registry,
+            challenges,
             entries: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            lock_wait_observer: Mutex::new(None),
         }
     }
 
+    fn authority(&self) -> Result<IntroductionAuthority> {
+        self.registry.ensure_running()?;
+        IntroductionAuthority::load_installed_with_stores(
+            &self.home,
+            self.audience,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.challenges),
+        )
+    }
+
     fn entries(&self) -> Result<std::sync::MutexGuard<'_, HashMap<Uuid, TrackedIntroduction>>> {
-        self.entries
-            .lock()
-            .map_err(|_| anyhow::anyhow!("introduction ledger lock was poisoned"))
+        loop {
+            self.registry.ensure_running()?;
+            match self.entries.try_lock() {
+                Ok(entries) => return Ok(entries),
+                Err(TryLockError::Poisoned(_)) => bail!("introduction ledger lock was poisoned"),
+                Err(TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    if let Some(observer) = self.lock_wait_observer.lock().unwrap().as_ref() {
+                        let _ = observer.try_send(());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     /// Owner-socket admission. Policy and audience come from local authority;
@@ -174,7 +222,7 @@ impl IntroductionLedger {
         envelope: IntroductionEnvelope,
         now: DateTime<Utc>,
     ) -> Result<IntroductionStatus> {
-        let authority = IntroductionAuthority::load_installed(&self.home, self.audience)?;
+        let authority = self.authority()?;
         authority.admit_transcript(&envelope.request, &envelope.destination_signature, now)?;
         if IntroductionAuthority::passkey_approver(&envelope.request)
             != envelope
@@ -184,7 +232,9 @@ impl IntroductionLedger {
         {
             bail!("introduction passkey assertion does not match the named passkey");
         }
-        if super::registry::DeviceRegistry::load(&self.home)?
+        self.registry.reload()?;
+        if self
+            .registry
             .device(envelope.request.destination_id())?
             .is_some()
         {
@@ -303,7 +353,7 @@ impl IntroductionLedger {
         if entry.approvals.len() < entry.envelope.request.approvers().len() {
             return Ok(entry.status(id));
         }
-        let authority = IntroductionAuthority::load_installed(&self.home, self.audience);
+        let authority = self.authority();
         if let Ok(authority) = &authority {
             let maximum_age = authority.maximum_step_up_age();
             let expired: Vec<_> = entry
@@ -350,8 +400,10 @@ impl IntroductionLedger {
             }
             Err(error) => {
                 let destination = entry.envelope.request.destination_id();
-                let committed = super::registry::DeviceRegistry::load(&self.home)
-                    .and_then(|registry| registry.device(destination))
+                let committed = self
+                    .registry
+                    .reload()
+                    .and_then(|()| self.registry.device(destination))
                     .map_or(true, |device| device.is_some());
                 entry.state = if committed || error.is::<IntroductionCommitUncertain>() {
                     IntroductionState::Uncertain

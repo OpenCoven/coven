@@ -197,6 +197,7 @@ pub(super) fn apply_root_rotation(
         review.push_str(&format!("  {name:<28} {value}\n"));
     };
     field("operation", action.operation.clone());
+    field("scope", action.scope.as_str().into());
     field("installation (audience)", action.target.clone());
     field(
         "outgoing owner-root key",
@@ -205,14 +206,19 @@ pub(super) fn apply_root_rotation(
     field("incoming owner-root key", key_fingerprint(&incoming));
     field("revision", proposal.revision.to_string());
     field("previous digest", head.digest.clone());
-    field("policy", "unchanged".into());
+    // The effect digest covers the whole policy, so every field is shown
+    // even though a rotation must keep it exactly.
+    for (name, value) in policy_fields(&proposal.policy) {
+        field(name, value);
+    }
     field("nonce", action.nonce.clone());
     field("issued at", timestamp(action.issued_at));
     field("expires at", timestamp(action.expires_at));
     field("effect digest", action.effect_digest.clone());
     review.push_str(
         "  Devices, grants and familiars are unchanged. Signatures bound to the current\n  \
-         policy head, such as unused recovery approvals, are retired.\n",
+         policy head, such as unused recovery approvals and pending introductions,\n  \
+         are retired. The policy above is unchanged.\n",
     );
     let answer = reader(&format!(
         "{review}Type `rotate` to sign this exact action with both keys (anything else cancels): "
@@ -303,29 +309,9 @@ pub(super) fn render_review(
             .clone()
             .unwrap_or_else(|| "(none: first install)".into()),
     );
-    field("eligible introducers", join(&policy.eligible_introducers));
-    field("required approvals", policy.required_approvals.to_string());
-    field(
-        "allowed scopes",
-        policy
-            .allowed_scopes
-            .iter()
-            .map(|scope| scope.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    field(
-        "maximum grant lifetime",
-        format!("{} seconds", policy.maximum_grant_lifetime_seconds),
-    );
-    field(
-        "required assurance",
-        policy.required_assurance.as_str().into(),
-    );
-    field(
-        "maximum step-up age",
-        format!("{} seconds", policy.maximum_step_up_age_seconds),
-    );
+    for (name, value) in policy_fields(policy) {
+        field(name, value);
+    }
     field("nonce", action.nonce.clone());
     field("issued at", timestamp(action.issued_at));
     field("expires at", timestamp(action.expires_at));
@@ -342,6 +328,35 @@ pub(super) fn render_review(
         });
     }
     out
+}
+
+/// The policy fields an owner-root action's effect digest covers.
+fn policy_fields(policy: &IntroductionPolicy) -> [(&'static str, String); 6] {
+    [
+        ("eligible introducers", join(&policy.eligible_introducers)),
+        ("required approvals", policy.required_approvals.to_string()),
+        (
+            "allowed scopes",
+            policy
+                .allowed_scopes
+                .iter()
+                .map(|scope| scope.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        (
+            "maximum grant lifetime",
+            format!("{} seconds", policy.maximum_grant_lifetime_seconds),
+        ),
+        (
+            "required assurance",
+            policy.required_assurance.as_str().into(),
+        ),
+        (
+            "maximum step-up age",
+            format!("{} seconds", policy.maximum_step_up_age_seconds),
+        ),
+    ]
 }
 
 fn render_head(head: &InstalledPolicy) -> String {
@@ -443,7 +458,7 @@ fn load_root_key(path: &Path) -> Result<SigningKey> {
 }
 
 pub(super) fn public_key(key: &SigningKey) -> String {
-    URL_SAFE_NO_PAD.encode(key.verifying_key().to_encoded_point(false).as_bytes())
+    URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_point(false).as_bytes())
 }
 
 fn key_fingerprint(public_key: &str) -> String {

@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -440,7 +440,7 @@ fn spki_to_x963(spki_b64: &str) -> Result<String> {
     let der = decode(spki_b64, 26, 512)?;
     let key = p256::PublicKey::from_public_key_der(&der)
         .context("passkey public key must be a P-256 (ES256) SPKI key")?;
-    Ok(URL_SAFE_NO_PAD.encode(key.to_encoded_point(false).as_bytes()))
+    Ok(URL_SAFE_NO_PAD.encode(key.to_sec1_point(false).as_bytes()))
 }
 
 fn decode(value: &str, min: usize, max: usize) -> Result<Vec<u8>> {

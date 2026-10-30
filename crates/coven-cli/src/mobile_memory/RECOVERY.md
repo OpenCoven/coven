@@ -96,8 +96,9 @@ different incoming key is refused. Success is audited as
 `owner_root_rotated`; failure as `owner_root_rotation_rejected`.
 
 After rotation, the old key approves nothing. Every signature bound to the
-old head digest is retired, including unused access-recovery approvals.
-Devices, grants and familiars are unchanged.
+old head digest is retired. That includes unused access-recovery approvals
+and trusted-device introductions approved but not yet committed. Devices,
+grants and familiars are unchanged.
 
 `coven device owner-root rotate --root-key OLD --new-root-key NEW` prints both
 key fingerprints and every signed field, and signs only after the owner types
