@@ -690,10 +690,10 @@ cancellations left past their execution lease, and returns or fails stale and
 expired claims (`retry_expired`, `retry_held`, `session_finished`,
 `timeout_expired`, `launch_abandoned`, `cancellation_expired`, `claim_stale`
 and `lease_expired`, below). Each releases the hold it lists, except where the
-pass holds the run, as described below. Reconciliation also acts on other runs
-before claiming, which are listed as `running_run` or `in_flight` and not named
-yet (#1523): it stops or settles other runs past their deadline or lease, and
-reconciles other expired cancellations. It holds at most 20 items: those that
+pass holds the run, as described below. A run the pass acts on without one of
+these codes is listed as `in_flight` or `running_run`, and each code's section
+below says when; a `running_run` item is never named further, as described
+after them. It holds at most 20 items: those that
 hold claims first, then by code in the order below, with each code that
 replaces another item sorted as that item, then by stored scheduled time and
 ids. `workTruncated` is `true` when more exist. All reads, `conditions`
@@ -770,6 +770,9 @@ Among them:
   lease is not after `observedAt`, when one of its values is not readable text,
   its requester cannot be read, or its run has a deadline that cannot be read,
   on which cancellation reconciliation fails;
+- a `stopping` cancellation of any run whose stored execution lease is not
+  after `observedAt`, when the run's occurrence is planned, settled or missing,
+  on which holding the run for recovery fails;
 - a run whose session is still `created` on a `claimed` occurrence whose
   stored lease is not after `observedAt`, with no stored deadline at or before
   it, holding its own recovery stop fence whose expiry cannot be read, or has
@@ -781,6 +784,14 @@ Among them:
 - an unfenced run holding a failed attempt whose occurrence is not `claimed`,
   `running` or `recovery_required` at its deadline, on which settlement fails
   after timeout enforcement has run;
+- a plain run whose session has finished, unfenced or with an ambiguous latest
+  attempt, whose occurrence is planned or missing, or settled in a state other
+  than the one that evidence gives, on which settlement fails, unless a plain
+  failure before the run's deadline holds the run for an operator retry; a
+  Runtime Authority run whose session has finished, and a plain run whose
+  session has finished holding its own expired timeout or recovery stop fence
+  with a live attempt, fail the same way when the occurrence is planned,
+  settled or missing, on which holding the run for recovery fails;
 - a run past its deadline whose session and attempt are live, holding its own
   timeout stop fence whose expiry cannot be read, on which timeout enforcement
   fails.
@@ -980,6 +991,37 @@ passed deadline or a stop fence on its run does not keep it from being named.
 A run with an expired cancellation whose occurrence awaits recovery is listed
 as `recovery_required`, with next step `await_cancellation`, or
 `await_runtime_authority` for a Runtime Authority run.
+
+A `running_run` item is a running run keyed to the routine whose occurrence is
+not one of the routine's claimed, running or recovery-required ones: a planned
+or settled one of its own, another routine's, or none. Only a retry on a
+planned occurrence, of any routine, is named instead, as `retry_waiting` or
+`retry_expired` above. Every other such run stays `running_run` whatever the
+next pass does with it, and `coven automations run <id>` shows why it is there.
+The pass treats it as it treats any run on that occurrence:
+
+- one on another routine's claimed, running or recovery-required occurrence is
+  stopped, settled, held or left as the sections above describe for a run on
+  such an occurrence, and that routine's explanation names it under the
+  occurrence;
+- one whose occurrence is already settled is settled alone, releasing its
+  hold, when its finished session gives the occurrence's own state:
+  `succeeded` for a completed session with exit code 0 that ended before the
+  run's deadline, `cancelled` for a cancelled session that did, and `failed`
+  otherwise, or for an ambiguous attempt. A plain failure before the run's
+  deadline is held for an operator retry instead, as for `session_finished`.
+  Timeout enforcement, abandoned-launch recovery and a stop fence that has not
+  expired leave such a run alone, as they do one on a planned or missing
+  occurrence;
+- a requested cancellation of one whose occurrence is not claimed or running
+  is left `requested` while the run's deadline is ahead: each pass takes the
+  cancellation's lease and refuses the stop, whose fence needs such an
+  occurrence. Once the deadline has passed, the pass rejects the cancellation,
+  as it does for any run that reached its timeout first, and leaves the run.
+
+Where settlement, timeout enforcement's retry settlement or the cancellation
+reconciler reaches such a run otherwise, it fails every pass, as the store-wide
+list above says.
 
 Claim releases describe the next pass of the daemon holding the scheduler
 authority on record, if that pass completes. It first returns to `planned`

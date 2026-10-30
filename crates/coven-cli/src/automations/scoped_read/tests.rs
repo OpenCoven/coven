@@ -110,6 +110,24 @@ fn path_limits_count_components_and_bytes() {
 }
 
 #[test]
+fn implicit_exclusion_aliases_do_not_expand_exact_grants() {
+    let grants =
+        Grants::from_scopes(&[scope("read:work/repo/.e\u{200d}nv")], &R0_READ_POLICY).unwrap();
+    for (path, expected) in [
+        ("work/repo/.e\u{200d}nv", Ok(Coverage::Exact)),
+        ("work/repo/.env", Err(Refusal::ScopeMissing)),
+        ("work/repo/.E\u{200d}NV", Err(Refusal::ScopeMissing)),
+    ] {
+        let request = Request::parse(
+            &json!({"operation": "read_file", "root": "project", "path": path}),
+            &R0_READ_POLICY,
+        )
+        .unwrap();
+        assert_eq!(grants.authorize(&request), expected, "{path:?}");
+    }
+}
+
+#[test]
 fn the_r0_policy_is_the_designs() {
     assert_eq!(R0_READ_POLICY.file_bytes, 1 << 20);
     assert_eq!(R0_READ_POLICY.attempt_bytes, 8 << 20);
@@ -725,6 +743,172 @@ mod filesystem {
     }
 
     #[test]
+    fn implicit_exclusion_alias_requests_refuse_before_filesystem_access() {
+        let scratch = scratch();
+        fs::create_dir_all(scratch.path().join("root/work/repo")).unwrap();
+        for ignored in ['\u{200d}', '\u{00ad}', '\u{034f}', '\u{fe0f}', '\u{feff}'] {
+            let env = format!("work/repo/.e{ignored}nv");
+            let git = format!("work/repo/.g{ignored}it");
+            for request in [
+                read_request(&env),
+                read_request(&format!("{env}.local")),
+                read_request(&format!("{git}/config")),
+                list_request(&git, None),
+                search_request(&git, "TODO", None),
+            ] {
+                let mut reader = reader(scratch.path(), &[scope("recursive-read:work/repo")]);
+                let mut steps = Vec::new();
+                let result = reader.serve_with(&request, &mut |step| steps.push(step));
+                assert_eq!(result.err(), Some(Refusal::ScopeExcluded), "{request}");
+                assert!(
+                    steps.is_empty(),
+                    "{request} touched the filesystem: {steps:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_exclusion_aliases_stay_out_of_listings_and_searches() {
+        for ignored in ['\u{200d}', '\u{00ad}', '\u{034f}', '\u{fe0f}', '\u{feff}'] {
+            let scratch = scratch();
+            let repo = scratch.path().join("root/work/repo");
+            let env = format!(".e{ignored}nv");
+            let git = format!(".g{ignored}it");
+            fs::create_dir_all(repo.join(&git)).unwrap();
+            for name in [&env, &format!("{env}.local"), &format!("{git}/config")] {
+                fs::write(repo.join(name), "TODO SENTINEL").unwrap();
+            }
+            fs::write(repo.join("a.md"), "TODO a").unwrap();
+            let mut reader = reader(
+                scratch.path(),
+                &[
+                    scope("recursive-read:work/repo"),
+                    scope(&format!("read:work/repo/{env}")),
+                ],
+            );
+            let listing = reader
+                .serve(&list_request("work/repo", None))
+                .unwrap()
+                .to_json();
+            assert_eq!(
+                listing["entries"],
+                json!([{"name": "a.md", "kind": "file"}]),
+                "{ignored:?}"
+            );
+            let found = reader
+                .serve(&search_request("work/repo", "TODO", None))
+                .unwrap()
+                .to_json();
+            assert_eq!(
+                found["matches"],
+                json!([{"path": "work/repo/a.md", "line": 1, "text": "TODO a"}]),
+                "{ignored:?}"
+            );
+            assert_eq!(found["complete"], true);
+            assert_eq!(found["skipped"], 0);
+            // Deliberately naming the exact excluded alias still permits reading it.
+            assert_eq!(
+                content(
+                    reader
+                        .serve(&read_request(&format!("work/repo/{env}")))
+                        .unwrap()
+                ),
+                "TODO SENTINEL"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_exclusion_alias_search_never_opens_hidden_files() {
+        let scratch = scratch();
+        let repo = scratch.path().join("root/work/repo");
+        fs::create_dir_all(repo.join(".g\u{200d}it")).unwrap();
+        fs::write(repo.join(".g\u{200d}it/config"), "TODO SENTINEL git").unwrap();
+        fs::write(repo.join(".e\u{200d}nv"), "TODO SENTINEL env").unwrap();
+        fs::write(repo.join("a.md"), "TODO a").unwrap();
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:work/repo")]);
+        let mut reads = 0;
+        let found = reader
+            .serve_with(&search_request("work/repo", "TODO", None), &mut |step| {
+                if step == Step::Read {
+                    reads += 1;
+                }
+            })
+            .unwrap()
+            .to_json();
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "work/repo/a.md", "line": 1, "text": "TODO a"}])
+        );
+        // One read enumerates the requested directory; one reads a.md.
+        assert_eq!(reads, 2, "no hidden file may be read");
+        assert_eq!(found["complete"], true);
+        assert_eq!(found["skipped"], 0);
+    }
+
+    #[test]
+    fn implicit_exclusion_aliases_charge_original_name_bytes() {
+        let scratch = scratch();
+        let repo = scratch.path().join("root/work/repo");
+        fs::create_dir_all(repo.join(".g\u{200d}it")).unwrap();
+        fs::write(repo.join(".g\u{200d}it/config"), "TODO SENTINEL").unwrap();
+        fs::write(repo.join(".e\u{200d}nv"), "TODO SENTINEL").unwrap();
+        fs::write(repo.join(".env\u{200d}.local"), "TODO SENTINEL").unwrap();
+        fs::write(repo.join("a.md"), "TODO a").unwrap();
+        // Raw UTF-8 name lengths: 7 + 7 + 13 + 4 = 31, not the 22 normalized bytes.
+        let scoped = |scan_bytes| {
+            reader_with(
+                scratch.path(),
+                &[scope("recursive-read:work/repo")],
+                ReadPolicy {
+                    scan_bytes,
+                    ..R0_READ_POLICY
+                },
+            )
+        };
+        let mut listing = scoped(30);
+        assert_eq!(
+            listing.serve(&list_request("work/repo", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+        let mut search = scoped(30);
+        let found = search
+            .serve(&search_request("work/repo", "TODO", None))
+            .unwrap()
+            .to_json();
+        assert_eq!(found["matches"], json!([]));
+        assert_eq!(found["complete"], false);
+        let mut listing = scoped(31);
+        let listed = listing
+            .serve(&list_request("work/repo", None))
+            .unwrap()
+            .to_json();
+        assert_eq!(listed["entries"], json!([{"name": "a.md", "kind": "file"}]));
+        assert_eq!(
+            listing.serve(&list_request("work/repo", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+    }
+
+    #[test]
+    fn a_named_exclusion_alias_cannot_override_a_protected_path() {
+        let scratch = scratch();
+        let repo = scratch.path().join("root/work/repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(".e\u{200d}nv"), "TODO SENTINEL").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("read:work/repo/.e\u{200d}nv")],
+            &["root/work/repo/.env"],
+        );
+        assert_eq!(
+            reader.serve(&read_request("work/repo/.e\u{200d}nv")).err(),
+            Some(Refusal::ResourceProtected)
+        );
+    }
+
+    #[test]
     fn a_search_reports_incomplete_when_content_uses_the_exact_scan_budget() {
         let scratch = scratch();
         let file = scratch.path().join("root/docs/guides/a");
@@ -1077,5 +1261,477 @@ mod filesystem {
         let text = found["matches"][0]["text"].as_str().unwrap();
         assert_eq!(text.len(), R0_READ_POLICY.match_bytes - 1);
         assert!(line.starts_with(text));
+    }
+
+    /// A reader over `base/root` that protects each of `protected`, given
+    /// relative to `base`.
+    fn reader_protecting(base: &Path, scopes: &[Value], protected: &[&str]) -> ScopedReader {
+        let root = base.join("root");
+        let protected: Vec<PathBuf> = protected.iter().map(|path| base.join(path)).collect();
+        let protected: Vec<&Path> = protected.iter().map(PathBuf::as_path).collect();
+        ScopedReader::new(
+            scopes,
+            &[(RootKind::Project, root.as_path())],
+            &protected,
+            R0_READ_POLICY,
+        )
+        .unwrap_or_else(|refusal| panic!("binds: {}", refusal.code()))
+    }
+
+    /// Replaces `path` the way an editor's atomic save does: a new file is
+    /// written beside it and renamed over it, so the name gets a new inode.
+    fn atomic_replace(path: &Path, content: &str) {
+        let temporary = path.with_extension("tmp-save");
+        fs::write(&temporary, content).expect("replacement");
+        fs::rename(&temporary, path).expect("atomic rename");
+    }
+
+    /// Reads, lists and searches `docs/guides`, asserting that the protected
+    /// `secret.cfg` is refused, left out of the listing, and never searched.
+    fn assert_secret_withheld(reader: &mut ScopedReader) {
+        assert_eq!(
+            reader.serve(&read_request("docs/guides/secret.cfg")).err(),
+            Some(Refusal::ResourceProtected),
+            "a read of the protected secret.cfg"
+        );
+        assert_secret_unlisted_and_unsearched(reader);
+    }
+
+    fn assert_secret_unlisted_and_unsearched(reader: &mut ScopedReader) {
+        let listing = reader
+            .serve(&list_request("docs/guides", None))
+            .expect("a listing")
+            .to_json();
+        assert_eq!(
+            listing["entries"],
+            json!([{"name": "a.md", "kind": "file"}]),
+            "the listing leaves the protected secret.cfg out"
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("a search")
+            .to_json();
+        assert!(
+            !found.to_string().contains("SENTINEL"),
+            "the search disclosed the protected secret.cfg: {found}"
+        );
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a.md", "line": 1, "text": "TODO a"}])
+        );
+        assert_eq!(found["skipped"], 0);
+        assert_eq!(found["complete"], true);
+    }
+
+    #[test]
+    fn a_protected_file_replaced_by_an_atomic_save_stays_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("secret.cfg"), "TODO SENTINEL original").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/secret.cfg"],
+        );
+        assert_secret_withheld(&mut reader);
+        atomic_replace(&guides.join("secret.cfg"), "TODO SENTINEL replaced");
+        assert_secret_withheld(&mut reader);
+    }
+
+    #[test]
+    fn a_protected_file_replaced_during_a_request_stays_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("secret.cfg"), "TODO SENTINEL original").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/secret.cfg"],
+        );
+        let env = guides.join("secret.cfg");
+        let mut replaced = 0;
+        let mut replace_at_root = |step: Step| {
+            if step == Step::Root {
+                replaced += 1;
+                atomic_replace(&env, &format!("TODO SENTINEL replaced {replaced}"));
+            }
+        };
+        assert_eq!(
+            reader
+                .serve_with(
+                    &read_request("docs/guides/secret.cfg"),
+                    &mut replace_at_root
+                )
+                .err(),
+            Some(Refusal::ResourceProtected)
+        );
+        let listing = reader
+            .serve_with(&list_request("docs/guides", None), &mut replace_at_root)
+            .expect("a listing")
+            .to_json();
+        assert_eq!(
+            listing["entries"],
+            json!([{"name": "a.md", "kind": "file"}])
+        );
+        let found = reader
+            .serve_with(
+                &search_request("docs/guides", "TODO", None),
+                &mut replace_at_root,
+            )
+            .expect("a search")
+            .to_json();
+        assert!(!found.to_string().contains("SENTINEL"), "{found}");
+    }
+
+    #[test]
+    fn a_protected_path_created_after_the_reader_is_built_is_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/secret.cfg"],
+        );
+        fs::write(guides.join("secret.cfg"), "TODO SENTINEL created").unwrap();
+        assert_secret_withheld(&mut reader);
+    }
+
+    #[test]
+    fn a_protected_directory_created_after_the_reader_is_built_is_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/secret.cfg"],
+        );
+        fs::create_dir(guides.join("secret.cfg")).unwrap();
+        fs::write(guides.join("secret.cfg/key"), "TODO SENTINEL created").unwrap();
+        assert_eq!(
+            reader
+                .serve(&read_request("docs/guides/secret.cfg/key"))
+                .err(),
+            Some(Refusal::ResourceProtected)
+        );
+        assert_secret_unlisted_and_unsearched(&mut reader);
+    }
+
+    /// Reads, lists and searches `docs/guides` after a protected entry was
+    /// renamed to `moved`, asserting `moved` stays refused, hidden and
+    /// unsearched: what was protected at the build stays protected.
+    fn assert_moved_withheld(reader: &mut ScopedReader, read: &str) {
+        assert_eq!(
+            reader.serve(&read_request(read)).err(),
+            Some(Refusal::ResourceProtected),
+            "a read of the renamed protected resource"
+        );
+        let listing = reader
+            .serve(&list_request("docs/guides", None))
+            .expect("a listing")
+            .to_json();
+        assert_eq!(
+            listing["entries"],
+            json!([{"name": "a.md", "kind": "file"}]),
+            "the listing leaves the renamed protected resource out"
+        );
+        let found = reader
+            .serve(&search_request("docs/guides", "TODO", None))
+            .expect("a search")
+            .to_json();
+        assert!(!found.to_string().contains("SENTINEL"), "{found}");
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a.md", "line": 1, "text": "TODO a"}])
+        );
+    }
+
+    #[test]
+    fn a_protected_directory_renamed_inside_a_scope_stays_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(guides.join("vault")).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("vault/k"), "TODO SENTINEL key").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/vault"],
+        );
+        fs::rename(guides.join("vault"), guides.join("moved")).unwrap();
+        assert_moved_withheld(&mut reader, "docs/guides/moved/k");
+    }
+
+    #[test]
+    fn a_protected_file_renamed_inside_a_scope_stays_refused() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("secret.cfg"), "TODO SENTINEL key").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/secret.cfg"],
+        );
+        fs::rename(guides.join("secret.cfg"), guides.join("moved")).unwrap();
+        assert_moved_withheld(&mut reader, "docs/guides/moved");
+    }
+
+    #[test]
+    fn a_replacement_observed_during_an_attempt_stays_protected_after_rename() {
+        for created in [false, true] {
+            let scratch = scratch();
+            let guides = scratch.path().join("root/docs/guides");
+            fs::create_dir_all(&guides).unwrap();
+            fs::write(guides.join("a.md"), "TODO a").unwrap();
+            if !created {
+                fs::write(guides.join("secret.cfg"), "original").unwrap();
+            }
+            let mut reader = reader_protecting(
+                scratch.path(),
+                &[scope("recursive-read:docs/guides")],
+                &["root/docs/guides/secret.cfg"],
+            );
+            atomic_replace(&guides.join("secret.cfg"), "TODO SENTINEL replacement");
+            assert_eq!(
+                content(reader.serve(&read_request("docs/guides/a.md")).unwrap()),
+                "TODO a"
+            );
+            fs::rename(guides.join("secret.cfg"), guides.join("moved")).unwrap();
+            assert_moved_withheld(&mut reader, "docs/guides/moved");
+        }
+    }
+
+    #[test]
+    fn a_protected_identity_first_encountered_during_a_refusal_is_retained() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["root/docs/guides/secret.cfg"],
+        );
+        let refused = reader.serve_with(&read_request("docs/guides/secret.cfg"), &mut |step| {
+            if step == Step::Root {
+                fs::write(guides.join("secret.cfg"), "TODO SENTINEL created").unwrap();
+            }
+        });
+        assert_eq!(refused.err(), Some(Refusal::ResourceProtected));
+        fs::rename(guides.join("secret.cfg"), guides.join("moved")).unwrap();
+        assert_moved_withheld(&mut reader, "docs/guides/moved");
+    }
+
+    #[test]
+    fn aliases_of_a_protected_name_created_mid_request_are_refused() {
+        for (alias_kind, protected, alias) in [
+            ("case", "secret.cfg", "SECRET.CFG"),
+            ("unicode", "secret-é", "secret-e\u{301}"),
+        ] {
+            let scratch = scratch();
+            if !equates(scratch.path(), alias_kind) {
+                continue;
+            }
+            let guides = scratch.path().join("root/docs/guides");
+            fs::create_dir_all(&guides).unwrap();
+            let protected_path = format!("root/docs/guides/{protected}");
+            let mut reader = reader_protecting(
+                scratch.path(),
+                &[scope("recursive-read:docs/guides")],
+                &[&protected_path],
+            );
+            let result = reader.serve_with(
+                &read_request(&format!("docs/guides/{alias}")),
+                &mut |step| {
+                    if step == Step::Root {
+                        fs::write(guides.join(protected), "TODO SENTINEL alias").unwrap();
+                    }
+                },
+            );
+            assert_eq!(
+                result.err(),
+                Some(Refusal::ResourceProtected),
+                "{alias_kind} alias must not disclose protected content"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bound_root_that_becomes_protected_refuses_every_operation() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO SENTINEL private root").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["later-protected"],
+        );
+        std::os::unix::fs::symlink(
+            scratch.path().join("root"),
+            scratch.path().join("later-protected"),
+        )
+        .unwrap();
+        for request in [
+            read_request("docs/guides/a.md"),
+            list_request("docs/guides", None),
+            search_request("docs/guides", "TODO", None),
+        ] {
+            assert_eq!(reader.serve(&request).err(), Some(Refusal::RootProtected));
+        }
+    }
+
+    #[test]
+    fn a_bound_root_inside_a_newly_protected_ancestor_refuses_every_operation() {
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO SENTINEL private ancestor").unwrap();
+        let mut reader = reader_protecting(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            &["later-protected"],
+        );
+        std::os::unix::fs::symlink(scratch.path(), scratch.path().join("later-protected")).unwrap();
+        for request in [
+            read_request("docs/guides/a.md"),
+            list_request("docs/guides", None),
+            search_request("docs/guides", "TODO", None),
+        ] {
+            assert_eq!(reader.serve(&request).err(), Some(Refusal::RootProtected));
+        }
+    }
+
+    #[test]
+    fn a_search_whose_directory_fails_to_list_is_refused_and_charged() {
+        use super::super::open::FAIL_LISTING_AFTER;
+
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        // Two names of four bytes each, so the fault fires after the first
+        // whichever order the directory returns them in.
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("b.md"), "TODO b").unwrap();
+        let mut reader = reader_with(
+            scratch.path(),
+            &[scope("recursive-read:docs/guides")],
+            ReadPolicy {
+                scan_bytes: 8,
+                ..R0_READ_POLICY
+            },
+        );
+        FAIL_LISTING_AFTER.with(|after| after.set(Some(4)));
+        let mut steps = Vec::new();
+        let refused = reader
+            .serve_with(&search_request("docs/guides", "TODO", None), &mut |step| {
+                steps.push(step)
+            });
+        let fired = FAIL_LISTING_AFTER.with(|after| after.take()).is_none();
+        assert!(fired, "the listing fault fired");
+        assert_eq!(
+            steps.last(),
+            Some(&Step::Read),
+            "the directory opened and its checks passed before the listing failed"
+        );
+        assert_eq!(refused.err(), Some(Refusal::ResourceUnavailable));
+        // The four name bytes scanned before the failure stay charged: a
+        // listing of the same eight bytes no longer fits the scan total.
+        assert_eq!(
+            reader.serve(&list_request("docs/guides", None)).err(),
+            Some(Refusal::LimitScan)
+        );
+    }
+
+    /// Whether this process ignores permission bits, as root does.
+    fn privileged() -> bool {
+        // SAFETY: geteuid() only reads the effective uid and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("permissions");
+    }
+
+    #[test]
+    fn a_search_that_cannot_open_a_subdirectory_is_incomplete() {
+        if privileged() {
+            eprintln!("skipped: permission bits do not bind a privileged process");
+            return;
+        }
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(guides.join("locked")).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("locked/x.md"), "TODO x").unwrap();
+        fs::write(guides.join("z.md"), "TODO z").unwrap();
+        set_mode(&guides.join("locked"), 0o000);
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let found = reader.serve(&search_request("docs/guides", "TODO", None));
+        set_mode(&guides.join("locked"), 0o755);
+        let found = found.expect("a search").to_json();
+        assert_eq!(
+            found["matches"],
+            json!([
+                {"path": "docs/guides/a.md", "line": 1, "text": "TODO a"},
+                {"path": "docs/guides/z.md", "line": 1, "text": "TODO z"},
+            ]),
+            "the walk continues past the unopenable directory"
+        );
+        assert_eq!(found["skipped"], 1);
+        assert_eq!(found["complete"], false);
+        assert_eq!(found["next"], Value::Null);
+    }
+
+    #[test]
+    fn a_search_that_cannot_examine_a_subdirectorys_entries_is_incomplete() {
+        if privileged() {
+            eprintln!("skipped: permission bits do not bind a privileged process");
+            return;
+        }
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(guides.join("opaque")).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        fs::write(guides.join("opaque/x.md"), "TODO x").unwrap();
+        // Readable but not searchable: its names list, but none can be examined.
+        set_mode(&guides.join("opaque"), 0o400);
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let found = reader.serve(&search_request("docs/guides", "TODO", None));
+        set_mode(&guides.join("opaque"), 0o755);
+        let found = found.expect("a search").to_json();
+        assert_eq!(
+            found["matches"],
+            json!([{"path": "docs/guides/a.md", "line": 1, "text": "TODO a"}])
+        );
+        assert_ne!(found["skipped"], 0);
+        assert_eq!(found["complete"], false);
+    }
+
+    #[test]
+    fn a_search_whose_directory_cannot_be_listed_is_refused() {
+        if privileged() {
+            eprintln!("skipped: permission bits do not bind a privileged process");
+            return;
+        }
+        let scratch = scratch();
+        let guides = scratch.path().join("root/docs/guides");
+        fs::create_dir_all(&guides).unwrap();
+        fs::write(guides.join("a.md"), "TODO a").unwrap();
+        set_mode(&guides, 0o000);
+        let mut reader = reader(scratch.path(), &[scope("recursive-read:docs/guides")]);
+        let refused = reader.serve(&search_request("docs/guides", "TODO", None));
+        set_mode(&guides, 0o755);
+        assert_eq!(refused.err(), Some(Refusal::ResourceUnavailable));
     }
 }

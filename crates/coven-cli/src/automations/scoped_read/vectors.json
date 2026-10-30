@@ -746,6 +746,35 @@
       "pattern": "TODO",
       "race": { "at": "read", "do": [{ "rename": ["root/docs/guides", "outside/guides"] }] },
       "expect": { "matches": [], "next": null, "skipped": 2, "complete": true }
+    },
+    {
+      "id": "protected-file-replaced-by-an-atomic-save-during-the-read",
+      "tree": [{ "file": "root/docs/guides/secret.cfg", "text": "SENTINEL original" }],
+      "protected": ["root/docs/guides/secret.cfg"],
+      "scopes": ["recursive-read:docs/guides"],
+      "request": "docs/guides/secret.cfg",
+      "race": { "at": "root", "do": [{ "file": "root/docs/guides/secret.cfg.save", "text": "SENTINEL replaced" }, { "rename": ["root/docs/guides/secret.cfg.save", "root/docs/guides/secret.cfg"] }] },
+      "expect": { "refusal": "resource_protected", "lastStep": "directory:1" }
+    },
+    {
+      "id": "protected-file-created-during-the-read",
+      "tree": [{ "dir": "root/docs/guides" }],
+      "protected": ["root/docs/guides/secret.cfg"],
+      "scopes": ["recursive-read:docs/guides"],
+      "request": "docs/guides/secret.cfg",
+      "race": { "at": "root", "do": [{ "file": "root/docs/guides/secret.cfg", "text": "SENTINEL created" }] },
+      "expect": { "refusal": "resource_protected", "lastStep": "directory:1" }
+    },
+    {
+      "id": "search-skips-a-protected-file-replaced-during-the-search",
+      "tree": [{ "file": "root/docs/guides/secret.cfg", "text": "TODO SENTINEL original" }, { "file": "root/docs/guides/a.md", "text": "TODO a" }],
+      "protected": ["root/docs/guides/secret.cfg"],
+      "scopes": ["recursive-read:docs/guides"],
+      "operation": "search",
+      "request": "docs/guides",
+      "pattern": "TODO",
+      "race": { "at": "root", "do": [{ "file": "root/docs/guides/secret.cfg.save", "text": "TODO SENTINEL replaced" }, { "rename": ["root/docs/guides/secret.cfg.save", "root/docs/guides/secret.cfg"] }] },
+      "expect": { "matches": [["docs/guides/a.md", 1, "TODO a"]], "next": null, "skipped": 0, "complete": true }
     }
   ]
 }

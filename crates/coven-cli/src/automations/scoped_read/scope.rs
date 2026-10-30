@@ -133,12 +133,13 @@ impl RelativePath {
 }
 
 /// Whether a recursive scope leaves out an entry named `name`: a `.git`
-/// folder, or a `.env` or `.env.*` file, in any ASCII case so that an alias
-/// on a case-insensitive filesystem is left out too. Maintainer decision,
+/// folder, or a `.env` or `.env.*` file, including the conservative Unicode,
+/// case and ignorable-character aliases used for protected paths. This only
+/// classifies exclusions; grant matching keeps exact spelling. Maintainer decision,
 /// 2026-10-20 (#857): project secrets usually sit there, so a grant includes
 /// one only by naming it. Listings and searches never show one.
 pub(crate) fn is_excluded_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
+    let name = super::open::protected_name_key(name);
     name == ".git" || name == ".env" || name.starts_with(".env.")
 }
 

@@ -26,7 +26,9 @@ yet. They cover:
 - the lexical rules for grant and request paths, and authorization before any
   filesystem access;
 - the open walk on Unix;
-- protected resources, held by identity;
+- protected resources, matched by the identity held when the reader is
+  built, by the identity and by the path beneath the root resolved again for
+  every request;
 - the recheck from the root after the open;
 - the `.git` and `.env` exclusions beneath recursive scopes;
 - listings and searches that leave out every entry a read would refuse;
@@ -90,16 +92,11 @@ records it in the profile as an additive consumer note.
 A non-recursive scope on a directory lets the model see the directory's entry
 names but read none of them. Recursion stops 32 components from the root.
 
-**Excluded names.** Val decided on 2026-10-20 (#857) that a recursive scope
-leaves out every `.git` folder and every `.env` or `.env.*` file beneath its
-directory, in any ASCII case, because project secrets usually sit there:
-- A read, listing or search whose path passes through one beneath the scope's
-  directory is refused before any filesystem access (`scope_excluded`).
-- A scope whose own path names one covers it. A non-recursive scope on
-  `.env` can read it, and a recursive scope on `repo/.git` covers what is
-  beneath.
-- Listings and searches never show an excluded name, even when another scope
-  names it.
+**Excluded names.** Val decided on 2026-10-20 (#857) that a recursive scope leaves out every `.git` folder and every `.env` or `.env.*` file beneath its directory because project secrets usually sit there. Classification uses the same conservative Unicode/case/ignorable-character key as protected paths, including aliases such as `.e\u{200D}nv` and `.g\u{200D}it`, even on filesystems that distinguish those names. This key never broadens exact grant matching. Enumeration still charges the original filename bytes before filtering.
+
+- A read, listing or search whose path passes through one beneath the scope's directory is refused before any filesystem access (`scope_excluded`).
+- A scope whose own path names one covers it. A non-recursive scope on `.env` can read it, and a recursive scope on `repo/.git` covers what is beneath.
+- Listings and searches never show an excluded name, even when another scope names it.
 
 **Listings and searches show only what a read would admit.** They leave out:
 - links, special files and hard-linked files;
@@ -113,7 +110,11 @@ directory, in any ASCII case, because project secrets usually sit there:
 **A search** matches a literal pattern of 1 to 256 bytes against each line, and
 never shells out. It walks in path order and reads every file through the same
 checked read, from the root. A file that cannot be read, is too large or is not
-text is counted in `skipped`. Matched lines are cut to 512 bytes and count
+text is counted in `skipped`. A directory beneath the searched one that cannot
+be opened or listed, or an entry that cannot be examined, is also counted in
+`skipped`, and because the files beneath it went unscanned the result says
+`complete: false`; the walk continues past it. A searched directory that
+cannot itself be listed refuses the search rather than answering empty. Matched lines are cut to 512 bytes and count
 against the attempt's disclosure total. Each page holds up to 256 matches, and
 `after` resumes after a file and line.
 
@@ -134,7 +135,7 @@ These are the points the design left open. Each is for review:
 | What a retained root means | The directory opened when the reader is built. A request is served only while the root's path still names that directory. A root renamed away or replaced refuses every request (`root_moved`). |
 | A granted filesystem scope the service cannot enforce as written | The whole grant is refused (`grant_unsupported`), not silently narrowed. This covers backslashes, repeated separators, `.` components, and anything the profile's breadth rule refuses. |
 | Spellings that platforms read differently | Refused in grants and requests on every platform: backslash, colon (drive or data stream), control characters, a trailing dot or space, and Windows device names. |
-| How protected resources match | By the identity of what each protected path names, so a case or Unicode alias still matches. A root that is, or is inside, a protected resource refuses the reader (`root_protected`). The daemon supplies the list; choosing it belongs to the service step. |
+| How protected resources match | The reader keeps every protected identity observed during the attempt, including refreshed replacements, resources created after construction, and identities encountered by refused operations. Renaming an observed protected resource to an unprotected name never releases it. Each request resolves the daemon-supplied protected paths again, preserving identities learned even if refresh later refuses. Protected path components also compare with canonical Unicode normalization, modern simple case mappings followed by full case folding, and removal of Unicode Default_Ignorable_Code_Point characters, covering Linux casefold and HFS+ ignored-format aliases. The 38 historical HFS+ Georgian case pairs are unified transitively with their modern case classes. These exclusions conservatively apply on case-sensitive filesystems too; grant authorization keeps exact path spelling. The path exclusion covers creation or atomic replacement during a request, including alias spellings, and records any encountered replacement identity. Before traversal, the root and its ancestors are checked against refreshed and retained protection; a root that is, or is inside, a protected resource refuses (`root_protected`). The daemon supplies the protected paths; choosing them belongs to the service step. |
 | Mount crossings | Refused by device on Unix. On Linux the mount id is also compared, which catches a bind mount from the same filesystem. A kernel that cannot report the mount id refuses (`platform_unsupported`). |
 | Content that is not text | `read_file` refuses it (`resource_not_text`); a search skips it. |
 | Platforms without a reviewed walk | Every request is refused (`platform_unsupported`). Today that is Windows. |

@@ -2,6 +2,7 @@
 //! Trusted inputs are the owner's explicit policy and instance fingerprint.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -172,8 +173,8 @@ pub struct IntroductionAuthority {
     /// Set when policy came from the protected store; each check re-reads the
     /// head so a replacement retires requests bound to the previous policy.
     installed: Option<(OwnerPolicyStore, String)>,
-    registry: DeviceRegistry,
-    challenges: AssuranceChallengeStore,
+    registry: Arc<DeviceRegistry>,
+    challenges: Arc<AssuranceChallengeStore>,
 }
 
 impl IntroductionAuthority {
@@ -192,8 +193,8 @@ impl IntroductionAuthority {
             audience,
             policy,
             installed: None,
-            registry: DeviceRegistry::load(home)?,
-            challenges: AssuranceChallengeStore::load(home)?,
+            registry: Arc::new(DeviceRegistry::load(home)?),
+            challenges: Arc::new(AssuranceChallengeStore::load(home)?),
         })
     }
 
@@ -206,6 +207,31 @@ impl IntroductionAuthority {
         let mut authority = Self::load(home, audience, Some(current.policy))?;
         authority.installed = Some((store, current.digest));
         Ok(authority)
+    }
+
+    /// Reuses runtime stores so registry waits observe runtime shutdown.
+    pub(super) fn load_installed_with_stores(
+        home: &Path,
+        audience: [u8; 32],
+        registry: Arc<DeviceRegistry>,
+        challenges: Arc<AssuranceChallengeStore>,
+    ) -> Result<Self> {
+        let store = OwnerPolicyStore::open(home, audience)?;
+        let current = store
+            .current()?
+            .context("introduction policy is not installed")?;
+        current.policy.validate()?;
+        if audience == [0; 32] {
+            bail!("introduction audience is not configured");
+        }
+        Ok(Self {
+            home: home.to_owned(),
+            audience,
+            policy: current.policy,
+            installed: Some((store, current.digest)),
+            registry,
+            challenges,
+        })
     }
 
     /// Admission check before an introducer is asked to approve: the request
