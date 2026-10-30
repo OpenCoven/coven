@@ -1,5 +1,7 @@
 # branch-triage action
 
+This action does not delete local task branches, switch the caller's checkout or pull into a local branch. A gone upstream, remote merge or superseded remote ref is insufficient evidence that local work is safe to remove. Follow [the repository worktree lifecycle procedure](../../../docs/development/worktree-lifecycle.md) for local ownership, data and process checks. `DRY_RUN=true` preserves local branches as well as remote branches and PRs; fetching still refreshes remote-tracking refs.
+
 Composite GitHub Action that classifies, merges, and prunes branches in a
 repository. Designed for repos that accumulate many short-lived feature
 branches and need periodic cleanup.
@@ -11,14 +13,11 @@ branches and need periodic cleanup.
    | Category | Definition | Action |
    |---|---|---|
    | OPEN | Has an open PR | Merge if it passes the gate below |
-   | MERGED | Has a merged PR whose head lived in this repository | Delete local + remote |
+   | MERGED | Exact origin head matches a merged PR whose merge is in the fetched base | Delete remote with an expected-SHA lease |
    | SUPERSEDED | No PR, 0 unique commits vs base | Delete |
    | REVIEW | No PR, >0 unique commits | Skip — report only |
 
-2. **Deletes** MERGED and SUPERSEDED branches (remote + local). Only a merged
-   PR from this repository marks a branch MERGED; a merged fork PR that reused
-   the branch name does not, so the branch falls through to the unique-commit
-   check instead of being deleted on a name match.
+2. **Deletes** MERGED and SUPERSEDED remote branches after refreshing every page of open PR heads. Exact origin-head and delivered-merge evidence is required for MERGED; a reused name, changed head, fork PR or merge into another base is insufficient. Deletion uses an expected-SHA lease so a concurrent push is preserved. Failed deletions are held and are not counted as deleted. Local branches remain untouched.
 3. **Merges** each OPEN-PR branch that clears the merge gate.
 4. **Skips** REVIEW branches — reports them in the job summary so a human can decide.
 5. **Writes** a Markdown summary to the GitHub job summary.

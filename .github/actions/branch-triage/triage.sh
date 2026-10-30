@@ -41,13 +41,14 @@ err()  { echo "$(red '[error]') $*" >&2; }
 # ── Step 0 — fetch ────────────────────────────────────────────────────────────
 log "Fetching all remotes and pruning stale tracking refs…"
 git fetch --all --prune -q
-git checkout "$BASE" -q
-git pull -q
+# Classification and GitHub merges need only the fetched base, never a local
+# checkout or pull. Preserve the caller's branch and working files in all modes.
 BASE_REF="refs/remotes/origin/$BASE"
 git show-ref --verify --quiet "$BASE_REF" || {
   err "base branch is unavailable: $BASE_REF"
   exit 1
 }
+BASE_OID=$(git rev-parse "$BASE_REF")
 
 # ── Step 1 — collect PR data ──────────────────────────────────────────────────
 log "Loading open and merged PR data from GitHub…"
@@ -64,12 +65,11 @@ OPEN_PR_JSON=$(gh pr list --state open  --json number,title,headRefName,headRepo
 # classified MERGED and deleted; with no same-owner PR the branch falls through
 # to the unique-commit check like any other. Narrowing this list can only
 # reduce deletions, so it does not reopen the fail-open concern below.
-MRGD_PR_JSON=$(gh pr list --state merged --json headRefName,headRepositoryOwner --limit 500 |
+MRGD_PR_JSON=$(gh pr list --state merged --json headRefName,headRefOid,headRepositoryOwner,mergeCommit --limit 500 |
   jq --arg owner "$REPO_OWNER" \
     '[ .[] | select((.headRepositoryOwner.login // "" | ascii_downcase) == $owner) ]')
 
 open_branches()  { echo "$OPEN_PR_JSON" | jq -r '.[].headRefName'; }
-merged_branches(){ echo "$MRGD_PR_JSON" | jq -r '.[].headRefName'; }
 
 # A PR is eligible for this branch only when GitHub reports that it comes from
 # this repository's remote-tracking ref at exactly the commit we fetched. Branch
@@ -110,7 +110,19 @@ pr_title_for() {
 }
 
 branch_is_open_pr()   { open_branches  | grep -qxF "$1"; }
-branch_is_merged_pr() { merged_branches | grep -qxF "$1"; }
+branch_is_merged_pr() {
+  local branch="$1" head_oid="$2" merge_oid
+  # A reused branch name is not delivery evidence. Bind the fetched head to
+  # the merged PR and require its merge to be in this exact base snapshot.
+  while IFS= read -r merge_oid; do
+    [[ "$merge_oid" =~ ^[0-9a-f]{40}$ ]] || continue
+    if git merge-base --is-ancestor "$merge_oid" "$BASE_OID" 2>/dev/null; then
+      return 0
+    fi
+  done < <(echo "$MRGD_PR_JSON" | jq -r --arg b "$branch" --arg oid "$head_oid" \
+    '.[] | select(.headRefName == $b and .headRefOid == $oid) | .mergeCommit.oid // empty')
+  return 1
+}
 
 # Branch names reach these helpers with the `origin/` prefix stripped, because
 # that bare form is what `gh pr list` reports as `headRefName` and what the
@@ -119,18 +131,14 @@ branch_is_merged_pr() { merged_branches | grep -qxF "$1"; }
 # 128 for every other name and `set -e` kills the run. Always resolve through
 # `origin/`, and never let a single unresolvable ref abort the whole triage.
 unique_commits() {
-  local ref="refs/remotes/origin/$1"
-  if ! git show-ref --verify --quiet "$ref"; then
-    echo 0
-    return
-  fi
-  git rev-list --count "$ref" ^"$BASE_REF"
+  local ref="${2:-refs/remotes/origin/$1}"
+  git rev-list --count "$ref" ^"$BASE_OID"
 }
 
 last_commit_days_ago() {
-  local ref="refs/remotes/origin/$1"
+  local ref="${2:-refs/remotes/origin/$1}"
   local ts=0
-  if git show-ref --verify --quiet "$ref"; then
+  if git cat-file -e "$ref^{commit}" 2>/dev/null; then
     ts=$(git log -1 --format="%ct" "$ref")
   fi
   local now
@@ -182,7 +190,9 @@ merge_block_reason() {
 # ── Step 2 — classify ─────────────────────────────────────────────────────────
 declare -a OPEN_LIST=()      # branches with open PRs
 declare -a MERGED_LIST=()    # branches with merged PRs
+declare -a MERGED_HEADS=()   # exact classified heads, used as deletion leases
 declare -a SUPERSEDED_LIST=() # no PR, 0 unique commits (or stale)
+declare -a SUPERSEDED_HEADS=()
 declare -a REVIEW_LIST=()    # no PR, >0 unique commits — need human decision
 declare -a SKIPPED_LIST=()   # open PRs the merge gate refused, as "#N — reason"
 
@@ -195,21 +205,24 @@ while IFS= read -r branch; do
   [[ "$branch" == "$BASE" ]] && continue
   [[ -z "$branch" ]] && continue
 
-  uniq=$(unique_commits "$branch")
-  age=$(last_commit_days_ago "$branch")
+  head_oid=$(git rev-parse "refs/remotes/origin/$branch")
+  uniq=$(unique_commits "$branch" "$head_oid")
+  age=$(last_commit_days_ago "$branch" "$head_oid")
 
   if branch_is_open_pr "$branch"; then
     cat="OPEN"
     pr=$(pr_number_for "$branch")
     OPEN_LIST+=("$branch")
     printf "%-52s %-12s %-8s %s\n" "$branch" "$(green $cat)" "$uniq" "#$pr"
-  elif branch_is_merged_pr "$branch"; then
+  elif branch_is_merged_pr "$branch" "$head_oid"; then
     cat="MERGED"
     MERGED_LIST+=("$branch")
+    MERGED_HEADS+=("$head_oid")
     printf "%-52s %-12s %-8s %s\n" "$branch" "$(dim $cat)" "$uniq" "—"
   elif [[ "$uniq" -eq 0 ]] || { [[ "$STALE" -gt 0 ]] && [[ "$age" -gt "$STALE" ]] && [[ "$uniq" -eq 0 ]]; }; then
     cat="SUPERSEDED"
     SUPERSEDED_LIST+=("$branch")
+    SUPERSEDED_HEADS+=("$head_oid")
     printf "%-52s %-12s %-8s %s\n" "$branch" "$(dim $cat)" "$uniq" "—"
   else
     cat="REVIEW"
@@ -223,28 +236,38 @@ echo ""
 # ── Step 3 — delete MERGED + SUPERSEDED ──────────────────────────────────────
 log "Deleting MERGED and SUPERSEDED branches…"
 delete_branch() {
-  local branch="$1"
+  local branch="$1" expected_oid="$2" current_open_heads
   if [[ "$DRY" == "true" ]]; then
     log "[dry-run] would delete: $branch"
   else
-    if git push origin --delete "$branch" -q 2>/dev/null; then
-      log "  deleted remote: $(red $branch)"
-    else
-      warn "  remote already gone: $branch"
+    # Refresh every page immediately before deletion. A PR opened after the
+    # classification snapshot must protect its branch too. API failure holds
+    # the ref; an exact lease protects pushes that race the final check.
+    if ! current_open_heads=$(gh api --paginate 'repos/{owner}/{repo}/pulls?state=open&per_page=100' --jq '.[].head.ref'); then
+      warn "  held remote: $branch (could not refresh open PR heads)"
+      return
     fi
-    git branch -D "$branch" 2>/dev/null || true
-    (( deleted_count++ )) || true
+    if echo "$current_open_heads" | grep -qxF "$branch"; then
+      warn "  held remote: $branch (open PR)"
+      return
+    fi
+    if git push --force-with-lease="refs/heads/$branch:$expected_oid" origin ":refs/heads/$branch" -q 2>/dev/null; then
+      log "  deleted remote: $(red $branch)"
+      (( deleted_count++ )) || true
+    else
+      warn "  held remote: $branch (head changed, protected ref, or deletion failed)"
+    fi
   fi
 }
 
 if [[ ${#MERGED_LIST[@]} -gt 0 ]]; then
-  for branch in "${MERGED_LIST[@]}"; do
-    delete_branch "$branch"
+  for index in "${!MERGED_LIST[@]}"; do
+    delete_branch "${MERGED_LIST[$index]}" "${MERGED_HEADS[$index]}"
   done
 fi
 if [[ ${#SUPERSEDED_LIST[@]} -gt 0 ]]; then
-  for branch in "${SUPERSEDED_LIST[@]}"; do
-    delete_branch "$branch"
+  for index in "${!SUPERSEDED_LIST[@]}"; do
+    delete_branch "${SUPERSEDED_LIST[$index]}" "${SUPERSEDED_HEADS[$index]}"
   done
 fi
 
@@ -253,7 +276,10 @@ fi
 # `set -e`, takes the whole run with it. `git fetch --prune` does accept `-q`
 # and prunes the same refs.
 git fetch origin --prune -q
-git branch -v | grep '\[gone\]' | awk '{print $1}' | xargs -r git branch -D 2>/dev/null || true
+# Remote delivery state grants no authority over local task branches. In
+# particular, a gone upstream can still have unique local commits, and this
+# section also runs in dry-run mode. Local cleanup follows the owner-aware
+# procedure in docs/development/worktree-lifecycle.md.
 
 # ── Step 4 — REVIEW branches — report, do not touch ──────────────────────────
 if [[ ${#REVIEW_LIST[@]} -gt 0 ]]; then
@@ -331,7 +357,8 @@ fi
 echo ""
 log "Final state:"
 git fetch --prune -q
-remaining_open=$(gh pr list --state open --json number --limit 50 | jq 'length')
+remaining_open=$(gh api --paginate 'repos/{owner}/{repo}/pulls?state=open&per_page=100' --jq 'length' |
+  awk '{ count += $1 } END { print count + 0 }')
 remaining_branches=$(
   git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin |
     awk -v base="$BASE" '$0 != "HEAD" && $0 != base { count++ } END { print count + 0 }'
