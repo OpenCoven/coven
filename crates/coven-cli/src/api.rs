@@ -64,6 +64,7 @@ struct DirectApplyPauseState {
     reached: bool,
     released: bool,
     watchdog_expired: bool,
+    fail_audit_directory_sync: bool,
 }
 
 #[cfg(test)]
@@ -137,6 +138,10 @@ impl DirectApplyPauseGuard {
 
     fn release(&self) {
         self.pause.release();
+    }
+
+    fn fail_audit_directory_sync(&self) {
+        self.pause.state.lock().unwrap().fail_audit_directory_sync = true;
     }
 }
 
@@ -349,6 +354,9 @@ fn maybe_pause_direct_apply_before_audit(coven_home: &Path, familiar_id: &str) {
             pause.changed.notify_all();
             return;
         }
+    }
+    if state.fail_audit_directory_sync {
+        crate::durable_fs::fail_next_directory_sync();
     }
 }
 
@@ -6656,6 +6664,13 @@ fn apply_familiar_edits(
                 "changes": changes,
             }),
         );
+    }
+    // Flush both the audit batch and any baseline advances before acknowledging
+    // the installed bytes. Keep their existing failure ordering and retain the
+    // reservation if the WAL or checked namespace barrier cannot be synced.
+    if let Err(error) = store::durable_barrier(audit_reservation.connection()) {
+        audit_reservation.preserve()?;
+        return direct_audit_persist_failed_response(&changes, &error);
     }
     if let Err(error) = audit_reservation.finish() {
         return json_response(
