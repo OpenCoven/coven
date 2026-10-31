@@ -13,14 +13,19 @@ Protected proposal approvals use this order:
 
 1. Commit the scheduled submission recovery binding durably before publishing
    its pending file. Commit its submission receipt before acknowledging staging.
-2. Sync the claim contents and its directory after publishing or renaming it.
-3. Commit the apply intent with SQLite `synchronous=FULL` before swapping targets.
-4. Sync each installed target and its retained parent directory. New directory
+2. Commit the decision's Ward audit reservation, and any purpose bound to a new
+   decision request, in a FULL barrier before publishing the decision claim.
+   A retry after power loss therefore reuses that reservation instead of
+   quarantining the claim as `decision-origin`. If the barrier fails, no claim
+   is published and nothing is applied.
+3. Sync the claim contents and its directory after publishing or renaming it.
+4. Commit the apply intent with SQLite `synchronous=FULL` before swapping targets.
+5. Sync each installed target and its retained parent directory. New directory
    components are published with checked parent barriers. Rollback also syncs
    restored contents and namespace before reporting a completed rollback.
-5. Commit apply audit rows, protected baselines, and the approval terminal in one
+6. Commit apply audit rows, protected baselines, and the approval terminal in one
    FULL transaction. Rejections and veto terminals also use durable transactions.
-6. Check the database directory barrier, then remove the claim with a checked
+7. Check the database directory barrier, then remove the claim with a checked
    directory barrier, before returning success.
 
 Recovery repeats the evidence and claim barriers before applying. An idempotent
@@ -41,8 +46,7 @@ to refuse Tier-0 edits; these barriers grant no additional write authority.
 Legacy staging syncs its pending file, then commits `proposal_submitted` in a
 durable transaction before HTTP 202. A receipt failure may leave a pending file,
 but never acknowledges staging. Existing legacy validation and quarantine rules
-still apply. The separate decision-reservation durability residual tracked in
-[#1618](https://github.com/OpenCoven/coven/issues/1618) is unchanged.
+still apply.
 
 New Coven-owned home/workspace hierarchies use per-parent
 `.coven-directory-publications` registries. A marker precedes each mkdir and is
@@ -109,4 +113,8 @@ sync errors, mode restoration, and retained directory identity after a rename.
 Direct-write cases cover pre-audit and acknowledged cuts, plus failed SQLite
 and database-directory syncs. Legacy staging cases cover acknowledgment,
 receipt-insert failure, and failed receipt sync while retaining the pending file.
+Decision cases cut after the claim is published and before the apply intent,
+for scheduled and legacy proposals. The retry reuses the surviving reservation
+and applies once. A failed reservation sync leaves the proposal unclaimed and
+unchanged.
 These are deterministic protocol tests, not physical power-cut certification.
