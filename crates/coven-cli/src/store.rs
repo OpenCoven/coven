@@ -648,6 +648,26 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     open_initialized_store(path)
 }
 
+/// Makes every commit in the store's WAL durable without checkpointing it.
+///
+/// Writable connections commit with `synchronous = NORMAL`: a commit is on
+/// disk only after the next WAL sync. Syncing the one file, and the directory
+/// that names it, costs far less than a checkpoint's page copy. A missing WAL
+/// means every commit is already in the main file.
+pub(crate) fn sync_wal(store_path: &Path) -> Result<()> {
+    let wal = wal_path(store_path);
+    let file = match std::fs::File::open(&wal) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to open {}", wal.display()))
+        }
+    };
+    crate::durable_fs::sync_file(&file)
+        .with_context(|| format!("failed to sync {}", wal.display()))?;
+    crate::durable_fs::sync_parent(&wal)
+}
+
 /// Initialization-only entry for schema and migration regressions.
 #[cfg(test)]
 pub fn initialize_store(path: &Path) -> Result<()> {
