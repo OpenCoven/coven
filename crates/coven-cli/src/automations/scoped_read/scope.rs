@@ -15,10 +15,8 @@ const FILESYSTEM_SCOPE_FIELDS: &[&str] = &["kind", "root", "path", "access", "re
 /// Scope kinds that grant no filesystem access. The read service ignores
 /// them; whether the envelope accepts them is the adapter's decision.
 const NON_FILESYSTEM_SCOPE_KINDS: &[&str] = &["network", "credential", "evidence"];
-/// The fields of a `read_file` request.
-const READ_FILE_FIELDS: &[&str] = &["operation", "root", "path"];
-/// Operations the design requires but no reviewed scope mapping covers yet.
-const UNMAPPED_OPERATIONS: &[&str] = &["list_directory", "search"];
+/// The fields every request has.
+const REQUEST_FIELDS: &[&str] = &["operation", "root", "path"];
 
 /// Which bound directory a path is relative to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,11 +33,20 @@ impl RootKind {
             _ => None,
         }
     }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Workspace => "workspace",
+        }
+    }
 }
 
 /// A relative path in the one spelling the service interprets: non-empty
-/// components joined by `/`, none of them `.` or `..`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// components joined by `/`, none of them `.` or `..`. Paths order component
+/// by component, which is the order a walk visits them in when it takes each
+/// directory's entries sorted by name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RelativePath {
     components: Vec<String>,
 }
@@ -92,13 +99,48 @@ impl RelativePath {
         })
     }
 
+    /// Whether `name` is one component the service would accept in a path.
+    /// A directory entry with any other name can never be requested, so it is
+    /// never listed or searched either.
+    pub(crate) fn is_name(name: &str, policy: &ReadPolicy) -> bool {
+        Self::parse(name, policy).is_ok_and(|path| path.components.len() == 1)
+    }
+
     pub(crate) fn components(&self) -> &[String] {
         &self.components
     }
 
-    fn starts_with(&self, prefix: &Self) -> bool {
+    /// This path with a name appended, checked against the same complete-path limits as a direct request.
+    pub(crate) fn child(&self, name: &str, policy: &ReadPolicy) -> Result<Self, Refusal> {
+        Self::parse(&format!("{}/{}", self.text(), name), policy)
+    }
+
+    pub(crate) fn text(&self) -> String {
+        self.components.join("/")
+    }
+
+    pub(crate) fn starts_with(&self, prefix: &Self) -> bool {
         self.components.starts_with(&prefix.components)
     }
+
+    /// Whether a component after `prefix` is an excluded name. The caller
+    /// has checked that this path starts with `prefix`.
+    fn excluded_beneath(&self, prefix: &Self) -> bool {
+        self.components[prefix.components.len()..]
+            .iter()
+            .any(|component| is_excluded_name(component))
+    }
+}
+
+/// Whether a recursive scope leaves out an entry named `name`: a `.git`
+/// folder, or a `.env` or `.env.*` file, including the conservative Unicode,
+/// case and ignorable-character aliases used for protected paths. This only
+/// classifies exclusions; grant matching keeps exact spelling. Maintainer decision,
+/// 2026-10-20 (#857): project secrets usually sit there, so a grant includes
+/// one only by naming it. Listings and searches never show one.
+pub(crate) fn is_excluded_name(name: &str) -> bool {
+    let name = super::open::protected_name_key(name);
+    name == ".git" || name == ".env" || name.starts_with(".env.")
 }
 
 /// `CON`, `NUL`, `COM1` and the rest open a device on Windows whatever their
@@ -137,11 +179,22 @@ struct FileScope {
 /// The enforcement form of a grant's filesystem scopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Grants {
-    /// Non-recursive scopes: each names one file.
-    files: Vec<FileScope>,
-    /// Recursive scopes. No reviewed mapping says which operations they
-    /// authorize, so a request under one is refused as unmapped.
+    /// Non-recursive scopes: each covers exactly one file or directory.
+    exact: Vec<FileScope>,
+    /// Recursive scopes: each covers a directory and everything beneath it.
     subtrees: Vec<FileScope>,
+}
+
+/// How a read scope covers a request's path. Maintainer decision,
+/// 2026-10-20 (#857): a recursive read scope permits reading, listing and
+/// searching anything beneath its directory; a non-recursive one covers one
+/// object, which can be read if it is a file and listed if it is a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Coverage {
+    /// A non-recursive scope names exactly this path.
+    Exact,
+    /// The path is a recursive scope's directory or beneath it.
+    Subtree,
 }
 
 impl Grants {
@@ -151,7 +204,7 @@ impl Grants {
     /// owner believing something was granted that never could be read.
     pub(crate) fn from_scopes(scopes: &[Value], policy: &ReadPolicy) -> Result<Self, Refusal> {
         let mut grants = Self {
-            files: Vec::new(),
+            exact: Vec::new(),
             subtrees: Vec::new(),
         };
         for scope in scopes {
@@ -194,36 +247,49 @@ impl Grants {
             if recursive {
                 grants.subtrees.push(scope);
             } else {
-                grants.files.push(scope);
+                grants.exact.push(scope);
             }
         }
         Ok(grants)
     }
 
-    /// Whether `request` may read its file. Only a non-recursive read scope
-    /// naming exactly that path authorizes it: not its parent, not a sibling,
-    /// and not another spelling of the same name.
-    pub(crate) fn authorize(&self, request: &ReadRequest) -> Result<(), Refusal> {
-        let mut named = self
-            .files
+    /// How `request` is covered, if a read scope covers it for its operation.
+    /// A scope covers only its own spelling: a case or Unicode alias of a
+    /// granted name is not covered. Search needs a recursive scope. A
+    /// recursive scope does not cover a path through an excluded name beneath
+    /// its directory; a scope whose own path names one does.
+    pub(crate) fn authorize(&self, request: &Request) -> Result<Coverage, Refusal> {
+        let applies = |scope: &&FileScope| scope.root == request.root;
+        let exact: Vec<&FileScope> = self
+            .exact
             .iter()
-            .filter(|scope| scope.root == request.root && scope.path == request.path)
-            .peekable();
-        if named.peek().is_some() {
-            return if named.any(|scope| scope.read) {
-                Ok(())
-            } else {
-                Err(Refusal::ScopeAccessDenied)
-            };
-        }
-        if self
+            .filter(applies)
+            .filter(|scope| scope.path == request.path)
+            .collect();
+        let subtrees: Vec<&FileScope> = self
             .subtrees
             .iter()
-            .any(|scope| scope.root == request.root && request.path.starts_with(&scope.path))
+            .filter(applies)
+            .filter(|scope| request.path.starts_with(&scope.path))
+            .collect();
+        let coverage = if subtrees
+            .iter()
+            .any(|scope| scope.read && !request.path.excluded_beneath(&scope.path))
         {
-            return Err(Refusal::OperationUnmapped);
+            Coverage::Subtree
+        } else if exact.iter().any(|scope| scope.read) {
+            Coverage::Exact
+        } else if subtrees.iter().any(|scope| scope.read) {
+            return Err(Refusal::ScopeExcluded);
+        } else if exact.is_empty() && subtrees.is_empty() {
+            return Err(Refusal::ScopeMissing);
+        } else {
+            return Err(Refusal::ScopeAccessDenied);
+        };
+        if matches!(request.operation, Operation::Search { .. }) && coverage == Coverage::Exact {
+            return Err(Refusal::ScopeOperationDenied);
         }
-        Err(Refusal::ScopeMissing)
+        Ok(coverage)
     }
 }
 
@@ -243,29 +309,59 @@ fn too_broad(text: &str, recursive: bool) -> bool {
         || (recursive && candidate.split('/').filter(|part| !part.is_empty()).count() < 2)
 }
 
-/// One `read_file` request from the model.
+/// What a request asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReadRequest {
+pub(crate) enum Operation {
+    ReadFile,
+    /// A directory's entries, continuing after the entry named `after`.
+    ListDirectory {
+        after: Option<String>,
+    },
+    /// Lines containing `pattern` in the files beneath a directory,
+    /// continuing after the line at `after`.
+    Search {
+        pattern: String,
+        after: Option<SearchPosition>,
+    },
+}
+
+/// A line in a file, which is where a search continues from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchPosition {
+    pub path: RelativePath,
+    pub line: u64,
+}
+
+/// One request from the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Request {
+    pub operation: Operation,
     pub root: RootKind,
     pub path: RelativePath,
 }
 
-impl ReadRequest {
-    /// Parses a request object. An operation the design names but no reviewed
-    /// mapping covers is refused as unmapped before its fields are read.
+impl Request {
+    /// Parses a request object: `operation`, `root` and `path`, plus `after`
+    /// to continue a listing or search and `pattern` for a search. Any other
+    /// field refuses it. A continuation only says where to resume; each page
+    /// is authorized afresh, so it carries no authority of its own.
     pub(crate) fn parse(value: &Value, policy: &ReadPolicy) -> Result<Self, Refusal> {
         let object = value.as_object().ok_or(Refusal::RequestInvalid)?;
-        match object.get("operation").and_then(Value::as_str) {
-            Some("read_file") => {}
-            Some(operation) if UNMAPPED_OPERATIONS.contains(&operation) => {
-                return Err(Refusal::OperationUnmapped)
-            }
+        let optional: &[&str] = match object.get("operation").and_then(Value::as_str) {
+            Some("read_file") => &[],
+            Some("list_directory") => &["after"],
+            Some("search") => &["pattern", "after"],
             _ => return Err(Refusal::RequestInvalid),
-        }
-        if object.len() != READ_FILE_FIELDS.len()
-            || !READ_FILE_FIELDS
-                .iter()
-                .all(|field| object.contains_key(*field))
+        };
+        let required = REQUEST_FIELDS
+            .iter()
+            .chain(optional.iter().filter(|field| **field == "pattern"));
+        if !required
+            .into_iter()
+            .all(|field| object.contains_key(*field))
+            || !object.keys().all(|key| {
+                REQUEST_FIELDS.contains(&key.as_str()) || optional.contains(&key.as_str())
+            })
         {
             return Err(Refusal::RequestInvalid);
         }
@@ -278,9 +374,72 @@ impl ReadRequest {
             .get("path")
             .and_then(Value::as_str)
             .ok_or(Refusal::RequestInvalid)?;
+        let path = RelativePath::parse(path, policy)?;
+        let operation = match object.get("operation").and_then(Value::as_str) {
+            Some("list_directory") => Operation::ListDirectory {
+                after: match object.get("after") {
+                    None => None,
+                    Some(after) => Some(
+                        after
+                            .as_str()
+                            .filter(|name| RelativePath::is_name(name, policy))
+                            .ok_or(Refusal::RequestInvalid)?
+                            .to_owned(),
+                    ),
+                },
+            },
+            Some("search") => {
+                let pattern = object
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .filter(|pattern| {
+                        !pattern.is_empty()
+                            && pattern.len() <= policy.pattern_bytes
+                            // Lines split on newlines, so no other control
+                            // character can be searched for usefully.
+                            && !pattern.chars().any(|c| c.is_control() && c != '\t')
+                    })
+                    .ok_or(Refusal::RequestInvalid)?
+                    .to_owned();
+                let after = match object.get("after") {
+                    None => None,
+                    Some(after) => Some(search_position(after, &path, policy)?),
+                };
+                Operation::Search { pattern, after }
+            }
+            _ => Operation::ReadFile,
+        };
         Ok(Self {
+            operation,
             root,
-            path: RelativePath::parse(path, policy)?,
+            path,
         })
     }
+}
+
+/// A search continuation: a file strictly beneath the searched directory, and
+/// a line in it.
+fn search_position(
+    value: &Value,
+    searched: &RelativePath,
+    policy: &ReadPolicy,
+) -> Result<SearchPosition, Refusal> {
+    let object = value.as_object().ok_or(Refusal::RequestInvalid)?;
+    if object.len() != 2 {
+        return Err(Refusal::RequestInvalid);
+    }
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or(Refusal::RequestInvalid)?;
+    let path = RelativePath::parse(path, policy).map_err(|_| Refusal::RequestInvalid)?;
+    let line = object
+        .get("line")
+        .and_then(Value::as_u64)
+        .filter(|line| *line >= 1)
+        .ok_or(Refusal::RequestInvalid)?;
+    if !path.starts_with(searched) || path == *searched {
+        return Err(Refusal::RequestInvalid);
+    }
+    Ok(SearchPosition { path, line })
 }

@@ -36,12 +36,20 @@ public static class ControlledPublicTests {
             Check(encoded.Payload.Length>0 && encoded.Payload.Length<=524288,"Probe wire bound failed");
             using(var doc=JsonDocument.Parse(encoded.Payload)) {
                 var wire=doc.RootElement;
-                Check(wire.GetProperty("schemaVersion").GetString()=="coven.kernel-file-probe.v1","Probe version changed");
+                Check(wire.GetProperty("schemaVersion").GetString()=="coven.kernel-file-probe.v2","Probe version changed");
                 Check(!wire.TryGetProperty("query",out _),"Private probe forged parent observation");
                 Check(wire.GetProperty("source").GetProperty("files").GetArrayLength()==21,"Probe source omitted files");
                 Check(wire.GetProperty("host").GetProperty("assemblies").GetArrayLength()==5,"Probe selected host omitted assemblies");
                 if (encoded.DataWithheld) Check(wire.GetProperty("collector").GetProperty("collectorSummary").GetProperty("operation").GetProperty("errorClass").GetString()==value.Operation.ErrorClass,"Probe fallback replaced primary");
-                else Check(wire.GetProperty("collector").GetProperty("operation").GetProperty("errorClass").GetString()==value.Operation.ErrorClass,"Probe collector changed");
+                else {
+                    var collector=wire.GetProperty("collector");
+                    Check(collector.GetProperty("operation").GetProperty("errorClass").GetString()==value.Operation.ErrorClass,"Probe collector changed");
+                    foreach(var item in collector.GetProperty("events").EnumerateArray()) {
+                        var template=item.GetProperty("template");
+                        Check(template.GetProperty("reasons").ValueKind==JsonValueKind.Array,"Probe template omitted reasons");
+                        Check(template.GetProperty("status").GetString()!="unsupported" || template.GetProperty("reasons").GetArrayLength()>0,"Unsupported template omitted its reasons");
+                    }
+                }
             }
             Check(encoded.ExitCode==(scenario.Count==1?0:2),"Probe exit suppressed failure");
         }

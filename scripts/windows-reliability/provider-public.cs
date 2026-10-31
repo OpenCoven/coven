@@ -108,7 +108,8 @@ public sealed class CovenKernelHost {
     }
 }
 public sealed class CovenKernelProbeWire {
-    public string SchemaVersion { get { return "coven.kernel-file-probe.v1"; } }
+    // v2 adds one closed reasons array per template; nothing else changes.
+    public string SchemaVersion { get { return "coven.kernel-file-probe.v2"; } }
     public bool CaptureAttempted { get { return false; } }
     public bool MetadataComplete { get { return false; } }
     public CovenKernelSource Source { get; }

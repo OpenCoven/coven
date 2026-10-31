@@ -652,14 +652,12 @@ fn handle_mobile_request(
     state: &MobileGatewayState,
     request: MobileHttpRequest,
 ) -> MobileHttpResponse {
+    // No mobile route takes a query string. Encrypted transport ingress
+    // rejects the same targets in `handle_transport_message`.
     if request.target.contains('?') {
         return error_response(404, MobileErrorCode::InvalidRequest);
     }
-    let path = request
-        .target
-        .split_once('?')
-        .map_or(request.target.as_str(), |value| value.0)
-        .to_owned();
+    let path = request.target.clone();
     match route_request(&request.method, &path) {
         RouteDecision::NotFound => error_response(404, MobileErrorCode::InvalidRequest),
         RouteDecision::MethodNotAllowed(allow) => MobileHttpResponse {
@@ -821,12 +819,17 @@ fn handle_transport_message(
     if !reader.fill_buf()?.is_empty() {
         bail!("trailing transport request data");
     }
+    // Match direct ingress: a query string is rejected before routing or
+    // verification, never stripped, so it closes the channel undispatched.
+    if request.target.contains('?') {
+        bail!("transport request target has a query string");
+    }
     let auth = parse_auth_headers(&request.headers)
         .map_err(|_| anyhow::anyhow!("invalid signed transport request"))?;
     if auth.device_id != pairing.device_id {
         bail!("request identity differs from channel identity");
     }
-    let path = request.target.split('?').next().unwrap_or("").to_owned();
+    let path = request.target.clone();
     let RouteDecision::Route(route) = route_request(&request.method, &path) else {
         bail!("unsupported transport route");
     };

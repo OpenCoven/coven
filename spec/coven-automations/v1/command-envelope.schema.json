@@ -353,7 +353,27 @@
             "timeoutMinutes": { "type": "integer", "minimum": 1, "maximum": 60 }
           }
         },
-        "validUntil": { "$ref": "common.schema.json#/$defs/timestamp", "description": "Dispatch must begin before this instant, at most 15 minutes after the request. A mission still queued then settles rejected with reason expired_before_dispatch." }
+        "validUntil": { "$ref": "common.schema.json#/$defs/timestamp", "description": "Dispatch must begin before this instant, at most 15 minutes after the request. A mission still queued then settles rejected with reason expired_before_dispatch." },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/missionScope" },
+          "description": "Optional. The project files and folders the mission asks to read; absent means none, so a present list names at least one. The daemon validates each with the scoped read service's rules and refuses the submit with VALIDATION_FAILED for a malformed item, a root-wide, absolute, `..` or glob path, a workspace root or write access. Stored with the mission and returned by mission.get.v1. Older daemons reject the field."
+        }
+      }
+    },
+    "missionScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "root", "path", "access", "recursive"],
+      "description": "A profile filesystem read scope on the project root.",
+      "properties": {
+        "kind": { "const": "filesystem" },
+        "root": { "const": "project" },
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "Relative to the project root, `/`-separated, at most 32 components. Not `.`, absolute, drive-qualified, or containing `..` or `*`. A recursive scope names a folder at least two levels deep." },
+        "access": { "const": "read" },
+        "recursive": { "type": "boolean", "description": "true covers the folder and what is beneath it; false covers exactly one file or folder." }
       }
     },
     "missionGet": {
@@ -442,6 +462,7 @@
         "familiar": { "$ref": "#/$defs/familiarRevisionRef" },
         "envelope": { "$ref": "#/$defs/missionEnvelopeRef" },
         "project": { "$ref": "#/$defs/missionSubmit/properties/project" },
+        "scopes": { "$ref": "#/$defs/missionSubmit/properties/scopes", "description": "The scopes the submit named, in canonical form. Absent when it named none." },
         "task": {
           "type": "object",
           "additionalProperties": false,

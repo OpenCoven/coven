@@ -1,5 +1,5 @@
 {
-  "policy_sha256": "ae8cde7d5bc9aaa7e1018494a68bb5e2a33bd43cee51bcf7fd26da3e57aa9068",
+  "policy_sha256": "251acf6dfb1b7d9c5617e604bcf1ae27b542918164faef72968f8dcad3e4a3a0",
   "commands": [
     [
       "python3",
@@ -98,6 +98,14 @@
     [
       "python3",
       "scripts/dev-verify-test.py"
+    ],
+    [
+      "python3",
+      "scripts/task-worktree-test.py"
+    ],
+    [
+      "python3",
+      "scripts/branch-triage-test.py"
     ],
     [
       "npm",

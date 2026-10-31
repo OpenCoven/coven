@@ -82,19 +82,46 @@ slot it has yet to plan, after misfire policy skips the older of the two. It say
 whether each holds claims, which keeps every other occurrence of the routine
 from being claimed. Follow one with
 `coven automations occurrence <id>`, `coven automations run <id>` or
-`coven automations leases --automation-id <id>`. The codes and next steps are
-listed in the [API contract](../API-CONTRACT.md#automations-explanation).
-A retry waiting for its `notBefore`, or past its deadline, is named with its
-times, and so is a failed attempt held for an operator retry, with its
-deadline when it has one. A claim the next pass releases because it is stale
-or its lease has expired is named too, with its lease when one is readable,
-and so is a run whose session has finished, which the next pass settles or
-holds, is still running past its deadline, or has not started when its claim's
-lease expires, both of which the next pass stops, and so is a run whose
-cancellation was left unfinished past its execution lease, which the next pass
-finishes. Other runs a pass acts on before claiming, such as other runs past
-their deadline or lease, are not named yet (#1523). Principal-scoped reads and
-the remaining operator surface are still tracked by #858.
+`coven automations leases --automation-id <id>`.
+Each `work` item carries a `code`, whether it holds claims, and a `nextStep`.
+The codes, and what the next daemon pass does with each:
+
+| `code` | What it is | `nextStep` |
+| --- | --- | --- |
+| `in_flight` | a claimed or running occurrence the pass leaves alone, or acts on only in the cases the contract lists under each code below | `inspect_occurrence` |
+| `claim_stale` | a daemon claim from another scheduler generation with no run; the next pass returns it to `planned` | `await_scheduler_pass` |
+| `lease_expired` | a claim whose lease has expired with no running run, with `leaseExpiresAt`; the next pass settles it `failed` | `await_settlement` |
+| `running_run` | a running run whose occurrence is not one of the routine's live ones: settled, another routine's, missing, or planned without being a retry on it; the contract says what the pass does with it | `inspect_run` |
+| `retry_waiting` | a retry on a planned occurrence waiting for `notBefore`, with `deadlineAt` | `await_retry` |
+| `retry_expired` | a retry past its deadline, with `deadlineAt`; the next pass settles it `failed` | `await_settlement` |
+| `retry_held` | a failed attempt held for an operator retry until the run's deadline, with `deadlineAt`; `coven automations retry` opens one first | `await_settlement` |
+| `session_finished` | a run whose session has finished; the next pass settles it, holds a plain failure for an operator retry, or holds a Runtime Authority run for recovery | `await_settlement`, or `await_runtime_authority` |
+| `timeout_expired` | a run whose session is still running past the run's deadline, with `deadlineAt`; the next pass stops it, then settles it `failed` or holds it for recovery | `await_settlement`, or `await_runtime_authority` |
+| `launch_abandoned` | a launch whose session has not started when its claim's lease expires, with `leaseExpiresAt`; the next pass stops it, then settles or holds it | `await_settlement`, or `await_runtime_authority` |
+| `cancellation_expired` | a run whose cancellation was left `requested` or `stopping` past its execution lease; the next pass finishes it, settling the run `cancelled` or holding it for recovery | `await_cancellation`, or `await_runtime_authority` |
+| `stop_fenced` | a run under a stop fence that no row above names: the pass defers to the stop that holds it. The step says what ends the fence: the requested cancellation holding it, the pass that reaches the run's own expired timeout or recovery fence and holds the run for recovery, or nothing, including a fence whose expiry cannot be read | `await_cancellation`; `await_settlement` or `await_runtime_authority`; `inspect_run` when no pass ends it |
+| `eligible_now` | a planned occurrence the next pass claims, unless misfire policy skips it | `await_scheduler_pass` |
+| `due_unplanned` | the slot the next pass plans, with no `occurrenceId` | `await_scheduler_pass` |
+| `recovery_required` | an occurrence held for recovery, with the step recovery itself takes | `recover_occurrence`, `cancel_run`, `await_cancellation` or `await_runtime_authority` |
+
+The next steps, and what an operator does for each:
+
+| `nextStep` | Do |
+| --- | --- |
+| `inspect_occurrence`, `inspect_run` | read `coven automations occurrence <id>` or `coven automations run <id>` and its `attempts`; the pass does not release this hold on its own |
+| `await_scheduler_pass`, `await_retry`, `await_settlement`, `await_cancellation` | nothing: the next pass of the daemon holding the scheduler authority acts, about once a minute; `coven automations status` shows its last pass. A `retry_held` run can be retried first with `coven automations retry` |
+| `await_runtime_authority` | nothing in the CLI: a Runtime Authority run stays held for recovery until a trusted adapter consumes its evidence (#857) |
+| `recover_occurrence` | record a determination with `coven.automations.occurrence.recover.v1` |
+| `cancel_run` | cancel the run's live attempt with `coven.automations.run.cancel.v1`; recovery refuses it until then |
+
+The conditions' next steps are `activate_if_intended`, `review_failure_then_unquarantine`
+and `revise_definition`, and `none` for `next_slot`. Every time an item carries
+is in canonical millisecond form; a stored time the pass compares as text is
+shown only when it is stored that way. The full rules, including when a run the
+pass acts on stays `in_flight` or `running_run`, and which stores fail every
+pass, are in the [API contract](../API-CONTRACT.md#automations-explanation).
+Principal-scoped reads and the remaining operator surface are still tracked by
+#858.
 
 `coven automations retry` is the one write command under `coven automations`.
 It retries a run held after a failure, before its deadline; see

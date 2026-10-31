@@ -331,15 +331,17 @@ pub fn run_recover(envelope_path: &Path, root_key: &Path, assume_yes: bool) -> R
         }
     }
     let signature = super::policy_cli::sign_action(&key, &action)?;
-    let device = authority.recover(
+    authority.recover(
         &envelope.request,
         &envelope.destination_signature,
         &signature,
         Utc::now(),
     )?;
+    // Recovery enrolls exactly the requested id. Print it from the request so
+    // nothing read back from the key-bearing registry record reaches stdout.
     println!(
         "Recovered access for device {}. The event is in the mobile audit log.",
-        device.device.id
+        envelope.request.destination_id
     );
     Ok(())
 }

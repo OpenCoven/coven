@@ -3,9 +3,9 @@
   "schema_version": 2,
   "description": "Reviewed GitHub issue graph for the Coven Automations v1 program. GitHub owns outcomes, execution ownership, dependencies, acceptance gates, and delivery evidence. Runtime state stays in Coven.",
   "sync": {
-    "last_sync": "2026-10-05",
-    "source_branch": "chore/github-issue-tracking",
-    "source": "GitHub REST issue state; reviewed snapshot, not a live readiness report.",
+    "last_sync": "2026-10-30",
+    "source_branch": "chore/1626-worktree-lifecycle",
+    "source": "GitHub REST issue states and native dependency relationships reviewed under #1626; snapshot, not a live readiness report.",
     "drift_check": "node docs/roadmaps/drift-check.mjs --strict; optionally --issues-export PATH with a local GitHub REST JSON issue array."
   },
   "program": "OpenCoven/coven#854",
