@@ -26,7 +26,10 @@
 //! under the daemon's fence are later steps of the same design.
 
 #[cfg(unix)]
+pub(crate) mod admission;
+#[cfg(unix)]
 pub(crate) mod channel;
+pub(crate) mod credential;
 pub(crate) mod open;
 pub(crate) mod scope;
 pub(crate) mod service;
