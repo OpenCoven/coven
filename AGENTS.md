@@ -134,7 +134,8 @@ The Cloud suites need Python 3.11+ on `PATH` as `python3`.
            check-ci-workflow-test.py install-native-link-dependencies-test.py \
            bootstrap-contract/runner-test.py cloud/config-test.py \
            cloud/runtime-test.py cloud/provision-test.py cloud/bootstrap-test.py \
-           cloud/readiness-test.py delivery/checkpoint-test.py; do
+           cloud/readiness-test.py delivery/checkpoint-test.py \
+           delivery/preflight-test.py; do
     python3 "scripts/$s" || { echo "FAILED: $s"; fail=1; }
   done
   bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh || fail=1
