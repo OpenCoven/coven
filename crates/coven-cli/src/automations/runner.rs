@@ -60,6 +60,8 @@ const RUNTIME_TERMINAL_EVIDENCE_POLICY_REASON: &str =
     "authenticated runtime terminal evidence exceeds the authorized binding; recovery required";
 const RUNTIME_TERMINAL_EVIDENCE_LATE_REASON: &str =
     "verified runtime terminal evidence arrived after the recovery hold; operator recovery required";
+const SCOPED_READ_UNRECONCILED_REASON: &str =
+    "scoped read commitments do not reconcile with the channel's operations; recovery required";
 
 pub(crate) fn containment_receipt_path(coven_home: &Path, session_id: &str) -> PathBuf {
     coven_home
@@ -4616,6 +4618,12 @@ fn consume_runtime_terminal_evidence(
                     RUNTIME_TERMINAL_EVIDENCE_LATE_REASON,
                 ));
             }
+            // A scoped read attempt settles only when what the gate
+            // authorized and what the channel did reconcile, whatever the
+            // evidence says (#1606).
+            if !scoped_reads_reconciled(conn, &binding, &attempt_id)? {
+                return Ok(EvidenceConsumption::Held(SCOPED_READ_UNRECONCILED_REASON));
+            }
             let settled_here = settle_from_runtime_terminal_evidence(
                 conn,
                 TerminalEvidenceSettlement {
@@ -4648,6 +4656,25 @@ fn consume_runtime_terminal_evidence(
         }
     };
     Ok(EvidenceConsumption::Held(reason))
+}
+
+/// Whether `binding`'s attempt either runs no scoped read service, or its
+/// scoped read commitments and close reconcile.
+fn scoped_reads_reconciled(
+    conn: &Connection,
+    binding: &AutomationExecutionBinding,
+    attempt_id: &str,
+) -> Result<bool, String> {
+    let scoped = super::runtime_envelope::by_descriptor_digest(
+        binding.runtime.descriptor_digest.value.as_str(),
+    )
+    .is_some_and(|envelope| envelope.service.is_some());
+    if !scoped {
+        return Ok(true);
+    }
+    super::scoped_read_settlement::reconcile(conn, attempt_id, None)
+        .map(|reconciled| reconciled.is_ok())
+        .map_err(|error| format!("failed to reconcile scoped read commitments: {error:#}"))
 }
 
 struct TerminalEvidenceSettlement<'a> {
@@ -12761,8 +12788,9 @@ mod tests {
             payload_json: payload.to_string(),
             created_at: ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
+        // Both reads reached the service, so the stream shows both.
         let stream = crate::automations::stream_observation::test_support::stream(
-            &crate::automations::stream_observation::test_support::scoped_read_run(),
+            &crate::automations::stream_observation::test_support::scoped_read_run_calling(2),
         );
         let transaction = conn.unchecked_transaction().unwrap();
         crate::store::insert_event(&transaction, &event("output", json!({ "data": stream })))

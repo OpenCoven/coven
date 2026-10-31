@@ -54,6 +54,10 @@ pub(crate) trait Gate: Send {
     /// discarded. Once it returns `Ok`, those bytes are authorized and cannot
     /// be recalled.
     fn commit(&mut self, committing: &Committing<'_>) -> Result<(), Refusal>;
+    /// Once the service has stopped: what each tool call did, for the
+    /// gate to record. It runs once, after the last reply was written or
+    /// failed to be, and also when no relay ever connected.
+    fn close(&mut self, _operations: &[Operation]) {}
 }
 
 /// The time an operation may take.
@@ -76,15 +80,19 @@ pub(crate) struct Operation {
     /// The tool, when the call named one of the service's.
     pub tool: Option<&'static str>,
     pub outcome: Outcome,
+    /// Whether the whole reply was written to the channel. A committed
+    /// result that was not written was authorized but never delivered.
+    pub written: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// The reader produced a result and the gate committed its JCS SHA-256.
-    /// This does not establish whether the subsequent write reached the peer.
+    /// The result was committed. `digest` is the SHA-256 of its JCS text,
+    /// which is exactly the text the reply carries. [`Operation::written`]
+    /// says whether the reply was written; neither establishes that the
+    /// peer received it.
     Served { digest: String },
-    /// The request was refused and the gate committed the refusal's digest.
-    /// This does not establish whether the subsequent write reached the peer.
+    /// The request was refused, and the refusal was committed.
     Refused { refusal: Refusal, digest: String },
     /// The gate refused: nothing the reader produced was written.
     Withheld { refusal: Refusal },
@@ -202,6 +210,7 @@ impl Service {
         let mut message = Vec::new();
         loop {
             message.clear();
+            let called = session.operations.len();
             let reply = match read_message(&mut input, &mut message) {
                 Ok(Incoming::End) | Err(_) => break,
                 Ok(Incoming::TooLong) => {
@@ -214,7 +223,13 @@ impl Service {
                 Ok(Incoming::Message) => session.answer(&message),
             };
             let Some(reply) = reply else { continue };
-            if write(&mut output, &reply.message).is_err() || reply.stop {
+            let written = write(&mut output, &reply.message).is_ok();
+            if session.operations.len() > called {
+                if let Some(operation) = session.operations.last_mut() {
+                    operation.written = written;
+                }
+            }
+            if !written || reply.stop {
                 break;
             }
         }
@@ -223,7 +238,15 @@ impl Service {
         // the worker, which exits once its current operation returns.
         drop(session);
         drop(worker);
+        gate.close(&operations);
         operations
+    }
+
+    /// Ends a service that never ran, because no relay connected: the gate
+    /// records that no tool call was made.
+    pub(crate) fn end_unserved(self) {
+        let Self { mut gate, .. } = self;
+        gate.close(&[]);
     }
 }
 
@@ -334,6 +357,7 @@ impl Session<'_> {
             sequence,
             tool,
             outcome,
+            written: false,
         });
         (delivered, stop)
     }

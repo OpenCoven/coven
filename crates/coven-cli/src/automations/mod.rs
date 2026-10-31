@@ -71,6 +71,9 @@ pub mod store;
 // records under the store's write lock (#1603).
 #[cfg(unix)]
 pub(crate) mod store_gate;
+// A scoped read attempt's close, and its reconciliation with the gate's
+// commitments before settlement (#1606).
+pub(crate) mod scoped_read_settlement;
 pub mod stream_observation;
 // Wired into every session ending; it observes only Runtime Authority attempts,
 // which nothing dispatches until the trusted adapter (coven#857 slice 6).

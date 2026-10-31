@@ -360,6 +360,16 @@ runtime stream. A model-authored tool-looking line cannot manufacture an
 operation or receipt. Missing service or runtime evidence yields incomplete
 or unknown evidence and preserves recovery hold; exit zero is not success.
 
+As implemented (#1606), the service evidence is two immutable records:
+- the gate's per-operation commitments;
+- the channel's close, which lists each operation and whether its reply was
+  written.
+
+The observer and settlement reconcile them, as the
+[gate proposal](coven-automations-scoped-read-gate-proposal.md#settlement-reconciliation-1606)
+describes. Request digests and privacy-classified resource references, the
+receipt schema for service operations, remain open.
+
 A conclusive R0 receipt must identify the exact grant and descriptor, the
 operations actually exercised, refusal/cancellation history and evidence
 completeness. Historical records retain their original privacy and integrity
