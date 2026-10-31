@@ -19,6 +19,12 @@
 //!   classified instead ([`super::stream_observation`]). A stream that
 //!   accounts for everything yields complete evidence. Anything it cannot
 //!   account for leaves coverage partial, and the run is held.
+//! - **Scoped read service.** When the envelope runs the scoped read service,
+//!   the stream is the harness's own account. Coverage is also complete only
+//!   when the gate's commitments and the channel's close reconcile
+//!   ([`super::scoped_read_settlement::reconcile`]) and the stream shows every
+//!   operation the service ran. A committed result that was never written, a
+//!   channel that never closed, or any mismatch leaves coverage partial.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, DurationRound, SecondsFormat, TimeDelta, Utc};
@@ -38,6 +44,7 @@ use super::contract::types::TerminalOutcome;
 use super::ed25519_trust::Ed25519TerminalEvidenceVerifier;
 use super::runtime_envelope::{self, StreamFormat};
 use super::runtime_terminal_evidence::{self, RuntimeTerminalEvidenceStoreOutcome};
+use super::scoped_read_settlement;
 use super::stream_observation::{classify_claude_stream, StreamObservation, StreamResult};
 
 /// Why a plain-text launch leaves capabilities and side effects unknown.
@@ -103,11 +110,19 @@ pub(crate) fn record(
         ) {
             Some(envelope) => {
                 let (output, altered) = session_output(conn, session_id)?;
-                Some(match envelope.stream {
+                let mut stream = match envelope.stream {
                     StreamFormat::ClaudeStreamJson => {
                         classify_claude_stream(envelope, &output, altered)
                     }
-                })
+                };
+                if envelope.service.is_some() {
+                    let attempt_id = binding.base.attempt_id.as_str();
+                    if let Err(why) = scoped_reads_reconcile(conn, attempt_id, &stream) {
+                        stream.complete = false;
+                        unreconciled(conn, session_id, &why);
+                    }
+                }
+                Some(stream)
             }
             None => None,
         };
@@ -137,6 +152,31 @@ pub(crate) fn record(
             let _ = conn.execute_batch("ROLLBACK TO terminal_observer; RELEASE terminal_observer");
             failed(conn, session_id, &format!("{error:#}"))
         }
+    }
+}
+
+/// Whether the attempt's scoped read commitments and close reconcile with
+/// each other and with `stream`, or why not.
+fn scoped_reads_reconcile(
+    conn: &Connection,
+    attempt_id: &str,
+    stream: &StreamObservation,
+) -> std::result::Result<(), String> {
+    match scoped_read_settlement::reconcile(conn, attempt_id, Some(stream.tool_calls)) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(discrepancy)) => Err(discrepancy.code().to_owned()),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
+fn unreconciled(conn: &Connection, session_id: &str, why: &str) {
+    if let Some(home) = authority_keys::store_home(conn) {
+        crate::daemon::append_daemon_recovery_log(
+            &home,
+            &format!(
+                "scoped reads of session `{session_id}` do not reconcile ({why}), so its evidence is partial and its run is held"
+            ),
+        );
     }
 }
 
@@ -851,5 +891,138 @@ mod tests {
             classification(&conn),
             RuntimeTerminalEvidenceClassification::AuthenticatedUnknown
         );
+    }
+
+    /// A store whose attempt's binding pins the scoped read envelope, with
+    /// `lines` recorded as its session's output, and the gate's tables.
+    #[cfg(unix)]
+    fn seed_scoped(home: &std::path::Path, lines: &[String]) -> Connection {
+        use crate::automations::contract::authority::test_support::{fixture, resign_binding};
+        use crate::automations::stream_observation::test_support::stream;
+        let mut binding = fixture("binding");
+        binding["runtime"]["descriptorDigest"]["value"] =
+            json!(crate::automations::runtime_envelope::CLAUDE_R0_SCOPED_READ.descriptor_digest());
+        resign_binding(&mut binding);
+        let conn = test_support::seed_with_binding(home, true, binding);
+        conn.execute(
+            "INSERT INTO events (id, session_id, kind, payload_json, created_at, redaction_status)
+             VALUES ('event-0', ?1, 'output', ?2, '2026-09-03T12:10:00.000Z', 'clean')",
+            rusqlite::params![SESSION_ID, json!({ "data": stream(lines) }).to_string()],
+        )
+        .unwrap();
+        conn.execute_batch(crate::automations::store_gate::SCHEMA)
+            .unwrap();
+        conn.execute_batch(scoped_read_settlement::SCHEMA).unwrap();
+        conn
+    }
+
+    /// Records that the attempt's channel served `served` reads, each
+    /// committed, and closed.
+    #[cfg(unix)]
+    fn served_and_closed(conn: &Connection, served: u64) {
+        use crate::automations::scoped_read::service::{Operation, Outcome};
+        const DIGEST: &str = "abababababababababababababababababababababababababababababababab";
+        let operations: Vec<Operation> = (1..=served)
+            .map(|sequence| {
+                conn.execute(
+                    "INSERT INTO automation_scoped_read_commitments (
+                        attempt_id, channel_id, sequence, tool, outcome, refusal,
+                        result_digest, result_bytes, committed_at
+                     ) VALUES ('attempt.daily-notes-1-1', 'channel', ?1, 'read_file',
+                               'served', NULL, ?2, 42, '2026-09-03T12:05:00.000Z')",
+                    rusqlite::params![sequence as i64, DIGEST],
+                )
+                .unwrap();
+                Operation {
+                    sequence,
+                    tool: Some("read_file"),
+                    outcome: Outcome::Served {
+                        digest: DIGEST.to_owned(),
+                    },
+                    written: true,
+                }
+            })
+            .collect();
+        scoped_read_settlement::record(
+            conn,
+            "attempt.daily-notes-1-1",
+            "channel",
+            &operations,
+            ended_at(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scoped_read_run_whose_reads_reconcile_yields_receipt_eligible_evidence() {
+        use crate::automations::stream_observation::test_support::scoped_read_run;
+        let temp = tempfile::tempdir().unwrap();
+        let conn = seed_scoped(temp.path(), &scoped_read_run());
+        served_and_closed(&conn, 1);
+        assert_eq!(
+            record(&conn, SESSION_ID, TerminalOutcome::Succeeded, ended_at()),
+            Recorded::Stored
+        );
+        assert_eq!(
+            classification(&conn),
+            RuntimeTerminalEvidenceClassification::ReceiptEligibleComplete
+        );
+    }
+
+    /// The harness's stream alone never makes a scoped read run complete:
+    /// what the gate committed and the channel did must agree with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_scoped_read_run_whose_reads_do_not_reconcile_is_held() {
+        use crate::automations::stream_observation::test_support::scoped_read_run;
+        type Setup = fn(&Connection);
+        let cases: [(&str, Setup); 3] = [
+            // The daemon died before the channel closed, or a stream claims
+            // a run no daemon served.
+            ("no close", |_| {}),
+            // The service ran a read the stream does not show.
+            ("an operation not in the stream", |conn| {
+                served_and_closed(conn, 2)
+            }),
+            // A commitment no operation accounts for.
+            ("an unaccounted commitment", |conn| {
+                served_and_closed(conn, 1);
+                conn.execute(
+                    "INSERT INTO automation_scoped_read_commitments (
+                        attempt_id, channel_id, sequence, tool, outcome, refusal,
+                        result_digest, result_bytes, committed_at
+                     ) VALUES ('attempt.daily-notes-1-1', 'channel', 2, 'read_file',
+                               'withheld', 'attempt_closed', NULL, NULL,
+                               '2026-09-03T12:06:00.000Z')",
+                    [],
+                )
+                .unwrap();
+            }),
+        ];
+        for (what, setup) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let conn = seed_scoped(temp.path(), &scoped_read_run());
+            setup(&conn);
+            assert_eq!(
+                record(&conn, SESSION_ID, TerminalOutcome::Succeeded, ended_at()),
+                Recorded::Stored,
+                "{what}"
+            );
+            // Partial coverage also leaves delivery unobserved, so the
+            // evidence is never receipt eligible.
+            let held = classification(&conn);
+            assert!(
+                matches!(
+                    held,
+                    RuntimeTerminalEvidenceClassification::AuthenticatedPartialOrAmbiguous
+                        | RuntimeTerminalEvidenceClassification::AuthenticatedUnknown
+                ),
+                "{what}: {held:?}"
+            );
+            let log = std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(temp.path()))
+                .unwrap_or_default();
+            assert!(log.contains("do not reconcile"), "{what}: {log}");
+        }
     }
 }

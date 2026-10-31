@@ -142,14 +142,20 @@ impl Channel {
             thread::Builder::new()
                 .name("scoped-read-channel".to_owned())
                 .spawn(move || {
+                    // A service that never runs still tells its gate that no
+                    // call was made.
+                    let unserved = |service: Service| {
+                        service.end_unserved();
+                        Vec::new()
+                    };
                     let Some(stream) = accept(&listener, &channel_token, &closed) else {
-                        return Vec::new();
+                        return unserved(service);
                     };
                     // One connection only: nothing can join after the relay.
                     drop(listener);
                     let _ = fs::remove_file(&socket);
                     let Ok(held) = stream.try_clone() else {
-                        return Vec::new();
+                        return unserved(service);
                     };
                     *connection
                         .lock()
@@ -157,10 +163,10 @@ impl Channel {
                     // A close that ran before the connection was held has
                     // nothing to shut down, so look again.
                     if closed.load(Ordering::SeqCst) {
-                        return Vec::new();
+                        return unserved(service);
                     }
                     let Ok(input) = stream.try_clone() else {
-                        return Vec::new();
+                        return unserved(service);
                     };
                     let operations = service.run(BufReader::new(input), stream);
                     // The held handle would keep the relay's end open.
@@ -269,6 +275,11 @@ impl Gate for Closing {
             return Err(Refusal::AttemptClosed);
         }
         self.inner.commit(committing)
+    }
+
+    /// Recorded whether or not the channel has closed.
+    fn close(&mut self, operations: &[Operation]) {
+        self.inner.close(operations);
     }
 }
 

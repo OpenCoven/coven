@@ -23,6 +23,10 @@
 //!
 //! A row holds the result's SHA-256 and length, never its content, the path
 //! asked for, a search pattern or an entry name.
+//!
+//! When the service stops, [`StoreGate`]'s `close` records what each call did
+//! ([`super::scoped_read_settlement`]), which settlement reconciles with these
+//! rows (#1606).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -34,7 +38,7 @@ use serde_json::Value;
 
 use super::contract::authority::AuthorityProfileErrorCode;
 use super::contract::canonical_json::sha256_hex;
-use super::scoped_read::service::{Committing, Gate};
+use super::scoped_read::service::{Committing, Gate, Operation};
 use super::scoped_read::Refusal;
 
 /// One row per committed or withheld operation. Rows are never updated or
@@ -315,6 +319,8 @@ impl StoreGate {
         let conn = crate::store::open_store(&crate::api::store_path(coven_home))?;
         conn.execute_batch(SCHEMA)
             .context("failed to create the scoped read commitments table")?;
+        conn.execute_batch(super::scoped_read_settlement::SCHEMA)
+            .context("failed to create the scoped read closes table")?;
         Ok(Self {
             conn,
             held,
@@ -422,6 +428,40 @@ impl StoreGate {
     }
 }
 
+impl StoreGate {
+    /// Once the service has stopped: records the channel's close, whatever
+    /// the attempt's state, waiting at most the gate's store wait. A close
+    /// that cannot be written leaves the attempt's evidence partial, so its
+    /// run is held rather than settled; the reason goes to the daemon
+    /// recovery log.
+    pub(crate) fn close(&mut self, operations: &[Operation]) {
+        let recorded = self
+            .conn
+            .busy_timeout(self.busy)
+            .context("failed to bound the store wait")
+            .and_then(|()| {
+                super::scoped_read_settlement::record(
+                    &self.conn,
+                    &self.held.attempt_id,
+                    &self.channel_id,
+                    operations,
+                    self.clock.now(),
+                )
+            });
+        if let Err(error) = recorded {
+            if let Some(home) = super::authority_keys::store_home(&self.conn) {
+                crate::daemon::append_daemon_recovery_log(
+                    &home,
+                    &format!(
+                        "scoped read channel of attempt `{}` closed unrecorded, so its run is held: {error:#}",
+                        self.held.attempt_id
+                    ),
+                );
+            }
+        }
+    }
+}
+
 /// The wall clock, which a test can replace to move it.
 #[derive(Default)]
 struct Clock {
@@ -446,6 +486,10 @@ impl Gate for StoreGate {
 
     fn commit(&mut self, committing: &Committing<'_>) -> std::result::Result<(), Refusal> {
         StoreGate::commit(self, committing)
+    }
+
+    fn close(&mut self, operations: &[Operation]) {
+        StoreGate::close(self, operations);
     }
 }
 
