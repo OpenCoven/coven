@@ -115,7 +115,9 @@ billed. On 2.1.305:
   a home for the harness. These sit under the system's temporary folder,
   never under `COVEN_HOME`, because the harness writes into its home and the
   whole folder is removed when the launch ends. A temporary folder that
-  resolves inside `COVEN_HOME` is refused.
+  resolves inside `COVEN_HOME` is refused. The folder's name carries a
+  digest of `COVEN_HOME`, and it holds a `.coven-launch` marker naming the
+  same home, which the launch locks for the folder's life (#1607).
 - **Environment.** It builds the harness's whole environment from exactly the
   envelope's variable names. A name the daemon can't fill refuses the launch.
 - **Reader.** It builds the reader with `COVEN_HOME`, the launch folder and the
@@ -126,6 +128,51 @@ billed. On 2.1.305:
 
   A project folder inside `COVEN_HOME` is therefore refused (`root_protected`).
 - **Channel.** It opens the attempt's channel and adds `--mcp-config`.
+
+**Crash-left launch folders** (#1607). A daemon that dies without ending a
+launch leaves its folder, and the harness's home in it can hold transcripts
+of what it read. At startup, after the channel sweep, the daemon removes
+those folders from the system's temporary folder
+(`automations/scoped_read/launch_reaper.rs`):
+
+- **Eligible.** Only a folder named for this `COVEN_HOME`, opened without
+  following a link, owned by this user and closed to group and others, whose
+  regular marker names this home and whose marker lock is free. A free lock
+  means no process holds the launch: a lock ends with its process, however
+  the process ends.
+- **Retained.** Anything else with the name is left and counted: no marker,
+  another home's marker, a wider mode, a link, a file, a marker that is a
+  link, and any folder whose lock is held. The sweep never examines another
+  name in the temporary folder.
+- **Removal.** Contents are removed relative to the verified folder's handle
+  and to no-follow handles of its subfolders, so a rename or replacement
+  after verification cannot redirect a removal. A link inside is removed,
+  never followed, and a hard link removes only its own name. The marker goes
+  last. The final step, `rmdir` of the folder's name, removes only an empty
+  directory, so the final-component replacement residual of #924 cannot
+  remove data here.
+- **Bounds.** At most 64 matching folders, 200,000 entries and 5 seconds per
+  startup. A folder left part-removed keeps its marker, and the next startup
+  resumes it. A permission failure is counted and left; the sweep never
+  changes a mode.
+- **Diagnostics.** The recovery log gets one line of counts, `removed`,
+  `live`, `unattributed`, `incomplete` and `failed`, never a path or a name.
+
+Limits:
+
+- A harness process that outlives its daemon's crash loses its folder at the
+  next startup. The marker lock is the daemon's, not the harness's. The
+  harness has no channel and no authority by then: startup orphans its
+  session and sweeps its channel.
+- Folders are found in the daemon's temporary folder. If `TMPDIR` differs
+  between daemon runs, an older folder is not found.
+- `flock` must work on the temporary folder. On a filesystem where it does
+  not, launches fail to create their marker and are refused.
+- Folders from Coven builds before #1607 have no marker and are not removed.
+- Windows is out of scope, as for the rest of the scoped read service.
+
+Rollback is a revert: a folder with a marker is still removed whole when its
+launch ends, and leftovers stay retained as before.
 
 An opt-in test runs the installed Claude Code 2.1.305 through `prepare`, with
 exactly the environment and arguments it returns. The granted read is served,

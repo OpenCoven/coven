@@ -280,7 +280,8 @@ Left for follow-up, because this proposal does not cover them:
 - persisting `Prepared::finish`'s operation list, and comparing it with the
   committed rows at settlement;
 - sweeping launch folders that a crash leaves in the system temporary
-  folder.
+  folder. #1607 adds the startup reaper described in
+  [the scoped read service](coven-automations-scoped-read-service.md).
 
 ## What this proposal does not decide
 
