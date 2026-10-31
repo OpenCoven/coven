@@ -17,16 +17,17 @@ use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::assurance::{validate_public_key, verify_assurance_signature};
-use super::audit::{append_event, MobileAuditEvent};
+use super::audit::{append_event, append_policy_event, MobileAuditEvent};
 use super::config::{atomic_replace_private, ensure_private_mobile_dir, validate_private_file};
 use super::grant::{DeviceActionIntent, DeviceScope, DEVICE_ACTION_VERSION};
-use super::owner_policy::OwnerPolicyStore;
+use super::owner_policy::{InstalledPolicy, OwnerPolicyStore};
 
 const PASSKEY_FILE: &str = "passkeys.json";
 const PASSKEY_LOCK_FILE: &str = ".passkeys.lock";
-const PASSKEY_STORE_VERSION: u16 = 1;
+const PASSKEY_STORE_VERSION: u16 = 2;
 const MAX_PASSKEYS: usize = 8;
 const REGISTER_OPERATION: &str = "owner.passkey.register";
 const FLAG_USER_PRESENT: u8 = 0x01;
@@ -35,11 +36,30 @@ const FLAG_BACKUP_ELIGIBLE: u8 = 0x08;
 const FLAG_BACKUP_STATE: u8 = 0x10;
 static PASSKEY_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[derive(Debug)]
+struct PasskeyRegistrationUncertain;
+
+impl std::fmt::Display for PasskeyRegistrationUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("passkey registration outcome uncertain; reload persisted state")
+    }
+}
+
+#[derive(Debug)]
+struct PasskeyRegistrationAuditPending;
+
+impl std::fmt::Display for PasskeyRegistrationAuditPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("passkey registration committed; audit reconciliation pending")
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Runs inside registration after every check passes, before the store write.
     static BEFORE_PASSKEY_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static FAIL_AFTER_PASSKEY_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// One WebAuthn `navigator.credentials.get()` result, as the client returns it.
@@ -79,6 +99,10 @@ pub struct PasskeyCredential {
     pub backed_up: bool,
     pub sign_count: u32,
     pub registered_at: DateTime<Utc>,
+    pub owner_root_key: String,
+    pub owner_root_generation: String,
+    pub registration_transition_id: Uuid,
+    pub registration_audited_at: Option<DateTime<Utc>>,
     pub registration_action: DeviceActionIntent,
     pub root_signature: String,
 }
@@ -96,10 +120,19 @@ struct StoredPasskeys {
 struct RegistrationMaterial<'a> {
     audience: &'a str,
     owner_root_key: &'a str,
+    owner_root_generation: &'a str,
     credential_id: &'a str,
     rp_id: &'a str,
     origins: &'a [String],
     public_key_x963: &'a str,
+}
+
+impl RegistrationMaterial<'_> {
+    fn digest(&self) -> Result<String> {
+        let mut material = b"COVEN-PASSKEY/1\0".to_vec();
+        material.extend(serde_jcs::to_vec(self)?);
+        Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(material)))
+    }
 }
 
 struct PasskeyStoreLock {
@@ -145,6 +178,7 @@ impl PasskeyStore {
     }
 
     pub fn list(&self) -> Result<Vec<PasskeyCredential>> {
+        let _lock = PasskeyStoreLock::acquire(self.lock_dir()?)?;
         self.read()
     }
 
@@ -154,24 +188,33 @@ impl PasskeyStore {
         &self,
         registration: &PasskeyRegistration,
     ) -> Result<DeviceActionIntent> {
-        let root = self.owner_root()?;
+        let head = self.owner_policy()?;
+        self.registration_action_for(registration, &head)
+    }
+
+    fn registration_action_for(
+        &self,
+        registration: &PasskeyRegistration,
+        head: &InstalledPolicy,
+    ) -> Result<DeviceActionIntent> {
         let public = spki_to_x963(&registration.public_key_spki)?;
         validate_registration(registration)?;
-        let mut material = b"COVEN-PASSKEY/1\0".to_vec();
-        material.extend(serde_jcs::to_vec(&RegistrationMaterial {
+        let effect_digest = RegistrationMaterial {
             audience: &self.audience,
-            owner_root_key: &root,
+            owner_root_key: &head.owner_root_key,
+            owner_root_generation: &head.root_generation,
             credential_id: &registration.credential_id,
             rp_id: &registration.rp_id,
             origins: &registration.origins,
             public_key_x963: &public,
-        })?);
+        }
+        .digest()?;
         Ok(DeviceActionIntent {
             version: DEVICE_ACTION_VERSION,
             scope: DeviceScope::DeviceAdmin,
             operation: REGISTER_OPERATION.into(),
             target: self.audience.clone(),
-            effect_digest: URL_SAFE_NO_PAD.encode(Sha256::digest(material)),
+            effect_digest,
             nonce: URL_SAFE_NO_PAD.encode(registration.nonce),
             issued_at: registration.issued_at,
             expires_at: registration.expires_at,
@@ -191,12 +234,11 @@ impl PasskeyStore {
         // one policy lock, so a rotation cannot land between them.
         let result = self.policy_store().and_then(|policy| {
             policy.with_current_locked(|head| {
-                let root = &head
-                    .context("passkeys require an installed owner policy and root")?
-                    .owner_root_key;
+                let head = head.context("passkeys require an installed owner policy and root")?;
+                let root = &head.owner_root_key;
                 let _lock = PasskeyStoreLock::acquire(self.lock_dir()?)?;
                 let mut credentials = self.read()?;
-                let action = self.registration_action(registration)?;
+                let action = self.registration_action_for(registration, head)?;
                 if action.issued_at > now || now >= action.expires_at {
                     bail!("passkey registration is outside its validity window");
                 }
@@ -213,6 +255,10 @@ impl PasskeyStore {
                     backed_up: false,
                     sign_count: 0,
                     registered_at: now,
+                    owner_root_key: head.owner_root_key.clone(),
+                    owner_root_generation: head.root_generation.clone(),
+                    registration_transition_id: Uuid::new_v4(),
+                    registration_audited_at: None,
                     registration_action: action,
                     root_signature: root_signature.to_owned(),
                 };
@@ -233,17 +279,37 @@ impl PasskeyStore {
                 credentials.push(credential.clone());
                 #[cfg(test)]
                 BEFORE_PASSKEY_WRITE.with(|hook| hook.borrow_mut().take().map(|hook| hook()));
-                self.write(&credentials)?;
-                Ok(credential)
+                // The outbox is persisted with the credential. A replacement
+                // error can occur after rename, so it is never a rejection.
+                self.write(&credentials)
+                    .context(PasskeyRegistrationUncertain)?;
+                self.read()
+                    .context(PasskeyRegistrationAuditPending)?
+                    .into_iter()
+                    .find(|record| {
+                        record.registration_transition_id == credential.registration_transition_id
+                    })
+                    .context(PasskeyRegistrationAuditPending)
             })
         });
-        let event = if result.is_ok() {
-            MobileAuditEvent::PasskeyRegistered
-        } else {
-            MobileAuditEvent::PasskeyRegistrationRejected
-        };
-        append_event(&self.home, now, event, None).context("passkey audit delivery failed")?;
-        result
+        match result {
+            Ok(credential) => Ok(credential),
+            Err(error) => {
+                let event = if error.is::<PasskeyRegistrationUncertain>()
+                    || error.is::<PasskeyRegistrationAuditPending>()
+                {
+                    MobileAuditEvent::PasskeyRegistrationUncertain
+                } else {
+                    MobileAuditEvent::PasskeyRegistrationRejected
+                };
+                if let Err(audit_error) = append_event(&self.home, now, event, None) {
+                    return Err(
+                        error.context(format!("passkey audit delivery failed: {audit_error:#}"))
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Verifies one assertion over `challenge` and advances its sign counter.
@@ -260,6 +326,9 @@ impl PasskeyStore {
             .find(|credential| credential.credential_id == assertion.credential_id)
             .context("passkey is not registered")?;
         let verified = verify_assertion(credential, assertion, challenge)?;
+        if verified.backup_eligible != credential.backup_eligible {
+            bail!("passkey backup eligibility changed from its registered value");
+        }
         credential.sign_count = verified.sign_count;
         credential.backed_up = verified.backed_up;
         let result = credential.clone();
@@ -275,12 +344,10 @@ impl PasskeyStore {
         OwnerPolicyStore::open(&self.home, audience)
     }
 
-    fn owner_root(&self) -> Result<String> {
-        Ok(self
-            .policy_store()?
+    fn owner_policy(&self) -> Result<InstalledPolicy> {
+        self.policy_store()?
             .current()?
-            .context("passkeys require an installed owner policy and root")?
-            .owner_root_key)
+            .context("passkeys require an installed owner policy and root")
     }
 
     fn lock_dir(&self) -> Result<&Path> {
@@ -298,7 +365,7 @@ impl PasskeyStore {
                     .with_context(|| format!("failed to inspect {}", self.path.display()))
             }
         }
-        let stored: StoredPasskeys = serde_json::from_slice(
+        let mut stored: StoredPasskeys = serde_json::from_slice(
             &fs::read(&self.path)
                 .with_context(|| format!("failed to read {}", self.path.display()))?,
         )
@@ -306,29 +373,71 @@ impl PasskeyStore {
         if stored.version != PASSKEY_STORE_VERSION || stored.audience != self.audience {
             bail!("passkey store is bound to another version or installation");
         }
-        // Each credential stays self-verifying against the current root. One
-        // signed by a rotated-out root (or edited) is retired: it is skipped,
-        // never usable, and the owner re-registers it under the new root.
-        let root = self.owner_root()?;
-        let mut current = Vec::new();
-        for credential in stored.credentials {
+        // Validate every record against its captured signing root before
+        // delivering pending audit, including records retired by rotation.
+        for credential in &stored.credentials {
             validate_public_key(&credential.public_key_x963)?;
+            validate_public_key(&credential.owner_root_key)?;
+            decode(&credential.owner_root_generation, 32, 32)?;
             if credential.registration_action.operation != REGISTER_OPERATION
                 || credential.registration_action.target != self.audience
+                || credential.registration_action.scope != DeviceScope::DeviceAdmin
+                || credential.registration_transition_id.is_nil()
+                || credential
+                    .registration_audited_at
+                    .is_some_and(|at| at < credential.registered_at)
             {
                 bail!("passkey registration does not match its record");
             }
-            if verify_assurance_signature(
-                &root,
+            verify_assurance_signature(
+                &credential.owner_root_key,
                 &credential.registration_action.canonical_bytes()?,
                 &credential.root_signature,
             )
-            .is_ok()
-            {
-                current.push(credential);
+            .context("passkey registration root signature is invalid")?;
+            let digest = RegistrationMaterial {
+                audience: &self.audience,
+                owner_root_key: &credential.owner_root_key,
+                owner_root_generation: &credential.owner_root_generation,
+                credential_id: &credential.credential_id,
+                rp_id: &credential.rp_id,
+                origins: &credential.origins,
+                public_key_x963: &credential.public_key_x963,
+            }
+            .digest()?;
+            if digest != credential.registration_action.effect_digest {
+                bail!("passkey registration material does not match the signed action");
             }
         }
-        Ok(current)
+        let mut reconciled = false;
+        for credential in &mut stored.credentials {
+            if credential.registration_audited_at.is_none() {
+                // The shared audit transition writer deduplicates by UUID,
+                // including retries after audit succeeded but receipt failed.
+                append_policy_event(
+                    &self.home,
+                    credential.registration_transition_id,
+                    credential.registered_at,
+                    MobileAuditEvent::PasskeyRegistered,
+                )
+                .context(PasskeyRegistrationAuditPending)?;
+                credential.registration_audited_at = Some(credential.registered_at);
+                reconciled = true;
+            }
+        }
+        if reconciled {
+            self.write(&stored.credentials)
+                .context(PasskeyRegistrationAuditPending)?;
+        }
+        let head = self.owner_policy()?;
+        Ok(stored
+            .credentials
+            .into_iter()
+            .filter(|credential| {
+                credential.owner_root_key == head.owner_root_key
+                    && credential.owner_root_generation == head.root_generation
+            })
+            .collect())
     }
 
     fn write(&self, credentials: &[PasskeyCredential]) -> Result<()> {
@@ -338,7 +447,12 @@ impl PasskeyStore {
             credentials: credentials.to_vec(),
         })?;
         encoded.push(b'\n');
-        atomic_replace_private(&self.path, &encoded)
+        atomic_replace_private(&self.path, &encoded)?;
+        #[cfg(test)]
+        if FAIL_AFTER_PASSKEY_REPLACE.with(|fail| fail.replace(false)) {
+            bail!("injected failure after passkey replacement");
+        }
+        Ok(())
     }
 }
 
@@ -424,10 +538,13 @@ fn validate_registration(registration: &PasskeyRegistration) -> Result<()> {
             .any(|c| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
         || registration.origins.is_empty()
         || registration.origins.len() > 4
-        || registration
-            .origins
-            .iter()
-            .any(|origin| !origin.starts_with("https://") || origin.len() > 255)
+        || registration.origins.iter().any(|origin| {
+            origin.len() > 255
+                || origin.chars().any(char::is_control)
+                || url::Url::parse(origin).map_or(true, |url| {
+                    url.scheme() != "https" || url.origin().ascii_serialization() != *origin
+                })
+        })
         || lifetime <= chrono::Duration::zero()
         || lifetime > chrono::Duration::seconds(300)
     {
@@ -451,6 +568,52 @@ fn decode(value: &str, min: usize, max: usize) -> Result<Vec<u8>> {
         bail!("value is not canonical or has the wrong length");
     }
     Ok(bytes)
+}
+
+fn render_registration_review(
+    registration: &PasskeyRegistration,
+    action: &DeviceActionIntent,
+    owner: &InstalledPolicy,
+) -> Result<String> {
+    use std::fmt::Write;
+
+    let mut review = String::from("Review the exact passkey registration:\n");
+    for (name, value) in [
+        ("version", action.version.to_string()),
+        ("scope", action.scope.as_str().to_owned()),
+        ("operation", action.operation.clone()),
+        ("installation (audience)", action.target.clone()),
+        ("owner-root public key", owner.owner_root_key.clone()),
+        ("owner-root generation", owner.root_generation.clone()),
+        ("credential id", registration.credential_id.clone()),
+        (
+            "credential public key",
+            spki_to_x963(&registration.public_key_spki)?,
+        ),
+        ("relying party id", registration.rp_id.clone()),
+        ("allowed origins", registration.origins.join(", ")),
+        ("nonce", action.nonce.clone()),
+        ("effect digest", action.effect_digest.clone()),
+        (
+            "issued at",
+            action
+                .issued_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
+        (
+            "expires at",
+            action
+                .expires_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
+    ] {
+        writeln!(review, "  {name:<28} {value}")?;
+    }
+    review.push_str(
+        "  A passkey is a recovery factor, never a device. It can fill at most one approval of a\n  \
+         threshold introduction that still needs a trusted device.\n",
+    );
+    Ok(review)
 }
 
 /// Owner CLI: register a passkey the client created, after reviewing every
@@ -477,25 +640,14 @@ pub fn run_register(
         serde_json::from_slice(&read(assertion_path)?).context("passkey assertion is malformed")?;
     let key = super::policy_cli::load_owner_root(&home, root_key)?;
     let store = PasskeyStore::open(&home, super::identity::installed_host_fingerprint(&home)?)?;
-    if store.owner_root()? != super::policy_cli::public_key(&key) {
+    let owner = store.owner_policy()?;
+    if owner.owner_root_key != super::policy_cli::public_key(&key) {
         bail!("this key is not the installed owner-root credential");
     }
-    let action = store.registration_action(&registration)?;
-    println!("Review the exact passkey registration:");
-    for (name, value) in [
-        ("operation", action.operation.clone()),
-        ("installation (audience)", action.target.clone()),
-        ("credential id", registration.credential_id.clone()),
-        ("relying party id", registration.rp_id.clone()),
-        ("allowed origins", registration.origins.join(", ")),
-        ("nonce", action.nonce.clone()),
-        ("effect digest", action.effect_digest.clone()),
-    ] {
-        println!("  {name:<28} {value}");
-    }
-    println!(
-        "  A passkey is a recovery factor, never a device. It can fill at most one approval of a\n  \
-         threshold introduction that still needs a trusted device."
+    let action = store.registration_action_for(&registration, &owner)?;
+    print!(
+        "{}",
+        render_registration_review(&registration, &action, &owner)?
     );
     if !assume_yes {
         print!("Type `register` to sign this exact action with the owner-root key (anything else cancels): ");

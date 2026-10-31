@@ -487,6 +487,7 @@ fn edited_store_is_refused_on_load() {
         stored.revision,
         None,
         &stored.policy,
+        stored.root_generation.as_deref(),
     )
     .unwrap();
     value["digest"] = digest.clone().into();
@@ -562,4 +563,109 @@ fn strictness_covers_every_policy_dimension() {
         assert!(!is_at_least_as_strict(&widened, &base));
     }
     assert!(!is_at_least_as_strict(&weaker, &tighter(id)));
+}
+
+#[test]
+fn root_generation_survives_replacement_but_changes_on_reinstallation() {
+    let fixture = Fixture::new();
+    let head = fixture.install();
+    let proposal = fixture.next(&head, tighter(fixture.device_id));
+    let replaced = fixture
+        .store
+        .replace(&proposal, &fixture.root_approval(&proposal), fixture.now)
+        .unwrap();
+    assert_eq!(head.root_generation, replaced.root_generation);
+    std::fs::remove_file(fixture.policy_path()).unwrap();
+    let mut proposal = fixture.proposal(1, None, head.policy);
+    proposal.nonce = [99; 32];
+    let action = fixture
+        .store
+        .install_action(&public(&fixture.root), &proposal)
+        .unwrap();
+    let reinstalled = fixture
+        .store
+        .install(
+            &public(&fixture.root),
+            &proposal,
+            &sign(&fixture.root, &action.canonical_bytes().unwrap()),
+            fixture.now,
+        )
+        .unwrap();
+    assert_ne!(head.root_generation, reinstalled.root_generation);
+}
+
+#[test]
+fn legacy_root_signed_heads_verify_and_carry_their_generation_forward() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let mut stored = fixture.store.read().unwrap().unwrap();
+    stored.root_generation = None;
+    stored.digest = transition_digest(
+        &stored.audience,
+        &stored.owner_root_key,
+        stored.revision,
+        stored.previous_digest.as_deref(),
+        &stored.policy,
+        None,
+    )
+    .unwrap();
+    let StoredApproval::OwnerRoot { action, signature } = &mut stored.approval else {
+        panic!("root install expected")
+    };
+    action.effect_digest = stored.digest.clone();
+    *signature = sign(&fixture.root, &action.canonical_bytes().unwrap());
+    let bytes = encode(&stored).unwrap();
+    assert!(!String::from_utf8(bytes.clone())
+        .unwrap()
+        .contains("rootGeneration"));
+    atomic_replace_private(&fixture.policy_path(), &bytes).unwrap();
+    let head = fixture.store.current().unwrap().unwrap();
+    let proposal = fixture.next(&head, tighter(fixture.device_id));
+    let replaced = fixture
+        .store
+        .replace(&proposal, &fixture.root_approval(&proposal), fixture.now)
+        .unwrap();
+    assert_eq!(head.root_generation, replaced.root_generation);
+    assert_eq!(
+        fixture.store.read().unwrap().unwrap().root_generation,
+        Some(head.root_generation)
+    );
+}
+
+#[test]
+fn changing_or_removing_a_root_approved_generation_invalidates_its_signature() {
+    let fixture = Fixture::new();
+    fixture.install();
+    let original = fixture.store.read().unwrap().unwrap();
+    for generation in [Some(URL_SAFE_NO_PAD.encode([8; 32])), None] {
+        let mut stored = original.clone();
+        stored.root_generation = generation;
+        stored.digest = transition_digest(
+            &stored.audience,
+            &stored.owner_root_key,
+            stored.revision,
+            stored.previous_digest.as_deref(),
+            &stored.policy,
+            stored.root_generation.as_deref(),
+        )
+        .unwrap();
+        let StoredApproval::OwnerRoot { action, .. } = &mut stored.approval else {
+            panic!("root install expected")
+        };
+        action.effect_digest = stored.digest.clone();
+        atomic_replace_private(&fixture.policy_path(), &encode(&stored).unwrap()).unwrap();
+        assert!(format!("{:#}", fixture.store.current().unwrap_err()).contains("root signature"));
+        if stored.root_generation.is_none() {
+            let mut null_field = serde_json::to_value(&stored).unwrap();
+            null_field["rootGeneration"] = serde_json::Value::Null;
+            atomic_replace_private(
+                &fixture.policy_path(),
+                &serde_json::to_vec(&null_field).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                format!("{:#}", fixture.store.current().unwrap_err()).contains("root signature")
+            );
+        }
+    }
 }

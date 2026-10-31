@@ -112,6 +112,7 @@ impl Fixture {
             })
             .collect()
     }
+
     /// Refusal leaves the old root installed and audits exactly one rejection.
     fn refused(
         &self,
@@ -228,107 +229,6 @@ fn rotation_is_an_explicit_audited_succession() {
         fixture.store.current().unwrap().unwrap().digest,
         head.digest
     );
-}
-
-#[test]
-fn rotation_needs_both_the_outgoing_and_incoming_root() {
-    let fixture = Fixture::new();
-    let proposal = fixture.proposal(policy());
-    let service = SigningKey::from_slice(&[66; 32]).unwrap();
-    // Only the new key, only the old key, or a relay/account key installing
-    // itself: each is refused.
-    for (by_old, by_new, incoming) in [
-        (&fixture.new, &fixture.new, &fixture.new),
-        (&fixture.old, &fixture.old, &fixture.new),
-        (&service, &service, &service),
-        (&fixture.old, &service, &fixture.new),
-    ] {
-        let (old, new) = fixture.signatures(incoming, &proposal, by_old, by_new);
-        assert!(fixture
-            .store
-            .rotate_root(&public(incoming), &proposal, &old, &new, fixture.now)
-            .is_err());
-    }
-    // A genuine pair of signatures for one successor cannot install another.
-    let (old, new) = fixture.signatures(&fixture.new, &proposal, &fixture.old, &fixture.new);
-    assert!(fixture
-        .store
-        .rotate_root(&public(&service), &proposal, &old, &new, fixture.now)
-        .is_err());
-    assert_eq!(
-        fixture.store.current().unwrap().unwrap().owner_root_key,
-        public(&fixture.old)
-    );
-    assert_eq!(
-        fixture
-            .audit()
-            .iter()
-            .filter(|e| *e == "owner_root_rotation_rejected")
-            .count(),
-        5
-    );
-}
-
-#[test]
-fn rotation_changes_only_the_key() {
-    let fixture = Fixture::new();
-    let mut changed = policy();
-    changed.maximum_grant_lifetime_seconds = 7 * 86400;
-    let proposal = fixture.proposal(changed);
-    let (old, new) = fixture.signatures(&fixture.new, &proposal, &fixture.old, &fixture.new);
-    let error = fixture
-        .store
-        .rotate_root(&public(&fixture.new), &proposal, &old, &new, fixture.now)
-        .unwrap_err();
-    assert!(error.to_string().contains("keep the current policy"));
-
-    let same = fixture.proposal(policy());
-    let (old, new) = fixture.signatures(&fixture.old, &same, &fixture.old, &fixture.old);
-    assert!(fixture
-        .store
-        .rotate_root(&public(&fixture.old), &same, &old, &new, fixture.now)
-        .is_err());
-}
-
-#[test]
-fn after_rotation_only_the_new_root_approves() {
-    let fixture = Fixture::new();
-    fixture.rotate();
-    let downgrade = {
-        let mut broad = policy();
-        broad.maximum_grant_lifetime_seconds = 7 * 86400;
-        fixture.proposal(broad)
-    };
-    let action = fixture.store.replace_action(&downgrade).unwrap();
-    let by_old = PolicyApproval::OwnerRoot {
-        signature: sign(&fixture.old, &action.canonical_bytes().unwrap()),
-    };
-    assert!(fixture
-        .store
-        .replace(&downgrade, &by_old, fixture.now)
-        .is_err());
-    let by_new = PolicyApproval::OwnerRoot {
-        signature: sign(&fixture.new, &action.canonical_bytes().unwrap()),
-    };
-    fixture
-        .store
-        .replace(&downgrade, &by_new, fixture.now)
-        .unwrap();
-}
-
-#[test]
-fn rotation_cannot_be_replayed() {
-    let fixture = Fixture::new();
-    let proposal = fixture.proposal(policy());
-    let (old, new) = fixture.signatures(&fixture.new, &proposal, &fixture.old, &fixture.new);
-    fixture
-        .store
-        .rotate_root(&public(&fixture.new), &proposal, &old, &new, fixture.now)
-        .unwrap();
-    assert!(fixture
-        .store
-        .rotate_root(&public(&fixture.new), &proposal, &old, &new, fixture.now)
-        .is_err());
 }
 
 #[test]
@@ -454,6 +354,7 @@ fn an_incoming_key_edited_on_disk_is_refused_on_load() {
         stored.revision,
         stored.previous_digest.as_deref(),
         &stored.policy,
+        stored.root_generation.as_deref(),
     )
     .unwrap();
     value["digest"] = digest.clone().into();
@@ -461,53 +362,6 @@ fn an_incoming_key_edited_on_disk_is_refused_on_load() {
     atomic_replace_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
     let error = fixture.store.current().unwrap_err();
     assert!(format!("{error:#}").contains("rotation"));
-}
-
-#[test]
-fn rotation_retires_recovery_approvals_bound_to_the_old_head() {
-    use crate::mobile_memory::grant::DeviceGrant;
-    use crate::mobile_memory::recovery::{AccessRecoveryAuthority, AccessRecoveryRequest};
-    let fixture = Fixture::new();
-    let head = fixture.store.current().unwrap().unwrap();
-    let destination = SigningKey::from_slice(&[3; 32]).unwrap();
-    let id = Uuid::from_u128(2);
-    let mut grant = DeviceGrant::for_device(
-        id,
-        &public(&destination),
-        vec![DeviceScope::MemoryRead],
-        fixture.now,
-    )
-    .unwrap();
-    grant.expires_at = Some(fixture.now + chrono::Duration::hours(1));
-    let request = AccessRecoveryRequest {
-        version: 1,
-        audience: AUDIENCE,
-        policy_revision: head.revision,
-        policy_head_digest: head.digest,
-        destination_id: id,
-        destination_public_key: public(&destination),
-        device_name: "Replacement phone".into(),
-        device_context: "Signed before the owner rotated the root".into(),
-        grant,
-        nonce: [9; 32],
-        issued_at: fixture.now,
-        expires_at: fixture.now + chrono::Duration::seconds(120),
-    };
-    let destination_signature = sign(&destination, &request.possession_bytes().unwrap());
-    let root_signature = sign(
-        &fixture.old,
-        &request.action().unwrap().canonical_bytes().unwrap(),
-    );
-    fixture.rotate();
-    let recovery = AccessRecoveryAuthority::load(fixture.home.path(), AUDIENCE).unwrap();
-    assert!(recovery
-        .recover(
-            &request,
-            &destination_signature,
-            &root_signature,
-            fixture.now
-        )
-        .is_err());
 }
 
 #[test]

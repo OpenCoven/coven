@@ -217,8 +217,8 @@ pub(super) fn apply_root_rotation(
     field("effect digest", action.effect_digest.clone());
     review.push_str(
         "  Devices, grants and familiars are unchanged. Signatures bound to the current\n  \
-         policy head, such as unused recovery approvals and pending introductions,\n  \
-         are retired. The policy above is unchanged.\n",
+         policy head, such as unused recovery approvals, are retired. The policy\n  \
+         above is unchanged.\n",
     );
     let answer = reader(&format!(
         "{review}Type `rotate` to sign this exact action with both keys (anything else cancels): "
@@ -386,6 +386,7 @@ struct ShownPolicy {
     revision: u64,
     digest: String,
     owner_root_key_fingerprint: String,
+    root_generation: String,
     eligible_introducers: Vec<Uuid>,
     required_approvals: u16,
     allowed_scopes: Vec<DeviceScope>,
@@ -401,6 +402,7 @@ impl From<&InstalledPolicy> for ShownPolicy {
             revision: head.revision,
             digest: head.digest.clone(),
             owner_root_key_fingerprint: key_fingerprint(&head.owner_root_key),
+            root_generation: head.root_generation.clone(),
             eligible_introducers: head.policy.eligible_introducers.clone(),
             required_approvals: head.policy.required_approvals,
             allowed_scopes: head.policy.allowed_scopes.clone(),

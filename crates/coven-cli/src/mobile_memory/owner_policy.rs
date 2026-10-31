@@ -114,6 +114,7 @@ pub struct InstalledPolicy {
     pub revision: u64,
     pub digest: String,
     pub owner_root_key: String,
+    pub root_generation: String,
     pub policy: IntroductionPolicy,
     pub committed_at: DateTime<Utc>,
 }
@@ -148,6 +149,8 @@ struct StoredOwnerPolicy {
     version: u16,
     audience: String,
     owner_root_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_generation: Option<String>,
     revision: u64,
     previous_digest: Option<String>,
     digest: String,
@@ -167,6 +170,8 @@ struct PolicyTransitionMaterial<'a> {
     revision: u64,
     previous_digest: Option<&'a str>,
     policy: &'a PolicyDocument,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_generation: Option<&'a str>,
 }
 
 fn transition_digest(
@@ -175,6 +180,7 @@ fn transition_digest(
     revision: u64,
     previous_digest: Option<&str>,
     policy: &PolicyDocument,
+    root_generation: Option<&str>,
 ) -> Result<String> {
     let mut material = b"COVEN-INTRODUCTION-POLICY/1\0".to_vec();
     material.extend(serde_jcs::to_vec(&PolicyTransitionMaterial {
@@ -184,8 +190,44 @@ fn transition_digest(
         revision,
         previous_digest,
         policy,
+        root_generation,
     })?);
     Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(material)))
+}
+
+fn fresh_root_generation(legacy_transition_digest: &str, nonce: &[u8]) -> String {
+    let mut material = b"COVEN-ROOT-GENERATION/1\0".to_vec();
+    // The transition digest already binds audience, root, revision, predecessor
+    // and policy. Its nonce distinguishes fresh installs after an explicit reset.
+    material.extend_from_slice(legacy_transition_digest.as_bytes());
+    material.extend_from_slice(nonce);
+    URL_SAFE_NO_PAD.encode(Sha256::digest(material))
+}
+
+fn effective_root_generation(stored: &StoredOwnerPolicy) -> String {
+    if let Some(generation) = &stored.root_generation {
+        return generation.clone();
+    }
+    // Legacy heads have no generation field. Bind their initial epoch to the
+    // current head and its approval nonce, not just a reusable public key.
+    let nonce = match &stored.approval {
+        StoredApproval::OwnerRoot { action, .. } | StoredApproval::RootRotation { action, .. } => {
+            &action.nonce
+        }
+        StoredApproval::Introducer { challenge, .. } => challenge,
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"COVEN-ROOT-GENERATION/LEGACY\0");
+    for field in [
+        &stored.audience,
+        &stored.owner_root_key,
+        &stored.digest,
+        nonce,
+    ] {
+        hash.update((field.len() as u32).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    URL_SAFE_NO_PAD.encode(hash.finalize())
 }
 
 /// Names every dimension on which `new` grants introduction authority that
@@ -347,7 +389,7 @@ impl OwnerPolicyStore {
                     signature: root_signature.to_owned(),
                 },
                 now,
-            );
+            )?;
             let bytes = encode(&stored)?;
             if !atomic_create_private(&self.path, &bytes).context(PolicyCommitUncertain)? {
                 bail!("introduction policy is already installed");
@@ -445,7 +487,7 @@ impl OwnerPolicyStore {
                 action.effect_digest,
                 stored_approval,
                 now,
-            );
+            )?;
             atomic_replace_private(&self.path, &encode(&stored)?).context(PolicyCommitUncertain)?;
             Ok(stored)
         })
@@ -509,7 +551,7 @@ impl OwnerPolicyStore {
                     new_signature: new_signature.to_owned(),
                 },
                 now,
-            );
+            )?;
             atomic_replace_private(&self.path, &encode(&stored)?).context(PolicyCommitUncertain)?;
             Ok(stored)
         })
@@ -608,6 +650,7 @@ impl OwnerPolicyStore {
         if let Some(previous) = &proposal.previous_digest {
             validate_digest(previous)?;
         }
+        let generation = self.generation_for(operation, owner_root_key, proposal)?;
         Ok(DeviceActionIntent {
             version: DEVICE_ACTION_VERSION,
             scope: DeviceScope::DeviceAdmin,
@@ -619,11 +662,36 @@ impl OwnerPolicyStore {
                 proposal.revision,
                 proposal.previous_digest.as_deref(),
                 &PolicyDocument::from(&proposal.policy),
+                Some(&generation),
             )?,
             nonce: URL_SAFE_NO_PAD.encode(proposal.nonce),
             issued_at: proposal.issued_at,
             expires_at: proposal.expires_at,
         })
+    }
+
+    fn generation_for(
+        &self,
+        operation: &str,
+        owner_root_key: &str,
+        proposal: &PolicyProposal,
+    ) -> Result<String> {
+        if operation == REPLACE_OPERATION {
+            return self
+                .read()?
+                .as_ref()
+                .map(effective_root_generation)
+                .context("introduction policy is not installed");
+        }
+        let legacy_digest = transition_digest(
+            &self.audience,
+            owner_root_key,
+            proposal.revision,
+            proposal.previous_digest.as_deref(),
+            &PolicyDocument::from(&proposal.policy),
+            None,
+        )?;
+        Ok(fresh_root_generation(&legacy_digest, &proposal.nonce))
     }
 
     fn record(
@@ -633,11 +701,18 @@ impl OwnerPolicyStore {
         digest: String,
         approval: StoredApproval,
         now: DateTime<Utc>,
-    ) -> StoredOwnerPolicy {
-        StoredOwnerPolicy {
+    ) -> Result<StoredOwnerPolicy> {
+        let operation = match &approval {
+            StoredApproval::RootRotation { .. } => ROTATE_OPERATION,
+            _ if proposal.revision == 1 => INSTALL_OPERATION,
+            _ => REPLACE_OPERATION,
+        };
+        let generation = self.generation_for(operation, owner_root_key, proposal)?;
+        Ok(StoredOwnerPolicy {
             version: POLICY_STORE_VERSION,
             audience: self.audience.clone(),
             owner_root_key: owner_root_key.to_owned(),
+            root_generation: Some(generation),
             revision: proposal.revision,
             previous_digest: proposal.previous_digest.clone(),
             digest,
@@ -646,7 +721,7 @@ impl OwnerPolicyStore {
             committed_at: now,
             transition_id: Uuid::new_v4(),
             audited_at: None,
-        }
+        })
     }
 
     /// Mirrors the introduction contract: rejected/uncertain outcomes are
@@ -742,7 +817,11 @@ impl OwnerPolicyStore {
             stored.revision,
             stored.previous_digest.as_deref(),
             &stored.policy,
+            stored.root_generation.as_deref(),
         )?;
+        if let Some(generation) = &stored.root_generation {
+            validate_digest(generation)?;
+        }
         if !chain_valid
             || digest != stored.digest
             || stored.transition_id.is_nil()
@@ -811,10 +890,12 @@ impl OwnerPolicyStore {
 }
 
 fn installed(stored: StoredOwnerPolicy) -> InstalledPolicy {
+    let root_generation = effective_root_generation(&stored);
     InstalledPolicy {
         revision: stored.revision,
         digest: stored.digest,
         owner_root_key: stored.owner_root_key,
+        root_generation,
         policy: stored.policy.into(),
         committed_at: stored.committed_at,
     }
