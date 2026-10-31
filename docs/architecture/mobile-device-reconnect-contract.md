@@ -4,7 +4,7 @@ source_adjacent_reason: "Defines the endpoint contract for the Rust mobile gatew
 
 # Returning-device transport contract
 
-Status: **approved by Val to proceed with implementation and validation on 2026-10-22; the outbound relay client shipped in [#1551](https://github.com/OpenCoven/coven/pull/1551) on 2026-10-28; the independent security review and the routing review remain open on [#1526](https://github.com/OpenCoven/coven/issues/1526)**.
+Status: **approved by Val to proceed with implementation and validation on 2026-10-22; the outbound relay client shipped in [#1551](https://github.com/OpenCoven/coven/pull/1551) on 2026-10-28; the wire profile and [v2 routing](#v2-routing-accepted-2026-10-30) were accepted by owner review (BunsDev, sole maintainer) on 2026-10-30 on [#1526](https://github.com/OpenCoven/coven/issues/1526); no independent third-party review has been performed, and v2 is not yet implemented**.
 
 Approval: [recorded on #1526](https://github.com/OpenCoven/coven/issues/1526#issuecomment-6349914514). The approval covers this contract direction and operator-configured endpoint policy. It is not evidence of cryptographic correctness, passing acceptance tests, or hosted deployment authorization.
 
@@ -14,15 +14,15 @@ Parent: [#787](https://github.com/OpenCoven/coven/issues/787). Read with [pairin
 
 `coven-relay` implements bounded opaque WebSocket forwarding. It does not authenticate application peers or encrypt their payloads. Its room credential controls routing only. `identity.rs` persists a P-256 host key and derives its fingerprint from the uncompressed public key, not the certificate bytes. `auth.rs` verifies signed requests and rechecks current registry/grant state before releasing a response. These remain authoritative.
 
-Since #1551, `mobile_memory/transport/` implements the candidate channel below as `Noise_NK_25519_ChaChaPoly_SHA256` with the P-256 binding, `transport/storage.rs` holds the private relay configuration and pairwise material, and `gateway/relay_runtime.rs` runs daemon-owned outbound workers. The shipped rendezvous is the v1 derivation: one room and credential per pairing, transport and 600-second slot of the host clock, with no clock-skew window, consumed-room tracking or offline recovery; a peer in another slot is never paired and recovers by rejoining the current slot. An authenticated relay channel is closed after 15 seconds without a request and the worker reconnects. The shipped behavior and its evidence are described in [`transport/README.md`](../../crates/coven-cli/src/mobile_memory/transport/README.md); the routing construction that replaces the v1 slots is the open review on #1526.
+Since #1551, `mobile_memory/transport/` implements the candidate channel below as `Noise_NK_25519_ChaChaPoly_SHA256` with the P-256 binding, `transport/storage.rs` holds the private relay configuration and pairwise material, and `gateway/relay_runtime.rs` runs daemon-owned outbound workers. The shipped rendezvous is the v1 derivation: one room and credential per pairing, transport and 600-second slot of the host clock, with no clock-skew window, consumed-room tracking or offline recovery; a peer in another slot is never paired and recovers by rejoining the current slot. An authenticated relay channel is closed after 15 seconds without a request and the worker reconnects. The shipped behavior and its evidence are described in [`transport/README.md`](../../crates/coven-cli/src/mobile_memory/transport/README.md); the routing construction that replaces the v1 slots is [v2 routing](#v2-routing-accepted-2026-10-30), accepted on #1526 and not yet implemented.
 
 The protocol architecture specifies Noise/X25519 but the existing mobile keys are P-256. Do not reinterpret, convert, replace, or silently rotate existing identity keys to fit a transport library. A reviewed binding is required.
 
 ## Approved direction and remaining review
 
 1. **Val: endpoint ownership (approved).** Use explicit operator-configured relay URLs, disabled by default, with no built-in OpenCoven endpoint. Tests use a local relay. Self-hosted operation is supported. Selecting an OpenCoven hosted endpoint, its operator and its deployment remains a separate decision.
-2. **Security review: channel profile.** Review the candidate below, including P-256-to-Noise key binding and identity confidentiality. Approve an exact wire profile and independent vectors before production implementation.
-3. **Security/product review: bootstrap and routing.** Approve an authenticated upgrade path for existing devices and a bounded rotating rendezvous scheme. Missing routing material must not prompt a recurring QR or fall back to cloud-account trust. The recovery behavior below needs explicit acceptance.
+2. **Security review: channel profile (accepted by owner review, 2026-10-30).** Review the candidate below, including P-256-to-Noise key binding and identity confidentiality. Approve an exact wire profile and independent vectors before production implementation.
+3. **Security/product review: bootstrap and routing (v2 routing accepted by owner review, 2026-10-30; bootstrap upgrade path is implemented by the follow-up issue).** Approve an authenticated upgrade path for existing devices and a bounded rotating rendezvous scheme. Missing routing material must not prompt a recurring QR or fall back to cloud-account trust. The recovery behavior below needs explicit acceptance.
 
 Record decisions with reviewer, exact document revision, scope and unresolved conditions on the contract child issue. The recorded approval permits implementation and validation of this direction. Security review must assess the concrete wire construction and evidence before delivery; hosted deployment remains a separate decision.
 
@@ -62,9 +62,81 @@ Errors and doctor expose coarse connection/authorization state only. Logs and me
 
 The current server requires both sides to already know a 32-byte room identifier and separate 32-byte credential. It is not a durable directory or an offline mailbox. Provision independent pairwise routing material over an authenticated channel; never derive it from a device name, public key, owner identifier or IP. Room credentials remain bearer routing secrets and never authorize application access. This is distinct from any application resumption credential.
 
-The routing review must specify domain-separated derivation or preprovisioned single-use rooms, rotation intervals, clock-skew windows, consumed-room tracking, restart persistence and bounded recovery when peers miss rotations. Require independent material across Covens and devices, and rotation after revocation. A stale room may at worst route an unauthenticated attempt; it cannot restore revoked authority. Do not claim seamless reconnection until restart, missed-window and prolonged-offline cases work without re-enrollment. The v1 slot derivation shipped as an explicitly interim construction; the reviewed construction replaces it before seamless-reconnect acceptance is claimed.
+The routing review must specify domain-separated derivation or preprovisioned single-use rooms, rotation intervals, clock-skew windows, consumed-room tracking, restart persistence and bounded recovery when peers miss rotations. Require independent material across Covens and devices, and rotation after revocation. A stale room may at worst route an unauthenticated attempt; it cannot restore revoked authority. Do not claim seamless reconnection until restart, missed-window and prolonged-offline cases work without re-enrollment. The v1 slot derivation shipped as an explicitly interim construction; the reviewed construction replaces it before seamless-reconnect acceptance is claimed. The accepted replacement is [v2 routing](#v2-routing-accepted-2026-10-30) below.
 
 Every reconnect performs fresh possession proof and fresh key agreement. An optional resumption handle references the pairwise device key, audience, grant and revocation generation, expires, and is usable only after fresh proof by that key. No handle skips current registry/grant checks or permits early data. Tests must steal, replay and race stale handles after policy changes. No resumption optimization is needed to eliminate recurring QR, but the sender-constrained resumption contract and its evidence remain required by #787.
+
+## v2 routing (accepted 2026-10-30)
+
+This section is the routing construction proposed on #1526 ([proposal](https://github.com/OpenCoven/coven/issues/1526#issuecomment-6468641453), [architectural evaluation](https://github.com/OpenCoven/coven/issues/1526#issuecomment-6481038221), [revision 2](https://github.com/OpenCoven/coven/issues/1526#issuecomment-6481069847)). The reviewer, BunsDev ([recorded](https://github.com/OpenCoven/coven/issues/1526#issuecomment-6513213577)), accepted it on 2026-10-30 with the scope wire profile plus routing. The decision covers Option A with the host-proof `(g, c, k)` binding, `W = 4`, a global listener cap of 512, direct-only recovery, and a crash-consistency guarantee with a restore ceremony. It also confirms that the `Noise_NK_25519_ChaChaPoly_SHA256` / P-256 binding is unchanged. This is an owner review, not an independent third-party cryptographic review. The values here are frozen. Changing any of them needs a new decision on the contract issue. Implementation belongs to a follow-up issue. The shipped v1 code and the evidence from #1551 and #1620 are unchanged.
+
+### State and derivation
+
+Routing state is kept per pairing and per transport (`direct` or `relay`), in generation `g`. The device stores `d`, the next room it will try, and `f`, the highest host floor it has authenticated. Coven stores `c`, its committed floor; every room below `c` is consumed. All three start at `0` and are written durably with the 32-byte `routing_seed` and `g` in one authenticated provisioning handover. No room depends on the clock.
+
+```
+PRK  = HKDF-SHA256-Extract(salt = "coven.mobile.rendezvous.v2", IKM = routing_seed)
+info = lp(transport) ‖ lp(label) ‖ u64be(g) ‖ u64be(n)        lp(x) = u8(len(x)) ‖ x
+room = HKDF-SHA256-Expand(PRK, info with label "room", 32)
+cred = HKDF-SHA256-Expand(PRK, info with label "credential", 32)
+```
+
+`transport` is the ASCII string `direct` or `relay`. v1 vectors stay valid for v1 only; v2 adds separate vectors.
+
+### Consumption ordering
+
+Coven serves rooms `[c, c+W)`. Before connecting, the device requires `d − f < W` and uses `k = d`.
+
+1. Coven's possession proof in room `k` binds `(g, c, k)` into its signed deterministic CBOR, alongside the fields in [the connection sequence](#candidate-channel-for-security-review).
+2. The device verifies the host proof and rejects it if `c > k`. In one durable write it sets `d = k+1` and `f = max(f, c)`. It then sends its own proof. If the write fails or is uncertain, it aborts without sending anything.
+3. Coven verifies the device proof and takes the per-pairing lock. It re-reads `(g, c)`, rejects the attempt if `g` changed or `k < c`, and rechecks the registry and grant. It then durably sets `c = k+1`, which consumes every room through `k`, releases the lock and sends the completion acknowledgment.
+
+No counter moves on a relay join, a Noise message or any traffic before the peer is authenticated, so forged or unauthenticated traffic cannot advance either counter. A failed attempt before step 2 retries the same room. Completion acknowledgments are advisory: the next host proof carries `c`, so lost completions do not exhaust the window. Only one consuming attempt per pairing and transport is in flight, serialized across tasks and processes by `.transport.lock`.
+
+A durable write is: write a temporary file, `fsync` it, rename it into place, then `fsync` the directory. Any error at any of these steps is uncertain, and the side aborts before its next protocol message. Every surviving image is safe:
+
+- the device's old `d` retries a room Coven has not committed;
+- the device's new `d`, or Coven's old `c`, leaves the device inside the window;
+- Coven's new `c` matches the device.
+
+Counters never wrap. If `k+1` or `c+W` would overflow `u64`, the pairing requires a generation handover. If `g+1` would overflow, it requires re-pairing.
+
+### Window and budget
+
+`W = 4`. It tolerates three device-only advances followed by a successful fourth attempt. It is a margin for mobile failures, not protection against relay malice. Measured reconnect behavior is part of the delivery evidence, and if the measurements contradict `W = 4`, changing it needs a new decision. A relay that forwards a genuine host proof and drops the device proof can advance the device by one room per attempt. After `W` such attempts the device moves to recovery. This bounded denial of service is accepted; it needs no key compromise, and it exhausts nothing beyond one pairing's window.
+
+Coven listens on at most `W` rooms per pairing, per transport, per endpoint. At the current 32-pairing worker cap that is 128 rooms on one endpoint, or 512 across four endpoints. The global listener cap is 512 rooms per Coven installation across all endpoints. It is configurable downward only. Past the cap, Coven refuses new listeners instead of evicting ones it already holds. The existing connect budget and jittered backoff still apply to handshakes. Concurrent joins are correlatable by the relay; this falls within the existing no-traffic-analysis-anonymity boundary. The challenge lifetime is a 30-second monotonic deadline.
+
+### Recovery, rotation and rollback
+
+Recovery is **direct-channel only**:
+
+- **Intact counters:** over a pinned authenticated direct channel, the device sends `d` and Coven sends `c`. Coven durably sets `c = max(c, d)` and replies `(g, c)`. The device sets `d = f = c`. Neither side lowers a counter or reopens a consumed room.
+- **Missing, corrupt or uncertain state:** a generation handover. Coven durably writes a pending `(g+1, seed)` and sends it. The device durably adopts it with zeroed counters and acknowledges. Coven then commits `g+1`, which closes every generation-`g` room. Until the commit, Coven resends the same pending value. The device accepts that value again and rejects any other `g+1`, and Coven rejects any generation below its committed `g`.
+
+A device that is offline for months resumes at its stored `d` while its grant and binding remain valid. A remote-only device stays unreachable after window exhaustion, state loss or an interrupted rotation until it reaches a direct path. This is a stated availability limit. Remote recovery, if required later, is a separately configured, default-off, **reusable** routing mode with its own review; it is never described as single-use.
+
+Revocation, suspension and expiry stop Coven listening on the pairing's rooms at once. A re-grant, a host or device key rotation, or a revocation-epoch change forces a generation handover. Routing never confers authority, and every connection still runs the current registry and grant checks. v1 material moves to v2 only through an authenticated handover, and there is no downgrade from v2 to v1.
+
+The guarantee is **crash consistency only**. Current-state checks, MACs and atomic writes cannot tell an authentic old snapshot from current state. Restoring host or device state from a snapshot is therefore outside the routing and revocation guarantees unless it goes through a fail-closed restore ceremony. In that ceremony the operator restore command bumps the installation revocation epoch and `g` for every pairing, re-applies revocations made after the snapshot, and leaves each pairing unusable until a fresh authenticated handover. A monotonic freshness anchor is possible later hardening; it is not part of this construction.
+
+### Evidence required before delivery
+
+These items are conditions on the implementation. Without them the decision doesn't hold.
+
+- **Fixture format:** the fixtures carry a format version that is distinct from the protocol versions. They include independent positive and negative signature vectors, full Noise transcript vectors and v2 KDF vectors. Counters `0`, `2^32` and `2^64−1` are covered as encodings only, and wrapping is forbidden.
+- **Conformance cases:**
+  - each completion dropped, independently and repeatedly;
+  - a genuine host proof forwarded and the device proof dropped `W` times;
+  - process or power loss at every write and send boundary, including uncertain errors;
+  - same-room and different-room races across processes and endpoints;
+  - stale commits after a higher counter has been consumed;
+  - restoration of host, device or joint snapshots, and missing or corrupt state;
+  - revoke, rotate or tighten during proof, commit, completion and response;
+  - overflow, and long-offline or expired-binding cases.
+- **Channel profile:** a field-for-field mapping of the current binding and prologue to the trust-domain, fingerprint, generation, validity and role requirements in [the candidate channel](#candidate-channel-for-security-review). The v2 host-proof binding changes signed bytes, so it needs review even though the Noise primitives are unchanged.
+
+The decision comment on #1526 records the reviewer, the scope, the merged SHA of this file, the fixture identity it was reviewed against, and any unresolved conditions. The fixture identity is the v1 `wire.json`, blob `9f81e440`, which has no version field. The follow-up implementation issue records the implementation tree, the versioned v2 fixtures and their hashes, and the evidence above. Any divergence from this section goes back to the contract issue; it is not fixed in code.
 
 ## Connection state, LAN and privacy
 
