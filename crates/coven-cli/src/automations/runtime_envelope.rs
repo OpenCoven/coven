@@ -261,6 +261,11 @@ impl RuntimeEnvelope {
     }
 }
 
+/// Whether the daemon launches `envelope` from its arguments.
+pub(crate) fn is_launchable(envelope: &RuntimeEnvelope) -> bool {
+    LAUNCHABLE.contains(&envelope)
+}
+
 /// The envelope whose descriptor has `digest`.
 pub(crate) fn by_descriptor_digest(digest: &str) -> Option<&'static RuntimeEnvelope> {
     ENVELOPES
@@ -295,13 +300,32 @@ pub(crate) fn for_projection(
 
 /// The envelope for a grant of exactly `capabilities` on `harness`, if v1
 /// launches one.
-// The trusted adapter (coven#857 slice 6) picks the envelope it pins with this.
 #[allow(dead_code)]
 pub(crate) fn for_grant(harness: &str, capabilities: &[&str]) -> Option<&'static RuntimeEnvelope> {
+    exactly(LAUNCHABLE, harness, capabilities)
+}
+
+/// The scoped read envelope for a grant of exactly `capabilities` on
+/// `harness`. The trusted adapter (coven#857 slice 6) pins this one, so a
+/// routine's file access is its granted scopes and nothing else. Missions
+/// keep [`for_grant`] until they move to `r0-read.2` in their own change.
+pub(crate) fn for_scoped_grant(
+    harness: &str,
+    capabilities: &[&str],
+) -> Option<&'static RuntimeEnvelope> {
+    exactly(&[&CLAUDE_R0_SCOPED_READ], harness, capabilities)
+        .filter(|envelope| envelope.service.is_some())
+}
+
+fn exactly(
+    envelopes: &[&'static RuntimeEnvelope],
+    harness: &str,
+    capabilities: &[&str],
+) -> Option<&'static RuntimeEnvelope> {
     let mut wanted: Vec<&str> = capabilities.to_vec();
     wanted.sort_unstable();
     wanted.dedup();
-    LAUNCHABLE.iter().copied().find(|envelope| {
+    envelopes.iter().copied().find(|envelope| {
         let mut held: Vec<&str> = envelope.capabilities.to_vec();
         held.sort_unstable();
         envelope.harness == harness && held == wanted
@@ -329,6 +353,30 @@ mod tests {
         );
         assert_eq!(for_grant("claude", &[]), None);
         assert_eq!(for_grant("codex", &["analysis.read"]), None);
+    }
+
+    #[test]
+    fn the_scoped_read_envelope_stays_unlaunchable() {
+        // The daemon launches what LAUNCHABLE lists from the envelope's
+        // arguments alone. r0-read.2 has no file tools of its own: until the
+        // daemon's launch path calls `trusted_launch::prepare`, listing it
+        // here would launch it without the scoped read service, its grant or
+        // its channel.
+        assert!(!LAUNCHABLE.contains(&&CLAUDE_R0_SCOPED_READ));
+    }
+
+    #[test]
+    fn the_adapter_pins_only_the_scoped_read_envelope() {
+        assert_eq!(
+            for_scoped_grant("claude", &["analysis.read"]),
+            Some(&CLAUDE_R0_SCOPED_READ)
+        );
+        assert_eq!(
+            for_scoped_grant("claude", &["analysis.read", "artifact.write"]),
+            None
+        );
+        assert_eq!(for_scoped_grant("claude", &[]), None);
+        assert_eq!(for_scoped_grant("codex", &["analysis.read"]), None);
     }
 
     #[test]

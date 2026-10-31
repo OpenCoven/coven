@@ -240,6 +240,31 @@ pub(crate) fn current_signing_key(
     Ok(key)
 }
 
+/// The directory of the store `conn` writes, which is `COVEN_HOME`: the
+/// daemon's store is `COVEN_HOME/coven.sqlite3`, and the key records live in
+/// it beside the key files.
+pub(crate) fn store_home(conn: &Connection) -> Option<PathBuf> {
+    conn.path()
+        .filter(|path| !path.is_empty())
+        .and_then(|path| Path::new(path).parent())
+        .map(Path::to_path_buf)
+}
+
+/// Creates any role's missing current key. Runtime Authority dispatch calls
+/// this before its launch transaction opens, because the producers inside
+/// that transaction only load keys, and the key store needs transactions of
+/// its own to create them.
+pub(crate) fn ensure_role_keys(
+    conn: &Connection,
+    coven_home: &Path,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    for role in AuthorityKeyRole::ALL {
+        current_signing_key(conn, coven_home, role, now)?;
+    }
+    Ok(())
+}
+
 /// The role's current key, if it has one. It creates nothing and opens no
 /// transaction, so a caller can use it inside its own write transaction.
 pub(crate) fn existing_signing_key(
@@ -357,8 +382,21 @@ pub(crate) fn revoke_key(
 }
 
 /// Every recorded key, oldest first.
+///
+/// Reading creates nothing: a store that has never held a key has none. So a
+/// daemon that only settles ordinary runs never writes this schema.
 pub(crate) fn key_records(conn: &Connection) -> Result<Vec<AuthorityKeyRecord>> {
-    ensure_authority_keys_schema(conn)?;
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                            WHERE type = 'table' AND name = 'automation_authority_keys')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to look for the authority keys table")?;
+    if !exists {
+        return Ok(Vec::new());
+    }
     let mut statement = conn
         .prepare(&format!(
             "SELECT {RECORD_COLUMNS} FROM automation_authority_keys

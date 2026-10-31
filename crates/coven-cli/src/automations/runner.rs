@@ -312,10 +312,6 @@ pub(crate) struct AutomationAuthorityRequest {
     pub runtime_id: String,
 }
 
-// The dispatch path constructs this request, but every
-// `AutomationDispatchAuthority` that reads its fields is still a test double:
-// the trusted-state adapter that consumes them in production has not landed.
-#[allow(dead_code)]
 pub(crate) struct AutomationTerminalAuthorityRequest<'a> {
     pub execution_binding: &'a AutomationExecutionBinding,
     pub receipt: &'a AutomationReceipt,
@@ -336,8 +332,6 @@ pub(crate) trait AutomationDispatchAuthority: AuthorityEvidenceVerifier {
 #[derive(Clone, Copy)]
 pub(crate) enum AutomationAuthorityMode<'a> {
     BaseV1,
-    // Production construction remains blocked until the trusted-state adapter lands.
-    #[allow(dead_code)]
     RuntimeAuthority(&'a dyn AutomationDispatchAuthority),
 }
 
@@ -357,11 +351,12 @@ struct PersistLaunchContext<'a> {
     scheduler_fence: Option<&'a super::leadership::SchedulerFence>,
 }
 
+/// How a Runtime Authority refusal before launch begins, so dispatch can
+/// record its code on the occurrence.
+const AUTHORITY_REFUSAL_PREFIX: &str = "automation authority refused dispatch: ";
+
 fn authority_refusal(error: &AuthorityProfileError) -> String {
-    format!(
-        "automation authority refused dispatch: {}",
-        error.code().as_str()
-    )
+    format!("{AUTHORITY_REFUSAL_PREFIX}{}", error.code().as_str())
 }
 
 fn authority_binding_matches_request(
@@ -1262,6 +1257,15 @@ fn dispatch_occurrence(
     cwd: &str,
     now: DateTime<Utc>,
 ) -> Result<RunOutcome, String> {
+    // A manual run carries no owner grant of its own until
+    // `occurrence.runNow.v1` (coven#857 slice 7), so a routine that declares
+    // authority runs only on its schedule.
+    if definition.authority.is_some() {
+        return Err(format!(
+            "routine `{}` declares Runtime Authority, so it runs only on its schedule",
+            definition.id
+        ));
+    }
     let mut clock = Utc::now;
     let cancelled = || false;
     let mut control = DispatchControl {
@@ -1542,7 +1546,13 @@ fn dispatch_occurrence_with_clock(
             Ok(DispatchAttempt::Deferred)
         }
         Err(error) => {
-            let reason = format!("{error:#}");
+            // A Runtime Authority launch refused after its decision was
+            // consumed is recorded under its profile code, as a refusal
+            // before launch is.
+            let reason = match error.downcast_ref::<crate::api::RuntimeAuthorityLaunchRefused>() {
+                Some(refused) => format!("{AUTHORITY_REFUSAL_PREFIX}{}", refused.code.as_str()),
+                None => format!("{error:#}"),
+            };
             let failure_class = classify_preownership_failure(&error);
             let failure_at = (control.clock)().max(now);
             let status = settle_rejected_launch(
@@ -2485,10 +2495,99 @@ fn dispatch_claimed_occurrences_inner(
             ));
             continue;
         }
+        // A manual occurrence carries no owner grant of its own until
+        // `occurrence.runNow.v1` (coven#857 slice 7), so a routine that
+        // declares authority dispatches only on its schedule.
+        if definition.authority.is_some() {
+            let kind: String = conn
+                .query_row(
+                    "SELECT kind FROM automation_occurrences WHERE id = ?1",
+                    [&occurrence_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("failed to read the occurrence kind: {error}"))?;
+            if kind != "scheduled" {
+                let reason = format!(
+                    "{automation_id}: routine declares Runtime Authority, so it runs only on its schedule"
+                );
+                settle_dispatch_occurrence(
+                    conn,
+                    &occurrence_id,
+                    Some(&reason),
+                    dispatch_now,
+                    scheduler_fence,
+                )?;
+                report.failed.push(reason);
+                continue;
+            }
+        }
+        // What the launch needs that no decision does, checked before the
+        // launch transaction decides and consumes one, so a refusal here
+        // burns none: a runtime that takes authority projections and can
+        // launch the envelope the adapter would pin, with an admitted harness
+        // version and the owner's key. A grant no envelope enforces is left
+        // to the adapter, which refuses it before deciding too.
+        if let Some(authority) = definition.authority.as_ref() {
+            let capabilities: Vec<&str> =
+                authority.capabilities.iter().map(String::as_str).collect();
+            if let Some(envelope) =
+                super::runtime_envelope::for_scoped_grant(&definition.runtime, &capabilities)
+            {
+                let preflight = if runtime.accepts_automation_authority_projection() {
+                    runtime.preflight_authority_launch(&definition.runtime, envelope)
+                } else {
+                    Err(anyhow::anyhow!(
+                        crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+                    ))
+                };
+                if let Err(error) = preflight {
+                    let reason = format!(
+                        "{automation_id}: Runtime Authority launch preflight refused: {error:#}"
+                    );
+                    settle_dispatch_occurrence(
+                        conn,
+                        &occurrence_id,
+                        Some(&reason),
+                        dispatch_now,
+                        scheduler_fence,
+                    )?;
+                    report.failed.push(reason);
+                    continue;
+                }
+            }
+        }
+        // A routine that declares authority dispatches only under Runtime
+        // Authority, through the trusted adapter, and never as an ordinary run.
+        let authority_home = if definition.authority.is_some() {
+            match prepare_runtime_authority(conn, dispatch_now) {
+                Ok(home) => Some(home),
+                Err(reason) => {
+                    let reason = format!("{automation_id}: {reason}");
+                    settle_dispatch_occurrence(
+                        conn,
+                        &occurrence_id,
+                        Some(&reason),
+                        dispatch_now,
+                        scheduler_fence,
+                    )?;
+                    report.failed.push(reason);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let trusted = authority_home
+            .as_deref()
+            .map(|home| super::trusted_authority::TrustedAuthority::new(conn, home, dispatch_now));
         let mut control = DispatchControl {
             clock: &mut clock,
             cancelled: &cancelled,
-            authority: AutomationAuthorityMode::BaseV1,
+            authority: trusted
+                .as_ref()
+                .map_or(AutomationAuthorityMode::BaseV1, |trusted| {
+                    AutomationAuthorityMode::RuntimeAuthority(trusted)
+                }),
             scheduler_fence,
         };
         match dispatch_occurrence_with_clock(
@@ -2523,10 +2622,17 @@ fn dispatch_claimed_occurrences_inner(
                 break;
             }
             Err(reason) => {
+                // A Runtime Authority refusal names only its profile code,
+                // so it is recorded; any other reason stays in the report.
+                let recorded = if reason.starts_with(AUTHORITY_REFUSAL_PREFIX) {
+                    format!("dispatch failed before runtime ownership: {reason}")
+                } else {
+                    "dispatch failed before runtime ownership".to_owned()
+                };
                 settle_dispatch_occurrence(
                     conn,
                     &occurrence_id,
-                    Some("dispatch failed before runtime ownership"),
+                    Some(&recorded),
                     dispatch_now,
                     scheduler_fence,
                 )?;
@@ -3848,12 +3954,57 @@ pub fn settle_finished_runs(
     conn: &Connection,
     now: DateTime<Utc>,
 ) -> Result<SettlementReport, String> {
-    settle_finished_runs_with(conn, now, None)
+    // Runtime Authority runs settle from terminal evidence the terminal
+    // observer signed, through the trusted adapter. Its keys are read only
+    // when such a run is waiting, so a bad key record never stops ordinary
+    // settlement. A Runtime Authority run that starts after this check is
+    // held this pass and settles on the next.
+    let Some(home) = super::authority_keys::store_home(conn) else {
+        return settle_finished_runs_with(conn, now, None);
+    };
+    let authority_running: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM automation_runs
+                            WHERE status = 'running' AND authority_profile IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to look for Runtime Authority runs: {error}"))?;
+    if !authority_running {
+        return settle_finished_runs_with(conn, now, None);
+    }
+    let observer_keys = super::authority_keys::trusted_keys(
+        conn,
+        super::authority_keys::AuthorityKeyRole::TerminalObserver,
+    )
+    .map_err(|error| format!("failed to read the terminal-observer keys: {error:#}"))?;
+    let trusted = super::trusted_authority::TrustedAuthority::new(conn, &home, now);
+    let evidence = super::ed25519_trust::Ed25519TerminalEvidenceVerifier(&observer_keys);
+    settle_finished_runs_with(
+        conn,
+        now,
+        Some(RuntimeAuthoritySettlement {
+            authority: &trusted,
+            evidence: &evidence,
+        }),
+    )
+}
+
+/// Prepares Runtime Authority for a dispatch at `now`: the daemon's
+/// `COVEN_HOME`, and every role key, created before the launch transaction
+/// opens because the trusted adapter only loads keys.
+fn prepare_runtime_authority(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<std::path::PathBuf, String> {
+    let home = super::authority_keys::store_home(conn)
+        .ok_or_else(|| "Runtime Authority needs the daemon's COVEN_HOME".to_string())?;
+    super::authority_keys::ensure_role_keys(conn, &home, now)
+        .map_err(|error| format!("failed to prepare the Runtime Authority keys: {error:#}"))?;
+    Ok(home)
 }
 
 /// What terminal settlement needs to consume Runtime Authority evidence.
-/// Production supplies none, so every terminal Runtime Authority session is
-/// held for recovery until a trusted adapter exists (coven#857).
 #[derive(Clone, Copy)]
 pub(crate) struct RuntimeAuthoritySettlement<'a> {
     pub authority: &'a dyn AutomationDispatchAuthority,
@@ -12549,5 +12700,329 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.status, "failed");
         assert!(outcome.error.as_deref().unwrap().contains("no cwd"));
+    }
+
+    // The scoped read launch is Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_routine_that_declares_authority_dispatches_only_under_runtime_authority() {
+        use crate::automations::trusted_launch::{
+            self,
+            test_support::{r0, read, read_through, scope, Fixture, GRANTED},
+        };
+        let fixture = Fixture::new();
+        fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
+        let conn = &fixture.home.conn;
+
+        // Dispatch: the owner grant, the familiar binding and the signed
+        // Threads decision, verified and consumed inside the launch
+        // transaction, pin the scoped read envelope.
+        let (run_id, launched) = fixture.dispatch("notes");
+        assert_eq!(launched.harness, "claude");
+        assert_eq!(
+            launched.projection.runtime.descriptor_digest.value.as_str(),
+            crate::automations::runtime_envelope::CLAUDE_R0_SCOPED_READ.descriptor_digest()
+        );
+        let decision_id: String = conn
+            .query_row(
+                "SELECT decision_id FROM automation_threads_decisions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(crate::automations::threads_decisions::consumed(conn, &decision_id).unwrap());
+
+        // Launch: admitted under exactly the decision's scopes.
+        let prepared = trusted_launch::prepare(conn, &fixture.launch(&launched), Utc::now())
+            .expect("the granted launch is admitted");
+        let results = read_through(prepared, &[read("notes/today.md"), read("note.txt")]);
+        assert_eq!(results[0].0["content"], GRANTED);
+        assert!(
+            results[1].1,
+            "the sibling the grant does not name is refused"
+        );
+        assert_eq!(results[1].0["refusal"], "scope_missing");
+
+        // The session ends cleanly: its stream accounts for everything, and
+        // the writer that ends it records the terminal observer's evidence.
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE id = ?1",
+                [&run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ended = Utc::now() + chrono::TimeDelta::seconds(30);
+        let event = |kind: &str, payload: serde_json::Value| crate::store::EventRecord {
+            seq: 0,
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.clone(),
+            kind: kind.to_owned(),
+            payload_json: payload.to_string(),
+            created_at: ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        let stream = crate::automations::stream_observation::test_support::stream(
+            &crate::automations::stream_observation::test_support::scoped_read_run(),
+        );
+        let transaction = conn.unchecked_transaction().unwrap();
+        crate::store::insert_event(&transaction, &event("output", json!({ "data": stream })))
+            .unwrap();
+        assert!(crate::store::update_session_terminal_if_active(
+            &transaction,
+            &session_id,
+            "completed",
+            Some(0),
+            &ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+        crate::store::insert_event(
+            &transaction,
+            &event("exit", json!({ "status": "completed", "exitCode": 0 })),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::automations::terminal_observer::record(
+                &transaction,
+                &session_id,
+                TerminalOutcome::Succeeded,
+                ended,
+            ),
+            crate::automations::terminal_observer::Recorded::Stored
+        );
+        transaction.commit().unwrap();
+
+        // Settlement consumes the evidence and settles the run through the
+        // adapter, with the launched receipt and its authority evidence.
+        let settled = settle_finished_runs(conn, ended).unwrap();
+        assert_eq!(settled.succeeded, 1, "{settled:?}");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM automation_runs WHERE id = ?1",
+                [&run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "succeeded");
+
+        // The decision was consumed once; a second consumption refuses.
+        let decided = crate::automations::threads_decisions::recorded(conn, &decision_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::automations::threads_decisions::consume_in(conn, &decided, ended).unwrap(),
+            Err(crate::automations::threads_decisions::DecisionRefusal::Replayed)
+        );
+
+        // A manual run carries no owner grant of its own yet.
+        let definition: RoutineDefinition = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT definition_json FROM automation_definitions WHERE id = 'notes'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let error = dispatch_occurrence(
+            conn,
+            &crate::api::NoopSessionRuntime,
+            &definition,
+            "occurrence.manual",
+            &fixture.project_text(),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("runs only on its schedule"), "{error}");
+    }
+
+    // The scoped read launch is Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_routine_without_authority_still_dispatches_as_base_v1() {
+        use crate::automations::trusted_launch::test_support::Fixture;
+        let fixture = Fixture::new();
+        let routine = json!({
+            "schemaVersion": 1, "id": "plain", "name": "Plain", "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
+            "overlap": "forbid", "timeoutMinutes": 30, "runtime": "claude",
+            "cwd": fixture.project_text(), "prompt": "Summarise the notes."
+        });
+        let (status, response) = crate::control_plane::route_action_with_authority(
+            json!({ "action": "coven.automations.definition.create.v1",
+                    "adoptionKey": "adopt:plain:create", "definition": routine }),
+            &fixture.home.conn,
+            &crate::api::NoopSessionRuntime,
+            crate::automations::owner_grants::CommandAuthority::OwnerLocal,
+        );
+        assert!(status == 200 && response.accepted, "{response:?}");
+        let now =
+            chrono::DurationRound::duration_trunc(Utc::now(), chrono::TimeDelta::milliseconds(1))
+                .unwrap();
+        assert!(crate::automations::occurrences::insert_claimed_occurrence(
+            &fixture.home.conn,
+            "occurrence.plain-1",
+            "plain",
+            "daemon",
+            60,
+            now,
+        )
+        .unwrap());
+        let runtime = crate::automations::trusted_launch::test_support::RecordingRuntime::default();
+        let report =
+            dispatch_claimed_occurrences_with_clock(&fixture.home.conn, &runtime, now, || now)
+                .unwrap();
+        assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
+        assert_eq!(*runtime.base.lock().unwrap(), 1);
+        assert!(
+            runtime.launched.lock().unwrap().is_empty(),
+            "a routine without authority never carries a projection"
+        );
+        let decided: i64 = fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'automation_threads_decisions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decided, 0, "no Threads decision is made for it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_corrupt_observer_key_does_not_stop_base_v1_settlement() {
+        use crate::automations::trusted_launch::test_support::{Fixture, RecordingRuntime};
+        let fixture = Fixture::new();
+        let conn = &fixture.home.conn;
+        let routine = json!({
+            "schemaVersion": 1, "id": "plain", "name": "Plain", "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest",
+            "overlap": "forbid", "timeoutMinutes": 30, "runtime": "claude",
+            "cwd": fixture.project_text(), "prompt": "Summarise the notes."
+        });
+        let (status, response) = crate::control_plane::route_action_with_authority(
+            json!({ "action": "coven.automations.definition.create.v1",
+                    "adoptionKey": "adopt:plain:create", "definition": routine }),
+            conn,
+            &crate::api::NoopSessionRuntime,
+            crate::automations::owner_grants::CommandAuthority::OwnerLocal,
+        );
+        assert!(status == 200 && response.accepted, "{response:?}");
+        fixture.schedule("plain");
+        let now = Utc::now();
+        let runtime = RecordingRuntime::default();
+        let report = dispatch_claimed_occurrences_with_clock(conn, &runtime, now, || now).unwrap();
+        assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
+        let run_id = &report.dispatched[0];
+
+        // A malformed terminal-observer key record.
+        crate::automations::authority_keys::ensure_authority_keys_schema(conn).unwrap();
+        conn.execute(
+            "INSERT INTO automation_authority_keys
+                (key_id, role, proof_ref, producer_component, producer_instance_id,
+                 public_key_der_hex, valid_from, created_at)
+             VALUES ('corrupt', 'terminal-observer', 'proof:corrupt', 'coven', 'daemon',
+                     'not-hex', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ended = now + chrono::TimeDelta::seconds(30);
+        assert!(crate::store::update_session_terminal_if_active(
+            conn,
+            &session_id,
+            "completed",
+            Some(0),
+            &ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+        let settled = settle_finished_runs(conn, ended).expect("BaseV1 settlement proceeds");
+        assert_eq!(settled.succeeded, 1, "{settled:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_adapter_refusal_is_recorded_on_the_occurrence() {
+        use crate::automations::trusted_launch::test_support::{r0, Fixture};
+        let fixture = Fixture::new();
+        // Only the project root is bound to a launch, so the adapter refuses
+        // this declaration before deciding.
+        let mut authority = r0(vec![]);
+        authority["scopes"] = json!([{ "kind": "filesystem", "root": "workspace",
+            "path": "notes/today.md", "access": "read", "recursive": false }]);
+        fixture.create("notes", authority, "ACTIVE");
+        let occurrence = fixture.schedule("notes");
+        let (report, runtime) = fixture.dispatch_pass();
+        assert!(report.dispatched.is_empty());
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        let (state, reason): (String, Option<String>) = fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT state, failure_reason FROM automation_occurrences WHERE id = ?1",
+                [&occurrence],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        let reason = reason.unwrap_or_default();
+        assert!(
+            reason.contains(AuthorityProfileErrorCode::RuntimeDowngrade.as_str()),
+            "{reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manual_occurrence_of_an_authority_routine_is_refused() {
+        use crate::automations::trusted_launch::test_support::{r0, scope, Fixture};
+        let fixture = Fixture::new();
+        fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
+        let conn = &fixture.home.conn;
+        let now = Utc::now();
+        assert!(crate::automations::occurrences::insert_claimed_occurrence(
+            conn,
+            "occurrence.notes-manual",
+            "notes",
+            "daemon",
+            60,
+            now,
+        )
+        .unwrap());
+        let (report, runtime) = fixture.dispatch_pass();
+        assert!(report.dispatched.is_empty(), "{report:?}");
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT failure_reason FROM automation_occurrences
+                 WHERE id = 'occurrence.notes-manual'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runs only on its schedule"),
+            "{reason:?}"
+        );
+        let decided: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'automation_threads_decisions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decided, 0, "no decision is made or consumed for it");
     }
 }
