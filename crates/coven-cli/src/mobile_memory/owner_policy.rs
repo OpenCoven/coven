@@ -35,6 +35,7 @@ const POLICY_STORE_VERSION: u16 = 1;
 const MAX_POLICY_ACTION_SECONDS: i64 = 300;
 const INSTALL_OPERATION: &str = "owner.introduction_policy.install";
 const REPLACE_OPERATION: &str = "owner.introduction_policy.replace";
+const ROTATE_OPERATION: &str = "owner.root.rotate";
 static POLICY_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug)]
@@ -130,6 +131,14 @@ enum StoredApproval {
         revocation_epoch: u64,
         authorization_key_id: String,
         challenge: String,
+    },
+    /// Owner-root rotation: the outgoing root authorizes succession and the
+    /// incoming root proves possession, both over the same exact action.
+    RootRotation {
+        action: DeviceActionIntent,
+        previous_owner_root_key: String,
+        previous_signature: String,
+        new_signature: String,
     },
 }
 
@@ -317,7 +326,7 @@ impl OwnerPolicyStore {
         root_signature: &str,
         now: DateTime<Utc>,
     ) -> Result<InstalledPolicy> {
-        self.audited(now, || {
+        self.audited(now, MobileAuditEvent::IntroductionPolicyRejected, || {
             let _lock = PolicyStoreLock::acquire(self.lock_dir()?)?;
             if self.read()?.is_some() {
                 bail!("introduction policy is already installed");
@@ -384,7 +393,7 @@ impl OwnerPolicyStore {
         approval: &PolicyApproval,
         now: DateTime<Utc>,
     ) -> Result<InstalledPolicy> {
-        self.audited(now, || {
+        self.audited(now, MobileAuditEvent::IntroductionPolicyRejected, || {
             let _lock = PolicyStoreLock::acquire(self.lock_dir()?)?;
             let current = self
                 .read()?
@@ -435,6 +444,70 @@ impl OwnerPolicyStore {
                 proposal,
                 action.effect_digest,
                 stored_approval,
+                now,
+            );
+            atomic_replace_private(&self.path, &encode(&stored)?).context(PolicyCommitUncertain)?;
+            Ok(stored)
+        })
+    }
+
+    /// The exact action both roots sign. It binds the incoming key, so a
+    /// signature for one successor never installs another.
+    pub fn rotation_action(
+        &self,
+        new_root_key: &str,
+        proposal: &PolicyProposal,
+    ) -> Result<DeviceActionIntent> {
+        self.action(ROTATE_OPERATION, new_root_key, proposal)
+    }
+
+    /// Owner identity rotation. The policy must be unchanged, so the event
+    /// means exactly one thing; devices, grants and familiars are untouched.
+    /// The new head digest retires every signature bound to the old head.
+    pub fn rotate_root(
+        &self,
+        new_root_key: &str,
+        proposal: &PolicyProposal,
+        previous_signature: &str,
+        new_signature: &str,
+        now: DateTime<Utc>,
+    ) -> Result<InstalledPolicy> {
+        self.audited(now, MobileAuditEvent::OwnerRootRotationRejected, || {
+            let _lock = PolicyStoreLock::acquire(self.lock_dir()?)?;
+            let current = self
+                .read()?
+                .context("introduction policy is not installed")?;
+            if proposal.revision != current.revision.saturating_add(1)
+                || proposal.previous_digest.as_deref() != Some(current.digest.as_str())
+            {
+                bail!("owner-root rotation does not extend the current chain");
+            }
+            validate_public_key(new_root_key)?;
+            if new_root_key == current.owner_root_key {
+                bail!("owner-root rotation must change the key");
+            }
+            if IntroductionPolicy::from(current.policy.clone()).digest()?
+                != proposal.policy.digest()?
+            {
+                bail!("owner-root rotation must keep the current policy");
+            }
+            let action = self.action(ROTATE_OPERATION, new_root_key, proposal)?;
+            validate_window(&action, now)?;
+            let bytes = action.canonical_bytes()?;
+            verify_assurance_signature(&current.owner_root_key, &bytes, previous_signature)
+                .context("outgoing owner-root signature is invalid")?;
+            verify_assurance_signature(new_root_key, &bytes, new_signature)
+                .context("incoming owner-root signature is invalid")?;
+            let stored = self.record(
+                new_root_key,
+                proposal,
+                action.effect_digest.clone(),
+                StoredApproval::RootRotation {
+                    action,
+                    previous_owner_root_key: current.owner_root_key.clone(),
+                    previous_signature: previous_signature.to_owned(),
+                    new_signature: new_signature.to_owned(),
+                },
                 now,
             );
             atomic_replace_private(&self.path, &encode(&stored)?).context(PolicyCommitUncertain)?;
@@ -581,6 +654,7 @@ impl OwnerPolicyStore {
     fn audited(
         &self,
         now: DateTime<Utc>,
+        rejected: MobileAuditEvent,
         commit: impl FnOnce() -> Result<StoredOwnerPolicy>,
     ) -> Result<InstalledPolicy> {
         let stored = match commit() {
@@ -589,7 +663,7 @@ impl OwnerPolicyStore {
                 let event = if error.is::<PolicyCommitUncertain>() {
                     MobileAuditEvent::IntroductionPolicyUncertain
                 } else {
-                    MobileAuditEvent::IntroductionPolicyRejected
+                    rejected
                 };
                 append_event(&self.home, now, event, None).context(format!(
                     "introduction policy change failed ({error}); audit delivery failed"
@@ -606,10 +680,10 @@ impl OwnerPolicyStore {
         mut stored: StoredOwnerPolicy,
         now: DateTime<Utc>,
     ) -> Result<InstalledPolicy> {
-        let event = if stored.revision == 1 {
-            MobileAuditEvent::IntroductionPolicyInstalled
-        } else {
-            MobileAuditEvent::IntroductionPolicyReplaced
+        let event = match (&stored.approval, stored.revision) {
+            (StoredApproval::RootRotation { .. }, _) => MobileAuditEvent::OwnerRootRotated,
+            (_, 1) => MobileAuditEvent::IntroductionPolicyInstalled,
+            _ => MobileAuditEvent::IntroductionPolicyReplaced,
         };
         append_policy_event(&self.home, stored.transition_id, stored.committed_at, event)
             .context("introduction policy committed; audit delivery pending")?;
@@ -707,6 +781,30 @@ impl OwnerPolicyStore {
                     bail!("introduction policy approval does not match its record");
                 }
             }
+            // Rotation heads re-verify both the succession and the possession
+            // signature, so an edited incoming key is refused on load.
+            StoredApproval::RootRotation {
+                action,
+                previous_owner_root_key,
+                previous_signature,
+                new_signature,
+            } => {
+                validate_public_key(previous_owner_root_key)?;
+                if stored.revision == 1
+                    || previous_owner_root_key == &stored.owner_root_key
+                    || action.operation != ROTATE_OPERATION
+                    || action.target != stored.audience
+                    || action.effect_digest != stored.digest
+                    || action.scope != DeviceScope::DeviceAdmin
+                {
+                    bail!("owner-root rotation does not match its record");
+                }
+                let bytes = action.canonical_bytes()?;
+                verify_assurance_signature(previous_owner_root_key, &bytes, previous_signature)
+                    .context("owner-root rotation succession signature is invalid")?;
+                verify_assurance_signature(&stored.owner_root_key, &bytes, new_signature)
+                    .context("owner-root rotation possession signature is invalid")?;
+            }
         }
         Ok(())
     }
@@ -752,3 +850,7 @@ fn encode(stored: &StoredOwnerPolicy) -> Result<Vec<u8>> {
 #[cfg(test)]
 #[path = "../../tests/fixtures/owner-introduction-policy/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/fixtures/owner-introduction-policy/rotation.rs"]
+mod rotation_tests;
