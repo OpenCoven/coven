@@ -936,9 +936,19 @@ fn handle_protected_route(
                     verified.device_id,
                 )?;
                 let mut provisioning = material.provisioning(&host)?;
+                // Provisioning admits the direct channel; relay endpoints and
+                // their CA material go only to a grant the relay worker would
+                // admit, so DirectOnly devices never learn them (#1614).
+                let relay_admitted = super::transport::authority::check_current(
+                    &state.registry,
+                    &material.pairing,
+                    false,
+                    Utc::now(),
+                )
+                .is_ok();
                 if let Some(config) =
                     super::transport::storage::RelayConfig::load(&state.coven_home)?
-                        .filter(|config| config.enabled)
+                        .filter(|config| relay_admitted && config.enabled)
                 {
                     provisioning.relay_endpoints = config.endpoints;
                 }
