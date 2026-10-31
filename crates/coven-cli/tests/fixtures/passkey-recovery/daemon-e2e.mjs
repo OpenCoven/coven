@@ -441,15 +441,27 @@ try {
       {},
     );
     assert.equal(challenge.status, 200, JSON.stringify(challenge));
+    assert.equal(challenge.body.ok, true, JSON.stringify(challenge));
+    assert.equal(challenge.body.protocolVersion, 1, JSON.stringify(challenge));
+    const challengeData = challenge.body.data;
+    assert.equal(
+      typeof challengeData?.challenge,
+      "string",
+      JSON.stringify(challenge),
+    );
+    assert(
+      Number.isFinite(Date.parse(challengeData?.expiresAt)),
+      JSON.stringify(challenge),
+    );
     const received = Date.now();
     while (Date.now() <= received)
       await new Promise((resolve) => setTimeout(resolve, 1));
     const step = {
-      challenge: challenge.body.challenge,
+      challenge: challengeData.challenge,
       issuedAt: new Date().toISOString(),
       expiresAt: new Date(
         Math.min(
-          Date.parse(challenge.body.expiresAt),
+          Date.parse(challengeData.expiresAt),
           Date.parse(act.expiresAt),
         ),
       ).toISOString(),
@@ -487,7 +499,8 @@ try {
   }
   const { committed, approval } = await approveIntroduction(admitted, act);
   assert.equal(committed.status, 200, JSON.stringify(committed));
-  assert.equal(committed.body.state, "introduced");
+  assert.equal(committed.body.ok, true, JSON.stringify(committed));
+  assert.equal(committed.body.data.state, "introduced");
   assert(run(["device", "list", "--json"]).includes(id));
   check("real daemon commits one trusted device plus passkey over pinned TLS");
   const replay = await request(
@@ -597,7 +610,12 @@ try {
     200,
     JSON.stringify(freshAttempt.committed),
   );
-  assert.equal(freshAttempt.committed.body.state, "introduced");
+  assert.equal(
+    freshAttempt.committed.body.ok,
+    true,
+    JSON.stringify(freshAttempt.committed),
+  );
+  assert.equal(freshAttempt.committed.body.data.state, "introduced");
   assert(run(["device", "list", "--json"]).includes(fresh.id));
   check(
     "current-root re-registration restores the factor and a fresh introduction succeeds",
