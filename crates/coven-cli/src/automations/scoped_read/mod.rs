@@ -16,11 +16,22 @@
 //!   undetected. Listings and searches leave out every entry a read would
 //!   refuse. Everything is bounded by the policy.
 //!
-//! Nothing launches this yet: the service channel, harness admission and
-//! response commitment are later steps of the same design.
+//! - [`service`] is the MCP server the harness sees: three tools over one
+//!   JSON-RPC stream, each call admitted and each response committed through
+//!   the attempt's gate before a byte of it is written.
+//! - [`channel`] is the private Unix socket between that server and the relay
+//!   the harness launches, `coven automations scoped-read-relay`.
+//!
+//! Nothing launches this yet: harness admission and response commitment
+//! under the daemon's fence are later steps of the same design.
 
+#[cfg(unix)]
+pub(crate) mod channel;
 pub(crate) mod open;
 pub(crate) mod scope;
+pub(crate) mod service;
+#[cfg(test)]
+mod service_tests;
 #[cfg(test)]
 mod tests;
 
@@ -88,6 +99,11 @@ pub(crate) enum Refusal {
     LimitCalls,
     /// The attempt has scanned all the names and file content it may.
     LimitScan,
+    /// The operation ran past its time limit or the attempt's deadline.
+    LimitTime,
+    /// The attempt was cancelled, revoked or ended, so the service serves
+    /// nothing more.
+    AttemptClosed,
     /// This platform has no reviewed race-safe open for the service.
     PlatformUnsupported,
 }
@@ -123,6 +139,8 @@ impl Refusal {
             Self::LimitAttemptDisclosure => "limit_attempt_disclosure",
             Self::LimitCalls => "limit_calls",
             Self::LimitScan => "limit_scan",
+            Self::LimitTime => "limit_time",
+            Self::AttemptClosed => "attempt_closed",
             Self::PlatformUnsupported => "platform_unsupported",
         }
     }

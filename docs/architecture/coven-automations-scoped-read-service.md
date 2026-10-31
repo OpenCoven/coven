@@ -34,10 +34,76 @@ yet. They cover:
 - listings and searches that leave out every entry a read would refuse;
 - the per-file, per-attempt, scan, call, page, depth and path-length limits.
 
-Still open: the service channel and tool schema, harness admission, response
-commitment under the revocation fence, the per-operation time limit, the
-adapter and receipts, and Windows. The vectors are engineering evidence, not
-containment certification.
+The service the harness talks to is beside them, in `service.rs` and
+`channel.rs`:
+
+- **An MCP server**, `coven`, with three tools: `read_file`, `list_directory`
+  and `search` (`coven.scoped-read.tools.v1`).
+  - Every `tools/call` request with an ID reaches the reader, an unknown tool included, so every call counts against the attempt. No-ID notifications perform no read, create no operation record and receive no response.
+  - The first terminal call-limit refusal ends the service. Its retained operation records are bounded by the call budget plus that final refusal.
+  - Each call is admitted by the attempt's gate before it runs, and its
+    result, refusals included, is committed by digest before a byte is
+    written. The text the harness receives is exactly the committed JCS text.
+  - Each operation has a 5-second response-wait limit, or less when the run's deadline is nearer. One that overruns is refused (`limit_time`), and the service stops. Its worker remains owned: channel close drains it before removing attempt resources. This limit does not interrupt filesystem work or bound draining close; a stuck filesystem operation can still hold close open.
+- **A private channel per attempt**, in a new directory under
+  `<COVEN_HOME>/runtime/scoped-read`.
+  - The directory is readable only by the owner. It holds a Unix socket and
+    the MCP configuration the harness is pointed at.
+  - That configuration names a hidden relay, `coven automations
+    scoped-read-relay`, as the only MCP server. It passes the socket and a
+    random token in the relay's environment, so neither appears in process
+    arguments.
+  - The channel serves one connection that presents the token, then closes
+    its listener.
+  - Token authentication has one total two-second deadline. Each byte consumes that same budget; a slow peer cannot restart it or keep channel close waiting beyond the remaining budget.
+  - Closing the channel and committing through the attempt's gate share one fence. If close takes it first, the result is withheld (`attempt_closed`); a commitment already holding it wins and cannot be recalled. Close releases the fence before joining the response loop and its retained reader, then removes only the files it created. Commitment still does not establish transport delivery.
+  - Failed initialization also removes the attempt entries it created, without removing unrelated entries or the shared runtime directory.
+
+The returned operation records describe reader/gate outcomes and committed response digests. They are not transport delivery receipts: a subsequent write may fail or be partial, and even a completed write does not prove harness receipt. The existing `Served` and `Refused` names refer to the reader/gate result.
+
+Two opt-in tests launch the installed Claude Code through the real relay with
+a dummy key and a local server standing in for the model, so nothing is
+billed. On 2.1.305:
+- the init event and every model request listed exactly the three service
+  tools;
+- a scripted read of a granted file returned its content;
+- a sibling the grant does not name was refused (`scope_missing`) in the same
+  run;
+- no memory file from the home folder, the launch folder or its parent reached
+  the model.
+
+**The replacement envelope, `r0-read.2`,** is described in
+`automations/runtime_envelope.rs`:
+
+- It launches claude with `--bare`, `--tools ""`, `--setting-sources ""`,
+  `--strict-mcp-config`, no session persistence and no slash commands. Only the
+  service's three tools are allowed, and the launch adds the attempt's
+  `--mcp-config`.
+- Its descriptor uses the `coven.automations.runtime-envelope.v2` profile. It
+  binds:
+  - the exact Claude Code versions proven so far, which is 2.1.305;
+  - the service's server, transport, tools version and policy, including the
+    5-second operation limit;
+  - the launch: an empty working directory, an isolated home, the owner's API
+    key, and the only environment variables passed.
+- The observer reads its stream as complete only when the init event lists
+  exactly the `coven` server, connected, and one of those versions. It also
+  knows the `ui_invalidate` event that Claude Code 2.1.304 and later emit
+  before init.
+- The opt-in claude tests launch with these very arguments. The observer reads
+  the scripted run's real stream as complete evidence of `analysis.read`.
+- **It is not launchable yet.** `for_projection` and `for_grant` still find
+  only `r0-read.1`, whose descriptor and digest are unchanged. Val decided on
+  2026-10-20 that missions, the catalog and the mission-commands conformance
+  vectors move to `r0-read.2` in a separate change, coordinated with Chat and
+  the SDK.
+
+Still open: the daemon's admission for `r0-read.2` (the version check before
+launch, the isolated launch folder and home, the API key command and file, the
+protected paths, and opening and closing the channel with the session),
+response commitment under the daemon's revocation fence, the mission switch,
+the adapter and receipts, and Windows. The vectors are engineering evidence,
+not containment certification.
 
 ### Scope operations
 
@@ -102,6 +168,9 @@ These are the points the design left open. Each is for review:
 | Content that is not text | `read_file` refuses it (`resource_not_text`); a search skips it. |
 | Platforms without a reviewed walk | Every request is refused (`platform_unsupported`). Today that is Windows. |
 | What counts against the call limit | Every call, refused ones included. Paths are limited to 32 components and 4,096 bytes. |
+| How the harness reaches the service | Through a per-attempt Unix socket in a private directory, by a relay the harness launches as its only MCP server. The socket path and token travel in the relay's environment through a 0600 configuration file, never in process arguments. One connection is served. |
+| Whether a refusal is committed | Yes. A refusal can disclose that something exists, so it passes the same gate as content. Only the gate's own `attempt_closed` is written uncommitted. |
+| What an overrun does | It refuses the call (`limit_time`) and stops the service. The worker cannot be interrupted, so no later call may share the reader with it. |
 
 ## Problem and chosen boundary
 
