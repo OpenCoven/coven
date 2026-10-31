@@ -3,6 +3,12 @@ use crate::Failure;
 
 /// Decode the exact private four-pipe libuv startup contract, not arbitrary CRT data.
 pub fn decode_node_lease(bytes: &[u8], handle_bytes: usize) -> Result<u64, Failure> {
+    Ok(decode_node_pipes(bytes, handle_bytes)?[3])
+}
+
+/// All four descriptors in stdin/stdout/stderr/control order. Native callers
+/// must duplicate noninheritable handles and validate their byte-pipe kind.
+pub fn decode_node_pipes(bytes: &[u8], handle_bytes: usize) -> Result<[u64; 4], Failure> {
     if !matches!(handle_bytes, 4 | 8)
         || bytes.len() != 8 + 4 * handle_bytes
         || bytes[..4] != 4u32.to_le_bytes()
@@ -28,7 +34,7 @@ pub fn decode_node_lease(bytes: &[u8], handle_bytes: usize) -> Result<u64, Failu
         }
         handles[fd] = handle;
     }
-    Ok(handles[3])
+    Ok(handles)
 }
 
 #[cfg(windows)]
@@ -50,6 +56,10 @@ mod tests {
     fn decodes_four_distinct_pipe_descriptors_for_both_handle_widths() {
         for width in [4, 8] {
             assert_eq!(decode_node_lease(&table(width), width), Ok(28));
+            assert_eq!(
+                decode_node_pipes(&table(width), width),
+                Ok([16, 20, 24, 28])
+            );
         }
     }
     #[test]

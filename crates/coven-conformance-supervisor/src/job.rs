@@ -314,7 +314,10 @@ pub fn spawn_suspended(
     if unsafe { IsProcessInJob(contained.process.as_raw_handle(), raw_job, &mut member) } == 0
         || member == 0
     {
-        return Err(Failure::ContainmentUnavailable);
+        // Creation succeeded, but membership is unknown. Drop requests both
+        // job and exact-root termination without proving either has completed;
+        // ordinary containment refusal would hide that cleanup uncertainty.
+        return Err(Failure::CleanupUnproven);
     }
     Ok(contained)
 }
