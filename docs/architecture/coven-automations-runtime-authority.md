@@ -10,7 +10,9 @@ that declare it, under the scoped read envelope only. The daemon launches
 that envelope only through `trusted_launch::prepare`, under the store gate
 ([gate proposal](coven-automations-scoped-read-gate-proposal.md)), so
 definitions may declare an `authority` block. The capability is not
-advertised, and containment is not certified (#858, #854).
+advertised, and containment is not certified (#858, #854). The tuple
+proposed for certification, and what its evidence does and does not claim,
+is in the [tuple proposal](coven-automations-scoped-read-tuple.md) (#1608).
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
 OpenCoven/coven-runtimes#48 (terminal observations), #858 (certification)
@@ -428,7 +430,8 @@ unadvertised until slice 6.
    - Every operation runs under a `StoreGate`. `admit` checks P and records
      nothing. `commit` checks P again and records one immutable row, inside
      one `BEGIN IMMEDIATE` transaction. If a revocation commits first, the
-     result is withheld. A busy store also withholds it.
+     result is withheld. A busy store also withholds it. Settlement holds a
+     run with a withheld read for recovery (#1608).
    - At startup the daemon sweeps channel directories that a crash left
      behind.
    - Definition validation admits an `authority` block.

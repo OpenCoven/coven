@@ -463,6 +463,16 @@ mod tests {
         );
     }
 
+    /// The tuple proposed for certification (#1608) names this digest. A
+    /// change to `r0-read.2` is a new tuple, so it must change this pin.
+    #[test]
+    fn the_scoped_read_descriptor_digest_is_pinned() {
+        assert_eq!(
+            CLAUDE_R0_SCOPED_READ.descriptor_digest(),
+            "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+        );
+    }
+
     #[test]
     fn the_scoped_read_envelope_is_described_but_not_yet_launched() {
         let digest = CLAUDE_R0_SCOPED_READ.descriptor_digest();

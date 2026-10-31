@@ -37,6 +37,7 @@ fn stand_in(program: &Path, capture: &Path) {
              pwd -P > '{capture}/cwd'\n\
              ls -A > '{capture}/entries'\n\
              env | sed 's/=.*//' > '{capture}/environment'\n\
+             for n in 3 4 5 6 7 8 9; do if (: <&$n) 2>/dev/null || (: >&$n) 2>/dev/null; then echo $n; fi; done > '{capture}/fds'\n\
              touch '{capture}/started'\n\
              while [ ! -e '{capture}/release' ]; do sleep 0.05; done\n\
              if [ -e '{capture}/stream' ]; then cat '{capture}/stream'; fi\n"
@@ -136,6 +137,10 @@ fn a_scoped_read_launch_runs_under_the_store_gate_in_an_empty_folder() {
         .map(|name| (*name).to_owned())
         .collect();
     assert_eq!(names, expected);
+    // It inherited no descriptor but its standard streams: duplicating
+    // each of 3 to 9 fails (#1608). The shell's own descriptors sit at 10
+    // and above.
+    assert_eq!(fs::read_to_string(capture.join("fds")).unwrap(), "");
 
     // Both reads were committed, and at session end the channel and the
     // launch folder are gone.
@@ -263,6 +268,25 @@ fn a_launch_refused_after_consumption_records_its_profile_code() {
 /// through its channel. Returns once the session has ended and its terminal
 /// evidence is stored.
 fn scoped_run_ending_with(fixture: &Fixture, stream: &[String]) -> LiveSessionRuntime {
+    scoped_run(
+        fixture,
+        stream,
+        |_| {},
+        |results| {
+            assert_eq!(results[0]["content"], GRANTED);
+            assert_eq!(results[1]["refusal"], "scope_missing");
+        },
+    )
+}
+
+/// [`scoped_run_ending_with`], with `before_reads` run once the harness has
+/// started and before the reads, and `check` given the reads' results.
+fn scoped_run(
+    fixture: &Fixture,
+    stream: &[String],
+    before_reads: impl FnOnce(&Fixture),
+    check: impl FnOnce(&[Value]),
+) -> LiveSessionRuntime {
     let capture = fixture
         .program
         .parent()
@@ -292,6 +316,7 @@ fn scoped_run_ending_with(fixture: &Fixture, stream: &[String]) -> LiveSessionRu
         .unwrap();
     let config: Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
     let server = &config["mcpServers"]["coven"];
+    before_reads(fixture);
     let mut input = Vec::new();
     for message in [
         json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -312,9 +337,7 @@ fn scoped_run_ending_with(fixture: &Fixture, stream: &[String]) -> LiveSessionRu
         &mut output,
     )
     .expect("the relay runs");
-    let results = tool_results(&output);
-    assert_eq!(results[0]["content"], GRANTED);
-    assert_eq!(results[1]["refusal"], "scope_missing");
+    check(&tool_results(&output));
     fs::write(capture.join("release"), "").unwrap();
     wait_for("the session's terminal evidence", || {
         fixture
@@ -424,4 +447,83 @@ fn a_commitment_no_closed_channel_accounts_for_holds_settlement() {
         "{reason:?}"
     );
     drop(runtime);
+}
+
+/// Authority withdrawn or expired while the harness runs, before it reads
+/// (#1608, work breakdown 4). The gate withholds the read and stops the
+/// service, no byte of the note reaches the harness, and settlement holds
+/// the run for recovery: the harness's stream claims both reads, and the
+/// authority a success would rest on is gone.
+#[test]
+fn a_run_whose_authority_ends_while_it_runs_reads_nothing_and_never_succeeds() {
+    type End = (&'static str, fn(&Fixture));
+    let ends: [End; 3] = [
+        ("familiar revision revoked", |fixture| {
+            fixture
+                .home
+                .conn
+                .execute(
+                    "UPDATE familiar_ledger_revisions
+                     SET status = 'revoked', revoked_at = '2026-10-30T00:00:00.000Z',
+                         revocation_reason = 'compromised'",
+                    [],
+                )
+                .unwrap();
+        }),
+        ("definition paused", |fixture| {
+            fixture
+                .home
+                .conn
+                .execute(
+                    "UPDATE automation_definitions SET lifecycle_state = 'paused'",
+                    [],
+                )
+                .unwrap();
+        }),
+        ("run timed out", |fixture| {
+            let past = (chrono::Utc::now() - chrono::TimeDelta::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            fixture
+                .home
+                .conn
+                .execute("UPDATE automation_runs SET timeout_at = ?1", [past])
+                .unwrap();
+        }),
+    ];
+    for (name, end) in ends {
+        let fixture = Fixture::new();
+        let runtime = scoped_run(&fixture, &two_reads(), end, |results| {
+            assert_eq!(results.len(), 1, "{name}: the service stops: {results:?}");
+            assert!(
+                results[0]["refusal"].is_string() && results[0].get("content").is_none(),
+                "{name}: {results:?}"
+            );
+        });
+        let served: i64 = fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_scoped_read_commitments WHERE outcome = 'served'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(served, 0, "{name}: nothing was authorized");
+        let report = crate::automations::runner::settle_finished_runs(
+            &fixture.home.conn,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let (status, receipt, reason) = run_state(&fixture);
+        assert_eq!(report.succeeded, 0, "{name}: {report:?}");
+        assert_eq!(status, "running", "{name}: held, not settled");
+        assert!(receipt.is_none(), "{name}: no receipt");
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("a scoped read was withheld")),
+            "{name}: {reason:?}"
+        );
+        drop(runtime);
+    }
 }

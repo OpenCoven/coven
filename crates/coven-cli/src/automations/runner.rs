@@ -62,6 +62,8 @@ const RUNTIME_TERMINAL_EVIDENCE_LATE_REASON: &str =
     "verified runtime terminal evidence arrived after the recovery hold; operator recovery required";
 const SCOPED_READ_UNRECONCILED_REASON: &str =
     "scoped read commitments do not reconcile with the channel's operations; recovery required";
+const SCOPED_READ_WITHHELD_REASON: &str =
+    "a scoped read was withheld because the attempt's authority ended or could not be confirmed during the run; recovery required";
 
 pub(crate) fn containment_receipt_path(coven_home: &Path, session_id: &str) -> PathBuf {
     coven_home
@@ -4621,8 +4623,8 @@ fn consume_runtime_terminal_evidence(
             // A scoped read attempt settles only when what the gate
             // authorized and what the channel did reconcile, whatever the
             // evidence says (#1606).
-            if !scoped_reads_reconciled(conn, &binding, &attempt_id)? {
-                return Ok(EvidenceConsumption::Held(SCOPED_READ_UNRECONCILED_REASON));
+            if let Some(reason) = scoped_reads_unsettled(conn, &binding, &attempt_id)? {
+                return Ok(EvidenceConsumption::Held(reason));
             }
             let settled_here = settle_from_runtime_terminal_evidence(
                 conn,
@@ -4660,21 +4662,27 @@ fn consume_runtime_terminal_evidence(
 
 /// Whether `binding`'s attempt either runs no scoped read service, or its
 /// scoped read commitments and close reconcile.
-fn scoped_reads_reconciled(
+fn scoped_reads_unsettled(
     conn: &Connection,
     binding: &AutomationExecutionBinding,
     attempt_id: &str,
-) -> Result<bool, String> {
+) -> Result<Option<&'static str>, String> {
+    use super::scoped_read_settlement::{reconcile, Discrepancy};
     let scoped = super::runtime_envelope::by_descriptor_digest(
         binding.runtime.descriptor_digest.value.as_str(),
     )
     .is_some_and(|envelope| envelope.service.is_some());
     if !scoped {
-        return Ok(true);
+        return Ok(None);
     }
-    super::scoped_read_settlement::reconcile(conn, attempt_id, None)
-        .map(|reconciled| reconciled.is_ok())
-        .map_err(|error| format!("failed to reconcile scoped read commitments: {error:#}"))
+    match reconcile(conn, attempt_id, None) {
+        Ok(Ok(_)) => Ok(None),
+        Ok(Err(Discrepancy::OperationWithheld)) => Ok(Some(SCOPED_READ_WITHHELD_REASON)),
+        Ok(Err(_)) => Ok(Some(SCOPED_READ_UNRECONCILED_REASON)),
+        Err(error) => Err(format!(
+            "failed to reconcile scoped read commitments: {error:#}"
+        )),
+    }
 }
 
 struct TerminalEvidenceSettlement<'a> {

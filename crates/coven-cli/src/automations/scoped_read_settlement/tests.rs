@@ -119,33 +119,53 @@ fn matching_commitments_and_close_reconcile() {
         Some("scope_missing"),
         Some(DIGEST),
     );
-    commit(&conn, CHANNEL, 3, "withheld", Some("attempt_closed"), None);
     close(
         &conn,
         CHANNEL,
-        &[
-            served(1, DIGEST),
-            refused(2, Refusal::ScopeMissing),
-            withheld(3),
-        ],
+        &[served(1, DIGEST), refused(2, Refusal::ScopeMissing)],
     );
-    assert_eq!(reconciled(&conn), Ok(3));
+    assert_eq!(reconciled(&conn), Ok(2));
     // The stream must show every operation the service ran.
-    assert_eq!(reconcile(&conn, ATTEMPT, Some(3)).unwrap(), Ok(3));
-    assert_eq!(reconcile(&conn, ATTEMPT, Some(4)).unwrap(), Ok(3));
+    assert_eq!(reconcile(&conn, ATTEMPT, Some(2)).unwrap(), Ok(2));
+    assert_eq!(reconcile(&conn, ATTEMPT, Some(3)).unwrap(), Ok(2));
     assert_eq!(
-        reconcile(&conn, ATTEMPT, Some(2)).unwrap(),
+        reconcile(&conn, ATTEMPT, Some(1)).unwrap(),
         Err(Discrepancy::OperationNotInStream)
     );
 }
 
+/// A withheld operation's records can agree, committed or not: a gate that
+/// refused at admit, or found the store busy, records nothing. They still
+/// never settle a run, because the authority it would rest on ended or could
+/// not be confirmed (#1608). A disagreement elsewhere is still reported as
+/// itself.
 #[test]
-fn a_withheld_operation_may_have_no_commitment() {
-    // A gate that refused at admit, or found the store busy, records nothing.
-    let conn = store();
-    commit(&conn, CHANNEL, 1, "served", None, Some(DIGEST));
-    close(&conn, CHANNEL, &[served(1, DIGEST), withheld(2)]);
-    assert_eq!(reconciled(&conn), Ok(2));
+fn a_withheld_operation_agrees_but_never_reconciles() {
+    let committed = store();
+    commit(&committed, CHANNEL, 1, "served", None, Some(DIGEST));
+    commit(
+        &committed,
+        CHANNEL,
+        2,
+        "withheld",
+        Some("attempt_closed"),
+        None,
+    );
+    close(&committed, CHANNEL, &[served(1, DIGEST), withheld(2)]);
+    assert_eq!(reconciled(&committed), Err(Discrepancy::OperationWithheld));
+    assert_eq!(
+        reconcile(&committed, ATTEMPT, Some(1)).unwrap(),
+        Err(Discrepancy::OperationNotInStream)
+    );
+
+    let unrecorded = store();
+    commit(&unrecorded, CHANNEL, 1, "served", None, Some(DIGEST));
+    close(&unrecorded, CHANNEL, &[served(1, DIGEST), withheld(2)]);
+    assert_eq!(reconciled(&unrecorded), Err(Discrepancy::OperationWithheld));
+
+    let alone = store();
+    close(&alone, CHANNEL, &[withheld(1)]);
+    assert_eq!(reconciled(&alone), Err(Discrepancy::OperationWithheld));
 }
 
 #[test]

@@ -21,6 +21,13 @@
 //! [`Discrepancy`], and the evidence stays partial: the run is held for
 //! recovery rather than settled, and nothing is replayed or invented.
 //!
+//! Records that agree still do not settle a run whose service withheld an
+//! operation (#1608). The gate withholds when it cannot confirm the
+//! attempt's authority: it was withdrawn, the run's deadline passed, or the
+//! store could not be reached. A success would rest on that authority, and
+//! whatever the harness reports after it is not evidence the service
+//! answered.
+//!
 //! Like a commitment, a close holds no file content, no path, no search
 //! pattern and no entry name.
 
@@ -144,6 +151,9 @@ pub(crate) enum Discrepancy {
     /// The service ran more operations than the harness's stream shows tool
     /// calls.
     OperationNotInStream,
+    /// The records agree, and the service withheld an operation: the
+    /// attempt's authority ended, or could not be confirmed, during the run.
+    OperationWithheld,
 }
 
 impl Discrepancy {
@@ -162,6 +172,7 @@ impl Discrepancy {
             Self::DigestMismatch => "scoped_read_digest_mismatch",
             Self::CommittedNotWritten => "scoped_read_committed_not_written",
             Self::OperationNotInStream => "scoped_read_operation_not_in_stream",
+            Self::OperationWithheld => "scoped_read_operation_withheld",
         }
     }
 }
@@ -307,6 +318,12 @@ pub(crate) fn reconcile(
     }
     if stream_calls.is_some_and(|calls| closed.len() > calls) {
         return Ok(Err(OperationNotInStream));
+    }
+    if closed
+        .iter()
+        .any(|operation| operation.outcome == "withheld")
+    {
+        return Ok(Err(OperationWithheld));
     }
     Ok(Ok(closed.len()))
 }

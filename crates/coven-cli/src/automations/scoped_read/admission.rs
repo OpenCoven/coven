@@ -14,6 +14,10 @@
 //!   harness configuration and credential folders.
 //! - The attempt's channel is opened, and the harness is pointed at its MCP
 //!   configuration.
+//! - No machine policy for the harness exists (#1608). Claude Code loads its
+//!   managed settings, managed MCP configuration and managed preferences
+//!   whatever `--setting-sources` says, and they can add hooks, permissions
+//!   and environment the envelope never granted.
 
 use std::fmt;
 use std::fs::{self, DirBuilder};
@@ -54,6 +58,84 @@ const OWNER_PROTECTED: &[&str] = &[
     ".ssh",
 ];
 
+/// Where Claude Code 2.1.305 reads machine policy on this platform. Each is
+/// loaded as `policySettings`, which the harness always adds to its setting
+/// sources, so the envelope's arguments cannot exclude it. Per-user managed
+/// preferences live in a folder per user under `/Library/Managed
+/// Preferences`, so that folder is a root too.
+#[cfg(target_os = "macos")]
+const MACHINE_POLICY: &[&str] = &[
+    "/Library/Application Support/ClaudeCode",
+    "/Library/Managed Preferences/com.anthropic.claudecode.plist",
+];
+#[cfg(not(target_os = "macos"))]
+const MACHINE_POLICY: &[&str] = &["/etc/claude-code"];
+/// The managed preferences domain, looked for in each per-user folder.
+#[cfg(target_os = "macos")]
+const MANAGED_PREFERENCES: (&str, &str) = (
+    "/Library/Managed Preferences",
+    "com.anthropic.claudecode.plist",
+);
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the machine's policy paths and managed preferences
+    /// folder in tests.
+    static MACHINE_POLICY_OVERRIDE: std::cell::RefCell<Option<(Vec<PathBuf>, Option<PathBuf>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes this thread's admissions look for machine policy at `paths`, and
+/// for per-user managed preferences under `preferences`.
+#[cfg(test)]
+pub(crate) fn set_machine_policy_for_test(paths: Vec<PathBuf>, preferences: Option<PathBuf>) {
+    MACHINE_POLICY_OVERRIDE.with(|cell| *cell.borrow_mut() = Some((paths, preferences)));
+}
+
+/// The machine policy paths, and the managed preferences folder whose
+/// per-user subfolders may hold the harness's domain.
+fn machine_policy_paths() -> (Vec<PathBuf>, Option<PathBuf>) {
+    #[cfg(test)]
+    if let Some(paths) = MACHINE_POLICY_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return paths;
+    }
+    let paths = MACHINE_POLICY.iter().map(PathBuf::from).collect();
+    #[cfg(target_os = "macos")]
+    let preferences = Some(PathBuf::from(MANAGED_PREFERENCES.0));
+    #[cfg(not(target_os = "macos"))]
+    let preferences = None;
+    (paths, preferences)
+}
+
+/// The first machine policy source that exists, or that cannot be shown
+/// absent. A path that cannot be inspected counts as present.
+fn machine_policy() -> Option<PathBuf> {
+    let present = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    let (paths, preferences) = machine_policy_paths();
+    if let Some(path) = paths.into_iter().find(|path| present(path)) {
+        return Some(path);
+    }
+    let preferences = preferences?;
+    let users = match fs::read_dir(&preferences) {
+        Ok(users) => users,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(preferences),
+    };
+    for user in users {
+        let Ok(user) = user else {
+            return Some(preferences);
+        };
+        let domain = user.path().join("com.anthropic.claudecode.plist");
+        if present(&domain) {
+            return Some(domain);
+        }
+    }
+    None
+}
+
 /// Why a scoped read launch was not admitted. Each message says what to do.
 #[derive(Debug)]
 pub(crate) enum AdmissionError {
@@ -65,6 +147,11 @@ pub(crate) enum AdmissionError {
         admitted: &'static [&'static str],
     },
     KeyMissing,
+    /// Machine policy for the harness exists at this path (#1608).
+    MachinePolicy(PathBuf),
+    /// The project folder is the filesystem root, the owner's home, or holds
+    /// the owner's home (#1608).
+    ProjectUnsupported(PathBuf),
     /// `COVEN_HOME` is too long for the channel's socket path.
     HomeTooLong {
         bytes: usize,
@@ -91,6 +178,16 @@ impl fmt::Display for AdmissionError {
             Self::KeyMissing => write!(
                 f,
                 "Runtime Authority runs need the owner's Anthropic API key; save it with `coven automations api-key set`"
+            ),
+            Self::MachinePolicy(path) => write!(
+                f,
+                "Claude Code loads machine policy from {} whatever a launch says, so Runtime Authority runs are not admitted while it exists",
+                path.display()
+            ),
+            Self::ProjectUnsupported(path) => write!(
+                f,
+                "{} is not a project folder: a Runtime Authority run may not read the filesystem root, the owner's home or a folder that holds it; launch from the project itself",
+                path.display()
             ),
             Self::HomeTooLong { bytes, limit } => write!(
                 f,
@@ -169,6 +266,10 @@ pub(in crate::automations) fn prepare(
 ) -> Result<Prepared, AdmissionError> {
     let envelope = request.envelope;
     let service = envelope.service.as_ref().ok_or(AdmissionError::NotScoped)?;
+    if let Some(path) = machine_policy() {
+        return Err(AdmissionError::MachinePolicy(path));
+    }
+    supported_project(request.project, request.owner_home)?;
     let launch = IsolatedLaunch::create(request.coven_home)?;
     let version = installed_version(request.program, &launch.home(), VERSION_TIME)?;
     if !envelope.harness_versions.contains(&version.as_str()) {
@@ -214,8 +315,9 @@ pub(in crate::automations) fn prepare(
 
 /// What admission checks that needs no grant: the envelope runs the scoped
 /// read service, `COVEN_HOME` leaves room for the channel's socket path,
-/// the installed harness reports an admitted version, and the owner's API
-/// key is saved. The trusted adapter runs this before it decides
+/// the installed harness reports an admitted version, the owner's API key
+/// is saved, and no machine policy for the harness exists. The trusted
+/// adapter runs this before it decides
 /// and consumes a Threads decision, so a refusal here burns none. Returns
 /// the version the harness reported.
 pub(crate) fn preflight(
@@ -237,6 +339,9 @@ pub(crate) fn preflight(
         });
     }
     credential::load(coven_home)?.ok_or(AdmissionError::KeyMissing)?;
+    if let Some(path) = machine_policy() {
+        return Err(AdmissionError::MachinePolicy(path));
+    }
     Ok(version)
 }
 
@@ -337,6 +442,23 @@ fn search_path(program: &Path) -> Result<String, AdmissionError> {
         Some(folder) => Ok(format!("{}:/usr/bin:/bin", text(folder)?)),
         None => Ok("/usr/bin:/bin".to_owned()),
     }
+}
+
+/// Refuses a project folder that is the filesystem root, the owner's home
+/// or a folder holding it, after links and `..` are resolved. A folder that
+/// cannot be resolved is left to the reader, which refuses it.
+fn supported_project(project: &Path, owner_home: Option<&Path>) -> Result<(), AdmissionError> {
+    let Ok(project) = fs::canonicalize(project) else {
+        return Ok(());
+    };
+    let unsupported = project.parent().is_none()
+        || owner_home
+            .and_then(|home| fs::canonicalize(home).ok())
+            .is_some_and(|home| home.starts_with(&project));
+    if unsupported {
+        return Err(AdmissionError::ProjectUnsupported(project));
+    }
+    Ok(())
 }
 
 /// What the reader refuses beyond the grant's own exclusions.
@@ -674,6 +796,175 @@ mod tests {
         assert!(
             !runtime.exists() || fs::read_dir(&runtime).unwrap().count() == 0,
             "a refused launch leaves no channel"
+        );
+    }
+
+    /// Machine policy for the harness refuses admission, at preflight and at
+    /// prepare, before anything is created; its absence admits (#1608).
+    #[test]
+    fn machine_policy_for_the_harness_refuses_the_launch() {
+        let scopes = note_scope();
+        let setup = Setup::new("2.1.305 (Claude Code)");
+        let base = setup.scratch.path().to_path_buf();
+        let folder = base.join("ClaudeCode");
+        let plist = base.join("com.anthropic.claudecode.plist");
+        let preferences = base.join("Managed Preferences");
+        let policy = || {
+            (
+                vec![folder.clone(), plist.clone()],
+                Some(preferences.clone()),
+            )
+        };
+        let refused_with = |expected: &Path| {
+            let (paths, users) = policy();
+            set_machine_policy_for_test(paths, users);
+            let error = prepare(
+                setup.request(&CLAUDE_R0_SCOPED_READ, &scopes),
+                Box::new(Open),
+            )
+            .err()
+            .expect("refused");
+            assert!(
+                matches!(&error, AdmissionError::MachinePolicy(path) if path == expected),
+                "{error}"
+            );
+            assert!(error.to_string().contains("machine policy"), "{error}");
+            assert!(matches!(
+                preflight(&setup.coven_home, &CLAUDE_R0_SCOPED_READ, &setup.program),
+                Err(AdmissionError::MachinePolicy(_))
+            ));
+            let runtime = setup.coven_home.join("runtime/scoped-read");
+            assert!(
+                !runtime.exists() || fs::read_dir(&runtime).unwrap().count() == 0,
+                "a refused launch leaves no channel"
+            );
+        };
+
+        // None of it exists: admitted.
+        let (paths, users) = policy();
+        set_machine_policy_for_test(paths, users);
+        prepare(
+            setup.request(&CLAUDE_R0_SCOPED_READ, &scopes),
+            Box::new(Open),
+        )
+        .expect("no machine policy admits")
+        .finish();
+        preflight(&setup.coven_home, &CLAUDE_R0_SCOPED_READ, &setup.program)
+            .expect("no machine policy passes preflight");
+
+        // An empty managed preferences folder holds no policy.
+        fs::create_dir_all(preferences.join("someone")).unwrap();
+        let (paths, users) = policy();
+        set_machine_policy_for_test(paths, users);
+        prepare(
+            setup.request(&CLAUDE_R0_SCOPED_READ, &scopes),
+            Box::new(Open),
+        )
+        .expect("other users' preferences hold no policy")
+        .finish();
+
+        // A per-user managed preferences domain.
+        let domain = preferences.join("someone/com.anthropic.claudecode.plist");
+        fs::write(&domain, "").unwrap();
+        refused_with(&domain);
+        fs::remove_file(&domain).unwrap();
+
+        // The device-level domain, even as a dangling link.
+        std::os::unix::fs::symlink(base.join("missing"), &plist).unwrap();
+        refused_with(&plist);
+        fs::remove_file(&plist).unwrap();
+
+        // The policy folder, empty or not.
+        fs::create_dir(&folder).unwrap();
+        refused_with(&folder);
+
+        // A path that cannot be inspected counts as present.
+        fs::remove_dir(&folder).unwrap();
+        let locked = base.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        set_machine_policy_for_test(vec![locked.join("ClaudeCode")], None);
+        let unreadable = prepare(
+            setup.request(&CLAUDE_R0_SCOPED_READ, &scopes),
+            Box::new(Open),
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(unreadable, Err(AdmissionError::MachinePolicy(_))),
+            "an uninspectable policy path refuses"
+        );
+    }
+
+    /// This machine's own policy paths are the ones Claude Code 2.1.305
+    /// reads.
+    #[test]
+    fn the_machine_policy_paths_are_the_harnesses() {
+        let (paths, preferences) = machine_policy_paths();
+        let paths: Vec<String> = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                paths,
+                [
+                    "/Library/Application Support/ClaudeCode",
+                    "/Library/Managed Preferences/com.anthropic.claudecode.plist"
+                ]
+            );
+            assert_eq!(
+                preferences,
+                Some(PathBuf::from("/Library/Managed Preferences"))
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(paths, ["/etc/claude-code"]);
+            assert_eq!(preferences, None);
+        }
+    }
+
+    /// A project folder that is the filesystem root, the owner's home, or a
+    /// folder holding the owner's home is not a project: a grant over it
+    /// reaches other users' homes and the system (#1608).
+    #[test]
+    fn a_project_folder_that_holds_the_owners_home_is_refused() {
+        let scopes = note_scope();
+        let setup = Setup::new("2.1.305 (Claude Code)");
+        let base = setup.scratch.path().to_path_buf();
+        let owner = base.join("users/owner");
+        fs::create_dir_all(owner.join("work/notes")).unwrap();
+        fs::write(owner.join("work/notes/today.md"), "granted notes").unwrap();
+        let attempt = |project: &Path| {
+            let mut request = setup.request(&CLAUDE_R0_SCOPED_READ, &scopes);
+            request.project = project;
+            request.owner_home = Some(&owner);
+            prepare(request, Box::new(Open))
+        };
+        for project in [
+            Path::new("/"),
+            owner.as_path(),
+            &base.join("users"),
+            &owner.join("work/.."),
+        ] {
+            match attempt(project) {
+                Err(AdmissionError::ProjectUnsupported(_)) => {}
+                other => panic!("{} was {:?}", project.display(), other.map(|_| ())),
+            }
+        }
+        // A folder beneath the home is a project.
+        attempt(&owner.join("work"))
+            .expect("a folder in the home")
+            .finish();
+        // So is a folder outside it.
+        attempt(&setup.project)
+            .expect("a folder elsewhere")
+            .finish();
+        let error = attempt(&owner).err().unwrap();
+        assert!(
+            error.to_string().contains("not a project folder"),
+            "{error}"
         );
     }
 }
