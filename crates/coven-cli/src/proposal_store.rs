@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs,
     io::Write,
@@ -436,6 +437,104 @@ pub(crate) fn sync_existing(path: &Path) -> Result<()> {
     crate::durable_fs::sync_file(&file)?;
     crate::durable_fs::sync_directory(&directory)
 }
+
+// Scheduler pass ordering: a durable cursor rotates bounded batches through a
+// backlog so no proposal is starved. Decisions about each candidate stay with
+// the API coordinator.
+
+fn scheduler_cursor_path(coven_home: &Path) -> PathBuf {
+    coven_home.join("pending").join(".scheduler-cursor")
+}
+
+pub(crate) fn read_scheduler_cursor(coven_home: &Path) -> Option<String> {
+    let cursor = fs::read_to_string(scheduler_cursor_path(coven_home)).ok()?;
+    let cursor = cursor.trim();
+    (!cursor.is_empty()
+        && !cursor.contains(['/', '\\'])
+        && crate::proposal_store::is_active_proposal_file(cursor))
+    .then(|| cursor.to_string())
+}
+
+pub(crate) fn write_scheduler_cursor(coven_home: &Path, cursor: &str) -> Result<()> {
+    let path = scheduler_cursor_path(coven_home);
+    let pending_dir = path
+        .parent()
+        .context("proposal scheduler cursor has no parent")?;
+    fs::create_dir_all(pending_dir)
+        .with_context(|| format!("creating {}", pending_dir.display()))?;
+    let staged = pending_dir.join(format!(".scheduler-cursor.{}.staged", Uuid::new_v4()));
+    let write_result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged)
+            .with_context(|| format!("creating proposal scheduler cursor {}", staged.display()))?;
+        file.write_all(cursor.as_bytes())
+            .with_context(|| format!("writing proposal scheduler cursor {}", staged.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing proposal scheduler cursor {}", staged.display()))?;
+        fs::rename(&staged, &path)
+            .with_context(|| format!("committing proposal scheduler cursor {}", path.display()))
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    write_result
+}
+
+fn retain_smallest_scheduler_candidate(
+    candidates: &mut BTreeMap<String, PathBuf>,
+    name: String,
+    path: PathBuf,
+) {
+    candidates.insert(name, path);
+    if candidates.len() > crate::proposal_store::PROPOSAL_SCHEDULER_BATCH_LIMIT {
+        candidates.pop_last();
+    }
+}
+
+pub(crate) fn scheduler_candidate_batch(coven_home: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let pending_dir = coven_home.join("pending");
+    crate::proposal_store::reconcile_invalid_active_names(coven_home)?;
+    let entries = match fs::read_dir(&pending_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading proposal scheduler {}", pending_dir.display()))
+        }
+    };
+    let cursor = read_scheduler_cursor(coven_home);
+    let mut after = BTreeMap::new();
+    let mut wrapped = BTreeMap::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !crate::proposal_store::is_active_proposal_file(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if cursor
+            .as_ref()
+            .is_none_or(|cursor| name.as_str() > cursor.as_str())
+        {
+            retain_smallest_scheduler_candidate(&mut after, name, path);
+        } else {
+            retain_smallest_scheduler_candidate(&mut wrapped, name, path);
+        }
+    }
+    let mut candidates: Vec<_> = after.into_iter().collect();
+    let remaining =
+        crate::proposal_store::PROPOSAL_SCHEDULER_BATCH_LIMIT.saturating_sub(candidates.len());
+    candidates.extend(wrapped.into_iter().take(remaining));
+    Ok(candidates)
+}
+
+#[cfg(test)]
+#[path = "proposal_store/scheduler_tests.rs"]
+mod scheduler_tests;
 
 #[cfg(test)]
 mod tests {
