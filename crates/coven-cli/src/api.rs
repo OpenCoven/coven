@@ -8829,6 +8829,11 @@ fn decide_threads_proposal_inner(
         if planned_request.is_some() {
             audit_reservation.replace_purpose(&reservation_purpose)?;
         }
+        // The decision claim is file- and directory-synced. Commit the
+        // reservation (and its bound purpose) durably first, or power loss can
+        // keep the claim while losing the authority a retry must reuse. On
+        // failure nothing is published; the reservation drops and is released.
+        store::durable_barrier(audit_reservation.connection())?;
         let mut claim = match PendingDecisionClaim::acquire(
             coven_home,
             proposal_uuid,

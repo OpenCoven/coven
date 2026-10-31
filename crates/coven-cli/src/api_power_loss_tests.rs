@@ -549,3 +549,137 @@ fn legacy_submission_survives_loss_of_unsynced_wal_suffix() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn decision_reservation_survives_loss_of_unsynced_wal_suffix() -> Result<()> {
+    for scheduled in [true, false] {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let database = home.join("coven.sqlite3");
+        let loss = crate::power_loss_tests::PowerLoss::observe(&database);
+        // A live keeper prevents graceful request-connection close from
+        // checkpointing NORMAL commits and hiding the power-loss defect.
+        let keeper = store::open_store(&database)?;
+        let (id, target, after) = if scheduled {
+            let (_, id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            (id, "reviewed/skill.md", b"after".as_slice())
+        } else {
+            let (_, id) = stage_pending_protected_edit(home)?;
+            (id, "SOUL.md", b"approved identity".as_slice())
+        };
+        let target = home.join("familiars/sage").join(target);
+        let before = std::fs::read(&target).ok();
+        let body = if scheduled {
+            scheduled_decision_body(home, &id, None)?
+        } else {
+            r#"{"note":"principal reviewed"}"#.to_string()
+        };
+        keeper.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let reservations = || -> Result<i64> {
+            Ok(store::open_store(&database)?.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        let reserved_before = reservations()?;
+        // Cut after the decision claim is published and before any apply
+        // intent: the claim is durable, so its reservation must be too.
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            id.clone(),
+        )));
+        let interrupted = decide_threads_proposal(home, &id, "approve", Some(&body));
+        assert!(interrupted.is_err(), "scheduled={scheduled}: {interrupted:?}");
+        keeper.execute(
+            "INSERT INTO store_meta(key, value) VALUES ('power-loss-tail', 'lost')",
+            [],
+        )?;
+        let images = loss.synced_images();
+        drop(keeper);
+        loss.restore(images)?;
+        let conn = store::open_store(&database)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM store_meta WHERE key = 'power-loss-tail'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert!(load_proposal_apply_intent(&conn, &id)?.is_none());
+        assert_eq!(
+            conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
+            1
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&target).ok(), before, "no effect before apply");
+        assert_eq!(
+            reservations()?,
+            reserved_before + 1,
+            "scheduled={scheduled}: published claim lost its decision reservation"
+        );
+        // The retry reuses the durable reservation instead of quarantining
+        // the claim as having no pre-existing authority.
+        let retry_body = if scheduled { None } else { Some(body.as_str()) };
+        let retried = decide_threads_proposal(home, &id, "approve", retry_body)?;
+        assert_eq!(
+            retried.status, 200,
+            "scheduled={scheduled}: {}",
+            retried.body
+        );
+        assert!(
+            !home.join("pending/quarantine").exists(),
+            "scheduled={scheduled}: retry must not quarantine the claim"
+        );
+        assert_eq!(std::fs::read(&target)?, after);
+    }
+    Ok(())
+}
+
+#[test]
+fn failed_decision_reservation_sync_publishes_no_claim() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let home = temp.path();
+    let database = home.join("coven.sqlite3");
+    let loss = crate::power_loss_tests::PowerLoss::observe(&database);
+    let keeper = store::open_store(&database)?;
+    let (pending, id) = stage_scheduled_reviewed_edit(
+        home,
+        coven_threads_core::ApprovalPath::HumanApproval,
+        time::OffsetDateTime::now_utc(),
+    )?;
+    let target = home.join("familiars/sage/reviewed/skill.md");
+    let before = std::fs::read(&target)?;
+    let body = scheduled_decision_body(home, &id, None)?;
+    keeper.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    // NORMAL may sync a newly created WAL's header. Prime it so the injected
+    // failure reaches the reservation barrier's FULL commit.
+    keeper.execute(
+        "INSERT INTO store_meta(key, value) VALUES ('prime-wal', 'normal')",
+        [],
+    )?;
+    loss.fail_next_sync();
+    let error = decide_threads_proposal(home, &id, "approve", Some(&body))
+        .expect_err("failed reservation sync must not proceed to the claim");
+    assert!(
+        format!("{error:#}").contains("committing durable authority evidence"),
+        "{error:#}"
+    );
+    assert!(pending.exists(), "the pending proposal must stay unclaimed");
+    assert!(find_any_pending_decision_claim(home, &id).is_none());
+    assert!(!home.join("pending/quarantine").exists());
+    assert_eq!(std::fs::read(&target)?, before);
+    let conn = store::open_store(&database)?;
+    assert!(load_proposal_apply_intent(&conn, &id)?.is_none());
+    assert!(proposal_terminal_event(&conn, &id)?.is_none());
+    drop(conn);
+    let retried = decide_threads_proposal(home, &id, "approve", Some(&body))?;
+    assert_eq!(retried.status, 200, "{}", retried.body);
+    assert_eq!(std::fs::read(&target)?, b"after");
+    Ok(())
+}
