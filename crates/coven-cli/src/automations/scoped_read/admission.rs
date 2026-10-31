@@ -356,8 +356,16 @@ fn text(path: &Path) -> Result<String, AdmissionError> {
 
 /// A launch's own folder: an empty working folder and a home for the
 /// harness, removed whole when the launch ends.
+///
+/// Its name carries a digest of `COVEN_HOME`, and it holds a marker naming the
+/// same home, locked for the folder's life. A folder a crashed daemon left
+/// behind is therefore positively identifiable, and its free lock shows that
+/// no launch owns it: [`super::launch_reaper`] removes it at the next startup.
 pub(crate) struct IsolatedLaunch {
+    // Declared first, so it is dropped first: the folder is removed while
+    // the marker is still locked.
     root: tempfile::TempDir,
+    _marker: fs::File,
 }
 
 impl IsolatedLaunch {
@@ -367,7 +375,7 @@ impl IsolatedLaunch {
 
     /// Creates the folder beneath `base`. Because it is removed whole, it may
     /// never sit inside `coven_home`, which holds the owner's state.
-    fn create_in(base: &Path, coven_home: &Path) -> anyhow::Result<Self> {
+    pub(super) fn create_in(base: &Path, coven_home: &Path) -> anyhow::Result<Self> {
         let base = fs::canonicalize(base)?;
         let home = fs::canonicalize(coven_home).unwrap_or_else(|_| coven_home.to_path_buf());
         if base.starts_with(&home) {
@@ -376,16 +384,21 @@ impl IsolatedLaunch {
                 base.display()
             );
         }
+        let digest = super::launch_reaper::home_digest(coven_home);
         let root = tempfile::Builder::new()
-            .prefix("coven-launch-")
+            .prefix(&super::launch_reaper::folder_prefix(&digest))
             .tempdir_in(&base)?;
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+        let marker = super::launch_reaper::mark(root.path(), &digest)?;
         for folder in ["cwd", "home"] {
             DirBuilder::new()
                 .mode(0o700)
                 .create(root.path().join(folder))?;
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            _marker: marker,
+        })
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -398,6 +411,15 @@ impl IsolatedLaunch {
 
     pub(crate) fn home(&self) -> PathBuf {
         self.root.path().join("home")
+    }
+
+    /// Simulates a crash: the folder stays, and its marker lock is released
+    /// as a dead process's would be.
+    #[cfg(test)]
+    pub(crate) fn abandon(self) -> PathBuf {
+        let Self { root, _marker } = self;
+        drop(_marker);
+        root.keep()
     }
 }
 
