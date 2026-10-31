@@ -308,7 +308,10 @@ call:
     outcome, refusal and digest, and its reply was written.
 
   A withheld operation may have no commitment, because a refusal at admit,
-  or at a busy store, records nothing.
+  or at a busy store, records nothing. Records that agree still do not
+  settle a run whose service withheld an operation
+  (`scoped_read_operation_withheld`, #1608): the gate withholds only when it
+  cannot confirm the attempt's authority, and a success would rest on it.
 - **Where it applies.**
   - *The terminal observer.* For an envelope with a scoped read service, the
     observer reconciles the attempt before it signs. It also requires the
@@ -318,12 +321,18 @@ call:
   - *The evidence consumer.* `consume_runtime_terminal_evidence` reconciles
     again before it settles receipt-eligible evidence for such an attempt.
     A discrepancy holds the run for recovery ("scoped read commitments do
-    not reconcile with the channel's operations").
+    not reconcile with the channel's operations"). A withheld operation holds
+    it with its own reason ("a scoped read was withheld because the
+    attempt's authority ended or could not be confirmed during the run").
+    The observer does not treat a withheld operation as a gap in the stream,
+    so this hold is settlement's.
 - **The results.**
   - A committed result that was never written is never reported as
     delivered, or as success.
   - A crash leaves no close, so the run stays held, and restart neither
     adopts the old channel nor writes a close for it.
+  - Authority withdrawn or expired during the run, and a busy store, hold
+    the run, whatever the harness's stream claims afterwards.
   - The harness's stream alone can no longer make a scoped read run
     complete.
 

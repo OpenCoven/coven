@@ -559,6 +559,32 @@ fn a_crash_after_commit_keeps_the_row_and_restart_sweeps_the_channel() {
     drop(release);
     let results = reading.join().unwrap();
     assert_eq!(results, [(json!({ "refusal": "attempt_closed" }), true)]);
+
+    // Settlement after the restart (#1608): the channel never closed, so
+    // the committed row reconciles with nothing, and the run neither
+    // settles nor gets a receipt.
+    assert_eq!(
+        crate::automations::scoped_read_settlement::reconcile(
+            dispatched.conn(),
+            &dispatched.held.attempt_id,
+            None
+        )
+        .unwrap(),
+        Err(crate::automations::scoped_read_settlement::Discrepancy::NotClosed)
+    );
+    let report =
+        crate::automations::runner::settle_finished_runs(dispatched.conn(), Utc::now()).unwrap();
+    assert_eq!(report.succeeded, 0, "{report:?}");
+    let (status, receipt): (String, Option<String>) = dispatched
+        .conn()
+        .query_row(
+            "SELECT status, receipt_id FROM automation_runs WHERE id = ?1",
+            [&dispatched.run],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(status, "succeeded");
+    assert!(receipt.is_none(), "no receipt for a crashed attempt");
 }
 
 /// The run's deadline crossing a write lock wait (#1605). A test clock P is

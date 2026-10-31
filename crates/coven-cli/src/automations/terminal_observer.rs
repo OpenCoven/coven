@@ -163,7 +163,9 @@ fn scoped_reads_reconcile(
     stream: &StreamObservation,
 ) -> std::result::Result<(), String> {
     match scoped_read_settlement::reconcile(conn, attempt_id, Some(stream.tool_calls)) {
-        Ok(Ok(_)) => Ok(()),
+        // The records agree. That the authority ended during the run is
+        // settlement's to judge, not a gap in what the stream shows (#1608).
+        Ok(Ok(_) | Err(scoped_read_settlement::Discrepancy::OperationWithheld)) => Ok(()),
         Ok(Err(discrepancy)) => Err(discrepancy.code().to_owned()),
         Err(error) => Err(format!("{error:#}")),
     }
