@@ -39,6 +39,8 @@ pub(crate) struct StreamObservation {
     pub capabilities: BTreeSet<&'static str>,
     /// The highest side-effect class among them.
     pub side_effects: SideEffectClass,
+    /// How many tool calls the envelope classifies the stream shows.
+    pub tool_calls: usize,
     pub complete: bool,
     pub result: StreamResult,
 }
@@ -54,6 +56,7 @@ pub(crate) fn classify_claude_stream(
     let mut observation = StreamObservation {
         capabilities: BTreeSet::new(),
         side_effects: SideEffectClass::None,
+        tool_calls: 0,
         complete: !truncated,
         result: StreamResult::Unobserved,
     };
@@ -106,6 +109,7 @@ pub(crate) fn classify_claude_stream(
                                 .and_then(|name| envelope.tool(name));
                             match tool {
                                 Some(tool) => {
+                                    observation.tool_calls += 1;
                                     observation.capabilities.insert(tool.capability);
                                     if rank(tool.side_effect) > rank(observation.side_effects) {
                                         observation.side_effects = tool.side_effect;
@@ -296,6 +300,15 @@ pub(crate) mod test_support {
             text("It says granted notes."),
             result("It says granted notes."),
         ]
+    }
+
+    /// [`scoped_read_run`], with `calls` read tool calls, each answered.
+    #[cfg(unix)]
+    pub(crate) fn scoped_read_run_calling(calls: usize) -> Vec<String> {
+        let mut lines = scoped_read_run();
+        let answered = [tool_use("mcp__coven__read_file"), tool_result()];
+        lines.splice(2..4, answered.iter().cycle().take(calls * 2).cloned());
+        lines
     }
 
     pub(crate) fn stream(lines: &[String]) -> String {

@@ -278,9 +278,54 @@ the implementation chose:
 Left for follow-up, because this proposal does not cover them:
 
 - persisting `Prepared::finish`'s operation list, and comparing it with the
-  committed rows at settlement;
+  committed rows at settlement. #1606 implements it, as described below;
 - sweeping launch folders that a crash leaves in the system temporary
-  folder.
+  folder (#1607).
+
+## Settlement reconciliation (#1606)
+
+A commitment row says a result was *authorized*. It does not say the result
+was delivered. Settlement now also needs the service's own account of each
+call:
+
+- **What the service records.** Each `Operation` now says whether its reply
+  was written to the channel. When the service stops, the gate's new
+  `close` step records the channel's operations in
+  `automation_scoped_read_closes`, one immutable row per channel:
+  - sequence, tool, outcome, refusal code, digest, and whether the reply
+    was written;
+  - no content, path, pattern or entry name.
+
+  A channel that no relay reached records an empty close. A daemon that
+  dies, or a busy store, records none.
+- **What reconciliation requires.**
+  `automations/scoped_read_settlement.rs` reconciles the close with the
+  commitments. It passes only when:
+  - exactly one channel of the attempt closed;
+  - its sequences run 1 to n, with a withheld operation only last;
+  - every commitment belongs to that channel and to one of its operations;
+  - every served or refused operation has a commitment with the same tool,
+    outcome, refusal and digest, and its reply was written.
+
+  A withheld operation may have no commitment, because a refusal at admit,
+  or at a busy store, records nothing.
+- **Where it applies.**
+  - *The terminal observer.* For an envelope with a scoped read service, the
+    observer reconciles the attempt before it signs. It also requires the
+    harness's stream to show at least as many tool calls as the service ran.
+    Any discrepancy leaves coverage partial, so the evidence is never
+    receipt-eligible, and its stable code goes to the daemon recovery log.
+  - *The evidence consumer.* `consume_runtime_terminal_evidence` reconciles
+    again before it settles receipt-eligible evidence for such an attempt.
+    A discrepancy holds the run for recovery ("scoped read commitments do
+    not reconcile with the channel's operations").
+- **The results.**
+  - A committed result that was never written is never reported as
+    delivered, or as success.
+  - A crash leaves no close, so the run stays held, and restart neither
+    adopts the old channel nor writes a close for it.
+  - The harness's stream alone can no longer make a scoped read run
+    complete.
 
 ## What this proposal does not decide
 

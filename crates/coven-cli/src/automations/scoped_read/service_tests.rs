@@ -230,6 +230,7 @@ fn a_served_result_is_exactly_the_committed_text() {
             outcome: Outcome::Served {
                 digest: digest.clone()
             },
+            written: true,
         }]
     );
     assert_eq!(
@@ -364,6 +365,7 @@ fn a_closed_gate_withholds_the_result_and_stops_the_service() {
                 outcome: Outcome::Withheld {
                     refusal: Refusal::AttemptClosed
                 },
+                written: true,
             }]
         );
         let ran = seen.lock().unwrap().len();

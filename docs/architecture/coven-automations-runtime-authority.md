@@ -310,8 +310,13 @@ These were decided on 2026-10-04 for slice 6.
     - only known events;
     - only the envelope's tools;
     - exactly one result;
-    - no dropped or redacted output.
+    - no dropped or redacted output;
+    - for the scoped read envelope, the gate's commitments and the channel's
+      close reconcile, and the stream shows every operation the service ran
+      (#1606).
   - **Anything else.** Coverage is partial, and the run is held.
+    Settlement reconciles a scoped read attempt again before it consumes
+    complete evidence.
 
 ## Ordered slices
 
