@@ -98,12 +98,45 @@ billed. On 2.1.305:
   vectors move to `r0-read.2` in a separate change, coordinated with Chat and
   the SDK.
 
-Still open: the daemon's admission for `r0-read.2` (the version check before
-launch, the isolated launch folder and home, the API key command and file, the
-protected paths, and opening and closing the channel with the session),
-response commitment under the daemon's revocation fence, the mission switch,
-the adapter and receipts, and Windows. The vectors are engineering evidence,
-not containment certification.
+**Admission for `r0-read.2`** is in `admission.rs` and `credential.rs`.
+`prepare` admits one launch and returns what to start it with:
+
+- **Version.** It runs the installed harness's `--version` with an empty
+  environment apart from its own `PATH`, an isolated `HOME` and no
+  auto-update. The version must be in the envelope's list, or the launch is
+  refused with the version found and the versions admitted.
+- **Key.** It reads the owner's saved API key. The hidden
+  `coven automations api-key set|status|remove` command manages it, reading it
+  only from standard input, never from a terminal. The key lives in
+  `<COVEN_HOME>/credentials/anthropic-api-key`, 0600 in a 0700 folder. A key
+  file that is a link, owned by someone else or readable by others is
+  refused.
+- **Launch folder.** It creates the launch folder, an empty working folder and
+  a home for the harness. These sit under the system's temporary folder,
+  never under `COVEN_HOME`, because the harness writes into its home and the
+  whole folder is removed when the launch ends. A temporary folder that
+  resolves inside `COVEN_HOME` is refused.
+- **Environment.** It builds the harness's whole environment from exactly the
+  envelope's variable names. A name the daemon can't fill refuses the launch.
+- **Reader.** It builds the reader with `COVEN_HOME`, the launch folder and the
+  owner's harness configuration and credential folders protected:
+  - `.aws`, `.claude`, `.claude.json`, `.codex`, `.config/claude` and
+    `.config/gh`;
+  - `.docker`, `.gemini`, `.gnupg`, `.netrc` and `.ssh`.
+
+  A project folder inside `COVEN_HOME` is therefore refused (`root_protected`).
+- **Channel.** It opens the attempt's channel and adds `--mcp-config`.
+
+An opt-in test runs the installed Claude Code 2.1.305 through `prepare`, with
+exactly the environment and arguments it returns. The granted read is served,
+the sibling is refused, the stream is complete evidence, and the launch folder
+and channel are gone afterwards.
+
+Still open: wiring `prepare` into the daemon's launch, so the channel opens and
+closes with the session; it takes the grant's scopes from the restored adapter.
+Also open: response commitment under the daemon's revocation fence, the
+mission switch, the adapter and receipts, and Windows. The vectors are
+engineering evidence, not containment certification.
 
 ### Scope operations
 
