@@ -1283,6 +1283,26 @@ fn foreground_daemon_startup_failure_retains_exit_and_output() -> Result<()> {
     Ok(())
 }
 
+/// Replaces a stopped daemon's whole store with invalid bytes. The store is
+/// the main file plus its WAL: a daemon stopped abruptly before any
+/// last-connection checkpoint leaves initialized pages in `coven.sqlite3-wal`,
+/// where SQLite still reads them, so rewriting the main file alone may not
+/// invalidate the store (#1227).
+fn invalidate_store(home: &Path) -> Result<()> {
+    for sidecar in ["coven.sqlite3-wal", "coven.sqlite3-shm"] {
+        match fs::remove_file(home.join(sidecar)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    fs::write(
+        home.join("coven.sqlite3"),
+        b"synthetic invalid SQLite store",
+    )?;
+    Ok(())
+}
+
 #[test]
 fn foreground_restart_failure_is_finalized_before_return() -> Result<()> {
     let artifacts = tempfile::tempdir()?;
@@ -1291,10 +1311,7 @@ fn foreground_restart_failure_is_finalized_before_return() -> Result<()> {
     evidence.foreground_daemon = true;
     let mut fixture = ThreadsFixture::start(&evidence)?;
     fixture.stop_daemon()?;
-    fs::write(
-        fixture.coven_home.join("coven.sqlite3"),
-        b"synthetic invalid SQLite store",
-    )?;
+    invalidate_store(&fixture.coven_home)?;
     let error = fixture
         .restart_daemon()
         .expect_err("invalid owned store must fail restart");
@@ -1412,10 +1429,7 @@ fn failure_artifacts_retain_failed_restart_cli_output() -> Result<()> {
     evidence.foreground_daemon = true;
     let mut fixture = ThreadsFixture::start(&evidence)?;
     fixture.stop_daemon()?;
-    fs::write(
-        fixture.coven_home.join("coven.sqlite3"),
-        b"synthetic invalid SQLite store",
-    )?;
+    invalidate_store(&fixture.coven_home)?;
 
     let error = fixture
         .restart_daemon_via_cli()

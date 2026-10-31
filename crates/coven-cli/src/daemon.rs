@@ -5757,17 +5757,128 @@ fn write_startup_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> 
     Ok(())
 }
 
-fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
+/// The daemon's initialization connection, still open.
+///
+/// Closing the last connection to a WAL store checkpoints the WAL into the
+/// main file, which after startup holds the whole schema initialization. On a
+/// contended hosted Windows disk that checkpoint took about 3.5 s of the 5 s
+/// readiness budget (#1227, #1566), so the daemon keeps this connection open
+/// through recovery and scheduler start and closes it on its own thread once
+/// the accept loop runs. Every commit is already durable in the WAL, so when
+/// the checkpoint runs does not change durability. If a request connection is
+/// open when this one closes, SQLite leaves the checkpoint to the last
+/// connection that closes later. Dropping an unclosed store closes it on the
+/// dropping thread, which is what a startup that fails before readiness does.
+struct StartupStore {
+    conn: Option<rusqlite::Connection>,
+    observer: StartupCheckpointObserver,
+    coven_home: PathBuf,
+    /// The store's Ward-audit WAL limit, read at startup.
+    wal_limit_bytes: u64,
+}
+
+impl StartupStore {
+    /// Closes the connection on this thread, reporting a close failure.
+    #[cfg(test)]
+    fn close(mut self) -> Result<()> {
+        self.close_now()
+    }
+
+    /// Closes the connection on a detached thread, so readiness never waits
+    /// for the startup checkpoint. A close failure can then only be logged.
+    fn close_after_readiness(self) {
+        self.close_after_readiness_with(|| {});
+    }
+
+    fn close_after_readiness_with(mut self, before_close: impl FnOnce() + Send + 'static) {
+        // Ward-audit admission truncates a WAL past its limit before admitting a
+        // write, and that truncate fails while this checkpoint runs. A WAL
+        // already past the limit, as a large migration can leave, is therefore
+        // checkpointed here, before the accept loop serves requests, as startup
+        // did before #1227.
+        let wal = self.coven_home.join("coven.sqlite3-wal");
+        if std::fs::metadata(&wal).map_or(0, |metadata| metadata.len()) >= self.wal_limit_bytes {
+            before_close();
+            if let Err(error) = self.close_now() {
+                append_daemon_recovery_log(&self.coven_home, &format!("{error:#}"));
+            }
+            return;
+        }
+        let coven_home = self.coven_home.clone();
+        let spawned = std::thread::Builder::new()
+            .name("coven-startup-store-close".to_owned())
+            .spawn(move || {
+                before_close();
+                let mut store = self;
+                if let Err(error) = store.close_now() {
+                    append_daemon_recovery_log(
+                        &store.coven_home,
+                        &format!("startup store close after readiness failed: {error:#}"),
+                    );
+                }
+            });
+        if let Err(error) = spawned {
+            // The unspawned closure, and the store in it, was dropped above,
+            // which closed the connection on this thread.
+            append_daemon_recovery_log(
+                &coven_home,
+                &format!("startup store closed on the accept thread: no close thread: {error}"),
+            );
+        }
+    }
+
+    /// Closes the connection before a startup failure is recorded. The launching
+    /// CLI reports the failure as soon as it is recorded, and an operator can
+    /// start another daemon at once; that daemon must not find this one still
+    /// checkpointing under the serve lock and refuse to start.
+    fn close_before_reporting_failure(&mut self) {
+        if let Err(error) = self.close_now() {
+            append_daemon_recovery_log(&self.coven_home, &format!("{error:#}"));
+        }
+    }
+
+    fn close_now(&mut self) -> Result<()> {
+        let Some(conn) = self.conn.take() else {
+            return Ok(());
+        };
+        close_startup_store(conn, |phase| self.observer.append(&self.coven_home, phase))
+    }
+}
+
+impl Drop for StartupStore {
+    fn drop(&mut self) {
+        if let Err(error) = self.close_now() {
+            append_daemon_recovery_log(&self.coven_home, &format!("{error:#}"));
+        }
+    }
+}
+
+fn initialize_daemon_store(coven_home: &Path) -> Result<StartupStore> {
     let mut observer = StartupCheckpointObserver::new(Instant::now());
-    initialize_daemon_store_with_observer(coven_home, |phase| {
+    let conn = initialize_daemon_store_with_observer(coven_home, |phase| {
         observer.append(coven_home, phase);
+    })?;
+    let wal_limit_bytes = conn
+        .query_row(
+            "SELECT wal_limit_bytes FROM coven_ward_audit_capacity WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .and_then(|limit| u64::try_from(limit).ok())
+        .unwrap_or(crate::store::WARD_AUDIT_WAL_LIMIT_BYTES);
+    Ok(StartupStore {
+        conn: Some(conn),
+        observer,
+        coven_home: coven_home.to_path_buf(),
+        wal_limit_bytes,
     })
 }
 
 fn initialize_daemon_store_with_observer(
     coven_home: &Path,
     mut observe: impl FnMut(StartupCheckpoint),
-) -> Result<()> {
+) -> Result<rusqlite::Connection> {
     observe(StartupCheckpoint::DaemonStoreBegin);
     let store_path = coven_home.join("coven.sqlite3");
     observe(StartupCheckpoint::StoreInitializeBegin);
@@ -5803,8 +5914,29 @@ fn initialize_daemon_store_with_observer(
         }
     }
     observe(StartupCheckpoint::StorageHealthReturned);
-    // Finish the one normal last-connection checkpoint before publishing readiness.
+    // Writable connections commit with `synchronous = NORMAL`, so a commit is
+    // on disk only once the WAL is synced. The checkpoint that used to run
+    // here did that before readiness; it now runs after readiness, so sync the
+    // WAL itself. What readiness exposes, such as a fresh home's hub identity,
+    // then survives an OS crash or power loss, without the page copy.
+    crate::store::sync_wal(&store_path)?;
+    Ok(conn)
+}
+
+/// The one final close of the startup store, normally after readiness (see
+/// [`StartupStore`]).
+fn close_startup_store(
+    conn: rusqlite::Connection,
+    mut observe: impl FnMut(StartupCheckpoint),
+) -> Result<()> {
     observe(StartupCheckpoint::StoreCloseBegin);
+    // After readiness, request and scheduler connections are usually open, so
+    // this close is not the last and would leave the initialization frames for
+    // whichever close comes last, possibly a graceful `daemon stop`. A PASSIVE
+    // checkpoint moves them now and never waits on or blocks readers and
+    // writers. It is advisory: a busy or failed attempt leaves the frames to a
+    // later checkpoint, as before.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
     conn.close()
         .map_err(|(_, error)| error)
         .context("failed to close Coven startup store")?;
@@ -5833,7 +5965,7 @@ pub fn serve_forever(
     // catching the wedged-but-alive incumbent the socket guard can't, and the
     // direct `daemon serve` path that bypasses ensure_background_server.
     let serve_lock = acquire_serve_lock(coven_home)?;
-    initialize_daemon_store(coven_home)?;
+    let mut startup_store = initialize_daemon_store(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -5913,7 +6045,10 @@ pub fn serve_forever(
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
     let mobile_gateway = crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)
-        .inspect_err(|error| startup_failure::record(coven_home, &status, error))?;
+        .inspect_err(|error| {
+            startup_store.close_before_reporting_failure();
+            startup_failure::record(coven_home, &status, error);
+        })?;
     startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     let (tcp_thread, active_tcp_connection) = if let Some(tcp_listener) = tcp_listener {
@@ -6031,6 +6166,7 @@ pub fn serve_forever(
     use std::sync::atomic::Ordering;
     // Entry alone does not prove authenticated health or readiness.
     startup.append(coven_home, StartupCheckpoint::ApiAcceptLoopEnter);
+    startup_store.close_after_readiness();
     loop {
         if daemon_termination_requested() {
             break;
@@ -7080,7 +7216,7 @@ fn serve_forever_with_lifetime_job_installer(
     // Claim the pipe before mutating shared daemon/session state. A duplicate
     // daemon must fail at bind without replacing the incumbent's daemon.json
     // or marking sessions owned by that live daemon orphaned.
-    initialize_daemon_store(coven_home)?;
+    let mut startup_store = initialize_daemon_store(coven_home)?;
     write_startup_status(coven_home, &status)?;
     // Match the Unix runtime interval; status publication is not readiness.
     let mut startup = StartupCheckpointObserver::new(Instant::now());
@@ -7105,14 +7241,19 @@ fn serve_forever_with_lifetime_job_installer(
     let _automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
-    let _mobile_gateway =
-        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)
-            .inspect_err(|error| startup_failure::record(coven_home, &status, error))?;
+    let _mobile_gateway = crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(
+        coven_home,
+    )
+    .inspect_err(|error| {
+        startup_store.close_before_reporting_failure();
+        startup_failure::record(coven_home, &status, error);
+    })?;
     startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));
     startup.append(coven_home, StartupCheckpoint::ApiAcceptLoopEnter);
+    startup_store.close_after_readiness();
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,
@@ -8143,7 +8284,7 @@ mod tests {
     #[test]
     fn daemon_store_initialization_prepares_request_connections() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
-        initialize_daemon_store(temp_dir.path())?;
+        initialize_daemon_store(temp_dir.path())?.close()?;
         let store_path = temp_dir.path().join("coven.sqlite3");
         let conn = crate::store::open_initialized_store(&store_path)?;
         assert!(crate::store::list_sessions(&conn)?.is_empty());
@@ -8154,7 +8295,7 @@ mod tests {
         )?;
         assert!(hub_id.starts_with("hub_"));
 
-        initialize_daemon_store(temp_dir.path())?;
+        initialize_daemon_store(temp_dir.path())?.close()?;
         let health = crate::api::handle_request("GET", "/health", temp_dir.path(), None)?;
         assert_eq!(health.status, 200);
         let health: serde_json::Value = serde_json::from_str(&health.body)?;
@@ -8233,7 +8374,7 @@ mod tests {
             "log_retention_days = \"broken\"\n",
         )?;
 
-        initialize_daemon_store(temp_dir.path())?;
+        initialize_daemon_store(temp_dir.path())?.close()?;
 
         let health = crate::api::handle_request("GET", "/health", temp_dir.path(), None)?;
         assert_eq!(health.status, 200);
@@ -16552,7 +16693,7 @@ mod tests {
         let home = tempfile::tempdir()?;
         let wal = home.path().join("coven.sqlite3-wal");
         let mut observed = 0;
-        initialize_daemon_store_with_observer(home.path(), |phase| {
+        let mut retained = |phase: StartupCheckpoint| {
             if matches!(
                 phase,
                 StartupCheckpoint::StoreInitializeEnd | StartupCheckpoint::StoreCloseBegin
@@ -16567,7 +16708,9 @@ mod tests {
                     "daemon startup reopened an empty WAL instead of retaining initialization"
                 );
             }
-        })?;
+        };
+        let conn = initialize_daemon_store_with_observer(home.path(), &mut retained)?;
+        close_startup_store(conn, &mut retained)?;
         assert_eq!(
             observed, 2,
             "both live-connection boundaries must be observed"
@@ -16580,9 +16723,156 @@ mod tests {
     }
 
     #[test]
+    fn startup_store_closes_after_readiness_without_blocking_its_caller() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let wal = home.path().join("coven.sqlite3-wal");
+        let log = daemon_recovery_log_path(home.path());
+        let phases = || -> Vec<String> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.split_once("startup_checkpoint phase="))
+                .map(|(_, rest)| rest.split(' ').next().unwrap_or_default().to_owned())
+                .collect()
+        };
+        let store = initialize_daemon_store(home.path())?;
+        assert!(
+            wal.exists(),
+            "initialization was checkpointed before readiness"
+        );
+        assert_eq!(
+            phases().last().map(String::as_str),
+            Some("storage-health-returned")
+        );
+
+        // Hold the close at its start, as a slow checkpoint would. A close on
+        // the caller's thread blocks this call until release; the readiness
+        // path must get its thread back first.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (closed, done) = std::sync::mpsc::channel();
+        let (returned, caller) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            store.close_after_readiness_with(move || {
+                let _ = held.recv();
+                let _ = closed.send(());
+            });
+            let _ = returned.send(());
+        });
+        // Hang guard only: the old synchronous close never returns while held.
+        caller
+            .recv_timeout(Duration::from_secs(60))
+            .context("closing the startup store after readiness blocked its caller")?;
+        let path = home.path().join("coven.sqlite3");
+        let held_size = std::fs::metadata(&path)?.len();
+        let (page_size, page_count) = {
+            let reader = crate::store::open_initialized_store(&path)?;
+            let page_size: i64 = reader.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+            let page_count: i64 = reader.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+            (page_size, page_count)
+        };
+        assert!(
+            held_size < u64::try_from(page_size * page_count)?,
+            "the held close checkpointed anyway: {held_size} bytes"
+        );
+        assert!(!phases().iter().any(|phase| phase == "store-close-begin"));
+
+        release.send(()).expect("close thread waits for release");
+        done.recv_timeout(Duration::from_secs(60))
+            .context("released startup store close did not run")?;
+        // Wait for the close itself, which the hook only precedes.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !phases().iter().any(|phase| phase == "daemon-store-end") {
+            assert!(
+                Instant::now() < deadline,
+                "startup store close never finished: {:?}",
+                phases()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let tail = phases();
+        assert_eq!(
+            tail[tail.len() - 2..],
+            ["store-close-begin", "daemon-store-end"]
+        );
+        assert!(
+            !wal.exists(),
+            "the last connection's close must still checkpoint and remove the WAL"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_close_checkpoints_initialization_while_other_connections_are_open() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("coven.sqlite3");
+        let store = initialize_daemon_store(home.path())?;
+        // A request connection open across the close, as after readiness.
+        let request = crate::store::open_initialized_store(&path)?;
+        let before = std::fs::metadata(&path)?.len();
+        store.close()?;
+        let after = std::fs::metadata(&path)?.len();
+        let page_size: i64 = request.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let page_count: i64 = request.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let full = u64::try_from(page_size * page_count)?;
+        // Initialization commits to the WAL, so the main file starts short of
+        // the schema; the close's checkpoint backfills every page into it.
+        assert!(
+            before < full,
+            "initialization was already checkpointed: {before} bytes"
+        );
+        assert_eq!(after, full, "main file was not backfilled");
+        drop(request);
+        Ok(())
+    }
+
+    #[test]
+    fn a_startup_wal_past_the_ward_audit_limit_closes_before_serving() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let mut store = initialize_daemon_store(home.path())?;
+        assert_eq!(
+            store.wal_limit_bytes,
+            crate::store::WARD_AUDIT_WAL_LIMIT_BYTES
+        );
+        // Any initialization WAL exceeds a one-byte limit.
+        store.wal_limit_bytes = 1;
+        store.close_after_readiness_with(|| {});
+        // No thread to wait for: the close completed before this returned.
+        let log = std::fs::read_to_string(daemon_recovery_log_path(home.path()))?;
+        let phases: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once("startup_checkpoint phase="))
+            .map(|(_, rest)| rest.split(' ').next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            phases[phases.len() - 2..],
+            ["store-close-begin", "daemon-store-end"]
+        );
+        assert!(!home.path().join("coven.sqlite3-wal").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_dropped_startup_store_still_closes_with_its_checkpoints() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        drop(initialize_daemon_store(home.path())?);
+        let log = std::fs::read_to_string(daemon_recovery_log_path(home.path()))?;
+        let tail: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once("startup_checkpoint phase="))
+            .map(|(_, rest)| rest.split(' ').next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            tail[tail.len() - 2..],
+            ["store-close-begin", "daemon-store-end"]
+        );
+        assert!(!home.path().join("coven.sqlite3-wal").exists());
+        Ok(())
+    }
+
+    #[test]
     fn startup_checkpoints_report_fixed_phases_and_monotonic_elapsed() -> Result<()> {
         let home = tempfile::tempdir()?;
-        initialize_daemon_store(home.path())?;
+        initialize_daemon_store(home.path())?.close()?;
         let log = std::fs::read_to_string(daemon_recovery_log_path(home.path()))?;
         let checkpoints: Vec<_> = log
             .lines()
@@ -16707,7 +16997,7 @@ mod tests {
     fn startup_checkpoints_remain_advisory_when_log_cannot_be_opened() -> Result<()> {
         let home = tempfile::tempdir()?;
         std::fs::create_dir(daemon_recovery_log_path(home.path()))?;
-        initialize_daemon_store(home.path())?;
+        initialize_daemon_store(home.path())?.close()?;
         assert!(home.path().join("coven.sqlite3").is_file());
         Ok(())
     }

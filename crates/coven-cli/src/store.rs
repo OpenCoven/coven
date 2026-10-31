@@ -648,10 +648,69 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     open_initialized_store(path)
 }
 
+/// Makes every commit in the store's WAL durable without checkpointing it.
+///
+/// Writable connections commit with `synchronous = NORMAL`: a commit is on
+/// disk only after the next WAL sync. Syncing the one file, and the directory
+/// that names it, costs far less than a checkpoint's page copy. A missing WAL
+/// means every commit is already in the main file.
+pub(crate) fn sync_wal(store_path: &Path) -> Result<()> {
+    let wal = wal_path(store_path);
+    let file = match std::fs::File::open(&wal) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to open {}", wal.display()))
+        }
+    };
+    crate::durable_fs::sync_file(&file)
+        .with_context(|| format!("failed to sync {}", wal.display()))?;
+    crate::durable_fs::sync_parent(&wal)
+}
+
 /// Initialization-only entry for schema and migration regressions.
 #[cfg(test)]
 pub fn initialize_store(path: &Path) -> Result<()> {
     initialize_store_connection(path, |_| {}).map(drop)
+}
+
+/// Opens a newly initialized store at `path` for scenario tests that build a
+/// fresh store per case.
+///
+/// `initialize_store` then `open_store` is the slow part of those tests: the
+/// schema commit and the last-connection checkpoint each flush to disk, which
+/// costs about 0.4 s per store on hosted Windows runners (#1227). This runs
+/// that initialization once per test process, keeps the closed store's bytes,
+/// and gives each caller a copy opened as `open_store` opens an initialized
+/// path. Schema and migration regressions keep calling `initialize_store`.
+#[cfg(test)]
+pub(crate) fn open_store_from_initialized_template(path: &Path) -> Result<Connection> {
+    static TEMPLATE: OnceLock<Vec<u8>> = OnceLock::new();
+    let template = TEMPLATE.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("store template directory");
+        let template = dir.path().join("store.sqlite");
+        initialize_store(&template).expect("initialize store template");
+        // Closing the last connection checkpoints the WAL into the main file
+        // and deletes it, so the main file alone is the whole store.
+        let mut wal = template.clone().into_os_string();
+        wal.push("-wal");
+        assert!(
+            !Path::new(&wal).exists(),
+            "store template kept its WAL after the last connection closed"
+        );
+        std::fs::read(&template).expect("read store template")
+    });
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_private_store_directory(parent)?;
+    }
+    ensure_private_store_file(path)?;
+    std::fs::write(path, template)
+        .with_context(|| format!("failed to copy store template to {}", path.display()))?;
+    remember_initialized_store(path);
+    open_store(path)
 }
 
 #[derive(Clone, Copy)]
@@ -6046,6 +6105,62 @@ END;
             error.to_string().contains("symlinked Coven store file"),
             "unexpected error: {error:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_store_is_the_store_initialization_leaves() -> Result<()> {
+        fn describe(conn: &Connection) -> Result<Vec<String>> {
+            let mut facts = vec![
+                conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?
+                    .to_string(),
+                conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?,
+                conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?,
+            ];
+            let mut statement = conn.prepare(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name",
+            )?;
+            let schema = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (kind, name, table, sql) in schema {
+                let rows = if kind == "table" && !name.starts_with("sqlite_") {
+                    conn.query_row(&format!("SELECT count(*) FROM \"{name}\""), [], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                } else {
+                    0
+                };
+                facts.push(format!("{kind}|{name}|{table}|{sql:?}|{rows}"));
+            }
+            Ok(facts)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let fresh_path = temp.path().join("fresh").join("store.sqlite");
+        initialize_store(&fresh_path)?;
+        let fresh = open_store(&fresh_path)?;
+        let copied_path = temp.path().join("copied").join("store.sqlite");
+        let copied = open_store_from_initialized_template(&copied_path)?;
+
+        assert_eq!(describe(&copied)?, describe(&fresh)?);
+        assert_eq!(initialization_count(&copied_path), 1);
+        #[cfg(unix)]
+        for path in [&copied_path, &copied_path.with_file_name("")] {
+            let mode = std::fs::metadata(path)?.permissions().mode() & 0o077;
+            assert_eq!(mode, 0, "{} is readable beyond its owner", path.display());
+        }
+        // The copy is a separate store: a write to it is not seen by the next.
+        copied.execute_batch("CREATE TABLE scenario_only (id INTEGER)")?;
+        let next = open_store_from_initialized_template(&temp.path().join("next.sqlite"))?;
+        assert_eq!(describe(&next)?, describe(&fresh)?);
         Ok(())
     }
 

@@ -151,6 +151,38 @@ fn assert_runtime_phases(home: &Path, expected: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The startup store closes on its own thread once the accept loop runs
+/// (#1227), or on the way out of a startup that failed before readiness.
+/// Either way both of its close checkpoints follow `preceding`.
+fn assert_store_closes_after(home: &Path, preceding: &str, deadline: Instant) -> Result<()> {
+    loop {
+        let captured = daemon_startup_diagnostics::capture_startup_checkpoints(home);
+        let phases: Vec<_> = captured
+            .lines()
+            .filter_map(|line| line.strip_prefix("startup_checkpoint phase="))
+            .filter_map(|fields| fields.split_whitespace().next())
+            .collect();
+        let position = |phase: &str| phases.iter().position(|seen| *seen == phase);
+        if let Some(end) = position("daemon-store-end") {
+            let (Some(preceding), Some(begin)) =
+                (position(preceding), position("store-close-begin"))
+            else {
+                anyhow::bail!("startup store close checkpoints incomplete:\n{captured}");
+            };
+            anyhow::ensure!(
+                preceding < begin && begin < end,
+                "startup store closed before its readiness boundary:\n{captured}"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "startup store close exceeded test hang guard:\n{captured}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn exercise_startup(fail_mobile: bool, unavailable_log: bool) -> Result<()> {
     exercise_startup_with(fail_mobile, unavailable_log, |_, _| Ok(()))
 }
@@ -215,6 +247,7 @@ fn exercise_startup_with(
         );
         assert!(read_bounded(&stderr_path)?.contains("mobile gateway bind port must be non-zero"));
         assert_runtime_phases(&home, &RUNTIME_PHASES[..9])?;
+        assert_store_closes_after(&home, "automations-scheduler-end", deadline)?;
     } else {
         loop {
             anyhow::ensure!(
@@ -244,6 +277,7 @@ fn exercise_startup_with(
         }
         if !unavailable_log {
             assert_runtime_phases(&home, RUNTIME_PHASES)?;
+            assert_store_closes_after(&home, "api-accept-loop-enter", deadline)?;
         }
     }
     daemon.terminate()?;
@@ -331,6 +365,19 @@ fn exercise_background_failure(action: &str) -> Result<()> {
         assert!(message.contains(expected), "missing {expected}: {message}");
     }
     assert!(!message.contains("192.168.1.10"), "{message}");
+    // The failure is reported only once the startup store is closed, so the
+    // corrected start below cannot meet this daemon still closing it.
+    let log = fs::read_to_string(home.join("daemon-recovery.log"))?;
+    let closed = log
+        .find("phase=daemon-store-end")
+        .context("startup store closed")?;
+    let reported = log
+        .find("startup_failure ")
+        .context("startup failure recorded")?;
+    assert!(
+        closed < reported,
+        "startup failure reported before its store closed"
+    );
 
     // Explicit operator correction, retaining the rejected file for recovery.
     let rejected = mobile.join("gateway.rejected.json");
