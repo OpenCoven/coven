@@ -132,11 +132,31 @@ exactly the environment and arguments it returns. The granted read is served,
 the sibling is refused, the stream is complete evidence, and the launch folder
 and channel are gone afterwards.
 
-Still open: wiring `prepare` into the daemon's launch, so the channel opens and
-closes with the session; it takes the grant's scopes from the restored adapter.
-Also open: response commitment under the daemon's revocation fence, the
-mission switch, the adapter and receipts, and Windows. The vectors are
-engineering evidence, not containment certification.
+**The restored adapter supplies the scopes** (#1603). It pins `r0-read.2`
+for a routine that declares authority, and refuses any declared scope the
+service cannot enforce as written. `automations/trusted_launch.rs` takes a
+launch's scopes from the signed Threads request its consumed decision names,
+never from the stored definition, and admits the launch through `prepare`
+over the routine's project folder. Its tests use the `notes/today.md` grant
+from #1217:
+- the granted note is served, and `note.txt` is refused (`scope_missing`);
+- traversal, absolute paths and symbolic links out of the project are
+  refused;
+- a widened definition, a different launch folder, another binding and a
+  tampered request are refused.
+
+**The daemon launches it under the production gate** (#1604). The
+[gate proposal](coven-automations-scoped-read-gate-proposal.md) is approved
+and implemented:
+- the channel opens with the session and closes when it ends;
+- each result is committed under the store's write lock before a byte of it
+  is written;
+- stale channels are swept at startup.
+
+`r0-read.2` still never starts from its arguments alone. Still open: the
+mission switch, receipts
+of the service's operations, and Windows. The vectors are engineering
+evidence, not containment certification.
 
 ### Scope operations
 

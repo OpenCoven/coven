@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 
-use super::service::{Gate, Operation, Service, Worker, SERVER_NAME};
+use super::service::{Committing, Gate, Operation, Service, Worker, SERVER_NAME};
 use super::Refusal;
 
 /// The relay's arguments after the `coven` executable.
@@ -36,6 +36,12 @@ pub(crate) const RELAY_ARGS: &[&str] = &["automations", "scoped-read-relay"];
 pub(crate) const CHANNEL_ENV: &str = "COVEN_SCOPED_READ_CHANNEL";
 /// The relay's environment: the token it presents first.
 pub(crate) const TOKEN_ENV: &str = "COVEN_SCOPED_READ_TOKEN";
+/// The length of a channel directory's random name, in hex characters.
+const DIRECTORY_HEX: usize = 24;
+/// A channel directory's socket.
+const SOCKET_NAME: &str = "s";
+/// A channel directory's MCP configuration.
+const CONFIG_NAME: &str = "mcp.json";
 /// How long a connection has to present the token.
 const HANDSHAKE_TIME: Duration = Duration::from_secs(2);
 /// How often the listener looks for a connection or a close.
@@ -78,7 +84,7 @@ impl Channel {
         // failure cannot leave an unguarded directory behind.
         let channel_token = random_hex(TOKEN_HEX / 2)?;
         let directory = loop {
-            let name = random_hex(12)?;
+            let name = random_hex(DIRECTORY_HEX / 2)?;
             let directory = runtime.join(name);
             match DirBuilder::new().mode(0o700).create(&directory) {
                 Ok(()) => break directory,
@@ -90,8 +96,8 @@ impl Channel {
                 }
             }
         };
-        let socket = directory.join("s");
-        let config = directory.join("mcp.json");
+        let socket = directory.join(SOCKET_NAME);
+        let config = directory.join(CONFIG_NAME);
         let closed = Arc::new(AtomicBool::new(false));
         let mut channel = Self {
             directory,
@@ -254,7 +260,7 @@ impl Gate for Closing {
         self.inner.admit()
     }
 
-    fn commit(&mut self, tool: Option<&'static str>, digest: &str) -> Result<(), Refusal> {
+    fn commit(&mut self, committing: &Committing<'_>) -> Result<(), Refusal> {
         let _fence = self
             .fence
             .lock()
@@ -262,8 +268,55 @@ impl Gate for Closing {
         if self.closed.load(Ordering::SeqCst) {
             return Err(Refusal::AttemptClosed);
         }
-        self.inner.commit(tool, digest)
+        self.inner.commit(committing)
     }
+}
+
+/// The length in bytes of the socket path every channel for `coven_home`
+/// gets, and the most this platform allows. Every channel directory's name
+/// has the same length, so this is exact before a channel opens.
+pub(crate) fn socket_path_bytes(coven_home: &Path) -> (usize, usize) {
+    let socket = runtime_dir(coven_home)
+        .join("0".repeat(DIRECTORY_HEX))
+        .join(SOCKET_NAME);
+    (socket.as_os_str().len(), SOCKET_PATH_BYTES)
+}
+
+/// Where the channels of the daemon in `coven_home` live.
+pub(crate) fn runtime_dir(coven_home: &Path) -> PathBuf {
+    coven_home.join("runtime").join("scoped-read")
+}
+
+/// Removes what channels left behind when their daemon stopped without
+/// closing them: in each directory under `runtime` that this user owns, the
+/// socket and the MCP configuration, which holds a token, then the directory.
+/// The daemon runs it at startup, before any channel opens, so none of them
+/// is live: a channel's listener and gate live only in the daemon that
+/// opened it. Anything else is left in place. Returns how many directories
+/// were removed.
+pub(crate) fn sweep_stale(runtime: &Path) -> Result<usize> {
+    let entries = match fs::read_dir(runtime) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", runtime.display())),
+    };
+    // SAFETY: geteuid() only reads the calling process's effective uid.
+    let uid = unsafe { libc::geteuid() };
+    let mut removed = 0;
+    for entry in entries {
+        let directory = entry?.path();
+        let owned_directory = fs::symlink_metadata(&directory)
+            .is_ok_and(|metadata| metadata.is_dir() && metadata.uid() == uid);
+        if !owned_directory {
+            continue;
+        }
+        let _ = fs::remove_file(directory.join(SOCKET_NAME));
+        let _ = fs::remove_file(directory.join(CONFIG_NAME));
+        if fs::remove_dir(&directory).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Waits for a connection that presents `token`, until the channel closes.

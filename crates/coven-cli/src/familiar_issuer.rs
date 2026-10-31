@@ -142,19 +142,37 @@ pub(crate) fn issue(
     request: &BindingRequest<'_>,
     now: DateTime<Utc>,
 ) -> Result<std::result::Result<IssuedBinding, IssueRefusal>> {
+    ensure_familiar_bindings_schema(conn)?;
+    // The key store opens its own transaction, so the key comes first.
+    authority_keys::current_signing_key(conn, coven_home, AuthorityKeyRole::FamiliarBinding, now)?;
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("failed to begin familiar binding transaction")?;
+    let issued = issue_in(&transaction, coven_home, request, now)?;
+    if issued.is_ok() {
+        transaction
+            .commit()
+            .context("failed to commit the issued familiar binding")?;
+    }
+    Ok(issued)
+}
+
+/// [`issue`] inside the caller's open write transaction, which then holds the
+/// ledger read, the record and anything else the caller decides with them.
+/// It opens no transaction of its own, so the `familiar-binding` key must
+/// already exist.
+pub(crate) fn issue_in(
+    conn: &Connection,
+    coven_home: &Path,
+    request: &BindingRequest<'_>,
+    now: DateTime<Utc>,
+) -> Result<std::result::Result<IssuedBinding, IssueRefusal>> {
     let now = chrono::DurationRound::duration_trunc(now, TimeDelta::milliseconds(1))
         .context("binding time cannot be represented")?;
     ensure_familiar_bindings_schema(conn)?;
-    // The key store opens its own transaction, so the key comes first.
-    let key = authority_keys::current_signing_key(
-        conn,
-        coven_home,
-        AuthorityKeyRole::FamiliarBinding,
-        now,
-    )?;
-    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .context("failed to begin familiar binding transaction")?;
-    let Some(head) = familiar_ledger::live_head(&transaction, request.familiar_id)? else {
+    let key =
+        authority_keys::existing_signing_key(conn, coven_home, AuthorityKeyRole::FamiliarBinding)?
+            .context("there is no familiar-binding key; dispatch provisions it first")?;
+    let Some(head) = familiar_ledger::live_head(conn, request.familiar_id)? else {
         return Ok(Err(IssueRefusal::NotRegistered));
     };
     if head.head.status != "active" {
@@ -169,7 +187,7 @@ pub(crate) fn issue(
         }));
     }
 
-    let mut binding = unsigned_binding(&transaction, &head, request, now)?;
+    let mut binding = unsigned_binding(conn, &head, request, now)?;
     let binding_digest = familiar_contract::binding_digest(&binding);
     binding["integrity"]["bindingDigest"] = json!(binding_digest);
     binding["commit"]["verifiedBindingDigest"] = json!(binding_digest);
@@ -177,7 +195,7 @@ pub(crate) fn issue(
 
     // The contract's own verifier, against the retained bundle and the
     // ledger as it stands in this transaction.
-    let observation = familiar_ledger::observation(&transaction, &head.root.root_id, now)?
+    let observation = familiar_ledger::observation(conn, &head.root.root_id, now)?
         .context("the familiar ledger root disappeared mid-transaction")?;
     let binding_text = binding.to_string();
     let observation_text = observation.to_string();
@@ -197,19 +215,14 @@ pub(crate) fn issue(
             .join("; ")
     );
     // Coven's key policy, for the binding and every transition it cites.
-    authenticate(
-        &transaction,
-        &binding["authentication"],
-        &binding_digest,
-        now,
-    )?;
+    authenticate(conn, &binding["authentication"], &binding_digest, now)?;
     if let Some(predecessor) = binding["familiar"]["lineageEvidence"].get("predecessor") {
         let transition = &predecessor["transition"];
         let signed_at = DateTime::parse_from_rfc3339(&head.head.recorded_at)
             .context("revision time is RFC 3339")?
             .with_timezone(&Utc);
         authenticate(
-            &transaction,
+            conn,
             &transition["authentication"],
             &transition_digest(transition)?,
             signed_at,
@@ -217,29 +230,25 @@ pub(crate) fn issue(
     }
 
     let authority = projection(&binding, &head, now)?;
-    transaction
-        .execute(
-            "INSERT INTO familiar_bindings
+    conn.execute(
+        "INSERT INTO familiar_bindings
                 (binding_id, root_id, revision_id, binding_digest, binding_json, purpose,
                  target_type, target_id, ledger_generation, issued_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                binding["bindingId"].as_str(),
-                head.root.root_id,
-                head.head.revision_id,
-                binding_digest,
-                binding_text,
-                request.purpose.as_str(),
-                request.target_type.as_str(),
-                request.target_id,
-                i64::try_from(head.root.generation).context("generation exceeds SQLite range")?,
-                timestamp(now),
-            ],
-        )
-        .context("failed to record the issued familiar binding")?;
-    transaction
-        .commit()
-        .context("failed to commit the issued familiar binding")?;
+        params![
+            binding["bindingId"].as_str(),
+            head.root.root_id,
+            head.head.revision_id,
+            binding_digest,
+            binding_text,
+            request.purpose.as_str(),
+            request.target_type.as_str(),
+            request.target_id,
+            i64::try_from(head.root.generation).context("generation exceeds SQLite range")?,
+            timestamp(now),
+        ],
+    )
+    .context("failed to record the issued familiar binding")?;
     Ok(Ok(IssuedBinding {
         binding,
         binding_digest,

@@ -456,8 +456,10 @@ pub struct RoutineDefinition {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tags: Vec<String>,
-    /// Declared Runtime Authority. Validation refuses it until the daemon
-    /// advertises Runtime Authority (coven#857), as it refuses `outputTarget`.
+    /// Declared Runtime Authority (coven#857). Validation refuses it until the
+    /// daemon's launch path runs the scoped read service (#1603). A routine
+    /// that declares it is dispatched only under Runtime Authority, never as
+    /// an ordinary run.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub authority: Option<RoutineAuthority>,
 }
@@ -595,10 +597,6 @@ impl RoutineDefinition {
         }
         if let Some(authority) = &self.authority {
             authority.validate()?;
-            return Err(
-                "authority is not supported until this daemon advertises Runtime Authority"
-                    .to_string(),
-            );
         }
         Ok(())
     }
@@ -913,11 +911,11 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_authority_is_refused_until_runtime_authority_is_advertised() {
-        let error = RoutineDefinition::from_json(&with_authority(r0_authority())).unwrap_err();
-        assert!(
-            error.contains("until this daemon advertises Runtime Authority"),
-            "{error}"
+    fn a_declared_authority_is_admitted_and_round_trips() {
+        let declared = RoutineDefinition::from_json(&with_authority(r0_authority())).unwrap();
+        assert_eq!(
+            serde_json::to_value(&declared).unwrap()["authority"],
+            r0_authority()
         );
         // A definition that declares nothing serializes as before, so existing
         // definition digests do not move.

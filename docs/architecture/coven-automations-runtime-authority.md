@@ -4,8 +4,13 @@ source_adjacent_reason: "Records the runtime authority trust decisions alongside
 
 # Coven Automations Runtime Authority: trust decisions
 
-Status: maintainer decisions recorded 2026-10-03; slices 1–5
-implemented, Runtime Authority not yet constructed
+Status: maintainer decisions recorded 2026-10-03; slices 1 to 6
+implemented. The trusted adapter constructs Runtime Authority for routines
+that declare it, under the scoped read envelope only. The daemon launches
+that envelope only through `trusted_launch::prepare`, under the store gate
+([gate proposal](coven-automations-scoped-read-gate-proposal.md)), so
+definitions may declare an `authority` block. The capability is not
+advertised, and containment is not certified (#858, #854).
 
 Tracks: #857 (dispatch authority, receipts), #1137 (familiar identity),
 OpenCoven/coven-runtimes#48 (terminal observations), #858 (certification)
@@ -14,9 +19,9 @@ Runtime Authority binds each automation run to an authenticated principal, an
 exact familiar revision, a Threads authorization decision and a runtime
 descriptor, and settles a launched run only from authenticated terminal
 evidence. The contract, the immutable sidecar, the Ed25519 verifiers (#1192)
-and the evidence consumer (#1193) have landed. Production still constructs no
-Runtime Authority, because four producers had no owner. These are the
-maintainer's decisions on them.
+and the evidence consumer (#1193) have landed. The trusted adapter composes
+the producers for scheduled routines that declare authority. The decisions
+below define their ownership and remaining integration requirements.
 
 ## Decisions
 
@@ -373,6 +378,72 @@ unadvertised until slice 6.
    Construct Runtime Authority only for definitions that declare authority,
    launch only what an envelope enforces, apply the #857 approval policy for
    R3 and R4, and advertise the profile only once its conformance passes.
+
+   As built (#1603, recovered from #1217), `TrustedAuthority` serves a
+   routine that declares authority. Every other routine still dispatches
+   under BaseV1. The adapter works inside the runner's launch transaction. The
+   dispatch provisions every role key before that transaction opens, because
+   the producers inside it only load keys. For each attempt it:
+   - checks the owner activation of the current revision;
+   - pins the scoped read envelope, `r0-read.2`, and refuses any declared
+     scope that envelope cannot enforce as written: another root than the
+     project, a write, a non-filesystem kind, or a path the service refuses;
+   - issues a familiar binding, verified by the Familiar Contract;
+   - decides the Threads request, with the activation as the recurring grant.
+
+   It then verifies the dispatch bundle against a Threads-signed consumption
+   snapshot, consumes the decision once, and signs the binding. The
+   consumption store is a set of immutable events beside the slice 4
+   decisions: each decided request's adoption, and at most one consumption
+   per decision.
+
+   Only a `permit` dispatches:
+   - a grant no envelope enforces gets `RuntimeDowngrade`;
+   - a `requires_approval` decision gets `ApprovalRequired`, because
+     approvals are slice 7;
+   - R2 is refused by the profile, because a routine cannot yet declare the
+     safeguards R2 requires.
+
+   `trusted_launch::prepare` is the launch half. From the projection a launch
+   carries, it reads the binding the attempt pinned and authenticates it. It
+   checks that the launch folder is the project the binding names, and that
+   the binding's decision still verifies, is current and was consumed. It then
+   admits the launch through scoped read admission, with the scopes from the
+   decision's signed request. A definition changed after the decision cannot
+   widen them.
+
+   The daemon launches `r0-read.2` only through `prepare`, as the approved
+   [gate proposal](coven-automations-scoped-read-gate-proposal.md) describes:
+   - `r0-read.2` stays out of the daemon's launchable envelopes. The
+     arguments-only path refuses any envelope with a scoped read service.
+   - The daemon opens its own store connection and calls `prepare`. The
+     harness runs in its empty launch folder with exactly the envelope's
+     environment. The session registry owns the admitted launch until the
+     session exits, is killed or is stopped by shutdown.
+   - Every operation runs under a `StoreGate`. `admit` checks P and records
+     nothing. `commit` checks P again and records one immutable row, inside
+     one `BEGIN IMMEDIATE` transaction. If a revocation commits first, the
+     result is withheld. A busy store also withholds it.
+   - At startup the daemon sweeps channel directories that a crash left
+     behind.
+   - Definition validation admits an `authority` block.
+
+   Before the launch transaction decides anything, dispatch preflights what
+   needs no decision: the runtime takes authority projections and can launch
+   the envelope, the harness reports an admitted version, and the owner's
+   key is saved. A refusal there records no decision, adoption or
+   consumption. At launch, `prepare` also refuses an attempt whose authority
+   was withdrawn since dispatch: an attempt that is no longer live, a
+   pending stop or cancellation, a retired or revoked familiar revision, or
+   a definition revision that is no longer current and active.
+
+   A refusal before launch records its profile code on the occurrence.
+   Manual occurrences, including run-now and claimed manual ones, stay
+   refused until the Runtime Authority grant integration for
+   `occurrence.runNow.v1` lands. Settlement reads the terminal-observer keys
+   only when a Runtime Authority run is waiting, so a bad key record never
+   stops ordinary settlement. It verifies terminal evidence with those keys,
+   so a clean run settles from its own evidence with a signed receipt.
 7. **Held commands, then approvals.** The five versioned commands #1054
    holds for #857:
    - `occurrence.runNow.v1`;
