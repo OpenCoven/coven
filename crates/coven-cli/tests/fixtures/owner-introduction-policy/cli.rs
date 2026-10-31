@@ -11,6 +11,7 @@ fn policy(lifetime_days: u32) -> IntroductionPolicy {
         maximum_grant_lifetime_seconds: lifetime_days * 86_400,
         required_assurance: RequestedAssurance::FreshBiometric,
         maximum_step_up_age_seconds: 30,
+        minimum_attestation: Default::default(),
     }
 }
 

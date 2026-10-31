@@ -120,6 +120,8 @@ pub struct DeviceView {
     pub expires_at: Option<DateTime<Utc>>,
     pub revocation_epoch: u64,
     pub authorization_key: DeviceAuthorizationKeyView,
+    /// Assurance attribute only; never identity or authority.
+    pub attestation: super::attestation::DeviceAttestation,
 }
 
 pub struct DeviceAuthority {
@@ -412,6 +414,8 @@ impl DeviceAuthority {
             expires_at: record.grant.expires_at,
             revocation_epoch: record.grant.revocation_epoch,
             authorization_key,
+            attestation: super::attestation::AttestationRecords::open(&self.coven_home)?
+                .attestation(record.device.id, &record.device.public_key_x963)?,
         })
     }
 }
@@ -564,6 +568,7 @@ fn print_device(device: &DeviceView) {
             .unwrap_or_else(|| "unbounded legacy grant".to_owned())
     );
     println!("Revocation epoch: {}", device.revocation_epoch);
+    println!("Attestation: {}", device.attestation.as_str());
     println!(
         "Authorization key: {:?}{}",
         device.authorization_key.status,

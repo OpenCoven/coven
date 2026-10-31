@@ -331,7 +331,7 @@ pub(super) fn render_review(
 }
 
 /// The policy fields an owner-root action's effect digest covers.
-fn policy_fields(policy: &IntroductionPolicy) -> [(&'static str, String); 6] {
+fn policy_fields(policy: &IntroductionPolicy) -> [(&'static str, String); 7] {
     [
         ("eligible introducers", join(&policy.eligible_introducers)),
         ("required approvals", policy.required_approvals.to_string()),
@@ -355,6 +355,10 @@ fn policy_fields(policy: &IntroductionPolicy) -> [(&'static str, String); 6] {
         (
             "maximum step-up age",
             format!("{} seconds", policy.maximum_step_up_age_seconds),
+        ),
+        (
+            "minimum attestation",
+            policy.minimum_attestation.as_str().into(),
         ),
     ]
 }
