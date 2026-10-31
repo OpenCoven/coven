@@ -588,16 +588,7 @@ impl WriterLease {
         };
         let thread_participant = participant.clone();
         let renewer = thread::spawn(move || {
-            loop {
-                let (stopped, wake) = &*thread_stopper;
-                let guard = stopped.lock().expect("writer lease stop lock poisoned");
-                let (guard, _) = wake
-                    .wait_timeout(guard, RENEW_EVERY)
-                    .expect("writer lease wait poisoned");
-                if *guard {
-                    return;
-                }
-                drop(guard);
+            renew_until_stopped(&thread_stopper, RENEW_EVERY, || {
                 if thread_gate
                     .renew_writer(&thread_path, &thread_participant.generation)
                     .is_err()
@@ -605,7 +596,7 @@ impl WriterLease {
                     // Keep trying: a transient rename failure must not make a
                     // still-running session invisible to a maintenance owner.
                 }
-            }
+            })
         });
         Self {
             gate,
@@ -622,6 +613,27 @@ impl WriterLease {
 
     pub fn participant_capability(&self) -> Result<String> {
         self.participant().encode()
+    }
+}
+
+/// Calls `renew` every `every` until a stop is requested.
+///
+/// A condvar keeps no record of a notification sent while nobody waits, so a
+/// lease dropped before its renewer first waits would otherwise sleep a whole
+/// interval before seeing the stop, and `Drop` would block on that join. The
+/// flag is therefore checked before every wait as well as after it.
+fn renew_until_stopped(stopper: &(Mutex<bool>, Condvar), every: Duration, mut renew: impl FnMut()) {
+    let (stopped, wake) = stopper;
+    loop {
+        let guard = stopped.lock().expect("writer lease stop lock poisoned");
+        let (guard, _) = wake
+            .wait_timeout_while(guard, every, |stopped| !*stopped)
+            .expect("writer lease wait poisoned");
+        if *guard {
+            return;
+        }
+        drop(guard);
+        renew();
     }
 }
 
@@ -1091,6 +1103,31 @@ mod tests {
         assert!(WriterParticipant::decode(r#"{"id":" ","generation":"gen"}"#).is_err());
         assert!(WriterParticipant::decode(r#"{"id":"session","generation":" "}"#).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_stop_requested_before_the_first_wait_ends_renewal_at_once() {
+        let stopper = Arc::new((Mutex::new(true), Condvar::new()));
+        let thread_stopper = Arc::clone(&stopper);
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut renewals = 0;
+            renew_until_stopped(&thread_stopper, Duration::from_secs(3600), || renewals += 1);
+            let _ = done.send(renewals);
+        });
+        // Hang guard only. A renewer that waits before checking the stop
+        // returns after the hour-long interval; one that checks first returns
+        // without waiting at all.
+        let started = Instant::now();
+        let renewals = finished
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "renewer still waiting {:?} after a stop requested before its first wait",
+                    started.elapsed()
+                )
+            });
+        assert_eq!(renewals, 0);
     }
 
     #[test]
