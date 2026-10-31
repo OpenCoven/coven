@@ -443,6 +443,200 @@ fn relay_shutdown_cancels_contended_registry_lock_without_mutating_authority() {
     );
 }
 
+/// A DirectOnly grant may bootstrap over the direct channel, but the response
+/// omits the configured relay endpoints and their CA material, a relay-channel
+/// request is refused, and the production relay worker still refuses the
+/// device's relay attempt (#1614).
+#[test]
+fn direct_only_bootstrap_omits_relay_endpoints_and_relay_still_refuses() {
+    let _guard = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    use super::super::grant::{AssuranceLevel, DeviceGrantRestrictions, GrantTransportConstraint};
+    use super::super::transport::{self, test_support::Relay, websocket};
+    let fixture = Fixture::new();
+    let device_id = fixture.pairing.device_id;
+    let relay = Relay::start();
+    let certificate =
+        rcgen::generate_simple_self_signed(vec!["relay.example.test".into()]).unwrap();
+    let private_endpoint = websocket::EndpointConfig {
+        url: "wss://relay.example.test/ws".into(),
+        ca_certificates: vec![URL_SAFE_NO_PAD.encode(certificate.cert.der())],
+    };
+    storage::RelayConfig {
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration(), private_endpoint.clone()],
+    }
+    .save(&fixture.state.coven_home)
+    .unwrap();
+    let record = fixture
+        .state
+        .registry
+        .authorization_record(device_id)
+        .unwrap()
+        .unwrap();
+    let direct_only = record
+        .grant
+        .reissue(
+            &record.device.public_key_x963,
+            record.grant.scopes.clone(),
+            DeviceGrantRestrictions {
+                transport: GrantTransportConstraint::DirectOnly,
+                ..DeviceGrantRestrictions::default()
+            },
+            AssuranceLevel::Possession,
+            Utc::now(),
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .unwrap();
+    fixture
+        .state
+        .registry
+        .replace_grant(device_id, direct_only)
+        .unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let material = storage::load_or_provision(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &signer,
+        device_id,
+    )
+    .unwrap();
+    let pairing = material.pairing.clone();
+    let bootstrap = "/api/v1/mobile/transport/bootstrap";
+
+    let wire = fixture.request("POST", bootstrap, device_id);
+    let (response, _) = handle_transport_message(&fixture.state, &pairing, true, &wire).unwrap();
+    assert_eq!(response.status, 200);
+    for (label, marker) in [
+        ("relay URL", relay.configuration().url),
+        ("private relay URL", private_endpoint.url.clone()),
+        ("relay CA", private_endpoint.ca_certificates[0].clone()),
+    ] {
+        assert!(
+            !response.body.contains(&marker),
+            "DirectOnly bootstrap disclosed the {label}"
+        );
+    }
+    let envelope: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    let provisioning: storage::Provisioning =
+        serde_json::from_value(envelope["data"].clone()).unwrap();
+    assert!(provisioning.relay_endpoints.is_empty());
+    let trusted = provisioning
+        .verify(&pairing.host_key, device_id, fixture.device.verifying_key())
+        .unwrap();
+    assert_eq!(trusted.grant_id, pairing.grant_id);
+
+    let wire = fixture.request("POST", bootstrap, device_id);
+    let Err(error) = handle_transport_message(&fixture.state, &pairing, false, &wire) else {
+        panic!("DirectOnly bootstrap was served over a relay channel");
+    };
+    assert_eq!(error.to_string(), "grant requires direct transport");
+
+    // Real router: the relay runtime runs with the device's current material
+    // and a reachable endpoint, yet the device's relay session is refused.
+    // The same material derives the same routing secret the host uses.
+    let provisioning = material.provisioning(&signer).unwrap();
+    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+        .unwrap()
+        .unwrap();
+    let registry_path = fixture.state.coven_home.join("mobile/devices.json");
+    let registry_before = std::fs::read(&registry_path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut attempts = 0;
+    while Instant::now() < deadline {
+        let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+        let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+        let connected = relay
+            .connect(websocket::Role::Client, &room, &credential)
+            .and_then(|records| {
+                transport::connect(
+                    records,
+                    &pairing,
+                    &provisioning.binding_signature,
+                    &fixture.device,
+                    &room,
+                    false,
+                )
+            });
+        assert!(connected.is_err(), "DirectOnly device admitted over relay");
+        attempts += 1;
+        // Paces attempts across the manager's one-second reload; the positive
+        // control below, not this sleep, shows the worker could be reached.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(attempts > 1);
+    assert_eq!(std::fs::read(&registry_path).unwrap(), registry_before);
+
+    // Positive control on the same runtime and router: lifting the restriction
+    // lets the re-provisioned device connect and be served over the relay, so
+    // the refusals above came from transport policy, not an unreachable worker.
+    let record = fixture
+        .state
+        .registry
+        .authorization_record(device_id)
+        .unwrap()
+        .unwrap();
+    let unrestricted = record
+        .grant
+        .reissue(
+            &record.device.public_key_x963,
+            record.grant.scopes.clone(),
+            DeviceGrantRestrictions::default(),
+            AssuranceLevel::Possession,
+            Utc::now(),
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .unwrap();
+    fixture
+        .state
+        .registry
+        .replace_grant(device_id, unrestricted)
+        .unwrap();
+    let material = storage::load_or_provision(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &signer,
+        device_id,
+    )
+    .unwrap();
+    let provisioning = material.provisioning(&signer).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut channel = loop {
+        let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+        let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+        match relay
+            .connect(websocket::Role::Client, &room, &credential)
+            .and_then(|records| {
+                transport::connect(
+                    records,
+                    &material.pairing,
+                    &provisioning.binding_signature,
+                    &fixture.device,
+                    &room,
+                    false,
+                )
+            }) {
+            Ok(channel) => break channel,
+            Err(error) => {
+                assert!(Instant::now() < deadline, "relay connect failed: {error}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let wire = fixture.request("GET", "/api/v1/mobile/device", device_id);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    channel
+        .send_message(&wire, MAX_MOBILE_REQUEST_BYTES, deadline)
+        .unwrap();
+    assert!(channel
+        .receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline)
+        .unwrap()
+        .starts_with(b"HTTP/1.1 200"));
+    drop(runtime);
+}
+
 #[test]
 fn authenticated_bootstrap_reuses_identity_and_persists_routing_without_qr() {
     let fixture = Fixture::new();
