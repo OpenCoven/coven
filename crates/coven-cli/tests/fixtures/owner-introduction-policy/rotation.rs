@@ -354,6 +354,7 @@ fn an_incoming_key_edited_on_disk_is_refused_on_load() {
         stored.revision,
         stored.previous_digest.as_deref(),
         &stored.policy,
+        stored.root_generation.as_deref(),
     )
     .unwrap();
     value["digest"] = digest.clone().into();

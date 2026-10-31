@@ -37,6 +37,10 @@ const MAX_TRACKED_INTRODUCTIONS: usize = 16;
 pub struct IntroductionEnvelope {
     pub request: IntroductionTranscript,
     pub destination_signature: String,
+    /// The owner's WebAuthn assertion for a v2 request naming a passkey. The
+    /// passkey never approves alone; device approvals are still collected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passkey_assertion: Option<super::passkey::PasskeyAssertion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +224,14 @@ impl IntroductionLedger {
     ) -> Result<IntroductionStatus> {
         let authority = self.authority()?;
         authority.admit_transcript(&envelope.request, &envelope.destination_signature, now)?;
+        if IntroductionAuthority::passkey_approver(&envelope.request)
+            != envelope
+                .passkey_assertion
+                .as_ref()
+                .map(|assertion| assertion.credential_id.as_str())
+        {
+            bail!("introduction passkey assertion does not match the named passkey");
+        }
         self.registry.reload()?;
         if self
             .registry
@@ -376,6 +388,7 @@ impl IntroductionLedger {
                 &entry.envelope.request,
                 &entry.envelope.destination_signature,
                 &approvals,
+                entry.envelope.passkey_assertion.as_ref(),
                 now,
             )
         })();

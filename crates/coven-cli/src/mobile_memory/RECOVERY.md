@@ -21,6 +21,7 @@ silently performs another.
 | **Recover access** | adds one device and grant | owner-root signature over the exact request | `access_recovered` | owner root, policy, other devices, familiars |
 | Rotate or replace a device | moves a grant to an already-paired device | local owner (`coven device rotate`) | `device_authorization_reenrolled` | owner root, policy, familiars |
 | Rotate the owner root | replaces the root key in the policy chain | old *and* new root keys | `owner_root_rotated` | policy, devices, grants, familiars |
+| Register a passkey factor | adds one recovery credential | owner-root signature + the passkey's own assertion | `passkey_registered` | devices, grants, policy, familiars |
 | Rotate a familiar identity | — | no such operation exists | — | — |
 
 ## Recovering access
@@ -104,6 +105,40 @@ key fingerprints and every signed field, and signs only after the owner types
 `rotate`. A lost root key cannot be rotated. Recovering from that is an
 explicit owner trust-domain reset: remove `mobile/introduction-policy.json`
 and install a new policy. This is never automatic.
+
+## Passkey recovery factor
+
+A passkey is an optional owner credential, **never a device**. It has no `DeviceRecord`, grant, introducer identity or pairwise ID, and it is never listed by `coven device list`. Its WebAuthn backup flags are recorded as `backupEligible` and `backedUp`, so a synced passkey is shown as synced and is never treated as evidence of one physical device. Backup eligibility remains fixed after registration; backup state may change, following the [WebAuthn credential backup rules](https://www.w3.org/TR/webauthn-3/#sctn-credential-backup).
+
+**Registration.** `PasskeyStore::register` needs:
+
+- the owner-root signature over `owner.passkey.register`, which binds the audience, current root and root generation, credential ID, RP ID, canonical HTTPS origins and ES256 key
+- an assertion from that passkey, proving possession, whose WebAuthn challenge is the SHA-256 of the same action's canonical bytes
+
+The CLI shows the owner-root and credential public keys, root generation, relying party and origins, scope, audience, nonce, validity window and effect digest before asking for confirmation. Origins must be canonical HTTPS origins without credentials, paths, query strings, fragments or terminal controls. Stored credential material must match the root-signed registration digest and the **current root generation**. Rotating the root retires every registration, including when a formerly used root key returns; the owner re-registers. Ordinary policy replacement preserves the generation, while a fresh installation uses its proposal nonce to distinguish the new generation. Registration reads the root and writes the credential under one policy lock (policy store → passkey store), so a rotation lands either before it, which then refuses the old root's signature, or after it, which retires the new credential.
+
+Registration persists an audit outbox with the credential. Success is returned only after the deduplicated `passkey_registered` transition and its local receipt are durable. A failure after replacement reports an uncertain outcome, and an audit failure reports pending reconciliation; neither is a rejection. Reopening through `passkey list`, registration or assertion verification reconciles pending transitions, including retired registrations, before using a factor. An unavailable audit sink prevents that reconciliation and factor use.
+
+The passkey store is version 2; generation-less preview records are refused rather than reinterpreted. Preserve any old store for recovery outside the active path and explicitly re-register credentials with the owner root. Existing owner-policy heads without generation metadata still verify using their original signed bytes; the first updated policy replacement carries forward a stable generation derived from that legacy head. New policy writes include generation metadata in the transition digest. Older binaries refuse those fields, so downgrade requires a compatible recovery plan. This preserves the existing protected-storage trust model: root-approved heads reverify their signatures, while introducer-approved persisted policy heads retain their existing metadata validation and do not gain signature verification from generation metadata.
+
+**What a passkey may do.** It may fill **at most one** of the N approvals of a v2 threshold introduction (`passkeyApprover`). The request must still name at least one trusted device, so N ≥ 2. A passkey can never approve alone, and it has no slot under N = 1.
+
+**Verification.** The passkey's assertion over the exact introduction action (challenge = SHA-256 of its canonical bytes) is verified in Rust, inside the same registry commit as the device approvals:
+
+- the client data type, challenge and origin
+- the RP ID hash
+- user presence *and* verification
+- consistent backup flags and unchanged backup eligibility
+- the ES256 signature
+- counter advancement when either stored or presented counter is nonzero
+
+An authenticator that always reports zero has no signature-counter protection. It still requires a trusted-device approval and an exact introduction action; the registry's consumed-nonce ledger refuses replay even with fresh signatures and a different destination. A counter that was already nonzero cannot fall back to zero. Counter advancement is a rejection signal for a possible cloned authenticator, not proof that cloning is impossible.
+
+The passkey counter is persisted before the device-registry commit. If the registry write fails before replacement, no destination is enrolled, but the counter and other consumed proofs may already be spent. A replacement can also fail after its rename, yielding an uncertain introduction outcome with enrollment possibly present; reconcile the persisted introduction and device state before considering another attempt. Reusing the assertion is refused. When reconciliation establishes that a fresh attempt is needed, use a fresh introduction nonce, fresh trusted-device approval and a fresh passkey assertion. This ordering prevents replay rather than rolling back an already used factor proof.
+
+No vendor SDK, browser, relying-party server or hosted account service is involved in the decision. Optional account sign-in with a passkey needs a hosted account service and is out of scope here.
+
+The Linux CI job also runs `node crates/coven-cli/tests/fixtures/passkey-recovery/daemon-e2e.mjs "$CARGO_TARGET_DIR/debug/coven"` after the workspace suite. The fixture seeds synthetic trusted devices and uses a synthetic WebAuthn authenticator, then exercises the real CLI, owner socket and pinned-TLS daemon approval. It checks cancellation, review fields, unchanged device membership during registration, enrollment only after the trusted-device approval, replay refusal, and retirement followed by current-root re-registration. A usable private-interface listener is required; networking errors fail the check. Its receipt records the tested binary digest and source commit, and contains no private keys.
 
 ## Why a compromised service cannot recover access
 
