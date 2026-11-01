@@ -1125,6 +1125,25 @@ enum AttestationCommand {
         #[arg(long, value_name = "BASE64URL_SHA256")]
         signature_digest: String,
     },
+    #[command(
+        about = "Trust an Apple App Attest anchor certificate you supply (PEM or DER)",
+        long_about = "Trust an Apple App Attest anchor certificate you supply (PEM or DER).\n\n\
+                      Coven compiles in no vendor roots and never contacts Apple. An anchor can \
+                      only raise a device's assurance attribute to verified_official_app for an \
+                      app you also name; it never creates identity or authority, and devices \
+                      without attestation keep working under owner policy."
+    )]
+    AddAppleRoot {
+        #[arg(long, value_name = "CERTIFICATE")]
+        certificate: PathBuf,
+    },
+    #[command(about = "Name an official Apple app (team ID and bundle ID)")]
+    AddOfficialAppleApp {
+        #[arg(long, value_name = "TEAM_ID")]
+        team_id: String,
+        #[arg(long, value_name = "BUNDLE_ID")]
+        bundle_id: String,
+    },
     #[command(about = "Remove every anchor and official app")]
     Clear,
 }
@@ -2344,6 +2363,14 @@ fn run_cli(cli: Cli) -> Result<()> {
                     &package,
                     &signature_digest,
                 ),
+                AttestationCommand::AddAppleRoot { certificate } => {
+                    mobile_memory::attestation::run_trust_add_apple_root(&certificate)
+                }
+                AttestationCommand::AddOfficialAppleApp { team_id, bundle_id } => {
+                    mobile_memory::attestation::run_trust_add_official_apple_app(
+                        &team_id, &bundle_id,
+                    )
+                }
                 AttestationCommand::Clear => mobile_memory::attestation::run_trust_clear(),
             },
             DeviceCommand::Passkey { command } => match command {
