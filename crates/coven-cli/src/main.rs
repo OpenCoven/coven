@@ -24,6 +24,7 @@ mod api_response;
 mod api_routes;
 mod capabilities;
 mod chat_context_admission;
+mod claude_write_scope;
 mod cockpit_sources;
 mod config_paths;
 mod control_plane;
@@ -523,6 +524,12 @@ enum Command {
             help = "Additional directory the harness may access beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (codex/claude/copilot/coven-code --add-dir). Harnesses with no add-dir mechanism warn and continue."
         )]
         add_dir: Vec<String>,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Explicit Claude scoped-write v1 authority document; requires a qualified Claude streamed profile, and cannot be combined with --permission or --add-dir"
+        )]
+        write_scope: Option<PathBuf>,
         #[arg(
             long,
             help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
@@ -2245,6 +2252,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             speed,
             permission,
             add_dir,
+            write_scope,
             stream_json,
             stream_json_input,
         }) => run_session(
@@ -2266,6 +2274,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             stream_json,
             stream_json_input,
             context_admission.as_deref(),
+            write_scope.as_deref(),
         ),
         Some(Command::Sessions {
             command,
@@ -5662,6 +5671,7 @@ fn run_session(
     stream_json: bool,
     stream_json_input: bool,
     context_admission: Option<&Path>,
+    write_scope: Option<&Path>,
 ) -> Result<()> {
     let context_admission = context_admission
         .map(chat_context_admission::Request::read)
@@ -5804,13 +5814,27 @@ fn run_session(
             );
         }
     }
+    let scoped_policy = write_scope
+        .map(|file| {
+            anyhow::ensure!(
+                harness_id == "claude" && stream_json && !detach,
+                "writeScope requires a Claude streamed launch"
+            );
+            anyhow::ensure!(
+                requested_permission.is_none() && requested_add_dirs.is_empty(),
+                "writeScope cannot be combined with permission or add-dir options"
+            );
+            claude_write_scope::ClaudeWriteScope::read(file, &cwd)
+                .map(harness::LaunchPolicy::ClaudeScopedWrite)
+        })
+        .transpose()?;
     let launch_options = harness::HarnessLaunchOptions {
         model: requested_model,
         think,
         speed: requested_speed,
         permission: requested_permission,
         add_dirs: &requested_add_dirs,
-        launch_policy: None,
+        launch_policy: scoped_policy.as_ref(),
     };
 
     let effective_prompt = match (&familiar_ctx, spec.as_ref()) {
@@ -5914,7 +5938,11 @@ fn run_session(
             tools: Vec::new(),
             agent_mode: None,
             model: requested_model.map(str::to_string),
-            permission: requested_permission.map(|p| p.as_str().to_string()),
+            permission: if scoped_policy.is_some() {
+                Some("workspace-write".into())
+            } else {
+                requested_permission.map(|p| p.as_str().to_string())
+            },
         }))?;
     }
 

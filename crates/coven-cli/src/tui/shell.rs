@@ -1265,6 +1265,7 @@ fn dispatch_via_local_pty(
         false,
         false,
         None,
+        None,
     )?;
     let mut notes = plan_outcome_notes(plan);
     notes.push(format!("Cast event follower skipped: {daemon_reason}."));
@@ -2008,6 +2009,7 @@ fn run_guided_harness_session() -> Result<()> {
         Vec::new(),
         false,
         false,
+        None,
         None,
     )
 }

@@ -15,6 +15,17 @@ use anyhow::Context;
 use serde_json::{json, Value};
 
 #[test]
+fn claude_write_scope_cli_advertises_a_distinct_contract() -> anyhow::Result<()> {
+    let output = Command::new(coven_bin()).args(["run", "--help"]).output()?;
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("--write-scope"),
+        "scoped writes must be separately advertised, never inferred from --permission full"
+    );
+    Ok(())
+}
+
+#[test]
 fn chat_context_admission_cli_never_downgrades_to_an_ordinary_run() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let coven_home = temp.path().join("coven-home");

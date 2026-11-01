@@ -1,7 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod copilot;
-mod process;
+pub(crate) mod process;
 mod verify;
 
 use std::ffi::{OsStr, OsString};

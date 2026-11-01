@@ -2515,11 +2515,17 @@ pub(crate) fn launch_session_with_executor(
     if payload.get("requestAdoption").is_some() {
         return request_adoption_invalid("executionBinding");
     }
-    if payload.get("launchPolicy").is_some() && !authority.allows_session_launch_policy() {
+    if (payload.get("launchPolicy").is_some() || payload.get("writeScope").is_some())
+        && !authority.allows_session_launch_policy()
+    {
         return api_error(
             403,
             "forbidden",
-            "launchPolicy is accepted only over the owner-gated local IPC transport.",
+            if payload.get("launchPolicy").is_some() {
+                "launchPolicy is accepted only over the owner-gated local IPC transport."
+            } else {
+                "writeScope is accepted only over the owner-gated local IPC transport."
+            },
             None,
         );
     }
@@ -3008,11 +3014,17 @@ fn launch_adopted_session(
 
     // The gate, but no SQLite writer transaction, remains held across mutable
     // filesystem, harness, roster, parent, and maintenance admission.
-    if payload.get("launchPolicy").is_some() && !authority.allows_session_launch_policy() {
+    if (payload.get("launchPolicy").is_some() || payload.get("writeScope").is_some())
+        && !authority.allows_session_launch_policy()
+    {
         return api_error(
             403,
             "forbidden",
-            "launchPolicy is accepted only over the owner-gated local IPC transport.",
+            if payload.get("launchPolicy").is_some() {
+                "launchPolicy is accepted only over the owner-gated local IPC transport."
+            } else {
+                "writeScope is accepted only over the owner-gated local IPC transport."
+            },
             None,
         );
     }
@@ -4070,7 +4082,20 @@ fn session_launch_from_payload(payload: &Value) -> Result<SessionLaunch> {
     // binary is surfaced by the runtime as a structured launch failure.
     session_launch::validate_harness(&harness, session_launch::HarnessCheck::Configured)?;
     let launch_mode = launch_mode_from_payload(payload)?;
-    let launch_policy = launch_policy_from_payload(payload, &harness, launch_mode)?;
+    let mut launch_policy = launch_policy_from_payload(payload, &harness, launch_mode)?;
+    if let Some(value) = payload.get("writeScope") {
+        anyhow::ensure!(
+            launch_policy.is_none(),
+            "writeScope cannot be combined with launchPolicy"
+        );
+        anyhow::ensure!(
+            harness == "claude" && launch_mode == HarnessLaunchMode::Stream,
+            "writeScope requires a Claude streamed launch"
+        );
+        launch_policy = Some(LaunchPolicy::ClaudeScopedWrite(
+            crate::claude_write_scope::ClaudeWriteScope::from_value(value.clone(), &paths.cwd)?,
+        ));
+    }
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -23080,6 +23105,67 @@ pub(crate) mod tests {
         );
         assert!(runtime.launches.borrow()[0].model.is_none());
         assert!(runtime.launches.borrow()[0].launch_policy.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn claude_write_scope_is_separate_owner_local_authority() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("repo");
+        std::fs::create_dir(&project)?;
+        let scope = json!({"version":1,"primaryRoot":project,"writableRoots":[project],
+            "readOnlyRoots":[],"protectedRoots":[]});
+        let valid = json!({"projectRoot":project,"harness":"claude","launchMode":"stream",
+            "prompt":"write a synthetic artifact","writeScope":scope});
+        for (authority, expected) in [
+            (RequestAuthority::OwnerLocalIpc, 201),
+            (RequestAuthority::Tcp, 403),
+        ] {
+            let runtime = RecordingRuntime::default();
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/sessions",
+                temp.path(),
+                None,
+                Some(&valid.to_string()),
+                &runtime,
+                authority,
+            )?;
+            assert_eq!(response.status, expected, "{}", response.body);
+            if expected == 201 {
+                assert!(matches!(
+                    runtime.launches.borrow()[0].launch_policy,
+                    Some(LaunchPolicy::ClaudeScopedWrite(_))
+                ));
+            } else {
+                assert!(runtime.launches.borrow().is_empty());
+            }
+        }
+        for (key, value) in [
+            ("harness", json!("codex")),
+            ("launchMode", json!("interactive")),
+            ("writeScope", Value::Null),
+            ("writeScope", json!({"version":2})),
+            (
+                "launchPolicy",
+                json!({"approval":"never","sandbox":"workspace-write"}),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            let runtime = RecordingRuntime::default();
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/sessions",
+                temp.path(),
+                None,
+                Some(&invalid.to_string()),
+                &runtime,
+                RequestAuthority::OwnerLocalIpc,
+            )?;
+            assert_eq!(response.status, 400, "{}", response.body);
+            assert!(runtime.launches.borrow().is_empty());
+        }
         Ok(())
     }
 

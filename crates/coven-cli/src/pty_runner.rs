@@ -503,6 +503,7 @@ fn build_harness_command_with_conversation_inner(
         &mut args,
         cfg!(windows) || force_codex_stdin,
     );
+    let (program, args) = qualify_scoped_write_command(cwd, options, program, args)?;
     let (program, env_overrides) = prepare_harness_program(harness_id, mode, program)?;
 
     Ok(HarnessCommand {
@@ -3652,6 +3653,25 @@ fn codex_event_error_message(event: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn qualify_scoped_write_command(
+    cwd: &Path,
+    options: crate::harness::HarnessLaunchOptions<'_>,
+    program: String,
+    args: Vec<String>,
+) -> Result<(String, Vec<String>)> {
+    if let Some(crate::harness::LaunchPolicy::ClaudeScopedWrite(scope)) = options.launch_policy {
+        anyhow::ensure!(
+            scope.validate_for_cwd(cwd)? == *scope,
+            "writeScope directory identity changed before launch"
+        );
+        crate::claude_write_scope::validate_native_environment()?;
+        crate::claude_write_scope::verify_native_profile(&program)?;
+        crate::claude_write_scope::guard_native_command(program, args)
+    } else {
+        Ok((program, args))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_stream_harness_command_with_conversation(
     harness_id: &str,
@@ -3678,6 +3698,7 @@ pub fn build_stream_harness_command_with_conversation(
         &program,
         args,
     );
+    let (program, args) = qualify_scoped_write_command(cwd, options, program, args)?;
     let (program, env_overrides) = prepare_harness_program(
         harness_id,
         crate::harness::HarnessLaunchMode::Stream,
