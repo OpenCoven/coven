@@ -76,6 +76,10 @@ impl Records for Pipe {
             .receiver
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))?)
     }
+    fn receive_idle(&mut self) -> Result<Vec<u8>> {
+        // Hang guard only: the in-process pipe has no peer liveness to probe.
+        self.receive(Instant::now() + Duration::from_secs(30))
+    }
 }
 fn pipes() -> (Pipe, Pipe, Capture) {
     let (a_tx, a_rx) = mpsc::channel();

@@ -147,6 +147,105 @@ fn substituted_peers_fail_closed_through_the_production_relay() {
     assert_bytes_exclude(&captured, &markers);
 }
 
+/// The production router answers an idle host's WebSocket pings itself and
+/// does not forward them, so an authenticated channel with nothing to say
+/// stays registered across several keepalive intervals and still delivers the
+/// device's eventual record on the same Noise session. The relay's own
+/// TLS-terminated capture is the evidence: unmasked empty pong frames
+/// (`0x8A 0x00`) appear only after the exchange has gone idle, and the device
+/// receives nothing but its own traffic.
+#[test]
+fn production_relay_answers_idle_keepalives_and_delivers_the_late_record() {
+    let relay = Relay::start();
+    let (private, public) = generate_noise_key().unwrap();
+    let paired = pairing(public);
+    let binding = paired.sign_noise_binding(&identity(1)).unwrap();
+    let room = [37; 32];
+    let mut host_records = relay.join(websocket::Role::Host, &room);
+    // Short interval so the fixture observes several probes; the production
+    // budget stays, so a healthy loopback pong can never miss it.
+    host_records.set_keepalive(Duration::from_millis(200), websocket::KEEPALIVE_BUDGET);
+    let client_records = relay.join(websocket::Role::Client, &room);
+    let (authenticated_tx, authenticated_rx) = mpsc::channel();
+    let host_pairing = paired.clone();
+    let host_private = private.clone();
+    let host = thread::spawn(move || {
+        let mut channel = accept(
+            host_records,
+            &host_pairing,
+            &host_private,
+            &identity(1),
+            &room,
+            false,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        authenticated_tx.send(()).unwrap();
+        let request = channel.receive_idle().unwrap();
+        assert_eq!(request.as_slice(), b"late-request-private-marker");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        channel
+            .send(b"late-response-private-marker", deadline)
+            .unwrap();
+        assert_eq!(
+            channel.receive(deadline).unwrap().as_slice(),
+            b"late-received"
+        );
+    });
+    let mut channel = connect(
+        client_records,
+        &paired,
+        &binding,
+        &identity(2),
+        &room,
+        false,
+    )
+    .unwrap();
+    authenticated_rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap();
+    // Everything after this point is idle: only the host's pings and the
+    // relay's pongs cross the broker until the device sends.
+    let idle_from = relay.captured().len();
+    let pongs = |captured: &[u8]| {
+        captured[idle_from.min(captured.len())..]
+            .windows(2)
+            .filter(|frame| *frame == [0x8A, 0x00])
+            .count()
+    };
+    let observation_deadline = Instant::now() + Duration::from_secs(30);
+    while pongs(&relay.captured()) < 3 {
+        assert!(
+            Instant::now() < observation_deadline,
+            "relay did not answer three keepalive probes"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    channel
+        .send(b"late-request-private-marker", deadline)
+        .unwrap();
+    assert_eq!(
+        channel.receive(deadline).unwrap().as_slice(),
+        b"late-response-private-marker"
+    );
+    channel.send(b"late-received", deadline).unwrap();
+    host.join().unwrap();
+
+    let captured = relay.captured();
+    assert!(pongs(&captured) >= 3);
+    // The device's socket saw no probe: the only unmasked control frame the
+    // relay wrote during the idle period is the pong to the host, and the
+    // relay's own test suite proves pings are never forwarded.
+    let mut markers = stable_identifier_markers(&paired);
+    markers.push(("request plaintext", b"late-request-private-marker".to_vec()));
+    markers.push((
+        "response plaintext",
+        b"late-response-private-marker".to_vec(),
+    ));
+    assert_bytes_exclude(&captured, &markers);
+}
+
 #[test]
 fn production_relay_over_wss_carries_fresh_authenticated_reconnections() {
     let relay = Relay::start();

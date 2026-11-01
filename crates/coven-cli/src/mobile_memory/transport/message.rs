@@ -1,7 +1,7 @@
 //! Bounded fragmentation inside the authenticated encrypted record stream.
 use super::{Channel, Records, MAX_PLAINTEXT_BYTES};
 use anyhow::{ensure, Result};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 impl<R: Records> Channel<R> {
@@ -61,6 +61,33 @@ impl<R: Records> Channel<R> {
         deadline: Instant,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let first = self.receive(deadline)?;
+        self.assemble_message(first, maximum, deadline)
+    }
+
+    /// Wait for the next logical message on an idle channel. The first record
+    /// is awaited with the transport's keepalive-bounded idle wait; once it has
+    /// arrived, the remaining fragments must complete within `io_timeout`, so a
+    /// peer that starts a message and stalls cannot hold the channel.
+    pub fn receive_message_idle(
+        &mut self,
+        maximum: usize,
+        io_timeout: Duration,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let result = self
+            .receive_idle()
+            .and_then(|first| self.assemble_message(first, maximum, Instant::now() + io_timeout));
+        if result.is_err() {
+            self.cipher = None;
+        }
+        result
+    }
+
+    fn assemble_message(
+        &mut self,
+        first: Zeroizing<Vec<u8>>,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<Zeroizing<Vec<u8>>> {
         ensure!(first.len() >= 5 && first[0] == 1, "invalid message start");
         let total = u32::from_be_bytes(first[1..5].try_into()?) as usize;
         ensure!(total <= maximum, "message exceeds limit");
