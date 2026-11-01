@@ -6617,63 +6617,50 @@ fn apply_familiar_edits(
     maybe_pause_direct_apply_before_audit(coven_home, familiar_id);
     // Gate 4 persistence (#414): the audit records returned to the client
     // also land in the append-only ward_audit ledger, so applied writes stay
-    // observable across daemon restarts. Persist before advancing protected
-    // baselines so a post-write failure is less likely to leave an audit gap.
+    // observable across daemon restarts. The audit rows and any protected
+    // baseline advances commit as one durable transaction before the 200
+    // (#1640), so neither DB effect can survive without the other.
     // On persistence failure, return a structured 500 that includes the applied
     // changes so clients can distinguish "write applied, audit failed" from a
     // full failure and avoid blind retries that would produce duplicate writes.
+    if let Err(error) = maybe_fail_direct_audit_store_verification(&store_path)
+        .and_then(|()| audit_reservation.verify_store_path(&store_path))
     {
-        if let Err(error) = maybe_fail_direct_audit_store_verification(&store_path)
-            .and_then(|()| audit_reservation.verify_store_path(&store_path))
-        {
-            audit_reservation.preserve()?;
-            return direct_audit_persist_failed_response(&changes, &error);
-        }
-        let persist_error = crate::threads_gate::persist_apply_audit_records_on_connection(
-            audit_reservation.connection(),
-            familiar_id,
-            &workspace,
-            &config,
-            &report,
-            apply_now,
-        )
-        .err();
-        if let Some(err) = persist_error {
-            audit_reservation.preserve()?;
-            return direct_audit_persist_failed_response(&changes, &err);
-        }
+        audit_reservation.preserve()?;
+        return direct_audit_persist_failed_response(&changes, &error);
     }
-    if let Err(error) = advance_applied_protected_baselines_on_connection(
+    if let Err(failure) = persist_direct_apply_evidence(
         audit_reservation.connection(),
         familiar_id,
         &workspace,
-        &report.changes,
+        &config,
+        &report,
+        apply_now,
     ) {
         audit_reservation.preserve()?;
-        return json_response(
-            500,
-            &json!({
-                "error": {
-                    "code": "ward_baseline_advance_failed",
-                    "message": format!(
-                        "The file write was applied and audited, but protected-surface \
-                         baseline advancement failed: {error:#}"
-                    ),
-                    "details": {
-                        "writeApplied": true,
-                        "retrySafe": false,
+        return match failure {
+            DirectEvidenceFailure::Audit(error) | DirectEvidenceFailure::Durability(error) => {
+                direct_audit_persist_failed_response(&changes, &error)
+            }
+            DirectEvidenceFailure::Baseline(error) => json_response(
+                500,
+                &json!({
+                    "error": {
+                        "code": "ward_baseline_advance_failed",
+                        "message": format!(
+                            "The file write was applied, but protected-surface baseline \
+                             advancement failed, so neither its audit evidence nor the \
+                             baseline advance was recorded: {error:#}"
+                        ),
+                        "details": {
+                            "writeApplied": true,
+                            "retrySafe": false,
+                        },
                     },
-                },
-                "changes": changes,
-            }),
-        );
-    }
-    // Flush both the audit batch and any baseline advances before acknowledging
-    // the installed bytes. Keep their existing failure ordering and retain the
-    // reservation if the WAL or checked namespace barrier cannot be synced.
-    if let Err(error) = store::durable_barrier(audit_reservation.connection()) {
-        audit_reservation.preserve()?;
-        return direct_audit_persist_failed_response(&changes, &error);
+                    "changes": changes,
+                }),
+            ),
+        };
     }
     if let Err(error) = audit_reservation.finish() {
         return json_response(
@@ -6722,6 +6709,63 @@ fn apply_familiar_edits(
             "threadsGate": threads_gate_json,
         }),
     )
+}
+
+/// Which part of a direct write's DB evidence failed. The audit rows and the
+/// baseline advances share one durable transaction, so an `Audit` or
+/// `Baseline` failure rolls back both. A `Durability` failure covers the
+/// mode switch, COMMIT, SQLite sync and the post-COMMIT directory barrier;
+/// after a failed barrier the evidence may already be committed.
+#[derive(Debug)]
+enum DirectEvidenceFailure {
+    Audit(anyhow::Error),
+    Baseline(anyhow::Error),
+    Durability(anyhow::Error),
+}
+
+#[derive(Clone, Copy)]
+enum DirectEvidenceStage {
+    Audit,
+    Baseline,
+}
+
+/// Persist a direct write's Gate-4 audit rows and applicable protected
+/// baseline advances in one durable transaction (#1640). The direct API
+/// refuses Tier-0 edits, so the baseline branch is reached only by callers
+/// that already hold an applied protected change; this boundary adds no
+/// protected-write route.
+fn persist_direct_apply_evidence(
+    conn: &rusqlite::Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    report: &ward::ApplyReport,
+    now: time::OffsetDateTime,
+) -> std::result::Result<(), DirectEvidenceFailure> {
+    let failed = std::cell::Cell::new(None);
+    let result = store::durable_transaction(conn, || {
+        crate::threads_gate::persist_apply_audit_records_on_connection(
+            conn,
+            familiar_id,
+            workspace,
+            config,
+            report,
+            now,
+        )
+        .inspect_err(|_| failed.set(Some(DirectEvidenceStage::Audit)))?;
+        advance_applied_protected_baselines_on_connection(
+            conn,
+            familiar_id,
+            workspace,
+            &report.changes,
+        )
+        .inspect_err(|_| failed.set(Some(DirectEvidenceStage::Baseline)))
+    });
+    result.map_err(|error| match failed.get() {
+        Some(DirectEvidenceStage::Audit) => DirectEvidenceFailure::Audit(error),
+        Some(DirectEvidenceStage::Baseline) => DirectEvidenceFailure::Baseline(error),
+        None => DirectEvidenceFailure::Durability(error),
+    })
 }
 
 fn advance_applied_protected_baselines_on_connection(
