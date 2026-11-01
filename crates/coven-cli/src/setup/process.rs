@@ -383,7 +383,14 @@ impl RunningProcess for SystemRunningProcess {
 
 #[cfg(unix)]
 fn terminate_system_tree(process: &mut SystemRunningProcess) -> io::Result<()> {
-    signal_process_group(process.process_group, libc::SIGTERM)?;
+    // macOS reports EPERM for a group containing only zombies. Let the
+    // existing grace period reap our child and observe the group disappear;
+    // retain the error if the group is still inaccessible at escalation.
+    let term_error = match signal_process_group(process.process_group, libc::SIGTERM) {
+        Ok(()) => None,
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => Some(error),
+        Err(error) => return Err(error),
+    };
     let deadline = Instant::now() + Duration::from_millis(250);
     while process_group_is_alive(process.process_group) && Instant::now() < deadline {
         let _ = process.child.try_wait();
@@ -392,7 +399,11 @@ fn terminate_system_tree(process: &mut SystemRunningProcess) -> io::Result<()> {
     if process_group_is_alive(process.process_group) {
         match signal_process_group(process.process_group, libc::SIGKILL) {
             Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                if let Some(term_error) = term_error {
+                    return Err(term_error);
+                }
+            }
             Err(error) => return Err(error),
         }
     }
@@ -426,6 +437,14 @@ fn signal_process_group(process_group: libc::pid_t, signal: libc::c_int) -> io::
     if error.raw_os_error() == Some(libc::ESRCH) {
         Ok(())
     } else {
+        #[cfg(test)]
+        {
+            eprintln!(
+                "setup fixture signal failure: group={process_group} signal={signal} kind={:?} os_code={:?}",
+                error.kind(),
+                error.raw_os_error()
+            );
+        }
         Err(error)
     }
 }
@@ -701,6 +720,52 @@ mod version_extraction_tests {
         assert_eq!(
             extract_version("runtime 1.2.3 protocol 4.5.6", Some("claude")),
             None
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_reaps_a_zombie_process_group_before_reporting_permission_denied() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut process = spawn_managed(&mut command).expect("spawn fixture");
+        // WNOWAIT observes completion without reaping. This deterministically
+        // retains the all-zombie group that macOS reports as EPERM to killpg.
+        // SAFETY: waitid initializes this output structure before it is read.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: our live child id and valid output pointer are supplied;
+            // WNOWAIT leaves ownership and reaping with SystemRunningProcess.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    process.child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "waitid: {error}");
+        }
+        assert_eq!(
+            signal_process_group(process.process_group, libc::SIGTERM)
+                .expect_err("macOS zombie-only group must reproduce EPERM")
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        process
+            .terminate_tree()
+            .expect("a completed zombie-only group must be reaped, not rejected");
+        assert_eq!(
+            process.wait().expect("wait fixture"),
+            ProcessExit::Exited(0)
         );
     }
 }

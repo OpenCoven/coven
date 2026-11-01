@@ -1046,7 +1046,41 @@ fn system_launcher_timeout_reaps_descendants() -> Result<()> {
     let terminal = FixedTerminal(true);
     let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
     let clock = SystemClock::new();
-    let mut launcher = SystemProcessLauncher;
+    struct DescendantReadyLauncher<'a> {
+        pid_file: &'a Path,
+    }
+    impl ProcessLauncher for DescendantReadyLauncher<'_> {
+        fn launch(&mut self, request: &LaunchRequest) -> io::Result<Box<dyn RunningProcess>> {
+            let mut process = SystemProcessLauncher.launch(request)?;
+            // The action budget tests cleanup after a descendant exists, not
+            // whether a loaded host can schedule the shell within 250 ms.
+            // This is only a hang guard; early fixture exit is reported below.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match fs::read_to_string(self.pid_file) {
+                    Ok(pid) if pid.parse::<u32>().is_ok() => return Ok(process),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                if let Some(exit) = process.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "descendant fixture exited before readiness: {exit:?}"
+                    )));
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "descendant fixture did not announce readiness",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let mut launcher = DescendantReadyLauncher {
+        pid_file: &pid_file,
+    };
     let mut setup_options = options(Selector::Codex);
     setup_options.timeout = Duration::from_millis(250);
     let mut runtime = SetupRuntime {
@@ -1099,7 +1133,12 @@ fn inherited_terminal_io_stays_separate_from_the_redacted_report() -> Result<()>
         .write_all(b"terminal-input\n")?;
     drop(child.stdin.take());
     let status = child.wait()?;
-    assert!(status.success(), "helper failed with {status}");
+    assert!(
+        status.success(),
+        "helper failed with {status}\nstdout:\n{}\nstderr:\n{}",
+        fs::read_to_string(&stdout_path).unwrap_or_default(),
+        fs::read_to_string(&stderr_path).unwrap_or_default(),
+    );
 
     let stdout = fs::read_to_string(stdout_path)?;
     let stderr = fs::read_to_string(stderr_path)?;
@@ -1235,7 +1274,12 @@ fn copilot_fixture_inherits_terminal_streams_and_records_exact_login() -> Result
         .write_all(b"terminal-input\n")?;
     drop(child.stdin.take());
     let status = child.wait()?;
-    assert!(status.success(), "helper failed with {status}");
+    assert!(
+        status.success(),
+        "helper failed with {status}\nstdout:\n{}\nstderr:\n{}",
+        fs::read_to_string(&stdout_path).unwrap_or_default(),
+        fs::read_to_string(&stderr_path).unwrap_or_default(),
+    );
 
     assert_eq!(fs::read_to_string(args_path)?, "login\n");
     assert!(
