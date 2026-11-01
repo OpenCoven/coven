@@ -785,15 +785,21 @@ fn serve_authenticated_transport_inner<R: super::transport::Records>(
     serve_transport_with_state(&state, channel)
 }
 
+/// Serve one request on an authenticated channel. The wait for the next
+/// request is an idle wait with no request deadline: the transport keeps the
+/// channel alive and detects a dead peer within its documented budget, and the
+/// manager's cancellation (policy change, disable, stop) interrupts it. Once a
+/// request starts, its remaining fragments and the response are bounded by
+/// `MOBILE_IO_TIMEOUT`, the same mid-request budget as direct HTTPS (#1609).
 fn serve_transport_with_state<R: super::transport::Records>(
     state: &MobileGatewayState,
     channel: &mut super::transport::Channel<R>,
 ) -> Result<()> {
-    let deadline = std::time::Instant::now() + MOBILE_IO_TIMEOUT;
-    let encoded = channel.receive_message(
+    let encoded = channel.receive_message_idle(
         MAX_MOBILE_REQUEST_BYTES + MAX_HEADER_LINE_BYTES * (MAX_HEADER_COUNT + 1),
-        deadline,
+        MOBILE_IO_TIMEOUT,
     )?;
+    let deadline = std::time::Instant::now() + MOBILE_IO_TIMEOUT;
     let (response, close) =
         handle_transport_message(state, channel.pairing(), channel.is_direct(), &encoded)?;
     channel.send_message(

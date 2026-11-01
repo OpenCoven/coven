@@ -790,7 +790,7 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
         if round == 1 {
             assert!(storage::RelayConfig::disable(&fixture.state.coven_home).unwrap());
             // Eight seconds separates the one-second configuration poll from
-            // the unchanged fifteen-second idle request deadline. A timeout
+            // the thirty-second keepalive interval of the idle wait. A timeout
             // error cannot satisfy this assertion: the relay must send Close.
             let error = channel
                 .receive_message(
@@ -834,6 +834,131 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
                 .is_err());
         }
     }
+}
+
+/// An authenticated relay channel with nothing to say is held open: the worker
+/// does not tear it down at the former 15-second request deadline, the device
+/// completes a signed request on the same Noise session afterwards without
+/// reconnecting, the host made no further relay connection meanwhile, and the
+/// daemon still stops inside its two-second budget while the channel is idle
+/// (#1609).
+#[test]
+fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_request() {
+    let _guard = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    use super::super::transport::{self, test_support::Relay, websocket};
+    let fixture = Fixture::new();
+    let relay = Relay::start();
+    super::super::config::save_mobile_config(
+        &fixture.state.coven_home,
+        &MobileGatewayConfig {
+            enabled: false,
+            bind: "192.168.50.1:7443".parse().unwrap(),
+            advertised_endpoint: "https://192.168.50.1:7443".into(),
+        },
+    )
+    .unwrap();
+    storage::RelayConfig {
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(&fixture.state.coven_home)
+    .unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let device_id = fixture.pairing.device_id;
+    let material = storage::load_existing(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        signer.verifying_key(),
+        device_id,
+    )
+    .unwrap()
+    .unwrap();
+    let provisioning = material.provisioning(&signer).unwrap();
+    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut channel = loop {
+        let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+        let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+        match relay
+            .connect(websocket::Role::Client, &room, &credential)
+            .and_then(|records| {
+                transport::connect(
+                    records,
+                    &fixture.pairing,
+                    &provisioning.binding_signature,
+                    &fixture.device,
+                    &room,
+                    false,
+                )
+            }) {
+            Ok(channel) => break channel,
+            Err(error) => {
+                assert!(Instant::now() < deadline, "relay connect failed: {error}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let exchange = |channel: &mut transport::Channel<websocket::WebSocketRecords>| {
+        let wire = fixture.request("GET", "/api/v1/mobile/device", device_id);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        channel
+            .send_message(&wire, MAX_MOBILE_REQUEST_BYTES, deadline)
+            .and_then(|()| channel.receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline))
+    };
+    assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
+
+    // Every host connection is an upgrade with `role=host` in the relay's
+    // TLS-terminated capture. The count must not move while the channel idles.
+    let host_upgrades = |captured: &[u8]| {
+        captured
+            .windows(b"role=host".len())
+            .filter(|part| *part == b"role=host")
+            .count()
+    };
+    let before = relay.captured();
+    let upgrades_before = host_upgrades(&before);
+    assert!(upgrades_before >= 1);
+    // The idle period is the behavior under test, not a sequencing wait: it
+    // exceeds the former 15-second request deadline that tore the channel down.
+    std::thread::sleep(Duration::from_secs(16));
+    assert!(
+        exchange(&mut channel)
+            .expect("signed request after the idle period failed")
+            .starts_with(b"HTTP/1.1 200"),
+        "signed request after the idle period was not served"
+    );
+    let after = relay.captured();
+    assert_eq!(
+        host_upgrades(&after),
+        upgrades_before,
+        "host reconnected during the idle period"
+    );
+    assert!(
+        !after[before.len()..]
+            .windows(b"GET /ws".len())
+            .any(|part| part == b"GET /ws"),
+        "a relay upgrade crossed the broker during the idle period"
+    );
+
+    let started = Instant::now();
+    drop(runtime);
+    // The daemon's documented stop budget is a contract, not a jitter guard.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "relay runtime stop exceeded two seconds with an idle channel: {:?}",
+        started.elapsed()
+    );
+    assert!(channel
+        .receive_message(
+            MAX_MOBILE_RESPONSE_BYTES,
+            Instant::now() + Duration::from_secs(30)
+        )
+        .is_err());
 }
 
 /// Two persistent synthetic peers through the production relay router: a

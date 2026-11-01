@@ -36,6 +36,11 @@ const HANDSHAKE_BUDGET: Duration = Duration::from_secs(30);
 pub trait Records {
     fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<()>;
     fn receive(&mut self, deadline: Instant) -> Result<Vec<u8>>;
+    /// Wait for the next record on an idle channel. There is no absolute
+    /// deadline: the implementation keeps the path alive and must fail within
+    /// its documented dead-peer budget once the peer stops answering.
+    /// Cancellation must still interrupt the wait.
+    fn receive_idle(&mut self) -> Result<Vec<u8>>;
 }
 
 /// Trusted local pairing snapshot; never obtained from relay/discovery metadata.
@@ -222,6 +227,27 @@ impl<R: Records> Channel<R> {
         ensure!(self.cipher.is_some(), "channel closed");
         ensure!(Instant::now() < deadline, "channel deadline expired");
         let ciphertext = self.records.receive(deadline)?;
+        self.decrypt(&ciphertext)
+    }
+
+    /// Wait for the next record while the channel is idle. Liveness is owned
+    /// by the transport (`Records::receive_idle`); any failure closes the
+    /// channel exactly like a deadline failure.
+    pub fn receive_idle(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+        let result = self.receive_idle_inner();
+        if result.is_err() {
+            self.cipher = None;
+        }
+        result
+    }
+
+    fn receive_idle_inner(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+        ensure!(self.cipher.is_some(), "channel closed");
+        let ciphertext = self.records.receive_idle()?;
+        self.decrypt(&ciphertext)
+    }
+
+    fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         ensure!(
             (16..=MAX_RECORD_BYTES).contains(&ciphertext.len()),
             "invalid encrypted record size"
@@ -231,7 +257,7 @@ impl<R: Records> Channel<R> {
             .cipher
             .as_mut()
             .context("channel closed")?
-            .read_message(&ciphertext, &mut plaintext)?;
+            .read_message(ciphertext, &mut plaintext)?;
         plaintext.truncate(len);
         Ok(plaintext)
     }

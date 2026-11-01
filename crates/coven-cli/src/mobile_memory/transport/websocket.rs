@@ -2,7 +2,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -17,6 +17,32 @@ use zeroize::Zeroize;
 use super::cancellation::{Attempt, Cancellation};
 use super::network::{self, remaining};
 use super::{Records, MAX_RECORD_BYTES};
+
+/// Idle keepalive for an authenticated relay socket (#1609). After this long
+/// without an inbound frame the endpoint sends a WebSocket ping. The relay
+/// answers pings itself and resets its 120-second idle timer on every inbound
+/// frame, so this cadence holds the socket open with a four-ping margin.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// A frame (normally the relay's pong) must arrive this soon after a ping, or
+/// the path is dead and the idle wait fails. Dead-relay detection is therefore
+/// bounded by `KEEPALIVE_INTERVAL + KEEPALIVE_BUDGET`; the opposite peer's
+/// departure is reported by the relay with a close frame as soon as it notices.
+pub const KEEPALIVE_BUDGET: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct Keepalive {
+    interval: Duration,
+    budget: Duration,
+}
+
+impl Default for Keepalive {
+    fn default() -> Self {
+        Self {
+            interval: KEEPALIVE_INTERVAL,
+            budget: KEEPALIVE_BUDGET,
+        }
+    }
+}
 
 /// No Debug/Display implementation: URLs may carry private deployment metadata.
 pub struct RelayEndpoint {
@@ -202,7 +228,11 @@ pub fn connect_cancellable(
     let (socket, _) =
         tungstenite::client_tls_with_config(request, stream, Some(limits()), connector)
             .map_err(|_| anyhow::anyhow!("relay TLS or upgrade failed"))?;
-    Ok(WebSocketRecords { socket, attempt })
+    Ok(WebSocketRecords {
+        socket,
+        attempt,
+        keepalive: Keepalive::default(),
+    })
 }
 
 fn limits() -> WebSocketConfig {
@@ -349,9 +379,18 @@ impl Write for DeadlineStream {
 pub struct WebSocketRecords {
     socket: WebSocket<MaybeTlsStream<DeadlineStream>>,
     attempt: Attempt,
+    keepalive: Keepalive,
 }
 
 impl WebSocketRecords {
+    /// Test-only: shorten the keepalive cadence so fixtures can observe several
+    /// probes without waiting for the production interval. Production code has
+    /// no way to change these budgets.
+    #[cfg(test)]
+    pub(super) fn set_keepalive(&mut self, interval: Duration, budget: Duration) {
+        self.keepalive = Keepalive { interval, budget };
+    }
+
     /// Fixture barrier only: a pong proves the real router has registered this
     /// role. It is not endpoint authentication or proof of opposite-peer presence.
     #[cfg(test)]
@@ -379,6 +418,25 @@ impl WebSocketRecords {
     }
 }
 
+impl WebSocketRecords {
+    /// Consume one inbound frame. Control frames keep the wait going (a read
+    /// ping queues Tungstenite's pong, which the flush writes); anything other
+    /// than a binary record or a control frame fails the channel.
+    fn admit(&mut self, message: Message) -> Result<Option<Vec<u8>>> {
+        self.attempt.ensure_active()?;
+        match message {
+            Message::Binary(bytes) => Ok(Some(bytes.to_vec())),
+            Message::Ping(_) | Message::Pong(_) => {
+                self.socket
+                    .flush()
+                    .map_err(|_| anyhow::anyhow!("relay control write failed"))?;
+                Ok(None)
+            }
+            _ => bail!("unexpected relay record"),
+        }
+    }
+}
+
 impl Records for WebSocketRecords {
     fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<()> {
         ensure!(bytes.len() <= MAX_RECORD_BYTES, "relay record too large");
@@ -395,14 +453,44 @@ impl Records for WebSocketRecords {
                 .socket
                 .read()
                 .map_err(|_| anyhow::anyhow!("relay receive failed"))?;
-            self.attempt.ensure_active()?;
-            match message {
-                Message::Binary(bytes) => return Ok(bytes.to_vec()),
-                Message::Ping(_) | Message::Pong(_) => self
-                    .socket
-                    .flush()
-                    .map_err(|_| anyhow::anyhow!("relay control write failed"))?,
-                _ => bail!("unexpected relay record"),
+            if let Some(bytes) = self.admit(message)? {
+                return Ok(bytes);
+            }
+        }
+    }
+    /// Idle wait with keepalive. Each read is sliced at the keepalive interval;
+    /// a slice that expires with nothing inbound sends a ping and arms the
+    /// dead-peer budget. Any inbound frame (the relay's pong included) proves
+    /// the path and re-arms the interval. A slice that expires while a probe
+    /// is outstanding fails the wait. Cancellation surfaces from the stream as
+    /// a non-timeout error and fails the wait immediately; partial frames
+    /// buffered across a slice are resumed by Tungstenite on the next read.
+    fn receive_idle(&mut self) -> Result<Vec<u8>> {
+        let mut probing = false;
+        loop {
+            let slice = if probing {
+                self.keepalive.budget
+            } else {
+                self.keepalive.interval
+            };
+            self.set_deadline(Instant::now() + slice)?;
+            match self.socket.read() {
+                Ok(message) => {
+                    probing = false;
+                    if let Some(bytes) = self.admit(message)? {
+                        return Ok(bytes);
+                    }
+                }
+                Err(tungstenite::Error::Io(error)) if error.kind() == io::ErrorKind::TimedOut => {
+                    self.attempt.ensure_active()?;
+                    ensure!(!probing, "relay peer unresponsive");
+                    self.set_deadline(Instant::now() + self.keepalive.budget)?;
+                    self.socket
+                        .send(Message::Ping(Vec::new().into()))
+                        .map_err(|_| anyhow::anyhow!("relay keepalive failed"))?;
+                    probing = true;
+                }
+                Err(_) => bail!("relay receive failed"),
             }
         }
     }
@@ -430,7 +518,11 @@ fn fixture_connect_cancellable(
         Some(limits()),
     )
     .map_err(|_| anyhow::anyhow!("fixture upgrade failed"))?;
-    Ok(WebSocketRecords { socket, attempt })
+    Ok(WebSocketRecords {
+        socket,
+        attempt,
+        keepalive: Keepalive::default(),
+    })
 }
 
 #[cfg(test)]
@@ -580,15 +672,28 @@ mod tests {
 
     #[test]
     fn cancellation_interrupts_established_record_receive() {
-        established_receive_cancellation(false);
+        established_receive_cancellation(false, false);
     }
 
     #[test]
     fn cancellation_before_established_socket_read_is_observed() {
-        established_receive_cancellation(true);
+        established_receive_cancellation(true, false);
     }
 
-    fn established_receive_cancellation(gate_read: bool) {
+    /// The relay worker's idle wait (`receive_idle`, production keepalive
+    /// budgets) must observe cancellation exactly like a deadline-bounded read,
+    /// so the daemon's two-second stop contract holds while a channel is idle.
+    #[test]
+    fn cancellation_interrupts_established_idle_wait() {
+        established_receive_cancellation(false, true);
+    }
+
+    #[test]
+    fn cancellation_before_idle_socket_read_is_observed() {
+        established_receive_cancellation(true, true);
+    }
+
+    fn established_receive_cancellation(gate_read: bool, idle: bool) {
         use std::net::{Shutdown, TcpListener};
         use std::sync::mpsc;
         use std::time::Duration;
@@ -623,7 +728,11 @@ mod tests {
         }
         let (done, completed) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = records.receive(Instant::now() + Duration::from_secs(120));
+            let result = if idle {
+                records.receive_idle()
+            } else {
+                records.receive(Instant::now() + Duration::from_secs(120))
+            };
             // Preserve the actual outcome even when the parent hang guard fired.
             let _ = done.send(result);
         });
@@ -670,6 +779,121 @@ mod tests {
         );
         assert!(matches!(outcome, Ok(Err(_))), "cancelled record read did not fail before peer cleanup: {outcome:?}; elapsed={elapsed:?}; shutdown={shutdown:?}; entry={read_entry:?}; trace={trace:?}");
         assert!(trace.iter().any(|(phase, _, _)| *phase == "after socket read"), "probe gate failed before socket read: shutdown={shutdown:?}; entry={read_entry:?}; trace={trace:?}");
+        if idle {
+            // The daemon stop budget is a documented contract, not a jitter
+            // guard: an idle worker must leave its wait inside it.
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "idle wait left the stop budget: elapsed={elapsed:?}; trace={trace:?}"
+            );
+        }
+    }
+
+    /// A broker that stays connected and answers pings keeps an idle wait
+    /// alive across several keepalive intervals, and the record that finally
+    /// arrives is delivered on the same socket. The broker counts the probes,
+    /// so the evidence is the exchange itself rather than elapsed time.
+    #[test]
+    fn idle_wait_probes_the_broker_and_outlives_answered_keepalives() {
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let broker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Hang guards only; the probe count below is the evidence.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut peer = tungstenite::accept(stream).unwrap();
+            let mut pings = 0_usize;
+            loop {
+                match peer.read().unwrap() {
+                    // Reading a ping queues the pong; the next read flushes it.
+                    Message::Ping(_) => pings += 1,
+                    other => panic!("broker received {other:?} during the idle wait"),
+                }
+                if pings == 3 {
+                    peer.send(Message::Binary(b"after-idle".to_vec().into()))
+                        .unwrap();
+                    break;
+                }
+            }
+            // Keep the socket open until the client has read the record.
+            let _ = peer.read();
+            pings
+        });
+        let cancellation = Cancellation::default();
+        let mut records = fixture_connect_cancellable(address, &cancellation).unwrap();
+        // Three 200 ms idle slices: the production 30 s interval would make this
+        // fixture slow without changing what it proves. The budget stays at the
+        // production value so loopback scheduling cannot fail a healthy probe.
+        records.set_keepalive(Duration::from_millis(200), KEEPALIVE_BUDGET);
+        let started = Instant::now();
+        let record = records.receive_idle().unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(record, b"after-idle");
+        drop(records);
+        assert_eq!(
+            broker.join().unwrap(),
+            3,
+            "broker saw a different probe count"
+        );
+        // Discriminating bound: three idle slices precede the record. Far below
+        // the production interval, so a wait that never probed cannot pass.
+        assert!(
+            elapsed >= Duration::from_millis(600) && elapsed < KEEPALIVE_INTERVAL,
+            "idle wait did not pace by the keepalive interval: {elapsed:?}"
+        );
+    }
+
+    /// A broker that holds the TCP connection open but never answers is dead
+    /// from the endpoint's point of view: the idle wait fails once a probe's
+    /// budget expires, and the failure class names the unresponsive peer.
+    #[test]
+    fn idle_wait_fails_within_the_dead_peer_budget_when_keepalives_go_unanswered() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, released) = mpsc::channel::<()>();
+        let broker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let peer = tungstenite::accept(stream).unwrap();
+            // Never read again: the queued pong is never produced, while the
+            // TCP connection stays open until the endpoint has failed.
+            let _ = released.recv_timeout(Duration::from_secs(30));
+            drop(peer);
+        });
+        let cancellation = Cancellation::default();
+        let mut records = fixture_connect_cancellable(address, &cancellation).unwrap();
+        // The budget is the timeout under test. The broker never answers, so
+        // this is not a race against scheduling; 500 ms keeps the fixture fast.
+        records.set_keepalive(Duration::from_millis(200), Duration::from_millis(500));
+        let started = Instant::now();
+        let error = records.receive_idle().unwrap_err();
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        broker.join().unwrap();
+        assert_eq!(error.to_string(), "relay peer unresponsive", "{elapsed:?}");
+        // Interval plus budget precede the failure; the upper bound is a hang
+        // guard far above anything load produces, not a promptness claim.
+        assert!(
+            elapsed >= Duration::from_millis(700) && elapsed < Duration::from_secs(20),
+            "dead-peer detection outside its budget: {elapsed:?}"
+        );
     }
 
     #[test]
