@@ -1,5 +1,8 @@
 //! Test VFS: retain only images observed at successful SQLite xSync calls.
 //! Restoring those images discards an unsynced WAL suffix, unlike killing a process.
+//! Unit tests use it in-process. The `threads-test-clock` feature also lets the
+//! synthetic Ward power-loss fixture register it inside a real daemon (#1640);
+//! default builds never compile it.
 use anyhow::{Context, Result};
 use rusqlite::ffi;
 use std::{
@@ -156,9 +159,31 @@ impl PowerLoss {
     pub(crate) fn fail_next_sync(&self) {
         self.images.lock().unwrap().fail_sync = true;
     }
+    /// Restart observation from a completed TRUNCATE checkpoint. SQLite syncs
+    /// the database after a completed checkpoint and leaves an empty WAL, so
+    /// the database file alone is the durable image; earlier WAL images would
+    /// describe frames that are already in it.
+    #[cfg(feature = "threads-test-clock")]
+    pub(crate) fn restart_from_checkpointed_database(&self) -> Result<()> {
+        let database = std::fs::read(&self.database).context("reading checkpointed database")?;
+        let mut capture = self.images.lock().unwrap();
+        capture.images.clear();
+        capture.images.insert(self.database.clone(), database);
+        Ok(())
+    }
+    #[cfg(feature = "threads-test-clock")]
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database
+    }
+    #[cfg(feature = "threads-test-clock")]
+    pub(crate) fn wal_path(&self) -> &Path {
+        &self.wal
+    }
+    #[cfg(test)]
     pub(crate) fn sync_flags(&self) -> Vec<i32> {
         self.images.lock().unwrap().sync_flags.clone()
     }
+    #[cfg(test)]
     pub(crate) fn restore(&self, images: BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
         anyhow::ensure!(
             !files()

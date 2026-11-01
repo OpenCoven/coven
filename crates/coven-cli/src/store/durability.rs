@@ -58,6 +58,10 @@ pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T
         tx.commit()
             .context("committing durable authority evidence")?;
         checkpoint(Phase::DurableCommitReady);
+        // Synthetic fixture builds only: fail this post-COMMIT barrier once,
+        // leaving committed evidence as a real failed directory sync would.
+        #[cfg(feature = "threads-test-clock")]
+        crate::ward_power_loss_fixture::take_store_directory_barrier_failure(conn.path())?;
         if let Some(directory) = directory.as_ref() {
             checkpoint(Phase::DurableDirectorySyncBegin);
             crate::durable_fs::sync_directory(directory)?;

@@ -34,11 +34,15 @@ COMMIT may have succeeded even when its following directory barrier failed.
 A reported barrier failure never means that a preceding rename or commit did
 not happen. Retained intent/claims and terminal evidence drive reconciliation.
 
-Direct (non-proposal) Ward writes sync installed targets before persisting their
-Gate-4 audit rows and advancing any applied protected baselines. A checked FULL
-database barrier follows those writes before reservation release and HTTP 200.
-A barrier failure retains the reservation and returns `audit_persist_failed`
-with `writeApplied: true` and `retrySafe: false`. This acknowledgment guarantee
+Direct (non-proposal) Ward writes sync installed targets, then commit their
+Gate-4 audit rows and any applied protected baseline advances in one FULL
+transaction, followed by the checked database-directory barrier, before
+reservation release and HTTP 200. A failed audit insert, COMMIT, SQLite sync or
+directory barrier retains the reservation and returns `audit_persist_failed`;
+a failed baseline advance returns `ward_baseline_advance_failed`. Both report
+`writeApplied: true` and `retrySafe: false`. An audit or baseline failure rolls
+back both DB effects. A failed directory barrier follows COMMIT, so its evidence
+may already be committed and durable. This acknowledgment guarantee
 does not close the pre-audit crash window: an unacknowledged direct write may
 have installed target bytes without audit evidence. The direct API continues
 to refuse Tier-0 edits; these barriers grant no additional write authority.
@@ -117,4 +121,23 @@ Decision cases cut after the claim is published and before the apply intent,
 for scheduled and legacy proposals. The retry reuses the surviving reservation
 and applies once. A failed reservation sync leaves the proposal unclaimed and
 unchanged.
+The direct API refuses Tier-0 edits, so the protected-baseline branch of the
+direct evidence transaction is tested at the persistence boundary with a
+synthetic report: a forced baseline failure after audit insertion leaves
+neither effect, and the positive branch survives the lost-suffix cut.
+
+Real-daemon journeys in `threads_e2e` repeat the direct and legacy cases
+through the ordinary edits endpoint over owner IPC. They need the
+`threads-test-clock` feature, which also compiles a synthetic power-loss
+fixture into the test daemon. Default and release builds contain neither. The
+fixture activates only from an owner-private `test-fixtures/ward-power-loss/`
+directory in the daemon's own home, and its owner-IPC control requires the
+fixture capability and names no paths. It observes exactly `coven.sqlite3` and
+its WAL, starts from a TRUNCATE checkpoint, and can fail the next store sync or
+post-COMMIT store-directory barrier once. A journey's power cut freezes the
+synced images, terminates the daemon and restores only those images before
+restarting it. The journeys verify that acknowledged direct audit rows and
+legacy receipts and pending bytes survive, that the unsynced tail disappears,
+and that injected failures never acknowledge and recover coherently.
+
 These are deterministic protocol tests, not physical power-cut certification.

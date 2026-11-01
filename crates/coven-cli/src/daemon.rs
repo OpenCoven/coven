@@ -5965,6 +5965,9 @@ pub fn serve_forever(
     // catching the wedged-but-alive incumbent the socket guard can't, and the
     // direct `daemon serve` path that bypasses ensure_background_server.
     let serve_lock = acquire_serve_lock(coven_home)?;
+    // Synthetic fixture builds only: observe store syncs before the first open.
+    #[cfg(feature = "threads-test-clock")]
+    crate::ward_power_loss_fixture::activate_for_daemon(coven_home)?;
     let mut startup_store = initialize_daemon_store(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
@@ -7192,6 +7195,9 @@ fn serve_forever_with_lifetime_job_installer(
     let _ = allowed_hosts; // only meaningful on the (Unix) TCP transport
 
     let _serve_lock = acquire_serve_lock(coven_home)?;
+    // Synthetic fixture builds only: observe store syncs before the first open.
+    #[cfg(feature = "threads-test-clock")]
+    crate::ward_power_loss_fixture::activate_for_daemon(coven_home)?;
     install_lifetime_job()?;
     let pipe_name = windows_pipe_name(coven_home)?;
     let status = DaemonStatus {

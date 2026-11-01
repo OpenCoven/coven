@@ -1065,6 +1065,16 @@ fn handle_request_with_runtime_authority_and_automation_time(
             )
         }
         #[cfg(feature = "threads-test-clock")]
+        (_, "/internal/ward/power-loss") if !authority.allows_ward_proposal_access() => api_error(
+            403,
+            "transport_forbidden",
+            "Synthetic Ward power-loss control requires the owner-gated local IPC transport.",
+            Some(json!({
+                "requiredAuthority": "owner_local_ipc",
+                "writeApplied": false,
+            })),
+        ),
+        #[cfg(feature = "threads-test-clock")]
         (_, path)
             if (path == "/internal/threads/test-clock"
                 || path == "/internal/threads/test-clock/tick")
@@ -1114,6 +1124,8 @@ fn handle_request_with_runtime_authority_and_automation_time(
         ("POST", "/internal/threads/test-clock/tick") => {
             deterministic_threads_tick_response(coven_home, body)
         }
+        #[cfg(feature = "threads-test-clock")]
+        ("POST", "/internal/ward/power-loss") => ward_power_loss_fixture_response(coven_home, body),
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
         ("GET", p) if p.starts_with("/skills/eval-loop/") && !p.ends_with("/run") => {
             let familiar_id = p.trim_start_matches("/skills/eval-loop/");
@@ -15565,6 +15577,44 @@ fn deterministic_threads_clock_response(
             }),
         ),
         Err(error) => map_deterministic_threads_clock_error(error),
+    }
+}
+
+/// Owner-IPC control of the synthetic Ward power-loss fixture (#1640).
+#[cfg(feature = "threads-test-clock")]
+fn ward_power_loss_fixture_response(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    use crate::ward_power_loss_fixture as fixture;
+    let request: fixture::ControlRequest = match serde_json::from_str(body.unwrap_or_default()) {
+        Ok(request) => request,
+        Err(error) => {
+            return api_error(
+                400,
+                "invalid_request",
+                &format!("Synthetic Ward power-loss request is invalid: {error}"),
+                None,
+            );
+        }
+    };
+    match fixture::control(coven_home, &request) {
+        Ok(report) => json_response(200, &json!({ "ok": true, "report": report })),
+        Err(error) if error.is::<fixture::InactiveFixture>() => api_error(
+            409,
+            "ward_power_loss_fixture_inactive",
+            "The synthetic Ward power-loss fixture is not active for this daemon.",
+            None,
+        ),
+        Err(error) if error.is::<fixture::InvalidFixtureCapability>() => api_error(
+            403,
+            "ward_power_loss_fixture_forbidden",
+            "The synthetic Ward power-loss capability was rejected.",
+            None,
+        ),
+        Err(error) => api_error(
+            500,
+            "ward_power_loss_fixture_failed",
+            &format!("{error:#}"),
+            None,
+        ),
     }
 }
 
@@ -38466,6 +38516,69 @@ tier = 0
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "threads-test-clock"))]
+    #[test]
+    fn ward_power_loss_fixture_route_is_unavailable_in_default_build() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for authority in [RequestAuthority::OwnerLocalIpc, RequestAuthority::Tcp] {
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/api/v1/internal/ward/power-loss",
+                temp.path(),
+                None,
+                Some(r#"{"capability":"fixture-cap","action":"freeze"}"#),
+                &NoopSessionRuntime,
+                authority,
+            )?;
+            assert_eq!(response.status, 404, "{authority:?}: {}", response.body);
+        }
+        assert!(
+            !temp.path().join("test-fixtures").exists(),
+            "a default build must not create fixture state"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn ward_power_loss_fixture_control_requires_owner_transport_and_active_fixture() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = r#"{"capability":"fixture-cap","action":"fail-next-store-sync"}"#;
+        let response = handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/internal/ward/power-loss",
+            temp.path(),
+            None,
+            Some(body),
+            &NoopSessionRuntime,
+            RequestAuthority::Tcp,
+        )?;
+        assert_eq!(response.status, 403, "{}", response.body);
+        // This unit-test process never activates the fixture for this home.
+        let response = handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/internal/ward/power-loss",
+            temp.path(),
+            None,
+            Some(body),
+            &NoopSessionRuntime,
+            RequestAuthority::OwnerLocalIpc,
+        )?;
+        assert_eq!(response.status, 409, "{}", response.body);
+        // Requests name an action only; a path field is refused, not ignored.
+        let response = handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/internal/ward/power-loss",
+            temp.path(),
+            None,
+            Some(r#"{"capability":"fixture-cap","action":"freeze","path":"/tmp/elsewhere"}"#),
+            &NoopSessionRuntime,
+            RequestAuthority::OwnerLocalIpc,
+        )?;
+        assert_eq!(response.status, 400, "{}", response.body);
         Ok(())
     }
 
