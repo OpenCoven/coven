@@ -610,9 +610,16 @@ fn run_action(
                         .map(verify::EphemeralState::env_overrides)
                         .unwrap_or_default(),
                 };
-                process::probe_version(&request, timeout.min(Duration::from_secs(2)))
-                    .ok()
-                    .flatten()
+                let version = process::probe_version(&request, timeout.min(Duration::from_secs(2)));
+                #[cfg(test)]
+                match &version {
+                    Ok(None) => {
+                        eprintln!("setup fixture failure: phase=version probe result=Ok(None)");
+                    }
+                    Err(error) => trace_setup_test_failure("version probe", error),
+                    Ok(Some(_)) => {}
+                }
+                version.unwrap_or_default()
             });
             if version.is_none() {
                 outcome = failure_outcome(action);

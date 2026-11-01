@@ -156,6 +156,18 @@ a supported `python3`, the pinned pnpm, and `cargo install --locked
 failure does not reproduce on an idle rerun, record both runs. Do not retry
 until green without recording them.
 
+## Diagnosing concurrent setup integration failures
+
+Build `cargo test -p coven-cli --test setup_cli --locked --no-run` before launching concurrent copies of the resulting test binary. Record the source revision and working diff, binary hash, host, round/process counts, controlling-terminal context, command, exit status and separate complete output for each process. Keep the first failure and subsequent attempts; sequential or filtered passes do not establish concurrent full-binary acceptance.
+
+On macOS, signaling an all-zombie process group can return `EPERM`. Setup cleanup uses its existing 250 ms grace period to reap the child and observe the group disappear rather than immediately rejecting the completed action. A group that remains inaccessible at escalation retains the permission failure. The native regression uses `waitid(..., WNOWAIT)` to hold this state deterministically without a scheduling delay.
+
+The descendant-timeout fixture waits for its provider to announce a descendant PID before starting the unchanged 250 ms action budget. Early provider exit is an explicit readiness failure, and the readiness wait has a separate 30 s hang guard. This keeps host scheduling delay from erasing the descendant whose cleanup the test must prove.
+
+The inherited-terminal and Copilot fixture parents include captured helper stdout/stderr in a failed status assertion. The verification helper already includes both streams. In test builds, version-probe diagnostics distinguish `Ok(None)` from an I/O error kind and OS code without printing provider output or private paths. `Ok(None)` alone does not identify a timeout: it can also mean unsuccessful provider exit or rejected version text. Production report redaction, outcome mapping and deadlines remain unchanged.
+
+Compare full-binary stress with a shared controlling terminal against separate sessions before attributing a failure to terminal contention. The interactive login regression creates a real PTY, so a consent timeout alone is insufficient evidence of interference with the stress driver's terminal. Preserve its transcript and inspect the actual process/session/foreground groups. Do not widen production deadlines or skip tests to make the stress run pass.
+
 ## Keeping the inventory current
 
 `scripts/dev-verify-policy.json` explicitly lists the Policy guard's single-line
