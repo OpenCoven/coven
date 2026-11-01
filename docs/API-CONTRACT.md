@@ -111,6 +111,7 @@ setting any of them requests the envelope.
     "structuredErrors": true,
     "sessionHandoff": true,
     "sessionLaunchPolicy": true,
+    "sessionClaudeWriteScope": true,
     "afs": true,
     "afsMount": false,
     "afsCommit": true,
@@ -179,6 +180,7 @@ durability.
 | `structuredErrors`| boolean | Errors use the `{ error: { code, message, details } }` shape; session-policy admission decisions have their separately negotiated refusal shape. |
 | `sessionHandoff` | boolean | Durable generation-fenced session handoff routes are available. |
 | `sessionLaunchPolicy` | boolean | Owner-gated local IPC accepts the exact unattended Codex launch policy. Always `false` over TCP. |
+| `sessionClaudeWriteScope` | boolean | Owner-local IPC accepts the separate Claude `writeScope` v1 shape. Always `false` over TCP. This advertises parsing, not a qualified local executable or a grant. |
 | `sessionPolicyContracts` | string array | Refusal-only admission contracts. Currently `["coven.session-policy.v1"]` over owner-local IPC and `[]` over TCP. Missing on older daemons; absence means unavailable. This is not a supported enforcement profile, identity proof, or grant. |
 | `afs` | boolean | The AFS route family is available. |
 | `afsMount` | string or `false` | Active mount backend, or `false` when mount-backed access is unavailable. |
@@ -1150,6 +1152,18 @@ Other unknown action ids return `400` and fail closed:
   "reason": "unknown action `desktop.deleteEverything`"
 }
 ```
+
+## Claude scoped writes v1
+
+`capabilities.sessionClaudeWriteScope === true` advertises owner-local acceptance of `writeScope` on normal and adopted session launches. TCP rejects the field with `403 forbidden`. It is separate from unrestricted Full and the Codex-only `launchPolicy`; neither existing contract changes. Capability discovery does not establish platform/runtime qualification or grant authority.
+
+For Claude `launchMode: "stream"`, `writeScope` is a closed object with all fields required: `{ version: 1, primaryRoot: string, writableRoots: string[], readOnlyRoots: string[], protectedRoots: string[] }`. Roots must be existing absolute directories and are canonicalized and deduplicated. `primaryRoot` must equal launch cwd and be explicitly writable. Protected roots cannot contain writable roots. A writable child outside any broader write grant may sit under a read-only parent; a read-only subtree inside a broader writable root cannot also contain a writable descendant. Unsupported overlaps and native rule syntax, including literal backslashes, are refused. Read-only and protected roots receive explicit Read rules and no write-directory grant; protected/nested read-only paths receive Edit denials.
+
+The local CLI equivalent is `coven run claude --cwd /repo --stream-json --write-scope /private/path/scope.json -- "prompt"`. The JSON file is bounded to 65536 bytes. Do not combine this self-contained scope with `--permission`, `--add-dir`, or API `launchPolicy`. The caller supplies an authorized write set; prompts and model reports cannot confer access. Cave derives this set from live grants and retains read-only resource roots even beneath writable projects.
+
+The initial execution profile is macOS with Claude Code 2.1.316. Both direct streaming and daemon builders check the selected runtime, audit writable filesystem objects, and launch the child tree under a kernel no-hardlink guard. Existing hardlinks whose names are not all inside the writable set, unsupported filesystem objects, and audits exceeding 200000 entries are refused. Native `CLAUDE_` permission/settings/add-directory environment overrides and background session kinds are refused rather than silently dropping a possible administrator restriction. Provider credential and endpoint variables remain available. User/project settings sources and MCP configuration cannot broaden the requested scope.
+
+This is a qualified native edit boundary, not general shell confinement or confinement of concurrent external filesystem actors. Same-user executable selection remains trusted. Other platforms/versions and unsupported layouts fail closed; no fallback to Full occurs. Permission-denial records and policy refusals must remain errors even if a later wrapper reports success. Scope admission, actual tool artifacts, provider-backed behavior, and release readiness require separate evidence.
 
 ## `POST /api/v1/sessions`
 

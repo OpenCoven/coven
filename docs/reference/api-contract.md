@@ -74,6 +74,7 @@ GET /api/v1/health
     "structuredErrors": true,
     "sessionHandoff": true,
     "sessionLaunchPolicy": true,
+    "sessionClaudeWriteScope": true,
     "afs": true,
     "afsMount": false,
     "afsCommit": true,
@@ -96,11 +97,7 @@ GET /api/v1/health
 }
 ```
 
-The health `capabilities` object contains all 17 fields: `sessions`, `events`,
-`travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`,
-`structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsMount`,
-`afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, and
-`requestAdoptionContracts`, and `sessionPolicyContracts`.
+The health `capabilities` object contains all 18 fields: `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `sessionClaudeWriteScope`, `afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, and `requestAdoptionContracts`, and `sessionPolicyContracts`.
 
 `sessionPolicyContracts` is `["coven.session-policy.v1"]` only over owner-local
 IPC and `[]` over TCP. It advertises a refusal-only admission boundary, not an
@@ -175,3 +172,5 @@ See [Error envelope](/daemon/error-envelope) for the full code list.
 - [Socket API](/daemon/socket-api)
 - [API versioning](/daemon/api-versioning)
 - [API reference](/reference/api)
+
+`sessionClaudeWriteScope` is owner-local only and advertises the separate Claude `writeScope` v1 request shape; it is false over TCP and does not prove runtime qualification or grant authority. See the [scoped-write contract](../API-CONTRACT.md#claude-scoped-writes-v1) for schema, native-profile restrictions, refusals, and the local `--write-scope` equivalent.

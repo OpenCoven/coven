@@ -60,6 +60,9 @@ pub struct HealthCapabilities {
     /// `launchPolicy` contract documented for unattended Codex work.
     #[serde(default)]
     pub session_launch_policy: bool,
+    /// Separate, owner-local Claude scoped-write v1 contract.
+    #[serde(default)]
+    pub session_claude_write_scope: bool,
     /// Whether the `afs.*` route family is served at all.
     pub afs: bool,
     /// Mount backend, or `false` when none is available. A client must branch
@@ -169,6 +172,7 @@ pub(crate) fn health_response_for_authority(
             structured_errors: true,
             session_handoff: true,
             session_launch_policy: authority.allows_session_launch_policy(),
+            session_claude_write_scope: authority.allows_session_launch_policy(),
             afs: true,
             afs_mount: MountCapability::detect(),
             afs_commit: true,
@@ -263,6 +267,12 @@ mod tests {
             json!(["coven.session-policy.v1"])
         );
         assert_eq!(tcp["capabilities"]["sessionPolicyContracts"], json!([]));
+        assert_eq!(
+            owner["capabilities"]["sessionClaudeWriteScope"],
+            json!(true)
+        );
+        assert_eq!(tcp["capabilities"]["sessionClaudeWriteScope"], json!(false));
+        tcp["capabilities"]["sessionClaudeWriteScope"] = json!(true);
         tcp["capabilities"]["sessionLaunchPolicy"] = json!(true);
         tcp["capabilities"]["sessionPolicyContracts"] =
             owner["capabilities"]["sessionPolicyContracts"].clone();
@@ -275,6 +285,7 @@ mod tests {
         let tcp = health_response_for_authority(None, RequestAuthority::Tcp);
         let mut expected_tcp = owner_local.clone();
         expected_tcp.capabilities.session_launch_policy = false;
+        expected_tcp.capabilities.session_claude_write_scope = false;
         expected_tcp.capabilities.session_policy_contracts.clear();
 
         assert_eq!(tcp, expected_tcp);

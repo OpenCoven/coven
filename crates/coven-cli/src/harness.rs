@@ -63,13 +63,14 @@ pub enum HarnessLaunchMode {
 /// enforces its Codex/non-interactive boundary so another caller cannot use it
 /// to broaden an interactive or unsupported launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchPolicy {
-    pub add_dirs: Vec<String>,
+pub enum LaunchPolicy {
+    UnattendedWorkspaceWrite { add_dirs: Vec<String> },
+    ClaudeScopedWrite(crate::claude_write_scope::ClaudeWriteScope),
 }
 
 impl LaunchPolicy {
     pub fn unattended_workspace_write(add_dirs: Vec<String>) -> Self {
-        Self { add_dirs }
+        Self::UnattendedWorkspaceWrite { add_dirs }
     }
 }
 
@@ -2087,6 +2088,15 @@ fn command_parts_with_specs(
         .cloned()
         .ok_or_else(|| anyhow!(unsupported_harness_message(harness_id, &configured_ids)))?;
     let program = resolve_program(&spec.executable);
+    let scoped_write = matches!(
+        options.launch_policy,
+        Some(LaunchPolicy::ClaudeScopedWrite(_))
+    );
+    anyhow::ensure!(
+        !scoped_write || (spec.id == "claude" && spec.source == "bundled"),
+        "writeScope requires the bundled Claude adapter"
+    );
+    let claude_bypass_enabled = claude_bypass_enabled && !scoped_write;
 
     // Model selection forwards to the harness's native flag as a normal option
     // ahead of the prompt positional. Adapters that declare no model mechanism
@@ -2294,6 +2304,20 @@ fn launch_policy_args(
     let Some(policy) = options.launch_policy else {
         return Ok(Vec::new());
     };
+    if let LaunchPolicy::ClaudeScopedWrite(scope) = policy {
+        anyhow::ensure!(
+            harness_id == "claude" && mode == HarnessLaunchMode::Stream,
+            "writeScope is supported only for Claude streamed launches"
+        );
+        anyhow::ensure!(
+            options.permission.is_none() && options.add_dirs.is_empty(),
+            "writeScope cannot be combined with permission or add-dir options"
+        );
+        return scope.native_args();
+    }
+    let LaunchPolicy::UnattendedWorkspaceWrite { add_dirs } = policy else {
+        unreachable!()
+    };
     if harness_id != "codex" || mode != HarnessLaunchMode::NonInteractive {
         anyhow::bail!("launchPolicy is supported only for Codex nonInteractive launches");
     }
@@ -2328,7 +2352,7 @@ fn launch_policy_args(
         args.push("-c".to_string());
         args.push(r#"windows.sandbox="unelevated""#.to_string());
     }
-    for dir in &policy.add_dirs {
+    for dir in add_dirs {
         args.push("--add-dir".to_string());
         args.push(dir.clone());
     }
