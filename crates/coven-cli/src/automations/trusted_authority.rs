@@ -855,8 +855,7 @@ mod tests {
         );
         assert!(
             status == 200 && response.accepted,
-            "{status} {:?}",
-            response.status
+            "the definition was refused"
         );
     }
 
@@ -1120,8 +1119,7 @@ mod tests {
             );
             assert!(
                 status == 200 && response.accepted,
-                "{status} {:?}",
-                response.status
+                "the definition was refused"
             );
         };
         accepted(json!({ "action": "coven.automations.definition.create.v1",
