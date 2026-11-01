@@ -1,7 +1,9 @@
 //! Attestation at local enrollment: optional by default, an owner-chosen floor
 //! when the owner tightens policy. Synthetic chains; no vendor root or device.
 use super::*;
-use crate::mobile_memory::attestation::tests::{key_description, Ca};
+use crate::mobile_memory::attestation::tests::{
+    apple_trust, key_description, AppleAttestation, Ca,
+};
 use crate::mobile_memory::attestation::{AttestationEvidence, OfficialAndroidApp};
 use crate::mobile_memory::device::DeviceAuthority;
 use crate::mobile_memory::enrollment::tests::Fixture;
@@ -115,6 +117,7 @@ fn an_owner_floor_requires_verified_evidence_and_records_it() {
             package_name: "org.opencoven.pocket".into(),
             signature_digest: URL_SAFE_NO_PAD.encode([44; 32]),
         }],
+        ..AttestationTrust::default()
     }
     .save(fixture.home.path())
     .unwrap();
@@ -165,4 +168,50 @@ fn lowering_the_floor_is_a_downgrade() {
     unchanged.minimum_attestation = DeviceAttestation::UnattestedDevice;
     let serialized = serde_json::to_string(&unchanged).unwrap();
     assert!(!serialized.contains("minimumAttestation"));
+}
+
+#[test]
+fn an_apple_app_attest_object_meets_the_official_app_floor() {
+    let fixture = Fixture::new();
+    let ca = Ca::new();
+    apple_trust(&ca, true).save(fixture.home.path()).unwrap();
+    let digest = require(&fixture, DeviceAttestation::VerifiedOfficialApp);
+    let envelope_with = |evidence: &AppleAttestation| {
+        let mut envelope = envelope(&fixture, digest.clone(), None);
+        envelope.attestation = Some(evidence.evidence());
+        envelope
+    };
+    let possession = envelope(&fixture, digest.clone(), None)
+        .request
+        .possession_bytes()
+        .unwrap();
+    let challenge = attestation_challenge(&possession);
+
+    // An object bound to another request, or one chaining to a CA the owner
+    // never supplied, is unattested_device and so below the floor.
+    let replayed = AppleAttestation::new(&ca, &fixture.destination, [9; 32]);
+    let error = fixture
+        .ledger
+        .admit(envelope_with(&replayed), fixture.now)
+        .unwrap_err();
+    assert!(error.to_string().contains("requires verified_official_app"));
+    let rogue = Ca::new();
+    let unanchored = AppleAttestation::new(&rogue, &fixture.destination, challenge);
+    let error = fixture
+        .ledger
+        .admit(envelope_with(&unanchored), fixture.now)
+        .unwrap_err();
+    assert!(error.to_string().contains("requires verified_official_app"));
+
+    // A valid object for this exact request and destination key is admitted
+    // and recorded as verified_official_app for that key.
+    let attested = AppleAttestation::new(&ca, &fixture.destination, challenge);
+    let done = approve(&fixture, &fixture.ledger, &envelope_with(&attested));
+    assert_eq!(done.state, IntroductionState::Introduced);
+    assert_eq!(done.attestation, DeviceAttestation::VerifiedOfficialApp);
+    let view = DeviceAuthority::load(fixture.home.path())
+        .unwrap()
+        .inspect(&done.device_id.unwrap().to_string(), fixture.now)
+        .unwrap();
+    assert_eq!(view.attestation, DeviceAttestation::VerifiedOfficialApp);
 }

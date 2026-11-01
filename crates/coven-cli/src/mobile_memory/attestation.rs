@@ -22,8 +22,17 @@ use super::config::{atomic_replace_private, ensure_private_mobile_dir, validate_
 const TRUST_FILE: &str = "attestation-trust.json";
 const ATTESTATIONS_FILE: &str = "attestations.json";
 const ANDROID_KEY_DESCRIPTION_OID: &str = "1.3.6.1.4.1.11129.2.1.17";
+const APPLE_NONCE_OID: &str = "1.2.840.113635.100.8.2";
+const APPLE_ATTESTATION_FORMAT: &str = "apple-appattest";
+/// Production App Attest AAGUID: `appattest` padded with zeros. Development
+/// keys (`appattestdevelop`) are not official-app evidence.
+const APPLE_AAGUID: [u8; 16] = *b"appattest\0\0\0\0\0\0\0";
 const MAX_CHAIN: usize = 6;
 const MAX_RECORDS: usize = 256;
+/// An attestation object is a few kilobytes; anything larger is not decoded.
+const MAX_ATTESTATION_OBJECT: usize = 32 * 1024;
+/// `{ fmt, attStmt: { x5c: [...] }, authData }` is three containers deep.
+const MAX_CBOR_DEPTH: usize = 4;
 
 /// Ordered: each level implies the ones below it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -56,6 +65,10 @@ pub enum AttestationEvidence {
     /// Android Keystore key attestation: leaf-first DER certificate chain for
     /// the device's own possession key.
     AndroidKey { chain: Vec<String> },
+    /// Apple App Attest: the base64url CBOR attestation object for the
+    /// device's own possession key, made with the request challenge as the
+    /// `clientDataHash`.
+    AppleAppAttest { attestation_object: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +77,25 @@ pub struct OfficialAndroidApp {
     pub package_name: String,
     /// SHA-256 of the app signing certificate, base64url.
     pub signature_digest: String,
+}
+
+/// An App ID is the team ID and bundle ID joined by a dot; App Attest binds
+/// its SHA-256 into the authenticator data's RP ID hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct OfficialAppleApp {
+    pub team_id: String,
+    pub bundle_id: String,
+}
+
+impl OfficialAppleApp {
+    fn app_id(&self) -> String {
+        format!("{}.{}", self.team_id, self.bundle_id)
+    }
+
+    fn rp_id_hash(&self) -> [u8; 32] {
+        Sha256::digest(self.app_id()).into()
+    }
 }
 
 /// Owner-managed. Empty by default: nothing is verifiable, so every device is
@@ -76,6 +108,11 @@ pub struct AttestationTrust {
     pub android_roots: Vec<String>,
     #[serde(default)]
     pub official_android_apps: Vec<OfficialAndroidApp>,
+    /// DER App Attest anchors, base64url, chosen by the owner.
+    #[serde(default)]
+    pub apple_roots: Vec<String>,
+    #[serde(default)]
+    pub official_apple_apps: Vec<OfficialAppleApp>,
 }
 
 impl AttestationTrust {
@@ -102,10 +139,14 @@ impl AttestationTrust {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.android_roots.len() > 8 || self.official_android_apps.len() > 32 {
+        if self.android_roots.len() > 8
+            || self.official_android_apps.len() > 32
+            || self.apple_roots.len() > 8
+            || self.official_apple_apps.len() > 32
+        {
             bail!("attestation trust configuration is too large");
         }
-        for root in &self.android_roots {
+        for root in self.android_roots.iter().chain(&self.apple_roots) {
             let der = decode(root)?;
             let (rest, _) = X509Certificate::from_der(&der)
                 .map_err(|_| anyhow::anyhow!("attestation anchor is not a DER certificate"))?;
@@ -121,11 +162,34 @@ impl AttestationTrust {
                 bail!("invalid official app identity");
             }
         }
+        for app in &self.official_apple_apps {
+            if !is_apple_team_id(&app.team_id) || !is_bundle_id(&app.bundle_id) {
+                bail!("invalid official app identity");
+            }
+        }
         Ok(())
     }
 }
 
-/// The attestation challenge for one exact transcript and device key.
+/// Apple team IDs are ten ASCII letters or digits.
+fn is_apple_team_id(value: &str) -> bool {
+    value.len() == 10 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Bundle IDs are dot-separated ASCII labels of letters, digits and hyphens.
+fn is_bundle_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// The attestation challenge for one exact transcript and device key. Apple
+/// clients pass it as the `clientDataHash`.
 pub(super) fn attestation_challenge(transcript_bytes: &[u8]) -> [u8; 32] {
     let mut material = b"COVEN-ATTESTATION/1\0".to_vec();
     material.extend_from_slice(transcript_bytes);
@@ -149,23 +213,24 @@ pub(super) fn evaluate(
             android_key(chain, trust, public_key_x963, challenge, now)
                 .unwrap_or(DeviceAttestation::UnattestedDevice)
         }
+        Some(AttestationEvidence::AppleAppAttest { attestation_object }) => {
+            apple_app_attest(attestation_object, trust, public_key_x963, challenge, now)
+                .unwrap_or(DeviceAttestation::UnattestedDevice)
+        }
     }
 }
 
-fn android_key(
-    chain: &[String],
-    trust: &AttestationTrust,
-    public_key_x963: &str,
-    challenge: &[u8; 32],
+/// Decodes a leaf-first DER chain and checks that each certificate is valid
+/// now, signed by the next, and that the last is, or is signed by, one of
+/// the owner-supplied `anchors`.
+fn verify_chain<'a>(
+    ders: &'a [Vec<u8>],
+    anchors: &[String],
     now: DateTime<Utc>,
-) -> Result<DeviceAttestation> {
-    if chain.is_empty() || chain.len() > MAX_CHAIN || trust.android_roots.is_empty() {
-        bail!("no verifiable android attestation chain");
+) -> Result<Vec<X509Certificate<'a>>> {
+    if ders.is_empty() || ders.len() > MAX_CHAIN || anchors.is_empty() {
+        bail!("no verifiable attestation chain");
     }
-    let ders = chain
-        .iter()
-        .map(|cert| decode(cert))
-        .collect::<Result<Vec<_>>>()?;
     let certs = ders
         .iter()
         .map(|der| match X509Certificate::from_der(der) {
@@ -180,27 +245,43 @@ fn android_key(
             bail!("attestation certificate is not valid now");
         }
     }
-    // Each certificate is signed by the next; the last must be signed by, or
-    // be, an owner-supplied anchor.
     for pair in certs.windows(2) {
         pair[0]
             .verify_signature(Some(pair[1].public_key()))
             .map_err(|_| anyhow::anyhow!("attestation chain signature is invalid"))?;
     }
     let last = certs.last().context("empty chain")?;
-    let anchored = trust.android_roots.iter().any(|root| {
+    let last_der = ders.last().context("empty chain")?;
+    let anchored = anchors.iter().any(|root| {
         let Ok(root_der) = decode(root) else {
             return false;
         };
         let Ok((_, anchor)) = X509Certificate::from_der(&root_der) else {
             return false;
         };
-        root_der == *ders.last().unwrap_or(&Vec::new())
-            || last.verify_signature(Some(anchor.public_key())).is_ok()
+        root_der == *last_der || last.verify_signature(Some(anchor.public_key())).is_ok()
     });
     if !anchored {
         bail!("attestation chain does not end at an owner-supplied anchor");
     }
+    Ok(certs)
+}
+
+fn android_key(
+    chain: &[String],
+    trust: &AttestationTrust,
+    public_key_x963: &str,
+    challenge: &[u8; 32],
+    now: DateTime<Utc>,
+) -> Result<DeviceAttestation> {
+    if chain.len() > MAX_CHAIN {
+        bail!("attestation chain is too long");
+    }
+    let ders = chain
+        .iter()
+        .map(|cert| decode(cert))
+        .collect::<Result<Vec<_>>>()?;
+    let certs = verify_chain(&ders, &trust.android_roots, now)?;
     let leaf = &certs[0];
     if URL_SAFE_NO_PAD.encode(leaf.public_key().subject_public_key.data.as_ref()) != public_key_x963
     {
@@ -235,6 +316,187 @@ fn android_key(
     } else {
         DeviceAttestation::VerifiedHardwareKey
     })
+}
+
+/// Apple App Attest. The object is `{ fmt: "apple-appattest", attStmt: { x5c,
+/// receipt }, authData }`. Every condition below must hold, else
+/// `UnattestedDevice`: x5c chains to an owner-supplied Apple anchor, the leaf
+/// certifies exactly the device key, its nonce extension equals
+/// SHA-256(authData ‖ challenge), and authData names an owner-named app ID with
+/// a fresh production key whose credential ID is SHA-256 of that key. The
+/// receipt is Apple-server material and is ignored; no network call is made.
+fn apple_app_attest(
+    attestation_object: &str,
+    trust: &AttestationTrust,
+    public_key_x963: &str,
+    challenge: &[u8; 32],
+    now: DateTime<Utc>,
+) -> Result<DeviceAttestation> {
+    if trust.apple_roots.is_empty() || trust.official_apple_apps.is_empty() {
+        bail!("no verifiable apple attestation");
+    }
+    if attestation_object.len() > MAX_ATTESTATION_OBJECT.div_ceil(3) * 4 {
+        bail!("attestation object is too large");
+    }
+    let object = decode(attestation_object)?;
+    if object.len() > MAX_ATTESTATION_OBJECT {
+        bail!("attestation object is too large");
+    }
+    let object = AppleAttestationObject::parse(&object)?;
+    let certs = verify_chain(&object.x5c, &trust.apple_roots, now)?;
+    let leaf = &certs[0];
+    let key = leaf.public_key().subject_public_key.data.as_ref();
+    if URL_SAFE_NO_PAD.encode(key) != public_key_x963 {
+        bail!("attestation is for another key");
+    }
+    let extension = leaf
+        .extensions()
+        .iter()
+        .find(|ext| ext.oid.to_id_string() == APPLE_NONCE_OID)
+        .context("attestation lacks a nonce")?;
+    let expected: [u8; 32] = Sha256::new()
+        .chain_update(&object.auth_data)
+        .chain_update(challenge)
+        .finalize()
+        .into();
+    if apple_nonce(extension.value)? != expected {
+        bail!("attestation is not bound to this request");
+    }
+    let auth_data = AuthenticatorData::parse(&object.auth_data)?;
+    if auth_data.credential_id != Sha256::digest(key).as_slice() {
+        bail!("attestation credential is not the device key");
+    }
+    if auth_data.aaguid != APPLE_AAGUID || auth_data.counter != 0 {
+        bail!("attestation is not a fresh production App Attest key");
+    }
+    if !trust
+        .official_apple_apps
+        .iter()
+        .any(|app| app.rp_id_hash() == auth_data.rp_id_hash)
+    {
+        bail!("attestation is for an app the owner has not named");
+    }
+    Ok(DeviceAttestation::VerifiedOfficialApp)
+}
+
+struct AppleAttestationObject {
+    /// Leaf-first DER chain.
+    x5c: Vec<Vec<u8>>,
+    auth_data: Vec<u8>,
+}
+
+impl AppleAttestationObject {
+    /// Strict: a text-keyed map with exactly the members above, no duplicate
+    /// members, no trailing bytes, and bounded nesting.
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut reader = bytes;
+        let value: ciborium::Value =
+            ciborium::de::from_reader_with_recursion_limit(&mut reader, MAX_CBOR_DEPTH)
+                .map_err(|_| anyhow::anyhow!("attestation object is not CBOR"))?;
+        if !reader.is_empty() {
+            bail!("attestation object has trailing data");
+        }
+        let mut fmt = None;
+        let mut statement = None;
+        let mut auth_data = None;
+        for (key, member) in cbor_map(value)? {
+            let slot = match key.as_str() {
+                "fmt" => &mut fmt,
+                "attStmt" => &mut statement,
+                "authData" => &mut auth_data,
+                _ => bail!("unexpected attestation object member"),
+            };
+            if slot.replace(member).is_some() {
+                bail!("duplicate attestation object member");
+            }
+        }
+        match fmt {
+            Some(ciborium::Value::Text(fmt)) if fmt == APPLE_ATTESTATION_FORMAT => {}
+            _ => bail!("attestation object is not apple-appattest"),
+        }
+        let mut x5c = None;
+        for (key, member) in cbor_map(statement.context("attestation object lacks attStmt")?)? {
+            match key.as_str() {
+                "x5c" if x5c.is_none() => x5c = Some(member),
+                "receipt" => {}
+                _ => bail!("unexpected attestation statement member"),
+            }
+        }
+        let Some(ciborium::Value::Array(chain)) = x5c else {
+            bail!("attestation statement lacks x5c");
+        };
+        let x5c = chain
+            .into_iter()
+            .map(|cert| match cert {
+                ciborium::Value::Bytes(der) => Ok(der),
+                _ => bail!("x5c entry is not a byte string"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let Some(ciborium::Value::Bytes(auth_data)) = auth_data else {
+            bail!("attestation object lacks authData");
+        };
+        Ok(Self { x5c, auth_data })
+    }
+}
+
+fn cbor_map(value: ciborium::Value) -> Result<Vec<(String, ciborium::Value)>> {
+    let ciborium::Value::Map(entries) = value else {
+        bail!("expected a CBOR map");
+    };
+    entries
+        .into_iter()
+        .map(|(key, member)| match key {
+            ciborium::Value::Text(key) => Ok((key, member)),
+            _ => bail!("expected a text CBOR key"),
+        })
+        .collect()
+}
+
+/// The nonce extension is `SEQUENCE { [1] EXPLICIT OCTET STRING nonce }`.
+fn apple_nonce(der: &[u8]) -> Result<[u8; 32]> {
+    let mut outer = Der::new(der);
+    let mut sequence = Der::new(outer.expect(0x30)?);
+    outer.end()?;
+    let mut tagged = Der::new(sequence.expect(0xa1)?);
+    sequence.end()?;
+    let nonce = tagged.expect(0x04)?;
+    tagged.end()?;
+    nonce
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("nonce is not 32 bytes"))
+}
+
+/// WebAuthn authenticator data with attested credential data:
+/// rpIdHash(32) ‖ flags(1) ‖ counter(4) ‖ aaguid(16) ‖ credentialIdLength(2)
+/// ‖ credentialId. Anything after the credential ID is covered by the nonce
+/// and otherwise ignored.
+struct AuthenticatorData<'a> {
+    rp_id_hash: [u8; 32],
+    counter: u32,
+    aaguid: [u8; 16],
+    credential_id: &'a [u8],
+}
+
+impl<'a> AuthenticatorData<'a> {
+    fn parse(bytes: &'a [u8]) -> Result<Self> {
+        let (rp_id_hash, rest) = bytes.split_at_checked(32).context("short authData")?;
+        let (flags, rest) = rest.split_first().context("short authData")?;
+        // Bit 6: attested credential data included.
+        if flags & 0x40 == 0 {
+            bail!("authData carries no attested credential");
+        }
+        let (counter, rest) = rest.split_at_checked(4).context("short authData")?;
+        let (aaguid, rest) = rest.split_at_checked(16).context("short authData")?;
+        let (length, rest) = rest.split_at_checked(2).context("short authData")?;
+        let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
+        let credential_id = rest.get(..length).context("short authData")?;
+        Ok(Self {
+            rp_id_hash: rp_id_hash.try_into()?,
+            counter: u32::from_be_bytes(counter.try_into()?),
+            aaguid: aaguid.try_into()?,
+            credential_id,
+        })
+    }
 }
 
 struct AttestationApplication {
@@ -485,17 +747,34 @@ pub fn run_trust_show(json: bool) -> Result<()> {
             app.package_name, app.signature_digest
         );
     }
+    for root in &trust.apple_roots {
+        let digest = Sha256::digest(decode(root)?);
+        println!(
+            "apple root    sha256:{}",
+            URL_SAFE_NO_PAD.encode(&digest[..12])
+        );
+    }
+    for app in &trust.official_apple_apps {
+        println!("official app  {}", app.app_id());
+    }
     Ok(())
+}
+
+/// Reads an owner-supplied anchor certificate, PEM or DER.
+fn read_anchor(certificate: &Path) -> Result<Vec<u8>> {
+    let bytes = fs::read(certificate)
+        .with_context(|| format!("failed to read {}", certificate.display()))?;
+    Ok(
+        match rustls_pki_types::CertificateDer::from_pem_slice(&bytes) {
+            Ok(der) => der.to_vec(),
+            Err(_) => bytes,
+        },
+    )
 }
 
 pub fn run_trust_add_android_root(certificate: &Path) -> Result<()> {
     let home = crate::coven_home_dir()?;
-    let bytes = fs::read(certificate)
-        .with_context(|| format!("failed to read {}", certificate.display()))?;
-    let der = match rustls_pki_types::CertificateDer::from_pem_slice(&bytes) {
-        Ok(der) => der.to_vec(),
-        Err(_) => bytes,
-    };
+    let der = read_anchor(certificate)?;
     let mut trust = AttestationTrust::load(&home)?;
     let encoded = URL_SAFE_NO_PAD.encode(&der);
     if !trust.android_roots.contains(&encoded) {
@@ -507,6 +786,39 @@ pub fn run_trust_add_android_root(certificate: &Path) -> Result<()> {
          attribute; it never grants authority.",
         URL_SAFE_NO_PAD.encode(&Sha256::digest(&der)[..12])
     );
+    Ok(())
+}
+
+pub fn run_trust_add_apple_root(certificate: &Path) -> Result<()> {
+    let home = crate::coven_home_dir()?;
+    let der = read_anchor(certificate)?;
+    let mut trust = AttestationTrust::load(&home)?;
+    let encoded = URL_SAFE_NO_PAD.encode(&der);
+    if !trust.apple_roots.contains(&encoded) {
+        trust.apple_roots.push(encoded);
+    }
+    trust.save(&home)?;
+    println!(
+        "Added Apple App Attest anchor sha256:{}. It can only raise a device's assurance \
+         attribute; it never grants authority.",
+        URL_SAFE_NO_PAD.encode(&Sha256::digest(&der)[..12])
+    );
+    Ok(())
+}
+
+pub fn run_trust_add_official_apple_app(team_id: &str, bundle_id: &str) -> Result<()> {
+    let home = crate::coven_home_dir()?;
+    let mut trust = AttestationTrust::load(&home)?;
+    let app = OfficialAppleApp {
+        team_id: team_id.to_owned(),
+        bundle_id: bundle_id.to_owned(),
+    };
+    let app_id = app.app_id();
+    if !trust.official_apple_apps.contains(&app) {
+        trust.official_apple_apps.push(app);
+    }
+    trust.save(&home)?;
+    println!("Added official Apple app {app_id}.");
     Ok(())
 }
 

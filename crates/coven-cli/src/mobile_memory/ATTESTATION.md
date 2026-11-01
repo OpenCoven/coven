@@ -34,6 +34,8 @@ anchors and official app identities in `mobile/attestation-trust.json`:
 ```sh
 coven device attestation add-android-root --certificate ROOT.pem
 coven device attestation add-official-android-app --package PKG --signature-digest SHA256_B64URL
+coven device attestation add-apple-root --certificate APPLE_APP_ATTEST_ROOT.pem
+coven device attestation add-official-apple-app --team-id TEAMID1234 --bundle-id org.example.app
 coven device attestation show
 coven device attestation clear
 ```
@@ -56,7 +58,7 @@ Every condition below must hold:
 
 The challenge is SHA-256 of `COVEN-ATTESTATION/1\0` followed by the exact
 transcript's possession bytes, so evidence cannot be replayed onto another
-request.
+request. The same challenge serves both platforms.
 
 The official-app level additionally requires that `attestationApplicationId`
 (`[709]` in the software-enforced list) contains an owner-named package
@@ -64,6 +66,32 @@ The official-app level additionally requires that `attestationApplicationId`
 
 A strict, minimal DER reader parses only the fields above: definite lengths,
 exact tags, and no trailing data.
+
+## Apple App Attest
+
+The evidence is the base64url CBOR attestation object that
+`DCAppAttestService.attestKey` returns for the device's own possession key,
+made with the request challenge as the `clientDataHash`. The object is
+`{ fmt: "apple-appattest", attStmt: { x5c, receipt }, authData }`; it is
+decoded with a bounded size (32 KiB) and nesting depth, with no duplicate or
+unknown members and no trailing bytes. Every condition below must hold:
+
+- the leaf-first `x5c` chain is valid now, each certificate signed by the
+  next, and the last is, or is signed by, an owner-supplied Apple anchor
+- the leaf certifies exactly the device's P-256 key
+- the leaf's nonce extension (`1.2.840.113635.100.8.2`, a `SEQUENCE` holding
+  `[1] OCTET STRING`) equals SHA-256 of `authData` followed by the challenge
+- `authData` has the attested-credential flag, a zero counter, the
+  production `appattest` AAGUID, and a credential ID equal to SHA-256 of the
+  device's uncompressed key
+- the `rpIdHash` equals SHA-256 of an owner-named App ID, `TEAMID.bundle.id`
+
+App Attest always names the app and keys always live in the Secure Enclave,
+so the only attribute it can produce is `verified_official_app`. An object
+for an app the owner has not named, a development (`appattestdevelop`) key,
+or any failure above is `unattested_device`. The `receipt` is material for
+Apple's servers; Coven ignores it and makes no network call to Apple. Apple
+anchors verify only Apple objects and Android anchors only Android chains.
 
 ## Owner policy minimum
 
@@ -94,13 +122,11 @@ On success, the raised attribute is recorded for that device key, and
 **and** key. A device with a rotated key does not inherit the old key's
 attribute. A missing record means `unattested_device`.
 
-Apple App Attest needs a CBOR attestation object and is a follow-up. Until it
-lands, Apple devices are `unattested_device`.
-
 ## Fixture
 
-`tests/fixtures/device-attestation/mod.rs` builds synthetic chains with
-rcgen:
+`tests/fixtures/device-attestation/mod.rs` builds synthetic Android chains
+and Apple attestation objects with rcgen; no real vendor root or device data
+is checked in:
 
 ```sh
 cargo test -p coven-cli --bin coven mobile_memory::attestation --locked
