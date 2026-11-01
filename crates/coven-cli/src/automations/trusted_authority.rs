@@ -853,7 +853,11 @@ mod tests {
             &NoopSessionRuntime,
             CommandAuthority::OwnerLocal,
         );
-        assert!(status == 200 && response.accepted, "{response:?}");
+        assert!(
+            status == 200 && response.accepted,
+            "{status} {:?}",
+            response.status
+        );
     }
 
     /// A home with `sage` registered and an active R0 routine `notes` the
@@ -1114,7 +1118,11 @@ mod tests {
                 &NoopSessionRuntime,
                 CommandAuthority::OwnerLocal,
             );
-            assert!(status == 200 && response.accepted, "{status} {response:?}");
+            assert!(
+                status == 200 && response.accepted,
+                "{status} {:?}",
+                response.status
+            );
         };
         accepted(json!({ "action": "coven.automations.definition.create.v1",
                          "adoptionKey": "adopt:notes:create",
