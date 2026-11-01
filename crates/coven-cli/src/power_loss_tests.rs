@@ -165,8 +165,19 @@ impl PowerLoss {
     /// describe frames that are already in it.
     #[cfg(feature = "threads-test-clock")]
     pub(crate) fn restart_from_checkpointed_database(&self) -> Result<()> {
-        let database = std::fs::read(&self.database).context("reading checkpointed database")?;
+        // Hold the capture lock: a concurrent commit either synced before this
+        // check (non-empty WAL, refused) or records its WAL image after it.
         let mut capture = self.images.lock().unwrap();
+        let wal_bytes = match std::fs::metadata(&self.wal) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error).context("inspecting checkpointed WAL"),
+        };
+        anyhow::ensure!(
+            wal_bytes == 0,
+            "a commit reached the WAL after the TRUNCATE checkpoint; refusing to discard it"
+        );
+        let database = std::fs::read(&self.database).context("reading checkpointed database")?;
         capture.images.clear();
         capture.images.insert(self.database.clone(), database);
         Ok(())

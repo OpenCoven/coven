@@ -42,7 +42,10 @@ directory barrier retains the reservation and returns `audit_persist_failed`;
 a failed baseline advance returns `ward_baseline_advance_failed`. Both report
 `writeApplied: true` and `retrySafe: false`. An audit or baseline failure rolls
 back both DB effects. A failed directory barrier follows COMMIT, so its evidence
-may already be committed and durable. This acknowledgment guarantee
+may already be committed and durable. The audit reservation is acquired and
+released with NORMAL commits: power loss after a failed SQLite sync can drop a
+retained reservation, and power loss after an acknowledged write can resurrect
+a released one as held capacity. Neither grants authority. This acknowledgment guarantee
 does not close the pre-audit crash window: an unacknowledged direct write may
 have installed target bytes without audit evidence. The direct API continues
 to refuse Tier-0 edits; these barriers grant no additional write authority.

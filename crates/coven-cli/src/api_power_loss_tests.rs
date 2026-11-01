@@ -685,12 +685,11 @@ fn failed_decision_reservation_sync_publishes_no_claim() -> Result<()> {
 }
 
 /// A synthetic direct-write report: one audited Tier-2 change for
-/// `notes/today.md` ("before" -> "after") plus one applied protected change
-/// at `protected`. The direct API refuses Tier-0 edits, so the protected
+/// `notes/today.md` ("before" -> "after") plus applied protected changes at
+/// each of `protected`, advanced in order. The direct API refuses Tier-0 edits, so the protected
 /// branch is exercised here at the persistence boundary only (#1640).
-fn direct_evidence_report(protected: &str) -> ward::ApplyReport {
-    ward::ApplyReport {
-        changes: vec![
+fn direct_evidence_report(protected: &[&str]) -> ward::ApplyReport {
+    let mut changes = vec![
             ward::AppliedChange {
                 decision: ward::Decision {
                     target: "notes/today.md".to_owned(),
@@ -712,18 +711,18 @@ fn direct_evidence_report(protected: &str) -> ward::ApplyReport {
                     bytes_written: 5,
                 }),
             },
-            ward::AppliedChange {
-                decision: ward::Decision {
-                    target: protected.to_owned(),
-                    resolved: protected.to_owned(),
-                    tier: ward::Tier::Protected,
-                    verdict: ward::Verdict::AuthorizedProtectedChange,
-                },
-                disposition: ward::Disposition::Applied,
-                audit: None,
-            },
-        ],
-    }
+    ];
+    changes.extend(protected.iter().map(|surface| ward::AppliedChange {
+        decision: ward::Decision {
+            target: (*surface).to_owned(),
+            resolved: (*surface).to_owned(),
+            tier: ward::Tier::Protected,
+            verdict: ward::Verdict::AuthorizedProtectedChange,
+        },
+        disposition: ward::Disposition::Applied,
+        audit: None,
+    }));
+    ward::ApplyReport { changes }
 }
 
 fn exact_direct_audit_rows(conn: &rusqlite::Connection) -> Result<i64> {
@@ -771,14 +770,15 @@ fn direct_evidence_baseline_failure_rolls_back_its_audit_rows() -> Result<()> {
     let workspace = seed_warded_familiar(home)?;
     let config = ward::WardConfig::load(&workspace)?.context("seeded ward.toml")?;
     let conn = store::open_store(&home.join("coven.sqlite3"))?;
-    // A path-escaping protected surface makes the baseline read fail after the
-    // audit rows were inserted in the same transaction.
+    // `SOUL.md` advances its baseline first; the path-escaping surface then
+    // fails, after both the audit rows and that manifest row were written in
+    // the same transaction.
     let failure = persist_direct_apply_evidence(
         &conn,
         "sage",
         &workspace,
         &config,
-        &direct_evidence_report("../SOUL.md"),
+        &direct_evidence_report(&["SOUL.md", "../SOUL.md"]),
         time::OffsetDateTime::now_utc(),
     )
     .expect_err("a failed baseline advance must fail the evidence write");
@@ -798,7 +798,7 @@ fn direct_evidence_baseline_failure_rolls_back_its_audit_rows() -> Result<()> {
             |row| row.get::<_, i64>(0)
         )?,
         0,
-        "a failed evidence transaction must not leave a manifest row"
+        "the earlier SOUL.md baseline advance must roll back with the audit rows"
     );
     assert!(conn.is_autocommit());
     assert_eq!(
@@ -825,7 +825,7 @@ fn direct_evidence_commits_audit_and_protected_baseline_atomically_and_durably()
         "sage",
         &workspace,
         &config,
-        &direct_evidence_report("SOUL.md"),
+        &direct_evidence_report(&["SOUL.md"]),
         time::OffsetDateTime::now_utc(),
     )
     .map_err(|failure| anyhow::anyhow!("{failure:?}"))?;
@@ -888,7 +888,7 @@ fn direct_evidence_sync_failures_are_typed_and_never_assume_rollback() -> Result
             "sage",
             &workspace,
             &config,
-            &direct_evidence_report("SOUL.md"),
+            &direct_evidence_report(&["SOUL.md"]),
             time::OffsetDateTime::now_utc(),
         )
         .expect_err("a failed sync or barrier must not report success");

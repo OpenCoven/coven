@@ -217,12 +217,15 @@ fn direct_acknowledged_write_survives_power_loss_over_real_daemon() -> Result<()
                 tail_rows(fixture, "power-loss-tail")? == 0,
                 "the unsynced NORMAL tail survived, so the loss model did not cut"
             );
-            // Reservation release commits with NORMAL after the durable
-            // evidence, so a cut can resurrect it as held capacity. That is
-            // conservative, not authority; record it rather than assume.
-            eprintln!(
-                "acknowledged direct write: retained reservations after power cut={}",
-                direct_reservations(fixture)?
+            // Reservation acquisition and release both commit with NORMAL.
+            // The evidence's FULL commit syncs the acquisition frames, but the
+            // later release stays unsynced, so the cut resurrects the
+            // reservation as held capacity. That is conservative, not
+            // authority, and is recorded as a residual on #1640.
+            let resurrected = direct_reservations(fixture)?;
+            anyhow::ensure!(
+                resurrected == 1,
+                "expected the unsynced reservation release to be lost: {resurrected}"
             );
             let audits = exact_direct_audits(fixture, "notes/today.md", BEFORE, AFTER)?;
             anyhow::ensure!(
@@ -335,10 +338,16 @@ fn direct_sync_failures_never_acknowledge_and_recover_over_real_daemon() -> Resu
                     fs::read_to_string(fixture.workspace.join(target))? == AFTER,
                     "{action}: installed target bytes changed across the power cut"
                 );
-                // A reservation acquired with NORMAL survives only if a later
-                // FULL commit synced it; record rather than assume.
+                // The reservation was acquired with NORMAL. A failed SQLite sync
+                // leaves it unsynced, so the cut loses it, inside the documented
+                // pre-audit window. A failed directory barrier follows a
+                // successful WAL sync, which made it durable.
+                let expected = retained - 1 + i64::from(committed);
                 retained = direct_reservations(fixture)?;
-                eprintln!("{action}: restored audit={restored} retained reservations={retained}");
+                anyhow::ensure!(
+                    retained == expected,
+                    "{action}: restored reservations {retained}, expected {expected}"
+                );
             }
             let recovered = post_direct(fixture, "notes/after-recovery.md", AFTER)?;
             anyhow::ensure!(

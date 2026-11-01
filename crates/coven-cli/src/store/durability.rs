@@ -78,9 +78,17 @@ pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T
     let restored = restore.restore().context("restoring store commit policy");
     // Include the guard's existing fallback restoration in the observed phase.
     drop(restore);
-    restored?;
-    checkpoint(Phase::DurableRestoreReady);
-    result
+    match (result, restored) {
+        (result, Ok(())) => {
+            checkpoint(Phase::DurableRestoreReady);
+            result
+        }
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        // Keep the write's own error so callers classify it correctly.
+        (Err(error), Err(restore_error)) => Err(error.context(format!(
+            "restoring store commit policy also failed: {restore_error:#}"
+        ))),
+    }
 }
 
 /// Force a real FULL commit even when the authority evidence already exists.
