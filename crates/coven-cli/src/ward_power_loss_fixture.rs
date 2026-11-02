@@ -1,7 +1,8 @@
 //! Synthetic Ward power-loss fixture for real-daemon journeys (#1640).
 //!
-//! Compiled only with the `threads-test-clock` feature, so default and release
-//! builds contain none of it. It activates only when the daemon's own home
+//! Compiled only with the `threads-test-clock` feature. Builds without that
+//! feature, including the current release CLI artifact builds, contain none of it.
+//! It activates only when the daemon's own home
 //! holds an owner-private `test-fixtures/ward-power-loss/` directory with an
 //! activation sentinel and a capability. When active, the daemon registers the
 //! xSync-observing VFS for exactly `<home>/coven.sqlite3` and its WAL before

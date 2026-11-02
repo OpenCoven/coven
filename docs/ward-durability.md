@@ -129,18 +129,8 @@ direct evidence transaction is tested at the persistence boundary with a
 synthetic report: a forced baseline failure after audit insertion leaves
 neither effect, and the positive branch survives the lost-suffix cut.
 
-Real-daemon journeys in `threads_e2e` repeat the direct and legacy cases
-through the ordinary edits endpoint over owner IPC. They need the
-`threads-test-clock` feature, which also compiles a synthetic power-loss
-fixture into the test daemon. Default and release builds contain neither. The
-fixture activates only from an owner-private `test-fixtures/ward-power-loss/`
-directory in the daemon's own home, and its owner-IPC control requires the
-fixture capability and names no paths. It observes exactly `coven.sqlite3` and
-its WAL, starts from a TRUNCATE checkpoint, and can fail the next store sync or
-post-COMMIT store-directory barrier once. A journey's power cut freezes the
-synced images, terminates the daemon and restores only those images before
-restarting it. The journeys verify that acknowledged direct audit rows and
-legacy receipts and pending bytes survive, that the unsynced tail disappears,
-and that injected failures never acknowledge and recover coherently.
+Real-daemon journeys in `threads_e2e` repeat the direct and legacy cases through the ordinary edits endpoint over owner IPC. They need the `threads-test-clock` feature, which also compiles a synthetic power-loss fixture into the test daemon. Builds without that feature, including the current release CLI artifact builds, contain neither. Selecting Cargo's release profile alone does not disable an explicitly enabled feature. The fixture activates only from an owner-private `test-fixtures/ward-power-loss/` directory in the daemon's own home, and its owner-IPC control requires the fixture capability and names no paths. It observes exactly `coven.sqlite3` and its WAL, starts from a TRUNCATE checkpoint, and can fail the next store sync or post-COMMIT store-directory barrier once. A journey's power cut freezes the synced images, terminates the daemon and restores only those images before restarting it. The journeys verify that acknowledged direct audit rows and legacy receipts and pending bytes survive, that the unsynced tail disappears, and that injected failures never acknowledge and recover coherently.
+
+Only the database and WAL images undergo simulated loss. Target and pending files are retained; their byte assertions establish consistency with the recovered database state, not an independent filesystem power-cut proof.
 
 These are deterministic protocol tests, not physical power-cut certification.
