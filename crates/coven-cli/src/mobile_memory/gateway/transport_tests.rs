@@ -96,6 +96,86 @@ fn relay_daemon_process_stops_during_unfinished_tls_handshake() {
     exercise_relay_daemon_process(true);
 }
 
+/// Waits for the first TLS record byte on a socket accepted from the polled
+/// non-blocking fixture listener. BSD-derived kernels (macOS) let the accepted
+/// socket inherit `O_NONBLOCK` from the listener; Linux does not. Without the
+/// reset, a ClientHello that arrives after `accept` makes the read fail at once
+/// with `WouldBlock` instead of waiting for the read timeout (#1636). The
+/// socket stays blocking afterward, so the later close check also waits.
+#[cfg(unix)]
+fn await_tls_record_type(socket: &mut std::net::TcpStream) -> u8 {
+    use std::io::Read;
+    socket.set_nonblocking(false).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut record_type = [0_u8];
+    socket.read_exact(&mut record_type).unwrap();
+    record_type[0]
+}
+
+#[cfg(unix)]
+#[test]
+fn stalled_tls_fixture_waits_for_a_client_hello_sent_after_accept() {
+    use std::io::Write;
+    // Match the daemon fixture: a polled non-blocking listener.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    // Hang guard only; loopback connect is normally visible immediately.
+    let accept_deadline = Instant::now() + Duration::from_secs(30);
+    let mut socket = loop {
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < accept_deadline, "fixture accept wedged");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("fixture accept failed: {error}"),
+        }
+    };
+    let inherited = rustix::fs::fcntl_getfl(&socket)
+        .unwrap()
+        .contains(rustix::fs::OFlags::NONBLOCK);
+    // This records the platform behavior behind #1636, not a fixture choice.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    assert!(inherited, "BSD accept() should inherit O_NONBLOCK");
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    assert!(!inherited, "Linux accept() should not inherit O_NONBLOCK");
+    let _ = inherited;
+
+    // Nothing has been written yet, so the read below starts before the
+    // ClientHello byte exists. The delay is only a lower bound on that order.
+    const DELAY: Duration = Duration::from_millis(200);
+    let started = Instant::now();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(DELAY);
+        client.write_all(&[22]).unwrap();
+        client
+    });
+    let record_type = await_tls_record_type(&mut socket);
+    let waited = started.elapsed();
+    let _client = writer.join().unwrap();
+    assert_eq!(record_type, 22, "expected the delayed handshake byte");
+    assert!(
+        waited >= DELAY,
+        "read returned before the delayed byte was sent: {waited:?}"
+    );
+    assert!(
+        !rustix::fs::fcntl_getfl(&socket)
+            .unwrap()
+            .contains(rustix::fs::OFlags::NONBLOCK),
+        "stalled TLS socket must stay blocking for the close check"
+    );
+}
+
 #[cfg(unix)]
 fn exercise_relay_daemon_process(stall_tls: bool) {
     use super::super::transport::{self, test_support::Relay, websocket};
@@ -181,7 +261,6 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
     let startup_deadline = Instant::now() + Duration::from_secs(120);
     let mut stalled_socket = None;
     let mut channel = if let Some(listener) = stalled_listener {
-        use std::io::Read;
         let mut socket = loop {
             assert!(
                 daemon.0.try_wait().unwrap().is_none(),
@@ -199,12 +278,11 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
                 Err(error) => panic!("fixture accept failed: {error}"),
             }
         };
-        socket
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        let mut record_type = [0_u8];
-        socket.read_exact(&mut record_type).unwrap();
-        assert_eq!(record_type[0], 22, "expected TLS handshake record");
+        assert_eq!(
+            await_tls_record_type(&mut socket),
+            22,
+            "expected TLS handshake record"
+        );
         // Receiving ClientHello proves the worker reached the real TLS path.
         // Send nothing back: shutdown must interrupt the pending handshake.
         stalled_socket = Some(socket);
