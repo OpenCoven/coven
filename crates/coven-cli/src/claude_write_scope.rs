@@ -1,6 +1,4 @@
 //! Explicit scoped edit authority, separate from unrestricted Full and #713.
-#[cfg(unix)]
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -86,71 +84,48 @@ impl ClaudeWriteScope {
         })
     }
 
-    /// A writable pathname must not be an alias for an object outside the
-    /// writable scope. The child tree also receives a kernel no-hardlink
-    /// guard, so it cannot manufacture another name after this admission.
-    fn audit_write_objects(&self) -> Result<()> {
+    /// A protected or nested read-only object must not have a second name
+    /// that a writable root could edit. Audit only those denied trees: their
+    /// size is bounded by runtime resources, while writable project trees can
+    /// hold millions of entries (pnpm stores hardlink every dependency file).
+    /// Pre-existing aliases between a writable name and an ungranted object
+    /// remain writable, as they were under unrestricted Full. The child tree
+    /// also receives a kernel no-hardlink guard, so it cannot manufacture a
+    /// new name after this admission.
+    fn audit_denied_objects(&self) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             const MAX_ENTRIES: usize = 200_000;
-            let mut blocked = self.protected_roots.clone();
-            blocked.extend(
-                self.read_only_roots
-                    .iter()
-                    .filter(|read| self.writable_roots.iter().any(|write| within(read, write)))
-                    .cloned(),
-            );
-            let mut pending: Vec<PathBuf> = self.writable_roots.iter().map(PathBuf::from).collect();
+            let mut pending: Vec<PathBuf> = self
+                .protected_roots
+                .iter()
+                .chain(
+                    self.read_only_roots
+                        .iter()
+                        .filter(|read| self.writable_roots.iter().any(|write| within(read, write))),
+                )
+                .map(PathBuf::from)
+                .collect();
             let mut visited = BTreeSet::new();
-            let mut objects: BTreeMap<(u64, u64), (u64, BTreeSet<PathBuf>)> = BTreeMap::new();
             while let Some(path) = pending.pop() {
-                if blocked.iter().any(|root| path.starts_with(root))
-                    || !visited.insert(path.clone())
-                {
+                if !visited.insert(path.clone()) {
                     continue;
                 }
                 ensure!(
                     visited.len() <= MAX_ENTRIES,
-                    "writeScope filesystem audit exceeds 200000 entries"
+                    "writeScope protected-resource audit exceeds 200000 entries"
                 );
                 let metadata =
                     fs::symlink_metadata(&path).context("writeScope filesystem audit failed")?;
-                if metadata.file_type().is_symlink() {
-                    continue;
-                }
                 if metadata.is_dir() {
                     for entry in fs::read_dir(&path).context("writeScope directory audit failed")? {
-                        ensure!(
-                            pending.len() + visited.len() < MAX_ENTRIES,
-                            "writeScope filesystem audit exceeds 200000 entries"
-                        );
                         pending.push(entry?.path());
                     }
                 } else if metadata.is_file() {
-                    let object = objects
-                        .entry((metadata.dev(), metadata.ino()))
-                        .or_insert_with(|| (metadata.nlink(), BTreeSet::new()));
                     ensure!(
-                        object.0 == metadata.nlink(),
-                        "writeScope object links changed during admission"
-                    );
-                    object.1.insert(path);
-                } else {
-                    anyhow::bail!("writeScope contains an unsupported filesystem object");
-                }
-            }
-            for ((device, inode), (links, names)) in objects {
-                ensure!(links == names.len() as u64,
-                    "writeScope has filesystem-object aliases outside its writable roots; use an isolated copy or narrower writable roots");
-                for name in names {
-                    let current = fs::symlink_metadata(name)?;
-                    ensure!(
-                        current.is_file()
-                            && current.dev() == device
-                            && current.ino() == inode
-                            && current.nlink() == links,
-                        "writeScope object identity changed during admission"
+                        metadata.nlink() == 1,
+                        "writeScope protected or read-only files have hardlink aliases; remove the extra links or narrow the grants"
                     );
                 }
             }
@@ -162,7 +137,7 @@ impl ClaudeWriteScope {
 
     pub fn native_args(&self) -> Result<Vec<String>> {
         let scope = self.validate_for_cwd(Path::new(&self.primary_root))?;
-        scope.audit_write_objects()?;
+        scope.audit_denied_objects()?;
         let read_allowed: Vec<String> = scope
             .read_only_roots
             .iter()
@@ -378,6 +353,43 @@ mod tests {
         fs::hard_link(cwd.join("first"), cwd.join("second")).unwrap();
         let scope = ClaudeWriteScope::from_value(value, &cwd).unwrap();
         scope.native_args().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_store_links_in_writable_trees_do_not_block_admission() {
+        let (temp, value) = fixture();
+        let cwd = PathBuf::from(value["primaryRoot"].as_str().unwrap());
+        let store = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("ungranted/store-file");
+        fs::write(&store, "dependency").unwrap();
+        fs::create_dir_all(cwd.join("node_modules/dep")).unwrap();
+        fs::hard_link(&store, cwd.join("node_modules/dep/index.js")).unwrap();
+        let scope = ClaudeWriteScope::from_value(value, &cwd).unwrap();
+        scope.native_args().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_read_only_hardlink_alias_cannot_be_admitted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("primary/locked")).unwrap();
+        fs::write(root.join("primary/locked/source"), "read-only sentinel").unwrap();
+        fs::hard_link(
+            root.join("primary/locked/source"),
+            root.join("primary/alias"),
+        )
+        .unwrap();
+        let value = json!({"version":1,"primaryRoot":root.join("primary"),
+            "writableRoots":[root.join("primary")],
+            "readOnlyRoots":[root.join("primary/locked")],"protectedRoots":[]});
+        let cwd = root.join("primary");
+        let scope = ClaudeWriteScope::from_value(value, &cwd).unwrap();
+        assert!(scope.native_args().is_err());
     }
 
     #[cfg(target_os = "macos")]
