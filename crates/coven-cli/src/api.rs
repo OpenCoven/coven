@@ -1,9 +1,14 @@
+mod proposal_apply_intent;
 mod proposal_document;
 mod proposal_preflight;
 mod proposal_revision;
 #[cfg(test)]
 use crate::proposal_store::read_scheduler_cursor;
 use crate::proposal_store::{scheduler_candidate_batch, write_scheduler_cursor};
+use proposal_apply_intent::{
+    append_proposal_apply_intent, invalid_proposal_apply_intent, load_proposal_apply_intent,
+    ProposalApplyingState, ProposalBeforeImage,
+};
 use proposal_document::{ProposalAuthority, ProposalEnvelopeDocument};
 pub(crate) use proposal_preflight::validate_proposal_envelope_preflight;
 use proposal_preflight::{PROPOSAL_ENVELOPE_MAX_BYTES, PROPOSAL_ENVELOPE_SYNTAX_MAX_BYTES};
@@ -13748,33 +13753,6 @@ fn proposal_decision_request(raw_value: &Value) -> Result<Option<ProposalDecisio
         .context("proposal decision request is corrupt")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProposalApplyingState {
-    decision: String,
-    recovery_commitment: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    baseline_snapshot: Option<BTreeMap<String, Option<Vec<u8>>>>,
-    weave_hash: Vec<u8>,
-    before_images: Vec<ProposalBeforeImage>,
-    rationale: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    probe_summary: Option<crate::ward_probes::ProbeSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProposalBeforeImage {
-    target: String,
-    /// Gate-2-resolved surface captured with the apply intent. Older authority
-    /// recovery records predate this field and rederive it from live Ward
-    /// adjudication.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resolved: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    contents: Option<coven_threads_core::StagedContents>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalRecoveryVersion {
     HistoricalV2,
@@ -14361,114 +14339,6 @@ fn persist_proposal_applying_state(
 ) -> Result<()> {
     let body = document.serialize_with_decision(request, Some(state))?;
     crate::proposal_store::replace_existing(claim_path, &body)
-}
-
-// Preserve the borrowed apply-intent inputs while passing the decision's captured time.
-#[allow(clippy::too_many_arguments)]
-fn append_proposal_apply_intent(
-    conn: &rusqlite::Connection,
-    proposal_id: &str,
-    familiar_id: &str,
-    approver: Option<&coven_threads_core::WriterId>,
-    files_touched: &[String],
-    state: &ProposalApplyingState,
-    channel: coven_threads_core::Channel,
-    now: time::OffsetDateTime,
-) -> Result<()> {
-    let detail = serde_json::to_string(state).context("serializing proposal apply intent")?;
-    let files_touched = serde_json::to_string(files_touched)?;
-    let now = now.format(&time::format_description::well_known::Rfc3339)?;
-    store::durable_transaction(conn, || {
-        conn.execute(
-            "INSERT INTO ward_audit (
-            event_type, proposal_id, familiar_id, ward_version, ward_hash,
-            tier, decision, approver, diff_hash, detail, files_touched,
-            channel, thread_id, submitted_at, decided_at
-         ) VALUES (
-            'validation_verdict', ?1, ?2, NULL, ?3, NULL,
-            'proposal-apply-intent', ?4, NULL, ?5, ?6, ?7, NULL, ?8, ?8
-         )",
-            rusqlite::params![
-                proposal_id,
-                familiar_id,
-                state.weave_hash,
-                approver.map(coven_threads_core::WriterId::as_str),
-                detail,
-                files_touched,
-                format!("{channel:?}").to_lowercase(),
-                now,
-            ],
-        )
-        .context("appending proposal apply intent")?;
-        Ok(())
-    })
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct RecordedProposalApplyIntent {
-    state: ProposalApplyingState,
-    approver: Option<String>,
-}
-
-#[derive(Debug)]
-struct InvalidProposalApplyIntent(String);
-
-impl std::fmt::Display for InvalidProposalApplyIntent {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for InvalidProposalApplyIntent {}
-
-fn invalid_proposal_apply_intent(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<InvalidProposalApplyIntent>().is_some()
-}
-
-fn load_proposal_apply_intent(
-    conn: &rusqlite::Connection,
-    proposal_id: &str,
-) -> Result<Option<RecordedProposalApplyIntent>> {
-    use rusqlite::OptionalExtension;
-
-    let row: Option<(String, Option<String>)> = match conn
-        .query_row(
-            "SELECT detail, approver
-             FROM ward_audit
-             WHERE proposal_id = ?1
-               AND event_type = 'validation_verdict'
-               AND decision = 'proposal-apply-intent'
-             ORDER BY id DESC
-             LIMIT 1",
-            [proposal_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-    {
-        Ok(row) => row,
-        Err(
-            error @ (rusqlite::Error::InvalidColumnType(..)
-            | rusqlite::Error::FromSqlConversionFailure(..)
-            | rusqlite::Error::IntegralValueOutOfRange(..)),
-        ) => {
-            return Err(InvalidProposalApplyIntent(format!(
-                "proposal apply intent columns are invalid: {error}"
-            ))
-            .into());
-        }
-        Err(error) => return Err(error).context("loading proposal apply intent"),
-    };
-    row.map(|(detail, approver)| {
-        Ok(RecordedProposalApplyIntent {
-            state: serde_json::from_str(&detail).map_err(|error| {
-                InvalidProposalApplyIntent(format!(
-                    "proposal apply intent detail is invalid: {error}"
-                ))
-            })?,
-            approver,
-        })
-    })
-    .transpose()
 }
 
 fn proposal_expected_resolved_surfaces(
