@@ -273,6 +273,31 @@ pub(crate) mod test_support {
         ]
     }
 
+    /// A clean scoped read run, as claude 2.1.305 prints it under
+    /// `r0-read.2`.
+    #[cfg(unix)]
+    pub(crate) fn scoped_read_run() -> Vec<String> {
+        vec![
+            json!({ "type": "system", "subtype": "ui_invalidate", "event": "ui.render" })
+                .to_string(),
+            json!({
+                "type": "system",
+                "subtype": "init",
+                "tools": ["mcp__coven__read_file", "mcp__coven__list_directory", "mcp__coven__search"],
+                "mcp_servers": [{ "name": "coven", "status": "connected", "source": "dynamic" }],
+                "permissionMode": "default",
+                "claude_code_version": "2.1.305",
+                "apiKeySource": "ANTHROPIC_API_KEY",
+                "session_id": "native-session"
+            })
+            .to_string(),
+            tool_use("mcp__coven__read_file"),
+            tool_result(),
+            text("It says granted notes."),
+            result("It says granted notes."),
+        ]
+    }
+
     pub(crate) fn stream(lines: &[String]) -> String {
         let mut output = lines.join("\n");
         output.push('\n');

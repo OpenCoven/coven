@@ -49,11 +49,11 @@ pub(crate) trait Gate: Send {
     /// Before an operation runs: the attempt is live and its grant current.
     fn admit(&mut self) -> Result<(), Refusal>;
     /// After a result is built and before any of it is written: authorizes
-    /// exactly the result whose JCS text has `digest`. If cancellation or
-    /// revocation committed first, this refuses and the result is discarded.
-    /// Once it returns `Ok`, those bytes are authorized and cannot be
-    /// recalled.
-    fn commit(&mut self, tool: Option<&'static str>, digest: &str) -> Result<(), Refusal>;
+    /// exactly the result `committing` names by its digest. If cancellation
+    /// or revocation committed first, this refuses and the result is
+    /// discarded. Once it returns `Ok`, those bytes are authorized and cannot
+    /// be recalled.
+    fn commit(&mut self, committing: &Committing<'_>) -> Result<(), Refusal>;
 }
 
 /// The time an operation may take.
@@ -88,6 +88,22 @@ pub(crate) enum Outcome {
     Refused { refusal: Refusal, digest: String },
     /// The gate refused: nothing the reader produced was written.
     Withheld { refusal: Refusal },
+}
+
+/// What a commit authorizes: one operation's result, named by its digest. It
+/// holds no file content, no path, no pattern and no entry name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Committing<'a> {
+    /// The call's place in the attempt, from 1.
+    pub sequence: u64,
+    /// The tool, when the call named one of the service's.
+    pub tool: Option<&'static str>,
+    /// `None` when the result serves the request, or the reader's refusal.
+    pub refusal: Option<Refusal>,
+    /// The SHA-256 of the result's JCS text.
+    pub digest: &'a str,
+    /// The length of that text in bytes.
+    pub bytes: usize,
 }
 
 type Serve = Box<dyn FnMut(&Value) -> Result<Response, Refusal> + Send>;
@@ -294,7 +310,14 @@ impl Session<'_> {
                     String::from_utf8(canonicalize(&payload).expect("a tool result is I-JSON"))
                         .expect("JCS text is UTF-8");
                 let digest = sha256_hex(text.as_bytes());
-                match self.gate.commit(tool, &digest) {
+                let committing = Committing {
+                    sequence,
+                    tool,
+                    refusal: answer.as_ref().err().copied(),
+                    digest: &digest,
+                    bytes: text.len(),
+                };
+                match self.gate.commit(&committing) {
                     Err(refusal) => (Outcome::Withheld { refusal }, refused(refusal), true),
                     Ok(()) => {
                         let is_error = answer.is_err();
@@ -520,7 +543,7 @@ impl Gate for Open {
         Ok(())
     }
 
-    fn commit(&mut self, _tool: Option<&'static str>, _digest: &str) -> Result<(), Refusal> {
+    fn commit(&mut self, _committing: &Committing<'_>) -> Result<(), Refusal> {
         Ok(())
     }
 }

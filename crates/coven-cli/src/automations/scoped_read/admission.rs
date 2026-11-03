@@ -65,6 +65,11 @@ pub(crate) enum AdmissionError {
         admitted: &'static [&'static str],
     },
     KeyMissing,
+    /// `COVEN_HOME` is too long for the channel's socket path.
+    HomeTooLong {
+        bytes: usize,
+        limit: usize,
+    },
     /// The grant or the project folder cannot be served.
     Grant(Refusal),
     Setup(anyhow::Error),
@@ -86,6 +91,10 @@ impl fmt::Display for AdmissionError {
             Self::KeyMissing => write!(
                 f,
                 "Runtime Authority runs need the owner's Anthropic API key; save it with `coven automations api-key set`"
+            ),
+            Self::HomeTooLong { bytes, limit } => write!(
+                f,
+                "the scoped read channel's socket path would be {bytes} bytes, and this platform allows {limit}; use a shorter COVEN_HOME"
             ),
             Self::Grant(refusal) => write!(
                 f,
@@ -151,8 +160,10 @@ impl Prepared {
     }
 }
 
-/// Admits and prepares one launch.
-pub(crate) fn prepare(
+/// Admits and prepares one launch. Only the automations module calls it: the
+/// daemon's one caller is `trusted_launch::prepare`, which supplies the
+/// store gate.
+pub(in crate::automations) fn prepare(
     request: Request<'_>,
     gate: Box<dyn Gate>,
 ) -> Result<Prepared, AdmissionError> {
@@ -182,7 +193,7 @@ pub(crate) fn prepare(
         deadline: request.deadline,
     };
     let channel = Channel::open(
-        &request.coven_home.join("runtime").join("scoped-read"),
+        &super::channel::runtime_dir(request.coven_home),
         request.relay,
         |gate| Service::new(reader, gate, limits),
         gate,
@@ -199,6 +210,34 @@ pub(crate) fn prepare(
         channel: Some(channel),
         launch,
     })
+}
+
+/// What admission checks that needs no grant: the envelope runs the scoped
+/// read service, `COVEN_HOME` leaves room for the channel's socket path,
+/// the installed harness reports an admitted version, and the owner's API
+/// key is saved. The trusted adapter runs this before it decides
+/// and consumes a Threads decision, so a refusal here burns none. Returns
+/// the version the harness reported.
+pub(crate) fn preflight(
+    coven_home: &Path,
+    envelope: &'static RuntimeEnvelope,
+    program: &Path,
+) -> Result<String, AdmissionError> {
+    envelope.service.as_ref().ok_or(AdmissionError::NotScoped)?;
+    let (bytes, limit) = super::channel::socket_path_bytes(coven_home);
+    if bytes > limit {
+        return Err(AdmissionError::HomeTooLong { bytes, limit });
+    }
+    let launch = IsolatedLaunch::create(coven_home)?;
+    let version = installed_version(program, &launch.home(), VERSION_TIME)?;
+    if !envelope.harness_versions.contains(&version.as_str()) {
+        return Err(AdmissionError::VersionNotAdmitted {
+            found: version,
+            admitted: envelope.harness_versions,
+        });
+    }
+    credential::load(coven_home)?.ok_or(AdmissionError::KeyMissing)?;
+    Ok(version)
 }
 
 /// The version `program --version` reports, run with nothing in its

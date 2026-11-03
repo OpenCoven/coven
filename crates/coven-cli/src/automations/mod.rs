@@ -67,6 +67,10 @@ pub mod schedule;
 #[allow(dead_code)]
 pub(crate) mod scoped_read;
 pub mod store;
+// The production scoped read gate: P, and the immutable commitments it
+// records under the store's write lock (#1603).
+#[cfg(unix)]
+pub(crate) mod store_gate;
 pub mod stream_observation;
 // Wired into every session ending; it observes only Runtime Authority attempts,
 // which nothing dispatches until the trusted adapter (coven#857 slice 6).
@@ -78,6 +82,12 @@ pub mod threads_decisions;
 pub mod transition_events;
 #[cfg(test)]
 mod transport_authority_tests;
+// The trusted Runtime Authority adapter (coven#857, slice 6).
+pub mod trusted_authority;
+// Launching a trusted attempt under its decision's scopes (coven#857 slice 6,
+// #1603). The daemon launches the scoped read envelope only through it.
+#[cfg(unix)]
+pub(crate) mod trusted_launch;
 
 #[allow(unused_imports)]
 pub use definition::RoutineDefinition;

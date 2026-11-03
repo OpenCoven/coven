@@ -20,8 +20,6 @@
 //!   accounts for everything yields complete evidence. Anything it cannot
 //!   account for leaves coverage partial, and the run is held.
 
-use std::path::{Path, PathBuf};
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, DurationRound, SecondsFormat, TimeDelta, Utc};
 use rusqlite::Connection;
@@ -96,7 +94,7 @@ pub(crate) fn record(
         return failed(conn, session_id, &format!("no savepoint: {error}"));
     }
     let stored = (|| -> Result<RuntimeTerminalEvidenceStoreOutcome> {
-        let home = store_home(conn).context("the store has no directory")?;
+        let home = authority_keys::store_home(conn).context("the store has no directory")?;
         let key =
             authority_keys::existing_signing_key(conn, &home, AuthorityKeyRole::TerminalObserver)?
                 .context("there is no terminal-observer key")?;
@@ -143,7 +141,7 @@ pub(crate) fn record(
 }
 
 fn failed(conn: &Connection, session_id: &str, reason: &str) -> Recorded {
-    if let Some(home) = store_home(conn) {
+    if let Some(home) = authority_keys::store_home(conn) {
         crate::daemon::append_daemon_recovery_log(
             &home,
             &format!(
@@ -152,14 +150,6 @@ fn failed(conn: &Connection, session_id: &str, reason: &str) -> Recorded {
         );
     }
     Recorded::Failed(reason.to_owned())
-}
-
-/// The directory of the store `conn` writes, which is `COVEN_HOME`.
-fn store_home(conn: &Connection) -> Option<PathBuf> {
-    conn.path()
-        .filter(|path| !path.is_empty())
-        .and_then(|path| Path::new(path).parent())
-        .map(Path::to_path_buf)
 }
 
 /// The session's recorded output in order, and whether it differs from what

@@ -241,6 +241,35 @@ pub(crate) fn authorize_scheduled_dispatch(
             && validity == TimeDelta::milliseconds(validity.num_milliseconds()),
         "an owner authorization needs a positive, whole-millisecond validity"
     );
+    if let Err(refusal) = current_and_active(conn, automation_id, revision)? {
+        return Ok(Err(refusal));
+    }
+    let Some(grant) = activation_grant(conn, automation_id, revision)? else {
+        return Ok(Err(OwnerAuthorizationRefusal::NoGrant {
+            automation_id: automation_id.to_owned(),
+            revision,
+        }));
+    };
+    let issued_at = chrono::DurationRound::duration_trunc(now, TimeDelta::milliseconds(1))
+        .context("authorization time cannot be represented")?;
+    Ok(Ok(OwnerAuthorization {
+        principal_id: grant.principal_id.clone(),
+        operation: SCHEDULED_DISPATCH_OPERATION,
+        nonce: format!("nonce:{}", random_hex()?),
+        issued_at,
+        valid_until: issued_at + validity,
+        grant,
+    }))
+}
+
+/// Whether `revision` is still `automation_id`'s current revision and
+/// active: not revised, paused, disabled or tombstoned since. Scheduled
+/// dispatch and the trusted launch both hold an attempt to it.
+pub(crate) fn current_and_active(
+    conn: &Connection,
+    automation_id: &str,
+    revision: u64,
+) -> Result<std::result::Result<(), OwnerAuthorizationRefusal>> {
     let current = match super::store::get_definition_with_tombstone(conn, automation_id, true)? {
         Some(record) if record.revision == revision => record,
         other => {
@@ -262,22 +291,7 @@ pub(crate) fn authorize_scheduled_dispatch(
             },
         }));
     }
-    let Some(grant) = activation_grant(conn, automation_id, revision)? else {
-        return Ok(Err(OwnerAuthorizationRefusal::NoGrant {
-            automation_id: automation_id.to_owned(),
-            revision,
-        }));
-    };
-    let issued_at = chrono::DurationRound::duration_trunc(now, TimeDelta::milliseconds(1))
-        .context("authorization time cannot be represented")?;
-    Ok(Ok(OwnerAuthorization {
-        principal_id: grant.principal_id.clone(),
-        operation: SCHEDULED_DISPATCH_OPERATION,
-        nonce: format!("nonce:{}", random_hex()?),
-        issued_at,
-        valid_until: issued_at + validity,
-        grant,
-    }))
+    Ok(Ok(()))
 }
 
 fn random_hex() -> Result<String> {

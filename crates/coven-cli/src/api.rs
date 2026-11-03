@@ -580,6 +580,26 @@ impl std::fmt::Display for RuntimeLaunchAdmissionClosedError {
 
 impl std::error::Error for RuntimeLaunchAdmissionClosedError {}
 
+/// A Runtime Authority launch the runtime refused before starting anything,
+/// with the authority profile code it is recorded under.
+#[derive(Debug)]
+pub(crate) struct RuntimeAuthorityLaunchRefused {
+    pub code: crate::automations::contract::authority::AuthorityProfileErrorCode,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RuntimeAuthorityLaunchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED}: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for RuntimeAuthorityLaunchRefused {}
+
 pub(crate) const RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED: &str =
     "runtime does not accept automation authority projections; no process started";
 
@@ -645,6 +665,22 @@ pub trait SessionRuntime {
     /// projection supplied to automation launches.
     fn accepts_automation_authority_projection(&self) -> bool {
         false
+    }
+    /// Checks, before any Threads decision is made or consumed, that this
+    /// runtime could launch `envelope` on `harness` now, so a refusal burns
+    /// no decision. By default only an envelope the daemon launches from its
+    /// arguments passes; a runtime that runs the scoped read service also
+    /// checks what admission needs before a decision.
+    fn preflight_authority_launch(
+        &self,
+        _harness: &str,
+        envelope: &'static crate::automations::runtime_envelope::RuntimeEnvelope,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            crate::automations::runtime_envelope::is_launchable(envelope),
+            RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+        );
+        Ok(())
     }
     /// Launches an automation session with the bounded authority evidence that
     /// the execution consumer is permitted to observe.
