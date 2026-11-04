@@ -14,6 +14,7 @@ mod durable_store;
 mod error;
 mod guardrail;
 mod invocation;
+mod invocation_capacity;
 mod invocation_journal;
 mod lifecycle;
 mod loop_journal;
@@ -42,6 +43,7 @@ pub use invocation::{
     InvocationEventKind, InvocationEventVersion, InvocationFailureKind, InvocationId,
     InvocationRequest, InvocationSource,
 };
+pub use invocation_capacity::InvocationCapacity;
 pub use invocation_journal::{
     invocation_request_digest, FileInvocationJournal, InMemoryInvocationJournal, InvocationAttempt,
     InvocationJournal, InvocationRecord, InvocationState,
