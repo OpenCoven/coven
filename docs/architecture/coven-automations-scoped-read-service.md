@@ -171,6 +171,12 @@ Limits:
 - `flock` must work on the temporary folder. On a filesystem where it does
   not, launches fail to create their marker and are refused.
 - Folders from Coven builds before #1607 have no marker and are not removed.
+- A folder stays, counted as `unattributed`, if a crash came after the folder
+  was created and before its marker was written, or if the harness deleted or
+  replaced its marker. In the first case it holds nothing the harness wrote.
+  In the second it can hold transcripts, and it needs manual removal.
+- A folder nested more than 64 levels deep stays, counted as `failed`, and
+  every later startup tries it again and stops at the same depth.
 - Windows is out of scope, as for the rest of the scoped read service.
 
 Rollback is a revert: a folder with a marker is still removed whole when its

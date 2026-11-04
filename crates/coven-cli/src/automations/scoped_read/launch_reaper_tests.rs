@@ -395,6 +395,46 @@ fn a_killed_owner_frees_its_folder() {
     assert!(!folder.exists());
 }
 
+/// `rmdir` alone would remove an empty replacement, so the final step checks
+/// that the name still holds the folder that was verified.
+#[test]
+fn an_empty_folder_replacing_the_verified_one_is_left() {
+    let scene = Scene::new();
+    let folder = scene.crashed_launch();
+    let moved_to = scene.base.join("moved-away");
+    let report = settled(|| {
+        reap_stale_in(&scene.base, &scene.home, FULL, &mut |name| {
+            let path = scene.base.join(name);
+            fs::rename(&path, &moved_to).unwrap();
+            fs::create_dir(&path).unwrap();
+        })
+        .unwrap()
+    });
+
+    assert_eq!(
+        report,
+        Report {
+            failed: 1,
+            ..Report::default()
+        }
+    );
+    assert!(folder.is_dir());
+}
+
+/// Another user's folder can't be set up here without root, so this checks the
+/// decision itself, on the facts of a real private folder.
+#[test]
+fn a_folder_of_another_user_is_not_private_to_us() {
+    let scene = Scene::new();
+    let folder = scene.crashed_launch();
+    let mut stat = rustix::fs::stat(&folder).unwrap();
+    assert!(is_private_directory(&stat));
+
+    stat.st_uid = euid().wrapping_add(1);
+
+    assert!(!is_private_directory(&stat));
+}
+
 /// A harness can write anything into its own folder, including a named pipe in
 /// the marker's place. Opening one for reading waits for a writer, and startup
 /// waits on this sweep, so the sweep must not wait.
