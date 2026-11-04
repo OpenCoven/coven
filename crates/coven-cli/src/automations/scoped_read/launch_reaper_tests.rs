@@ -322,6 +322,145 @@ fn a_folder_replaced_after_verification_cannot_redirect_removal() {
     scene.assert_canary_intact();
 }
 
+const LAUNCH_OWNER_ENV: &str = "COVEN_TEST_LAUNCH_OWNER_ROOT";
+
+/// Not a test of its own: `a_killed_owner_frees_its_folder` runs it in a child
+/// process, which holds a launch until it is killed.
+#[test]
+fn launch_owner_child_process() {
+    let Some(root) = std::env::var_os(LAUNCH_OWNER_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let launch = IsolatedLaunch::create_in(&root.join("tmp"), &root.join("coven")).unwrap();
+    fs::write(
+        root.join("owner-ready.tmp"),
+        launch.root().as_os_str().as_bytes(),
+    )
+    .unwrap();
+    fs::rename(root.join("owner-ready.tmp"), root.join("owner-ready")).unwrap();
+    // Bounded, so a child whose parent died can't stay behind for long.
+    std::thread::sleep(Duration::from_secs(120));
+}
+
+/// The real crash: a process holding a launch is killed, nothing in it runs
+/// again, and only its death frees the lock. Until then the folder is live.
+#[test]
+fn a_killed_owner_frees_its_folder() {
+    let scene = Scene::new();
+    let root = scene.base.parent().unwrap().to_path_buf();
+    let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "automations::scoped_read::launch_reaper::tests::launch_owner_child_process",
+        ])
+        .env(LAUNCH_OWNER_ENV, &root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let ready = root.join("owner-ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !ready.exists() {
+        if std::time::Instant::now() >= deadline {
+            let _ = owner.kill();
+            let _ = owner.wait();
+            panic!("the launch owner never became ready");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let folder = PathBuf::from(OsStr::from_bytes(&fs::read(&ready).unwrap()));
+
+    let while_alive = scene.reap(FULL);
+    let survived = folder.join("home").exists();
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+
+    assert_eq!(
+        while_alive,
+        Report {
+            live: 1,
+            ..Report::default()
+        }
+    );
+    assert!(survived);
+    let after_death = settled(|| scene.reap(FULL));
+    assert_eq!(
+        after_death,
+        Report {
+            removed: 1,
+            ..Report::default()
+        }
+    );
+    assert!(!folder.exists());
+}
+
+/// A harness can write anything into its own folder, including a named pipe in
+/// the marker's place. Opening one for reading waits for a writer, and startup
+/// waits on this sweep, so the sweep must not wait.
+#[test]
+fn a_named_pipe_cannot_stall_the_sweep() {
+    let scene = Scene::new();
+    let top_level = scene.base.join(format!("{}pipe", scene.prefix()));
+    let folder = scene.crashed_launch();
+    let marker = folder.join(MARKER);
+    fs::remove_file(&marker).unwrap();
+    for pipe in [&top_level, &marker] {
+        let made = std::process::Command::new("mkfifo")
+            .arg(pipe)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    }
+
+    // On its own thread, so a sweep that blocks fails here and does not hang
+    // the suite.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (base, home) = (scene.base.clone(), scene.home.clone());
+    std::thread::spawn(move || {
+        let _ = sender.send(reap_stale_in(&base, &home, FULL, &mut |_| {}).unwrap());
+    });
+    let report = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the sweep is blocked on a named pipe");
+
+    assert_eq!(
+        report,
+        Report {
+            unattributed: 2,
+            ..Report::default()
+        }
+    );
+    assert!(folder.join("home").exists());
+    assert!(top_level.exists());
+}
+
+/// Listing the temporary folder comes before any folder is examined, and that
+/// folder can be very large, so the listing spends the same time budget.
+#[test]
+fn listing_the_temporary_folder_spends_the_time_budget() {
+    let scene = Scene::new();
+    fs::write(scene.base.join("someone-elses-file"), "").unwrap();
+
+    let report = scene.reap(Budget {
+        time: Duration::ZERO,
+        ..FULL
+    });
+
+    assert!(report.budget_exhausted);
+}
+
+/// The recovery log carries no path, and a failed sweep's error goes there.
+#[test]
+fn a_failed_sweep_does_not_name_the_temporary_folder() {
+    let scene = Scene::new();
+    let missing = scene.base.join("not-there");
+
+    let error = reap_stale_in(&missing, &scene.home, FULL, &mut |_| {}).unwrap_err();
+
+    assert!(!format!("{error:#}").contains("not-there"));
+}
+
 #[test]
 fn a_new_launch_folder_is_named_marked_and_locked() {
     let scene = Scene::new();

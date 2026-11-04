@@ -34,7 +34,10 @@
 //! coven#924 describes for Ward artifacts cannot remove data here.
 //!
 //! **Bounds.** A sweep examines at most [`Budget::folders`] matching folders,
-//! removes at most [`Budget::entries`] entries and stops at [`Budget::time`].
+//! removes at most [`Budget::entries`] entries and stops at [`Budget::time`],
+//! which also covers listing the temporary folder. Startup waits on the sweep,
+//! so nothing here waits on what a harness left: the marker is opened
+//! non-blocking, because a named pipe in its place would otherwise block.
 //! A folder it cannot finish keeps its marker, so the next sweep resumes it.
 //! Permission failures are counted and left; the sweep never changes a mode
 //! to get further.
@@ -203,6 +206,7 @@ pub(crate) fn reap_stale_in(
     budget: Budget,
     verified: &mut dyn FnMut(&OsStr),
 ) -> Result<Report> {
+    let started = Instant::now();
     let digest = home_digest(coven_home);
     let prefix = folder_prefix(&digest);
     let base = rustix::fs::open(
@@ -210,9 +214,14 @@ pub(crate) fn reap_stale_in(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .with_context(|| format!("opening the temporary folder {}", base.display()))?;
+    .context("opening the temporary folder")?;
+    let mut report = Report::default();
     let mut names = Vec::new();
     for entry in Dir::read_from(&base).context("listing the temporary folder")? {
+        if started.elapsed() >= budget.time {
+            report.budget_exhausted = true;
+            break;
+        }
         let entry = entry.context("listing the temporary folder")?;
         let name = entry.file_name().to_bytes();
         if name.starts_with(prefix.as_bytes()) {
@@ -221,10 +230,9 @@ pub(crate) fn reap_stale_in(
     }
     names.sort();
 
-    let mut report = Report::default();
     let mut spend = Spend {
         budget,
-        started: Instant::now(),
+        started,
         entries: 0,
     };
     for (index, name) in names.iter().enumerate() {
@@ -289,11 +297,12 @@ fn reap_one(
     if !is_private_directory(&folder_stat) {
         return Disposition::Unattributed;
     }
-    // 2. Its marker names this home.
+    // 2. Its marker names this home. Opened non-blocking, and its type checked
+    //    only then, because opening a named pipe would wait for a writer.
     let Ok(marker) = rustix::fs::openat(
         &folder,
         MARKER,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     ) else {
         return Disposition::Unattributed;

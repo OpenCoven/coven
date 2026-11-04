@@ -141,9 +141,9 @@ those folders from the system's temporary folder
   means no process holds the launch: a lock ends with its process, however
   the process ends.
 - **Retained.** Anything else with the name is left and counted: no marker,
-  another home's marker, a wider mode, a link, a file, a marker that is a
-  link, and any folder whose lock is held. The sweep never examines another
-  name in the temporary folder.
+  another home's marker, a wider mode, a link, a file, a named pipe, a marker
+  that is a link or a named pipe, and any folder whose lock is held. The sweep
+  lists the temporary folder but never examines another name in it.
 - **Removal.** Contents are removed relative to the verified folder's handle
   and to no-follow handles of its subfolders, so a rename or replacement
   after verification cannot redirect a removal. A link inside is removed,
@@ -152,9 +152,11 @@ those folders from the system's temporary folder
   directory, so the final-component replacement residual of #924 cannot
   remove data here.
 - **Bounds.** At most 64 matching folders, 200,000 entries and 5 seconds per
-  startup. A folder left part-removed keeps its marker, and the next startup
-  resumes it. A permission failure is counted and left; the sweep never
-  changes a mode.
+  startup, with listing the temporary folder counted in those seconds. A
+  folder left part-removed keeps its marker, and the next startup resumes it.
+  A permission failure is counted and left; the sweep never changes a mode.
+  Startup waits on the sweep, so the sweep doesn't wait on anything a harness
+  left in its folder.
 - **Diagnostics.** The recovery log gets one line of counts, `removed`,
   `live`, `unattributed`, `incomplete` and `failed`, never a path or a name.
 
