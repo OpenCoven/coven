@@ -183,6 +183,19 @@ const refusals = [
   ['a binary built from another commit', 'artifacts.source-commit', /coven\.exe does not embed the tagged commit/, {
     deps: { readArtifact: (relativePath) => (relativePath.endsWith('.exe') ? Buffer.from(`v${VERSION} ${'9'.repeat(40)}`) : binary()) }
   }],
+  ['a commit present only as split movabs immediates', 'artifacts.source-commit', /x86_64-apple-darwin\/release\/coven does not embed the tagged commit/, {
+    deps: {
+      readArtifact: (relativePath) => {
+        const fragments = HEAD.match(/.{1,8}/g);
+        return Buffer.concat([
+          Buffer.from(`v${VERSION} `),
+          ...(relativePath.includes('x86_64-apple')
+            ? fragments.map((fragment) => Buffer.concat([Buffer.from([0x48, 0xb9]), Buffer.from(fragment)]))
+            : [Buffer.from(HEAD)])
+        ]);
+      }
+    }
+  }],
   ['a missing native binary', 'artifacts.source-commit', /x86_64-apple-darwin\/release\/coven is missing/, {
     deps: { readArtifact: (relativePath) => { if (relativePath.includes('x86_64-apple')) throw new Error('ENOENT'); return binary(); } }
   }],

@@ -598,6 +598,14 @@ loses nothing.
 
 The platform matrix uses `fail-fast: false`, so the other targets still attempt to build. Look at the failed job's logs, fix the cause on `main`, and push a new signed tag with a bumped patch number.
 
+If GitHub never assigned a runner (`The job was not acquired by Runner`), there is nothing to fix. Wait for Actions to recover, then re-run the failed jobs on the same tag with `gh run rerun <run-id> --failed`. Publication authorization repeats its checks from fresh reads, and nothing reaches the registry before it passes.
+
+### Publication authorization refused
+
+The `coven-release-publication-authorization-vX.Y.Z` artifact names each control that failed. Nothing has been published at that point, and a re-run repeats the same decision unless a live control changed. Fix the cause on `main`, then push a new signed tag with a bumped patch number. Leave the refused tag in place, and certify the new commit, because the old packet names a different one.
+
+The `npm onboarding smoke` jobs run the `artifacts.source-commit` check on every native target in main CI, so a binary that would fail it fails the commit's `PR gate` before it can be tagged.
+
 ### Dry-run shows a version conflict
 
 `npm publish --dry-run` returns an error like *"previously published version X is higher than the new version Y"*. The tag is below the registry's current `latest`. Leave it in place and push a signed tag above `latest`.

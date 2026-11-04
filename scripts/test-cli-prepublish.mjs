@@ -8,6 +8,9 @@
 //      (which also runs `cargo build --release --package coven-cli --target <rust-target>` unless
 //      --skip-build is passed) and lets `npm publish --dry-run` validate the
 //      platform + wrapper tarballs.
+//      It then applies release authorization's embedded-commit check to the
+//      binary it staged; `--skip-build` outside CI skips this, because a reused
+//      local binary may predate the current commit.
 //   4. `npm pack`s the native and wrapper packages, installs them into a fresh
 //      temp project, then runs the full hermetic installed-wrapper user
 //      journey through scripts/user-journey-e2e.mjs.
@@ -35,10 +38,11 @@
 // Exit code is non-zero on the first failing step.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { binaryEmbedsCommit } from './authorize-release-publication.mjs';
 import { defaultTargetName } from './publish-npm.mjs';
 import {
   createScratchDir,
@@ -67,10 +71,10 @@ const CARGO_GATE_TIMEOUT_MS = 20 * 60_000;
 const GUARDRAILS_TIMEOUT_MS = 10 * 60_000;
 
 const PLATFORM_TARGETS = {
-  macos: { packageName: '@opencoven/cli-macos', binaryName: 'coven' },
-  'macos-x64': { packageName: '@opencoven/cli-macos-x64', binaryName: 'coven' },
-  'linux-x64': { packageName: '@opencoven/cli-linux-x64', binaryName: 'coven' },
-  windows: { packageName: '@opencoven/cli-windows', binaryName: 'coven.exe' }
+  macos: { packageName: '@opencoven/cli-macos', binaryName: 'coven', rustTarget: 'aarch64-apple-darwin' },
+  'macos-x64': { packageName: '@opencoven/cli-macos-x64', binaryName: 'coven', rustTarget: 'x86_64-apple-darwin' },
+  'linux-x64': { packageName: '@opencoven/cli-linux-x64', binaryName: 'coven', rustTarget: 'x86_64-unknown-linux-gnu' },
+  windows: { packageName: '@opencoven/cli-windows', binaryName: 'coven.exe', rustTarget: 'x86_64-pc-windows-msvc' }
 };
 
 const args = process.argv.slice(2);
@@ -184,6 +188,16 @@ step(`stage dist via publish-npm.mjs --dry-run --target=${targetName}`, () => {
     fail(`expected wrapper dist at ${wrapperDir} after dry-run`);
   }
 });
+
+if (!skipBuild || process.env.CI) {
+  step(`native binary embeds this commit (${targetName})`, () => {
+    const commit = runCapture('git', ['rev-parse', 'HEAD']).stdout.trim();
+    const binary = path.join(repoRoot, 'target', target.rustTarget, 'release', target.binaryName);
+    if (!binaryEmbedsCommit(readFileSync(binary), commit)) {
+      fail(`${binary} does not embed ${commit}, so release authorization would refuse it.`);
+    }
+  });
+}
 
 let tempDir;
 step(`install wrapper + native package in a temp project (${targetName})`, () => {

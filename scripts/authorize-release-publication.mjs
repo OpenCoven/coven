@@ -45,6 +45,13 @@ const NATIVE_ARTIFACTS = {
 };
 const RUNNABLE_TARGET = 'linux-x64';
 
+/// Whether a native binary carries the commit as one contiguous literal. The
+/// onboarding smoke runs this same check on every target, so a compiler change
+/// that splits the literal fails on main before a tag is pushed (#1672).
+export function binaryEmbedsCommit(bytes, commit) {
+  return bytes.includes(Buffer.from(commit));
+}
+
 function isMainModule(argv1 = process.argv[1], moduleUrl = import.meta.url) {
   return Boolean(argv1) && pathToFileURL(argv1).href === moduleUrl;
 }
@@ -318,7 +325,7 @@ export async function authorizeReleasePublication({
         continue;
       }
       evidence.artifacts[target] = { path: relativePath, sha256: sha256(bytes), size: bytes.length };
-      if (!bytes.includes(Buffer.from(headSha))) {
+      if (!binaryEmbedsCommit(bytes, headSha)) {
         problems.push(`${relativePath} does not embed the tagged commit ${headSha}`);
       }
       if (!bytes.includes(Buffer.from(`v${npmVersion}`))) {
