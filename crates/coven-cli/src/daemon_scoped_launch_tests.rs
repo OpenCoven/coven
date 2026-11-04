@@ -466,6 +466,13 @@ fn a_scoped_read_run_whose_served_read_the_harness_never_received_is_held() {
                 .is_some_and(|reason| reason.contains("recovery required")),
             "{what}: {reason:?}"
         );
+        // The hold comes from this check, not from some other partial state.
+        let log = fs::read_to_string(crate::daemon::daemon_recovery_log_path(fixture.home.path()))
+            .unwrap_or_default();
+        assert!(
+            log.contains("scoped_read_served_not_answered"),
+            "{what}: {log}"
+        );
         drop(runtime);
     }
 }
