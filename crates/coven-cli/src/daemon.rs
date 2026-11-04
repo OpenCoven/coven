@@ -14373,20 +14373,62 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_verified_stop_never_signals_a_substituted_numeric_pid() -> Result<()> {
+        // No latency is asserted: the peer is refused after one local round
+        // trip, so this deadline is only a hang guard for that exchange.
+        let (error, still_running) = stop_against_substituted_numeric_pid(
+            LifecycleDeadline::after(Duration::from_secs(60))?,
+        )?;
+        assert!(
+            error.to_string().contains("connected peer pid"),
+            "unexpected identity rejection: {error:#}"
+        );
+        assert!(
+            still_running,
+            "a daemon connection closing must not authorize signaling its stale numeric PID"
+        );
+        Ok(())
+    }
+
+    /// A deadline that expires before the client connects used to strand the
+    /// fixture's server in `accept`, hanging the test instead of reporting why
+    /// the stop failed (macOS, parallel stress, sample retained on #1067).
+    #[cfg(unix)]
+    #[test]
+    fn verified_stop_fixture_reports_an_expired_deadline_instead_of_hanging() -> Result<()> {
+        let (error, still_running) =
+            stop_against_substituted_numeric_pid(LifecycleDeadline::after(Duration::ZERO)?)?;
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(still_running);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn stop_against_substituted_numeric_pid(
+        deadline: LifecycleDeadline,
+    ) -> Result<(anyhow::Error, bool)> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir()?;
         ensure_private_coven_home(temp_dir.path())?;
-        let mut substituted = Command::new("sleep")
-            .arg("5")
+        // Killed on every path; it only has to outlive the stop's deadline.
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Command::new("sleep")
+            .arg("600")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .context("spawn substituted process")?;
+        let mut substituted = KillOnDrop(child);
         let canonical_home = std::fs::canonicalize(temp_dir.path())?;
         let status = DaemonStatus {
-            pid: substituted.id(),
+            pid: substituted.0.id(),
             started_at: "2026-08-16T12:00:00Z".to_owned(),
             socket: daemon_socket_path(&canonical_home)
                 .to_string_lossy()
@@ -14438,29 +14480,28 @@ mod tests {
             Ok(())
         });
 
-        let error = SystemDaemonStopController
-            .stop_verified_daemon(
-                &canonical_home,
-                &status,
-                LifecycleDeadline::after(Duration::from_millis(250))?,
-            )
-            .expect_err("the connected peer must not authenticate a substituted numeric PID");
-        server.join().expect("substitute server thread")?;
-        let still_running = substituted.try_wait()?.is_none();
-        if still_running {
-            substituted.kill()?;
+        let stopped =
+            SystemDaemonStopController.stop_verified_daemon(&canonical_home, &status, deadline);
+        // A client that gave up before connecting leaves the server in accept;
+        // this connection releases it, and is refused if it already finished.
+        match UnixStream::connect(daemon_socket_path(temp_dir.path())) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            // Joining now could block forever on a server still in accept.
+            Err(error) => anyhow::bail!("could not release the fixture server: {error}"),
         }
-        let _ = substituted.wait();
-
-        assert!(
-            error.to_string().contains("connected peer pid"),
-            "unexpected identity rejection: {error:#}"
-        );
-        assert!(
-            still_running,
-            "a daemon connection closing must not authorize signaling its stale numeric PID"
-        );
-        Ok(())
+        let served = server.join().expect("substitute server thread");
+        let still_running = substituted.0.try_wait()?.is_none();
+        let error = match stopped {
+            Ok(_) => anyhow::bail!("the connected peer must not authenticate a substituted pid"),
+            Err(error) => error,
+        };
+        // The release connection sends nothing, so the server's own result
+        // says nothing about the stop when the client never reached it.
+        if error.to_string().contains("connected peer pid") {
+            served?;
+        }
+        Ok((error, still_running))
     }
 
     #[test]
