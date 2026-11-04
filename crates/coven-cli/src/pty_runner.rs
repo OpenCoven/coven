@@ -3816,10 +3816,8 @@ fn qualify_scoped_write_command(
         );
         crate::claude_write_scope::validate_native_environment()?;
         crate::claude_write_scope::verify_native_profile(&program)?;
-        crate::claude_write_scope::guard_native_command(program, args)
-    } else {
-        Ok((program, args))
     }
+    Ok((program, args))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -23019,7 +23019,7 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir()?;
         let project = temp.path().join("repo");
         std::fs::create_dir(&project)?;
-        let scope = json!({"version":1,"primaryRoot":project,"writableRoots":[project],
+        let scope = json!({"version":2,"primaryRoot":project,"writableRoots":[project],
             "readOnlyRoots":[],"protectedRoots":[]});
         let valid = json!({"projectRoot":project,"harness":"claude","launchMode":"stream",
             "prompt":"write a synthetic artifact","writeScope":scope});

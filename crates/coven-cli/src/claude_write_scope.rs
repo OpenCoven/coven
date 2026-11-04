@@ -1,4 +1,9 @@
-//! Explicit scoped edit authority, separate from unrestricted Full and #713.
+//! Explicit scoped authority, separate from unrestricted Full and #713.
+//!
+//! Cave's grants are the only permission source: native settings files are not
+//! loaded. File tools are bounded by native rules, and Claude's OS sandbox
+//! bounds every shell command, so Bash needs no per-command allowlist. Native
+//! MCP servers run outside that sandbox, so only owner-listed servers start.
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -17,6 +22,13 @@ pub struct ClaudeWriteScope {
     pub writable_roots: Vec<String>,
     pub read_only_roots: Vec<String>,
     pub protected_roots: Vec<String>,
+    /// Owner-private `--mcp-config` file. It can hold server credentials, so
+    /// it travels by path and never in argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_config_file: Option<String>,
+    /// Servers in that file whose tools may run without a native prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_server_names: Vec<String>,
 }
 
 impl ClaudeWriteScope {
@@ -37,7 +49,7 @@ impl ClaudeWriteScope {
     }
 
     pub fn validate_for_cwd(&self, cwd: &Path) -> Result<Self> {
-        ensure!(self.version == 1, "unsupported writeScope version");
+        ensure!(self.version == 2, "unsupported writeScope version");
         let primary_root = canonical_root(&self.primary_root)?;
         ensure!(
             Path::new(&primary_root) == crate::project::canonical_project_root(cwd)?,
@@ -75,12 +87,33 @@ impl ClaudeWriteScope {
                 );
             }
         }
+        if let Some(file) = &self.mcp_config_file {
+            ensure!(
+                Path::new(file).is_absolute(),
+                "writeScope mcpConfigFile must be an absolute path"
+            );
+        }
+        ensure!(
+            self.mcp_config_file.is_some() != self.mcp_server_names.is_empty(),
+            "writeScope MCP servers and their config file must be supplied together"
+        );
+        ensure!(
+            self.mcp_server_names.iter().all(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            }),
+            "writeScope MCP server names contain unsupported rule syntax"
+        );
         Ok(Self {
-            version: 1,
+            version: 2,
             primary_root,
             writable_roots,
             read_only_roots,
             protected_roots,
+            mcp_config_file: self.mcp_config_file.clone(),
+            mcp_server_names: self.mcp_server_names.clone(),
         })
     }
 
@@ -89,9 +122,9 @@ impl ClaudeWriteScope {
     /// size is bounded by runtime resources, while writable project trees can
     /// hold millions of entries (pnpm stores hardlink every dependency file).
     /// Pre-existing aliases between a writable name and an ungranted object
-    /// remain writable, as they were under unrestricted Full. The child tree
-    /// also receives a kernel no-hardlink guard, so it cannot manufacture a
-    /// new name after this admission.
+    /// remain writable, as they were under unrestricted Full. Claude's OS
+    /// sandbox refuses a new link to an object outside the writable roots, so
+    /// the shell cannot manufacture such a name after this admission.
     fn audit_denied_objects(&self) -> Result<()> {
         #[cfg(unix)]
         {
@@ -138,23 +171,27 @@ impl ClaudeWriteScope {
     pub fn native_args(&self) -> Result<Vec<String>> {
         let scope = self.validate_for_cwd(Path::new(&self.primary_root))?;
         scope.audit_denied_objects()?;
-        let read_allowed: Vec<String> = scope
-            .read_only_roots
-            .iter()
-            .chain(scope.protected_roots.iter())
-            .flat_map(|root| {
-                let root = root.replace('\\', "/");
-                [format!("Read(/{root})"), format!("Read(/{root}/**)")]
-            })
-            .collect();
-        let mut denied: BTreeSet<String> = scope.protected_roots.into_iter().collect();
-        for root in scope.read_only_roots {
-            if scope
-                .writable_roots
+        let mut allow: Vec<String> = ["Bash", "WebFetch", "WebSearch"].map(String::from).to_vec();
+        allow.extend(
+            scope
+                .read_only_roots
                 .iter()
-                .any(|write| within(&root, write))
-            {
-                denied.insert(root);
+                .chain(scope.protected_roots.iter())
+                .flat_map(|root| {
+                    let root = root.replace('\\', "/");
+                    [format!("Read(/{root})"), format!("Read(/{root}/**)")]
+                }),
+        );
+        allow.extend(
+            scope
+                .mcp_server_names
+                .iter()
+                .map(|name| format!("mcp__{name}__*")),
+        );
+        let mut denied: BTreeSet<String> = scope.protected_roots.iter().cloned().collect();
+        for root in &scope.read_only_roots {
+            if scope.writable_roots.iter().any(|write| within(root, write)) {
+                denied.insert(root.clone());
             }
         }
         let deny: Vec<String> = denied
@@ -164,6 +201,25 @@ impl ClaudeWriteScope {
                 [format!("Edit(/{root})"), format!("Edit(/{root}/**)")]
             })
             .collect();
+        // Allowing Bash is safe only because every command stays sandboxed:
+        // the launch fails if the sandbox cannot start, and the model cannot
+        // ask to leave it. trustd lets Go tools such as `gh` verify TLS.
+        let settings = json!({
+            "permissions": {"allow": allow, "deny": deny},
+            "sandbox": {
+                "enabled": true,
+                "failIfUnavailable": true,
+                "autoAllowBashIfSandboxed": true,
+                "allowUnsandboxedCommands": false,
+                "enableWeakerNetworkIsolation": true,
+                "filesystem": {"allowWrite": scope.writable_roots, "denyWrite": denied},
+                "network": {"allowedDomains": ["*"], "allowLocalBinding": true},
+            },
+        });
+        let mcp_config = scope
+            .mcp_config_file
+            .clone()
+            .unwrap_or_else(|| "{\"mcpServers\":{}}".into());
         let mut args = vec![
             "--permission-mode".into(),
             "acceptEdits".into(),
@@ -171,9 +227,9 @@ impl ClaudeWriteScope {
             String::new(),
             "--strict-mcp-config".into(),
             "--mcp-config".into(),
-            "{\"mcpServers\":{}}".into(),
+            mcp_config,
             "--settings".into(),
-            json!({"permissions": {"allow": read_allowed, "deny": deny}}).to_string(),
+            settings.to_string(),
         ];
         for root in scope.writable_roots {
             if root != scope.primary_root {
@@ -182,22 +238,6 @@ impl ClaudeWriteScope {
         }
         Ok(args)
     }
-}
-
-/// This is a no-hardlink guard, not a claim of general shell containment.
-/// Native permissions remain responsible for the admitted pathname boundary.
-pub fn guard_native_command(program: String, args: Vec<String>) -> Result<(String, Vec<String>)> {
-    ensure!(
-        cfg!(target_os = "macos"),
-        "Claude scoped writes require a qualified macOS hardlink guard"
-    );
-    let mut guarded = vec![
-        "-p".into(),
-        "(version 1) (allow default) (deny file-link)".into(),
-        program,
-    ];
-    guarded.extend(args);
-    Ok(("/usr/bin/sandbox-exec".into(), guarded))
 }
 
 fn within(candidate: &str, root: &str) -> bool {
@@ -250,8 +290,24 @@ fn validate_native_environment_names(
     Ok(())
 }
 
-/// Qualification is deliberately exact; a new CLI must be qualified before
-/// it can inherit this profile. Never infer enforcement from a flag's name.
+/// Claude Code updates itself, so an exact pin would refuse every familiar
+/// turn after each update. Enforcement does not rest on this floor alone:
+/// `sandbox.failIfUnavailable` makes the native launch fail closed. 2.1.318 is
+/// the oldest version whose sandbox and permission settings were qualified.
+const MIN_NATIVE_VERSION: [u64; 3] = [2, 1, 318];
+
+fn native_version_is_qualified(version: &str) -> bool {
+    let mut parts = version.trim().split('.');
+    let mut parsed = [0u64; 3];
+    for slot in &mut parsed {
+        match parts.next().and_then(|part| part.parse().ok()) {
+            Some(value) => *slot = value,
+            None => return false,
+        }
+    }
+    parts.next().is_none() && parsed >= MIN_NATIVE_VERSION
+}
+
 pub fn verify_native_profile(program: &str) -> Result<()> {
     ensure!(
         cfg!(target_os = "macos"),
@@ -266,8 +322,8 @@ pub fn verify_native_profile(program: &str) -> Result<()> {
     let version = crate::setup::process::probe_version(&request, Duration::from_secs(2))?
         .context("could not establish the Claude scoped-write profile")?;
     ensure!(
-        version.trim() == "2.1.316",
-        "Claude scoped-write profile is unsupported; qualified version is 2.1.316"
+        native_version_is_qualified(&version),
+        "Claude scoped-write profile is unsupported; qualified versions start at 2.1.318"
     );
     Ok(())
 }
@@ -287,7 +343,7 @@ mod tests {
         ] {
             fs::create_dir_all(root.join(name)).unwrap();
         }
-        let value = json!({"version":1,"primaryRoot":root.join("primary"),
+        let value = json!({"version":2,"primaryRoot":root.join("primary"),
             "writableRoots":[root.join("primary"),root.join("read/write")],
             "readOnlyRoots":[root.join("read")],"protectedRoots":[root.join("primary/skills")]});
         (temp, value)
@@ -328,6 +384,78 @@ mod tests {
             .iter()
             .any(|rule| rule.as_str().unwrap().ends_with("/primary/skills/**)")));
     }
+    #[cfg(unix)]
+    #[test]
+    fn shell_authority_rests_on_a_sandbox_that_cannot_be_left() {
+        let (_temp, value) = fixture();
+        let cwd = PathBuf::from(value["primaryRoot"].as_str().unwrap());
+        let args = ClaudeWriteScope::from_value(value, &cwd)
+            .unwrap()
+            .native_args()
+            .unwrap();
+        let settings: Value = serde_json::from_str(
+            &args[args.iter().position(|arg| arg == "--settings").unwrap() + 1],
+        )
+        .unwrap();
+        let sandbox = &settings["sandbox"];
+        assert_eq!(sandbox["enabled"], json!(true));
+        assert_eq!(sandbox["failIfUnavailable"], json!(true));
+        assert_eq!(sandbox["allowUnsandboxedCommands"], json!(false));
+        assert!(settings["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Bash")));
+        let list = |key: &str| -> Vec<String> {
+            sandbox["filesystem"][key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|root| root.as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert!(list("allowWrite").iter().any(|p| p.ends_with("/primary")));
+        assert!(list("allowWrite")
+            .iter()
+            .any(|p| p.ends_with("/read/write")));
+        assert!(!list("allowWrite").iter().any(|p| p.ends_with("/read")));
+        assert!(list("denyWrite")
+            .iter()
+            .any(|p| p.ends_with("/primary/skills")));
+        let setting_sources = args
+            .iter()
+            .position(|arg| arg == "--setting-sources")
+            .unwrap();
+        assert_eq!(args[setting_sources + 1], "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_listed_mcp_servers_are_loaded_and_allowed() {
+        let (_temp, value) = fixture();
+        let cwd = PathBuf::from(value["primaryRoot"].as_str().unwrap());
+        let mut listed = value.clone();
+        listed["mcpConfigFile"] = json!("/owner/private/mcp.json");
+        listed["mcpServerNames"] = json!(["sanity"]);
+        let args = ClaudeWriteScope::from_value(listed, &cwd)
+            .unwrap()
+            .native_args()
+            .unwrap();
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--mcp-config", "/owner/private/mcp.json"]));
+        let settings = &args[args.iter().position(|arg| arg == "--settings").unwrap() + 1];
+        assert!(settings.contains("mcp__sanity__*"));
+        let none = ClaudeWriteScope::from_value(value, &cwd)
+            .unwrap()
+            .native_args()
+            .unwrap();
+        assert!(none
+            .windows(2)
+            .any(|pair| pair == ["--mcp-config", "{\"mcpServers\":{}}"]));
+        assert!(!none.iter().any(|arg| arg.contains("mcp__")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn protected_hardlink_alias_cannot_be_admitted_as_writable() {
@@ -384,50 +512,12 @@ mod tests {
             root.join("primary/alias"),
         )
         .unwrap();
-        let value = json!({"version":1,"primaryRoot":root.join("primary"),
+        let value = json!({"version":2,"primaryRoot":root.join("primary"),
             "writableRoots":[root.join("primary")],
             "readOnlyRoots":[root.join("primary/locked")],"protectedRoots":[]});
         let cwd = root.join("primary");
         let scope = ClaudeWriteScope::from_value(value, &cwd).unwrap();
         assert!(scope.native_args().is_err());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn kernel_guard_denies_new_links_without_disabling_ordinary_writes() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        let alias = root.path().join("alias");
-        fs::write(&source, "sentinel").unwrap();
-        let (program, args) = guard_native_command(
-            "/bin/ln".into(),
-            vec![source.display().to_string(), alias.display().to_string()],
-        )
-        .unwrap();
-        let output = std::process::Command::new(program)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(!alias.exists());
-        assert_eq!(fs::read_to_string(source).unwrap(), "sentinel");
-        let destination = root.path().join("ordinary");
-        let (program, args) = guard_native_command(
-            "/bin/sh".into(),
-            vec![
-                "-c".into(),
-                "printf allowed > \"$1\"".into(),
-                "probe".into(),
-                destination.display().to_string(),
-            ],
-        )
-        .unwrap();
-        assert!(std::process::Command::new(program)
-            .args(args)
-            .status()
-            .unwrap()
-            .success());
-        assert_eq!(fs::read_to_string(destination).unwrap(), "allowed");
     }
 
     #[cfg(windows)]
@@ -504,11 +594,17 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn native_profile_uses_normalized_exact_version() {
+    fn native_profile_applies_the_qualified_floor() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("claude");
-        for (version, allowed) in [("2.1.316", true), ("2.1.315", false), ("2.1.317", false)] {
+        for (version, allowed) in [
+            ("2.1.318", true),
+            ("2.1.319", true),
+            ("2.2.0", true),
+            ("2.1.317", false),
+            ("1.9.999", false),
+        ] {
             fs::write(
                 &executable,
                 format!("#!/bin/sh\necho '{version} (Claude Code)'\n"),
@@ -531,7 +627,7 @@ mod tests {
             json!({}),
             {
                 let mut v = value.clone();
-                v["version"] = json!(2);
+                v["version"] = json!(1);
                 v
             },
             {
@@ -552,6 +648,28 @@ mod tests {
             {
                 let mut v = value.clone();
                 v["readOnlyRoots"] = json!([cwd.clone()]);
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["mcpServerNames"] = json!(["orphan"]);
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["mcpConfigFile"] = json!("/owner/mcp.json");
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["mcpConfigFile"] = json!("relative/mcp.json");
+                v["mcpServerNames"] = json!(["ok"]);
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["mcpConfigFile"] = json!("/owner/mcp.json");
+                v["mcpServerNames"] = json!(["*"]);
                 v
             },
         ] {
