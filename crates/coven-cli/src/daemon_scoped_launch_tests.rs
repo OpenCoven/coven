@@ -24,7 +24,8 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 
 /// Makes `program` a stand-in claude 2.1.305. Launched, it records its
 /// arguments, its working folder, that folder's entries and the names in its
-/// environment under `capture`, then waits until `capture/release` exists.
+/// environment under `capture`, then waits until `capture/release` exists and
+/// prints `capture/stream`, if there is one, as its output.
 fn stand_in(program: &Path, capture: &Path) {
     let capture = capture.display();
     fs::write(
@@ -37,7 +38,8 @@ fn stand_in(program: &Path, capture: &Path) {
              ls -A > '{capture}/entries'\n\
              env | sed 's/=.*//' > '{capture}/environment'\n\
              touch '{capture}/started'\n\
-             while [ ! -e '{capture}/release' ]; do sleep 0.05; done\n"
+             while [ ! -e '{capture}/release' ]; do sleep 0.05; done\n\
+             if [ -e '{capture}/stream' ]; then cat '{capture}/stream'; fi\n"
         ),
     )
     .unwrap();
@@ -254,4 +256,290 @@ fn a_launch_refused_after_consumption_records_its_profile_code() {
         )
         .unwrap();
     assert_eq!(recorded, expected);
+}
+
+/// A scoped read run through the live runtime whose harness prints `stream`
+/// as its output after the test reads the granted note and the sibling
+/// through its channel. Returns once the session has ended and its terminal
+/// evidence is stored.
+fn scoped_run_ending_with(fixture: &Fixture, stream: &[String]) -> LiveSessionRuntime {
+    let capture = fixture
+        .program
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("capture");
+    fs::create_dir_all(&capture).unwrap();
+    stand_in(&fixture.program, &capture);
+    fs::write(
+        capture.join("stream"),
+        crate::automations::stream_observation::test_support::stream(stream),
+    )
+    .unwrap();
+    fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
+    fixture.schedule("notes");
+    let runtime = LiveSessionRuntime::with_coven_home(fixture.home.path().to_path_buf())
+        .with_scoped_harness(fixture.program.clone());
+    let (report, runtime) = fixture.dispatch_pass_with(runtime);
+    assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
+    wait_for("the harness to start", || capture.join("started").exists());
+    let args = fs::read_to_string(capture.join("args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let config = args
+        .iter()
+        .position(|arg| *arg == "--mcp-config")
+        .map(|index| PathBuf::from(args[index + 1]))
+        .unwrap();
+    let config: Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
+    let server = &config["mcpServers"]["coven"];
+    let mut input = Vec::new();
+    for message in [
+        json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18" } }),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "read_file", "arguments": read("notes/today.md") } }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "read_file", "arguments": read("note.txt") } }),
+    ] {
+        input.extend(serde_json::to_vec(&message).unwrap());
+        input.push(b'\n');
+    }
+    let mut output = Vec::new();
+    relay(
+        Path::new(server["env"][CHANNEL_ENV].as_str().unwrap()),
+        server["env"][TOKEN_ENV].as_str().unwrap(),
+        Cursor::new(input),
+        &mut output,
+    )
+    .expect("the relay runs");
+    let results = tool_results(&output);
+    assert_eq!(results[0]["content"], GRANTED);
+    assert_eq!(results[1]["refusal"], "scope_missing");
+    fs::write(capture.join("release"), "").unwrap();
+    wait_for("the session's terminal evidence", || {
+        fixture
+            .home
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_runtime_terminal_evidence",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|stored| stored == 1)
+    });
+    runtime
+}
+
+/// The stream a harness that made both reads prints.
+fn two_reads() -> Vec<String> {
+    crate::automations::stream_observation::test_support::scoped_read_run_calling(2)
+}
+
+fn run_state(fixture: &Fixture) -> (String, Option<String>, Option<String>) {
+    fixture
+        .home
+        .conn
+        .query_row(
+            "SELECT r.status, r.receipt_id, a.state_reason
+             FROM automation_runs AS r
+             JOIN automation_attempts AS a ON a.run_id = r.id",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_scoped_read_run_whose_reads_reconcile_settles_from_its_signed_evidence() {
+    let fixture = Fixture::new();
+    let runtime = scoped_run_ending_with(&fixture, &two_reads());
+    let report =
+        crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+            .unwrap();
+    assert_eq!(report.succeeded, 1, "{report:?}: {:?}", run_state(&fixture));
+    let (status, receipt, _) = run_state(&fixture);
+    assert_eq!(status, "succeeded");
+    assert!(receipt.is_some(), "the launched receipt committed");
+    drop(runtime);
+}
+
+#[test]
+fn a_scoped_read_run_whose_stream_hides_a_read_is_held() {
+    let fixture = Fixture::new();
+    // The harness reports one read; the service served two.
+    let runtime = scoped_run_ending_with(
+        &fixture,
+        &crate::automations::stream_observation::test_support::scoped_read_run(),
+    );
+    let report =
+        crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+            .unwrap();
+    assert_eq!(report.succeeded, 0, "{report:?}");
+    let (status, receipt, reason) = run_state(&fixture);
+    assert_eq!(status, "running");
+    assert!(receipt.is_none());
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("recovery required")),
+        "{reason:?}"
+    );
+    drop(runtime);
+}
+
+#[test]
+fn a_commitment_no_closed_channel_accounts_for_holds_settlement() {
+    let fixture = Fixture::new();
+    let runtime = scoped_run_ending_with(&fixture, &two_reads());
+    // A commitment appears for the attempt after its evidence was signed
+    // complete, from a channel that never closed.
+    let attempt: String = fixture
+        .home
+        .conn
+        .query_row("SELECT id FROM automation_attempts", [], |row| row.get(0))
+        .unwrap();
+    fixture
+        .home
+        .conn
+        .execute(
+            "INSERT INTO automation_scoped_read_commitments (
+                attempt_id, channel_id, sequence, tool, outcome, refusal,
+                result_digest, result_bytes, committed_at
+             ) VALUES (?1, 'forged', 1, 'read_file', 'served', NULL, ?2, 1,
+                       '2026-10-30T00:00:00.000Z')",
+            rusqlite::params![attempt, "ab".repeat(32)],
+        )
+        .unwrap();
+    let report =
+        crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+            .unwrap();
+    assert_eq!(report.succeeded, 0, "{report:?}");
+    let (status, receipt, reason) = run_state(&fixture);
+    assert_eq!(status, "running");
+    assert!(receipt.is_none());
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("scoped read commitments do not reconcile")),
+        "{reason:?}"
+    );
+    // A later pass keeps saying why: the run is held, so it must not start
+    // reading as evidence that merely arrived late.
+    crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+        .unwrap();
+    let (_, _, later) = run_state(&fixture);
+    assert_eq!(later, reason, "the hold reason changed on a later pass");
+    drop(runtime);
+}
+
+#[test]
+fn a_scoped_read_run_whose_served_read_the_harness_never_received_is_held() {
+    use crate::automations::stream_observation::test_support::{
+        failed_tool_result, scoped_read_run_showing, tool_use,
+    };
+    let call = || tool_use("mcp__coven__read_file");
+    // Each reply reached the channel socket, so the close says written. The
+    // stream shows the harness never got a usable result: the relay died
+    // before forwarding it, and the harness carried on and exited cleanly.
+    let cases = [
+        (
+            "every call failed",
+            vec![call(), failed_tool_result(), call(), failed_tool_result()],
+        ),
+        ("no call was answered", vec![call(), call()]),
+    ];
+    for (what, calls) in cases {
+        let fixture = Fixture::new();
+        let runtime = scoped_run_ending_with(&fixture, &scoped_read_run_showing(&calls));
+        let report = crate::automations::runner::settle_finished_runs(
+            &fixture.home.conn,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(report.succeeded, 0, "{what}: {report:?}");
+        let (status, receipt, reason) = run_state(&fixture);
+        assert_eq!(status, "running", "{what}");
+        assert!(receipt.is_none(), "{what}");
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("recovery required")),
+            "{what}: {reason:?}"
+        );
+        // The hold comes from this check, not from some other partial state.
+        let log = fs::read_to_string(crate::daemon::daemon_recovery_log_path(fixture.home.path()))
+            .unwrap_or_default();
+        assert!(
+            log.contains("scoped_read_served_not_answered"),
+            "{what}: {log}"
+        );
+        drop(runtime);
+    }
+}
+
+#[test]
+fn a_scoped_read_run_whose_refused_read_shows_as_an_error_settles() {
+    use crate::automations::stream_observation::test_support::{
+        failed_tool_result, scoped_read_run_showing, tool_result, tool_use,
+    };
+    let fixture = Fixture::new();
+    // The harness marks the service's refusal as an error, which is what it
+    // really prints. The refusal was delivered, so the run still settles.
+    let runtime = scoped_run_ending_with(
+        &fixture,
+        &scoped_read_run_showing(&[
+            tool_use("mcp__coven__read_file"),
+            tool_result(),
+            tool_use("mcp__coven__read_file"),
+            failed_tool_result(),
+        ]),
+    );
+    let report =
+        crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+            .unwrap();
+    assert_eq!(report.succeeded, 1, "{report:?}: {:?}", run_state(&fixture));
+    drop(runtime);
+}
+
+#[test]
+fn a_malformed_scoped_read_row_holds_its_run_and_settlement_goes_on() {
+    let malformed: [&str; 2] = [
+        "INSERT INTO automation_scoped_read_closes (
+            attempt_id, channel_id, operations, operations_json, closed_at
+         ) VALUES (?1, 'forged', 0, x'00', '2026-10-30T00:00:00.000Z')",
+        "INSERT INTO automation_scoped_read_commitments (
+            attempt_id, channel_id, sequence, tool, outcome, refusal,
+            result_digest, result_bytes, committed_at
+         ) VALUES (?1, 'forged', 99, 'read_file', 'served', x'00',
+                   replace(hex(zeroblob(32)), '00', 'ab'), 1,
+                   '2026-10-30T00:00:00.000Z')",
+    ];
+    for insert in malformed {
+        let fixture = Fixture::new();
+        let runtime = scoped_run_ending_with(&fixture, &two_reads());
+        let attempt: String = fixture
+            .home
+            .conn
+            .query_row("SELECT id FROM automation_attempts", [], |row| row.get(0))
+            .unwrap();
+        fixture.home.conn.execute(insert, [&attempt]).unwrap();
+        // These rows are immutable, so an error here would stop settlement
+        // for every run on every tick, for good.
+        let report = crate::automations::runner::settle_finished_runs(
+            &fixture.home.conn,
+            chrono::Utc::now(),
+        )
+        .unwrap_or_else(|error| panic!("settlement stopped: {error}"));
+        assert_eq!(report.succeeded, 0, "{report:?}");
+        let (status, receipt, reason) = run_state(&fixture);
+        assert_eq!(status, "running");
+        assert!(receipt.is_none());
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("scoped read commitments do not reconcile")),
+            "{reason:?}"
+        );
+        drop(runtime);
+    }
 }
