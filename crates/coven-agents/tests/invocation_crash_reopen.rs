@@ -83,7 +83,14 @@ fn owner(
         ])
         .unwrap(),
     );
-    DurableInvocationRunner::new(runner, journal, process)
+    DurableInvocationRunner::new(
+        runner,
+        journal,
+        process,
+        std::sync::Arc::new(coven_agents::InvocationCapacity::new(
+            std::num::NonZeroUsize::new(16).unwrap(),
+        )),
+    )
 }
 
 async fn submit(

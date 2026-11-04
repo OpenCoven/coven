@@ -297,6 +297,10 @@ outcome survives a restart. `FileInvocationJournal` stores records with the
 same crash-safe checkpoints as `FileLoopJournal`. `InMemoryInvocationJournal`
 is for tests.
 
+Construction requires an explicit `Arc<InvocationCapacity>` with a nonzero limit. Share the same pool across direct and delegated runners that must obey one local bound. A slot is charged immediately before adoption and released only after a known outcome is durably settled. Saturation returns `CapacityUnavailable` before context resolution, model execution or tool dispatch; a newly recorded request can remain `reserved` without an attempt. There is no waiting queue or automatic resubmission. Settled replay, request conflicts and existing running/recovery states are checked before capacity, so saturation does not hide their actual disposition.
+
+Unknown adoption, a dropped adopted future, an uncertain tool/child outcome and failed settlement retain their charge, including a lost settlement reply whose write may have committed. A subsequent read can establish the invocation's outcome but does not reclaim the pool charge. No release/recovery override is provided while the authoritative fencing consumer remains unresolved. This conservative pool bounds local admissions; it does not prove containment or impose a durable cross-process resource limit. Charges are process-local and a new pool cannot fence old work or authorize replay. This pre-1.0 change adds the mandatory capacity argument to `DurableInvocationRunner::new`; hosts choose the limit explicitly and must reconcile abandoned work separately across restart.
+
 The journal is separate from any `SessionStore`. An `InvocationRecord` holds
 the invocation's identity, source and target, a digest of the exact request,
 its state and the attempt that adopted it. Content appears only as digests;
