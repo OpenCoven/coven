@@ -103,6 +103,14 @@ fn close(conn: &Connection, channel: &str, operations: &[Operation]) {
     record(conn, ATTEMPT, channel, operations, Utc::now()).unwrap();
 }
 
+/// A stream showing `calls` service tool calls, each answered.
+fn shows(calls: usize) -> StreamCalls {
+    StreamCalls {
+        calls,
+        answered: calls,
+    }
+}
+
 fn reconciled(conn: &Connection) -> std::result::Result<usize, Discrepancy> {
     reconcile(conn, ATTEMPT, None).unwrap()
 }
@@ -131,12 +139,76 @@ fn matching_commitments_and_close_reconcile() {
     );
     assert_eq!(reconciled(&conn), Ok(3));
     // The stream must show every operation the service ran.
-    assert_eq!(reconcile(&conn, ATTEMPT, Some(3)).unwrap(), Ok(3));
-    assert_eq!(reconcile(&conn, ATTEMPT, Some(4)).unwrap(), Ok(3));
+    assert_eq!(reconcile(&conn, ATTEMPT, Some(shows(3))).unwrap(), Ok(3));
+    assert_eq!(reconcile(&conn, ATTEMPT, Some(shows(4))).unwrap(), Ok(3));
     assert_eq!(
-        reconcile(&conn, ATTEMPT, Some(2)).unwrap(),
+        reconcile(&conn, ATTEMPT, Some(shows(2))).unwrap(),
         Err(Discrepancy::OperationNotInStream)
     );
+}
+
+#[test]
+fn a_served_read_the_stream_shows_no_usable_result_for_does_not_reconcile() {
+    let conn = store();
+    commit(&conn, CHANNEL, 1, "served", None, Some(DIGEST));
+    commit(
+        &conn,
+        CHANNEL,
+        2,
+        "refused",
+        Some("scope_missing"),
+        Some(DIGEST),
+    );
+    close(
+        &conn,
+        CHANNEL,
+        &[served(1, DIGEST), refused(2, Refusal::ScopeMissing)],
+    );
+    let stream = |answered| Some(StreamCalls { calls: 2, answered });
+    assert_eq!(
+        reconcile(&conn, ATTEMPT, stream(0)).unwrap(),
+        Err(Discrepancy::ServedNotAnswered)
+    );
+    // The harness marks a refusal as an error, so only the served read needs
+    // a result without one.
+    assert_eq!(reconcile(&conn, ATTEMPT, stream(1)).unwrap(), Ok(2));
+}
+
+#[test]
+fn a_row_of_the_wrong_shape_is_a_discrepancy_and_not_a_store_error() {
+    let conn = store();
+    conn.execute(
+        "INSERT INTO automation_scoped_read_closes (
+            attempt_id, channel_id, operations, operations_json, closed_at
+         ) VALUES (?1, ?2, 0, x'00', '2026-10-30T00:00:00.000Z')",
+        [ATTEMPT, CHANNEL],
+    )
+    .unwrap();
+    assert_eq!(reconciled(&conn), Err(Discrepancy::CloseInvalid));
+
+    let conn = store();
+    close(&conn, CHANNEL, &[]);
+    conn.execute(
+        "INSERT INTO automation_scoped_read_commitments (
+            attempt_id, channel_id, sequence, tool, outcome, refusal,
+            result_digest, result_bytes, committed_at
+         ) VALUES (?1, ?2, 1, 'read_file', 'served', x'00', ?3, 1,
+                   '2026-10-30T00:00:00.000Z')",
+        [ATTEMPT, CHANNEL, DIGEST],
+    )
+    .unwrap();
+    assert_eq!(reconciled(&conn), Err(Discrepancy::CommitmentInvalid));
+
+    // A store that cannot be read is still an error: a busy store must not
+    // become a permanent hold.
+    let busy = rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::DatabaseBusy,
+            extended_code: 5,
+        },
+        None,
+    );
+    assert!(!malformed(&busy));
 }
 
 #[test]
@@ -409,11 +481,11 @@ fn a_launch_through_its_channel_records_a_close_that_reconciles() {
     assert_eq!(results[1].0["refusal"], "scope_missing");
     let attempt = attempt_of(&fixture);
     assert_eq!(
-        reconcile(&fixture.home.conn, &attempt, Some(2)).unwrap(),
+        reconcile(&fixture.home.conn, &attempt, Some(shows(2))).unwrap(),
         Ok(2)
     );
     assert_eq!(
-        reconcile(&fixture.home.conn, &attempt, Some(1)).unwrap(),
+        reconcile(&fixture.home.conn, &attempt, Some(shows(1))).unwrap(),
         Err(Discrepancy::OperationNotInStream),
         "an operation the harness's stream does not show"
     );
@@ -626,7 +698,7 @@ fn closes_hold_no_content_path_pattern_or_name() {
         assert!(!column.contains("SENTINEL"), "a close discloses {column}");
     }
     assert_eq!(
-        reconcile(&fixture.home.conn, &attempt_of(&fixture), Some(3)).unwrap(),
+        reconcile(&fixture.home.conn, &attempt_of(&fixture), Some(shows(3))).unwrap(),
         Ok(3)
     );
 }

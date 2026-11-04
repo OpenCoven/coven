@@ -162,7 +162,11 @@ fn scoped_reads_reconcile(
     attempt_id: &str,
     stream: &StreamObservation,
 ) -> std::result::Result<(), String> {
-    match scoped_read_settlement::reconcile(conn, attempt_id, Some(stream.tool_calls)) {
+    let calls = scoped_read_settlement::StreamCalls {
+        calls: stream.tool_calls,
+        answered: stream.answered_calls,
+    };
+    match scoped_read_settlement::reconcile(conn, attempt_id, Some(calls)) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(discrepancy)) => Err(discrepancy.code().to_owned()),
         Err(error) => Err(format!("{error:#}")),

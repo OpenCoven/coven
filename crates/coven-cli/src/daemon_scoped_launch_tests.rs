@@ -423,5 +423,116 @@ fn a_commitment_no_closed_channel_accounts_for_holds_settlement() {
             .is_some_and(|reason| reason.contains("scoped read commitments do not reconcile")),
         "{reason:?}"
     );
+    // A later pass keeps saying why: the run is held, so it must not start
+    // reading as evidence that merely arrived late.
+    crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+        .unwrap();
+    let (_, _, later) = run_state(&fixture);
+    assert_eq!(later, reason, "the hold reason changed on a later pass");
     drop(runtime);
+}
+
+#[test]
+fn a_scoped_read_run_whose_served_read_the_harness_never_received_is_held() {
+    use crate::automations::stream_observation::test_support::{
+        failed_tool_result, scoped_read_run_showing, tool_use,
+    };
+    let call = || tool_use("mcp__coven__read_file");
+    // Each reply reached the channel socket, so the close says written. The
+    // stream shows the harness never got a usable result: the relay died
+    // before forwarding it, and the harness carried on and exited cleanly.
+    let cases = [
+        (
+            "every call failed",
+            vec![call(), failed_tool_result(), call(), failed_tool_result()],
+        ),
+        ("no call was answered", vec![call(), call()]),
+    ];
+    for (what, calls) in cases {
+        let fixture = Fixture::new();
+        let runtime = scoped_run_ending_with(&fixture, &scoped_read_run_showing(&calls));
+        let report = crate::automations::runner::settle_finished_runs(
+            &fixture.home.conn,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(report.succeeded, 0, "{what}: {report:?}");
+        let (status, receipt, reason) = run_state(&fixture);
+        assert_eq!(status, "running", "{what}");
+        assert!(receipt.is_none(), "{what}");
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("recovery required")),
+            "{what}: {reason:?}"
+        );
+        drop(runtime);
+    }
+}
+
+#[test]
+fn a_scoped_read_run_whose_refused_read_shows_as_an_error_settles() {
+    use crate::automations::stream_observation::test_support::{
+        failed_tool_result, scoped_read_run_showing, tool_result, tool_use,
+    };
+    let fixture = Fixture::new();
+    // The harness marks the service's refusal as an error, which is what it
+    // really prints. The refusal was delivered, so the run still settles.
+    let runtime = scoped_run_ending_with(
+        &fixture,
+        &scoped_read_run_showing(&[
+            tool_use("mcp__coven__read_file"),
+            tool_result(),
+            tool_use("mcp__coven__read_file"),
+            failed_tool_result(),
+        ]),
+    );
+    let report =
+        crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+            .unwrap();
+    assert_eq!(report.succeeded, 1, "{report:?}: {:?}", run_state(&fixture));
+    drop(runtime);
+}
+
+#[test]
+fn a_malformed_scoped_read_row_holds_its_run_and_settlement_goes_on() {
+    let malformed: [&str; 2] = [
+        "INSERT INTO automation_scoped_read_closes (
+            attempt_id, channel_id, operations, operations_json, closed_at
+         ) VALUES (?1, 'forged', 0, x'00', '2026-10-30T00:00:00.000Z')",
+        "INSERT INTO automation_scoped_read_commitments (
+            attempt_id, channel_id, sequence, tool, outcome, refusal,
+            result_digest, result_bytes, committed_at
+         ) VALUES (?1, 'forged', 99, 'read_file', 'served', x'00',
+                   replace(hex(zeroblob(32)), '00', 'ab'), 1,
+                   '2026-10-30T00:00:00.000Z')",
+    ];
+    for insert in malformed {
+        let fixture = Fixture::new();
+        let runtime = scoped_run_ending_with(&fixture, &two_reads());
+        let attempt: String = fixture
+            .home
+            .conn
+            .query_row("SELECT id FROM automation_attempts", [], |row| row.get(0))
+            .unwrap();
+        fixture.home.conn.execute(insert, [&attempt]).unwrap();
+        // These rows are immutable, so an error here would stop settlement
+        // for every run on every tick, for good.
+        let report = crate::automations::runner::settle_finished_runs(
+            &fixture.home.conn,
+            chrono::Utc::now(),
+        )
+        .unwrap_or_else(|error| panic!("settlement stopped: {error}"));
+        assert_eq!(report.succeeded, 0, "{report:?}");
+        let (status, receipt, reason) = run_state(&fixture);
+        assert_eq!(status, "running");
+        assert!(receipt.is_none());
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("scoped read commitments do not reconcile")),
+            "{reason:?}"
+        );
+        drop(runtime);
+    }
 }

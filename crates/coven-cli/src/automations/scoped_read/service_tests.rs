@@ -1494,6 +1494,10 @@ mod over_the_channel {
         let observed = classify_claude_stream(&CLAUDE_R0_SCOPED_READ, &raw, false);
         assert!(observed.complete, "{raw}");
         assert_eq!(observed.result, StreamResult::Produced("done".to_owned()));
+        // The installed harness shows the served read without an error and
+        // marks the refused one, which is what settlement counts on.
+        assert_eq!(observed.tool_calls, 2, "{raw}");
+        assert_eq!(observed.answered_calls, 1, "{raw}");
         let model = model_requests(&requests);
         assert!(last_tool_result(&model[1]).contains("granted notes"));
         assert!(last_tool_result(&model[2]).contains("scope_missing"));

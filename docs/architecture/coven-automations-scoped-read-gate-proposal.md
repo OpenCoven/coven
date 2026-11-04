@@ -312,7 +312,12 @@ call:
 - **Where it applies.**
   - *The terminal observer.* For an envelope with a scoped read service, the
     observer reconciles the attempt before it signs. It also requires the
-    harness's stream to show at least as many tool calls as the service ran.
+    harness's stream to show at least as many tool calls as the service ran,
+    and at least as many results without an error as the service served
+    reads. A written reply has only reached the channel socket: the relay can
+    die before forwarding it, and the harness then records an error and exits
+    cleanly. The harness marks a refusal as an error too, so refusals are not
+    counted. These are counts, not a per-call match.
     Any discrepancy leaves coverage partial, so the evidence is never
     receipt-eligible, and its stable code goes to the daemon recovery log.
   - *The evidence consumer.* `consume_runtime_terminal_evidence` reconciles
@@ -325,7 +330,13 @@ call:
   - A crash leaves no close, so the run stays held, and restart neither
     adopts the old channel nor writes a close for it.
   - The harness's stream alone can no longer make a scoped read run
-    complete.
+    complete, and a served read the stream shows no usable result for keeps
+    it from settling.
+  - A close or commitment row of the wrong shape holds its own run. It cannot
+    stop settlement for other runs.
+- **Rollback.** `StoreGate::open` creates the table with
+  `CREATE TABLE IF NOT EXISTS`. Reverting the change leaves the table inert,
+  because older binaries never read it, and its rows are retained.
 
 ## What this proposal does not decide
 

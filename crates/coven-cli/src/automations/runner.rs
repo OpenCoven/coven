@@ -4613,16 +4613,17 @@ fn consume_runtime_terminal_evidence(
     let (verified, binding) = verified;
     let reason = match verified.classification {
         RuntimeTerminalEvidenceClassification::ReceiptEligibleComplete => {
+            // A scoped read attempt settles only when what the gate
+            // authorized and what the channel did reconcile, whatever the
+            // evidence says (#1606). This comes before the late check, which
+            // the hold itself trips, so a held run keeps saying why.
+            if !scoped_reads_reconciled(conn, &binding, &attempt_id)? {
+                return Ok(EvidenceConsumption::Held(SCOPED_READ_UNRECONCILED_REASON));
+            }
             if !matches!(occurrence_state, Some("claimed" | "running")) {
                 return Ok(EvidenceConsumption::Held(
                     RUNTIME_TERMINAL_EVIDENCE_LATE_REASON,
                 ));
-            }
-            // A scoped read attempt settles only when what the gate
-            // authorized and what the channel did reconcile, whatever the
-            // evidence says (#1606).
-            if !scoped_reads_reconciled(conn, &binding, &attempt_id)? {
-                return Ok(EvidenceConsumption::Held(SCOPED_READ_UNRECONCILED_REASON));
             }
             let settled_here = settle_from_runtime_terminal_evidence(
                 conn,

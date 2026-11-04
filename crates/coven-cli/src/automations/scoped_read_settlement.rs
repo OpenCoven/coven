@@ -15,7 +15,9 @@
 //! [`reconcile`] compares the two. Settlement treats a scoped read attempt's
 //! evidence as complete only when exactly one channel closed and every
 //! operation it lists matches its commitment: the same sequence, tool,
-//! outcome, refusal and digest, with a committed result also written. A
+//! outcome, refusal and digest, with a committed result also written. The
+//! terminal observer also holds it to the harness's stream, which must show a
+//! result without an error for each served read. A
 //! missing close, a second channel, a commitment no operation accounts for,
 //! an operation with no commitment, or any field that differs is a
 //! [`Discrepancy`], and the evidence stays partial: the run is held for
@@ -32,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use super::scoped_read::service::{Operation, Outcome};
 
 /// One row per closed channel. Rows are never updated or deleted.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS automation_scoped_read_closes (
         attempt_id TEXT NOT NULL REFERENCES automation_attempts (id),
@@ -122,6 +125,8 @@ pub(crate) enum Discrepancy {
     SeveralChannels,
     /// The close's record cannot be read as written.
     CloseInvalid,
+    /// A commitment's row cannot be read as written.
+    CommitmentInvalid,
     /// The close lists sequences other than 1 to its count in order, or an
     /// operation after one that was withheld.
     SequenceInvalid,
@@ -144,6 +149,11 @@ pub(crate) enum Discrepancy {
     /// The service ran more operations than the harness's stream shows tool
     /// calls.
     OperationNotInStream,
+    /// The service served more reads than the harness's stream shows results
+    /// without an error. A written reply may never have reached the harness:
+    /// its relay can die after the socket write, and the harness then carries
+    /// on and exits cleanly.
+    ServedNotAnswered,
 }
 
 impl Discrepancy {
@@ -152,6 +162,7 @@ impl Discrepancy {
             Self::NotClosed => "scoped_read_not_closed",
             Self::SeveralChannels => "scoped_read_several_channels",
             Self::CloseInvalid => "scoped_read_close_invalid",
+            Self::CommitmentInvalid => "scoped_read_commitment_invalid",
             Self::SequenceInvalid => "scoped_read_sequence_invalid",
             Self::ForeignChannel => "scoped_read_foreign_channel",
             Self::CommitmentUnaccounted => "scoped_read_commitment_unaccounted",
@@ -162,6 +173,7 @@ impl Discrepancy {
             Self::DigestMismatch => "scoped_read_digest_mismatch",
             Self::CommittedNotWritten => "scoped_read_committed_not_written",
             Self::OperationNotInStream => "scoped_read_operation_not_in_stream",
+            Self::ServedNotAnswered => "scoped_read_served_not_answered",
         }
     }
 }
@@ -175,14 +187,37 @@ struct Commitment {
     digest: Option<String>,
 }
 
+/// What the harness's stream shows of the service's tools.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamCalls {
+    /// The service tool calls it shows.
+    pub calls: usize,
+    /// The tool results it shows without an error.
+    pub answered: usize,
+}
+
+/// A row of the wrong shape, as opposed to a store that could not be read.
+/// The row is immutable, so it can only hold its own run: returning it as an
+/// error would stop settlement for every run on every pass.
+fn malformed(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::Utf8Error(..)
+    )
+}
+
 /// Whether `attempt_id`'s scoped read commitments and close reconcile, and if
-/// so how many operations its channel ran. With `stream_calls`, the number of
-/// service tool calls the harness's stream shows, the service must not have
-/// run more operations than that. It only reads.
+/// so how many operations its channel ran. With `stream`, the harness's own
+/// account, the service must not have run more operations than the calls it
+/// shows, nor served more reads than the results it shows without an error.
+/// It only reads.
 pub(crate) fn reconcile(
     conn: &Connection,
     attempt_id: &str,
-    stream_calls: Option<usize>,
+    stream: Option<StreamCalls>,
 ) -> Result<std::result::Result<usize, Discrepancy>> {
     use Discrepancy::*;
 
@@ -207,8 +242,11 @@ pub(crate) fn reconcile(
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .context("failed to read the scoped read closes")?;
-        rows.collect::<rusqlite::Result<_>>()
-            .context("failed to read a scoped read close")?
+        match rows.collect::<rusqlite::Result<_>>() {
+            Ok(closes) => closes,
+            Err(error) if malformed(&error) => return Ok(Err(CloseInvalid)),
+            Err(error) => return Err(error).context("failed to read a scoped read close"),
+        }
     } else {
         Vec::new()
     };
@@ -260,8 +298,11 @@ pub(crate) fn reconcile(
                 })
             })
             .context("failed to read the scoped read commitments")?;
-        rows.collect::<rusqlite::Result<_>>()
-            .context("failed to read a scoped read commitment")?
+        match rows.collect::<rusqlite::Result<_>>() {
+            Ok(commitments) => commitments,
+            Err(error) if malformed(&error) => return Ok(Err(CommitmentInvalid)),
+            Err(error) => return Err(error).context("failed to read a scoped read commitment"),
+        }
     } else {
         Vec::new()
     };
@@ -305,8 +346,17 @@ pub(crate) fn reconcile(
     if accounted != commitments.len() {
         return Ok(Err(CommitmentUnaccounted));
     }
-    if stream_calls.is_some_and(|calls| closed.len() > calls) {
-        return Ok(Err(OperationNotInStream));
+    if let Some(stream) = stream {
+        if closed.len() > stream.calls {
+            return Ok(Err(OperationNotInStream));
+        }
+        let served = closed
+            .iter()
+            .filter(|operation| operation.outcome == "served")
+            .count();
+        if served > stream.answered {
+            return Ok(Err(ServedNotAnswered));
+        }
     }
     Ok(Ok(closed.len()))
 }
