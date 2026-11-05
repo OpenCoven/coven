@@ -103,6 +103,8 @@ class ClassifyTest(unittest.TestCase):
 
     def test_packaged_user_journey_paths_route_to_npm_packaging(self):
         for path in (
+            'scripts/authorize-release-publication.mjs',
+            'scripts/authorize-release-publication.test.mjs',
             'scripts/test-cli-prepublish-test.mjs',
             'scripts/user-journey-e2e.mjs',
             'scripts/user-journey-e2e-test.mjs',

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
+import os
 import pathlib
 import re
+import subprocess
+import sys
+import textwrap
 import unittest
 
 CI_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'ci.yml'
@@ -117,7 +122,12 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn('cargo test --workspace --locked --no-fail-fast', job)
 
     def test_ci_uses_expected_timeouts_and_cache_policy(self) -> None:
-        self.assertGreaterEqual(CI_TEXT.count('timeout-minutes: 20'), 10)
+        # The PR onboarding job gives Linux and Windows 20 minutes via its matrix.
+        pr = ci_job_block('npm-onboarding-pr')
+        self.assertIn('timeout-minutes: ${{ matrix.job-timeout }}', pr)
+        for target in ('linux-x64', 'windows'):
+            self.assertRegex(pr, rf'npm-target: {target}\n[^\n]+\n            job-timeout: 20\n')
+        self.assertGreaterEqual(CI_TEXT.count('timeout-minutes: 20') + 1, 10)
         self.assertIn(f"actions/cache@{CACHE_SHA}", CI_TEXT)
         self.assertNotIn('actions/cache@v', CI_TEXT)
 
@@ -242,6 +252,47 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn('cargo build --release -p coven-afs --features mount --bins --target ${{ matrix.rust-target }}', job)
         self.assertIn('node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan', job)
         self.assertNotIn('continue-on-error:', job)
+
+    def test_pr_intel_qualifies_exact_head_and_builds_the_packaged_helper(self) -> None:
+        job = ci_job_block('npm-onboarding-pr')
+        self.assertIn("needs.changes.outputs.npm_packaging == 'true'", job)
+        self.assertIn("os: macos-15-intel\n            npm-target: macos-x64\n"
+                      "            rust-target: x86_64-apple-darwin\n            job-timeout: 30", job)
+        self.assertIn("ref: ${{ matrix.npm-target == 'macos-x64' && github.event.pull_request.head.sha || github.sha }}", job)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"', job)
+        self.assertIn('test "$(uname -sm)" = "Darwin x86_64"', job)
+        self.assertIn("if: matrix.npm-target != 'macos-x64'", job)
+        self.assertIn('echo "COVEN_BUILD_VERSION=v$COVEN_NPM_DRY_RUN_VERSION" >> "$GITHUB_ENV"', job)
+        self.assertIn('lipo -archs target/x86_64-apple-darwin/release/coven', job)
+        self.assertIn('cargo build --release -p coven-afs --features mount --bins --target x86_64-apple-darwin', job)
+        self.assertIn('node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build', job)
+        self.assertNotIn('continue-on-error:', job)
+
+    def test_gate_requires_onboarding_when_scheduled(self) -> None:
+        gate = ci_job_block('pr-gate')
+        script = textwrap.dedent(gate.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+        cases = [
+            ('push', 'false', 'skipped', 'success', True),
+            ('push', 'false', 'skipped', 'skipped', False),
+            ('push', 'false', 'skipped', 'failure', False),
+            ('pull_request', 'true', 'success', 'skipped', True),
+            ('pull_request', 'true', 'skipped', 'skipped', False),
+            ('pull_request', 'false', 'skipped', 'skipped', True),
+            ('merge_group', 'true', 'failure', 'skipped', False),
+        ]
+        for event, packaging, pr_result, main_result, accepted in cases:
+            with self.subTest(event=event, packaging=packaging, pr=pr_result, main=main_result):
+                jobs = {name: {'result': 'success'} for name in (
+                    'changes', 'policy-guard', 'automations-protocol-bundle', 'automations-authority-profile-bundle'
+                )}
+                jobs['changes']['outputs'] = {'npm_packaging': packaging}
+                jobs['npm-onboarding-pr'] = {'result': pr_result}
+                jobs['npm-onboarding-main'] = {'result': main_result}
+                result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True,
+                                        env={**os.environ, 'JOB_RESULTS': json.dumps(jobs), 'GITHUB_EVENT_NAME': event})
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                if not accepted:
+                    self.assertIn('PR gate rejected job results: npm-onboarding-', result.stderr)
 
     def test_ci_subscribes_to_merge_group_events(self) -> None:
         # A merge queue raises merge_group events. Without this trigger no

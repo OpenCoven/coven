@@ -9,11 +9,11 @@
 //      --skip-build is passed) and lets `npm publish --dry-run` validate the
 //      platform + wrapper tarballs.
 //      It then applies release authorization's embedded-commit check to the
-//      binary it staged; `--skip-build` outside CI skips this, because a reused
-//      local binary may predate the current commit.
+//      compiled binary. A reused local build (`--skip-build` outside CI) may
+//      predate the checkout, so it skips the identity check.
 //   4. `npm pack`s the native and wrapper packages, installs them into a fresh
-//      temp project, then runs the full hermetic installed-wrapper user
-//      journey through scripts/user-journey-e2e.mjs.
+//      temp project, verifies the installed native executable against the
+//      build identity when checked, then runs the installed-wrapper journey.
 //
 // Flags:
 //   --target=<name>       Override the npm target (macos, macos-x64, linux-x64, windows).
@@ -38,6 +38,7 @@
 // Exit code is non-zero on the first failing step.
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -189,13 +190,13 @@ step(`stage dist via publish-npm.mjs --dry-run --target=${targetName}`, () => {
   }
 });
 
+// Preserve the build identity across staging and the offline tarball install.
+let buildIdentity;
 if (!skipBuild || process.env.CI) {
   step(`native binary embeds this commit (${targetName})`, () => {
     const commit = runCapture('git', ['rev-parse', 'HEAD']).stdout.trim();
     const binary = path.join(repoRoot, 'target', target.rustTarget, 'release', target.binaryName);
-    if (!binaryEmbedsCommit(readFileSync(binary), commit)) {
-      fail(`${binary} does not embed ${commit}, so release authorization would refuse it.`);
-    }
+    buildIdentity = { commit, sha256: verifyNativeBinary(binary, commit) };
   });
 }
 
@@ -226,6 +227,13 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
   run('npm', installArgs, {
     cwd: tempDir
   });
+
+  if (buildIdentity) {
+    const installedBinary = path.join(tempDir, 'node_modules', target.packageName, 'bin', target.binaryName);
+    verifyNativeBinary(installedBinary, buildIdentity.commit, buildIdentity.sha256);
+    const tarballHash = createHash('sha256').update(readFileSync(platformTgz)).digest('hex');
+    console.log(`native tarball ${path.basename(platformTgz)} sha256=${tarballHash}`);
+  }
 
   const wrapperBin = path.join(
     tempDir,
@@ -261,6 +269,19 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
     console.log(`packaged user journey scratch preserved at ${result.scratchRoot}`);
   }
 });
+
+export function verifyNativeBinary(binaryPath, commit, expectedSha256) {
+  const bytes = readFileSync(binaryPath);
+  if (!binaryEmbedsCommit(bytes, commit)) {
+    fail(`${binaryPath} does not embed ${commit}, so release authorization would refuse it.`);
+  }
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  if (expectedSha256 !== undefined && sha256 !== expectedSha256) {
+    fail(`${binaryPath} sha256=${sha256} differs from the build sha256=${expectedSha256}`);
+  }
+  console.log(`${binaryPath} commit=${commit} bytes=${bytes.length} sha256=${sha256}`);
+  return sha256;
+}
 
 export async function main() {
   try {

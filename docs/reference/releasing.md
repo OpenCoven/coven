@@ -604,7 +604,9 @@ If GitHub never assigned a runner (`The job was not acquired by Runner`), there 
 
 The `coven-release-publication-authorization-vX.Y.Z` artifact names each control that failed. Nothing has been published at that point, and a re-run repeats the same decision unless a live control changed. Fix the cause on `main`, then push a new signed tag with a bumped patch number. Leave the refused tag in place, and certify the new commit, because the old packet names a different one.
 
-The `npm onboarding smoke` jobs run the `artifacts.source-commit` check on every native target in main CI, so a binary that would fail it fails the commit's `PR gate` before it can be tagged.
+For packaging-related PRs, Intel onboarding builds the PR head on `macos-15-intel`. Merge-queue runs use the queue commit. On a push to `main`, all four native onboarding jobs must pass. The smoke checks the full commit literal and compares the installed native executable with the built executable by SHA-256. The job log records both identities and the native tarball digest.
+
+Before tagging, require the successful main push run for the intended SHA. The tag workflow builds new binaries with the release version and checks the tagged SHA and version on those artifacts immediately before publication.
 
 ### Dry-run shows a version conflict
 

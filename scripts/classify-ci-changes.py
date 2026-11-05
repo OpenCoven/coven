@@ -57,6 +57,8 @@ def classify(paths: list[str]) -> dict[str, bool]:
             }
         )
         is_npm = is_cargo_metadata or path.startswith('npm/') or path.startswith('crates/coven-cli/') or path in {
+            'scripts/authorize-release-publication.mjs',
+            'scripts/authorize-release-publication.test.mjs',
             'scripts/publish-npm.mjs',
             'scripts/publish-npm-test.mjs',
             'scripts/release-npm-context.mjs',
