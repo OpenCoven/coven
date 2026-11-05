@@ -133,6 +133,8 @@ fn load_or_create_key_pair(path: &Path) -> Result<KeyPair> {
 
 fn load_key_pair(path: &Path) -> Result<KeyPair> {
     validate_private_file(path)?;
+    #[cfg(test)]
+    super::test_io::read(path);
     let pem =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     KeyPair::from_pem(&pem).with_context(|| format!("failed to parse {}", path.display()))
@@ -212,6 +214,8 @@ fn load_stored_certificate(
     expected_fingerprint: [u8; 32],
 ) -> Result<(Vec<u8>, String)> {
     validate_private_file(path)?;
+    #[cfg(test)]
+    super::test_io::read(path);
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let stored: StoredHostIdentity = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;

@@ -652,3 +652,5 @@ fn post_mobile_control_inner(
         .context("mobile pairing control response omitted a body")?;
     Ok((status, body.to_owned()))
 }
+#[cfg(test)]
+mod test_io;

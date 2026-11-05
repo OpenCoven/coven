@@ -96,6 +96,8 @@ impl DeviceRegistryStoreLock {
         }
         // Cancellation stops admission, never interrupts an acquired transaction.
         check()?;
+        #[cfg(test)]
+        super::test_io::lock(path);
         Ok(Self {
             _process: process,
             file,
@@ -944,6 +946,22 @@ impl DeviceRegistry {
             }))
     }
 
+    /// Bounded scheduling projection; callers must refresh it on durable change.
+    pub(in crate::mobile_memory) fn authorization_snapshot(
+        &self,
+    ) -> Result<Vec<DeviceAuthorizationRecord>> {
+        Ok(self
+            .devices
+            .read()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?
+            .iter()
+            .map(|record| DeviceAuthorizationRecord {
+                device: record.device.clone(),
+                grant: record.grant.clone(),
+            })
+            .collect())
+    }
+
     pub fn authorization_key(
         &self,
         device_id: Uuid,
@@ -1190,6 +1208,8 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
         }
     }
+    #[cfg(test)]
+    super::test_io::read(path);
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;
