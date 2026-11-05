@@ -8,6 +8,12 @@ use std::collections::BTreeMap;
 use std::sync::Condvar;
 use std::time::Instant;
 
+mod cache;
+use cache::Cache;
+
+#[cfg(test)]
+mod tests;
+
 const MAX_WORKERS: usize = 32;
 const MANAGER_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECT_BUDGET: Duration = Duration::from_secs(10);
@@ -48,6 +54,9 @@ impl WorkerControl {
         control.1 = Some(cancellation.clone());
         Ok(cancellation)
     }
+    fn cancelled(&self) -> bool {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).0
+    }
     fn cancel(&self) {
         let mut control = self.0.lock().unwrap_or_else(|error| error.into_inner());
         control.0 = true;
@@ -72,6 +81,7 @@ impl Drop for Worker {
     }
 }
 
+#[derive(Debug)]
 struct Retry {
     count: usize,
     after: Instant,
@@ -108,14 +118,43 @@ impl Drop for RelayHandle {
     }
 }
 
-fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Stop>) {
-    let mut workers: BTreeMap<Uuid, Worker> = BTreeMap::new();
-    let mut retries: BTreeMap<Uuid, Retry> = BTreeMap::new();
-    let mut configuration = None;
-    let mut endpoints: Vec<Arc<websocket::RelayEndpoint>> = Vec::new();
-    let mut cursor = 0_usize;
-    while !stop.requested.load(Ordering::Acquire) {
-        let finished: Vec<_> = workers
+#[derive(Default)]
+struct Manager {
+    workers: BTreeMap<Uuid, Worker>,
+    retries: BTreeMap<Uuid, Retry>,
+    configuration: Option<storage::RelayConfig>,
+    endpoints: Vec<Arc<websocket::RelayEndpoint>>,
+    identity: Cache<bool>,
+    registry: Cache<Vec<super::super::registry::DeviceAuthorizationRecord>>,
+    cursor: usize,
+}
+
+impl Retry {
+    fn failed(retries: &mut BTreeMap<Uuid, Self>, id: Uuid, recovered: bool, now: Instant) {
+        let retry = retries.entry(id).or_insert(Self {
+            count: 0,
+            after: now,
+        });
+        retry.count = if recovered {
+            0
+        } else {
+            retry.count.saturating_add(1)
+        };
+        let seconds = (1_u64 << retry.count.min(5)).min(30);
+        retry.after = now + Duration::from_secs(seconds) + retry_jitter();
+    }
+}
+
+impl Manager {
+    fn tick(
+        &mut self,
+        state: &Arc<MobileGatewayState>,
+        signer: &Arc<SigningKey>,
+        stop: &Stop,
+        now: Instant,
+    ) {
+        let finished: Vec<_> = self
+            .workers
             .iter()
             .filter(|(_, worker)| {
                 worker
@@ -125,32 +164,16 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
             })
             .map(|(id, _)| *id)
             .collect();
-        for id in finished {
-            let worker = workers.remove(&id).expect("worker exists");
-            let authenticated = worker.authenticated.load(Ordering::Acquire);
-            drop(worker);
-            let retry = retries.entry(id).or_insert(Retry {
-                count: 0,
-                after: Instant::now(),
-            });
-            retry.count = if authenticated {
-                0
-            } else {
-                retry.count.saturating_add(1)
-            };
-            let seconds = (1_u64 << retry.count.min(5)).min(30);
-            let jitter = retry_jitter();
-            retry.after = Instant::now() + Duration::from_secs(seconds) + jitter;
-        }
+        let worker_event = !finished.is_empty();
         let next = storage::RelayConfig::load(&state.coven_home)
             .ok()
             .flatten()
             .filter(|config| config.enabled);
-        if next != configuration {
-            for worker in workers.values() {
+        if next != self.configuration {
+            for worker in self.workers.values() {
                 worker.control.cancel();
             }
-            endpoints = next
+            self.endpoints = next
                 .as_ref()
                 .map(|config| {
                     config
@@ -163,59 +186,99 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            configuration = next;
-            retries.clear();
+            self.configuration = next;
+            // Configuration changes must not erase a policy failure's history.
         }
-        let identity_matches =
-            super::super::identity::load_existing_host_identity(&state.coven_home)
-                .is_ok_and(|identity| identity.public_key_fingerprint == state.host_fingerprint);
-        let devices = state
-            .registry
-            .reload()
-            .and_then(|()| state.registry.list_status());
-        if endpoints.is_empty() || !identity_matches || devices.is_err() {
-            for worker in workers.values() {
+        self.identity.refresh(
+            &state.coven_home,
+            &["host-key.pem", "host-identity.json"],
+            worker_event,
+            || {
+                super::super::identity::load_existing_host_identity(&state.coven_home)
+                    .map(|identity| identity.public_key_fingerprint == state.host_fingerprint)
+            },
+        );
+        self.registry.refresh(
+            &state.coven_home,
+            &[super::super::registry::DEVICES_FILE],
+            worker_event,
+            || {
+                state.registry.reload()?;
+                state.registry.authorization_snapshot()
+            },
+        );
+        for id in finished {
+            let worker = self.workers.remove(&id).expect("worker exists");
+            // Read cancellation before Drop cancels the control for cleanup.
+            // Authentication from an earlier policy generation is not recovery.
+            let recovered = worker.authenticated.load(Ordering::Acquire)
+                && !worker.control.cancelled()
+                && self.identity.value == Some(true)
+                && self.registry.value.as_ref().is_some_and(|records| {
+                    records
+                        .iter()
+                        .find(|record| record.device.id == id)
+                        .is_some_and(|record| {
+                            authority::check_record(record, &worker.pairing, false, Utc::now())
+                                .is_ok()
+                        })
+                });
+            drop(worker);
+            Retry::failed(&mut self.retries, id, recovered, now);
+        }
+        let Some(devices) = self.registry.value.as_ref() else {
+            for worker in self.workers.values() {
                 worker.control.cancel();
             }
-            stop.wait();
-            continue;
+            return;
+        };
+        self.retries
+            .retain(|id, _| devices.iter().any(|record| record.device.id == *id));
+        if self.endpoints.is_empty() || self.identity.value != Some(true) {
+            for worker in self.workers.values() {
+                worker.control.cancel();
+            }
+            return;
         }
-        for worker in workers.values() {
-            if authority::check_current(&state.registry, &worker.pairing, false, Utc::now())
-                .is_err()
-            {
+        for (id, worker) in &self.workers {
+            let valid = devices
+                .iter()
+                .find(|record| record.device.id == *id)
+                .is_some_and(|record| {
+                    authority::check_record(record, &worker.pairing, false, Utc::now()).is_ok()
+                });
+            if !valid {
                 worker.control.cancel();
             }
         }
-        let devices = devices.unwrap_or_default();
-        retries.retain(|id, _| devices.iter().any(|device| device.id == *id));
         for offset in 0..devices.len() {
-            if workers.len() >= MAX_WORKERS || stop.requested.load(Ordering::Acquire) {
+            if self.workers.len() >= MAX_WORKERS || stop.requested.load(Ordering::Acquire) {
                 break;
             }
-            let device = &devices[cursor.wrapping_add(offset) % devices.len()];
-            if workers.contains_key(&device.id)
-                || retries
-                    .get(&device.id)
-                    .is_some_and(|retry| retry.after > Instant::now())
+            let record = &devices[self.cursor.wrapping_add(offset) % devices.len()];
+            let id = record.device.id;
+            if self.workers.contains_key(&id)
+                || self.retries.get(&id).is_some_and(|retry| retry.after > now)
             {
                 continue;
             }
-            let material = match storage::load_existing(
+            let material = match storage::load_existing_for_record(
                 &state.coven_home,
-                &state.registry,
                 signer.verifying_key(),
-                device.id,
+                record,
             ) {
                 Ok(Some(material)) => material,
-                _ => continue,
+                _ => {
+                    Retry::failed(&mut self.retries, id, false, now);
+                    continue;
+                }
             };
-            let attempt = retries.get(&device.id).map_or(0, |retry| retry.count);
-            let endpoint = Arc::clone(&endpoints[attempt % endpoints.len()]);
+            let attempt = self.retries.get(&id).map_or(0, |retry| retry.count);
+            let endpoint = Arc::clone(&self.endpoints[attempt % self.endpoints.len()]);
             let control = Arc::new(WorkerControl::default());
             let authenticated = Arc::new(AtomicBool::new(false));
-            let worker_state = Arc::clone(&state);
-            let worker_signer = Arc::clone(&signer);
+            let worker_state = Arc::clone(state);
+            let worker_signer = Arc::clone(signer);
             let worker_control = Arc::clone(&control);
             let worker_authenticated = Arc::clone(&authenticated);
             let pairing = material.pairing.clone();
@@ -233,8 +296,8 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
                 });
             match spawned {
                 Ok(thread) => {
-                    workers.insert(
-                        device.id,
+                    self.workers.insert(
+                        id,
                         Worker {
                             control,
                             authenticated,
@@ -243,24 +306,23 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
                         },
                     );
                 }
-                Err(_) => {
-                    retries.insert(
-                        device.id,
-                        Retry {
-                            count: attempt.saturating_add(1),
-                            after: Instant::now() + Duration::from_secs(30),
-                        },
-                    );
-                }
+                Err(_) => Retry::failed(&mut self.retries, id, false, now),
             }
         }
-        cursor = cursor.wrapping_add(1);
+        self.cursor = self.cursor.wrapping_add(1);
+    }
+}
+
+fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Stop>) {
+    let mut manager = Manager::default();
+    while !stop.requested.load(Ordering::Acquire) {
+        manager.tick(&state, &signer, &stop, Instant::now());
         stop.wait();
     }
-    for worker in workers.values() {
+    for worker in manager.workers.values() {
         worker.control.cancel();
     }
-    drop(workers);
+    drop(manager);
 }
 
 fn retry_jitter() -> Duration {

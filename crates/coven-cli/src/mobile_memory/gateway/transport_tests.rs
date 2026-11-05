@@ -11,14 +11,14 @@ use p256::{
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
-struct Fixture {
-    _home: tempfile::TempDir,
-    state: MobileGatewayState,
+pub(super) struct Fixture {
+    pub(super) _home: tempfile::TempDir,
+    pub(super) state: MobileGatewayState,
     device: SigningKey,
-    pairing: Pairing,
+    pub(super) pairing: Pairing,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
         Self::with_home(home)
     }

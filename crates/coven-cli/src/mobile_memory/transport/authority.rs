@@ -4,7 +4,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 
 use super::Pairing;
-use crate::mobile_memory::{grant::GrantTransportConstraint, registry::DeviceRegistry};
+use crate::mobile_memory::{
+    grant::GrantTransportConstraint,
+    registry::{DeviceAuthorizationRecord, DeviceRegistry},
+};
 
 /// This establishes possession-level channel admission only. It does not assert
 /// user verification or authorize an application action; the existing request
@@ -19,6 +22,18 @@ pub fn check_current(
     let current = registry
         .authorization_record(pairing.device_id)?
         .context("device unavailable")?;
+    check_record(&current, pairing, direct, now)
+}
+
+/// Scheduling-only check against the manager's change-aware snapshot. Channel
+/// admission and signed requests must continue to use durable current state.
+pub(in crate::mobile_memory) fn check_record(
+    current: &DeviceAuthorizationRecord,
+    pairing: &Pairing,
+    direct: bool,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    ensure!(current.device.id == pairing.device_id, "device changed");
     ensure!(
         current.device.revoked_at.is_none() && current.device.suspended_at.is_none(),
         "device unavailable"

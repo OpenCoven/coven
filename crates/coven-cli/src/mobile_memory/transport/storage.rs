@@ -321,6 +321,28 @@ pub fn load_existing(
     host: &VerifyingKey,
     device_id: Uuid,
 ) -> Result<Option<Material>> {
+    load_existing_checked(home, host, device_id, |pairing| {
+        authority::check_current(registry, pairing, false, Utc::now())
+    })
+}
+
+/// Scheduling only: the worker still reloads authority during channel admission.
+pub(in crate::mobile_memory) fn load_existing_for_record(
+    home: &Path,
+    host: &VerifyingKey,
+    record: &crate::mobile_memory::registry::DeviceAuthorizationRecord,
+) -> Result<Option<Material>> {
+    load_existing_checked(home, host, record.device.id, |pairing| {
+        authority::check_record(record, pairing, false, Utc::now())
+    })
+}
+
+fn load_existing_checked(
+    home: &Path,
+    host: &VerifyingKey,
+    device_id: Uuid,
+    check: impl FnOnce(&Pairing) -> Result<()>,
+) -> Result<Option<Material>> {
     let directory = home.join("mobile");
     validate_private_directory(&directory)?;
     let path = directory.join(format!("transport-{device_id}.json"));
@@ -349,12 +371,14 @@ pub fn load_existing(
         noise_private: Zeroizing::new(stored.noise_private.clone()),
         routing_seed: Zeroizing::new(stored.routing_seed),
     };
-    authority::check_current(registry, &material.pairing, false, Utc::now())?;
+    check(&material.pairing)?;
     Ok(Some(material))
 }
 
 fn read_private(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     validate_private_file(path)?;
+    #[cfg(test)]
+    super::super::test_io::read(path);
     let mut bytes = Zeroizing::new(Vec::new());
     fs::File::open(path)?
         .take(MAX_STATE_BYTES + 1)
