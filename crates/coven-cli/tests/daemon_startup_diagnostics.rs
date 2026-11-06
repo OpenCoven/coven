@@ -289,6 +289,70 @@ fn exercise_startup_with(
     Ok(())
 }
 
+/// A real daemon start removes the launch folder a crash left behind, keeps one
+/// it can't positively identify, and logs only counts (#1607). The temporary
+/// folder is this test's own, through `TMPDIR`.
+#[cfg(unix)]
+#[test]
+fn a_starting_daemon_removes_the_launch_folder_a_crash_left() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::Builder::new()
+        .prefix("coven-reap-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path().canonicalize()?;
+    let home = root.join("coven");
+    for directory in [&home, &root.join("user"), &root.join("tmp")] {
+        fs::create_dir(directory)?;
+    }
+    let digest: String = Sha256::digest(home.as_os_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let prefix = format!("coven-launch-{}-", &digest[..16]);
+    let crashed = root.join("tmp").join(format!("{prefix}crashed"));
+    let unmarked = root.join("tmp").join(format!("{prefix}unmarked"));
+    for folder in [&crashed, &unmarked] {
+        fs::create_dir_all(folder.join("home"))?;
+        fs::write(folder.join("home/transcript.jsonl"), "synthetic")?;
+        fs::set_permissions(folder, fs::Permissions::from_mode(0o700))?;
+    }
+    fs::write(
+        crashed.join(".coven-launch"),
+        format!("coven-scoped-launch/1\n{digest}\n"),
+    )?;
+
+    let _daemon = OwnedChild(command(&root, &["daemon", "serve"]).spawn()?);
+
+    // A harness hang guard, not a startup-performance assertion.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let log_path = home.join("daemon-recovery.log");
+    let log = loop {
+        let log = read_bounded(&log_path).unwrap_or_default();
+        if log.contains("scoped launch folders:") {
+            break log;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the daemon logged no launch-folder sweep"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    assert!(
+        log.contains(
+            "scoped launch folders: removed=1 live=0 unattributed=1 incomplete=0 failed=0"
+        ),
+        "{log}"
+    );
+    assert!(!crashed.exists());
+    assert!(unmarked.join("home/transcript.jsonl").exists());
+    assert!(!log.contains(&prefix), "{log}");
+    Ok(())
+}
+
 #[test]
 fn native_startup_checkpoints_cover_initialization_through_authenticated_serving() -> Result<()> {
     exercise_startup(false, false)

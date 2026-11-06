@@ -3101,6 +3101,24 @@ pub(crate) fn recover_stale_scoped_read_channels(coven_home: &Path) {
     }
 }
 
+/// Remove the scoped launch folders a previous daemon left in the system's
+/// temporary folder (#1607). Each can hold the harness's transcripts. Only a
+/// folder positively identified as this home's, with no live owner, is
+/// removed, within a bounded budget; anything else is retained and counted.
+/// Never fatal to startup.
+#[cfg(unix)]
+pub(crate) fn recover_stale_scoped_launch_folders(coven_home: &Path) {
+    use crate::automations::scoped_read::launch_reaper;
+    match launch_reaper::reap_stale(coven_home) {
+        Ok(report) if report.is_quiet() => {}
+        Ok(report) => append_daemon_recovery_log(coven_home, &report.to_string()),
+        Err(error) => append_daemon_recovery_log(
+            coven_home,
+            &format!("could not sweep stale scoped launch folders: {error:#}"),
+        ),
+    }
+}
+
 /// Unmount AFS mounts whose owning daemon is gone (DESIGN.md §7).
 ///
 /// Never fatal to startup. A mount we cannot reclaim is a stale mount point,
@@ -6326,6 +6344,7 @@ pub fn serve_forever(
     recover_orphaned_afs_mounts(coven_home);
     startup.append(coven_home, StartupCheckpoint::AfsRecoveryEnd);
     recover_stale_scoped_read_channels(coven_home);
+    recover_stale_scoped_launch_folders(coven_home);
     let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
         coven_home.to_path_buf(),
     )?);
