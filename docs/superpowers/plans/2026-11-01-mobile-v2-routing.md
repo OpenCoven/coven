@@ -352,3 +352,26 @@ On that rebased tree, on a host where OS user lookup works, every required local
 The first full-gate run on the signed commit failed one test, `authenticated_endpoint_process_races` (4932 passed, 1 failed): a host child reported `unexpected relay record` after it had committed. The test passes in isolation. Under eight parallel copies, 12 of 32 runs failed. Instrumentation showed the host reading the relay's `1001 relay peer disconnected` close where it expected `device-finished-v2`. The relay's connection loop handles a peer disconnect ahead of queued records (`crates/coven-relay/src/ws.rs`, biased select), and the test's device clients dropped their channel immediately after sending the completion. As a result, the advisory completion could be discarded after the durable commit. The device clients now hold the authenticated channel until their host child records its result, as a device keeps its session open. Each wait uses the same 30-second hang guard as the other barriers, and the race assertions and durable-floor checks are unchanged. Completion loss stays covered by its own enumerated cases. After the fix, 96 of 96 parallel runs pass (32 at width 8, 64 at width 16). The relay ordering itself is pre-existing and unchanged here.
 
 Still open: owner dispositions on #1526 for the measured W=4 availability edges (comments 6563111842 and 6566251969) and burned pending generations (6563776232), with the channel-profile validity gaps recorded in the transport README; protected CI and queue delivery; and the exact landed tree. No window, equation or primitive was changed.
+
+## 2026-11-06 owner dispositions and follow-ups
+
+Draft PR #1677 (head `ed31b981`) passed hosted CI run 42220435899: 20 checks passed and 11 were skipped by change classification. The owner then dispositioned every open review item on #1526 (comment 6688535435). The decisions:
+- the W=4 edge is an accepted direct-recovery availability limit;
+- burned pending generations are accepted as implemented;
+- server-side validity enforcement is accepted;
+- the key/grant-epoch generation composition is accepted.
+
+No window, equation, signed byte, certificate or primitive changed. The remaining evidence gaps moved to follow-up issues under #787:
+
+| Gap | Issue |
+| --- | --- |
+| Real power loss | #1679 |
+| Interrupted multi-file restore | #1680 |
+| Mixed-dependency restore with owner policy | #1681 |
+| Windows and physical-device acceptance | #1682 |
+| Adversarial v2 deadline evidence | #1683 |
+| Integrated v2 journeys | #1684 |
+| Pre-anchor provisioning and signed HTTPS loss | #1685 |
+| Revocation during physical transmission | #1686 |
+
+The transport README and the contract record these dispositions and references. #1645 and #1644 close after protected merge of #1677 and the landed tree is recorded.

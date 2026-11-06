@@ -4,7 +4,7 @@ source_adjacent_reason: "Defines the endpoint contract for the Rust mobile gatew
 
 # Returning-device transport contract
 
-Status: **approved by Val to proceed with implementation and validation on 2026-10-22; the outbound relay client shipped in [#1551](https://github.com/OpenCoven/coven/pull/1551) on 2026-10-28; the wire profile and [v2 routing](#v2-routing-accepted-2026-10-30) were accepted by owner review (BunsDev, sole maintainer) on 2026-10-30 on [#1526](https://github.com/OpenCoven/coven/issues/1526); no independent third-party review has been performed, and v2 is not yet implemented**.
+Status: **approved by Val to proceed with implementation and validation on 2026-10-22; the outbound relay client shipped in [#1551](https://github.com/OpenCoven/coven/pull/1551) on 2026-10-28; the wire profile and [v2 routing](#v2-routing-accepted-2026-10-30) were accepted by owner review (BunsDev, sole maintainer) on 2026-10-30 on [#1526](https://github.com/OpenCoven/coven/issues/1526); no independent third-party review has been performed; v2 routing is implemented by #1645 ([#1677](https://github.com/OpenCoven/coven/pull/1677)), with the owner's 2026-11-06 dispositions of its review items [recorded on #1526](https://github.com/OpenCoven/coven/issues/1526#issuecomment-6688535435)**.
 
 Approval: [recorded on #1526](https://github.com/OpenCoven/coven/issues/1526#issuecomment-6349914514). The approval covers this contract direction and operator-configured endpoint policy. It is not evidence of cryptographic correctness, passing acceptance tests, or hosted deployment authorization.
 
@@ -14,7 +14,7 @@ Parent: [#787](https://github.com/OpenCoven/coven/issues/787). Read with [pairin
 
 `coven-relay` implements bounded opaque WebSocket forwarding. It does not authenticate application peers or encrypt their payloads. Its room credential controls routing only. `identity.rs` persists a P-256 host key and derives its fingerprint from the uncompressed public key, not the certificate bytes. `auth.rs` verifies signed requests and rechecks current registry/grant state before releasing a response. These remain authoritative.
 
-Since #1551, `mobile_memory/transport/` implements the candidate channel below as `Noise_NK_25519_ChaChaPoly_SHA256` with the P-256 binding, `transport/storage.rs` holds the private relay configuration and pairwise material, and `gateway/relay_runtime.rs` runs daemon-owned outbound workers. The shipped rendezvous is the v1 derivation: one room and credential per pairing, transport and 600-second slot of the host clock, with no clock-skew window, consumed-room tracking or offline recovery; a peer in another slot is never paired and recovers by rejoining the current slot. An authenticated relay channel is held while idle: the host pings the relay after 30 seconds without an inbound frame, fails the channel if nothing arrives within 10 more seconds, and otherwise waits for the next request without re-authenticating ([#1609](https://github.com/OpenCoven/coven/issues/1609)); mid-request I/O keeps the 15-second budget. The shipped behavior and its evidence are described in [`transport/README.md`](../../crates/coven-cli/src/mobile_memory/transport/README.md); the routing construction that replaces the v1 slots is [v2 routing](#v2-routing-accepted-2026-10-30), accepted on #1526 and not yet implemented.
+Since #1551, `mobile_memory/transport/` implements the candidate channel below as `Noise_NK_25519_ChaChaPoly_SHA256` with the P-256 binding, `transport/storage.rs` holds the private relay configuration and pairwise material, and `gateway/relay_runtime.rs` runs daemon-owned outbound workers. The v1 rendezvous, still used by pairings that have not completed a v2 handover, derives one room and credential per pairing, transport and 600-second slot of the host clock, with no clock-skew window, consumed-room tracking or offline recovery; a peer in another slot is never paired and recovers by rejoining the current slot. An authenticated relay channel is held while idle: the host pings the relay after 30 seconds without an inbound frame, fails the channel if nothing arrives within 10 more seconds, and otherwise waits for the next request without re-authenticating ([#1609](https://github.com/OpenCoven/coven/issues/1609)); mid-request I/O keeps the 15-second budget. The shipped behavior and its evidence are described in [`transport/README.md`](../../crates/coven-cli/src/mobile_memory/transport/README.md); the routing construction that replaces the v1 slots is [v2 routing](#v2-routing-accepted-2026-10-30), accepted on #1526 and implemented by #1645. The relay runtime serves v2 counter rooms for pairings with v2 state and refuses v1 material once a pairing's v2 protocol floor exists.
 
 The protocol architecture specifies Noise/X25519 but the existing mobile keys are P-256. Do not reinterpret, convert, replace, or silently rotate existing identity keys to fit a transport library. A reviewed binding is required.
 
@@ -137,6 +137,24 @@ These items are conditions on the implementation. Without them the decision does
 - **Channel profile:** a field-for-field mapping of the current binding and prologue to the trust-domain, fingerprint, generation, validity and role requirements in [the candidate channel](#candidate-channel-for-security-review). The v2 host-proof binding changes signed bytes, so it needs review even though the Noise primitives are unchanged.
 
 The decision comment on #1526 records the reviewer, the scope, the merged SHA of this file, the fixture identity it was reviewed against, and any unresolved conditions. The fixture identity is the v1 `wire.json`, blob `9f81e440`, which has no version field. The follow-up implementation issue records the implementation tree, the versioned v2 fixtures and their hashes, and the evidence above. Any divergence from this section goes back to the contract issue; it is not fixed in code.
+
+### Owner dispositions (2026-11-06)
+
+The owner (BunsDev, sole maintainer) dispositioned the review items raised by the #1645 implementation [on #1526](https://github.com/OpenCoven/coven/issues/1526#issuecomment-6688535435). This is an owner review, not an independent third-party review. None of these decisions changes a value or equation in this section.
+
+- **`W = 4` availability limit.** Three device-only advances can be followed by a fourth attempt that commits, whether that attempt's completion is lost or delivered. Either way, the device is left at `c = d = 4, f = 0`, and its pre-connect check `d − f < W` refuses further remote attempts. Direct `max(c, d)` resync is then required. This is accepted as a direct-recovery availability limit. The window and equations are unchanged, and the "successful fourth attempt" and lost-completion statements above are read subject to it.
+- **Burned pending generations.** A grant, key or epoch change permanently burns a pending generation offered under the old authority. The replacement advances beyond the highest offered generation with fresh material. A device may skip a burned generation only on a strictly higher authenticated direct handover. This treatment is accepted.
+- **Channel-profile validity.** Grant validity, suspension and revocation are enforced server-side by `authority::check_current` at every admission and request. Accepted; validity is not added to the signed bytes.
+- **Channel-profile key generation.** The exact host, device and Noise keys plus the grant UUID and epoch bind each Noise key, and rotation forces a `g + 1` handover. This composition is accepted as the generation binding.
+- **Remaining evidence.** The following gaps are tracked as follow-ups under #787 and do not block #1645:
+  - real power loss: #1679
+  - interrupted multi-file restore: #1680
+  - mixed-dependency restore: #1681
+  - Windows and physical devices: #1682
+  - adversarial deadline evidence: #1683
+  - integrated journeys: #1684
+  - pre-anchor provisioning and HTTPS loss: #1685
+  - revocation during transmission: #1686
 
 ## Connection state, LAN and privacy
 
