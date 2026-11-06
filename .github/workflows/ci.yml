@@ -453,14 +453,28 @@ jobs:
   # all -- only AFS mount coverage -- so that leg of the release reliability gate
   # depended on an operator remembering to run it locally.
   rust-test-macos:
-    name: Rust tests (macOS)
+    name: Rust tests (macOS, ${{ matrix.shard }})
     needs: changes
     if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}
     runs-on: macos-26
-    # The workspace plus the Threads journeys now finish at about 20 minutes on
-    # macos-26, so a 20-minute limit cancelled the job after its last suite
-    # passed and failed the PR gate on every main push from f772b513 to 84066d2b.
+    # 30 minutes is a hang guard, not a measured budget. The unsplit workspace
+    # plus Threads job outgrew it: main pushes 34a60ab5 and 3058b30b were
+    # cancelled at the limit (#1687), with the workspace step alone at
+    # 1,088-1,399 s. The workspace is split with the Windows predicate below and
+    # the Threads feature build moved to `threads-test-macos`, so each job keeps
+    # the same guard with headroom and the same tests run exactly once.
     timeout-minutes: 30
+    # Same predicate as `rust-test-windows`: `named` runs every test whose name
+    # contains a token and `rest` skips exactly those. `fail-fast: false` keeps
+    # one shard's failure from cancelling the other's evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: named
+            test-args: 'automations:: api::tests::threads'
+          - shard: rest
+            test-args: '--skip automations:: --skip api::tests::threads'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -480,10 +494,37 @@ jobs:
       # one flaky target hides every target ordered after it -- the Seatbelt
       # conformance suite in `coven-restricted-runtime-macos` had never once
       # executed in CI, because runs kept dying earlier in `coven-client`.
-      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo test --workspace --locked --no-fail-fast -- ${{ matrix.test-args }}
+
+  # The Threads feature build is a second build profile; like
+  # `threads-test-windows`, it runs in its own job so the workspace shards
+  # cannot consume its budget (#1687). Push-only for the same billing reason as
+  # `rust-test-macos`.
+  threads-test-macos:
+    name: Threads daemon tests (macOS)
+    needs: changes
+    if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
       - name: Exercise isolated Threads clock feature
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
       - name: Exercise real-daemon Threads journeys
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock --test threads_identity_invariants --test threads_protected_intake --test threads_terminal_recovery --no-fail-fast
 
   # `rust-test-macos` runs the whole workspace but only on `push`, because
@@ -944,6 +985,7 @@ jobs:
       - rust-test-windows
       - threads-test-windows
       - rust-test-macos
+      - threads-test-macos
       - restricted-runtime-macos
       - afs-mount-linux
       - afs-mount-macos
