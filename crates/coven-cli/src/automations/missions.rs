@@ -13,15 +13,30 @@
 //!
 //! A submit may name `scopes`: profile filesystem read scopes on the project
 //! root (#1597). They are validated by the scoped read service's own rules,
-//! stored canonically on the mission row and returned by its view. Nothing
-//! reads them yet.
+//! stored canonically on the mission row and returned by its view. They reach
+//! the launch only through that row, which the request digest binds: the
+//! trusted adapter reads them from it ([`dispatch_grant`]), never from a stored
+//! definition, and the scoped read service enforces them.
 //!
-//! M0 launches nothing. The only dispatch path launches with ambient
-//! authority, and Runtime Authority, which would hold the run to the R0 read
-//! envelope, is not constructed yet (#857). So once the submit has committed,
-//! the mission's occurrence settles failed with
-//! [`AUTHORITY_UNAVAILABLE_REASON`], which the mission view reports as
-//! `unavailable`.
+//! A mission names the scoped read envelope, `r0-read.2` (#857). Once the
+//! submit has committed, [`launch_mission`] launches its one attempt, at most
+//! once: a replay finds the mission already decided and launches nothing.
+//! Before anything is decided it settles the mission without a launch when
+//! `validUntil` has passed, when the familiar revision is no longer the root's
+//! active head, or when the runtime cannot launch the envelope (the
+//! decision-free preflight: authority projections, an admitted harness
+//! version, the owner's key, a socket path that fits). Otherwise the runner
+//! dispatches the occurrence under Runtime Authority, through the trusted
+//! adapter, whose grant is this mission's submit, and the daemon launches it
+//! under the store gate. The run settles from its signed terminal evidence,
+//! like any Runtime Authority run, and the view's result reports what that
+//! evidence and the harness's result event say, never an estimate. A run that
+//! may or may not have done something is never terminal: a run the daemon
+//! stopped after a revocation stays `reconciling` until recovery settles it.
+//!
+//! None of this certifies containment: Runtime Authority stays unadvertised
+//! in the capability catalog, and the mission envelope list is the only thing
+//! a client learns about it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,14 +46,15 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
 use super::cancel_commands::{
-    execute_occurrence_cancel, CancelExecution, OCCURRENCE_CANCEL_ACTION,
+    execute_mission_occurrence_cancel, CancelExecution, OCCURRENCE_CANCEL_ACTION,
 };
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{AdoptionConflictOutcome, ErrorAdoption, ErrorCode, ErrorEnvelope};
 use super::contract::types::{AdoptionKey, MissionCancelPayload, MissionId, MissionSubmitPayload};
+use super::definition::{RoutineAuthority, RoutineDefinition, RoutineRiskClass};
 use super::occurrences::{insert_claimed_occurrence, settle_occurrence};
-use super::owner_grants::CommandAuthority;
-use super::runtime_envelope::CLAUDE_R0_READ;
+use super::owner_grants::{CommandAuthority, OwnerGrant};
+use super::runtime_envelope::{RuntimeEnvelope, CLAUDE_R0_SCOPED_READ};
 use super::scoped_read::scope::Grants;
 use super::scoped_read::R0_READ_POLICY;
 use crate::api::SessionRuntime;
@@ -51,14 +67,37 @@ const CANCEL_COMMAND: &str = "mission.cancel.v1";
 /// Prefix of the `occurrence.cancel.v1` key a mission cancel derives. The view
 /// reads the mission's cancellation back from that adoption.
 const CANCELLATION_KEY_PREFIX: &str = "mc:";
+/// Prefix of the `occurrence.cancel.v1` key the daemon derives to stop a
+/// running mission whose familiar revision was revoked or retired.
+const REVOCATION_KEY_PREFIX: &str = "mr:";
+/// The key prefixes only the mission layer may cancel under, because the
+/// view reads its cancellation and its revocation stop back from them.
+pub(crate) const RESERVED_CANCEL_KEY_PREFIXES: [&str; 2] =
+    [CANCELLATION_KEY_PREFIX, REVOCATION_KEY_PREFIX];
 /// Dispatch must begin before `validUntil`, at most this long after the request.
 const MAX_VALIDITY_MINUTES: i64 = 15;
-/// The failure reason that marks a mission refused for want of Runtime
-/// Authority. The mission view projects it to `unavailable`.
+/// The one envelope a mission may name and launch under.
+const MISSION_ENVELOPE: &RuntimeEnvelope = &CLAUDE_R0_SCOPED_READ;
+/// The owner authorization operation a mission's attempt presents.
+pub(crate) const MISSION_DISPATCH_OPERATION: &str = "automation.dispatch.mission";
+/// The failure reason that marks a mission refused because this daemon could
+/// not launch it under Runtime Authority: the preflight's own reason follows
+/// it. The mission view projects it to `unavailable`.
 pub(crate) const AUTHORITY_UNAVAILABLE_REASON: &str =
     "mission not launched: runtime authority is not available on this daemon";
 /// The scheduler's reason for a claim whose lease ran out before dispatch.
 const LEASE_EXPIRED_REASON: &str = "lease expired";
+/// `validUntil` passed before the launch began.
+const EXPIRED_BEFORE_DISPATCH_REASON: &str =
+    "mission not launched: validUntil passed before dispatch began";
+/// The submitted familiar revision was revoked before the launch.
+const REVISION_REVOKED_REASON: &str =
+    "mission not launched: the familiar revision it names was revoked or retired";
+/// The submitted familiar revision was superseded before the launch.
+const REVISION_STALE_REASON: &str =
+    "mission not launched: the familiar revision it names is no longer the active one";
+/// The most bytes a mission's report may hold (the schema's maximum).
+const MAX_REPORT_BYTES: usize = 262_144;
 /// The most filesystem scopes one mission may name (the schema's `maxItems`).
 pub(crate) const MAX_MISSION_SCOPES: usize = 32;
 
@@ -76,13 +115,45 @@ pub fn mission_id_for(adoption_key: &str) -> String {
     format!("mission-{}", &sha256_hex(adoption_key.as_bytes())[..32])
 }
 
-/// Executes one `mission.submit.v1` request at `now`. The body is the flat
-/// action: `action`, `adoptionKey` and the payload's fields.
+/// Executes one `mission.submit.v1` request at `now`, and launches the mission
+/// it commits on `runtime`. The body is the flat action: `action`,
+/// `adoptionKey` and the payload's fields.
 pub fn execute_mission_submit(
     conn: &Connection,
+    runtime: &dyn SessionRuntime,
     authority: CommandAuthority,
     body: Value,
     now: DateTime<Utc>,
+) -> Result<MissionExecution, String> {
+    // The launch reads the wall clock, so `validUntil` passing while the
+    // daemon works on it is seen.
+    execute_mission_submit_with_clock(conn, runtime, authority, body, now, &mut || {
+        Utc::now().max(now)
+    })
+}
+
+/// [`execute_mission_submit`], with the launch beginning at `launch_at`
+/// rather than as the submit commits, and its clock standing there: a daemon
+/// whose dispatch is busy begins it later than that.
+pub(crate) fn execute_mission_submit_launching_at(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    authority: CommandAuthority,
+    body: Value,
+    now: DateTime<Utc>,
+    launch_at: DateTime<Utc>,
+) -> Result<MissionExecution, String> {
+    execute_mission_submit_with_clock(conn, runtime, authority, body, now, &mut || launch_at)
+}
+
+/// [`execute_mission_submit`], committing at `now` and launching on `clock`.
+pub(crate) fn execute_mission_submit_with_clock(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    authority: CommandAuthority,
+    body: Value,
+    now: DateTime<Utc>,
+    clock: &mut dyn FnMut() -> DateTime<Utc>,
 ) -> Result<MissionExecution, String> {
     let (adoption_key, payload, digest) = match owner_request(authority, &body, SUBMIT_COMMAND)? {
         Ok(request) => request,
@@ -120,22 +191,283 @@ pub fn execute_mission_submit(
         Err(error) => return Ok(MissionExecution::Rejected(error)),
     };
 
-    // M0: nothing launches without Runtime Authority (see the module docs).
-    // The answer is the state at commit; mission.get reports the settlement.
-    let occurrence_id = result["occurrenceId"]
-        .as_str()
-        .ok_or("committed mission has no occurrence")?;
-    settle_occurrence(
-        conn,
-        occurrence_id,
-        "failed",
-        Some(AUTHORITY_UNAVAILABLE_REASON),
-        now,
-    )?;
+    // Only the commit that created the mission launches it; a replay returned
+    // above. The answer is the state at commit, and mission.get reports what
+    // the launch did.
+    launch_mission(conn, runtime, &mission_id_for(&adoption_key), clock)?;
     Ok(MissionExecution::Success {
         payload: result,
         replayed: false,
     })
+}
+
+/// Launches `mission_id`'s one attempt at `now`, if its occurrence still
+/// waits for it: claimed for this mission, with no run. Anything else was
+/// already decided, so this does nothing, and calling it again never launches
+/// twice.
+///
+/// What needs no decision is checked first, so a refusal here records none:
+/// `validUntil`, then the familiar revision, then the runtime's preflight. A
+/// refusal settles the occurrence failed with a reason the view projects.
+/// What the dispatch itself does, a launch or a refusal, is recorded on the
+/// occurrence and its run.
+pub(crate) fn launch_mission(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    mission_id: &str,
+    clock: &mut dyn FnMut() -> DateTime<Utc>,
+) -> Result<(), String> {
+    let Some(waiting) = waiting_mission(conn, mission_id)? else {
+        return Ok(());
+    };
+    let now = clock();
+    let refuse = |reason: &str, at: DateTime<Utc>| {
+        settle_occurrence(conn, &waiting.occurrence_id, "failed", Some(reason), at).map(|_| ())
+    };
+    if now >= waiting.valid_until {
+        return refuse(EXPIRED_BEFORE_DISPATCH_REASON, now);
+    }
+    match familiar_standing(conn, &waiting.root_id, &waiting.revision_id)? {
+        Standing::Current => {}
+        Standing::Withdrawn => return refuse(REVISION_REVOKED_REASON, now),
+        Standing::Superseded => return refuse(REVISION_STALE_REASON, now),
+    }
+    let preflight = if runtime.accepts_automation_authority_projection() {
+        runtime.preflight_authority_launch(MISSION_ENVELOPE.harness, MISSION_ENVELOPE)
+    } else {
+        Err(anyhow::anyhow!(
+            crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+        ))
+    };
+    if let Err(error) = preflight {
+        return refuse(&format!("{AUTHORITY_UNAVAILABLE_REASON}: {error:#}"), now);
+    }
+    // The preflight runs the harness, which takes time.
+    let preflighted = clock();
+    if preflighted >= waiting.valid_until {
+        return refuse(EXPIRED_BEFORE_DISPATCH_REASON, preflighted);
+    }
+    let definition = mission_definition(conn, mission_id)?;
+    // A refusal is already recorded on the occurrence, with its reason.
+    let _ = super::runner::dispatch_mission_occurrence(
+        conn,
+        runtime,
+        &definition,
+        &waiting.occurrence_id,
+        clock,
+    );
+    Ok(())
+}
+
+/// A mission whose occurrence waits for its launch.
+struct Waiting {
+    occurrence_id: String,
+    root_id: String,
+    revision_id: String,
+    valid_until: DateTime<Utc>,
+}
+
+fn waiting_mission(conn: &Connection, mission_id: &str) -> Result<Option<Waiting>, String> {
+    let row: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT mission.occurrence_id, mission.familiar_root_id,
+                    mission.familiar_revision_id, mission.valid_until
+             FROM automation_missions AS mission
+             JOIN automation_occurrences AS occurrence ON occurrence.id = mission.occurrence_id
+             WHERE mission.mission_id = ?1
+               AND occurrence.state = 'claimed' AND occurrence.lease_owner = 'manual'
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs AS run WHERE run.occurrence_id = occurrence.id
+               )",
+            [mission_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read mission `{mission_id}`: {error}"))?;
+    row.map(|(occurrence_id, root_id, revision_id, valid_until)| {
+        Ok(Waiting {
+            occurrence_id,
+            root_id,
+            revision_id,
+            valid_until: DateTime::parse_from_rfc3339(&valid_until)
+                .map_err(|error| {
+                    format!("mission `{mission_id}` has an invalid validUntil: {error}")
+                })?
+                .with_timezone(&Utc),
+        })
+    })
+    .transpose()
+}
+
+/// The mission's internal definition, which `store` reads as absent.
+fn mission_definition(conn: &Connection, mission_id: &str) -> Result<RoutineDefinition, String> {
+    let json: String = conn
+        .query_row(
+            "SELECT definition.definition_json
+             FROM automation_definitions AS definition
+             JOIN automation_missions AS mission ON mission.automation_id = definition.id
+             WHERE mission.mission_id = ?1 AND definition.tombstoned_at IS NULL",
+            [mission_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read mission `{mission_id}`'s definition: {error}"))?;
+    serde_json::from_str(&json)
+        .map_err(|error| format!("mission `{mission_id}`'s definition is invalid: {error}"))
+}
+
+/// Where the familiar revision a mission names stands now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// The root's active head.
+    Current,
+    /// Revoked or retired, or its root retired.
+    Withdrawn,
+    /// Superseded by a later revision.
+    Superseded,
+}
+
+fn familiar_standing(
+    conn: &Connection,
+    root_id: &str,
+    revision_id: &str,
+) -> Result<Standing, String> {
+    let head = familiar_head(conn, root_id)?;
+    if head.as_ref().is_some_and(|head| {
+        !head.retired && head.status == "active" && head.revision_id == revision_id
+    }) {
+        return Ok(Standing::Current);
+    }
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM familiar_ledger_revisions WHERE root_id = ?1 AND revision_id = ?2",
+            params![root_id, revision_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read familiar revision `{revision_id}`: {error}"))?;
+    let root_retired = head.as_ref().is_none_or(|head| head.retired);
+    Ok(match status.as_deref() {
+        Some("superseded") if !root_retired => Standing::Superseded,
+        _ => Standing::Withdrawn,
+    })
+}
+
+/// What the trusted adapter needs to dispatch a mission's attempt: its
+/// one-run owner grant and what the submit's request digest bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DispatchGrant {
+    pub principal_id: String,
+    pub adoption_key: String,
+    pub request_digest: String,
+    pub submitted_at: String,
+    pub valid_until: DateTime<Utc>,
+    pub familiar_root_id: String,
+    pub familiar_revision_id: String,
+    pub scopes: Vec<Value>,
+}
+
+impl DispatchGrant {
+    /// The authority the attempt runs under: an R0 read of the scopes the
+    /// submit named, and nothing else.
+    pub(crate) fn authority(&self) -> RoutineAuthority {
+        RoutineAuthority {
+            action_type: "analysis.read".to_owned(),
+            risk_class: RoutineRiskClass::R0,
+            capabilities: vec!["analysis.read".to_owned()],
+            scopes: self.scopes.clone(),
+            proposal_safe: true,
+        }
+    }
+
+    /// The submit, as the owner grant for revision `revision` of the
+    /// mission's internal definition `automation_id`.
+    pub(crate) fn owner_grant(&self, automation_id: &str, revision: u64) -> OwnerGrant {
+        OwnerGrant {
+            automation_id: automation_id.to_owned(),
+            revision,
+            command: SUBMIT_COMMAND.to_owned(),
+            adoption_key: self.adoption_key.clone(),
+            request_digest: self.request_digest.clone(),
+            principal_id: self.principal_id.clone(),
+            granted_at: self.submitted_at.clone(),
+        }
+    }
+}
+
+/// The dispatch grant of the mission whose internal definition is
+/// `automation_id`, or `None` when it belongs to no mission.
+pub(crate) fn dispatch_grant(
+    conn: &Connection,
+    automation_id: &str,
+) -> anyhow::Result<Option<DispatchGrant>> {
+    use anyhow::Context;
+    let row: Option<[Option<String>; 8]> = conn
+        .query_row(
+            "SELECT principal_id, adoption_key, request_digest, submitted_at, valid_until,
+                    familiar_root_id, familiar_revision_id, scopes_json
+             FROM automation_missions WHERE automation_id = ?1",
+            [automation_id],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ])
+            },
+        )
+        .optional()
+        .context("failed to read the mission's grant")?;
+    let Some(
+        [Some(principal_id), Some(adoption_key), Some(request_digest), Some(submitted_at), Some(valid_until), Some(familiar_root_id), Some(familiar_revision_id), scopes_json],
+    ) = row
+    else {
+        anyhow::ensure!(row.is_none(), "the mission's grant is incomplete");
+        return Ok(None);
+    };
+    let scopes = match scopes_json {
+        Some(json) => serde_json::from_str(&json).context("the mission's scopes are invalid")?,
+        None => Vec::new(),
+    };
+    Ok(Some(DispatchGrant {
+        principal_id,
+        adoption_key,
+        request_digest,
+        submitted_at,
+        valid_until: DateTime::parse_from_rfc3339(&valid_until)
+            .context("the mission's validUntil is invalid")?
+            .with_timezone(&Utc),
+        familiar_root_id,
+        familiar_revision_id,
+        scopes,
+    }))
+}
+
+/// `None` when `automation_id` belongs to no mission. Otherwise whether its
+/// one-run grant still stands for `revision`: the internal definition its
+/// submit recorded is still that revision, never tombstoned.
+pub(crate) fn grant_stands_if_mission(
+    conn: &Connection,
+    automation_id: &str,
+    revision: u64,
+) -> anyhow::Result<Option<bool>> {
+    use anyhow::Context;
+    let revision = i64::try_from(revision).context("revision exceeds SQLite range")?;
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM automation_definitions
+             WHERE id = mission.automation_id AND revision = ?2 AND tombstoned_at IS NULL
+         )
+         FROM automation_missions AS mission WHERE mission.automation_id = ?1",
+        params![automation_id, revision],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("failed to read the mission's definition")
 }
 
 /// Executes one `mission.cancel.v1` request at `now`. Before dispatch it is
@@ -230,9 +562,13 @@ fn cancel(
     if let Some(reason) = &request.reason {
         inner["reason"] = json!(reason.as_str());
     }
-    if let CancelExecution::Rejected(error) = execute_occurrence_cancel(conn, runtime, inner, now)?
+    if let CancelExecution::Rejected(error) =
+        execute_mission_occurrence_cancel(conn, runtime, inner, now)?
     {
-        // The mission may have settled since it was read.
+        // The mission may have settled since it was read, or its harness may
+        // have finished before a settlement pass ran: settle it now, so a
+        // conclusive completion beats the cancel that lost to it.
+        super::runner::settle_finished_runs(conn, now)?;
         return Ok(Err(
             match mission_view(conn, mission_id)?.filter(|view| view["terminal"] == json!(true)) {
                 Some(view) => nothing_to_cancel(view),
@@ -480,8 +816,8 @@ fn claim_in(
         );
     }
 
-    let supported_digest = CLAUDE_R0_READ.descriptor_digest();
-    if request.envelope.id.as_str() != CLAUDE_R0_READ.descriptor_version
+    let supported_digest = MISSION_ENVELOPE.descriptor_digest();
+    if request.envelope.id.as_str() != MISSION_ENVELOPE.descriptor_version
         || request.envelope.descriptor_digest.value.as_str() != supported_digest
     {
         return Ok(Err(unsupported_envelope(request.envelope.id.as_str())));
@@ -555,7 +891,7 @@ fn claim_in(
         "misfire": "latest",
         "overlap": "forbid",
         "timeoutMinutes": timeout_minutes,
-        "runtime": CLAUDE_R0_READ.harness,
+        "runtime": MISSION_ENVELOPE.harness,
         "familiarId": roster_id,
         "cwd": cwd_text,
         "prompt": request.task.prompt.as_str(),
@@ -745,17 +1081,31 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
     else {
         return Ok(None);
     };
-    let (state, reason) = project(&occurrence_state, failure_reason.as_deref());
+    let settled_after_valid_until = instant(&settled_at)? >= instant(&valid_until)?;
+    let (state, reason) = project(
+        &occurrence_state,
+        failure_reason.as_deref(),
+        settled_after_valid_until,
+    );
     let cancellation = cancellation(conn, mission_id, &occurrence_state)?;
-    // A stop the owner asked for that has not landed yet.
-    let state = if state == "running"
-        && cancellation
-            .as_ref()
-            .is_some_and(|cancellation| cancellation["outcome"] == "pending")
-    {
-        "cancelling"
-    } else {
-        state
+    // The daemon's stop after a revocation counts only while the revision is
+    // withdrawn, so a stop record alone never makes one.
+    let revoked = revocation_stop(conn, mission_id)?.is_some()
+        && familiar_standing(conn, &root_id, &revision_id)? == Standing::Withdrawn;
+    let stop_pending = cancellation
+        .as_ref()
+        .is_some_and(|cancellation| cancellation["outcome"] == "pending");
+    let (state, reason) = match state {
+        // A stop the owner asked for, or the daemon's after a revocation,
+        // that has not landed yet.
+        "running" if revoked || stop_pending => ("cancelling", None),
+        // The revocation's stop landed behind the run's stop fence, so what
+        // the run did is unresolved until recovery. The revocation is why.
+        "reconciling" if revoked => ("reconciling", Some("familiar_revision_revoked")),
+        // The revocation's stop settled the run.
+        "cancelled" if revoked => ("revoked", Some("familiar_revision_revoked")),
+        // Any other outcome is conclusive, and stands.
+        _ => (state, reason),
     };
     let terminal = matches!(
         state,
@@ -830,14 +1180,7 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
         view["cancellation"] = cancellation;
     }
     if terminal {
-        view["result"] = json!({
-            "outcome": state,
-            "settledAt": settled_at,
-            "artifacts": [],
-            "usage": null,
-            // Nothing was launched, so nothing went unobserved.
-            "observation": "complete",
-        });
+        view["result"] = terminal_result(conn, &occurrence_id, state, &settled_at)?;
     }
     Ok(Some(view))
 }
@@ -878,25 +1221,276 @@ fn cancellation(
     }))
 }
 
+/// A timestamp the mission's records store.
+fn instant(text: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(text)
+        .map(|instant| instant.with_timezone(&Utc))
+        .map_err(|error| format!("a mission record holds an invalid timestamp: {error}"))
+}
+
 /// The mission state for an occurrence state, by the contract's projection.
-fn project(state: &str, failure_reason: Option<&str>) -> (&'static str, Option<&'static str>) {
+/// `settled_after_valid_until` says whether a failed occurrence settled once
+/// `validUntil` had passed.
+fn project(
+    state: &str,
+    failure_reason: Option<&str>,
+    settled_after_valid_until: bool,
+) -> (&'static str, Option<&'static str>) {
     match state {
         "planned" | "eligible" | "claimed" => ("queued", None),
         "dispatching" | "running" => ("running", None),
         "succeeded" => ("completed", None),
         "cancelled" => ("cancelled", None),
         "timed_out" => ("failed", Some("timeout")),
-        "failed" if failure_reason == Some(AUTHORITY_UNAVAILABLE_REASON) => {
-            ("unavailable", Some("authority_unavailable"))
-        }
-        "failed" if failure_reason == Some(LEASE_EXPIRED_REASON) => {
-            ("rejected", Some("expired_before_dispatch"))
-        }
-        "failed" => ("failed", Some("harness_failed")),
+        "failed" => project_failure(
+            failure_reason.unwrap_or_default(),
+            settled_after_valid_until,
+        ),
         // Recovery, and any state a mission should never reach: execution may
         // or may not have happened, so it is never reported as nothing.
         _ => ("reconciling", Some("ambiguous_execution")),
     }
+}
+
+/// The mission state for a failed occurrence, from its recorded reason and
+/// whether it settled once `validUntil` had passed.
+fn project_failure(
+    reason: &str,
+    settled_after_valid_until: bool,
+) -> (&'static str, Option<&'static str>) {
+    use super::contract::authority::AuthorityProfileErrorCode as Code;
+    if reason.starts_with(AUTHORITY_UNAVAILABLE_REASON) {
+        return ("unavailable", Some("authority_unavailable"));
+    }
+    match reason {
+        LEASE_EXPIRED_REASON | EXPIRED_BEFORE_DISPATCH_REASON => {
+            return ("rejected", Some("expired_before_dispatch"));
+        }
+        REVISION_REVOKED_REASON => return ("revoked", Some("familiar_revision_revoked")),
+        REVISION_STALE_REASON => return ("revoked", Some("familiar_revision_stale")),
+        _ => {}
+    }
+    // Refused before the harness started: by the dispatch, before runtime
+    // ownership, or by the daemon admitting the launch under Runtime
+    // Authority, whose refusal ends with its profile code.
+    let prefix = super::runner::AUTHORITY_REFUSAL_PREFIX;
+    let code = reason.find(prefix).map(|at| &reason[at + prefix.len()..]);
+    if code.is_none() && !reason.starts_with(super::runner::BEFORE_OWNERSHIP_REASON) {
+        return ("failed", Some("harness_failed"));
+    }
+    if code == Some(Code::FamiliarStatusInvalid.as_str()) {
+        ("revoked", Some("familiar_revision_revoked"))
+    } else if code == Some(Code::FamiliarStale.as_str())
+        || code == Some(Code::FamiliarMismatch.as_str())
+    {
+        ("revoked", Some("familiar_revision_stale"))
+    } else if settled_after_valid_until {
+        // Nothing may launch once `validUntil` has passed, whichever check
+        // refused it first.
+        ("rejected", Some("expired_before_dispatch"))
+    } else {
+        ("unavailable", Some("authority_unavailable"))
+    }
+}
+
+/// When the daemon's stop of a mission whose familiar revision was revoked
+/// was committed, if it was.
+fn revocation_stop(conn: &Connection, mission_id: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT adopted_at FROM automation_command_adoptions
+         WHERE command = 'occurrence.cancel.v1' AND automation_id = ?1
+           AND outcome = 'committed'
+           AND substr(adoption_key, 1, length(?2)) = ?2
+         ORDER BY adopted_at, adoption_key
+         LIMIT 1",
+        params![mission_id, REVOCATION_KEY_PREFIX],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| format!("failed to read the mission's revocation stop: {error}"))
+}
+
+/// The terminal result of `occurrence_id`'s mission, settled as `outcome` at
+/// `settled_at`. It reports what the records say, never an estimate:
+/// - `observation` is the terminal observer's classification of the launched
+///   attempt, `unknown` when it recorded none, and `complete` when nothing
+///   was launched, so nothing went unobserved;
+/// - `usage` is what the harness's single result event reports, or null;
+/// - the report is that event's result text, listed only for a completed
+///   mission whose signed evidence names the same digest.
+fn terminal_result(
+    conn: &Connection,
+    occurrence_id: &str,
+    outcome: &str,
+    settled_at: &str,
+) -> Result<Value, String> {
+    let mut result = json!({
+        "outcome": outcome,
+        "settledAt": settled_at,
+        "artifacts": [],
+        "usage": null,
+        "observation": "complete",
+    });
+    let launched: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, session_id FROM automation_attempts
+             WHERE occurrence_id = ?1 AND session_id IS NOT NULL
+             ORDER BY attempt_number DESC LIMIT 1",
+            [occurrence_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read the mission's attempt: {error}"))?;
+    let Some((attempt_id, session_id)) = launched else {
+        return Ok(result);
+    };
+    let evidence_table: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'automation_runtime_terminal_evidence')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to inspect the evidence store: {error}"))?;
+    let evidence: Option<(String, String)> = if evidence_table {
+        conn.query_row(
+            "SELECT classification, canonical_json FROM automation_runtime_terminal_evidence
+             WHERE attempt_id = ?1",
+            [&attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read the mission's terminal evidence: {error}"))?
+    } else {
+        None
+    };
+    result["observation"] = json!(match evidence.as_ref().map(|(class, _)| class.as_str()) {
+        Some("receipt_eligible_complete") => "complete",
+        Some("authenticated_partial_or_ambiguous" | "policy_violating") => "partial",
+        _ => "unknown",
+    });
+    let (output, _) = super::terminal_observer::session_output(conn, &session_id)
+        .map_err(|error| format!("failed to read the mission's session output: {error:#}"))?;
+    let mut events = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["type"] == "result");
+    let Some(event) = events.next().filter(|_| events.next().is_none()) else {
+        return Ok(result);
+    };
+    result["usage"] = reported_usage(&event);
+    let produced = evidence
+        .as_ref()
+        .and_then(|(_, json)| serde_json::from_str::<Value>(json).ok())
+        .filter(|evidence| evidence["result"]["state"] == "produced")
+        .and_then(|evidence| {
+            evidence["result"]["digest"]["value"]
+                .as_str()
+                .map(str::to_owned)
+        });
+    if let (Some(digest), Some(text), "completed") = (produced, event["result"].as_str(), outcome) {
+        let canonical = canonicalize(&json!(text))
+            .map_err(|error| format!("a report cannot be canonicalized: {error:#}"))?;
+        if sha256_hex(&canonical) == digest && text.len() <= MAX_REPORT_BYTES {
+            result["resultDigest"] = digest_value(&digest);
+            result["artifacts"] = json!([{
+                "kind": "report",
+                // The report is the session's final result event, kept as
+                // long as the daemon keeps that session's log.
+                "ref": format!("session:{session_id}:result"),
+                "mediaType": "text/markdown",
+                "bytes": text.len(),
+                "digest": digest_value(&digest),
+            }]);
+        }
+    }
+    Ok(result)
+}
+
+/// The usage a claude result event reports: its token counts and cost, each
+/// only when present and well formed. Null when it reports none.
+fn reported_usage(event: &Value) -> Value {
+    let mut usage = serde_json::Map::new();
+    for (field, name) in [
+        ("input_tokens", "inputTokens"),
+        ("output_tokens", "outputTokens"),
+        ("cache_read_input_tokens", "cacheReadTokens"),
+        ("cache_creation_input_tokens", "cacheWriteTokens"),
+    ] {
+        if let Some(count) = event["usage"][field].as_u64() {
+            usage.insert(name.to_owned(), json!(count));
+        }
+    }
+    if let Some(cost) = event["total_cost_usd"]
+        .as_f64()
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+    {
+        usage.insert("costUsd".to_owned(), json!(cost));
+    }
+    if usage.is_empty() {
+        return Value::Null;
+    }
+    usage.insert("source".to_owned(), json!("harness_result_event"));
+    Value::Object(usage)
+}
+
+/// Stops each running mission whose familiar revision has been revoked or
+/// retired since it launched, through `occurrence.cancel.v1` and the run's
+/// stop fence, under a key derived from the mission so the stop is asked for
+/// once. The store gate already withholds every read such a mission asks for
+/// (P5); this ends its session. Returns what could not be stopped.
+pub(crate) fn stop_withdrawn_missions(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, String> {
+    let running: Vec<(String, String, String, String)> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT mission.mission_id, mission.occurrence_id, mission.familiar_root_id,
+                        mission.familiar_revision_id
+                 FROM automation_missions AS mission
+                 JOIN automation_occurrences AS occurrence
+                   ON occurrence.id = mission.occurrence_id
+                 WHERE occurrence.state = 'running'
+                 ORDER BY mission.mission_id",
+            )
+            .map_err(|error| format!("failed to read running missions: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|error| format!("failed to read running missions: {error}"))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| format!("failed to read a running mission: {error}"))?
+    };
+    let mut failures = Vec::new();
+    for (mission_id, occurrence_id, root_id, revision_id) in running {
+        if !matches!(
+            familiar_standing(conn, &root_id, &revision_id)?,
+            Standing::Withdrawn
+        ) {
+            continue;
+        }
+        let stop = json!({
+            "action": OCCURRENCE_CANCEL_ACTION,
+            "adoptionKey": format!(
+                "{REVOCATION_KEY_PREFIX}{}",
+                &sha256_hex(mission_id.as_bytes())[..40]
+            ),
+            "occurrenceId": occurrence_id,
+            "reason": "the familiar revision this mission runs was revoked",
+        });
+        if let CancelExecution::Rejected(error) =
+            execute_mission_occurrence_cancel(conn, runtime, stop, now)?
+        {
+            failures.push(format!(
+                "mission `{mission_id}` was not stopped: {}",
+                error.message.as_str()
+            ));
+        }
+    }
+    Ok(failures)
 }
 
 /// The runtime envelopes a mission may name. The capability catalog
@@ -904,8 +1498,8 @@ fn project(state: &str, failure_reason: Option<&str>) -> (&'static str, Option<&
 /// refusal repeats it, so a client learns the digest before it submits.
 pub(crate) fn advertised_envelopes() -> Value {
     json!([{
-        "id": CLAUDE_R0_READ.descriptor_version,
-        "descriptorDigest": digest_value(&CLAUDE_R0_READ.descriptor_digest()),
+        "id": MISSION_ENVELOPE.descriptor_version,
+        "descriptorDigest": digest_value(&MISSION_ENVELOPE.descriptor_digest()),
     }])
 }
 
@@ -1022,11 +1616,15 @@ mod tests {
         body
     }
 
+    /// Submits at the fixture's fixed `now()`, on a launch clock that stands
+    /// there too.
     fn submit(fixture: &Fixture, body: Value) -> MissionExecution {
-        execute_mission_submit(
+        execute_mission_submit_launching_at(
             &fixture.home.conn,
+            &NoopSessionRuntime,
             CommandAuthority::OwnerLocal,
             body,
+            now(),
             now(),
         )
         .unwrap()
@@ -1108,8 +1706,11 @@ mod tests {
         fixture.home.count(table)
     }
 
+    /// A daemon whose runtime takes no authority projections fails the
+    /// decision-free preflight: the mission settles `unavailable` and nothing
+    /// is decided, consumed or launched.
     #[test]
-    fn submit_records_the_mission_and_settles_it_unavailable_without_a_launch() {
+    fn submit_records_the_mission_and_settles_it_unavailable_when_preflight_fails() {
         let fixture = fixture();
         let key = "adopt:mission:first";
         let (answer, replayed) = committed(submit(&fixture, flat(key, payload(&fixture, now()))));
@@ -1133,7 +1734,8 @@ mod tests {
             .unwrap()
             .starts_with("principal:coven-local-owner:"));
 
-        // M0 launches nothing: the mission settles unavailable.
+        // The runtime cannot launch the envelope: the mission settles
+        // unavailable before anything is decided.
         let settled = view(&fixture, &mission_id);
         assert_mission_view(&settled);
         assert_eq!(
@@ -1154,6 +1756,11 @@ mod tests {
         for table in ["automation_runs", "automation_attempts", "sessions"] {
             assert_eq!(count(&fixture, table), 0, "{table}");
         }
+        assert_eq!(
+            launch::threads_rows(&fixture.home.conn),
+            (0, 0, 0),
+            "a preflight refusal decides nothing"
+        );
 
         // Its internal definition is not a routine.
         let conn = &fixture.home.conn;
@@ -1225,6 +1832,20 @@ mod tests {
                 "CAPABILITY_UNSUPPORTED",
             ),
             (
+                // The plain-text envelope missions named before #857: it
+                // launches with ambient file tools, so no mission may.
+                "envelope-r0-read-1",
+                Box::new(|body| {
+                    body["envelope"] = json!({
+                        "id": super::super::runtime_envelope::CLAUDE_R0_READ.descriptor_version,
+                        "descriptorDigest": digest_value(
+                            &super::super::runtime_envelope::CLAUDE_R0_READ.descriptor_digest()
+                        ),
+                    })
+                }),
+                "CAPABILITY_UNSUPPORTED",
+            ),
+            (
                 "inside-home",
                 Box::new({
                     let inside = fixture.home.path().join("familiars").display().to_string();
@@ -1272,7 +1893,7 @@ mod tests {
             let error = refused(submit(&fixture, body));
             assert_eq!(error["code"], code, "{name}: {error}");
             match name {
-                "envelope-id" => assert_eq!(
+                "envelope-id" | "envelope-r0-read-1" => assert_eq!(
                     error["details"]["supportedEnvelopes"],
                     advertised_envelopes(),
                     "{error}"
@@ -1316,6 +1937,7 @@ mod tests {
         let error = refused(
             execute_mission_submit(
                 conn,
+                &NoopSessionRuntime,
                 CommandAuthority::Unauthenticated,
                 flat(key, payload(&fixture, now())),
                 now(),
@@ -1930,5 +2552,800 @@ mod tests {
             ),
             (Some("rejected"), Some("ILLEGAL_TRANSITION"))
         );
+    }
+
+    /// Missions that launch: a home with `sage`, a stand-in claude 2.1.305
+    /// and the owner's key, and a runtime that preflights as the daemon does
+    /// and records each launch without starting anything.
+    pub(super) mod launch {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        use chrono::{DurationRound, TimeDelta};
+
+        use super::*;
+        use crate::automations::cancel_commands::execute_occurrence_cancel;
+        use crate::automations::trusted_launch::test_support::{scope, Fixture, RecordingRuntime};
+
+        /// The Threads store's decision, adoption and consumption rows.
+        pub(crate) fn threads_rows(conn: &Connection) -> (i64, i64, i64) {
+            let count =
+                |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap_or(0) };
+            (
+                count("SELECT COUNT(*) FROM automation_threads_decisions"),
+                count("SELECT COUNT(*) FROM automation_threads_store_events WHERE kind = 'adoption'"),
+                count(
+                    "SELECT COUNT(*) FROM automation_threads_store_events WHERE kind = 'consumption'",
+                ),
+            )
+        }
+
+        fn real_now() -> DateTime<Utc> {
+            Utc::now()
+                .duration_trunc(TimeDelta::milliseconds(1))
+                .unwrap()
+        }
+
+        fn body(fixture: &Fixture, key: &str, at: DateTime<Utc>) -> Value {
+            let head = fixture.home.head();
+            json!({
+                "action": SUBMIT_ACTION,
+                "adoptionKey": key,
+                "familiar": { "rootId": head.root.root_id, "revisionId": head.head.revision_id },
+                "envelope": advertised_envelopes()[0].clone(),
+                "project": { "cwd": fixture.project_text() },
+                "scopes": [scope("notes/today.md", false)],
+                "task": {
+                    "statement": "Summarize the notes.",
+                    "prompt": "Read the notes and summarize them.",
+                },
+                "limits": { "timeoutMinutes": 10 },
+                "validUntil": iso(at + Duration::minutes(10)),
+            })
+        }
+
+        fn submit_on(
+            fixture: &Fixture,
+            runtime: &dyn SessionRuntime,
+            body: Value,
+            at: DateTime<Utc>,
+        ) -> MissionExecution {
+            execute_mission_submit(
+                &fixture.home.conn,
+                runtime,
+                CommandAuthority::OwnerLocal,
+                body,
+                at,
+            )
+            .unwrap()
+        }
+
+        /// Records the mission `key` names and leaves it queued, as a daemon
+        /// whose dispatch is busy would.
+        fn hold_on(fixture: &Fixture, key: &str, at: DateTime<Utc>) -> String {
+            let request: MissionSubmitPayload =
+                serde_json::from_value(flat_payload(&body(fixture, key, at))).unwrap();
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &fixture.home.conn,
+                TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            claim_in(&transaction, key, &"b".repeat(64), &request, at)
+                .unwrap()
+                .unwrap();
+            transaction.commit().unwrap();
+            mission_id_for(key)
+        }
+
+        fn view_at(fixture: &Fixture, mission_id: &str) -> Value {
+            let view = mission_view(&fixture.home.conn, mission_id)
+                .unwrap()
+                .unwrap();
+            assert_mission_view(&view);
+            view
+        }
+
+        fn state(view: &Value) -> (&str, Option<&str>, bool) {
+            (
+                view["state"].as_str().unwrap(),
+                view["reason"].as_str(),
+                view["terminal"].as_bool().unwrap(),
+            )
+        }
+
+        fn launched(runtime: &RecordingRuntime) -> usize {
+            runtime.launched.lock().unwrap().len()
+        }
+
+        fn revoke(fixture: &Fixture) {
+            let head = fixture.home.head();
+            fixture.home.ok(json!({
+                "action": "coven.familiars.ledger.revoke.v1",
+                "adoptionKey": "adopt:ledger:revoke",
+                "revisionId": head.head.revision_id,
+                "reason": "the familiar's key was exposed",
+            }));
+        }
+
+        fn session_of(fixture: &Fixture, mission_id: &str) -> String {
+            fixture
+                .home
+                .conn
+                .query_row(
+                    "SELECT attempt.session_id FROM automation_attempts AS attempt
+                     JOIN automation_missions AS mission
+                       ON mission.occurrence_id = attempt.occurrence_id
+                     WHERE mission.mission_id = ?1",
+                    [mission_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        /// Where in a launch the wall clock jumps.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Stage {
+            Preflight,
+            Launch,
+        }
+
+        /// `RecordingRuntime`, staged as a daemon's work is: the shared
+        /// clock `time` jumps to `later` during the preflight or the launch,
+        /// and a launch it reaches that way is refused as the daemon refuses
+        /// a decision whose validity has ended. While a stop is in flight it
+        /// reads the mission's view on its own connection, as a polling
+        /// client would.
+        struct Staged {
+            inner: RecordingRuntime,
+            time: Rc<Cell<DateTime<Utc>>>,
+            later: DateTime<Utc>,
+            during: Option<Stage>,
+            store: std::path::PathBuf,
+            seen_while_stopping: RefCell<Vec<Value>>,
+        }
+
+        fn staged(
+            fixture: &Fixture,
+            time: &Rc<Cell<DateTime<Utc>>>,
+            later: DateTime<Utc>,
+            during: Option<Stage>,
+        ) -> Staged {
+            Staged {
+                inner: fixture.runtime(),
+                time: Rc::clone(time),
+                later,
+                during,
+                store: crate::api::store_path(fixture.home.path()),
+                seen_while_stopping: RefCell::new(Vec::new()),
+            }
+        }
+
+        impl SessionRuntime for Staged {
+            fn launch_session(&self, launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
+                self.inner.launch_session(launch)
+            }
+
+            fn accepts_automation_authority_projection(&self) -> bool {
+                true
+            }
+
+            fn preflight_authority_launch(
+                &self,
+                harness: &str,
+                envelope: &'static RuntimeEnvelope,
+            ) -> anyhow::Result<()> {
+                let result = self.inner.preflight_authority_launch(harness, envelope);
+                if self.during == Some(Stage::Preflight) {
+                    self.time.set(self.later);
+                }
+                result
+            }
+
+            fn launch_authorized_contained_adopted_session(
+                &self,
+                launch: &crate::api::SessionLaunch,
+                authority: Option<
+                    &crate::automations::authority_projection::AutomationAuthorityConsumerProjection,
+                >,
+                writer: Option<crate::maintenance_gate::WriterLease>,
+                ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+            ) -> anyhow::Result<()> {
+                if self.during == Some(Stage::Launch) {
+                    self.time.set(self.later);
+                    return Err(anyhow::Error::new(crate::api::RuntimeAuthorityLaunchRefused {
+                        code: crate::automations::contract::authority::AuthorityProfileErrorCode::AuthenticationUnverifiable,
+                        detail: "the decision's validity interval has ended".to_owned(),
+                    }));
+                }
+                self.inner.launch_authorized_contained_adopted_session(
+                    launch,
+                    authority,
+                    writer,
+                    ownership_established,
+                )
+            }
+
+            fn send_input(&self, session_id: &str, payload: &Value) -> anyhow::Result<()> {
+                self.inner.send_input(session_id, payload)
+            }
+
+            fn kill_session(&self, session_id: &str) -> anyhow::Result<()> {
+                let reader = Connection::open_with_flags(
+                    &self.store,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                let mission_id: String = reader.query_row(
+                    "SELECT mission.mission_id FROM automation_missions AS mission
+                     JOIN automation_attempts AS attempt
+                       ON attempt.occurrence_id = mission.occurrence_id
+                     WHERE attempt.session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )?;
+                let view = mission_view(&reader, &mission_id)
+                    .map_err(anyhow::Error::msg)?
+                    .expect("the stopped mission is readable");
+                self.seen_while_stopping.borrow_mut().push(view);
+                self.inner.kill_session(session_id)
+            }
+        }
+
+        #[test]
+        fn a_mission_launches_once_through_the_trusted_adapter() {
+            let fixture = Fixture::new();
+            let runtime = fixture.runtime();
+            let at = real_now();
+            let key = "adopt:mission:launch";
+            let (answer, replayed) =
+                committed(submit_on(&fixture, &runtime, body(&fixture, key, at), at));
+            assert!(!replayed);
+            assert_eq!(answer["mission"]["state"], "queued", "the state at commit");
+            let mission_id = mission_id_for(key);
+            assert_eq!(launched(&runtime), 1);
+            assert_eq!(
+                fixture.threads_rows(),
+                (1, 1, 1),
+                "decided and consumed once"
+            );
+            let view = view_at(&fixture, &mission_id);
+            assert_eq!(state(&view), ("running", None, false));
+            assert_eq!(view["attempts"][0]["state"], "started");
+
+            // The binding pins the scoped read envelope and grants exactly the
+            // scope the submit named, under the owner's one-run grant.
+            let pinned: String = fixture
+                .home
+                .conn
+                .query_row(
+                    "SELECT authority_extension_json FROM automation_attempts",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                pinned.contains("\"descriptorVersion\":\"r0-read.2\""),
+                "{pinned}"
+            );
+            assert!(pinned.contains(MISSION_DISPATCH_OPERATION), "{pinned}");
+            // The scopes reach the launch through the signed decision, whose
+            // request the launch rereads; the binding names that decision.
+            let request: String = fixture
+                .home
+                .conn
+                .query_row(
+                    "SELECT request_json FROM automation_threads_decisions",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["scopes"], json!([scope("notes/today.md", false)]));
+            let launched_revision = runtime.launched.lock().unwrap()[0]
+                .projection
+                .identity_revision_id
+                .as_str()
+                .to_owned();
+            assert_eq!(launched_revision, fixture.home.head().head.revision_id);
+
+            // A replay answers the first commit and launches nothing.
+            let (replay, replayed) = committed(submit_on(
+                &fixture,
+                &runtime,
+                body(&fixture, key, at),
+                at + Duration::seconds(1),
+            ));
+            assert!(replayed);
+            assert_eq!(replay, answer);
+            let mut changed = body(&fixture, key, at);
+            changed["task"]["statement"] = json!("Summarize something else.");
+            let error = refused(submit_on(&fixture, &runtime, changed, at));
+            assert_eq!(error["code"], "ADOPTION_REPLAY_MISMATCH");
+
+            // While it runs, a second mission in the project is refused.
+            let error = refused(submit_on(
+                &fixture,
+                &runtime,
+                body(&fixture, "adopt:mission:second", at),
+                at,
+            ));
+            assert_eq!(error["code"], "CONCURRENCY_LIMIT");
+            assert_eq!(launched(&runtime), 1, "nothing relaunched");
+            assert_eq!(fixture.threads_rows(), (1, 1, 1));
+        }
+
+        #[test]
+        fn a_failed_preflight_settles_unavailable_and_decides_nothing() {
+            // A runtime that cannot launch the scoped read envelope, and one
+            // whose harness version is not admitted.
+            let unlaunchable = Fixture::new();
+            let stale_harness = Fixture::new();
+            std::fs::write(
+                &stale_harness.program,
+                "#!/bin/sh\necho '2.0.1 (Claude Code)'\n",
+            )
+            .unwrap();
+            for (fixture, runtime) in [
+                (&unlaunchable, RecordingRuntime::default()),
+                (&stale_harness, stale_harness.runtime()),
+            ] {
+                let at = real_now();
+                let key = "adopt:mission:preflight";
+                committed(submit_on(fixture, &runtime, body(fixture, key, at), at));
+                let view = view_at(fixture, &mission_id_for(key));
+                assert_eq!(
+                    state(&view),
+                    ("unavailable", Some("authority_unavailable"), true)
+                );
+                assert_eq!(view["result"]["observation"], "complete");
+                assert_eq!(fixture.threads_rows(), (0, 0, 0));
+                assert_eq!(launched(&runtime), 0);
+                for table in ["automation_runs", "automation_attempts", "sessions"] {
+                    assert_eq!(fixture.home.count(table), 0, "{table}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_mission_naming_no_scopes_is_refused_at_its_decision_and_launches_nothing() {
+            // The automation-authority profile grants reads only through
+            // scopes, so a mission that names none has nothing to decide on:
+            // the refusal rolls back with the launch, leaving no decision.
+            let fixture = Fixture::new();
+            let runtime = fixture.runtime();
+            let at = real_now();
+            let key = "adopt:mission:no-scopes";
+            let mut body = body(&fixture, key, at);
+            body.as_object_mut().unwrap().remove("scopes");
+            committed(submit_on(&fixture, &runtime, body, at));
+            let view = view_at(&fixture, &mission_id_for(key));
+            assert_eq!(
+                state(&view),
+                ("unavailable", Some("authority_unavailable"), true)
+            );
+            assert_eq!(fixture.threads_rows(), (0, 0, 0));
+            assert_eq!(launched(&runtime), 0);
+            for table in ["automation_runs", "automation_attempts", "sessions"] {
+                assert_eq!(fixture.home.count(table), 0, "{table}");
+            }
+        }
+
+        #[test]
+        fn a_withdrawn_revision_or_a_passed_valid_until_is_refused_before_any_decision() {
+            /// A case's name, its change, the seconds after submit its
+            /// launch runs, and the state it settles in.
+            type Case = (
+                &'static str,
+                fn(&Fixture),
+                i64,
+                (&'static str, Option<&'static str>, bool),
+            );
+            let cases: [Case; 3] = [
+                (
+                    "revoked",
+                    revoke,
+                    1,
+                    ("revoked", Some("familiar_revision_revoked"), true),
+                ),
+                (
+                    "superseded",
+                    |fixture: &Fixture| {
+                        let revision = fixture.home.head().head.revision_id;
+                        fixture
+                            .home
+                            .write("sage", "SOUL.md", "# SOUL\nResearch and teach.\n");
+                        let (status, response) =
+                            fixture.home.adopt("adopt:ledger:adopt", &revision);
+                        assert_eq!(status, 200, "{response:?}");
+                    },
+                    1,
+                    ("revoked", Some("familiar_revision_stale"), true),
+                ),
+                (
+                    "expired",
+                    |_: &Fixture| {},
+                    600,
+                    ("rejected", Some("expired_before_dispatch"), true),
+                ),
+            ];
+            for (name, change, after_seconds, expected) in cases {
+                let fixture = Fixture::new();
+                let runtime = fixture.runtime();
+                let at = real_now();
+                let mission_id = hold_on(&fixture, &format!("adopt:mission:{name}"), at);
+                change(&fixture);
+                launch_mission(&fixture.home.conn, &runtime, &mission_id, &mut || {
+                    at + Duration::seconds(after_seconds)
+                })
+                .unwrap();
+                let view = view_at(&fixture, &mission_id);
+                assert_eq!(state(&view), expected, "{name}");
+                assert_eq!(launched(&runtime), 0, "{name}");
+                assert_eq!(fixture.threads_rows(), (0, 0, 0), "{name}");
+                // Settled, it is never launched later.
+                launch_mission(&fixture.home.conn, &runtime, &mission_id, &mut || at).unwrap();
+                assert_eq!(launched(&runtime), 0, "{name}");
+            }
+        }
+
+        #[test]
+        fn a_cancel_after_launch_stops_the_session_behind_its_fence() {
+            let fixture = Fixture::new();
+            let runtime = fixture.runtime();
+            let at = real_now();
+            let key = "adopt:mission:cancel-after";
+            committed(submit_on(&fixture, &runtime, body(&fixture, key, at), at));
+            let mission_id = mission_id_for(key);
+            let (answer, _) = committed(
+                execute_mission_cancel(
+                    &fixture.home.conn,
+                    &runtime,
+                    CommandAuthority::OwnerLocal,
+                    cancel_body("adopt:mission-cancel:after", &mission_id),
+                    at + Duration::seconds(1),
+                )
+                .unwrap(),
+            );
+            // Only signed evidence settles a Runtime Authority run, and the
+            // stopped session leaves it incomplete: reconciling, not
+            // reported as nothing.
+            let view = &answer["mission"];
+            assert_mission_view(view);
+            assert_eq!(
+                state(view),
+                ("reconciling", Some("ambiguous_execution"), false)
+            );
+            assert_eq!(answer["cancellation"]["outcome"], "recovery_required");
+            let session: String = fixture
+                .home
+                .conn
+                .query_row(
+                    "SELECT status FROM sessions WHERE id = ?1",
+                    [session_of(&fixture, &mission_id)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(session, "cancelled");
+        }
+
+        #[test]
+        fn a_session_that_ends_without_evidence_leaves_the_mission_reconciling() {
+            let fixture = Fixture::new();
+            let runtime = fixture.runtime();
+            let at = real_now();
+            let key = "adopt:mission:ambiguous";
+            committed(submit_on(&fixture, &runtime, body(&fixture, key, at), at));
+            let mission_id = mission_id_for(key);
+            let conn = &fixture.home.conn;
+            assert!(crate::store::update_session_terminal_if_active(
+                conn,
+                &session_of(&fixture, &mission_id),
+                "completed",
+                Some(0),
+                &iso(at + Duration::seconds(1)),
+            )
+            .unwrap());
+            crate::automations::runner::settle_finished_runs(conn, at + Duration::seconds(2))
+                .unwrap();
+            let view = view_at(&fixture, &mission_id);
+            assert_eq!(
+                state(&view),
+                ("reconciling", Some("ambiguous_execution"), false)
+            );
+            assert!(
+                view.get("result").is_none(),
+                "never terminal without evidence"
+            );
+        }
+
+        #[test]
+        fn a_revision_revoked_while_running_stops_the_mission_once() {
+            let fixture = Fixture::new();
+            let at = real_now();
+            let time = Rc::new(Cell::new(at));
+            let runtime = staged(&fixture, &time, at, None);
+            let key = "adopt:mission:revoked-running";
+            committed(submit_on(&fixture, &runtime, body(&fixture, key, at), at));
+            let mission_id = mission_id_for(key);
+            let conn = &fixture.home.conn;
+            // Nothing to stop while the revision stands.
+            assert!(stop_withdrawn_missions(conn, &runtime, at)
+                .unwrap()
+                .is_empty());
+            assert_eq!(state(&view_at(&fixture, &mission_id)).0, "running");
+
+            revoke(&fixture);
+            assert!(
+                stop_withdrawn_missions(conn, &runtime, at + Duration::seconds(1))
+                    .unwrap()
+                    .is_empty()
+            );
+            // While the stop is in flight, a reader sees it cancelling.
+            {
+                let seen = runtime.seen_while_stopping.borrow();
+                assert_eq!(seen.len(), 1);
+                assert_eq!(state(&seen[0]), ("cancelling", None, false));
+            }
+            // The stop landed behind the run's stop fence, so what the run did
+            // is unresolved until recovery: never terminal, and the
+            // revocation is the reason.
+            let view = view_at(&fixture, &mission_id);
+            assert_eq!(
+                state(&view),
+                ("reconciling", Some("familiar_revision_revoked"), false)
+            );
+            assert!(view.get("result").is_none(), "{view:#}");
+            assert!(
+                view.get("cancellation").is_none(),
+                "the owner asked for no cancel"
+            );
+            // Its project's slot stays held: the stopped run may not be over,
+            // and only recovery says it is.
+            assert!(active_mission_in_scope(
+                conn,
+                view["familiar"]["rootId"].as_str().unwrap(),
+                view["project"]["cwd"].as_str().unwrap(),
+            )
+            .unwrap());
+            let stops = || -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM automation_command_adoptions
+                     WHERE command = 'occurrence.cancel.v1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(stops(), 1);
+            stop_withdrawn_missions(conn, &runtime, at + Duration::seconds(2)).unwrap();
+            assert_eq!(stops(), 1, "the stop is asked for once");
+            assert_eq!(runtime.seen_while_stopping.borrow().len(), 1);
+        }
+
+        #[test]
+        fn a_dispatch_that_launches_nothing_settles_unavailable() {
+            // The trusted state is unreadable: every role key's record stands,
+            // but its private key is gone.
+            let fixture = Fixture::new();
+            let runtime = fixture.runtime();
+            let at = real_now();
+            crate::automations::authority_keys::ensure_role_keys(
+                &fixture.home.conn,
+                fixture.home.path(),
+                at,
+            )
+            .unwrap();
+            for entry in std::fs::read_dir(fixture.home.path().join("authority-keys")).unwrap() {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+            let key = "adopt:mission:unreadable";
+            committed(submit_on(&fixture, &runtime, body(&fixture, key, at), at));
+            let view = view_at(&fixture, &mission_id_for(key));
+            assert_eq!(
+                state(&view),
+                ("unavailable", Some("authority_unavailable"), true)
+            );
+            assert_eq!(fixture.threads_rows(), (0, 0, 0));
+            assert_eq!(launched(&runtime), 0);
+        }
+
+        /// Submits `key` on `runtime`, whose launch reads the shared `time`.
+        fn submit_staged(
+            fixture: &Fixture,
+            runtime: &Staged,
+            key: &str,
+            at: DateTime<Utc>,
+        ) -> MissionExecution {
+            let time = Rc::clone(&runtime.time);
+            execute_mission_submit_with_clock(
+                &fixture.home.conn,
+                runtime,
+                CommandAuthority::OwnerLocal,
+                body(fixture, key, at),
+                at,
+                &mut move || time.get(),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn valid_until_passing_during_the_preflight_is_refused_before_any_decision() {
+            let fixture = Fixture::new();
+            let at = real_now();
+            let time = Rc::new(Cell::new(at));
+            let runtime = staged(
+                &fixture,
+                &time,
+                at + Duration::minutes(11),
+                Some(Stage::Preflight),
+            );
+            let key = "adopt:mission:expires-in-preflight";
+            committed(submit_staged(&fixture, &runtime, key, at));
+            let view = view_at(&fixture, &mission_id_for(key));
+            assert_eq!(
+                state(&view),
+                ("rejected", Some("expired_before_dispatch"), true)
+            );
+            assert_eq!(fixture.threads_rows(), (0, 0, 0));
+            assert_eq!(launched(&runtime.inner), 0);
+            assert_eq!(view["attempts"], json!([]));
+            assert_eq!(fixture.home.count("sessions"), 0);
+        }
+
+        #[test]
+        fn valid_until_passing_during_the_launch_reads_expired_not_unavailable() {
+            let fixture = Fixture::new();
+            let at = real_now();
+            let time = Rc::new(Cell::new(at));
+            let runtime = staged(
+                &fixture,
+                &time,
+                at + Duration::minutes(11),
+                Some(Stage::Launch),
+            );
+            let key = "adopt:mission:expires-in-launch";
+            committed(submit_staged(&fixture, &runtime, key, at));
+            let view = view_at(&fixture, &mission_id_for(key));
+            assert_eq!(
+                state(&view),
+                ("rejected", Some("expired_before_dispatch"), true)
+            );
+            // Decided and consumed, then refused at the daemon: nothing ran.
+            assert_eq!(fixture.threads_rows(), (1, 1, 1));
+            assert_eq!(launched(&runtime.inner), 0);
+            // A refusal before validUntil is still unavailable.
+            let fixture = Fixture::new();
+            let time = Rc::new(Cell::new(at));
+            let runtime = staged(&fixture, &time, at, Some(Stage::Launch));
+            let key = "adopt:mission:refused-in-launch";
+            committed(submit_staged(&fixture, &runtime, key, at));
+            assert_eq!(
+                state(&view_at(&fixture, &mission_id_for(key))),
+                ("unavailable", Some("authority_unavailable"), true)
+            );
+        }
+
+        #[test]
+        fn an_owner_cancel_may_not_use_a_key_the_daemon_derives() {
+            let fixture = Fixture::new();
+            let runtime = fixture.runtime();
+            let at = real_now();
+            let key = "adopt:mission:forged";
+            committed(submit_on(&fixture, &runtime, body(&fixture, key, at), at));
+            let mission_id = mission_id_for(key);
+            let occurrence_id = view_at(&fixture, &mission_id)["occurrenceId"].clone();
+            for forged in ["mr:forged-revocation", "mc:forged-cancellation"] {
+                let answer = execute_occurrence_cancel(
+                    &fixture.home.conn,
+                    &runtime,
+                    json!({
+                        "action": OCCURRENCE_CANCEL_ACTION,
+                        "adoptionKey": forged,
+                        "occurrenceId": occurrence_id,
+                    }),
+                    at + Duration::seconds(1),
+                )
+                .unwrap();
+                let CancelExecution::Rejected(error) = answer else {
+                    panic!("`{forged}` was accepted");
+                };
+                assert_eq!(
+                    serde_json::to_value(error).unwrap()["code"],
+                    "VALIDATION_FAILED",
+                    "{forged}"
+                );
+            }
+            let adopted: i64 = fixture
+                .home
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_command_adoptions
+                     WHERE command = 'occurrence.cancel.v1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(adopted, 0, "a refused key is not taken");
+            assert_eq!(
+                state(&view_at(&fixture, &mission_id)),
+                ("running", None, false)
+            );
+        }
+
+        #[test]
+        fn a_revocation_stop_stands_only_for_a_revocation_and_never_over_an_outcome() {
+            let fixture = Fixture::new();
+            let at = real_now();
+            let mission_id = hold_on(&fixture, "adopt:mission:conclusive", at);
+            let occurrence_id = view_at(&fixture, &mission_id)["occurrenceId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            // A stop under the daemon's key, as a forged request or an older
+            // daemon could have left one.
+            fixture
+                .home
+                .conn
+                .execute(
+                    "INSERT INTO automation_command_adoptions (
+                        adoption_key, command, automation_id, request_digest, outcome,
+                        revision, response_json, adopted_at
+                     ) VALUES ('mr:recorded', 'occurrence.cancel.v1', ?1, ?2, 'committed',
+                               NULL, '{}', ?3)",
+                    params![mission_id, "c".repeat(64), iso(at)],
+                )
+                .unwrap();
+            // While the revision stands, it is no revocation.
+            assert_eq!(
+                state(&view_at(&fixture, &mission_id)),
+                ("queued", None, false)
+            );
+            // A conclusive failure stands, revocation or not.
+            assert!(settle_occurrence(
+                &fixture.home.conn,
+                &occurrence_id,
+                "failed",
+                Some("the harness exited 1"),
+                at,
+            )
+            .unwrap());
+            revoke(&fixture);
+            assert_eq!(
+                state(&view_at(&fixture, &mission_id)),
+                ("failed", Some("harness_failed"), true)
+            );
+        }
+
+        #[test]
+        fn usage_is_what_the_result_event_reports_or_null() {
+            let reported = json!({
+                "type": "result", "subtype": "success", "is_error": false, "result": "ok",
+                "total_cost_usd": 0.0125,
+                "usage": {
+                    "input_tokens": 1200, "output_tokens": 340,
+                    "cache_read_input_tokens": 800, "cache_creation_input_tokens": 40,
+                },
+            });
+            assert_eq!(
+                reported_usage(&reported),
+                json!({
+                    "source": "harness_result_event",
+                    "inputTokens": 1200, "outputTokens": 340,
+                    "cacheReadTokens": 800, "cacheWriteTokens": 40,
+                    "costUsd": 0.0125,
+                })
+            );
+            let partial =
+                json!({ "type": "result", "usage": { "output_tokens": 7, "input_tokens": -1 } });
+            assert_eq!(
+                reported_usage(&partial),
+                json!({ "source": "harness_result_event", "outputTokens": 7 })
+            );
+            for silent in [
+                json!({ "type": "result", "result": "ok" }),
+                json!({ "type": "result", "usage": {}, "total_cost_usd": "free" }),
+            ] {
+                assert_eq!(reported_usage(&silent), Value::Null, "{silent}");
+            }
+        }
     }
 }

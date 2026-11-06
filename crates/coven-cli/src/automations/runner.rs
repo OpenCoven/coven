@@ -355,7 +355,7 @@ struct PersistLaunchContext<'a> {
 
 /// How a Runtime Authority refusal before launch begins, so dispatch can
 /// record its code on the occurrence.
-const AUTHORITY_REFUSAL_PREFIX: &str = "automation authority refused dispatch: ";
+pub(crate) const AUTHORITY_REFUSAL_PREFIX: &str = "automation authority refused dispatch: ";
 
 fn authority_refusal(error: &AuthorityProfileError) -> String {
     format!("{AUTHORITY_REFUSAL_PREFIX}{}", error.code().as_str())
@@ -542,6 +542,7 @@ fn persist_launch_with_clock(
         occurrence_id,
         definition,
         existing_run.then_some(run_id),
+        context.authority,
     )?;
     let overlapping_run: bool = transaction
         .query_row(
@@ -2054,6 +2055,7 @@ fn ensure_dispatch_definition_pin(
     occurrence_id: &str,
     definition: &RoutineDefinition,
     existing_run_id: Option<&str>,
+    authority: AutomationAuthorityMode<'_>,
 ) -> Result<(), String> {
     let (automation_id, automation_revision, occurrence_digest): (String, i64, Option<String>) =
         conn.query_row(
@@ -2123,9 +2125,16 @@ fn ensure_dispatch_definition_pin(
         }
         return Ok(());
     }
-    let Some(current) =
-        super::store::get_definition(conn, &automation_id).map_err(|error| format!("{error:#}"))?
-    else {
+    // A mission's internal definition is absent to every routine read: only
+    // Runtime Authority, under the trusted adapter its submit grants,
+    // dispatches it.
+    let current = match authority {
+        AutomationAuthorityMode::RuntimeAuthority(_) => {
+            super::store::get_dispatch_definition(conn, &automation_id)
+        }
+        AutomationAuthorityMode::BaseV1 => super::store::get_definition(conn, &automation_id),
+    };
+    let Some(current) = current.map_err(|error| format!("{error:#}"))? else {
         return Err(format!(
             "routine `{automation_id}` vanished after occurrence fencing"
         ));
@@ -2233,6 +2242,82 @@ pub(crate) fn dispatch_manual_occurrence(
                 ));
             }
             Err(error)
+        }
+    }
+}
+
+/// What a mission's occurrence records when its dispatch refused before
+/// runtime ownership, so nothing was launched; a Runtime Authority refusal
+/// follows it with its profile code.
+pub(crate) const BEFORE_OWNERSHIP_REASON: &str = "dispatch failed before runtime ownership";
+
+/// Dispatches a mission's claimed manual occurrence on `clock`, under Runtime
+/// Authority, through the trusted adapter, whose grant is the mission's submit
+/// (#857). The caller has already run the decision-free preflight. An adapter
+/// refusal rolls back with the launch transaction, so it leaves no decision. A
+/// dispatch that refuses before runtime ownership settles the occurrence
+/// failed, recording a Runtime Authority refusal under its profile code and
+/// any other reason only as a failure before ownership, as the daemon's
+/// dispatch does. The refusal is settled when it happened, on `clock`.
+pub(crate) fn dispatch_mission_occurrence(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    definition: &RoutineDefinition,
+    occurrence_id: &str,
+    clock: &mut dyn FnMut() -> DateTime<Utc>,
+) -> Result<RunOutcome, String> {
+    let error = match dispatch_mission_attempt(conn, runtime, definition, occurrence_id, clock) {
+        Ok(outcome) => return Ok(outcome),
+        Err(error) => error,
+    };
+    let recorded = if error.starts_with(AUTHORITY_REFUSAL_PREFIX) {
+        format!("{BEFORE_OWNERSHIP_REASON}: {error}")
+    } else {
+        BEFORE_OWNERSHIP_REASON.to_owned()
+    };
+    if !settle_occurrence(conn, occurrence_id, "failed", Some(&recorded), clock())? {
+        return Err(format!(
+            "{error}; mission occurrence changed before rejection settlement"
+        ));
+    }
+    Err(error)
+}
+
+fn dispatch_mission_attempt(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    definition: &RoutineDefinition,
+    occurrence_id: &str,
+    clock: &mut dyn FnMut() -> DateTime<Utc>,
+) -> Result<RunOutcome, String> {
+    let cwd = definition
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .ok_or_else(|| "mission has no project directory".to_string())?;
+    let now = clock();
+    let home = prepare_runtime_authority(conn, now)?;
+    let trusted = super::trusted_authority::TrustedAuthority::new(conn, &home, now);
+    let cancelled = || false;
+    let mut control = DispatchControl {
+        clock,
+        cancelled: &cancelled,
+        authority: AutomationAuthorityMode::RuntimeAuthority(&trusted),
+        scheduler_fence: None,
+    };
+    match dispatch_occurrence_with_clock(
+        conn,
+        runtime,
+        definition,
+        occurrence_id,
+        cwd,
+        now,
+        &mut control,
+    )? {
+        DispatchAttempt::Completed(outcome) => Ok(outcome),
+        DispatchAttempt::Deferred => {
+            Err("mission dispatch was deferred before runtime ownership".to_string())
         }
     }
 }
@@ -13053,5 +13138,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decided, 0, "no decision is made or consumed for it");
+    }
+
+    /// A mission's internal definition is absent to every routine read, so
+    /// only Runtime Authority, whose trusted adapter its submit grants,
+    /// dispatches it. The ambient path finds no definition to pin.
+    #[test]
+    fn only_runtime_authority_pins_a_mission_definition() {
+        use crate::automations::missions;
+        use crate::automations::trusted_launch::test_support::{scope, Fixture};
+        let fixture = Fixture::new();
+        let conn = &fixture.home.conn;
+        let head = fixture.home.head();
+        let at = Utc::now();
+        missions::execute_mission_submit(
+            conn,
+            &crate::api::NoopSessionRuntime,
+            crate::automations::owner_grants::CommandAuthority::OwnerLocal,
+            json!({
+                "action": missions::SUBMIT_ACTION,
+                "adoptionKey": "adopt:mission:ambient",
+                "familiar": { "rootId": head.root.root_id, "revisionId": head.head.revision_id },
+                "envelope": missions::advertised_envelopes()[0].clone(),
+                "project": { "cwd": fixture.project_text() },
+                "scopes": [scope("notes/today.md", false)],
+                "task": { "statement": "Summarize.", "prompt": "Summarize the notes." },
+                "limits": { "timeoutMinutes": 10 },
+                "validUntil": (at + chrono::Duration::minutes(10))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            }),
+            at,
+        )
+        .unwrap();
+        let (occurrence_id, definition_json): (String, String) = conn
+            .query_row(
+                "SELECT mission.occurrence_id, definition.definition_json
+                 FROM automation_missions AS mission
+                 JOIN automation_definitions AS definition
+                   ON definition.id = mission.automation_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let definition: RoutineDefinition = serde_json::from_str(&definition_json).unwrap();
+        let refusal = ensure_dispatch_definition_pin(
+            conn,
+            &occurrence_id,
+            &definition,
+            None,
+            AutomationAuthorityMode::BaseV1,
+        )
+        .unwrap_err();
+        assert!(
+            refusal.contains("vanished after occurrence fencing"),
+            "{refusal}"
+        );
+        let trusted = crate::automations::trusted_authority::TrustedAuthority::new(
+            conn,
+            fixture.home.path(),
+            at,
+        );
+        ensure_dispatch_definition_pin(
+            conn,
+            &occurrence_id,
+            &definition,
+            None,
+            AutomationAuthorityMode::RuntimeAuthority(&trusted),
+        )
+        .unwrap();
     }
 }

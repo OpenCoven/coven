@@ -258,11 +258,9 @@ fn a_launch_refused_after_consumption_records_its_profile_code() {
     assert_eq!(recorded, expected);
 }
 
-/// A scoped read run through the live runtime whose harness prints `stream`
-/// as its output after the test reads the granted note and the sibling
-/// through its channel. Returns once the session has ended and its terminal
-/// evidence is stored.
-fn scoped_run_ending_with(fixture: &Fixture, stream: &[String]) -> LiveSessionRuntime {
+/// The stand-in harness's capture folder, with the stand-in installed and
+/// `stream` as what it prints once released.
+fn capture_printing(fixture: &Fixture, stream: &[String]) -> PathBuf {
     let capture = fixture
         .program
         .parent()
@@ -276,12 +274,14 @@ fn scoped_run_ending_with(fixture: &Fixture, stream: &[String]) -> LiveSessionRu
         crate::automations::stream_observation::test_support::stream(stream),
     )
     .unwrap();
-    fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
-    fixture.schedule("notes");
-    let runtime = LiveSessionRuntime::with_coven_home(fixture.home.path().to_path_buf())
-        .with_scoped_harness(fixture.program.clone());
-    let (report, runtime) = fixture.dispatch_pass_with(runtime);
-    assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
+    capture
+}
+
+/// Once the launched harness has started, reads the granted note and the
+/// sibling through its channel, as it would through the relay, releases it,
+/// and returns once the session has ended and its terminal evidence is
+/// stored.
+fn read_both_and_finish(fixture: &Fixture, capture: &Path) {
     wait_for("the harness to start", || capture.join("started").exists());
     let args = fs::read_to_string(capture.join("args")).unwrap();
     let args: Vec<&str> = args.lines().collect();
@@ -327,6 +327,21 @@ fn scoped_run_ending_with(fixture: &Fixture, stream: &[String]) -> LiveSessionRu
             )
             .is_ok_and(|stored| stored == 1)
     });
+}
+
+/// A scoped read run through the live runtime whose harness prints `stream`
+/// as its output after the test reads the granted note and the sibling
+/// through its channel. Returns once the session has ended and its terminal
+/// evidence is stored.
+fn scoped_run_ending_with(fixture: &Fixture, stream: &[String]) -> LiveSessionRuntime {
+    let capture = capture_printing(fixture, stream);
+    fixture.create("notes", r0(vec![scope("notes/today.md", false)]), "ACTIVE");
+    fixture.schedule("notes");
+    let runtime = LiveSessionRuntime::with_coven_home(fixture.home.path().to_path_buf())
+        .with_scoped_harness(fixture.program.clone());
+    let (report, runtime) = fixture.dispatch_pass_with(runtime);
+    assert_eq!(report.dispatched.len(), 1, "{:?}", report.failed);
+    read_both_and_finish(fixture, &capture);
     runtime
 }
 
@@ -542,4 +557,147 @@ fn a_malformed_scoped_read_row_holds_its_run_and_settlement_goes_on() {
         );
         drop(runtime);
     }
+}
+
+/// A mission (#1313) submitted on the live runtime with `r0-read.2` and one
+/// scope, whose harness prints `stream` after reading the granted note and
+/// the sibling. Returns once its session has ended and its terminal evidence
+/// is stored, with the mission's id.
+fn mission_ending_with(fixture: &Fixture, stream: &[String]) -> (LiveSessionRuntime, String) {
+    use crate::automations::missions::{self, MissionExecution};
+    let capture = capture_printing(fixture, stream);
+    let runtime = LiveSessionRuntime::with_coven_home(fixture.home.path().to_path_buf())
+        .with_scoped_harness(fixture.program.clone());
+    let now = chrono::DurationRound::duration_trunc(
+        chrono::Utc::now(),
+        chrono::TimeDelta::milliseconds(1),
+    )
+    .unwrap();
+    let head = fixture.home.head();
+    let key = "adopt:mission:live";
+    let answer = missions::execute_mission_submit(
+        &fixture.home.conn,
+        &runtime,
+        crate::automations::owner_grants::CommandAuthority::OwnerLocal,
+        json!({
+            "action": missions::SUBMIT_ACTION,
+            "adoptionKey": key,
+            "familiar": { "rootId": head.root.root_id, "revisionId": head.head.revision_id },
+            "envelope": missions::advertised_envelopes()[0].clone(),
+            "project": { "cwd": fixture.project_text() },
+            "scopes": [scope("notes/today.md", false)],
+            "task": { "statement": "Summarize the notes.", "prompt": "Summarise the notes." },
+            "limits": { "timeoutMinutes": 10 },
+            "validUntil": (now + chrono::TimeDelta::minutes(10))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }),
+        now,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            answer,
+            MissionExecution::Success {
+                replayed: false,
+                ..
+            }
+        ),
+        "{answer:?}"
+    );
+    let mission_id = missions::mission_id_for(key);
+    let view = missions::mission_view(&fixture.home.conn, &mission_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view["state"], "running", "{view:#}");
+    read_both_and_finish(fixture, &capture);
+    (runtime, mission_id)
+}
+
+fn mission_view(fixture: &Fixture, mission_id: &str) -> Value {
+    crate::automations::missions::mission_view(&fixture.home.conn, mission_id)
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn a_mission_launches_under_the_store_gate_and_settles_from_its_evidence() {
+    use crate::automations::stream_observation::test_support::scoped_read_run_calling;
+    let fixture = Fixture::new();
+    // The harness reports what the run used on its result event.
+    let mut stream = scoped_read_run_calling(2);
+    let report = "It says granted notes.";
+    *stream.last_mut().unwrap() = json!({
+        "type": "result", "subtype": "success", "is_error": false, "result": report,
+        "total_cost_usd": 0.0042,
+        "usage": { "input_tokens": 1500, "output_tokens": 120,
+                   "cache_read_input_tokens": 900, "cache_creation_input_tokens": 60 },
+    })
+    .to_string();
+    let (runtime, mission_id) = mission_ending_with(&fixture, &stream);
+    let settled =
+        crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+            .unwrap();
+    assert_eq!(
+        settled.succeeded,
+        1,
+        "{settled:?}: {:?}",
+        run_state(&fixture)
+    );
+
+    let view = mission_view(&fixture, &mission_id);
+    assert_eq!(
+        (view["state"].as_str(), view["terminal"].as_bool()),
+        (Some("completed"), Some(true)),
+        "{view:#}"
+    );
+    let result = &view["result"];
+    assert_eq!(result["outcome"], "completed");
+    assert_eq!(result["observation"], "complete");
+    assert_eq!(
+        result["usage"],
+        json!({ "source": "harness_result_event", "inputTokens": 1500, "outputTokens": 120,
+                "cacheReadTokens": 900, "cacheWriteTokens": 60, "costUsd": 0.0042 })
+    );
+    let digest = crate::automations::contract::canonical_json::sha256_hex(
+        &crate::automations::contract::canonical_json::canonicalize(&json!(report)).unwrap(),
+    );
+    assert_eq!(result["resultDigest"]["value"], digest);
+    let artifacts = result["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 1, "{result:#}");
+    assert_eq!(artifacts[0]["kind"], "report");
+    assert_eq!(artifacts[0]["mediaType"], "text/markdown");
+    assert_eq!(artifacts[0]["bytes"], report.len());
+    assert_eq!(artifacts[0]["digest"]["value"], digest);
+    drop(runtime);
+}
+
+#[test]
+fn a_mission_cancel_after_its_conclusive_completion_loses_to_it() {
+    use crate::automations::missions::{self, MissionExecution};
+    let fixture = Fixture::new();
+    let (runtime, mission_id) = mission_ending_with(&fixture, &two_reads());
+    // The harness has finished and its complete evidence is stored, but no
+    // settlement pass has run yet when the owner cancels.
+    let answer = missions::execute_mission_cancel(
+        &fixture.home.conn,
+        &runtime,
+        crate::automations::owner_grants::CommandAuthority::OwnerLocal,
+        json!({ "action": missions::CANCEL_ACTION, "adoptionKey": "adopt:mission-cancel:late",
+                "missionId": mission_id }),
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    let MissionExecution::Rejected(error) = answer else {
+        panic!("the cancel won: {answer:?}");
+    };
+    let error = serde_json::to_value(error).unwrap();
+    assert_eq!(error["code"], "ILLEGAL_TRANSITION");
+    let view = &error["details"]["mission"];
+    assert_eq!(view["state"], "completed", "{view:#}");
+    assert_eq!(view["cancellation"]["outcome"], "lost_to_completion");
+    // The harness reported no usage, so none is claimed.
+    assert_eq!(view["result"]["usage"], Value::Null);
+    assert_eq!(view["result"]["observation"], "complete");
+    assert_eq!(mission_view(&fixture, &mission_id), *view);
+    drop(runtime);
 }

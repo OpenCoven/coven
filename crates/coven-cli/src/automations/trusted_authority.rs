@@ -1,11 +1,14 @@
 //! The trusted Runtime Authority adapter (coven#857, slice 6).
 //!
 //! It composes slices 1–5 into the `AutomationDispatchAuthority` the runner
-//! consults for a routine that declares authority. For one attempt, inside the
-//! runner's launch transaction, it:
+//! consults for a routine that declares authority, or for a mission. For one
+//! attempt, inside the runner's launch transaction, it:
 //!
-//! 1. checks the owner grant: the owner activation of the current revision
-//!    (slice 2), with a fresh nonce and validity window;
+//! 1. checks the owner grant, with a fresh nonce and validity window: the
+//!    owner activation of the current revision (slice 2), or a mission's
+//!    submit, its one-run grant, which also bounds the window by the
+//!    mission's `validUntil`. A mission is an R0 `analysis.read` of the
+//!    scopes its submit named, and runs only the familiar revision it named;
 //! 2. picks the runtime envelope that enforces the declared grant, refusing a
 //!    grant no envelope enforces;
 //! 3. issues a familiar embodiment binding from the ledger (slice 3);
@@ -41,6 +44,7 @@ use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::types::ExtensionBag;
 use super::definition::{RoutineAuthority, RoutineDefinition, RoutineRiskClass};
 use super::ed25519_trust::authenticate_authority_extension;
+use super::missions;
 use super::owner_grants::{self, OwnerAuthorization, OwnerAuthorizationRefusal};
 use super::runner::{
     AutomationAuthorityRequest, AutomationDispatchAuthority, AutomationTerminalAuthorityRequest,
@@ -110,7 +114,12 @@ impl<'a> TrustedAuthority<'a> {
                 format!("no routine `{}`", request.automation_id),
             );
         };
-        let Some(authority) = definition.authority.as_ref() else {
+        // A mission's internal definition declares nothing: its submit is
+        // the one-run owner grant, and its scopes come from the mission row
+        // the submit's request digest binds, never from a stored definition.
+        let mission = missions::dispatch_grant(self.conn, &request.automation_id)?;
+        let mission_authority = mission.as_ref().map(missions::DispatchGrant::authority);
+        let Some(authority) = mission_authority.as_ref().or(definition.authority.as_ref()) else {
             return refuse(
                 AuthorityProfileErrorCode::DefinitionMismatch,
                 format!("routine `{}` declares no authority", definition.id),
@@ -129,14 +138,47 @@ impl<'a> TrustedAuthority<'a> {
             );
         };
 
-        // 1. The owner grant, fresh for this attempt.
-        let owner = match owner_grants::authorize_scheduled_dispatch(
-            self.conn,
-            &request.automation_id,
-            request.automation_revision,
-            self.now,
-            VALIDITY,
-        )? {
+        // 1. The owner grant, fresh for this attempt. A mission's lasts only
+        // until its `validUntil`, and only while its definition is the one the
+        // submit recorded.
+        let scheduled = match &mission {
+            Some(mission) => {
+                if missions::grant_stands_if_mission(
+                    self.conn,
+                    &request.automation_id,
+                    request.automation_revision,
+                )? != Some(true)
+                {
+                    return refuse(
+                        AuthorityProfileErrorCode::DefinitionMismatch,
+                        "the mission's definition is not the one its submit recorded".to_owned(),
+                    );
+                }
+                match owner_grants::one_run_authorization(
+                    mission.owner_grant(&request.automation_id, request.automation_revision),
+                    missions::MISSION_DISPATCH_OPERATION,
+                    self.now,
+                    VALIDITY,
+                    mission.valid_until,
+                )? {
+                    Some(owner) => Ok(owner),
+                    None => {
+                        return refuse(
+                            AuthorityProfileErrorCode::Stale,
+                            "the mission's validUntil has passed".to_owned(),
+                        )
+                    }
+                }
+            }
+            None => owner_grants::authorize_scheduled_dispatch(
+                self.conn,
+                &request.automation_id,
+                request.automation_revision,
+                self.now,
+                VALIDITY,
+            )?,
+        };
+        let owner = match scheduled {
             Ok(owner) => owner,
             Err(OwnerAuthorizationRefusal::NoGrant { .. }) => {
                 return refuse(
@@ -211,6 +253,19 @@ impl<'a> TrustedAuthority<'a> {
                 )
             }
         };
+        // A mission runs the exact revision its submit named, never a
+        // successor the ledger has since made current.
+        if let Some(mission) = &mission {
+            if issued.authority.familiar_root_id.as_str() != mission.familiar_root_id
+                || issued.authority.identity_revision_id.as_str() != mission.familiar_revision_id
+            {
+                return refuse(
+                    AuthorityProfileErrorCode::FamiliarStale,
+                    "the mission's familiar revision is no longer the root's active head"
+                        .to_owned(),
+                );
+            }
+        }
 
         // 4. The Threads decision, its dispatch verification and consumption.
         let inputs = RequestInputs {
@@ -223,6 +278,7 @@ impl<'a> TrustedAuthority<'a> {
             definition_digest: &format!("sha256:{}", request.definition_digest),
             project_id: &opaque_id("project", cwd),
             workspace_id: &opaque_id("workspace", cwd),
+            one_run: mission.is_some(),
         };
         let draft = inputs.request_draft(&self.timestamp(owner.issued_at));
         let policy = inputs.policy_snapshot(self.conn, &self.timestamp(self.now))?;
@@ -561,6 +617,8 @@ struct RequestInputs<'a> {
     definition_digest: &'a str,
     project_id: &'a str,
     workspace_id: &'a str,
+    /// The grant authorizes one use in all, as a mission's submit does.
+    one_run: bool,
 }
 
 impl RequestInputs<'_> {
@@ -679,7 +737,7 @@ impl RequestInputs<'_> {
                 "capabilities": self.authority.capabilities,
                 "scopes": self.authority.scopes,
                 "expires_at": self.owner.valid_until.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "max_uses": uses + 1,
+                "max_uses": if self.one_run { 1 } else { uses + 1 },
                 "uses": uses,
             }));
         }
@@ -1073,20 +1131,27 @@ mod tests {
 
     #[test]
     fn runtime_authority_stays_unadvertised() {
+        let missions = crate::automations::missions::advertised_envelopes();
         let advertised = [
             serde_json::to_string(&crate::api_health::health_response(None)).unwrap(),
             serde_json::to_string(crate::automations::capability_negotiation::capability_profile())
                 .unwrap(),
-            crate::automations::missions::advertised_envelopes().to_string(),
+            missions.to_string(),
         ];
         for text in advertised {
             assert!(!text.contains(RUNTIME_AUTHORITY_CAPABILITY), "{text}");
-            assert!(!text.contains("r0-read.2"), "{text}");
         }
-        // Missions keep launching r0-read.1; only the adapter pins r0-read.2.
+        // Missions name the scoped read envelope and only it, which says
+        // what a mission may launch and certifies no containment.
+        let ids: Vec<&str> = missions
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|envelope| envelope["id"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            runtime_envelope::for_grant("claude", &["analysis.read"]),
-            Some(&runtime_envelope::CLAUDE_R0_READ)
+            ids,
+            [runtime_envelope::CLAUDE_R0_SCOPED_READ.descriptor_version]
         );
     }
 

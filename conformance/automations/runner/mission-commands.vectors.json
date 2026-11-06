@@ -22,11 +22,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -60,11 +60,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -93,11 +93,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -131,11 +131,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -164,11 +164,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -199,11 +199,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -237,11 +237,11 @@
               "revisionId": "{{staleRevisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -274,11 +274,11 @@
               "revisionId": "{{staleRevisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -318,7 +318,7 @@
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -339,11 +339,11 @@
             "details": {
               "supportedEnvelopes": [
                 {
-                  "id": "r0-read.1",
+                  "id": "r0-read.2",
                   "descriptorDigest": {
                     "algorithm": "sha256",
                     "canonicalization": "jcs-rfc8785",
-                    "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                    "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
                   }
                 }
               ]
@@ -360,7 +360,7 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
@@ -384,6 +384,52 @@
             "errorCode": "CAPABILITY_UNSUPPORTED",
             "writes": "adoption"
           }
+        },
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m05-r0-read-1",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.1",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "CAPABILITY_UNSUPPORTED",
+            "details": {
+              "supportedEnvelopes": [
+                {
+                  "id": "r0-read.2",
+                  "descriptorDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+                  }
+                }
+              ]
+            },
+            "writes": "adoption"
+          }
         }
       ]
     },
@@ -399,11 +445,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -446,11 +492,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -512,11 +558,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -567,11 +613,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -606,11 +652,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -640,11 +686,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -674,11 +720,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -708,11 +754,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -747,11 +793,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -781,11 +827,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -815,11 +861,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -854,11 +900,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -944,11 +990,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -993,11 +1039,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1042,11 +1088,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1077,11 +1123,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1344,11 +1390,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1387,11 +1433,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1430,11 +1476,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1473,11 +1519,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1516,11 +1562,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1559,11 +1605,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1602,11 +1648,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1645,11 +1691,11 @@
               "revisionId": "{{revisionId}}"
             },
             "envelope": {
-              "id": "r0-read.1",
+              "id": "r0-read.2",
               "descriptorDigest": {
                 "algorithm": "sha256",
                 "canonicalization": "jcs-rfc8785",
-                "value": "3cace37dc76d6e28453698da0b925c028075d9c2360b0e220e3dc087b1507e5b"
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
               }
             },
             "project": {
@@ -1676,6 +1722,443 @@
             "outcome": "rejected",
             "errorCode": "VALIDATION_FAILED",
             "writes": "adoption"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m07-a-cancel-after-conclusive-completion-loses-to-it",
+      "runtime": "launching",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m07",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.2",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "notes/today.md",
+                "access": "read",
+                "recursive": false
+              }
+            ],
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "session.end",
+          "missionOf": "adopt:mission:m07",
+          "stream": "complete",
+          "expect": {
+            "outcome": "committed",
+            "state": "running"
+          }
+        },
+        {
+          "command": "mission.cancel.v1",
+          "adoptionKey": "adopt:mission-cancel:m07",
+          "missionOf": "adopt:mission:m07",
+          "expect": {
+            "outcome": "rejected",
+            "errorCode": "ILLEGAL_TRANSITION",
+            "state": "completed",
+            "cancellation": "lost_to_completion",
+            "writes": "settlement"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m07",
+          "expect": {
+            "outcome": "committed",
+            "state": "completed",
+            "cancellation": "lost_to_completion"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m10-an-unobserved-ending-is-reconciling-never-terminal",
+      "runtime": "launching",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m10",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.2",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "notes/today.md",
+                "access": "read",
+                "recursive": false
+              }
+            ],
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "session.end",
+          "missionOf": "adopt:mission:m10",
+          "stream": "none",
+          "expect": {
+            "outcome": "committed",
+            "state": "running"
+          }
+        },
+        {
+          "command": "daemon.tick",
+          "missionOf": "adopt:mission:m10",
+          "expect": {
+            "outcome": "committed",
+            "state": "reconciling",
+            "reason": "ambiguous_execution"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m10",
+          "expect": {
+            "outcome": "committed",
+            "state": "reconciling",
+            "reason": "ambiguous_execution"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m10-a-timed-out-run-is-reconciling-never-terminal",
+      "runtime": "launching",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m10-timeout",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.2",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "notes/today.md",
+                "access": "read",
+                "recursive": false
+              }
+            ],
+            "limits": {
+              "timeoutMinutes": 1
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m10-timeout",
+          "expect": {
+            "outcome": "committed",
+            "state": "running"
+          }
+        },
+        {
+          "command": "daemon.tick",
+          "missionOf": "adopt:mission:m10-timeout",
+          "expect": {
+            "outcome": "committed",
+            "state": "reconciling",
+            "reason": "ambiguous_execution",
+            "whileStopping": "running"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m10-timeout",
+          "expect": {
+            "outcome": "committed",
+            "state": "reconciling",
+            "reason": "ambiguous_execution"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m12-a-revision-revoked-while-running-is-stopped-and-reconciling",
+      "runtime": "launching",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m12",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.2",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "notes/today.md",
+                "access": "read",
+                "recursive": false
+              }
+            ],
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m12",
+          "expect": {
+            "outcome": "committed",
+            "state": "running"
+          }
+        },
+        {
+          "command": "familiar.revoke",
+          "adoptionKey": "adopt:ledger:m12-revoke",
+          "missionOf": "adopt:mission:m12",
+          "expect": {
+            "outcome": "committed",
+            "state": "running"
+          }
+        },
+        {
+          "command": "daemon.tick",
+          "missionOf": "adopt:mission:m12",
+          "expect": {
+            "outcome": "committed",
+            "state": "reconciling",
+            "reason": "familiar_revision_revoked",
+            "whileStopping": "cancelling"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m12",
+          "expect": {
+            "outcome": "committed",
+            "state": "reconciling",
+            "reason": "familiar_revision_revoked"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m13-valid-until-passing-before-dispatch-launches-nothing",
+      "runtime": "launching",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m13",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.2",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "notes/today.md",
+                "access": "read",
+                "recursive": false
+              }
+            ],
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          },
+          "launchAfterMinutes": 10
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m13",
+          "expect": {
+            "outcome": "committed",
+            "state": "rejected",
+            "reason": "expired_before_dispatch",
+            "attempts": 0,
+            "sessions": 0
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "m14-a-restarted-client-reads-the-same-view",
+      "runtime": "launching",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:m14",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.2",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "notes/today.md",
+                "access": "read",
+                "recursive": false
+              }
+            ],
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m14",
+          "expect": {
+            "outcome": "committed",
+            "state": "running"
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:m14",
+          "expect": {
+            "outcome": "committed",
+            "state": "running",
+            "sameAs": 1
           }
         }
       ]

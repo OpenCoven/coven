@@ -1393,13 +1393,13 @@ fn mission_commands_suite_executes_the_checked_in_vectors() {
     let response = evaluate(&request_for("mission-commands", vectors)).unwrap();
 
     assert_eq!(response.status, TargetSuiteStatus::Passed);
-    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 12);
-    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 12);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 18);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 18);
 }
 
 #[test]
 fn mission_commands_suite_fails_when_the_executors_disagree() {
-    let wrong_expectations: [fn(&mut Value); 11] = [
+    let wrong_expectations: [fn(&mut Value); 23] = [
         // A lost acknowledgement would have to commit a second time.
         |vectors| {
             vectors["cases"][1]["steps"][1]["expect"] =
@@ -1446,6 +1446,35 @@ fn mission_commands_suite_fails_when_the_executors_disagree() {
             vectors["cases"][11]["steps"][7]["expect"] =
                 json!({ "outcome": "committed", "state": "queued" });
         },
+        // The plain-text envelope missions used to name would have to launch.
+        |vectors| {
+            vectors["cases"][4]["steps"][2]["expect"] =
+                json!({ "outcome": "committed", "state": "queued" });
+        },
+        // A cancel after the harness's conclusive success would have to win.
+        |vectors| vectors["cases"][12]["steps"][3]["expect"]["state"] = json!("cancelled"),
+        |vectors| {
+            vectors["cases"][12]["steps"][3]["expect"]["cancellation"] = json!("cancelled");
+        },
+        // An unobserved ending would have to settle as a success.
+        |vectors| vectors["cases"][13]["steps"][3]["expect"]["state"] = json!("completed"),
+        // A timed-out run whose ending went unobserved would have to read as
+        // a conclusive failure.
+        |vectors| vectors["cases"][14]["steps"][2]["expect"]["state"] = json!("failed"),
+        // A revoked revision would have to keep running.
+        |vectors| vectors["cases"][15]["steps"][3]["expect"]["state"] = json!("running"),
+        // A stop that landed behind its fence would have to read terminal.
+        |vectors| vectors["cases"][15]["steps"][3]["expect"]["state"] = json!("revoked"),
+        // The revocation's stop would have to go unseen while in flight.
+        |vectors| {
+            vectors["cases"][15]["steps"][3]["expect"]["whileStopping"] = json!("running");
+        },
+        // A mission whose validUntil passed would have to launch late.
+        |vectors| vectors["cases"][16]["steps"][1]["expect"]["state"] = json!("running"),
+        |vectors| vectors["cases"][16]["steps"][1]["expect"]["attempts"] = json!(1),
+        |vectors| vectors["cases"][16]["steps"][1]["expect"]["sessions"] = json!(1),
+        // A restarted client would have to find the mission queued again.
+        |vectors| vectors["cases"][17]["steps"][2]["expect"]["state"] = json!("queued"),
     ];
 
     for mutate in wrong_expectations {
@@ -1458,9 +1487,16 @@ fn mission_commands_suite_fails_when_the_executors_disagree() {
 
 #[test]
 fn mission_commands_suite_rejects_invalid_vector_shapes() {
-    let invalid_mutations: [fn(&mut Value); 7] = [
+    let invalid_mutations: [fn(&mut Value); 9] = [
         |vectors| vectors["schemaVersion"] = json!("unsupported"),
         |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        // Only a stop on the launching runtime can be watched in flight.
+        |vectors| {
+            vectors["cases"][15]["steps"][4]["expect"]["whileStopping"] = json!("cancelling");
+        },
+        |vectors| {
+            vectors["cases"][6]["steps"][1]["expect"]["whileStopping"] = json!("cancelling");
+        },
         // A get takes no adoption key, and a submit needs a payload.
         |vectors| vectors["cases"][0]["steps"][0]["adoptionKey"] = json!("adopt:mission:get"),
         |vectors| {
