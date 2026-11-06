@@ -19,9 +19,11 @@
 //! refuses it. So does a revision that is no longer current or active when the
 //! attempt dispatches: the grant authorized that revision, not its successors.
 //!
-//! Manual run grants arrive with the versioned run-now command (slice 7).
-//! Nothing here constructs Runtime Authority; the trusted adapter (slice 6)
-//! maps [`OwnerAuthorization`] into the execution binding.
+//! A mission's submit is a one-run grant ([`one_run_authorization`]): the
+//! mission row records it, and it authorizes that mission's one attempt.
+//! Other manual run grants arrive with the versioned run-now command
+//! (slice 7). Nothing here constructs Runtime Authority; the trusted adapter
+//! (slice 6) maps [`OwnerAuthorization`] into the execution binding.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -258,6 +260,36 @@ pub(crate) fn authorize_scheduled_dispatch(
         nonce: format!("nonce:{}", random_hex()?),
         issued_at,
         valid_until: issued_at + validity,
+        grant,
+    }))
+}
+
+/// The owner authorization for the one attempt a one-run grant authorizes,
+/// such as a mission's submit: `grant` with a fresh nonce, valid from `now`
+/// for `validity` but never past `not_after`. `None` when no whole
+/// millisecond of that window remains.
+pub(crate) fn one_run_authorization(
+    grant: OwnerGrant,
+    operation: &'static str,
+    now: DateTime<Utc>,
+    validity: TimeDelta,
+    not_after: DateTime<Utc>,
+) -> Result<Option<OwnerAuthorization>> {
+    let truncate = |at: DateTime<Utc>| {
+        chrono::DurationRound::duration_trunc(at, TimeDelta::milliseconds(1))
+            .context("authorization time cannot be represented")
+    };
+    let issued_at = truncate(now)?;
+    let valid_until = (issued_at + validity).min(truncate(not_after)?);
+    if valid_until <= issued_at {
+        return Ok(None);
+    }
+    Ok(Some(OwnerAuthorization {
+        principal_id: grant.principal_id.clone(),
+        operation,
+        nonce: format!("nonce:{}", random_hex()?),
+        issued_at,
+        valid_until,
         grant,
     }))
 }
