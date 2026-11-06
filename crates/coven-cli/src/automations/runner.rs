@@ -13143,6 +13143,7 @@ mod tests {
     /// A mission's internal definition is absent to every routine read, so
     /// only Runtime Authority, whose trusted adapter its submit grants,
     /// dispatches it. The ambient path finds no definition to pin.
+    #[cfg(unix)]
     #[test]
     fn only_runtime_authority_pins_a_mission_definition() {
         use crate::automations::missions;

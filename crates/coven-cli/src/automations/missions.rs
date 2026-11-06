@@ -1757,7 +1757,7 @@ mod tests {
             assert_eq!(count(&fixture, table), 0, "{table}");
         }
         assert_eq!(
-            launch::threads_rows(&fixture.home.conn),
+            threads_rows(&fixture.home.conn),
             (0, 0, 0),
             "a preflight refusal decides nothing"
         );
@@ -2554,9 +2554,23 @@ mod tests {
         );
     }
 
+    /// The Threads store's decision, adoption and consumption rows.
+    pub(crate) fn threads_rows(conn: &Connection) -> (i64, i64, i64) {
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap_or(0) };
+        (
+            count("SELECT COUNT(*) FROM automation_threads_decisions"),
+            count("SELECT COUNT(*) FROM automation_threads_store_events WHERE kind = 'adoption'"),
+            count(
+                "SELECT COUNT(*) FROM automation_threads_store_events WHERE kind = 'consumption'",
+            ),
+        )
+    }
+
     /// Missions that launch: a home with `sage`, a stand-in claude 2.1.305
     /// and the owner's key, and a runtime that preflights as the daemon does
     /// and records each launch without starting anything.
+    // Launching needs the trusted adapter, which is Unix-only.
+    #[cfg(unix)]
     pub(super) mod launch {
         use std::cell::{Cell, RefCell};
         use std::rc::Rc;
@@ -2566,19 +2580,6 @@ mod tests {
         use super::*;
         use crate::automations::cancel_commands::execute_occurrence_cancel;
         use crate::automations::trusted_launch::test_support::{scope, Fixture, RecordingRuntime};
-
-        /// The Threads store's decision, adoption and consumption rows.
-        pub(crate) fn threads_rows(conn: &Connection) -> (i64, i64, i64) {
-            let count =
-                |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap_or(0) };
-            (
-                count("SELECT COUNT(*) FROM automation_threads_decisions"),
-                count("SELECT COUNT(*) FROM automation_threads_store_events WHERE kind = 'adoption'"),
-                count(
-                    "SELECT COUNT(*) FROM automation_threads_store_events WHERE kind = 'consumption'",
-                ),
-            )
-        }
 
         fn real_now() -> DateTime<Utc> {
             Utc::now()
