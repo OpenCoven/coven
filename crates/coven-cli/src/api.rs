@@ -1106,6 +1106,16 @@ fn handle_request_with_runtime_authority_and_automation_time(
             )
         }
         #[cfg(feature = "threads-test-clock")]
+        (_, "/internal/ward/power-loss") if !authority.allows_ward_proposal_access() => api_error(
+            403,
+            "transport_forbidden",
+            "Synthetic Ward power-loss control requires the owner-gated local IPC transport.",
+            Some(json!({
+                "requiredAuthority": "owner_local_ipc",
+                "writeApplied": false,
+            })),
+        ),
+        #[cfg(feature = "threads-test-clock")]
         (_, path)
             if (path == "/internal/threads/test-clock"
                 || path == "/internal/threads/test-clock/tick")
@@ -1155,6 +1165,8 @@ fn handle_request_with_runtime_authority_and_automation_time(
         ("POST", "/internal/threads/test-clock/tick") => {
             deterministic_threads_tick_response(coven_home, body)
         }
+        #[cfg(feature = "threads-test-clock")]
+        ("POST", "/internal/ward/power-loss") => ward_power_loss_fixture_response(coven_home, body),
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
         ("GET", p) if p.starts_with("/skills/eval-loop/") && !p.ends_with("/run") => {
             let familiar_id = p.trim_start_matches("/skills/eval-loop/");
@@ -6683,63 +6695,50 @@ fn apply_familiar_edits(
     maybe_pause_direct_apply_before_audit(coven_home, familiar_id);
     // Gate 4 persistence (#414): the audit records returned to the client
     // also land in the append-only ward_audit ledger, so applied writes stay
-    // observable across daemon restarts. Persist before advancing protected
-    // baselines so a post-write failure is less likely to leave an audit gap.
+    // observable across daemon restarts. The audit rows and any protected
+    // baseline advances commit as one durable transaction before the 200
+    // (#1640), so neither DB effect can survive without the other.
     // On persistence failure, return a structured 500 that includes the applied
     // changes so clients can distinguish "write applied, audit failed" from a
     // full failure and avoid blind retries that would produce duplicate writes.
+    if let Err(error) = maybe_fail_direct_audit_store_verification(&store_path)
+        .and_then(|()| audit_reservation.verify_store_path(&store_path))
     {
-        if let Err(error) = maybe_fail_direct_audit_store_verification(&store_path)
-            .and_then(|()| audit_reservation.verify_store_path(&store_path))
-        {
-            audit_reservation.preserve()?;
-            return direct_audit_persist_failed_response(&changes, &error);
-        }
-        let persist_error = crate::threads_gate::persist_apply_audit_records_on_connection(
-            audit_reservation.connection(),
-            familiar_id,
-            &workspace,
-            &config,
-            &report,
-            apply_now,
-        )
-        .err();
-        if let Some(err) = persist_error {
-            audit_reservation.preserve()?;
-            return direct_audit_persist_failed_response(&changes, &err);
-        }
+        audit_reservation.preserve()?;
+        return direct_audit_persist_failed_response(&changes, &error);
     }
-    if let Err(error) = advance_applied_protected_baselines_on_connection(
+    if let Err(failure) = persist_direct_apply_evidence(
         audit_reservation.connection(),
         familiar_id,
         &workspace,
-        &report.changes,
+        &config,
+        &report,
+        apply_now,
     ) {
         audit_reservation.preserve()?;
-        return json_response(
-            500,
-            &json!({
-                "error": {
-                    "code": "ward_baseline_advance_failed",
-                    "message": format!(
-                        "The file write was applied and audited, but protected-surface \
-                         baseline advancement failed: {error:#}"
-                    ),
-                    "details": {
-                        "writeApplied": true,
-                        "retrySafe": false,
+        return match failure {
+            DirectEvidenceFailure::Audit(error) | DirectEvidenceFailure::Durability(error) => {
+                direct_audit_persist_failed_response(&changes, &error)
+            }
+            DirectEvidenceFailure::Baseline(error) => json_response(
+                500,
+                &json!({
+                    "error": {
+                        "code": "ward_baseline_advance_failed",
+                        "message": format!(
+                            "The file write was applied, but protected-surface baseline \
+                             advancement failed, so neither its audit evidence nor the \
+                             baseline advance was recorded: {error:#}"
+                        ),
+                        "details": {
+                            "writeApplied": true,
+                            "retrySafe": false,
+                        },
                     },
-                },
-                "changes": changes,
-            }),
-        );
-    }
-    // Flush both the audit batch and any baseline advances before acknowledging
-    // the installed bytes. Keep their existing failure ordering and retain the
-    // reservation if the WAL or checked namespace barrier cannot be synced.
-    if let Err(error) = store::durable_barrier(audit_reservation.connection()) {
-        audit_reservation.preserve()?;
-        return direct_audit_persist_failed_response(&changes, &error);
+                    "changes": changes,
+                }),
+            ),
+        };
     }
     if let Err(error) = audit_reservation.finish() {
         return json_response(
@@ -6788,6 +6787,63 @@ fn apply_familiar_edits(
             "threadsGate": threads_gate_json,
         }),
     )
+}
+
+/// Which part of a direct write's DB evidence failed. The audit rows and the
+/// baseline advances share one durable transaction, so an `Audit` or
+/// `Baseline` failure rolls back both. A `Durability` failure covers the
+/// mode switch, COMMIT, SQLite sync and the post-COMMIT directory barrier;
+/// after a failed barrier the evidence may already be committed.
+#[derive(Debug)]
+enum DirectEvidenceFailure {
+    Audit(anyhow::Error),
+    Baseline(anyhow::Error),
+    Durability(anyhow::Error),
+}
+
+#[derive(Clone, Copy)]
+enum DirectEvidenceStage {
+    Audit,
+    Baseline,
+}
+
+/// Persist a direct write's Gate-4 audit rows and applicable protected
+/// baseline advances in one durable transaction (#1640). The direct API
+/// refuses Tier-0 edits, so the baseline branch is reached only by callers
+/// that already hold an applied protected change; this boundary adds no
+/// protected-write route.
+fn persist_direct_apply_evidence(
+    conn: &rusqlite::Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    report: &ward::ApplyReport,
+    now: time::OffsetDateTime,
+) -> std::result::Result<(), DirectEvidenceFailure> {
+    let failed = std::cell::Cell::new(None);
+    let result = store::durable_transaction(conn, || {
+        crate::threads_gate::persist_apply_audit_records_on_connection(
+            conn,
+            familiar_id,
+            workspace,
+            config,
+            report,
+            now,
+        )
+        .inspect_err(|_| failed.set(Some(DirectEvidenceStage::Audit)))?;
+        advance_applied_protected_baselines_on_connection(
+            conn,
+            familiar_id,
+            workspace,
+            &report.changes,
+        )
+        .inspect_err(|_| failed.set(Some(DirectEvidenceStage::Baseline)))
+    });
+    result.map_err(|error| match failed.get() {
+        Some(DirectEvidenceStage::Audit) => DirectEvidenceFailure::Audit(error),
+        Some(DirectEvidenceStage::Baseline) => DirectEvidenceFailure::Baseline(error),
+        None => DirectEvidenceFailure::Durability(error),
+    })
 }
 
 fn advance_applied_protected_baselines_on_connection(
@@ -15452,6 +15508,44 @@ fn deterministic_threads_clock_response(
             }),
         ),
         Err(error) => map_deterministic_threads_clock_error(error),
+    }
+}
+
+/// Owner-IPC control of the synthetic Ward power-loss fixture (#1640).
+#[cfg(feature = "threads-test-clock")]
+fn ward_power_loss_fixture_response(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    use crate::ward_power_loss_fixture as fixture;
+    let request: fixture::ControlRequest = match serde_json::from_str(body.unwrap_or_default()) {
+        Ok(request) => request,
+        Err(error) => {
+            return api_error(
+                400,
+                "invalid_request",
+                &format!("Synthetic Ward power-loss request is invalid: {error}"),
+                None,
+            );
+        }
+    };
+    match fixture::control(coven_home, &request) {
+        Ok(report) => json_response(200, &json!({ "ok": true, "report": report })),
+        Err(error) if error.is::<fixture::InactiveFixture>() => api_error(
+            409,
+            "ward_power_loss_fixture_inactive",
+            "The synthetic Ward power-loss fixture is not active for this daemon.",
+            None,
+        ),
+        Err(error) if error.is::<fixture::InvalidFixtureCapability>() => api_error(
+            403,
+            "ward_power_loss_fixture_forbidden",
+            "The synthetic Ward power-loss capability was rejected.",
+            None,
+        ),
+        Err(error) => api_error(
+            500,
+            "ward_power_loss_fixture_failed",
+            &format!("{error:#}"),
+            None,
+        ),
     }
 }
 
@@ -38414,6 +38508,69 @@ tier = 0
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "threads-test-clock"))]
+    #[test]
+    fn ward_power_loss_fixture_route_is_unavailable_in_default_build() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for authority in [RequestAuthority::OwnerLocalIpc, RequestAuthority::Tcp] {
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/api/v1/internal/ward/power-loss",
+                temp.path(),
+                None,
+                Some(r#"{"capability":"fixture-cap","action":"freeze"}"#),
+                &NoopSessionRuntime,
+                authority,
+            )?;
+            assert_eq!(response.status, 404, "{authority:?}: {}", response.body);
+        }
+        assert!(
+            !temp.path().join("test-fixtures").exists(),
+            "a default build must not create fixture state"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn ward_power_loss_fixture_control_requires_owner_transport_and_active_fixture() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = r#"{"capability":"fixture-cap","action":"fail-next-store-sync"}"#;
+        let response = handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/internal/ward/power-loss",
+            temp.path(),
+            None,
+            Some(body),
+            &NoopSessionRuntime,
+            RequestAuthority::Tcp,
+        )?;
+        assert_eq!(response.status, 403, "{}", response.body);
+        // This unit-test process never activates the fixture for this home.
+        let response = handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/internal/ward/power-loss",
+            temp.path(),
+            None,
+            Some(body),
+            &NoopSessionRuntime,
+            RequestAuthority::OwnerLocalIpc,
+        )?;
+        assert_eq!(response.status, 409, "{}", response.body);
+        // Requests name an action only; a path field is refused, not ignored.
+        let response = handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/internal/ward/power-loss",
+            temp.path(),
+            None,
+            Some(r#"{"capability":"fixture-cap","action":"freeze","path":"/tmp/elsewhere"}"#),
+            &NoopSessionRuntime,
+            RequestAuthority::OwnerLocalIpc,
+        )?;
+        assert_eq!(response.status, 400, "{}", response.body);
         Ok(())
     }
 

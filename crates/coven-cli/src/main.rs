@@ -78,7 +78,7 @@ mod parallel_protocol;
 mod patch;
 mod paths;
 mod pc;
-#[cfg(test)]
+#[cfg(any(test, feature = "threads-test-clock"))]
 mod power_loss_tests;
 mod privacy;
 mod project;
@@ -110,6 +110,8 @@ mod ward_probes;
 mod ward;
 mod ward_decision;
 mod ward_migrate;
+#[cfg(feature = "threads-test-clock")]
+mod ward_power_loss_fixture;
 // The coven-threads validator call site: typed authority-state gating of
 // protected-surface mutations (OpenCoven/coven-threads Phase 2). Runs before
 // Ward::apply on the same write path; see threads_gate.rs.
