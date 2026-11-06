@@ -47,6 +47,7 @@ All decided by Val on 2026-10-18.
 | 3 | Who authorizes a mission? | The **owner-local principal** (Decision 1 of the runtime-authority doc), over the owner-only socket or pipe. Submitting is the one-run owner grant, as `occurrence.runNow.v1` on an authority routine already is (decided 2026-10-05). TCP callers are refused before the store opens. |
 | 4 | Approvals? | **Reserved, not produced.** M0 launches only R0. An approval would unlock nothing until a writable envelope exists, the same reasoning slice 7 used. `needs_approval` is in the state set so clients render it once it exists. |
 | 5 | Where does usage come from? | The session's stream-json **result event**, recorded on the attempt when it settles and summed on the mission. Usage is reported, never estimated. A harness that reports none yields `usage: null`. |
+| 6 | Is an errored harness result a completion? | **No.** A run whose process exits cleanly but whose single result event reports `is_error: true`, or whose evidence records its result as not produced, settles the mission `failed` with reason `harness_failed`. It keeps the usage that event reports and lists no report. `completed` is reserved for a result that is not an error, with complete evidence. This is a mission projection only: routine and occurrence settlement are unchanged (decided 2026-11-06). |
 
 ## What a submit binds
 
@@ -224,9 +225,9 @@ keeps. The first matching row wins:
 | `needs_approval` | Reserved (Decision 4). |
 | `running` | The occurrence is `dispatching` or `running`. |
 | `queued` | The occurrence is `planned`, `eligible` or `claimed`. |
-| `completed` | The run is `succeeded`. |
+| `completed` | The run is `succeeded` and its harness produced a result that is not an error. |
 | `cancelled` | The occurrence or run is `cancelled`. |
-| `failed` | The run is `failed` or `timed_out` (reason `timeout`). |
+| `failed` | The run is `failed` or `timed_out` (reason `timeout`), or it is `succeeded` but its harness's result event reports an error or no result was produced (reason `harness_failed`, Decision 6). |
 
 Terminal states never change, and `revision` stops increasing at the terminal
 state. A mission enters `reconciling` instead of reporting "nothing happened"
@@ -258,8 +259,10 @@ interface MissionResult {
 ```
 
 The report is the final assistant message of the session, bounded and stored as
-an owner-only artifact. M0 produces no patch: `outputTarget` stays refused until a
-writable envelope exists.
+an owner-only artifact. Only a `completed` mission lists it: a `harness_failed`
+mission reports the usage its result event carries and no artifact. M0
+produces no patch: `outputTarget` stays refused until a writable envelope
+exists.
 
 ## Fail-closed rules
 
@@ -302,8 +305,9 @@ The `mission-commands` suite holds M-01 to M-07, M-09, M-10, M-11 (a) and
 M-12 to M-18 but M-16. A case runs on a daemon whose runtime either takes no
 authority projections (M-06, and M-03 (c), whose first mission has already
 settled) or launches the scoped read envelope without starting a process
-(M-07, M-10, M-12 to M-14). That stand-in establishes ownership without the
-trusted launch, so the store gate never runs in the suite: the live-runtime
+(M-07, M-10, M-12 to M-14, and Decision 6's errored result, which reads
+`failed` / `harness_failed` with no report). That stand-in establishes
+ownership without the trusted launch, so the store gate never runs in the suite: the live-runtime
 tests, which launch a stand-in harness end to end, hold it. A stop it is asked
 for reads the mission's state while in flight (`cancelling` in M-12). Unit
 tests hold M-08 with a mission kept queued, and M-13's expiry during the

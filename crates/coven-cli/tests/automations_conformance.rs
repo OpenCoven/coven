@@ -965,8 +965,8 @@ fn native_target_evaluates_checked_in_mission_command_vectors() -> anyhow::Resul
     let response: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(response["suiteId"], "mission-commands");
     assert_eq!(response["status"], "passed");
-    assert_eq!(response["evidence"]["executedCases"], 18);
-    assert_eq!(response["evidence"]["passedCases"], 18);
+    assert_eq!(response["evidence"]["executedCases"], 19);
+    assert_eq!(response["evidence"]["passedCases"], 19);
     assert!(!coven_home.exists());
     Ok(())
 }

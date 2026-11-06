@@ -116,6 +116,9 @@ struct Step {
 enum Stream {
     /// A clean scoped read run that read nothing, and its channel's close.
     Complete,
+    /// The same run, whose result event reports an error, as a harness whose
+    /// model refused its key does before it exits 0.
+    Errored,
     /// Nothing: the harness's last writes were never observed.
     None,
 }
@@ -171,6 +174,9 @@ struct Expect {
     /// How many attempts that view lists.
     #[serde(default)]
     attempts: Option<usize>,
+    /// How many artifacts that view's result lists.
+    #[serde(default)]
+    artifacts: Option<usize>,
     /// How many sessions the store holds after the step.
     #[serde(default)]
     sessions: Option<i64>,
@@ -411,6 +417,9 @@ fn case_matches(case: &Case) -> Result<bool, &'static str> {
                 .attempts
                 .is_none_or(|attempts| view["attempts"].as_array().map(Vec::len) == Some(attempts))
             && expect.sessions.is_none_or(|expected| sessions == expected)
+            && expect.artifacts.is_none_or(|artifacts| {
+                view["result"]["artifacts"].as_array().map(Vec::len) == Some(artifacts)
+            })
             && expect
                 .while_stopping
                 .as_ref()
@@ -538,6 +547,9 @@ const QUIET_STREAM: [&str; 3] = [
     r#"{"type":"result","subtype":"success","is_error":false,"result":"Nothing needed reading."}"#,
 ];
 
+/// The result event that ends an errored stream instead.
+const ERRORED_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":true,"result":"Failed to authenticate. API Error: 401","usage":{"input_tokens":7,"output_tokens":0}}"#;
+
 /// Ends the mission's session as a harness exiting cleanly would: what it
 /// printed and its channel's close are seeded, then the store ends the
 /// session and the terminal observer records it, in one transaction, as the
@@ -558,8 +570,12 @@ fn end_session(
         )
         .map_err(failed)?;
     let at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
-    if stream == Stream::Complete {
-        for (index, line) in QUIET_STREAM.iter().enumerate() {
+    if stream != Stream::None {
+        let mut printed = QUIET_STREAM;
+        if stream == Stream::Errored {
+            printed[2] = ERRORED_RESULT;
+        }
+        for (index, line) in printed.iter().enumerate() {
             crate::store::insert_event(
                 conn,
                 &crate::store::EventRecord {

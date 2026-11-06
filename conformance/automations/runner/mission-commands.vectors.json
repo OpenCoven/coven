@@ -1799,7 +1799,8 @@
           "expect": {
             "outcome": "committed",
             "state": "completed",
-            "cancellation": "lost_to_completion"
+            "cancellation": "lost_to_completion",
+            "artifacts": 1
           }
         }
       ]
@@ -2159,6 +2160,83 @@
             "outcome": "committed",
             "state": "running",
             "sameAs": 1
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "a-harness-error-result-is-a-failure-not-a-completion",
+      "runtime": "launching",
+      "steps": [
+        {
+          "command": "mission.submit.v1",
+          "adoptionKey": "adopt:mission:harness-error",
+          "payload": {
+            "familiar": {
+              "rootId": "{{rootId}}",
+              "revisionId": "{{revisionId}}"
+            },
+            "envelope": {
+              "id": "r0-read.2",
+              "descriptorDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "bb98895d2eceb4b926a25b1bc51cbfa03ed311c76dd7eb97f2e1c19beb47c2a2"
+              }
+            },
+            "project": {
+              "cwd": "{{project}}"
+            },
+            "task": {
+              "statement": "Summarize the open issues.",
+              "prompt": "Read the open issues and summarize them."
+            },
+            "scopes": [
+              {
+                "kind": "filesystem",
+                "root": "project",
+                "path": "notes/today.md",
+                "access": "read",
+                "recursive": false
+              }
+            ],
+            "limits": {
+              "timeoutMinutes": 10
+            },
+            "validUntil": "{{start:10m}}"
+          },
+          "expect": {
+            "outcome": "committed",
+            "state": "queued"
+          }
+        },
+        {
+          "command": "session.end",
+          "missionOf": "adopt:mission:harness-error",
+          "stream": "errored",
+          "expect": {
+            "outcome": "committed",
+            "state": "running"
+          }
+        },
+        {
+          "command": "daemon.tick",
+          "missionOf": "adopt:mission:harness-error",
+          "expect": {
+            "outcome": "committed",
+            "state": "failed",
+            "reason": "harness_failed",
+            "artifacts": 0
+          }
+        },
+        {
+          "command": "mission.get.v1",
+          "missionOf": "adopt:mission:harness-error",
+          "expect": {
+            "outcome": "committed",
+            "state": "failed",
+            "reason": "harness_failed",
+            "artifacts": 0
           }
         }
       ]

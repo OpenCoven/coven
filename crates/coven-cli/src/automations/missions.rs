@@ -1087,6 +1087,24 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
         failure_reason.as_deref(),
         settled_after_valid_until,
     );
+    // What the launched attempt left, once its occurrence settled in a state
+    // that `project` reads as terminal.
+    let observed = if matches!(
+        occurrence_state.as_str(),
+        "succeeded" | "failed" | "cancelled" | "timed_out"
+    ) {
+        observed(conn, &occurrence_id)?
+    } else {
+        None
+    };
+    // A run whose process ended cleanly completed the mission only if its
+    // harness produced a result that is not an error (decided 2026-11-06).
+    let (state, reason) =
+        if state == "completed" && observed.as_ref().is_some_and(Observed::result_failed) {
+            ("failed", Some("harness_failed"))
+        } else {
+            (state, reason)
+        };
     let cancellation = cancellation(conn, mission_id, &occurrence_state)?;
     // The daemon's stop after a revocation counts only while the revision is
     // withdrawn, so a stop record alone never makes one.
@@ -1180,7 +1198,7 @@ pub(crate) fn mission_view(conn: &Connection, mission_id: &str) -> Result<Option
         view["cancellation"] = cancellation;
     }
     if terminal {
-        view["result"] = terminal_result(conn, &occurrence_id, state, &settled_at)?;
+        view["result"] = terminal_result(observed.as_ref(), state, &settled_at)?;
     }
     Ok(Some(view))
 }
@@ -1310,27 +1328,34 @@ fn revocation_stop(conn: &Connection, mission_id: &str) -> Result<Option<String>
     .map_err(|error| format!("failed to read the mission's revocation stop: {error}"))
 }
 
-/// The terminal result of `occurrence_id`'s mission, settled as `outcome` at
-/// `settled_at`. It reports what the records say, never an estimate:
-/// - `observation` is the terminal observer's classification of the launched
-///   attempt, `unknown` when it recorded none, and `complete` when nothing
-///   was launched, so nothing went unobserved;
-/// - `usage` is what the harness's single result event reports, or null;
-/// - the report is that event's result text, listed only for a completed
-///   mission whose signed evidence names the same digest.
-fn terminal_result(
-    conn: &Connection,
-    occurrence_id: &str,
-    outcome: &str,
-    settled_at: &str,
-) -> Result<Value, String> {
-    let mut result = json!({
-        "outcome": outcome,
-        "settledAt": settled_at,
-        "artifacts": [],
-        "usage": null,
-        "observation": "complete",
-    });
+/// What the records hold about a mission's launched attempt.
+struct Observed {
+    session_id: String,
+    /// The terminal observer's classification of the attempt, with its
+    /// evidence (null when that cannot be read), if it recorded any.
+    evidence: Option<(String, Value)>,
+    /// The session's result event, when it printed exactly one.
+    result_event: Option<Value>,
+}
+
+impl Observed {
+    /// Whether the harness reported its result as an error, or the evidence
+    /// records its result as not produced. A run like that ended without
+    /// doing what the mission asked, however cleanly its process exited.
+    fn result_failed(&self) -> bool {
+        self.result_event
+            .as_ref()
+            .is_some_and(|event| event["is_error"] == json!(true))
+            || self
+                .evidence
+                .as_ref()
+                .is_some_and(|(_, evidence)| evidence["result"]["state"] == "not_produced")
+    }
+}
+
+/// What the records hold about `occurrence_id`'s launched attempt, or `None`
+/// when nothing was launched.
+fn observed(conn: &Connection, occurrence_id: &str) -> Result<Option<Observed>, String> {
     let launched: Option<(String, String)> = conn
         .query_row(
             "SELECT id, session_id FROM automation_attempts
@@ -1342,7 +1367,7 @@ fn terminal_result(
         .optional()
         .map_err(|error| format!("failed to read the mission's attempt: {error}"))?;
     let Some((attempt_id, session_id)) = launched else {
-        return Ok(result);
+        return Ok(None);
     };
     let evidence_table: bool = conn
         .query_row(
@@ -1364,26 +1389,59 @@ fn terminal_result(
     } else {
         None
     };
-    result["observation"] = json!(match evidence.as_ref().map(|(class, _)| class.as_str()) {
-        Some("receipt_eligible_complete") => "complete",
-        Some("authenticated_partial_or_ambiguous" | "policy_violating") => "partial",
-        _ => "unknown",
-    });
     let (output, _) = super::terminal_observer::session_output(conn, &session_id)
         .map_err(|error| format!("failed to read the mission's session output: {error:#}"))?;
     let mut events = output
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["type"] == "result");
-    let Some(event) = events.next().filter(|_| events.next().is_none()) else {
+    let result_event = events.next().filter(|_| events.next().is_none());
+    Ok(Some(Observed {
+        session_id,
+        evidence: evidence
+            .map(|(class, json)| (class, serde_json::from_str(&json).unwrap_or(Value::Null))),
+        result_event,
+    }))
+}
+
+/// The terminal result of a mission settled as `outcome` at `settled_at`,
+/// from what was `observed` of its launched attempt. It reports what the
+/// records say, never an estimate:
+/// - `observation` is the terminal observer's classification of the launched
+///   attempt, `unknown` when it recorded none, and `complete` when nothing
+///   was launched, so nothing went unobserved;
+/// - `usage` is what the harness's single result event reports, or null,
+///   whether or not that result was an error;
+/// - the report is that event's result text, listed only for a completed
+///   mission whose signed evidence names the same digest.
+fn terminal_result(
+    observed: Option<&Observed>,
+    outcome: &str,
+    settled_at: &str,
+) -> Result<Value, String> {
+    let mut result = json!({
+        "outcome": outcome,
+        "settledAt": settled_at,
+        "artifacts": [],
+        "usage": null,
+        "observation": "complete",
+    });
+    let Some(observed) = observed else {
         return Ok(result);
     };
-    result["usage"] = reported_usage(&event);
+    let evidence = observed.evidence.as_ref();
+    result["observation"] = json!(match evidence.map(|(class, _)| class.as_str()) {
+        Some("receipt_eligible_complete") => "complete",
+        Some("authenticated_partial_or_ambiguous" | "policy_violating") => "partial",
+        _ => "unknown",
+    });
+    let Some(event) = &observed.result_event else {
+        return Ok(result);
+    };
+    result["usage"] = reported_usage(event);
     let produced = evidence
-        .as_ref()
-        .and_then(|(_, json)| serde_json::from_str::<Value>(json).ok())
-        .filter(|evidence| evidence["result"]["state"] == "produced")
-        .and_then(|evidence| {
+        .filter(|(_, evidence)| evidence["result"]["state"] == "produced")
+        .and_then(|(_, evidence)| {
             evidence["result"]["digest"]["value"]
                 .as_str()
                 .map(str::to_owned)
@@ -1397,7 +1455,7 @@ fn terminal_result(
                 "kind": "report",
                 // The report is the session's final result event, kept as
                 // long as the daemon keeps that session's log.
-                "ref": format!("session:{session_id}:result"),
+                "ref": format!("session:{}:result", observed.session_id),
                 "mediaType": "text/markdown",
                 "bytes": text.len(),
                 "digest": digest_value(&digest),

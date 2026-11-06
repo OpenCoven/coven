@@ -672,6 +672,46 @@ fn a_mission_launches_under_the_store_gate_and_settles_from_its_evidence() {
 }
 
 #[test]
+fn a_mission_whose_harness_reports_an_error_fails_with_the_usage_it_reports() {
+    use crate::automations::stream_observation::test_support::scoped_read_run_calling;
+    let fixture = Fixture::new();
+    // The model refused the harness's key, and the harness still exits 0.
+    let mut stream = scoped_read_run_calling(2);
+    *stream.last_mut().unwrap() = json!({
+        "type": "result", "subtype": "success", "is_error": true,
+        "result": "Failed to authenticate. API Error: 401",
+        "total_cost_usd": 0.0,
+        "usage": { "input_tokens": 7, "output_tokens": 0,
+                   "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 },
+    })
+    .to_string();
+    let (runtime, mission_id) = mission_ending_with(&fixture, &stream);
+    crate::automations::runner::settle_finished_runs(&fixture.home.conn, chrono::Utc::now())
+        .unwrap();
+
+    let view = mission_view(&fixture, &mission_id);
+    assert_eq!(
+        (
+            view["state"].as_str(),
+            view["reason"].as_str(),
+            view["terminal"].as_bool()
+        ),
+        (Some("failed"), Some("harness_failed"), Some(true)),
+        "{view:#}"
+    );
+    let result = &view["result"];
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(
+        result["usage"],
+        json!({ "source": "harness_result_event", "inputTokens": 7, "outputTokens": 0,
+                "cacheReadTokens": 0, "cacheWriteTokens": 0, "costUsd": 0.0 })
+    );
+    assert_eq!(result["artifacts"], json!([]), "{result:#}");
+    assert!(result.get("resultDigest").is_none(), "{result:#}");
+    drop(runtime);
+}
+
+#[test]
 fn a_mission_cancel_after_its_conclusive_completion_loses_to_it() {
     use crate::automations::missions::{self, MissionExecution};
     let fixture = Fixture::new();

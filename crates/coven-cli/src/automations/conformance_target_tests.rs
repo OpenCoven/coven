@@ -1393,13 +1393,13 @@ fn mission_commands_suite_executes_the_checked_in_vectors() {
     let response = evaluate(&request_for("mission-commands", vectors)).unwrap();
 
     assert_eq!(response.status, TargetSuiteStatus::Passed);
-    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 18);
-    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 18);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 19);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 19);
 }
 
 #[test]
 fn mission_commands_suite_fails_when_the_executors_disagree() {
-    let wrong_expectations: [fn(&mut Value); 23] = [
+    let wrong_expectations: [fn(&mut Value); 26] = [
         // A lost acknowledgement would have to commit a second time.
         |vectors| {
             vectors["cases"][1]["steps"][1]["expect"] =
@@ -1475,6 +1475,12 @@ fn mission_commands_suite_fails_when_the_executors_disagree() {
         |vectors| vectors["cases"][16]["steps"][1]["expect"]["sessions"] = json!(1),
         // A restarted client would have to find the mission queued again.
         |vectors| vectors["cases"][17]["steps"][2]["expect"]["state"] = json!("queued"),
+        // A conclusive success would have to list no report.
+        |vectors| vectors["cases"][12]["steps"][3]["expect"]["artifacts"] = json!(0),
+        // A harness that reported an error would have to read as completed,
+        // or list a report.
+        |vectors| vectors["cases"][18]["steps"][2]["expect"]["state"] = json!("completed"),
+        |vectors| vectors["cases"][18]["steps"][3]["expect"]["artifacts"] = json!(1),
     ];
 
     for mutate in wrong_expectations {
