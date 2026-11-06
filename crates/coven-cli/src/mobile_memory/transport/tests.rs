@@ -4,6 +4,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 mod real_relay;
+mod v2_channel;
+mod v2_vectors;
 
 #[test]
 fn signed_preimages_match_independent_cbor_vectors() {
@@ -55,6 +57,47 @@ fn signed_preimages_match_independent_cbor_vectors() {
             hex(&prologue(&context, direct).unwrap()),
             vectors["prologues"][name].as_str().unwrap()
         );
+    }
+}
+
+#[test]
+fn v2_signed_preimages_bind_generation_host_floor_and_room() {
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("vectors/wire-v2.json")).unwrap();
+    let scalar = |n: u8| {
+        let mut b = [0; 32];
+        b[31] = n;
+        SigningKey::from_slice(&b).unwrap()
+    };
+    let pairing = Pairing {
+        device_id: Uuid::from_u128(1),
+        grant_id: Uuid::from_u128(2),
+        revocation_epoch: 3,
+        host_key: *scalar(1).verifying_key(),
+        device_key: *scalar(2).verifying_key(),
+        noise_key: std::array::from_fn(|i| i as u8),
+    };
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    for case in vectors["possessionProofs"].as_array().unwrap() {
+        for (role, field) in [("host", "hostProof"), ("device", "deviceProof")] {
+            assert_eq!(
+                hex(&pairing
+                    .proof_v2(
+                        role,
+                        &[3; 32],
+                        &[4; 32],
+                        &[5; 32],
+                        routing::HostProof {
+                            generation: case["generation"].as_u64().unwrap(),
+                            host_floor: case["hostFloor"].as_u64().unwrap(),
+                            counter: case["counter"].as_u64().unwrap()
+                        }
+                    )
+                    .unwrap()),
+                case[field].as_str().unwrap(),
+                "{case}"
+            );
+        }
     }
 }
 
@@ -699,6 +742,7 @@ fn relay_configuration_is_opt_in_and_private() {
     let home = tempfile::tempdir().unwrap();
     assert!(storage::RelayConfig::load(home.path()).unwrap().is_none());
     let config = storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
         version: 1,
         enabled: true,
         endpoints: vec![websocket::EndpointConfig {
@@ -711,6 +755,7 @@ fn relay_configuration_is_opt_in_and_private() {
     assert!(loaded.enabled);
     assert!(loaded.endpoints == config.endpoints);
     assert!(storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
         version: 2,
         enabled: true,
         endpoints: config.endpoints
