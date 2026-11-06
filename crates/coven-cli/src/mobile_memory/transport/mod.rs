@@ -21,6 +21,7 @@ pub mod cancellation;
 pub(super) mod diagnostics;
 mod message;
 mod network;
+pub mod routing;
 pub mod storage;
 #[cfg(test)]
 pub(super) mod test_support;
@@ -111,6 +112,36 @@ impl Pairing {
         fields.extend(self.fields());
         encode(fields)
     }
+
+    fn proof_v2(
+        &self,
+        role: &str,
+        hash: &[u8],
+        host_nonce: &[u8],
+        device_nonce: &[u8],
+        routing: routing::HostProof,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            role == "host" || role == "device",
+            "invalid possession role"
+        );
+        let mut fields = vec![
+            Value::Text("coven.mobile.possession".into()),
+            Value::Integer(2.into()),
+            Value::Text(PROFILE.into()),
+            Value::Text(role.into()),
+            bytes(hash),
+            bytes(host_nonce),
+            bytes(device_nonce),
+        ];
+        fields.extend(self.fields());
+        fields.extend([
+            Value::Integer(routing.generation.into()),
+            Value::Integer(routing.host_floor.into()),
+            Value::Integer(routing.counter.into()),
+        ]);
+        encode(fields)
+    }
 }
 
 fn bytes(value: &[u8]) -> Value {
@@ -171,6 +202,7 @@ pub struct Channel<R> {
     records: R,
     cipher: Option<TransportState>,
     pairing: Pairing,
+    routing_generation: Option<u64>,
     direct: bool,
 }
 
@@ -189,6 +221,10 @@ impl<R: Records> Channel<R> {
 
     pub fn pairing(&self) -> &Pairing {
         &self.pairing
+    }
+
+    pub fn routing_generation(&self) -> Option<u64> {
+        self.routing_generation
     }
 
     pub fn is_direct(&self) -> bool {
@@ -315,6 +351,7 @@ pub fn connect<R: Records>(
         records,
         cipher: Some(handshake.into_transport_mode()?),
         pairing: pairing.clone(),
+        routing_generation: None,
         direct,
     };
     let host_nonce = channel.receive(deadline)?;
@@ -373,6 +410,7 @@ pub fn accept<R: Records>(
         records,
         cipher: Some(handshake.into_transport_mode()?),
         pairing: pairing.clone(),
+        routing_generation: None,
         direct,
     };
     let host_nonce = nonce()?;

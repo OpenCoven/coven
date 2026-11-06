@@ -1,8 +1,8 @@
 //! Daemon-owned outbound workers; network state never changes device authority.
+mod budget;
+mod counter;
 use super::*;
-use crate::mobile_memory::transport::{
-    self, authority, cancellation::Cancellation, storage, websocket,
-};
+use crate::mobile_memory::transport::{self, cancellation::Cancellation, storage, websocket};
 use p256::ecdsa::SigningKey;
 use std::collections::BTreeMap;
 use std::sync::Condvar;
@@ -58,6 +58,8 @@ impl WorkerControl {
 }
 
 struct Worker {
+    // Released only after Drop has cancelled and joined the owning socket.
+    _listener: budget::ListenerPermit,
     control: Arc<WorkerControl>,
     authenticated: Arc<AtomicBool>,
     pairing: transport::Pairing,
@@ -111,7 +113,9 @@ impl Drop for RelayHandle {
 fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Stop>) {
     let mut workers: BTreeMap<Uuid, Worker> = BTreeMap::new();
     let mut retries: BTreeMap<Uuid, Retry> = BTreeMap::new();
-    let mut configuration = None;
+    let mut configuration: Option<storage::RelayConfig> = None;
+    let budget = budget::ListenerBudget::new(storage::MAX_LISTENERS).expect("fixed listener limit");
+    let mut counters = counter::Workers::default();
     let mut endpoints: Vec<Arc<websocket::RelayEndpoint>> = Vec::new();
     let mut cursor = 0_usize;
     while !stop.requested.load(Ordering::Acquire) {
@@ -146,10 +150,18 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
             .ok()
             .flatten()
             .filter(|config| config.enabled);
-        if next != configuration {
+        let network_changed = next
+            .as_ref()
+            .map(|config| (&config.enabled, &config.endpoints))
+            != configuration
+                .as_ref()
+                .map(|config| (&config.enabled, &config.endpoints));
+        let _ = budget.set_limit(next.as_ref().map_or(0, |config| config.listener_limit));
+        if network_changed {
             for worker in workers.values() {
                 worker.control.cancel();
             }
+            counters.cancel();
             endpoints = next
                 .as_ref()
                 .map(|config| {
@@ -163,9 +175,9 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            configuration = next;
             retries.clear();
         }
+        configuration = next;
         let identity_matches =
             super::super::identity::load_existing_host_identity(&state.coven_home)
                 .is_ok_and(|identity| identity.public_key_fingerprint == state.host_fingerprint);
@@ -174,6 +186,8 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
             .reload()
             .and_then(|()| state.registry.list_status());
         if endpoints.is_empty() || !identity_matches || devices.is_err() {
+            counters.cancel();
+            counters.reap();
             for worker in workers.values() {
                 worker.control.cancel();
             }
@@ -181,8 +195,14 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
             continue;
         }
         for worker in workers.values() {
-            if authority::check_current(&state.registry, &worker.pairing, false, Utc::now())
-                .is_err()
+            if storage::v2::check_channel(
+                &state.coven_home,
+                &state.registry,
+                &worker.pairing,
+                transport::routing::Transport::Relay,
+                None,
+            )
+            .is_err()
             {
                 worker.control.cancel();
             }
@@ -190,11 +210,14 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
         let devices = devices.unwrap_or_default();
         retries.retain(|id, _| devices.iter().any(|device| device.id == *id));
         for offset in 0..devices.len() {
-            if workers.len() >= MAX_WORKERS || stop.requested.load(Ordering::Acquire) {
+            if workers.len() + counters.pairing_count() >= MAX_WORKERS
+                || stop.requested.load(Ordering::Acquire)
+            {
                 break;
             }
             let device = &devices[cursor.wrapping_add(offset) % devices.len()];
             if workers.contains_key(&device.id)
+                || counters.contains(device.id)
                 || retries
                     .get(&device.id)
                     .is_some_and(|retry| retry.after > Instant::now())
@@ -209,6 +232,9 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
             ) {
                 Ok(Some(material)) => material,
                 _ => continue,
+            };
+            let Some(permit) = budget.acquire() else {
+                break;
             };
             let attempt = retries.get(&device.id).map_or(0, |retry| retry.count);
             let endpoint = Arc::clone(&endpoints[attempt % endpoints.len()]);
@@ -236,6 +262,7 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
                     workers.insert(
                         device.id,
                         Worker {
+                            _listener: permit,
                             control,
                             authenticated,
                             pairing,
@@ -254,12 +281,26 @@ fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Sto
                 }
             }
         }
+        let ids: Vec<_> = (0..devices.len())
+            .map(|offset| devices[cursor.wrapping_add(offset) % devices.len()].id)
+            .collect();
+        counters.tick(counter::Tick {
+            state: &state,
+            signer: &signer,
+            endpoints: &endpoints,
+            budget: &budget,
+            ids: &ids,
+            legacy: &workers,
+            stop: &stop,
+        });
         cursor = cursor.wrapping_add(1);
         stop.wait();
     }
     for worker in workers.values() {
         worker.control.cancel();
     }
+    counters.cancel();
+    drop(counters);
     drop(workers);
 }
 
@@ -307,7 +348,15 @@ fn serve(
         &signer,
         &room,
         false,
-        |pairing, direct| authority::check_current(&state.registry, pairing, direct, Utc::now()),
+        |pairing, _| {
+            storage::v2::check_channel(
+                &state.coven_home,
+                &state.registry,
+                pairing,
+                transport::routing::Transport::Relay,
+                None,
+            )
+        },
     )?;
     authenticated.store(true, Ordering::Release);
     while channel.is_open() {

@@ -109,8 +109,17 @@ pub(crate) struct Relay {
 
 impl Relay {
     pub(crate) fn start() -> Self {
+        Self::start_with_host("localhost")
+    }
+
+    /// Literal-address fixtures isolate socket ownership from resolver admission.
+    pub(crate) fn start_literal() -> Self {
+        Self::start_with_host("127.0.0.1")
+    }
+
+    fn start_with_host(host: &str) -> Self {
         use base64::Engine;
-        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec![host.into()]).unwrap();
         let root = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(certificate.cert.der());
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -128,7 +137,7 @@ impl Relay {
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let configuration = websocket::EndpointConfig {
-            url: format!("wss://localhost:{}/ws", address.port()),
+            url: format!("wss://{host}:{}/ws", address.port()),
             ca_certificates: vec![root],
         };
         let endpoint = configuration.parse().unwrap();

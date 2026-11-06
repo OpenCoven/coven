@@ -11,14 +11,14 @@ use p256::{
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
-struct Fixture {
+pub(super) struct Fixture {
     _home: tempfile::TempDir,
-    state: MobileGatewayState,
-    device: SigningKey,
-    pairing: Pairing,
+    pub(super) state: MobileGatewayState,
+    pub(super) device: SigningKey,
+    pub(super) pairing: Pairing,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
         Self::with_home(home)
     }
@@ -68,6 +68,9 @@ impl Fixture {
         }
     }
     fn request(&self, method: &str, path: &str, id: Uuid) -> Vec<u8> {
+        self.request_body(method, path, id, &[])
+    }
+    fn request_body(&self, method: &str, path: &str, id: Uuid, body: &[u8]) -> Vec<u8> {
         use ring::rand::SecureRandom;
         let timestamp = Utc::now().timestamp();
         let mut request_nonce = [0_u8; 32];
@@ -75,12 +78,14 @@ impl Fixture {
             .fill(&mut request_nonce)
             .unwrap();
         let nonce = URL_SAFE_NO_PAD.encode(request_nonce);
-        let digest = URL_SAFE_NO_PAD.encode(Sha256::digest([]));
+        let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(body));
         let canonical =
             crate::mobile_memory::auth::canonical_request(method, path, timestamp, &nonce, &digest)
                 .unwrap();
         let signature: Signature = self.device.sign(&canonical);
-        format!("{method} {path} HTTP/1.1\r\nx-coven-protocol: 1\r\nx-coven-device: {id}\r\nx-coven-timestamp: {timestamp}\r\nx-coven-nonce: {nonce}\r\nx-coven-body-sha256: {digest}\r\nx-coven-signature: {}\r\ncontent-length: 0\r\n\r\n", URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes())).into_bytes()
+        let mut request=format!("{method} {path} HTTP/1.1\r\nx-coven-protocol: 1\r\nx-coven-device: {id}\r\nx-coven-timestamp: {timestamp}\r\nx-coven-nonce: {nonce}\r\nx-coven-body-sha256: {digest}\r\nx-coven-signature: {}\r\ncontent-length: {}\r\n\r\n",URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),body.len()).into_bytes();
+        request.extend_from_slice(body);
+        request
     }
 }
 
@@ -220,6 +225,7 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         },
     );
     storage::RelayConfig {
+        listener_limit: crate::mobile_memory::transport::storage::MAX_LISTENERS,
         version: 1,
         enabled: true,
         endpoints: vec![endpoint],
@@ -383,7 +389,7 @@ fn encrypted_gateway_keeps_per_request_signatures_and_shared_replay_state() {
     let wire = fixture.request("GET", path, fixture.pairing.device_id);
     let request = read_mobile_request(&mut wire.as_slice()).unwrap();
     assert_eq!(
-        handle_protected_route(&fixture.state, MobileRoute::DeviceRead, path, request).status,
+        handle_protected_route(&fixture.state, MobileRoute::DeviceRead, path, request, true).status,
         200
     );
     let (replay, _) =
@@ -481,6 +487,7 @@ fn relay_shutdown_cancels_contended_registry_lock_without_mutating_authority() {
     let relay = super::super::transport::test_support::Relay::start();
     let home = fixture.state.coven_home.clone();
     storage::RelayConfig {
+        listener_limit: crate::mobile_memory::transport::storage::MAX_LISTENERS,
         version: 1,
         enabled: true,
         endpoints: vec![relay.configuration()],
@@ -540,6 +547,7 @@ fn direct_only_bootstrap_omits_relay_endpoints_and_relay_still_refuses() {
         ca_certificates: vec![URL_SAFE_NO_PAD.encode(certificate.cert.der())],
     };
     storage::RelayConfig {
+        listener_limit: crate::mobile_memory::transport::storage::MAX_LISTENERS,
         version: 1,
         enabled: true,
         endpoints: vec![relay.configuration(), private_endpoint.clone()],
@@ -742,6 +750,7 @@ fn authenticated_bootstrap_reuses_identity_and_persists_routing_without_qr() {
     let certificate =
         rcgen::generate_simple_self_signed(vec!["relay.example.test".into()]).unwrap();
     let relay = storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
         version: 1,
         enabled: true,
         endpoints: vec![super::super::transport::websocket::EndpointConfig {
@@ -788,6 +797,7 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
     };
     super::super::config::save_mobile_config(&fixture.state.coven_home, &config).unwrap();
     storage::RelayConfig {
+        listener_limit: crate::mobile_memory::transport::storage::MAX_LISTENERS,
         version: 1,
         enabled: true,
         endpoints: vec![relay.configuration()],
@@ -936,6 +946,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
     )
     .unwrap();
     storage::RelayConfig {
+        listener_limit: crate::mobile_memory::transport::storage::MAX_LISTENERS,
         version: 1,
         enabled: true,
         endpoints: vec![relay.configuration()],
@@ -1064,6 +1075,7 @@ fn relay_runtime_recovers_a_missed_slot_and_closes_rotated_or_revoked_sessions()
     )
     .unwrap();
     storage::RelayConfig {
+        listener_limit: crate::mobile_memory::transport::storage::MAX_LISTENERS,
         version: 1,
         enabled: true,
         endpoints: vec![relay.configuration()],
@@ -1257,3 +1269,459 @@ fn relay_runtime_recovers_a_missed_slot_and_closes_rotated_or_revoked_sessions()
     markers.push(("completion plaintext", b"host-finished-v1".to_vec()));
     assert_bytes_exclude(&captured, &markers);
 }
+
+#[test]
+fn signed_direct_v2_bootstrap_prepares_adopts_acknowledges_and_resyncs_without_v1_fallback() {
+    use crate::mobile_memory::transport::{routing::Transport, storage::v2};
+    let fixture = Fixture::new();
+    let id = fixture.pairing.device_id;
+    let path = "/api/v1/mobile/transport/bootstrap";
+    let direct_request = |body: serde_json::Value| {
+        let wire = fixture.request_body("POST", path, id, &serde_json::to_vec(&body).unwrap());
+        let request =
+            read_mobile_request_buffered(&mut BufReader::new(std::io::Cursor::new(wire))).unwrap();
+        handle_mobile_request(&fixture.state, request)
+    };
+    let response = direct_request(serde_json::json!({"version":2,"operation":"prepare"}));
+    assert_eq!(response.status, 200, "{}", response.body);
+    let envelope: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(
+        envelope["data"]["version"], 2,
+        "v2 bootstrap returned v1 material"
+    );
+    let handover: v2::Handover = serde_json::from_value(envelope["data"].clone()).unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    assert!(v2::load(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        id,
+        Transport::Relay
+    )
+    .unwrap()
+    .is_none());
+    let device_home = tempfile::tempdir().unwrap();
+    let ack = v2::device::adopt_direct(
+        device_home.path(),
+        handover,
+        host.verifying_key(),
+        id,
+        fixture.device.verifying_key(),
+    )
+    .unwrap();
+    let response = direct_request(
+        serde_json::json!({"version":2,"operation":"acknowledge","generation":ack.generation,"seedDigest":ack.seed_digest}),
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    let response = direct_request(
+        serde_json::json!({"version":2,"operation":"resync","transport":"relay","generation":0,"next":4}),
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["data"]["floor"],
+        4
+    );
+    assert_eq!(
+        v2::load(
+            &fixture.state.coven_home,
+            &fixture.state.registry,
+            host.verifying_key(),
+            id,
+            Transport::Relay
+        )
+        .unwrap()
+        .unwrap()
+        .floors,
+        [0, 4]
+    );
+    std::fs::remove_file(
+        fixture
+            .state
+            .coven_home
+            .join(format!("mobile/transport-{id}.json")),
+    )
+    .unwrap();
+    let response =
+        direct_request(serde_json::json!({"version":2,"operation":"recover","knownGeneration":0}));
+    assert_eq!(response.status, 200, "{}", response.body);
+    let handover: v2::Handover = serde_json::from_value(
+        serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["data"].clone(),
+    )
+    .unwrap();
+    assert_eq!(handover.generation, 1);
+    let ack = v2::device::adopt_direct(
+        device_home.path(),
+        handover,
+        host.verifying_key(),
+        id,
+        fixture.device.verifying_key(),
+    )
+    .unwrap();
+    assert_eq!(direct_request(serde_json::json!({"version":2,"operation":"acknowledge","generation":ack.generation,"seedDigest":ack.seed_digest})).status,200);
+    assert_eq!(
+        v2::load(
+            &fixture.state.coven_home,
+            &fixture.state.registry,
+            host.verifying_key(),
+            id,
+            Transport::Relay
+        )
+        .unwrap()
+        .unwrap()
+        .generation,
+        1
+    );
+    assert_ne!(
+        direct_request(serde_json::json!({"version":2,"operation":"prepare","extra":true})).status,
+        200
+    );
+    let wire = fixture.request("POST", path, id);
+    let request =
+        read_mobile_request_buffered(&mut BufReader::new(std::io::Cursor::new(wire))).unwrap();
+    assert_ne!(
+        handle_mobile_request(&fixture.state, request).status,
+        200,
+        "legacy bootstrap reopened v1"
+    );
+}
+
+#[test]
+fn relay_ingress_cannot_prepare_acknowledge_or_resync_v2_routing() {
+    let fixture = Fixture::new();
+    let id = fixture.pairing.device_id;
+    let path = "/api/v1/mobile/transport/bootstrap";
+    let material = fixture
+        .state
+        .coven_home
+        .join(format!("mobile/transport-{id}.json"));
+    let before = std::fs::read(&material).unwrap();
+    for body in [
+        serde_json::json!({"version":2,"operation":"recover","knownGeneration":0}),
+        serde_json::json!({"version":2,"operation":"prepare"}),
+        serde_json::json!({"version":2,"operation":"acknowledge","generation":0,"seedDigest":vec![0;32]}),
+        serde_json::json!({"version":2,"operation":"resync","transport":"relay","generation":0,"next":4}),
+    ] {
+        let wire = fixture.request_body("POST", path, id, &serde_json::to_vec(&body).unwrap());
+        let (response, _) =
+            handle_transport_message(&fixture.state, &fixture.pairing, false, &wire).unwrap();
+        assert_eq!(response.status, 403, "{}", response.body);
+        assert_eq!(std::fs::read(&material).unwrap(), before);
+        assert!(!response.body.contains("routingSeed"));
+    }
+}
+
+#[test]
+fn v2_upgrade_blocks_legacy_noise_effects_but_retains_authenticated_direct_recovery() {
+    let fixture = Fixture::new();
+    let id = fixture.pairing.device_id;
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let handover = storage::v2::prepare_direct(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &host,
+        id,
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let ack = storage::v2::device::adopt_direct(
+        home.path(),
+        handover,
+        host.verifying_key(),
+        id,
+        fixture.device.verifying_key(),
+    )
+    .unwrap();
+    storage::v2::acknowledge_direct(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &host,
+        id,
+        &ack,
+    )
+    .unwrap();
+    for direct in [false, true] {
+        let wire = fixture.request("DELETE", "/api/v1/mobile/device", id);
+        assert!(
+            handle_transport_message(&fixture.state, &fixture.pairing, direct, &wire).is_err(),
+            "legacy Noise channel retained application authority after v2 upgrade"
+        );
+        assert!(fixture
+            .state
+            .registry
+            .authorization_record(id)
+            .unwrap()
+            .unwrap()
+            .device
+            .revoked_at
+            .is_none());
+    }
+    let wire = fixture.request_body(
+        "POST",
+        "/api/v1/mobile/transport/bootstrap",
+        id,
+        br#"{"version":2,"operation":"prepare"}"#,
+    );
+    let (response, _) =
+        handle_transport_message(&fixture.state, &fixture.pairing, true, &wire).unwrap();
+    assert_eq!(response.status, 200, "{}", response.body);
+}
+
+#[test]
+fn generation_change_after_initial_admission_cannot_delete_device() {
+    let fixture = Fixture::new();
+    let id = fixture.pairing.device_id;
+    let home = fixture.state.coven_home.clone();
+    let registry = Arc::clone(&fixture.state.registry);
+    AFTER_ROUTING_ADMISSION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            let identity = super::super::identity::load_existing_host_identity(&home).unwrap();
+            let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+            storage::v2::prepare_direct(&home, &registry, &host, id).unwrap();
+        }));
+    });
+    let wire = fixture.request("DELETE", "/api/v1/mobile/device", id);
+    assert!(handle_transport_message(&fixture.state, &fixture.pairing, true, &wire).is_err());
+    assert!(fixture
+        .state
+        .registry
+        .authorization_record(id)
+        .unwrap()
+        .unwrap()
+        .device
+        .revoked_at
+        .is_none());
+}
+
+#[test]
+fn counter_runtime_advertises_four_rooms_per_endpoint_and_serves_durable_device() {
+    let _guard = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    use super::super::transport::{routing::Transport, test_support::Relay, websocket};
+    let fixture = Fixture::new();
+    let relays = [Relay::start(), Relay::start()];
+    super::super::config::save_mobile_config(
+        &fixture.state.coven_home,
+        &MobileGatewayConfig {
+            enabled: false,
+            bind: "192.168.50.1:7443".parse().unwrap(),
+            advertised_endpoint: "https://192.168.50.1:7443".into(),
+        },
+    )
+    .unwrap();
+    storage::RelayConfig {
+        version: 1,
+        enabled: true,
+        listener_limit: 512,
+        endpoints: relays.iter().map(Relay::configuration).collect(),
+    }
+    .save(&fixture.state.coven_home)
+    .unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let id = fixture.pairing.device_id;
+    let handover = storage::v2::prepare_direct(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &host,
+        id,
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let ack = storage::v2::device::adopt_direct(
+        home.path(),
+        handover,
+        host.verifying_key(),
+        id,
+        fixture.device.verifying_key(),
+    )
+    .unwrap();
+    storage::v2::acknowledge_direct(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &host,
+        id,
+        &ack,
+    )
+    .unwrap();
+    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+        .unwrap()
+        .unwrap();
+    assert!(runtime._direct.is_none());
+    for round in 0..6_u64 {
+        let snapshot = storage::v2::load(
+            &fixture.state.coven_home,
+            &fixture.state.registry,
+            host.verifying_key(),
+            id,
+            Transport::Relay,
+        )
+        .unwrap()
+        .unwrap();
+        // A generous hang guard; readiness is each actual outgoing host room join,
+        // not a delay or merely the existence of the daemon thread.
+        let until = Instant::now() + Duration::from_secs(120);
+        loop {
+            let complete = relays.iter().all(|relay| {
+                let captured = relay.captured();
+                let wire = String::from_utf8_lossy(&captured);
+                (round..round + 4).all(|counter| {
+                    let (room, _) = snapshot.rendezvous(Transport::Relay, counter).unwrap();
+                    wire.contains(&format!("room={}&role=host", URL_SAFE_NO_PAD.encode(room)))
+                })
+            });
+            if complete {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "daemon never advertised the four counter rooms on both endpoints"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let reconnect_started = Instant::now();
+        let mut retries = 0_u64;
+        let (attempt, mut channel) = loop {
+            let mut attempt = storage::v2::device::begin(
+                home.path(),
+                host.verifying_key(),
+                id,
+                fixture.device.verifying_key(),
+                Transport::Relay,
+            )
+            .unwrap();
+            let before = attempt.state();
+            let (room, credential) = attempt.rendezvous().unwrap();
+            let connected = relays[1]
+                .connect(websocket::Role::Client, &room, &credential)
+                .and_then(|records| attempt.connect(records, &fixture.device));
+            match connected {
+                Ok(channel) => break (attempt, channel),
+                Err(error) => {
+                    drop(attempt);
+                    let retained = storage::v2::device::begin(
+                        home.path(),
+                        host.verifying_key(),
+                        id,
+                        fixture.device.verifying_key(),
+                        Transport::Relay,
+                    )
+                    .unwrap();
+                    // Room arrival/expiry may fail before a genuine host proof.
+                    // Never retry away an advance or a lost completion here.
+                    assert_eq!(
+                        retained.state(),
+                        before,
+                        "round {round} failed after durable device consumption: {error:#}"
+                    );
+                    drop(retained);
+                    retries += 1;
+                    eprintln!("counter reconnect round {round} pre-consumption failure {retries}: {error:#}");
+                    assert!(
+                        reconnect_started.elapsed() < Duration::from_secs(120),
+                        "round {round} reconnect wedged: {error:#}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        eprintln!(
+            "counter reconnect round {round}: {:?}, pre-consumption retries {retries}",
+            reconnect_started.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        channel
+            .send_message(
+                &fixture.request("GET", "/api/v1/mobile/device", id),
+                MAX_MOBILE_REQUEST_BYTES,
+                deadline,
+            )
+            .unwrap();
+        let response = channel
+            .receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline)
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(
+            storage::v2::load(
+                &fixture.state.coven_home,
+                &fixture.state.registry,
+                host.verifying_key(),
+                id,
+                Transport::Relay
+            )
+            .unwrap()
+            .unwrap()
+            .floors,
+            [0, round + 1]
+        );
+        drop(channel);
+        drop(attempt);
+    }
+    let started = Instant::now();
+    drop(runtime);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "counter daemon stop exceeded two seconds: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn restore_fence_rejects_signed_direct_https_effects_until_fresh_handover() {
+    for (phase, complete) in [
+        ("installing", false),
+        ("awaitingHandovers", false),
+        ("awaitingHandovers", true),
+    ] {
+        let fixture = Fixture::new();
+        let id = fixture.pairing.device_id;
+        let directory = fixture.state.coven_home.join("mobile");
+        if phase == "awaitingHandovers" {
+            let path = directory.join("devices.json");
+            let mut registry: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            registry["restoreEpoch"] = serde_json::json!(1);
+            super::super::config::atomic_replace_private(
+                &path,
+                &serde_json::to_vec(&registry).unwrap(),
+            )
+            .unwrap();
+        }
+        let state = serde_json::json!({
+            "version": 1, "operationId": Uuid::from_u128(99), "sourceDigest": vec![0_u8; 32],
+            "installationFingerprint": fixture.state.host_fingerprint,
+            "installationEpoch": 1, "phase": phase,
+            "pairings": [{ "deviceId": id, "generation": 1, "revocationEpoch": 1, "handoverComplete": complete }]
+        });
+        super::super::config::atomic_replace_private(
+            &directory.join(".transport-restore.required"),
+            b"coven.mobile.restore.v1\n",
+        )
+        .unwrap();
+        super::super::config::atomic_replace_private(
+            &directory.join("transport-restore.json"),
+            &serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let wire = fixture.request("DELETE", "/api/v1/mobile/device", id);
+        let mut reader = BufReader::new(std::io::Cursor::new(wire));
+        let request = read_mobile_request_buffered(&mut reader).unwrap();
+        let response = handle_mobile_request(&fixture.state, request);
+        assert_eq!(response.status, 503, "{phase}: {}", response.body);
+        assert!(fixture
+            .state
+            .registry
+            .authorization_record(id)
+            .unwrap()
+            .unwrap()
+            .device
+            .revoked_at
+            .is_none());
+    }
+}
+
+mod v2_authority;
+mod v2_control_loss;

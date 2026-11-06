@@ -915,6 +915,11 @@ enum MemoryCommand {
 
 #[derive(Subcommand, Debug)]
 enum MobileMemoryCommand {
+    #[command(about = "Export private current authority for mobile restoration")]
+    Restore {
+        #[command(subcommand)]
+        command: MobileRestoreCommand,
+    },
     #[command(about = "Configure outbound relay access for already-paired devices")]
     Relay {
         #[command(subcommand)]
@@ -946,6 +951,38 @@ enum MobileMemoryCommand {
         #[command(subcommand)]
         command: Option<MobileDeviceCommand>,
         #[arg(long, help = "Print devices as JSON (machine-readable)")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MobileRestoreCommand {
+    #[command(about = "Restore a selected mobile snapshot with complete latest signed authority")]
+    Install {
+        #[arg(long, value_name = "PRIVATE_FILE")]
+        authority: PathBuf,
+        #[arg(
+            long,
+            value_name = "PRIVATE_HOME",
+            help = "Separate selected snapshot home; copied only after the restore fence is durable"
+        )]
+        snapshot_home: PathBuf,
+        #[arg(long, help = "Previously pinned installation fingerprint (base64url)")]
+        installation_fingerprint: String,
+        #[arg(long, help = "Stable UUID for this restore and every retry")]
+        operation_id: uuid::Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Export current authority and routing generation evidence")]
+    Export {
+        #[arg(
+            long,
+            value_name = "PRIVATE_FILE",
+            help = "New file in a private directory outside mobile state; never overwritten"
+        )]
+        output: PathBuf,
+        #[arg(long)]
         json: bool,
     },
 }
@@ -2137,7 +2174,18 @@ fn main() -> Result<()> {
         "dark" => theme::AppearanceChoice::Dark,
         _ => theme::AppearanceChoice::Auto,
     }));
-    let _state_lock = if matches!(&cli.command, Some(Command::Reset { .. })) {
+    let restores_mobile = matches!(
+        &cli.command,
+        Some(Command::Memory {
+            command: Some(MemoryCommand::Mobile {
+                command: MobileMemoryCommand::Restore {
+                    command: MobileRestoreCommand::Install { .. }
+                }
+            }),
+            ..
+        })
+    );
+    let _state_lock = if matches!(&cli.command, Some(Command::Reset { .. })) || restores_mobile {
         None
     } else {
         Some(state_lock::acquire_shared(&coven_home_dir()?)?)
@@ -2418,6 +2466,24 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Memory { command, json }) => match command {
             Some(MemoryCommand::Open) => memory_dashboard::run_open(),
             Some(MemoryCommand::Mobile { command }) => match command {
+                MobileMemoryCommand::Restore { command } => match command {
+                    MobileRestoreCommand::Install {
+                        authority,
+                        snapshot_home,
+                        installation_fingerprint,
+                        operation_id,
+                        json,
+                    } => mobile_memory::transport::storage::v2::restore::run_install(
+                        &authority,
+                        &snapshot_home,
+                        &installation_fingerprint,
+                        operation_id,
+                        json,
+                    ),
+                    MobileRestoreCommand::Export { output, json } => {
+                        mobile_memory::transport::storage::v2::restore::run_export(&output, json)
+                    }
+                },
                 MobileMemoryCommand::Relay { command } => match command {
                     MobileRelayCommand::Add {
                         endpoint,
@@ -10522,5 +10588,27 @@ mod tests {
             line,
             "coven 0.7.0-3-gabc123 (engine not installed, pinned 0.6.1)"
         );
+    }
+    #[test]
+    fn mobile_restore_export_cli_requires_explicit_private_output() {
+        for json in [false, true] {
+            let mut args = vec![
+                "coven",
+                "memory",
+                "mobile",
+                "restore",
+                "export",
+                "--output",
+                "/private/backups/authority.json",
+            ];
+            if json {
+                args.push("--json");
+            }
+            assert!(
+                Cli::try_parse_from(args).is_ok(),
+                "mobile restore export route missing"
+            );
+        }
+        assert!(Cli::try_parse_from(["coven", "memory", "mobile", "restore", "export"]).is_err());
     }
 }

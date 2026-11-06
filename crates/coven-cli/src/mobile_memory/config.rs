@@ -293,6 +293,53 @@ fn set_private_directory_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bound a source component before parsing it while its store lock is held.
+/// Absence is explicit to the caller; this never creates an empty authority file.
+pub(crate) fn validate_restore_export_component(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    validate_private_file(path)?;
+    if metadata.len() > 4 * 1024 * 1024 {
+        bail!("private authority component exceeds restore export limit");
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MobileWritePhase {
+    TempCreated,
+    Written,
+    FileSynced,
+    Renamed,
+    DirectorySynced,
+    RetainedParentSynced,
+    RetainedHomeSynced,
+}
+#[cfg(test)]
+type WriteObserver = Box<dyn FnMut(&Path, MobileWritePhase) -> Result<()>>;
+#[cfg(test)]
+thread_local! {
+    static WRITE_OBSERVER: std::cell::RefCell<Option<WriteObserver>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn set_write_observer(observer: WriteObserver) {
+    WRITE_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observer));
+}
+#[cfg(test)]
+pub(crate) fn write_checkpoint(path: &Path, phase: MobileWritePhase) -> Result<()> {
+    WRITE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().as_mut() {
+            observer(path, phase)
+        } else {
+            Ok(())
+        }
+    })
+}
+
 pub(crate) fn atomic_create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
     let parent = path
         .parent()
@@ -312,11 +359,18 @@ pub(crate) fn atomic_create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
             return Err(error).with_context(|| format!("failed to create {}", path.display()));
         }
     };
-    if let Err(error) = write_and_sync(&mut file, path, bytes) {
+    #[cfg(test)]
+    if let Err(error) = write_checkpoint(path, MobileWritePhase::TempCreated) {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    if let Err(error) = write_and_sync(&mut file, path, bytes, path) {
         let _ = fs::remove_file(path);
         return Err(error);
     }
     sync_directory(parent)?;
+    #[cfg(test)]
+    write_checkpoint(path, MobileWritePhase::DirectorySynced)?;
     validate_private_file(path)?;
     Ok(true)
 }
@@ -345,7 +399,12 @@ pub(crate) fn atomic_replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = options
         .open(&staged)
         .with_context(|| format!("failed to create {}", staged.display()))?;
-    if let Err(error) = write_and_sync(&mut file, &staged, bytes) {
+    #[cfg(test)]
+    if let Err(error) = write_checkpoint(path, MobileWritePhase::TempCreated) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    if let Err(error) = write_and_sync(&mut file, &staged, bytes, path) {
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
@@ -354,15 +413,26 @@ pub(crate) fn atomic_replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&staged);
         return Err(error).with_context(|| format!("failed to replace {}", path.display()));
     }
+    #[cfg(test)]
+    write_checkpoint(path, MobileWritePhase::Renamed)?;
     sync_directory(parent)?;
+    #[cfg(test)]
+    write_checkpoint(path, MobileWritePhase::DirectorySynced)?;
     validate_private_file(path)
 }
 
-fn write_and_sync(file: &mut File, path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_and_sync(file: &mut File, path: &Path, bytes: &[u8], logical_target: &Path) -> Result<()> {
+    #[cfg(not(test))]
+    let _ = logical_target;
     file.write_all(bytes)
         .with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(test)]
+    write_checkpoint(logical_target, MobileWritePhase::Written)?;
     file.sync_all()
-        .with_context(|| format!("failed to sync {}", path.display()))
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+    #[cfg(test)]
+    write_checkpoint(logical_target, MobileWritePhase::FileSynced)?;
+    Ok(())
 }
 
 #[cfg(unix)]
