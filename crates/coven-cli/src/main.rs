@@ -2613,7 +2613,10 @@ fn run_setup_command(
 }
 
 fn setup_candidate_commit() -> String {
-    env!("COVEN_BUILD_COMMIT").to_owned()
+    // Release authorization scans each native binary for this literal as one
+    // contiguous run of bytes. Without the barrier, x86_64-apple-darwin lowers
+    // the copy to `movabs` immediates and the literal never appears whole (#1672).
+    std::hint::black_box(env!("COVEN_BUILD_COMMIT")).to_owned()
 }
 
 fn run_eval_loop_command(command: EvalLoopCommand) -> Result<()> {

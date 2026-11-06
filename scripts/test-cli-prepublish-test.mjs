@@ -8,8 +8,30 @@ import {
   buildLocalInstallArgs,
   DEFAULT_COMMAND_TIMEOUT_MS,
   synthesizeDryRunVersion,
-  TEMP_PROJECT_CLEANUP_OPTIONS
+  TEMP_PROJECT_CLEANUP_OPTIONS,
+  verifyNativeBinary
 } from './test-cli-prepublish.mjs';
+
+test('the installed native executable must carry the full commit and match the build bytes', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'coven-package-identity-'));
+  try {
+    const commit = '0123456789abcdef0123456789abcdef01234567';
+    const binary = path.join(root, 'coven');
+    const built = Buffer.from(`build\0${commit}`);
+    writeFileSync(binary, built);
+    const sha256 = verifyNativeBinary(binary, commit);
+    assert.equal(verifyNativeBinary(binary, commit, sha256), sha256);
+
+    writeFileSync(binary, Buffer.concat([built, Buffer.from('substitution')]));
+    assert.throws(() => verifyNativeBinary(binary, commit, sha256), /differs from the build/);
+    for (const invalid of [commit.slice(0, 8), 'f'.repeat(40), commit.match(/.{8}/g).join('!')]) {
+      writeFileSync(binary, invalid);
+      assert.throws(() => verifyNativeBinary(binary, commit, sha256), /does not embed/);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('local tarball install is offline and disables registry extras', () => {
   assert.deepEqual(

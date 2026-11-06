@@ -728,7 +728,9 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changes.outputs.npm_packaging == 'true' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.job-timeout }}
+    env:
+      COVEN_NPM_DRY_RUN_VERSION: 999.0.0
     strategy:
       fail-fast: false
       matrix:
@@ -736,11 +738,21 @@ jobs:
           - os: ubuntu-latest
             npm-target: linux-x64
             rust-target: x86_64-unknown-linux-gnu
+            job-timeout: 20
           - os: windows-latest
             npm-target: windows
             rust-target: x86_64-pc-windows-msvc
+            job-timeout: 20
+          - os: macos-15-intel
+            npm-target: macos-x64
+            rust-target: x86_64-apple-darwin
+            job-timeout: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Intel qualifies the PR head. Other PR rows keep testing the merge ref.
+          ref: ${{ matrix.npm-target == 'macos-x64' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
@@ -748,7 +760,9 @@ jobs:
         with:
           toolchain: 1.99.1
           targets: ${{ matrix.rust-target }}
+      # Build the Intel qualification from a clean target directory.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: matrix.npm-target != 'macos-x64'
         with:
           path: |
             ~/.cargo/registry
@@ -760,10 +774,23 @@ jobs:
       - name: Install native link dependencies (Linux only)
         if: runner.os == 'Linux'
         run: bash scripts/install-native-link-dependencies.sh
-      - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
-      - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
+      - name: Confirm Intel source and native toolchain
+        if: matrix.npm-target == 'macos-x64'
         env:
-          COVEN_NPM_DRY_RUN_VERSION: 999.0.0
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(uname -sm)" = "Darwin x86_64"
+          rustc -Vv
+          # Mirror the tagged build's explicit version stamp in this dry run.
+          echo "COVEN_BUILD_VERSION=v$COVEN_NPM_DRY_RUN_VERSION" >> "$GITHUB_ENV"
+      - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
+      - name: Verify Intel architecture and build the AFS mount export helper
+        if: matrix.npm-target == 'macos-x64'
+        run: |
+          test "$(lipo -archs target/x86_64-apple-darwin/release/coven)" = x86_64
+          cargo build --release -p coven-afs --features mount --bins --target x86_64-apple-darwin
+      - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
 
   npm-onboarding-main:
     name: npm onboarding smoke (${{ matrix.npm-target }})
@@ -943,7 +970,12 @@ jobs:
               for name, data in jobs.items()
               if data["result"] not in {"success", "skipped"}
           }
-          for required in ("changes", "policy-guard", "automations-protocol-bundle", "automations-authority-profile-bundle"):
+          required_jobs = ["changes", "policy-guard", "automations-protocol-bundle", "automations-authority-profile-bundle"]
+          if os.environ["GITHUB_EVENT_NAME"] == "push":
+              required_jobs.append("npm-onboarding-main")
+          elif jobs["changes"]["outputs"].get("npm_packaging") == "true":
+              required_jobs.append("npm-onboarding-pr")
+          for required in required_jobs:
               if jobs[required]["result"] != "success":
                   bad[required] = jobs[required]["result"]
           if bad:
