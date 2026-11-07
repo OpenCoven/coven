@@ -63,6 +63,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'rust-test-windows',
             'threads-test-windows',
             'rust-test-macos',
+            'threads-test-macos',
             'restricted-runtime-macos',
             'afs-mount-linux',
             'afs-mount-macos',
@@ -114,12 +115,13 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_full_macos_workspace_suite_stays_push_only(self) -> None:
         # macOS runners bill at ~10x Linux; the workspace suite is push-only by
         # design and the PR-scoped job above exists so that split can hold.
-        job = ci_job_block('rust-test-macos')
-        self.assertIn(
-            "if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}",
-            job,
-        )
-        self.assertIn('cargo test --workspace --locked --no-fail-fast', job)
+        for name in ('rust-test-macos', 'threads-test-macos'):
+            with self.subTest(job=name):
+                self.assertIn(
+                    "if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}",
+                    ci_job_block(name),
+                )
+        self.assertIn('cargo test --workspace --locked --no-fail-fast', ci_job_block('rust-test-macos'))
 
     def test_ci_uses_expected_timeouts_and_cache_policy(self) -> None:
         # The PR onboarding job gives Linux and Windows 20 minutes via its matrix.
@@ -158,6 +160,37 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertEqual(rest[0::2], ['--skip'] * len(named))
         self.assertEqual(rest[1::2], named)
         self.assertEqual(len(rest), 2 * len(named))
+
+    def test_macos_workspace_shards_reuse_the_windows_predicate(self) -> None:
+        # The macOS workspace suite outgrew its 30-minute hang guard as one job
+        # (#1687). It is split with the exact Windows predicate, so both
+        # platforms partition the same tests, and the Threads feature build runs
+        # in its own job instead of after the workspace.
+        windows = ci_job_block('rust-test-windows')
+        macos = ci_job_block('rust-test-macos')
+        threads = ci_job_block('threads-test-macos')
+        self.assertIn('name: Rust tests (macOS, ${{ matrix.shard }})', macos)
+        self.assertIn('\n      fail-fast: false\n', macos)
+        self.assertIn(
+            '\n      - run: cargo test --workspace --locked --no-fail-fast -- ${{ matrix.test-args }}\n',
+            macos,
+        )
+        self.assertEqual(macos.count('run: cargo test'), 1)
+        pattern = r"- shard: (\S+)\n\s+test-args: '([^'\n]+)'\n"
+        self.assertEqual(dict(re.findall(pattern, macos)), dict(re.findall(pattern, windows)))
+        self.assertNotIn('--features threads-test-clock', macos)
+        self.assertNotIn('cargo test --workspace', threads)
+        for step in ["Exercise isolated Threads clock feature", "Exercise real-daemon Threads journeys"]:
+            self.assertIn(f"- name: {step}\n        if: ${{{{ !cancelled() }}}}", threads)
+        for job in (macos, threads):
+            self.assertIn("\n    timeout-minutes: 30\n", job)
+            self.assertIn("runs-on: macos-26", job)
+            self.assertNotIn("continue-on-error:", job)
+        self.assertIn(f"uses: actions/cache/restore@{CACHE_SHA}", threads)
+        self.assertNotIn("uses: actions/cache@", threads)
+        gate = ci_job_block("pr-gate")
+        self.assertIn("\n      - rust-test-macos\n", gate)
+        self.assertIn("\n      - threads-test-macos\n", gate)
 
     def test_windows_rust_gate_restores_without_post_job_cache_packing(self) -> None:
         for job in ('rust-test-windows', 'threads-test-windows'):
@@ -378,7 +411,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
 
     def test_all_platforms_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
         command = THREADS_FEATURE_COMMAND
-        for job in ("threads-test-linux", "threads-test-windows", "rust-test-macos"):
+        for job in ("threads-test-linux", "threads-test-windows", "threads-test-macos"):
             self.assertIn(command, ci_job_block(job))
         harness = CI_WORKFLOW.parents[2] / "crates/coven-cli/tests/threads_e2e.rs"
         self.assertNotIn("#![cfg(unix)]", harness.read_text(encoding="utf-8"))
