@@ -18,11 +18,7 @@ goal**.
 
 ## 1. Supported surfaces and security status
 
-**Supported release family.** Security fixes land on the current minor release
-line published in
-[repository releases](https://github.com/OpenCoven/coven/releases) (v0.4.x as
-of this update). Coven has no long-term-support commitment before 1.0; run the
-latest release to pick up security fixes.
+**Supported release family.** Security fixes land on the current minor release line published in [repository releases](https://github.com/OpenCoven/coven/releases) (v0.5.x as of this update). Coven has no long-term-support commitment before 1.0; run the latest release to pick up security fixes.
 
 **Security-supported surfaces.**
 

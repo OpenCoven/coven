@@ -1822,7 +1822,7 @@ test('packageVersionPublished refuses to guess when npm cannot answer', () => {
 
 test('the release support policy gates every surface and the release line', () => {
   const support = loadReleaseSupport();
-  assert.equal(support.supportedReleaseLine, '0.4');
+  assert.equal(support.supportedReleaseLine, '0.5');
   assert.deepEqual(
     Object.keys(support.packages).sort(),
     [...wrapperPackageNameList(), ...nativeTargetNamesForPackageSet('post-intel').map(targetPackageName)].sort(),
@@ -1831,11 +1831,11 @@ test('the release support policy gates every surface and the release line', () =
   for (const packageName of Object.keys(support.packages)) {
     assertPublishableSurface(support, packageName);
   }
-  assertSupportedReleaseLine(support, '0.4.11');
+  assertSupportedReleaseLine(support, '0.5.0');
   assertSupportedReleaseLine(support, '0.0.0');
-  assert.throws(() => assertSupportedReleaseLine(support, '0.3.9'), /supports the 0\.4\.x line, not 0\.3\.x/);
-  assert.throws(() => assertSupportedReleaseLine(support, '0.5.0'), /supports the 0\.4\.x line, not 0\.5\.x/);
-  assert.throws(() => assertSupportedReleaseLine(support, '0.4.11-rc.1'), /not a stable MAJOR\.MINOR\.PATCH/);
+  assert.throws(() => assertSupportedReleaseLine(support, '0.4.11'), /supports the 0\.5\.x line, not 0\.4\.x/);
+  assert.throws(() => assertSupportedReleaseLine(support, '0.6.0'), /supports the 0\.5\.x line, not 0\.6\.x/);
+  assert.throws(() => assertSupportedReleaseLine(support, '0.5.0-rc.1'), /not a stable MAJOR\.MINOR\.PATCH/);
   assert.throws(() => assertPublishableSurface(support, '@opencoven/cli-linux-arm64'), /not listed in \.github\/release-support\.json/);
 });
 
