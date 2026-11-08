@@ -149,7 +149,8 @@ pub struct Material {
 }
 
 /// Contains a routing secret. Serialize only inside pinned TLS or an authenticated
-/// encrypted channel, never Debug/log it, and zeroize it when the response is done.
+/// encrypted channel and never Debug/log it. This struct zeroizes its own fields
+/// on drop, but gateway serialization copies do not; see the transport README.
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Provisioning {
