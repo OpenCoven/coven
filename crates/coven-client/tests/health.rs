@@ -2422,16 +2422,29 @@ fn expired_diagnostic_deadline_never_opens_the_socket() {
 
 #[test]
 fn diagnostic_deadline_request_refuses_a_replaced_daemon_before_sending_body() {
+    use std::os::unix::fs::MetadataExt;
+
     let home = TestHome::new();
     let server = serve_once(&home.path, 200, HEALTH.to_owned());
     let endpoint = DaemonEndpoint::discover(&home.path).unwrap();
     let mut client = DaemonClient::new(endpoint);
     client.health().unwrap();
     server.join().unwrap();
-    fs::remove_file(home.path.join("coven.sock")).unwrap();
+    let socket = home.path.join("coven.sock");
+    let retired = home.path.join(".retired");
+    // Both fixture servers have this process's credentials. Retain the old
+    // inode so Linux cannot recycle it and erase the intended peer change.
+    fs::rename(&socket, &retired).expect("retain retired socket identity");
+    let original_identity = fs::metadata(&retired).unwrap();
     let server = serve_responses(
         &home.path,
         vec![("<peer-check>".to_owned(), 200, String::new())],
+    );
+    let replacement_identity = fs::metadata(&socket).unwrap();
+    assert_ne!(
+        (original_identity.dev(), original_identity.ino()),
+        (replacement_identity.dev(), replacement_identity.ino()),
+        "replacement fixture must have a distinct socket identity"
     );
     let result = client.request_json_until(
         "POST",
@@ -2439,6 +2452,9 @@ fn diagnostic_deadline_request_refuses_a_replaced_daemon_before_sending_body() {
         Some(&serde_json::json!({"transport":"relay"})),
         std::time::Instant::now() + std::time::Duration::from_secs(30),
     );
-    assert!(matches!(result, Err(ClientError::DaemonInstanceChanged)));
-    server.join().unwrap();
+    server.join().expect("replacement peer check");
+    assert!(
+        matches!(&result, Err(ClientError::DaemonInstanceChanged)),
+        "unexpected replacement outcome: {result:?}"
+    );
 }
