@@ -1274,6 +1274,11 @@ test('release builds report the derived npm version, not the raw tag name', () =
     /^          COVEN_BUILD_VERSION: v\$\{\{ needs\.verify-tag\.outputs\.npm_version \}\}$/m,
     'release binaries must report the parsed npm version, not the raw ref name'
   );
+  assert.match(
+    buildJob,
+    /^          COVEN_BUILD_COMMIT: \$\{\{ needs\.verify-tag\.outputs\.head_sha \}\}$/m,
+    'release binaries must embed the exact verified source commit'
+  );
   const buildScript = readFileSync(
     new URL(['..', 'crates', 'coven-cli', 'build.rs'].join('/'), import.meta.url),
     'utf8'
