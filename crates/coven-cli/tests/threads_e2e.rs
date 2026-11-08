@@ -30,6 +30,10 @@ const REPRODUCTION_COMMAND: &str = if cfg!(feature = "threads-test-clock") {
     "cargo test --locked -p coven-cli --test threads_e2e -- --nocapture"
 };
 
+mod approval_tier_load_cases {
+    include!("support/threads_approval_tier_load_cases.rs");
+}
+
 #[cfg(feature = "threads-test-clock")]
 mod final_commit_cases {
     include!("support/threads_final_commit_cases.rs");
