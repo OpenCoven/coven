@@ -21,6 +21,12 @@ Run the complete available daemon journeys from a Coven checkout:
 cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock -- --nocapture
 ```
 
+The `approval_tier_load_` cases cover Ward loading through the supported familiar-edits request boundary. Four valid tier configurations permit the same ordinary Tier-2 note with exact bytes, hash, byte count and one apply audit. An unknown tier beside a valid declaration and all twelve wrong known-tier/gate pairings must return `ward_config_invalid` with the specific load reason, preserve workspace bytes and audit state, and create no note or pending proposal. Each of the seventeen separately named cases seeds its Ward before launching an owned foreground daemon, retains before/after/stopped state and request/response evidence, and verifies unchanged state after shutdown. These cases run with or without `threads-test-clock`; they do not exercise veto timing or grant protected-write authority from fingerprint text. They cover these two load-error classes, not every RFC-0001 malformed declaration.
+
+```sh
+cargo test --locked -p coven-cli --test threads_e2e approval_tier_load_ -- --nocapture
+```
+
 The feature-enabled target covers bounded human approval with validation and
 write receipts, protected-route refusal, reviewed drift, canonical retired-Ward
 migration and intake, exact visibility/deadline boundaries, all five typed
@@ -116,7 +122,7 @@ issue closed on 2026-09-13 on its own retired-corpus dossier at `226bfcc8`.
 The clock feature is disabled in production builds. It uses a capability-gated
 fixture in each disposable home and explicit real-scheduler ticks, not sleeps
 or a mock scheduler. See [Threads test clock](../design/threads-test-clock.md).
-Without the feature, Cargo runs only the smaller smoke/lifecycle subset. CI
+Without the feature, Cargo runs only the smaller smoke/lifecycle/load subset. CI
 executes the feature-enabled target on Linux, Windows, and the existing macOS
 push lane. All platforms run the same feature-enabled journeys through `coven-client`
 discovery and authenticated transport; Windows uses the owner-only named pipe.
