@@ -18,6 +18,7 @@ use zeroize::Zeroizing;
 
 pub mod authority;
 pub mod cancellation;
+pub mod connection;
 pub(super) mod diagnostics;
 mod message;
 mod network;

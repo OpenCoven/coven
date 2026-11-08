@@ -48,6 +48,27 @@ impl std::fmt::Debug for DaemonEndpoint {
 
 impl DaemonEndpoint {
     pub fn discover(coven_home: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Self::discover_until(
+            coven_home,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+    }
+
+    /// Discover only owner-local IPC, with an optional tighter caller deadline.
+    /// Filesystem metadata checks retain the ordinary host filesystem trust.
+    pub fn discover_until(
+        coven_home: impl AsRef<Path>,
+        caller_deadline: std::time::Instant,
+    ) -> Result<Self, ClientError> {
+        if std::time::Instant::now() >= caller_deadline {
+            return Err(ClientError::Io {
+                operation: "daemon discovery deadline expired",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "daemon discovery deadline expired",
+                ),
+            });
+        }
         let coven_home = coven_home.as_ref();
         #[cfg(unix)]
         validate_unix_daemon_path_encoding(coven_home)?;
@@ -108,7 +129,8 @@ impl DaemonEndpoint {
                 .checked_add(WINDOWS_DISCOVERY_TIMEOUT)
                 .ok_or_else(|| {
                     ClientError::Discovery("daemon discovery deadline overflowed".to_owned())
-                })?;
+                })?
+                .min(caller_deadline);
             let stable_pipe_name = owner_only_windows_pipe_name(coven_home)?;
             let pipe_name =
                 match validate_windows_daemon_pipe_name_until(&stable_pipe_name, deadline) {

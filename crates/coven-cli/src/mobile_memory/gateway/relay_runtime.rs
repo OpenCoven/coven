@@ -319,6 +319,9 @@ fn serve(
     control: Arc<WorkerControl>,
     authenticated: Arc<AtomicBool>,
 ) -> Result<()> {
+    let mut connection = state
+        .connections
+        .begin(transport::connection::Transport::Relay)?;
     let slot = u64::try_from(Utc::now().timestamp())? / storage::SLOT_SECONDS;
     let (room, credential) = material.rendezvous(slot, false)?;
     let deadline = Instant::now() + CONNECT_BUDGET;
@@ -341,6 +344,7 @@ fn serve(
         }
     }
     let records = records.context("relay endpoints unavailable")?;
+    connection.authenticating()?;
     let mut channel = transport::accept(
         records,
         &material.pairing,
@@ -358,6 +362,7 @@ fn serve(
             )
         },
     )?;
+    connection.online()?;
     authenticated.store(true, Ordering::Release);
     while channel.is_open() {
         serve_transport_with_state(&state, &mut channel)?;

@@ -287,6 +287,9 @@ fn serve(connection: Connection) -> Result<()> {
         authenticated,
         consumption,
     } = connection;
+    let mut connection = state
+        .connections
+        .begin(transport::connection::Transport::Relay)?;
     let (room, credential) = snapshot.rendezvous(Transport::Relay, counter)?;
     let deadline = Instant::now() + CONNECT_BUDGET;
     let cancellation = control.attempt()?;
@@ -308,6 +311,7 @@ fn serve(connection: Connection) -> Result<()> {
         }
     }
     let records = records.context("relay endpoints unavailable")?;
+    connection.authenticating()?;
     let mut channel = routing::channel::accept(
         records,
         routing::channel::HostAdmission {
@@ -347,6 +351,7 @@ fn serve(connection: Connection) -> Result<()> {
             Ok(())
         },
     )?;
+    connection.online()?;
     authenticated.store(true, Ordering::Release);
     while channel.is_open() {
         serve_transport_with_state(&state, &mut channel)?;

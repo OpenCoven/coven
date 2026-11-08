@@ -89,6 +89,16 @@ corrupted or hand-composed value cannot smuggle a separator into the request
 target. Setting none of the three requests the inherited unpaginated array;
 setting any of them requests the envelope.
 
+### Mobile connection observations
+
+`POST /api/v1/internal/mobile/connections` is an owner-local diagnostic read handled by the mobile runtime. An empty JSON object selects relay for compatibility; `{"transport":"direct"}` or `{"transport":"relay"}` explicitly selects an ingress. Unknown fields, malformed bodies and unknown transports return 400. A successful response contains exactly `state` and `transport`, with state chosen from `offline`, `connecting`, `authenticating`, and `online`. Other methods return 405. TCP/mobile ingress cannot dispatch the diagnostic. It does not create enrollment, mutate authorization or authorize an application action.
+
+The result is a live aggregate for the selected transport: online takes precedence over authenticating, then connecting, then offline. Failed/cancelled attempts cannot clear another live channel. An absent mobile runtime reports offline. No device identifiers, room identifiers, keys, URLs or raw errors are returned. A channel may be online while current policy rejects its next request.
+
+`coven doctor --json` adds `mobileRelayConnection` and `mobileDirectConnection`, each with that coarse shape or null when the running daemon cannot supply a valid observation. Prose reports the same states or unavailable. A stopped daemon reports offline; stale daemon state remains unavailable. These observations do not affect existing health/exit-code checks. Unix probes validate private socket discovery and bound response waits to 500 ms. Windows probes use the same budget across owner-only pipe discovery, health negotiation and the bound diagnostic request. Native Windows acceptance remains separately verified by Windows checks.
+
+The reusable Rust client exposes `DaemonEndpoint::discover_until` and `DaemonClient::request_json_until` for callers needing a tighter absolute deadline. The latter retains health-version negotiation, structured-error requirements, owner/instance binding, request size limits and no automatic replay. Caller deadlines can shorten the existing discovery/request maxima, never extend them. Filesystem metadata remains subject to the host filesystem's normal trust and scheduling constraints.
+
 ## `GET /api/v1/health`
 
 `GET /api/v1/health` returns daemon reachability, the named contract version, coven version, and machine-readable capabilities.

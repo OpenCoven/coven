@@ -319,6 +319,7 @@ impl Drop for MobileGatewayHandle {
 }
 
 struct MobileGatewayState {
+    connections: super::transport::connection::Connections,
     coven_home: PathBuf,
     host_fingerprint: [u8; 32],
     registry: Arc<DeviceRegistry>,
@@ -401,6 +402,7 @@ fn create_gateway_state(
     let registry = Arc::new(DeviceRegistry::load(coven_home)?);
     let challenges = Arc::new(AssuranceChallengeStore::load(coven_home)?);
     Ok(Arc::new(MobileGatewayState {
+        connections: Default::default(),
         coven_home: coven_home.to_path_buf(),
         host_fingerprint,
         pairing: PairingManager::new(Arc::clone(&registry)),
@@ -1328,6 +1330,8 @@ fn active_gateway() -> Result<Arc<MobileGatewayState>> {
         .context("mobile gateway is not running")
 }
 
+pub(super) const LOCAL_CONNECTION_PATH: &str = "/api/v1/internal/mobile/connections";
+
 const LOCAL_CONTROL_ROOT: &str = "/api/v1/internal/mobile/pairings";
 
 /// Whether [`handle_local_control`] owns this path.
@@ -1338,6 +1342,9 @@ const LOCAL_CONTROL_ROOT: &str = "/api/v1/internal/mobile/pairings";
 /// `handle_local_control` refuse anything it rejects, stops the two from
 /// drifting apart.
 pub(crate) fn claims_local_control(path: &str) -> bool {
+    if path == LOCAL_CONNECTION_PATH {
+        return true;
+    }
     [
         LOCAL_CONTROL_ROOT,
         super::enrollment::LOCAL_INTRODUCTION_ROOT,
@@ -1356,6 +1363,57 @@ pub(crate) fn handle_local_control(
     path: &str,
     body: Option<&str>,
 ) -> Option<Result<crate::api::ApiResponse>> {
+    if path == LOCAL_CONNECTION_PATH {
+        return Some((|| {
+            if method != "POST" {
+                return crate::api::api_error(
+                    405,
+                    "method_not_allowed",
+                    "Method not allowed.",
+                    None,
+                );
+            }
+            use super::transport::connection::{ConnectionState, ConnectionStatus, Transport};
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                #[serde(default = "legacy_relay")]
+                transport: Transport,
+            }
+            fn legacy_relay() -> Transport {
+                Transport::Relay
+            }
+            let query = match serde_json::from_str::<serde_json::Value>(body.unwrap_or("{}"))
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .and_then(|query| serde_json::from_value::<Query>(query).ok())
+            {
+                Some(query) => query,
+                None => {
+                    return crate::api::api_error(
+                        400,
+                        "invalid_request",
+                        "Invalid connection observation query.",
+                        None,
+                    )
+                }
+            };
+            let transport = query.transport;
+            let state = ACTIVE_GATEWAY
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mobile connection status unavailable"))?
+                .as_ref()
+                .and_then(Weak::upgrade);
+            let status = match state {
+                Some(state) => state.connections.snapshot(transport)?,
+                None => ConnectionStatus {
+                    state: ConnectionState::Offline,
+                    transport,
+                },
+            };
+            crate::api::json_response(200, &status)
+        })());
+    }
     const ROOT: &str = LOCAL_CONTROL_ROOT;
     if !claims_local_control(path) {
         return None;
@@ -1897,6 +1955,7 @@ mod tests {
             )
             .unwrap();
         let state = MobileGatewayState {
+            connections: Default::default(),
             coven_home: temp.path().to_path_buf(),
             host_fingerprint: [3; 32],
             pairing: PairingManager::new(Arc::clone(&registry)),
@@ -2218,6 +2277,7 @@ mod tests {
         let registry = Arc::new(DeviceRegistry::load(home).unwrap());
         let challenges = Arc::new(AssuranceChallengeStore::load(home).unwrap());
         MobileGatewayState {
+            connections: Default::default(),
             coven_home: home.to_path_buf(),
             host_fingerprint: [7; 32],
             pairing: PairingManager::new(Arc::clone(&registry)),

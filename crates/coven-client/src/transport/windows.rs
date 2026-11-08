@@ -57,9 +57,27 @@ pub(crate) fn request(
     body: Option<&[u8]>,
     expected_peer: Option<&PeerIdentity>,
 ) -> Result<TransportResponse, ClientError> {
-    // One deadline covers the finite WaitNamedPipe/CreateFile loop and all
-    // subsequent nonblocking I/O.
-    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    request_until(
+        endpoint,
+        method,
+        path,
+        body,
+        expected_peer,
+        Instant::now() + RESPONSE_TIMEOUT,
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn request_until(
+    endpoint: &DaemonEndpoint,
+    method: &'static str,
+    path: &str,
+    body: Option<&[u8]>,
+    expected_peer: Option<&PeerIdentity>,
+    caller_deadline: Instant,
+) -> Result<TransportResponse, ClientError> {
+    // A diagnostic can shorten the existing budget, never extend it.
+    let deadline = caller_deadline.min(Instant::now() + RESPONSE_TIMEOUT);
     let body = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
