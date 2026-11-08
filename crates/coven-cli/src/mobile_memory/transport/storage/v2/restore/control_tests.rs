@@ -840,3 +840,133 @@ fn finish_initial(f: &Fixture, phone: &Path, handover: Handover, generation: u64
         process_crash::round(f, phone, Role::Host, transport, None, Failure::Kill).unwrap();
     }
 }
+
+/// Interrupt the first device adoption (no prior device file) and the first
+/// acknowledgment (no committed generation) before any routing anchor exists.
+#[test]
+fn first_adoption_and_acknowledgment_process_faults_converge_to_one_generation_zero_anchor() {
+    let f = Fixture::new();
+    let phone = tempfile::tempdir().unwrap();
+    let control = tempfile::tempdir().unwrap();
+    crate::daemon::ensure_private_coven_home(control.path()).unwrap();
+    let input = control.path().join("handover.json");
+    let output = control.path().join("unused-export.json");
+    let initial = f.prepare();
+    assert_eq!(initial.generation, 0);
+    atomic_replace_private(&input, &serde_json::to_vec(&initial).unwrap()).unwrap();
+    let c = Case {
+        f,
+        phone,
+        control,
+        input,
+        output,
+        initial: Some(initial.clone()),
+    };
+    let generations = |c: &Case| {
+        let stored = v2::read(&c.state_files()[0], c.f.id).unwrap().unwrap();
+        (
+            stored.minimum_generation,
+            stored.committed.as_ref().map(|g| g.generation),
+            stored.pending.as_ref().map(|g| g.generation),
+        )
+    };
+    let mut counts = BTreeMap::new();
+    for operation in [Operation::Adopt, Operation::Acknowledge] {
+        if matches!(operation, Operation::Acknowledge) {
+            device::adopt_direct(
+                c.phone.path(),
+                initial.clone(),
+                c.f.host.verifying_key(),
+                c.f.id,
+                c.f.device.verifying_key(),
+            )
+            .unwrap();
+        }
+        let baseline = c.state_files().map(|p| optional_bytes(&p));
+        assert_eq!(generations(&c), (None, None, Some(0)));
+        assert_eq!(
+            baseline[1].is_some(),
+            matches!(operation, Operation::Acknowledge)
+        );
+        let trace = run(&c, operation, 0, false);
+        assert!(
+            !trace.is_empty(),
+            "first {} had no observed writes",
+            operation.code()
+        );
+        for kill in [true, false] {
+            for cut in 1..=trace.len() {
+                c.reset(&baseline);
+                let observed = run(&c, operation, cut, kill);
+                assert_eq!(
+                    observed,
+                    trace[..cut],
+                    "first {} write order changed",
+                    operation.code()
+                );
+                // Never two anchors, a burned or skipped generation, or a
+                // commit without the device's adoption.
+                let image = generations(&c);
+                match operation {
+                    Operation::Adopt => assert_eq!(image, (None, None, Some(0))),
+                    _ => assert!(
+                        matches!(image, (None, None, Some(0)) | (None, Some(0), None)),
+                        "interrupted first acknowledgment left {image:?}"
+                    ),
+                }
+                if image.2.is_some() {
+                    let retry = c.f.prepare();
+                    assert!(
+                        retry.routing_seed == initial.routing_seed
+                            && retry.noise_public == initial.noise_public,
+                        "retry replaced retained initial material"
+                    );
+                }
+                let ack = device::adopt_direct(
+                    c.phone.path(),
+                    initial.clone(),
+                    c.f.host.verifying_key(),
+                    c.f.id,
+                    c.f.device.verifying_key(),
+                )
+                .unwrap();
+                assert_eq!(ack.seed_digest, initial.acknowledgment().seed_digest);
+                acknowledge_direct(c.f.home.path(), &c.f.registry, &c.f.host, c.f.id, &ack)
+                    .unwrap();
+                assert_eq!(generations(&c), (None, Some(0), None));
+                let snapshot = c.f.snapshot().unwrap();
+                assert_eq!(snapshot.floors, [0, 0]);
+                assert!(*snapshot.material.routing_seed == initial.routing_seed);
+                for transport in [Transport::Direct, Transport::Relay] {
+                    let state = device::begin(
+                        c.phone.path(),
+                        c.f.host.verifying_key(),
+                        c.f.id,
+                        c.f.device.verifying_key(),
+                        transport,
+                    )
+                    .unwrap()
+                    .state();
+                    assert_eq!((state.generation, state.next, state.floor), (0, 0, 0));
+                    process_crash::round(
+                        &c.f,
+                        c.phone.path(),
+                        Role::Host,
+                        transport,
+                        None,
+                        Failure::Kill,
+                    )
+                    .unwrap();
+                }
+                *counts.entry(operation.code()).or_insert(0) += 1;
+                println!(
+                    "first-commit operation={} kill={kill} cut={cut} {} converged",
+                    operation.code(),
+                    trace[cut - 1]
+                );
+            }
+        }
+        c.reset(&baseline);
+    }
+    println!("first-commit counts={counts:?}");
+}
