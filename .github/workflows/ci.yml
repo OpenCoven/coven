@@ -367,7 +367,7 @@ jobs:
     # runners (#1227). `named` runs every test whose name contains one of the
     # tokens and `rest` skips exactly those, so each test runs in exactly one
     # shard, and a new test lands in one without editing this list. The relay
-    # package runs unfiltered in its own required job: its strict five-minute
+    # package runs unfiltered in its own required job: its production
     # idle-expiry case otherwise consumes the rest shard's remaining budget.
     # Before sharding, the `coven` unit suite alone took 622-1,192 s of a
     # 30-minute budget;
