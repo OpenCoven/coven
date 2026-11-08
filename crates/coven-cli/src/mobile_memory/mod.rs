@@ -557,7 +557,7 @@ fn run_pair_unix() -> Result<()> {
 
 #[cfg(unix)]
 fn post_mobile_control(coven_home: &Path, path: &str, body: &str) -> Result<(u16, String)> {
-    post_mobile_control_inner(coven_home, path, body, true)
+    post_mobile_control_inner(coven_home, path, body, true, Duration::from_secs(5))
 }
 
 #[cfg(unix)]
@@ -566,7 +566,7 @@ fn post_mobile_control_without_interrupt(
     path: &str,
     body: &str,
 ) -> Result<(u16, String)> {
-    post_mobile_control_inner(coven_home, path, body, false)
+    post_mobile_control_inner(coven_home, path, body, false, Duration::from_secs(5))
 }
 
 #[cfg(unix)]
@@ -575,11 +575,11 @@ fn post_mobile_control_inner(
     path: &str,
     body: &str,
     observe_interrupt: bool,
+    io_deadline: Duration,
 ) -> Result<(u16, String)> {
     use std::os::unix::net::UnixStream;
 
     const IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
-    const IO_DEADLINE: Duration = Duration::from_secs(5);
     const MAX_CONTROL_RESPONSE_BYTES: usize = MAX_MOBILE_RESPONSE_BYTES + 16 * 1024;
 
     let socket = crate::daemon::daemon_socket_path(coven_home);
@@ -609,7 +609,7 @@ fn post_mobile_control_inner(
     stream
         .shutdown(std::net::Shutdown::Write)
         .context("failed to finish mobile pairing control request")?;
-    let deadline = Instant::now() + IO_DEADLINE;
+    let deadline = Instant::now() + io_deadline;
     let mut response = Vec::new();
     let mut chunk = [0_u8; 8 * 1024];
     loop {
@@ -651,4 +651,149 @@ fn post_mobile_control_inner(
         .split_once("\r\n\r\n")
         .context("mobile pairing control response omitted a body")?;
     Ok((status, body.to_owned()))
+}
+
+/// Best-effort live daemon observations; never infer online from configuration.
+pub(crate) fn relay_connection_for_doctor(
+    home: &std::path::Path,
+) -> Option<transport::connection::ConnectionStatus> {
+    connection_for_doctor(home, transport::connection::Transport::Relay)
+}
+
+pub(crate) fn direct_connection_for_doctor(
+    home: &std::path::Path,
+) -> Option<transport::connection::ConnectionStatus> {
+    connection_for_doctor(home, transport::connection::Transport::Direct)
+}
+
+#[cfg(unix)]
+fn connection_for_doctor(
+    home: &Path,
+    transport: transport::connection::Transport,
+) -> Option<transport::connection::ConnectionStatus> {
+    coven_client::DaemonEndpoint::discover(home).ok()?;
+    let query = serde_json::json!({"transport": transport}).to_string();
+    let (status, body) = post_mobile_control_inner(
+        home,
+        gateway::LOCAL_CONNECTION_PATH,
+        &query,
+        false,
+        Duration::from_millis(500),
+    )
+    .ok()?;
+    if status != 200 {
+        return None;
+    }
+    let observed: transport::connection::ConnectionStatus = serde_json::from_str(&body).ok()?;
+    (observed.transport == transport).then_some(observed)
+}
+
+#[cfg(windows)]
+fn connection_for_doctor(
+    home: &std::path::Path,
+    transport: transport::connection::Transport,
+) -> Option<transport::connection::ConnectionStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let endpoint = coven_client::DaemonEndpoint::discover_until(home, deadline).ok()?;
+    let mut client = coven_client::DaemonClient::new(endpoint);
+    let query = serde_json::json!({"transport": transport});
+    let response = client
+        .request_json_until(
+            "POST",
+            gateway::LOCAL_CONNECTION_PATH,
+            Some(&query),
+            deadline,
+        )
+        .ok()?;
+    if response.status != 200 {
+        return None;
+    }
+    let observed: transport::connection::ConnectionStatus =
+        serde_json::from_slice(&response.body).ok()?;
+    (observed.transport == transport).then_some(observed)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn connection_for_doctor(
+    _home: &std::path::Path,
+    _transport: transport::connection::Transport,
+) -> Option<transport::connection::ConnectionStatus> {
+    None
+}
+
+#[cfg(all(test, unix))]
+mod connection_probe_tests {
+    use super::*;
+
+    #[test]
+    fn doctor_probe_accepts_only_coarse_relay_observations() {
+        use std::os::unix::net::UnixListener;
+        for (body, accepted) in [
+            (r#"{"state":"online","transport":"relay"}"#, true),
+            (r#"{"state":"online","transport":"direct"}"#, false),
+            (
+                r#"{"state":"online","transport":"relay","room":"private"}"#,
+                false,
+            ),
+            (r#"{"state":"unknown","transport":"relay"}"#, false),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            crate::daemon::ensure_private_coven_home(home.path()).unwrap();
+            let listener =
+                UnixListener::bind(crate::daemon::daemon_socket_path(home.path())).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                crate::daemon::daemon_socket_path(home.path()),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            coven_client::DaemonEndpoint::discover(home.path())
+                .expect("private diagnostic fixture discovery");
+            listener.set_nonblocking(true).unwrap();
+            let (finished, completion) = std::sync::mpsc::channel::<()>();
+            let (ready, readiness) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                ready.send(()).unwrap();
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                matches!(
+                                    completion.try_recv(),
+                                    Err(std::sync::mpsc::TryRecvError::Empty)
+                                ),
+                                "probe finished without connecting to the private fixture"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                // Hang guard for a broken request producer, far above the probe budget.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut request = String::new();
+                stream.read_to_string(&mut request).unwrap();
+                assert!(
+                    request.starts_with("POST /api/v1/internal/mobile/connections HTTP/1.1\r\n")
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            });
+            readiness.recv().unwrap();
+            let observed = relay_connection_for_doctor(home.path());
+            let _ = finished.send(());
+            server.join().unwrap();
+            assert_eq!(observed.is_some(), accepted);
+        }
+        let missing = tempfile::tempdir().unwrap();
+        assert!(relay_connection_for_doctor(missing.path()).is_none());
+    }
 }

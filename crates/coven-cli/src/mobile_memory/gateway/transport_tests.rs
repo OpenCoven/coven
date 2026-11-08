@@ -46,6 +46,7 @@ impl Fixture {
             .unwrap()
             .pairing;
         let state = MobileGatewayState {
+            connections: Default::default(),
             coven_home: home.path().to_path_buf(),
             host_fingerprint: identity.public_key_fingerprint,
             pairing: PairingManager::new(Arc::clone(&registry)),
@@ -1000,6 +1001,21 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
             .and_then(|()| channel.receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline))
     };
     assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
+    let observed = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.status, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&observed.body).unwrap(),
+        serde_json::json!({"state":"online", "transport":"relay"})
+    );
+    assert_eq!(
+        handle_local_control("GET", LOCAL_CONNECTION_PATH, None)
+            .unwrap()
+            .unwrap()
+            .status,
+        405
+    );
 
     // Every host connection is an upgrade with `role=host` in the relay's
     // TLS-terminated capture. The count must not move while the channel idles.
@@ -1041,6 +1057,13 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
         started.elapsed() < Duration::from_secs(2),
         "relay runtime stop exceeded two seconds with an idle channel: {:?}",
         started.elapsed()
+    );
+    let observed = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&observed.body).unwrap(),
+        serde_json::json!({"state":"offline", "transport":"relay"})
     );
     assert!(channel
         .receive_message(
@@ -1725,3 +1748,94 @@ fn restore_fence_rejects_signed_direct_https_effects_until_fresh_handover() {
 
 mod v2_authority;
 mod v2_control_loss;
+
+#[test]
+fn online_connection_never_overrides_denial_or_restores_device_authority() {
+    use crate::mobile_memory::transport::connection::{ConnectionState, Transport};
+    for revoked in [false, true] {
+        let fixture = Fixture::new();
+        let mut attempt = fixture.state.connections.begin(Transport::Relay).unwrap();
+        attempt.authenticating().unwrap();
+        attempt.online().unwrap();
+        if revoked {
+            fixture
+                .state
+                .registry
+                .revoke(fixture.pairing.device_id, Utc::now())
+                .unwrap();
+        } else {
+            fixture
+                .state
+                .registry
+                .suspend(fixture.pairing.device_id, Utc::now())
+                .unwrap();
+        }
+        let before = fixture
+            .state
+            .registry
+            .authorization_record(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .connections
+                .snapshot(Transport::Relay)
+                .unwrap()
+                .state,
+            ConnectionState::Online
+        );
+        let request = fixture.request("GET", "/api/v1/mobile/device", fixture.pairing.device_id);
+        assert!(
+            handle_transport_message(&fixture.state, &fixture.pairing, false, &request).is_err()
+        );
+        drop(attempt);
+        assert_eq!(
+            fixture
+                .state
+                .connections
+                .snapshot(Transport::Relay)
+                .unwrap()
+                .state,
+            ConnectionState::Offline
+        );
+        let after = fixture
+            .state
+            .registry
+            .authorization_record(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.device.suspended_at, after.device.suspended_at);
+        assert_eq!(before.device.revoked_at, after.device.revoked_at);
+        assert_eq!(before.grant.id, after.grant.id);
+        assert_eq!(before.grant.revocation_epoch, after.grant.revocation_epoch);
+        assert_eq!(after.device.revoked_at.is_some(), revoked);
+    }
+}
+
+#[test]
+fn connection_observation_query_refuses_ambiguous_or_private_fields() {
+    let _guard = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    for body in [
+        "{\"transport\":null}",
+        "{\"transport\":\"unknown\"}",
+        "{\"transport\":\"direct\",\"room\":\"private\"}",
+        "[]",
+    ] {
+        let response = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some(body))
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 400);
+        assert!(!response.body.contains("private"));
+    }
+    let response = handle_local_control(
+        "POST",
+        LOCAL_CONNECTION_PATH,
+        Some("{\"transport\":\"direct\"}"),
+    )
+    .unwrap()
+    .unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(response["transport"], "direct");
+    assert_eq!(response.as_object().unwrap().len(), 2);
+}

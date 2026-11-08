@@ -12193,6 +12193,7 @@ mod tests {
         ] {
             for path in [
                 "/api/v1/internal/mobile/pairings",
+                "/api/v1/internal/mobile/connections",
                 "/api/v1/internal/lifecycle/shutdown",
             ] {
                 let temp = tempfile::tempdir().expect("tempdir");
@@ -12237,6 +12238,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mobile_connection_observation_is_unavailable_on_tcp_ingress() {
+        let home = tempfile::tempdir().unwrap();
+        ensure_private_coven_home(home.path()).unwrap();
+        let hosts = vec!["localhost".to_string()];
+        let request = "POST /api/v1/internal/mobile/connections HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
+        let mut input = std::io::Cursor::new(request.as_bytes());
+        let mut output = Vec::new();
+        handle_http_stream(
+            &mut input,
+            &mut output,
+            home.path(),
+            None,
+            &crate::api::NoopSessionRuntime,
+            None,
+            HostGuard::Loopback {
+                allowed_hosts: &hosts,
+            },
+        )
+        .unwrap();
+        let response = String::from_utf8(output).unwrap();
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(!response.contains("\"transport\""), "{response}");
     }
 
     #[test]

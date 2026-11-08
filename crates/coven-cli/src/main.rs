@@ -3359,6 +3359,8 @@ fn interactive_shell_route(
 /// Everything `coven doctor` inspects, gathered before rendering so the
 /// prose and `--json` surfaces read the same probe results and cannot drift.
 struct DoctorReport {
+    mobile_relay_connection: Option<mobile_memory::transport::connection::ConnectionStatus>,
+    mobile_direct_connection: Option<mobile_memory::transport::connection::ConnectionStatus>,
     home: PathBuf,
     project_root: Option<PathBuf>,
     daemon: Option<daemon::DaemonStatusState>,
@@ -3446,6 +3448,26 @@ fn gather_doctor_report() -> Result<DoctorReport> {
         .ok()
         .and_then(|cwd| project::canonical_project_root(&cwd).ok());
     let daemon = daemon::background_server_status(&home)?;
+    let mobile_relay_connection = match &daemon {
+        Some(daemon::DaemonStatusState::Running(_)) => {
+            mobile_memory::relay_connection_for_doctor(&home)
+        }
+        Some(daemon::DaemonStatusState::Stale(_)) => None,
+        None => Some(mobile_memory::transport::connection::ConnectionStatus {
+            state: mobile_memory::transport::connection::ConnectionState::Offline,
+            transport: mobile_memory::transport::connection::Transport::Relay,
+        }),
+    };
+    let mobile_direct_connection = match &daemon {
+        Some(daemon::DaemonStatusState::Running(_)) => {
+            mobile_memory::direct_connection_for_doctor(&home)
+        }
+        Some(daemon::DaemonStatusState::Stale(_)) => None,
+        None => Some(mobile_memory::transport::connection::ConnectionStatus {
+            state: mobile_memory::transport::connection::ConnectionState::Offline,
+            transport: mobile_memory::transport::connection::Transport::Direct,
+        }),
+    };
     let legacy_repos_config_path = repos_config::config_path(&home);
     let settings_config_path = settings::user_settings_path();
     let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
@@ -3486,6 +3508,8 @@ fn gather_doctor_report() -> Result<DoctorReport> {
     };
     let familiars = cockpit_sources::read_familiars(&home).map_err(|err| format!("{err:#}"));
     Ok(DoctorReport {
+        mobile_relay_connection,
+        mobile_direct_connection,
         familiars_manifest: home.join("familiars.toml"),
         home,
         project_root,
@@ -3617,6 +3641,23 @@ fn print_doctor_prose(report: &DoctorReport) {
             ),
             None => println!("  [--] Not running — run: coven daemon start"),
         },
+    }
+
+    for (label, observation) in [
+        ("relay", report.mobile_relay_connection),
+        ("direct", report.mobile_direct_connection),
+    ] {
+        let state = observation
+            .map(|observed| match observed.state {
+                mobile_memory::transport::connection::ConnectionState::Offline => "offline",
+                mobile_memory::transport::connection::ConnectionState::Connecting => "connecting",
+                mobile_memory::transport::connection::ConnectionState::Authenticating => {
+                    "authenticating"
+                }
+                mobile_memory::transport::connection::ConnectionState::Online => "online",
+            })
+            .unwrap_or("unavailable");
+        print_doctor_line(format!("Mobile {label} connection: {state}"));
     }
 
     if !report.repos.is_empty() {
@@ -4150,6 +4191,8 @@ fn doctor_json_body(report: &DoctorReport) -> serde_json::Value {
         "blocking": !ok,
         "store": "<coven-home>",
         "project": report.project_root.as_ref().map(|_| "<project>"),
+        "mobileRelayConnection": report.mobile_relay_connection,
+        "mobileDirectConnection": report.mobile_direct_connection,
         "checks": checks,
         "nextSteps": doctor_next_steps(report.default_harness.as_deref()),
     })
@@ -10249,8 +10292,44 @@ mod tests {
         assert!(!serialized.contains(&socket));
     }
 
+    #[test]
+    fn doctor_connection_observations_are_coarse_and_do_not_change_authority_health() {
+        use mobile_memory::transport::connection::{ConnectionState, ConnectionStatus, Transport};
+        let mut report = make_doctor_report();
+        let healthy = report.healthy();
+        for state in [
+            ConnectionState::Offline,
+            ConnectionState::Connecting,
+            ConnectionState::Authenticating,
+            ConnectionState::Online,
+        ] {
+            report.mobile_relay_connection = Some(ConnectionStatus {
+                state,
+                transport: Transport::Relay,
+            });
+            report.mobile_direct_connection = Some(ConnectionStatus {
+                state,
+                transport: Transport::Direct,
+            });
+            let body = doctor_json_body(&report);
+            assert_eq!(body["ok"], healthy);
+            assert_eq!(body["mobileDirectConnection"].as_object().unwrap().len(), 2);
+            assert_eq!(body["mobileDirectConnection"]["transport"], "direct");
+            let connection = body["mobileRelayConnection"].as_object().unwrap();
+            assert_eq!(connection.len(), 2);
+            assert!(connection.contains_key("state"));
+            assert_eq!(connection["transport"], "relay");
+        }
+        report.mobile_relay_connection = None;
+        report.mobile_direct_connection = None;
+        assert!(doctor_json_body(&report)["mobileRelayConnection"].is_null());
+        assert!(doctor_json_body(&report)["mobileDirectConnection"].is_null());
+    }
+
     fn make_doctor_report() -> DoctorReport {
         DoctorReport {
+            mobile_relay_connection: None,
+            mobile_direct_connection: None,
             home: PathBuf::from("/tmp/coven-home"),
             project_root: Some(PathBuf::from("/tmp/project")),
             daemon: Some(daemon::DaemonStatusState::Running(daemon::DaemonStatus {

@@ -2358,3 +2358,87 @@ fn lifecycle_shutdown_rejects_a_binding_replaced_before_the_request() {
     );
     server.join().expect("server thread");
 }
+
+#[test]
+fn diagnostic_deadline_request_negotiates_health_and_retains_peer_binding() {
+    let home = TestHome::new();
+    let server = serve_responses(
+        &home.path,
+        vec![
+            ("/api/v1/health".to_owned(), 200, HEALTH.to_owned()),
+            (
+                "/api/v1/internal/mobile/connections".to_owned(),
+                200,
+                "{\"state\":\"offline\",\"transport\":\"direct\"}".to_owned(),
+            ),
+        ],
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let endpoint = DaemonEndpoint::discover_until(&home.path, deadline).unwrap();
+    let mut client = DaemonClient::new(endpoint);
+    let response = client
+        .request_json_until(
+            "POST",
+            "/api/v1/internal/mobile/connections",
+            Some(&serde_json::json!({"transport":"direct"})),
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["transport"],
+        "direct"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn expired_diagnostic_deadline_never_opens_the_socket() {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    let home = TestHome::new();
+    let socket = home.path.join("coven.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = DaemonEndpoint::discover(&home.path).unwrap();
+    let mut client = DaemonClient::new(endpoint);
+    let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let result = client.request_json_until(
+        "POST",
+        "/api/v1/internal/mobile/connections",
+        None,
+        deadline,
+    );
+    assert!(
+        matches!(result, Err(ClientError::Io { source, .. }) if source.kind() == std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert!(
+        matches!(DaemonEndpoint::discover_until(home.path.join("absent"), deadline), Err(ClientError::Io { source, .. }) if source.kind() == std::io::ErrorKind::TimedOut)
+    );
+}
+
+#[test]
+fn diagnostic_deadline_request_refuses_a_replaced_daemon_before_sending_body() {
+    let home = TestHome::new();
+    let server = serve_once(&home.path, 200, HEALTH.to_owned());
+    let endpoint = DaemonEndpoint::discover(&home.path).unwrap();
+    let mut client = DaemonClient::new(endpoint);
+    client.health().unwrap();
+    server.join().unwrap();
+    fs::remove_file(home.path.join("coven.sock")).unwrap();
+    let server = serve_responses(
+        &home.path,
+        vec![("<peer-check>".to_owned(), 200, String::new())],
+    );
+    let result = client.request_json_until(
+        "POST",
+        "/api/v1/internal/mobile/connections",
+        Some(&serde_json::json!({"transport":"relay"})),
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    );
+    assert!(matches!(result, Err(ClientError::DaemonInstanceChanged)));
+    server.join().unwrap();
+}
