@@ -61,6 +61,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'rust-test-linux',
             'threads-test-linux',
             'rust-test-windows',
+            'relay-test-windows',
             'threads-test-windows',
             'rust-test-macos',
             'threads-test-macos',
@@ -147,7 +148,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn('name: Rust tests (Windows, ${{ matrix.shard }})', windows)
         self.assertIn('\n      fail-fast: false\n', windows)
         self.assertIn(
-            '\n      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}\n',
+            '\n      - run: cargo test --workspace --locked --exclude coven-relay -- ${{ matrix.test-args }}\n',
             windows,
         )
         self.assertEqual(windows.count('run: cargo test'), 1)
@@ -160,6 +161,26 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertEqual(rest[0::2], ['--skip'] * len(named))
         self.assertEqual(rest[1::2], named)
         self.assertEqual(len(rest), 2 * len(named))
+
+    def test_windows_relay_partition_keeps_every_package_required(self) -> None:
+        # Excluding the slow relay from both name shards is safe only when its
+        # complete package runs under the same Rust routing and required gate.
+        workspace = ci_job_block('rust-test-windows')
+        command = re.findall(r'^      - run: (cargo test .+)$', workspace, re.MULTILINE)
+        self.assertEqual(len(command), 1)
+        self.assertEqual(re.findall(r'--exclude (\S+)', command[0]), ['coven-relay'])
+        self.assertIn('--workspace --locked', command[0])
+        relay = ci_job_block('relay-test-windows')
+        self.assertIn('runs-on: windows-latest', relay)
+        for job in (workspace, relay):
+            self.assertIn('needs: changes', job)
+            self.assertIn("if: ${{ needs.changes.outputs.rust == 'true' }}", job)
+            self.assertNotIn('continue-on-error:', job)
+        self.assertEqual(
+            re.findall(r'^      - run: (cargo test .+)$', relay, re.MULTILINE),
+            ['cargo test --locked -p coven-relay'],
+        )
+        self.assertIn('\n      - relay-test-windows\n', ci_job_block('pr-gate'))
 
     def test_macos_workspace_shards_reuse_the_windows_predicate(self) -> None:
         # The macOS workspace suite outgrew its 30-minute hang guard as one job
@@ -193,7 +214,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("\n      - threads-test-macos\n", gate)
 
     def test_windows_rust_gate_restores_without_post_job_cache_packing(self) -> None:
-        for job in ('rust-test-windows', 'threads-test-windows'):
+        for job in ('rust-test-windows', 'relay-test-windows', 'threads-test-windows'):
             windows = ci_job_block(job)
             self.assertIn(f"uses: actions/cache/restore@{CACHE_SHA}", windows)
             self.assertNotIn("uses: actions/cache@", windows)

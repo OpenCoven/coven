@@ -366,8 +366,11 @@ jobs:
     # One libtest name predicate splits `cargo test --workspace` across two
     # runners (#1227). `named` runs every test whose name contains one of the
     # tokens and `rest` skips exactly those, so each test runs in exactly one
-    # shard, and a new test lands in one without editing this list. Unsplit,
-    # the `coven` unit suite alone took 622-1,192 s of a 30-minute budget;
+    # shard, and a new test lands in one without editing this list. The relay
+    # package runs unfiltered in its own required job: its strict five-minute
+    # idle-expiry case otherwise consumes the rest shard's remaining budget.
+    # Before sharding, the `coven` unit suite alone took 622-1,192 s of a
+    # 30-minute budget;
     # these tokens divide it roughly evenly, and `rest` also carries the
     # integration targets. `fail-fast: false` keeps one shard's failure from
     # cancelling the other's evidence.
@@ -403,7 +406,31 @@ jobs:
           key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-test-
-      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}
+      - run: cargo test --workspace --locked --exclude coven-relay -- ${{ matrix.test-args }}
+
+  relay-test-windows:
+    name: Relay tests (Windows)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    # Separate package coverage preserves the real idle-expiry contract without
+    # competing with workspace compilation and CLI integrations for one budget.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - run: cargo test --locked -p coven-relay
 
   threads-test-windows:
     name: Threads daemon tests (Windows)
@@ -983,6 +1010,7 @@ jobs:
       - rust-test-linux
       - threads-test-linux
       - rust-test-windows
+      - relay-test-windows
       - threads-test-windows
       - rust-test-macos
       - threads-test-macos
