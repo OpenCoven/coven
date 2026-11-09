@@ -489,3 +489,269 @@ fn rotation_adoption_and_device_recovery_loss_retry_identical_material_without_c
         println!("rotation-signed partial_reply={partial_reply} converged");
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Unanchored {
+    NeverProvisioned,
+    V1,
+    /// The crash window between the synced protocol floor and first material.
+    FloorOnly,
+}
+fn recover_named(known: u64) -> serde_json::Value {
+    json!({"version":2,"operation":"recover","knownGeneration":known})
+}
+fn bootstrap_refused(f: &Fixture, phone: &Path) {
+    let before = routing(f, phone);
+    let response = dispatch(f, &f.request("POST", PATH, f.pairing.device_id));
+    assert_ne!(response.status, 200, "legacy bootstrap opened a v1 anchor");
+    assert!(routing(f, phone) == before);
+}
+
+/// A signed `recover` naming a generation is the one path that can write the
+/// first anchor without generation 0: the contract accepts an authenticated
+/// device generation. It may only raise the generation, then converges.
+#[test]
+fn signed_recovery_naming_a_generation_on_an_unanchored_host_only_raises_it_and_converges() {
+    for start in [
+        Unanchored::NeverProvisioned,
+        Unanchored::V1,
+        Unanchored::FloorOnly,
+    ] {
+        for partial_reply in [false, true] {
+            let f = Fixture::new();
+            let id = f.pairing.device_id;
+            let phone = tempfile::tempdir().unwrap();
+            let phone = phone.path();
+            unanchored(&f, start == Unanchored::V1);
+            if start == Unanchored::FloorOnly {
+                let marker = f
+                    .state
+                    .coven_home
+                    .join(format!("mobile/.transport-v2-{id}.required"));
+                crate::mobile_memory::config::atomic_create_private(
+                    &marker,
+                    b"coven.mobile.routing.v2\n",
+                )
+                .unwrap();
+                // Without a named generation, nothing can be guessed here.
+                for body in [
+                    prepare_body(),
+                    json!({"version":2,"operation":"recover"}),
+                    ack_with(0, [0; 32]),
+                    json!({"version":2,"operation":"resync","transport":"direct","generation":0,"next":3}),
+                ] {
+                    refused(&f, phone, &body);
+                }
+                bootstrap_refused(&f, phone);
+            }
+            let pristine = routing_image(&f, phone);
+            refused(&f, phone, &recover_named(u64::MAX));
+            assert!(routing_image(&f, phone) == pristine, "overflow wrote state");
+
+            let body = recover_named(4);
+            let wire = request(&f, &body);
+            lose_request(&f, phone, &wire);
+            assert!(routing_image(&f, phone) == pristine);
+            let offered = lose_reply(dispatch(&f, &wire), partial_reply);
+            assert_eq!(offered["generation"].as_u64(), Some(5));
+            assert_eq!(generations(&f), Some((Some(4), None, Some(5))));
+            let pending = routing(&f, phone);
+            assert!(pending[1].is_some(), "protocol floor missing");
+            assert!(pending[2].is_none(), "device adopted without a reply");
+            inactive(&f);
+            assert_eq!(dispatch(&f, &wire).status, 409, "exact replay accepted");
+            bootstrap_refused(&f, phone);
+
+            // Every retry shape converges on the one pending value.
+            for retry in [
+                body.clone(),
+                recover_named(5),
+                json!({"version":2,"operation":"recover"}),
+                prepare_body(),
+            ] {
+                assert!(
+                    successful(&f, &retry) == offered,
+                    "{retry} replaced pending material"
+                );
+            }
+            assert!(routing(&f, phone) == pending);
+            for known in [0, 3, 6] {
+                refused(&f, phone, &recover_named(known));
+            }
+            let exact = serde_json::from_value::<v2::Handover>(offered.clone())
+                .unwrap()
+                .acknowledgment();
+            let mut wrong = exact.seed_digest;
+            wrong[0] ^= 1;
+            for body in [ack_with(5, wrong), ack_with(0, exact.seed_digest)] {
+                refused(&f, phone, &body);
+            }
+            assert!(routing(&f, phone) == pending);
+            inactive(&f);
+
+            let ack = handover(&f, offered.clone(), phone);
+            assert_eq!(ack.generation, 5);
+            successful(&f, &ack_body(&ack));
+            assert_eq!(generations(&f), Some((Some(4), Some(5), None)));
+            exchange(&f, phone, (1, 1, 0));
+
+            // Once anchored, a stale named recovery can neither lower nor rotate it.
+            let consumed = routing(&f, phone);
+            for known in [0, 4] {
+                refused(&f, phone, &recover_named(known));
+            }
+            successful(&f, &ack_body(&ack));
+            assert_eq!(handover(&f, offered, phone).generation, 5);
+            assert!(routing(&f, phone) == consumed, "retry changed counters");
+            assert_eq!(generations(&f), Some((Some(4), Some(5), None)));
+            bootstrap_refused(&f, phone);
+            println!(
+                "unanchored-named-recovery start={start:?} partial_reply={partial_reply} anchor=5 converged"
+            );
+        }
+    }
+}
+
+/// The legacy path blocks on the material lock while v2 polls it, so unstaggered
+/// requests always let legacy win. These offsets are jitter, not a timing
+/// assertion: the outcome must hold for whichever order the locks choose.
+#[test]
+fn legacy_bootstrap_racing_the_first_prepare_leaves_one_pending_generation_and_no_reused_seed() {
+    const OFFSETS_MS: [u64; 4] = [0, 2, 4, 8];
+    let (mut legacy_served, mut legacy_refused) = (0, 0);
+    for round in 0..8 {
+        let f = Fixture::new();
+        let id = f.pairing.device_id;
+        let phone = tempfile::tempdir().unwrap();
+        let phone = phone.path();
+        unanchored(&f, false);
+        let prepares: Vec<_> = (0..4).map(|_| request(&f, &prepare_body())).collect();
+        let legacies: Vec<_> = (0..4).map(|_| f.request("POST", PATH, id)).collect();
+        let start = std::sync::Barrier::new(8);
+        let timed = |wire: &[u8], offset: u64| {
+            start.wait();
+            std::thread::sleep(std::time::Duration::from_millis(offset));
+            dispatch(&f, wire)
+        };
+        // Even rounds start prepares first; odd rounds start legacy first.
+        let (prepare_lead, legacy_lead) = if round % 2 == 0 { (0, 1) } else { (1, 0) };
+        let (prepared, legacy): (Vec<_>, Vec<_>) = std::thread::scope(|scope| {
+            let timed = &timed;
+            let prepared: Vec<_> = prepares
+                .iter()
+                .zip(OFFSETS_MS)
+                .map(|(wire, offset)| scope.spawn(move || timed(wire, offset + prepare_lead)))
+                .collect();
+            let legacy: Vec<_> = legacies
+                .iter()
+                .zip(OFFSETS_MS)
+                .map(|(wire, offset)| scope.spawn(move || timed(wire, offset + legacy_lead)))
+                .collect();
+            (
+                prepared.into_iter().map(|w| w.join().unwrap()).collect(),
+                legacy.into_iter().map(|w| w.join().unwrap()).collect(),
+            )
+        });
+        let offers: Vec<_> = prepared
+            .iter()
+            .map(|reply| {
+                assert_eq!(reply.status, 200, "{}", reply.body);
+                complete_reply(&reply.to_http()).unwrap()
+            })
+            .collect();
+        let offered = offers[0].clone();
+        assert!(
+            offers.iter().all(|offer| *offer == offered),
+            "racing prepares offered different material"
+        );
+        assert_eq!(offered["generation"].as_u64(), Some(0));
+        for reply in &legacy {
+            if reply.status == 200 {
+                legacy_served += 1;
+                let material = complete_reply(&reply.to_http()).unwrap();
+                assert_ne!(
+                    material["routingSeed"], offered["routingSeed"],
+                    "v2 reused a seed served to the legacy path"
+                );
+            } else {
+                legacy_refused += 1;
+            }
+        }
+        // Whichever order the locks chose, exactly one v2 pending value remains.
+        assert_eq!(generations(&f), Some((None, None, Some(0))));
+        bootstrap_refused(&f, phone);
+        inactive(&f);
+        let ack = handover(&f, offered, phone);
+        successful(&f, &ack_body(&ack));
+        assert_eq!(generations(&f), Some((None, Some(0), None)));
+        exchange(&f, phone, (1, 1, 0));
+    }
+    println!(
+        "legacy-prepare-race rounds=8 legacy_served={legacy_served} legacy_refused={legacy_refused} converged"
+    );
+}
+
+/// Neither the legacy Noise channel nor the device's routing attempt can skip
+/// the acknowledgment: a pending generation authorizes no channel.
+#[test]
+fn legacy_channel_and_device_attempts_cannot_skip_adoption_of_a_pending_first_generation() {
+    for legacy in [false, true] {
+        let f = Fixture::new();
+        let id = f.pairing.device_id;
+        let phone = tempfile::tempdir().unwrap();
+        let phone = phone.path();
+        unanchored(&f, legacy);
+        let signer = host(&f);
+        let no_legacy_effect = |stage: &str| {
+            let before = routing(&f, phone);
+            for direct in [false, true] {
+                let wire = f.request("DELETE", "/api/v1/mobile/device", id);
+                assert!(
+                    handle_transport_message(&f.state, &f.pairing, direct, &wire).is_err(),
+                    "legacy channel kept application authority {stage} (direct={direct})"
+                );
+            }
+            let record = f.state.registry.authorization_record(id).unwrap().unwrap();
+            assert!(record.device.revoked_at.is_none(), "{stage} revoked device");
+            assert!(
+                routing(&f, phone) == before,
+                "{stage} changed routing state"
+            );
+        };
+        let offered = successful(&f, &prepare_body());
+        no_legacy_effect("before adoption");
+        inactive(&f);
+        // No device file yet: the device can neither join a room nor resync.
+        for transport in [Transport::Direct, Transport::Relay] {
+            assert!(v2::device::begin(
+                phone,
+                signer.verifying_key(),
+                id,
+                f.device.verifying_key(),
+                transport,
+            )
+            .is_err());
+            assert!(v2::device::resync_direct(
+                phone,
+                signer.verifying_key(),
+                id,
+                f.device.verifying_key(),
+                transport,
+                HostState {
+                    generation: 0,
+                    floor: 3,
+                },
+            )
+            .is_err());
+        }
+        assert!(routing(&f, phone)[2].is_none());
+        // Adopted but unacknowledged: the host still authorizes nothing.
+        let ack = handover(&f, offered, phone);
+        no_legacy_effect("after adoption");
+        inactive(&f);
+        successful(&f, &ack_body(&ack));
+        no_legacy_effect("after commit");
+        exchange(&f, phone, (1, 1, 0));
+        println!("pending-first-generation legacy={legacy} no channel before acknowledgment");
+    }
+}
