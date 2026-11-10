@@ -146,15 +146,14 @@ and says why. Commit the lock with the workflows.
 
 ### Certification packet
 
-Produce the redacted certification report for every supported built-in harness
-against the exact commit you intend to tag. Each report is a one-provider
-artifact and the destination must not already exist:
+Produce the redacted certification report for every supported built-in harness against the exact commit you intend to tag. Set `COVEN_RELEASE_CANDIDATE_BIN` to the absolute path of that freshly built candidate binary (`coven.exe` on Windows), and invoke that same file for every report. A globally installed `coven` can identify an older release even when the current checkout is correct. Each report is a one-provider artifact and the destination must not already exist:
 
 ```sh
+COVEN_RELEASE_CANDIDATE_BIN=/absolute/path/to/candidate/coven
 mkdir -p cert
-coven setup codex   --verify-only --report-json cert/codex.json
-coven setup claude  --verify-only --report-json cert/claude.json
-coven setup copilot --verify-only --report-json cert/copilot.json
+"$COVEN_RELEASE_CANDIDATE_BIN" setup codex   --verify-only --report-json cert/codex.json
+"$COVEN_RELEASE_CANDIDATE_BIN" setup claude  --verify-only --report-json cert/claude.json
+"$COVEN_RELEASE_CANDIDATE_BIN" setup copilot --verify-only --report-json cert/copilot.json
 ```
 
 Create the destination directory first: publication is fail-if-exists on the
