@@ -1262,18 +1262,30 @@ test('release workflow builds and publishes Intel macOS as a separate target', (
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=macos-x64 --skip-build --publish --skip-wrapper/);
 });
 
-test('release builds report the derived npm version, not the raw tag name', () => {
+test('each release build receives the derived npm version and verified commit', () => {
   const workflow = readFileSync(
     new URL(['..', '.github', 'workflows', 'release-npm.yml'].join('/'), import.meta.url),
     'utf8'
-  );
+  ).replaceAll('\r\n', '\n');
   const buildJob = workflow.match(/^  build-platform:[\s\S]*?(?=^  [A-Za-z0-9_-]+:)/m)?.[0];
   assert.ok(buildJob, 'release workflow must contain the platform build job');
-  assert.match(
-    buildJob,
-    /^          COVEN_BUILD_VERSION: v\$\{\{ needs\.verify-tag\.outputs\.npm_version \}\}$/m,
-    'release binaries must report the parsed npm version, not the raw ref name'
-  );
+  const steps = buildJob.split(/^      - /m);
+  for (const args of ['--package coven-cli', '-p coven-afs --features mount --bins']) {
+    const command = 'run: cargo build --release ' + args + ' --target ${{ matrix.rust-target }}';
+    const step = steps.find((candidate) => candidate.startsWith(command + '\n') ||
+      candidate.includes('\n        ' + command + '\n'));
+    assert.ok(step, `release workflow must contain the ${args} build step`);
+    assert.match(
+      step,
+      /^        env:\n(?:          [^\n]+\n)*          COVEN_BUILD_VERSION: v\$\{\{ needs\.verify-tag\.outputs\.npm_version \}\}$/m,
+      `${args} must receive the parsed npm version`
+    );
+    assert.match(
+      step,
+      /^        env:\n(?:          [^\n]+\n)*          COVEN_BUILD_COMMIT: \$\{\{ needs\.verify-tag\.outputs\.head_sha \}\}$/m,
+      `${args} must receive the verified source commit`
+    );
+  }
   const buildScript = readFileSync(
     new URL(['..', 'crates', 'coven-cli', 'build.rs'].join('/'), import.meta.url),
     'utf8'
