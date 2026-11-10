@@ -124,9 +124,15 @@ pub struct VerifiedMobileDevice {
     assurance_challenge_request: bool,
 }
 
+#[derive(Default)]
+struct ReplayCache {
+    entries: HashMap<(Uuid, [u8; 32]), i64>,
+    high_water: Option<i64>,
+}
+
 pub struct MobileAuthenticator {
     registry: Arc<DeviceRegistry>,
-    replay: Mutex<HashMap<(Uuid, [u8; 32]), i64>>,
+    replay: Mutex<ReplayCache>,
     rates: Mutex<HashMap<Uuid, VecDeque<i64>>>,
     challenges: Option<Arc<AssuranceChallengeStore>>,
 }
@@ -135,7 +141,7 @@ impl MobileAuthenticator {
     pub fn new(registry: Arc<DeviceRegistry>) -> Self {
         Self {
             registry,
-            replay: Mutex::new(HashMap::new()),
+            replay: Mutex::new(ReplayCache::default()),
             rates: Mutex::new(HashMap::new()),
             challenges: None,
         }
@@ -147,7 +153,7 @@ impl MobileAuthenticator {
     ) -> Self {
         Self {
             registry,
-            replay: Mutex::new(HashMap::new()),
+            replay: Mutex::new(ReplayCache::default()),
             rates: Mutex::new(HashMap::new()),
             challenges: Some(challenges.into()),
         }
@@ -230,7 +236,7 @@ impl MobileAuthenticator {
             super::grant::GrantError::AssuranceRequired => MobileAuthError::AssuranceRequired,
             _ => MobileAuthError::DeviceRevoked,
         })?;
-        self.insert_nonce(auth.device_id, nonce, now.timestamp())?;
+        self.insert_nonce(auth.device_id, nonce, now.timestamp(), auth.timestamp)?;
         self.record_rate(auth.device_id, now.timestamp())?;
         Ok(VerifiedMobileDevice {
             device_id: auth.device_id,
@@ -391,19 +397,35 @@ impl MobileAuthenticator {
         device_id: Uuid,
         nonce: [u8; 32],
         now: i64,
+        signed_timestamp: i64,
     ) -> Result<(), MobileAuthError> {
+        // Timestamp validation includes the last second of the signature window.
+        // Retain the nonce through that second, including accepted future skew;
+        // verification time alone is not the signed request's expiry.
+        let expires = signed_timestamp
+            .checked_add(MOBILE_REQUEST_WINDOW_SECONDS)
+            .and_then(|last_valid| last_valid.checked_add(1))
+            .ok_or(MobileAuthError::RequestExpired)?;
         let mut replay = self
             .replay
             .lock()
             .map_err(|_| MobileAuthError::RateLimited)?;
-        replay.retain(|_, expires| *expires > now);
-        if replay.contains_key(&(device_id, nonce)) {
+        // Retired signatures must stay retired if the wall clock moves back.
+        // Compare expiry, not the sample itself: concurrent requests may arrive
+        // at this lock out of order without a clock rollback.
+        let frontier = replay.high_water.map_or(now, |previous| previous.max(now));
+        replay.high_water = Some(frontier);
+        replay.entries.retain(|_, expires| *expires > frontier);
+        if expires <= frontier {
+            return Err(MobileAuthError::RequestExpired);
+        }
+        if replay.entries.contains_key(&(device_id, nonce)) {
             return Err(MobileAuthError::RequestReplayed);
         }
-        if replay.len() >= MAX_REPLAY_ENTRIES {
+        if replay.entries.len() >= MAX_REPLAY_ENTRIES {
             return Err(MobileAuthError::RateLimited);
         }
-        replay.insert((device_id, nonce), now + MOBILE_REQUEST_WINDOW_SECONDS);
+        replay.entries.insert((device_id, nonce), expires);
         Ok(())
     }
 
@@ -531,6 +553,148 @@ mod tests {
     }
 
     #[test]
+    fn replay_retention_covers_the_entire_accepted_signature_window() {
+        for skew in [0, MOBILE_REQUEST_WINDOW_SECONDS] {
+            let (_temp, authenticator) = authenticator();
+            let id = Uuid::new_v4();
+            authenticator.registry.register(test_device(id)).unwrap();
+            let now = Utc::now();
+            let timestamp = now.timestamp() + skew;
+            let nonce = URL_SAFE_NO_PAD.encode([7; 32]);
+            let digest = URL_SAFE_NO_PAD.encode(Sha256::digest([]));
+            let canonical =
+                canonical_request("GET", "/api/v1/mobile/device", timestamp, &nonce, &digest)
+                    .unwrap();
+            let key = SigningKey::from_slice(&[1; 32]).unwrap();
+            let signature: Signature = key.sign(&canonical);
+            let request = MobileRequestAuth {
+                device_id: id,
+                timestamp,
+                nonce,
+                body_digest: digest,
+                signature: URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+            };
+            assert!(authenticator
+                .verify("GET", "/api/v1/mobile/device", &[], &request, now)
+                .is_ok());
+            let last_valid =
+                DateTime::from_timestamp(timestamp + MOBILE_REQUEST_WINDOW_SECONDS, 0).unwrap();
+            assert_eq!(
+                authenticator
+                    .verify("GET", "/api/v1/mobile/device", &[], &request, last_valid)
+                    .err(),
+                Some(MobileAuthError::RequestReplayed),
+                "skew={skew}, last inclusive second"
+            );
+            assert_eq!(
+                authenticator
+                    .verify(
+                        "GET",
+                        "/api/v1/mobile/device",
+                        &[],
+                        &request,
+                        last_valid + Duration::seconds(1)
+                    )
+                    .err(),
+                Some(MobileAuthError::RequestExpired),
+                "skew={skew}, beyond signature validity"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_replay_stays_expired_after_clock_rollback() {
+        let (_temp, authenticator) = authenticator();
+        let id = Uuid::new_v4();
+        authenticator.registry.register(test_device(id)).unwrap();
+        let now = Utc::now();
+        let signed = |at: DateTime<Utc>, marker: u8| {
+            let nonce = URL_SAFE_NO_PAD.encode([marker; 32]);
+            let digest = URL_SAFE_NO_PAD.encode(Sha256::digest([]));
+            let canonical = canonical_request(
+                "GET",
+                "/api/v1/mobile/device",
+                at.timestamp(),
+                &nonce,
+                &digest,
+            )
+            .unwrap();
+            let key = SigningKey::from_slice(&[1; 32]).unwrap();
+            let signature: Signature = key.sign(&canonical);
+            MobileRequestAuth {
+                device_id: id,
+                timestamp: at.timestamp(),
+                nonce,
+                body_digest: digest,
+                signature: URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+            }
+        };
+        let original = signed(now, 7);
+        assert!(authenticator
+            .verify("GET", "/api/v1/mobile/device", &[], &original, now)
+            .is_ok());
+        let later = now + Duration::seconds(MOBILE_REQUEST_WINDOW_SECONDS + 1);
+        let fresh = signed(later, 8);
+        assert!(authenticator
+            .verify("GET", "/api/v1/mobile/device", &[], &fresh, later)
+            .is_ok());
+        assert_eq!(
+            authenticator
+                .verify("GET", "/api/v1/mobile/device", &[], &original, now)
+                .err(),
+            Some(MobileAuthError::RequestExpired),
+            "a wall-clock rollback must not make a retired signed operation usable again"
+        );
+    }
+
+    #[test]
+    fn replay_cache_never_evicts_live_operations_to_admit_more() {
+        let (_temp, auth) = authenticator();
+        let id = Uuid::new_v4();
+        auth.insert_nonce(id, [7; 32], 100, 100).unwrap();
+        {
+            let mut cache = auth.replay.lock().unwrap();
+            cache
+                .entries
+                .extend((0..MAX_REPLAY_ENTRIES - 1).map(|index| {
+                    let mut nonce = [0; 32];
+                    nonce[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                    ((id, nonce), 401)
+                }));
+            assert_eq!(cache.entries.len(), MAX_REPLAY_ENTRIES);
+        }
+        assert_eq!(
+            auth.insert_nonce(id, [255; 32], 100, 100),
+            Err(MobileAuthError::RateLimited)
+        );
+        assert_eq!(
+            auth.insert_nonce(id, [7; 32], 100, 100),
+            Err(MobileAuthError::RequestReplayed)
+        );
+        auth.insert_nonce(id, [255; 32], 401, 401).unwrap();
+        assert_eq!(auth.replay.lock().unwrap().entries.len(), 1);
+        assert_eq!(
+            auth.insert_nonce(id, [7; 32], 100, 100),
+            Err(MobileAuthError::RequestExpired)
+        );
+    }
+
+    #[test]
+    fn out_of_order_clock_samples_keep_valid_requests_usable() {
+        let (_temp, auth) = authenticator();
+        let id = Uuid::new_v4();
+        auth.insert_nonce(id, [1; 32], 101, 101).unwrap();
+        auth.insert_nonce(id, [2; 32], 100, 100).unwrap();
+        assert_eq!(
+            auth.insert_nonce(id, [1; 32], 100, 101),
+            Err(MobileAuthError::RequestReplayed)
+        );
+        // A nonce is device-scoped, not a reason to reject another paired device.
+        auth.insert_nonce(Uuid::new_v4(), [1; 32], 101, 101)
+            .unwrap();
+    }
+
+    #[test]
     fn accepted_nonce_cannot_be_replayed_even_concurrently() {
         let (_temp, authenticator) = authenticator();
         let authenticator = Arc::new(authenticator);
@@ -541,7 +705,7 @@ mod tests {
             let barrier = barrier.clone();
             workers.push(std::thread::spawn(move || {
                 barrier.wait();
-                authenticator.insert_nonce(Uuid::from_u128(1), [7; 32], 100)
+                authenticator.insert_nonce(Uuid::from_u128(1), [7; 32], 100, 100)
             }));
         }
         let accepted = workers
