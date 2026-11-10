@@ -23,6 +23,19 @@ impl Fixture {
         Self::with_home(home)
     }
     fn with_home(home: tempfile::TempDir) -> Self {
+        Self::configured(home, false)
+    }
+    fn with_authorization() -> Self {
+        Self::configured(tempfile::tempdir().unwrap(), true)
+    }
+    fn configured(home: tempfile::TempDir, with_authorization: bool) -> Self {
+        Self::configured_after(home, with_authorization, 0)
+    }
+    fn configured_after(
+        home: tempfile::TempDir,
+        with_authorization: bool,
+        preceding: usize,
+    ) -> Self {
         let registry = Arc::new(DeviceRegistry::load(home.path()).unwrap());
         let identity = load_or_create_host_identity(home.path(), "192.0.2.1").unwrap();
         let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
@@ -41,12 +54,45 @@ impl Fixture {
             scopes: vec![DeviceScope::MemoryRead],
         };
         let grant = DeviceGrant::for_device(id, &public_key, record.scopes.clone(), now).unwrap();
-        registry.register_with_grant(record, grant).unwrap();
+        let authorization =
+            with_authorization.then(|| super::super::assurance::NewAuthorizationKey {
+                public_key_x963: URL_SAFE_NO_PAD.encode(
+                    SigningKey::from_slice(&[43; 32])
+                        .unwrap()
+                        .verifying_key()
+                        .to_sec1_point(false)
+                        .as_bytes(),
+                ),
+                assurance_class: super::super::assurance::AssuranceClass::BiometricOnly,
+                enrolled_at: now,
+            });
+        for index in 0..preceding {
+            let mut other = record.clone();
+            other.id = Uuid::new_v4();
+            let other_key =
+                SigningKey::from_slice(&[u8::try_from(index + 100).unwrap(); 32]).unwrap();
+            other.public_key_x963 =
+                URL_SAFE_NO_PAD.encode(other_key.verifying_key().to_sec1_point(false).as_bytes());
+            let other_grant = DeviceGrant::for_device(
+                other.id,
+                &other.public_key_x963,
+                other.scopes.clone(),
+                now,
+            )
+            .unwrap();
+            registry
+                .register_with_grant_and_authorization(other, other_grant, None)
+                .unwrap();
+        }
+        registry
+            .register_with_grant_and_authorization(record, grant, authorization)
+            .unwrap();
         let pairing = storage::load_or_provision(home.path(), &registry, &host, id)
             .unwrap()
             .pairing;
         let state = MobileGatewayState {
             connections: Default::default(),
+            network: Default::default(),
             coven_home: home.path().to_path_buf(),
             host_fingerprint: identity.public_key_fingerprint,
             pairing: PairingManager::new(Arc::clone(&registry)),
@@ -263,6 +309,36 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         command.env("PATH", path);
     }
     let mut daemon = OwnedDaemon(command.spawn().unwrap());
+    let authority_before = fixture
+        .state
+        .registry
+        .authorization_record(fixture.pairing.device_id)
+        .unwrap()
+        .unwrap();
+    let observe_phase = |daemon: &mut OwnedDaemon, expected| {
+        let started = Instant::now();
+        // Hang guard only: wait on the actual daemon observation, never a sleep
+        // selected to race TLS/Noise setup. Child exit reports failure early.
+        let deadline = started + Duration::from_secs(120);
+        loop {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "daemon exited while waiting for {expected:?}"
+            );
+            if let Some(observed) = crate::mobile_memory::relay_connection_for_doctor(home) {
+                if observed.state == expected {
+                    assert_eq!(observed.transport, transport::connection::Transport::Relay);
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon never reported {expected:?}; observed wait {:?}",
+                started.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
     // Startup/store initialization is outside the strict stop budget. This is
     // only a hang guard; process exit reports early failure while retrying.
     let startup_deadline = Instant::now() + Duration::from_secs(120);
@@ -293,8 +369,16 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         // Receiving ClientHello proves the worker reached the real TLS path.
         // Send nothing back: shutdown must interrupt the pending handshake.
         stalled_socket = Some(socket);
+        observe_phase(
+            &mut daemon,
+            transport::connection::ConnectionState::Connecting,
+        );
         None
     } else {
+        observe_phase(
+            &mut daemon,
+            transport::connection::ConnectionState::Authenticating,
+        );
         let mut channel = loop {
             assert!(
                 daemon.0.try_wait().unwrap().is_none(),
@@ -341,6 +425,9 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         Some(channel)
     };
 
+    if !stall_tls {
+        observe_phase(&mut daemon, transport::connection::ConnectionState::Online);
+    }
     let started = Instant::now();
     assert!(crate::daemon::stop_background_server(home).unwrap());
     let elapsed = started.elapsed();
@@ -362,6 +449,19 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(
+        crate::mobile_memory::relay_connection_for_doctor(home).is_none(),
+        "stopped daemon retained a live connection observation"
+    );
+    assert_eq!(
+        authority_before,
+        fixture
+            .state
+            .registry
+            .authorization_record(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap()
+    );
     if let Some(channel) = channel.as_mut() {
         assert!(channel
             .receive_message(
@@ -1814,6 +1914,759 @@ fn online_connection_never_overrides_denial_or_restores_device_authority() {
 }
 
 #[test]
+fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_applies_once() {
+    use super::super::transport::{
+        self,
+        connection::{ConnectionState, Transport},
+        migration::Migration,
+        test_support::Relay,
+        websocket,
+    };
+    use std::sync::mpsc;
+    let fixture = Fixture::with_authorization();
+    let before = fixture
+        .state
+        .registry
+        .authorization_record(fixture.pairing.device_id)
+        .unwrap()
+        .unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let material = storage::load_existing(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        fixture.pairing.device_id,
+    )
+    .unwrap()
+    .unwrap();
+    let provisioning = material.provisioning(&host).unwrap();
+    let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+    let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+    let relays = [Relay::start(), Relay::start()];
+    let migration = Migration::new(
+        fixture.pairing.clone(),
+        provisioning.binding_signature.clone(),
+        fixture.device.clone(),
+    )
+    .unwrap();
+    let pending = migration
+        .prepare("POST", "/api/v1/mobile/assurance/challenge", &[])
+        .unwrap();
+    let operation_id = pending.id();
+    let request_hashes = Arc::new(Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        let (applied_tx, applied_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (consumed_tx, consumed_rx) = mpsc::channel();
+        let first_relay = &relays[0];
+        let state = &fixture.state;
+        let pairing = &fixture.pairing;
+        let host_ref = &host;
+        let material_ref = &material;
+        let credential_ref = &credential;
+        let hashes = Arc::clone(&request_hashes);
+        let old_host = scope.spawn(move || {
+            let records = first_relay
+                .connect(websocket::Role::Host, &room, credential_ref)
+                .unwrap();
+            let mut channel = transport::accept(
+                records,
+                pairing,
+                &material_ref.noise_private,
+                host_ref,
+                &room,
+                false,
+                |pairing, direct| {
+                    transport::authority::check_current(
+                        &state.registry,
+                        pairing,
+                        direct,
+                        Utc::now(),
+                    )
+                },
+            )
+            .unwrap();
+            let encoded = channel
+                .receive_message(
+                    MAX_MOBILE_REQUEST_BYTES + 16 * 1024,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .unwrap();
+            hashes
+                .lock()
+                .unwrap()
+                .push(Sha256::digest(&*encoded).to_vec());
+            let (response, _) = handle_transport_message(state, pairing, false, &encoded).unwrap();
+            assert_eq!(response.status, 200);
+            applied_tx.send(()).unwrap();
+            // Explicit post-effect fault: the old request has executed, but its
+            // response is lost while a freshly authenticated channel takes over.
+            // Test-only hang guard: registration, connect and authentication
+            // each permit 30s, and two exchanges permit 15s each. Leave ample
+            // scheduler margin beyond those roughly 120s of valid phases.
+            let budget = Duration::from_secs(240);
+            let started = Instant::now();
+            release_rx.recv_timeout(budget).unwrap_or_else(|error| {
+                panic!(
+                    "handoff never released old response fault after {:?} (budget {budget:?}): {error}",
+                    started.elapsed()
+                )
+            });
+            channel.close();
+        });
+        let candidate = migration.begin(Transport::Relay).unwrap();
+        let records = relays[0]
+            .connect(websocket::Role::Client, &room, &credential)
+            .unwrap();
+        migration
+            .commit(candidate.authenticate(records, &room).unwrap())
+            .unwrap();
+        let old_request = scope.spawn(|| migration.exchange(&pending));
+        applied_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("old operation never reached its side effect");
+
+        let next_relay = &relays[1];
+        let hashes = Arc::clone(&request_hashes);
+        let next_host = scope.spawn(move || {
+            let records = next_relay
+                .connect(websocket::Role::Host, &room, credential_ref)
+                .unwrap();
+            let mut channel = transport::accept(
+                records,
+                pairing,
+                &material_ref.noise_private,
+                host_ref,
+                &room,
+                false,
+                |pairing, direct| {
+                    transport::authority::check_current(
+                        &state.registry,
+                        pairing,
+                        direct,
+                        Utc::now(),
+                    )
+                },
+            )
+            .unwrap();
+            for index in 0..3 {
+                let encoded = channel
+                    .receive_message(
+                        MAX_MOBILE_REQUEST_BYTES + 16 * 1024,
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .unwrap();
+                if index == 0 {
+                    hashes
+                        .lock()
+                        .unwrap()
+                        .push(Sha256::digest(&*encoded).to_vec());
+                }
+                let (response, _) =
+                    handle_transport_message(state, pairing, false, &encoded).unwrap();
+                channel
+                    .send_message(
+                        &response.to_http(),
+                        MAX_MOBILE_RESPONSE_BYTES + 16 * 1024,
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .unwrap();
+            }
+            // A successful send only queues the relay record. Keep the new host
+            // alive until the client consumes the final response: relay peer
+            // disconnect may correctly take priority over queued application data.
+            consumed_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("client never consumed the final handoff response");
+        });
+        let candidate = migration.begin(Transport::Relay).unwrap();
+        let records = relays[1]
+            .connect(websocket::Role::Client, &room, &credential)
+            .unwrap();
+        migration
+            .commit(candidate.authenticate(records, &room).unwrap())
+            .unwrap();
+        let replay = migration.exchange(&pending).unwrap();
+        assert_eq!(replay.operation_id, operation_id);
+        assert!(replay.bytes.starts_with(b"HTTP/1.1 409"));
+        assert!(std::str::from_utf8(&replay.bytes)
+            .unwrap()
+            .contains("request_replayed"));
+        let control = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&control)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        release_tx.send(()).unwrap();
+        assert!(old_request.join().unwrap().is_err());
+        assert_eq!(
+            migration.status().unwrap().unwrap().state,
+            ConnectionState::Online
+        );
+        let control = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&control)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        consumed_tx.send(()).unwrap();
+        old_host.join().unwrap();
+        next_host.join().unwrap();
+    });
+    let hashes = request_hashes.lock().unwrap();
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(
+        hashes[0], hashes[1],
+        "handoff changed the pending signed request"
+    );
+    let challenges: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            fixture
+                .state
+                .coven_home
+                .join("mobile")
+                .join(super::super::assurance::ASSURANCE_CHALLENGES_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        challenges["challenges"].as_array().unwrap().len(),
+        1,
+        "overlapping replay repeated the side effect"
+    );
+    assert_eq!(
+        before,
+        fixture
+            .state
+            .registry
+            .authorization_record(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(pending.id(), operation_id);
+}
+
+struct FirstFlight<R> {
+    inner: R,
+    first: Arc<Mutex<Option<Vec<u8>>>>,
+}
+impl<R: super::super::transport::Records> super::super::transport::Records for FirstFlight<R> {
+    fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<()> {
+        let mut first = self.first.lock().unwrap();
+        if first.is_none() {
+            *first = Some(bytes.to_vec());
+        }
+        drop(first);
+        self.inner.send(bytes, deadline)
+    }
+    fn receive(&mut self, deadline: Instant) -> Result<Vec<u8>> {
+        self.inner.receive(deadline)
+    }
+    fn receive_idle(&mut self) -> Result<Vec<u8>> {
+        self.inner.receive_idle()
+    }
+}
+
+#[test]
+fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
+    use super::super::transport::{
+        self,
+        cancellation::Cancellation,
+        connection::{ConnectionState, Transport},
+        migration::Migration,
+        test_support::Relay,
+        websocket,
+    };
+    // The registry admits 128 devices. A direct candidate must still route to
+    // a provisioned pairing after 32 earlier active, unprovisioned records.
+    let fixture = Fixture::configured_after(tempfile::tempdir().unwrap(), false, 32);
+    assert_eq!(
+        fixture.state.registry.list_status().unwrap()[32].id,
+        fixture.pairing.device_id
+    );
+    let before = fixture
+        .state
+        .registry
+        .authorization_record(fixture.pairing.device_id)
+        .unwrap()
+        .unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let tls_config = tls_server_config(
+        identity.certificate_der.clone(),
+        identity.private_key_der.to_vec(),
+    )
+    .unwrap();
+    let material = storage::load_existing(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        fixture.pairing.device_id,
+    )
+    .unwrap()
+    .unwrap();
+    let provisioning = material.provisioning(&host).unwrap();
+    let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+    let (relay_room, relay_credential) = provisioning.rendezvous(slot, false).unwrap();
+    let (direct_room, direct_credential) = provisioning.rendezvous(slot, true).unwrap();
+    let relays = [Relay::start(), Relay::start()];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let direct_endpoint = websocket::EndpointConfig {
+        url: format!("wss://192.0.2.1:{}/ws", address.port()),
+        ca_certificates: vec![URL_SAFE_NO_PAD.encode(&identity.certificate_der)],
+    }
+    .parse()
+    .unwrap();
+    let flights: Vec<_> = (0..3).map(|_| Arc::new(Mutex::new(None))).collect();
+    std::thread::scope(|scope| {
+        let migration = Migration::new(
+            fixture.pairing.clone(),
+            provisioning.binding_signature.clone(),
+            fixture.device.clone(),
+        )
+        .unwrap();
+        let state = &fixture.state;
+        let pairing = &fixture.pairing;
+        let material_ref = &material;
+        let host_ref = &host;
+        let relay_credential_ref = &relay_credential;
+        let first_relay = &relays[0];
+        let first_host = scope.spawn(move || {
+            let records = first_relay
+                .connect(websocket::Role::Host, &relay_room, relay_credential_ref)
+                .unwrap();
+            let mut channel = transport::accept(
+                records,
+                pairing,
+                &material_ref.noise_private,
+                host_ref,
+                &relay_room,
+                false,
+                |pairing, direct| {
+                    transport::authority::check_current(
+                        &state.registry,
+                        pairing,
+                        direct,
+                        Utc::now(),
+                    )
+                },
+            )
+            .unwrap();
+            for _ in 0..2 {
+                serve_transport_with_state(state, &mut channel).unwrap();
+            }
+        });
+        let candidate = migration.begin(Transport::Relay).unwrap();
+        let records = relays[0]
+            .connect(websocket::Role::Client, &relay_room, &relay_credential)
+            .unwrap();
+        migration
+            .commit(
+                candidate
+                    .authenticate(
+                        FirstFlight {
+                            inner: records,
+                            first: Arc::clone(&flights[0]),
+                        },
+                        &relay_room,
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+
+        let direct_host = scope.spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_nonblocking(false).unwrap();
+            serve_tls_connection(socket, tls_config, state)
+        });
+        let candidate = migration.begin(Transport::Direct).unwrap();
+        let records = websocket::connect_cancellable(
+            &direct_endpoint,
+            address,
+            websocket::Role::Client,
+            &direct_room,
+            &direct_credential,
+            Instant::now() + Duration::from_secs(30),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let candidate = candidate
+            .authenticate(
+                FirstFlight {
+                    inner: records,
+                    first: Arc::clone(&flights[1]),
+                },
+                &direct_room,
+            )
+            .unwrap();
+        assert_eq!(
+            migration.status().unwrap().unwrap().transport,
+            Transport::Relay
+        );
+        // The old relay remains useful after the direct endpoint has proved its
+        // identity, until the caller explicitly commits the handoff.
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        migration.commit(candidate).unwrap();
+        assert_eq!(
+            migration.status().unwrap().unwrap().transport,
+            Transport::Direct
+        );
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        assert_eq!(
+            state.connections.snapshot(Transport::Direct).unwrap().state,
+            ConnectionState::Online
+        );
+
+        let last_relay = &relays[1];
+        let last_host = scope.spawn(move || {
+            let records = last_relay
+                .connect(websocket::Role::Host, &relay_room, relay_credential_ref)
+                .unwrap();
+            let mut channel = transport::accept(
+                records,
+                pairing,
+                &material_ref.noise_private,
+                host_ref,
+                &relay_room,
+                false,
+                |pairing, direct| {
+                    transport::authority::check_current(
+                        &state.registry,
+                        pairing,
+                        direct,
+                        Utc::now(),
+                    )
+                },
+            )
+            .unwrap();
+            serve_transport_with_state(state, &mut channel).unwrap();
+        });
+        let candidate = migration.begin(Transport::Relay).unwrap();
+        let records = relays[1]
+            .connect(websocket::Role::Client, &relay_room, &relay_credential)
+            .unwrap();
+        let candidate = candidate
+            .authenticate(
+                FirstFlight {
+                    inner: records,
+                    first: Arc::clone(&flights[2]),
+                },
+                &relay_room,
+            )
+            .unwrap();
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        migration.commit(candidate).unwrap();
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        assert_eq!(
+            migration.status().unwrap().unwrap().transport,
+            Transport::Relay
+        );
+        state.stop_network_connections();
+        first_host.join().unwrap();
+        let _ = direct_host.join().unwrap();
+        last_host.join().unwrap();
+        assert_eq!(
+            state.connections.snapshot(Transport::Direct).unwrap().state,
+            ConnectionState::Offline
+        );
+    });
+    let first_keys: Vec<_> = flights
+        .iter()
+        .map(|flight| flight.lock().unwrap().as_ref().unwrap()[..32].to_vec())
+        .collect();
+    assert_ne!(
+        first_keys[0], first_keys[1],
+        "direct handoff reused a Noise ephemeral key"
+    );
+    assert_ne!(
+        first_keys[1], first_keys[2],
+        "relay handoff reused a Noise ephemeral key"
+    );
+    assert_ne!(
+        first_keys[0], first_keys[2],
+        "reconnect reused a Noise ephemeral key"
+    );
+    assert_eq!(
+        before,
+        fixture
+            .state
+            .registry
+            .authorization_record(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap()
+    );
+}
+
+#[test]
+fn direct_wss_rejects_invalid_routing_before_upgrade() {
+    use super::super::transport::{routing, storage::v2};
+    use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore};
+
+    let fixture = Fixture::with_authorization();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let id = fixture.pairing.device_id;
+    let handover = v2::prepare_direct(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &host,
+        id,
+    )
+    .unwrap();
+    let device_home = tempfile::tempdir().unwrap();
+    let ack = v2::device::adopt_direct(
+        device_home.path(),
+        handover,
+        host.verifying_key(),
+        id,
+        fixture.device.verifying_key(),
+    )
+    .unwrap();
+    v2::acknowledge_direct(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &host,
+        id,
+        &ack,
+    )
+    .unwrap();
+    let snapshot = v2::load(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        id,
+        routing::Transport::Direct,
+    )
+    .unwrap()
+    .unwrap();
+    let (room, credential) = snapshot.rendezvous(routing::Transport::Direct, 0).unwrap();
+    let room = URL_SAFE_NO_PAD.encode(room);
+    let bearer = format!("Bearer {}", URL_SAFE_NO_PAD.encode(credential.as_slice()));
+    let valid = format!("/ws?v=1&role=client&room={room}");
+    let before = fixture.state.registry.authorization_record(id).unwrap();
+    let server_tls = tls_server_config(
+        identity.certificate_der.clone(),
+        identity.private_key_der.to_vec(),
+    )
+    .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            identity.certificate_der,
+        ))
+        .unwrap();
+    let client_tls = Arc::new(
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let try_upgrade = |method: &str, target: &str, authorization: &str| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Hang guards only. Queue both socket ends before spawning the TLS
+        // worker so early fixture failure cannot leave an accept() waiting.
+        let socket =
+            TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(30))
+                .unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope
+                .spawn(|| serve_tls_connection(server, Arc::clone(&server_tls), &fixture.state));
+            let connection = ClientConnection::new(
+                Arc::clone(&client_tls),
+                ServerName::try_from("192.0.2.1").unwrap(),
+            )
+            .unwrap();
+            let mut tls = StreamOwned::new(connection, socket);
+            let request = format!("{method} {target} HTTP/1.1\r\nHost: 192.0.2.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nAuthorization: {authorization}\r\n\r\n");
+            tls.write_all(request.as_bytes()).unwrap();
+            let mut status = [0_u8; 12];
+            let upgraded = tls.read_exact(&mut status).is_ok() && &status == b"HTTP/1.1 101";
+            // Close before joining: the positive control deliberately stops
+            // after upgrade, before it sends any Noise possession proof.
+            drop(tls);
+            (upgraded, worker.join().unwrap())
+        })
+    };
+    assert!(
+        try_upgrade("GET", &valid, &bearer).0,
+        "positive upgrade control failed"
+    );
+    let cases = [
+        (
+            "version",
+            "GET",
+            format!("/ws?v=2&role=client&room={room}"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "role",
+            "GET",
+            format!("/ws?v=1&role=host&room={room}"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "missing",
+            "GET",
+            format!("/ws?role=client&room={room}"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "duplicate",
+            "GET",
+            format!("{valid}&v=1"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "unknown",
+            "GET",
+            format!("{valid}&extra=1"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "padded room",
+            "GET",
+            format!("/ws?v=1&role=client&room={room}%3D"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "wrong room",
+            "GET",
+            format!(
+                "/ws?v=1&role=client&room={}",
+                URL_SAFE_NO_PAD.encode([255; 32])
+            ),
+            bearer.clone(),
+            "direct pairing unavailable",
+        ),
+        (
+            "wrong credential",
+            "GET",
+            valid.clone(),
+            format!("Bearer {}", URL_SAFE_NO_PAD.encode([255; 32])),
+            "direct pairing unavailable",
+        ),
+        (
+            "padded credential",
+            "GET",
+            valid.clone(),
+            format!("{bearer}="),
+            "invalid direct routing",
+        ),
+        (
+            "authorization scheme",
+            "GET",
+            valid.clone(),
+            "Basic synthetic".into(),
+            "invalid direct routing",
+        ),
+        (
+            "fragment",
+            "GET",
+            format!("{valid}#fragment"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "method",
+            "POST",
+            valid.clone(),
+            bearer.clone(),
+            "invalid direct upgrade",
+        ),
+    ];
+    for (case, method, target, authorization, expected) in cases {
+        let (upgraded, result) = try_upgrade(method, &target, &authorization);
+        assert!(!upgraded, "{case} reached the WebSocket upgrade");
+        let error = result
+            .expect_err("invalid routing was accepted")
+            .to_string();
+        assert!(error.contains(expected), "{case}: {error}");
+    }
+    assert!(
+        try_upgrade("GET", &valid, &bearer).0,
+        "rejections damaged positive upgrade control"
+    );
+    assert_eq!(
+        before,
+        fixture.state.registry.authorization_record(id).unwrap()
+    );
+    let after = v2::load(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        id,
+        routing::Transport::Direct,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        snapshot.floors, after.floors,
+        "upgrade spent a routing counter before endpoint proof"
+    );
+}
+
+#[test]
 fn connection_observation_query_refuses_ambiguous_or_private_fields() {
     let _guard = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
     for body in [
@@ -1839,3 +2692,5 @@ fn connection_observation_query_refuses_ambiguous_or_private_fields() {
     assert_eq!(response["transport"], "direct");
     assert_eq!(response.as_object().unwrap().len(), 2);
 }
+
+mod v2_migration;

@@ -35,6 +35,7 @@ use super::pairing::{PairingError, PairingLifecycleState, PairingManager, Pairin
 use super::registry::DeviceRegistry;
 use super::{MAX_MOBILE_REQUEST_BYTES, MAX_MOBILE_RESPONSE_BYTES};
 
+mod direct_transport;
 mod relay_runtime;
 
 const MOBILE_IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -311,6 +312,8 @@ impl MobileGatewayHandle {
 impl Drop for MobileGatewayHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.state.stop_network_connections();
+        self.state.registry.cancel_pending_operations();
         let _ = TcpStream::connect_timeout(&self.local_addr, Duration::from_millis(100));
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -318,7 +321,14 @@ impl Drop for MobileGatewayHandle {
     }
 }
 
+#[derive(Default)]
+struct NetworkConnections {
+    stopping: bool,
+    live: Vec<Weak<super::transport::cancellation::Cancellation>>,
+}
+
 struct MobileGatewayState {
+    network: Mutex<NetworkConnections>,
     connections: super::transport::connection::Connections,
     coven_home: PathBuf,
     host_fingerprint: [u8; 32],
@@ -327,6 +337,42 @@ struct MobileGatewayState {
     authenticator: MobileAuthenticator,
     advertised_endpoint: Option<String>,
     introductions: super::enrollment::IntroductionLedger,
+}
+
+impl MobileGatewayState {
+    fn register_network_connection(
+        &self,
+        socket: &TcpStream,
+    ) -> Result<(
+        Arc<super::transport::cancellation::Cancellation>,
+        super::transport::cancellation::Attempt,
+    )> {
+        let cancellation = Arc::new(super::transport::cancellation::Cancellation::default());
+        let attempt = cancellation.begin()?;
+        attempt.register(socket)?;
+        let mut network = self
+            .network
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mobile network state unavailable"))?;
+        if network.stopping {
+            cancellation.cancel();
+            bail!("mobile network runtime stopped");
+        }
+        network.live.retain(|entry| entry.strong_count() > 0);
+        network.live.push(Arc::downgrade(&cancellation));
+        Ok((cancellation, attempt))
+    }
+
+    fn stop_network_connections(&self) {
+        let mut network = self
+            .network
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        network.stopping = true;
+        for cancellation in network.live.iter().filter_map(Weak::upgrade) {
+            cancellation.cancel();
+        }
+    }
 }
 
 pub fn start_mobile_gateway(coven_home: &Path) -> Result<Option<MobileGatewayHandle>> {
@@ -403,6 +449,7 @@ fn create_gateway_state(
     let challenges = Arc::new(AssuranceChallengeStore::load(coven_home)?);
     Ok(Arc::new(MobileGatewayState {
         connections: Default::default(),
+        network: Default::default(),
         coven_home: coven_home.to_path_buf(),
         host_fingerprint,
         pairing: PairingManager::new(Arc::clone(&registry)),
@@ -461,7 +508,16 @@ fn start_mobile_gateway_with_config(
                 MobileAuditEvent::GatewayStarted,
                 None,
             );
+            let mut workers: Vec<JoinHandle<()>> = Vec::new();
             while !thread_shutdown.load(Ordering::Acquire) {
+                let mut index = 0;
+                while index < workers.len() {
+                    if workers[index].is_finished() {
+                        let _ = workers.swap_remove(index).join();
+                    } else {
+                        index += 1;
+                    }
+                }
                 let (stream, _) = match listener.accept() {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -481,11 +537,9 @@ fn start_mobile_gateway_with_config(
                     break;
                 }
                 if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_CONNECTIONS {
-                    if let Err(error) =
-                        serve_tls_connection(stream, Arc::clone(&tls_config), &state)
-                    {
-                        eprintln!("coven mobile gateway connection rejected: {error}");
-                    }
+                    // Refuse excess sockets instead of running a persistent
+                    // connection synchronously on the listener thread.
+                    drop(stream);
                     continue;
                 }
                 inflight.fetch_add(1, Ordering::Relaxed);
@@ -500,10 +554,16 @@ fn start_mobile_gateway_with_config(
                         }
                         connection_inflight.fetch_sub(1, Ordering::Relaxed);
                     });
-                if let Err(error) = spawn {
-                    inflight.fetch_sub(1, Ordering::Relaxed);
-                    eprintln!("coven mobile gateway request thread rejected: {error}");
+                match spawn {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => {
+                        inflight.fetch_sub(1, Ordering::Relaxed);
+                        eprintln!("coven mobile gateway request thread rejected: {error}");
+                    }
                 }
+            }
+            for worker in workers {
+                let _ = worker.join();
             }
             let _ = append_event(
                 &thread_home,
@@ -543,11 +603,22 @@ fn serve_tls_connection(
     config: Arc<ServerConfig>,
     state: &MobileGatewayState,
 ) -> Result<()> {
+    let (_socket_lifetime, attempt) = state.register_network_connection(&stream)?;
     stream.set_read_timeout(Some(MOBILE_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(MOBILE_IO_TIMEOUT))?;
     let connection = ServerConnection::new(config).context("failed to create TLS connection")?;
     let mut tls = StreamOwned::new(connection, stream);
-    let request = read_mobile_request(&mut tls)?;
+    let request = {
+        let mut reader = BufReader::new(&mut tls);
+        let request = read_mobile_request_buffered(&mut reader)?;
+        if direct_transport::claims(&request) && !reader.buffer().is_empty() {
+            bail!("unexpected early direct transport data");
+        }
+        request
+    };
+    if direct_transport::claims(&request) {
+        return direct_transport::serve(tls, state, request, attempt);
+    }
     let response = handle_mobile_request(state, request);
     tls.write_all(&response.to_http())?;
     tls.flush()?;
@@ -561,6 +632,7 @@ struct MobileHttpRequest {
     body: Vec<u8>,
 }
 
+#[cfg(test)]
 fn read_mobile_request(stream: &mut impl Read) -> Result<MobileHttpRequest> {
     let mut reader = BufReader::new(stream);
     read_mobile_request_buffered(&mut reader)
@@ -1956,6 +2028,7 @@ mod tests {
             .unwrap();
         let state = MobileGatewayState {
             connections: Default::default(),
+            network: Default::default(),
             coven_home: temp.path().to_path_buf(),
             host_fingerprint: [3; 32],
             pairing: PairingManager::new(Arc::clone(&registry)),
@@ -2278,6 +2351,7 @@ mod tests {
         let challenges = Arc::new(AssuranceChallengeStore::load(home).unwrap());
         MobileGatewayState {
             connections: Default::default(),
+            network: Default::default(),
             coven_home: home.to_path_buf(),
             host_fingerprint: [7; 32],
             pairing: PairingManager::new(Arc::clone(&registry)),
