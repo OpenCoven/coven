@@ -1959,6 +1959,7 @@ fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_app
     std::thread::scope(|scope| {
         let (applied_tx, applied_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let (consumed_tx, consumed_rx) = mpsc::channel();
         let first_relay = &relays[0];
         let state = &fixture.state;
         let pairing = &fixture.pairing;
@@ -2002,9 +2003,17 @@ fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_app
             applied_tx.send(()).unwrap();
             // Explicit post-effect fault: the old request has executed, but its
             // response is lost while a freshly authenticated channel takes over.
-            release_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("handoff never released old response fault");
+            // Test-only hang guard: registration, connect and authentication
+            // each permit 30s, and two exchanges permit 15s each. Leave ample
+            // scheduler margin beyond those roughly 120s of valid phases.
+            let budget = Duration::from_secs(240);
+            let started = Instant::now();
+            release_rx.recv_timeout(budget).unwrap_or_else(|error| {
+                panic!(
+                    "handoff never released old response fault after {:?} (budget {budget:?}): {error}",
+                    started.elapsed()
+                )
+            });
             channel.close();
         });
         let candidate = migration.begin(Transport::Relay).unwrap();
@@ -2065,6 +2074,12 @@ fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_app
                     )
                     .unwrap();
             }
+            // A successful send only queues the relay record. Keep the new host
+            // alive until the client consumes the final response: relay peer
+            // disconnect may correctly take priority over queued application data.
+            consumed_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("client never consumed the final handoff response");
         });
         let candidate = migration.begin(Transport::Relay).unwrap();
         let records = relays[1]
@@ -2101,6 +2116,7 @@ fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_app
             .unwrap()
             .bytes
             .starts_with(b"HTTP/1.1 200"));
+        consumed_tx.send(()).unwrap();
         old_host.join().unwrap();
         next_host.join().unwrap();
     });

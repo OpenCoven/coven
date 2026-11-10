@@ -70,10 +70,25 @@ fn v2_migration_preserves_one_operation_and_durable_counters_across_transports()
         // channels instead of leaving an idle server waiting for more requests.
         let migration = Migration::new(pairing, binding, device.clone()).unwrap();
         let connect_relay = || {
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let started = Instant::now();
+            let budget = Duration::from_secs(60);
+            let deadline = started + budget;
             let mut tries = 0;
+            let durable_state = || {
+                // The probe must release the device lock before routed acquires it.
+                v2::device::begin(
+                    device_home.path(),
+                    host.verifying_key(),
+                    id,
+                    device.verifying_key(),
+                    routing::Transport::Relay,
+                )
+                .unwrap()
+                .state()
+            };
             loop {
                 tries += 1;
+                let before = durable_state();
                 let routed = migration
                     .begin(Transport::Relay)
                     .unwrap()
@@ -86,11 +101,21 @@ fn v2_migration_preserves_one_operation_and_durable_counters_across_transports()
                 {
                     Ok(candidate) => break candidate,
                     Err(error) => {
+                        assert_eq!(
+                            durable_state(),
+                            before,
+                            "relay candidate failed after durable device consumption: {error}"
+                        );
                         eprintln!("v2 migration relay candidate {tries}: {error}");
                         assert!(
-                            Instant::now() < deadline && tries < 100,
-                            "v2 relay never became ready: {error}"
+                            Instant::now() < deadline,
+                            "v2 relay never became ready after {:?} (budget {budget:?}, attempts {tries}): {error}",
+                            started.elapsed()
                         );
+                        // Wait for actual authenticated readiness. An attempt count
+                        // can expire before the manager's next one-second tick;
+                        // retain the original hang guard and yield between attempts.
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                 }
             }

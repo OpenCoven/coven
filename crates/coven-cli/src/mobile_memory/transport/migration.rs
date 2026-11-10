@@ -507,4 +507,187 @@ mod tests {
             ConnectionState::Online
         );
     }
+
+    #[test]
+    fn old_exchange_failure_after_handoff_preserves_the_replacement() {
+        use super::super::{
+            accept,
+            tests::{pipes, Pipe},
+        };
+        use std::sync::mpsc;
+
+        #[derive(Debug)]
+        enum OldEvent {
+            Receiving,
+            Finished,
+        }
+        struct AnnounceCompletion(mpsc::Sender<OldEvent>);
+        impl Drop for AnnounceCompletion {
+            fn drop(&mut self) {
+                let _ = self.0.send(OldEvent::Finished);
+            }
+        }
+        struct GatedFailure {
+            inner: Pipe,
+            armed: Arc<AtomicBool>,
+            entered: mpsc::Sender<OldEvent>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Records for GatedFailure {
+            fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<()> {
+                self.inner.send(bytes, deadline)
+            }
+            fn receive(&mut self, deadline: Instant) -> Result<Vec<u8>> {
+                if !self.armed.load(Ordering::Acquire) {
+                    return self.inner.receive(deadline);
+                }
+                self.entered.send(OldEvent::Receiving)?;
+                // Deliberately hold this old I/O completion until after commit,
+                // even if its normal exchange deadline has passed. This models
+                // a late transport failure without widening production budgets.
+                // The 120s test-only hang guard clears both fixture handshakes.
+                let budget = Duration::from_secs(120);
+                let started = Instant::now();
+                self.release.recv_timeout(budget).map_err(|error| {
+                    anyhow::anyhow!(
+                        "old receive release failed after {:?} (budget {budget:?}): {error}",
+                        started.elapsed()
+                    )
+                })?;
+                anyhow::bail!("deliberate old channel receive failure")
+            }
+            fn receive_idle(&mut self) -> Result<Vec<u8>> {
+                self.inner.receive_idle()
+            }
+        }
+        struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let host = SigningKey::from_slice(&[11; 32]).unwrap();
+        let device = SigningKey::from_slice(&[12; 32]).unwrap();
+        let (private, public) = super::super::generate_noise_key().unwrap();
+        let pairing = Pairing {
+            device_id: Uuid::new_v4(),
+            grant_id: Uuid::new_v4(),
+            revocation_epoch: 0,
+            host_key: *host.verifying_key(),
+            device_key: *device.verifying_key(),
+            noise_key: public,
+        };
+        let migration = Migration::new(
+            pairing.clone(),
+            pairing.sign_noise_binding(&host).unwrap(),
+            device,
+        )
+        .unwrap();
+        let authenticate = |candidate: Candidate, records: AnyRecords, server| {
+            std::thread::scope(|scope| {
+                let server = scope.spawn(|| {
+                    accept(
+                        server,
+                        &pairing,
+                        &private,
+                        &host,
+                        &[9; 32],
+                        false,
+                        |_, _| Ok(()),
+                    )
+                });
+                let candidate = candidate.authenticate(records, &[9; 32]).unwrap();
+                (candidate, server.join().unwrap().unwrap())
+            })
+        };
+        let (client, server, _) = pipes();
+        let armed = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let completion_tx = entered_tx.clone();
+        let old_records = GatedFailure {
+            inner: client,
+            armed: Arc::clone(&armed),
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let (old, old_host) = authenticate(
+            migration.begin(Transport::Relay).unwrap(),
+            Box::new(old_records),
+            server,
+        );
+        migration.commit(old).unwrap();
+        armed.store(true, Ordering::Release);
+        let (client, server, _) = pipes();
+        let (replacement, mut new_host) = authenticate(
+            migration.begin(Transport::Relay).unwrap(),
+            Box::new(client),
+            server,
+        );
+        let pending = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        std::thread::scope(|scope| {
+            // Drop this release before scoped joins on unwind as well as success.
+            let mut release = ReleaseOnDrop(Some(release_tx));
+            let old_request = scope.spawn(|| {
+                // Announce normal early completion and panic before receive, so
+                // readiness never waits for the hang guard after producer exit.
+                let _completion = AnnounceCompletion(completion_tx);
+                migration.exchange(&pending)
+            });
+            let budget = Duration::from_secs(120);
+            let started = Instant::now();
+            match entered_rx.recv_timeout(budget).unwrap_or_else(|error| {
+                panic!(
+                    "old receive never started after {:?} (budget {budget:?}): {error}",
+                    started.elapsed()
+                )
+            }) {
+                OldEvent::Receiving => (),
+                OldEvent::Finished => {
+                    let error = old_request.join().unwrap().err();
+                    panic!(
+                        "old exchange finished before gated receive after {:?}: {error:?}",
+                        started.elapsed()
+                    );
+                }
+            }
+            migration.commit(replacement).unwrap();
+            assert_eq!(
+                migration.status().unwrap().unwrap().state,
+                ConnectionState::Online
+            );
+            release.0.take().unwrap().send(()).unwrap();
+            let error = old_request.join().unwrap().err().unwrap();
+            assert!(format!("{error:#}").contains("deliberate old channel receive failure"));
+            assert_eq!(
+                migration.status().unwrap().unwrap().state,
+                ConnectionState::Online
+            );
+            let response_host = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                new_host
+                    .receive_message(MAX_MOBILE_REQUEST_BYTES + 16 * 1024, deadline)
+                    .unwrap();
+                new_host
+                    .send_message(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                        MAX_MOBILE_RESPONSE_BYTES + 16 * 1024,
+                        deadline,
+                    )
+                    .unwrap();
+            });
+            let control = migration
+                .prepare("GET", "/api/v1/mobile/device", &[])
+                .unwrap();
+            let response = migration.exchange(&control).unwrap();
+            assert_eq!(response.operation_id, control.id());
+            assert!(response.bytes.starts_with(b"HTTP/1.1 200"));
+            response_host.join().unwrap();
+        });
+        drop(old_host);
+    }
 }

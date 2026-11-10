@@ -18,6 +18,61 @@ class RunnerTests(unittest.TestCase):
         self.runner = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.runner)
 
+    def test_prerequisite_failures_report_stage_status_and_only_safe_categories(self):
+        source = Path(__file__).with_name('container.sh')
+        # Never source an older entrypoint that would run its container-only main.
+        self.assertIn('install_prerequisites()', source.read_text())
+        self.assertIn('BASH_SOURCE[0]', source.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls, log = root / 'calls.jsonl', root / 'private.log'
+            apt = root / 'apt-get'
+            apt.write_text(f'#!{sys.executable}\n' + '''import json, os, sys
+with open(os.environ['CONTRACT_TEST_CALLS'], 'a') as output:
+    output.write(json.dumps(sys.argv[1:]) + '\\n')
+print('confidential-diagnostic-marker https://fixture.invalid/private/path', file=sys.stderr)
+print(os.environ['CONTRACT_TEST_DIAGNOSTIC'], file=sys.stderr)
+sys.exit(int(os.environ['CONTRACT_TEST_UPDATE_STATUS' if sys.argv[1] == 'update' else 'CONTRACT_TEST_INSTALL_STATUS']))
+''')
+            apt.chmod(0o700)
+            cases = [
+                ('apt-update', 42, 'Temporary failure resolving', 'resolution'),
+                ('apt-install', 100, 'Could not connect to distribution mirror', 'transport'),
+                ('apt-update', 100, 'NO_PUBKEY fixture', 'index-authentication'),
+                ('apt-update', 100, 'Hash Sum mismatch', 'index-integrity'),
+                ('apt-install', 100, '404 Not Found', 'package-unavailable'),
+                ('apt-install', 100, 'No space left on device', 'storage'),
+                ('apt-install', 100, 'Could not get lock', 'package-manager-lock'),
+                ('apt-install', 100, 'Unmet dependencies', 'package-resolution'),
+                ('apt-install', 100, 'Unrecognized private error', 'package-manager'),
+                ('success', 0, 'normal progress', None),
+            ]
+            for stage, status, diagnostic, category in cases:
+                with self.subTest(stage=stage, category=category):
+                    calls.unlink(missing_ok=True)
+                    env = {**os.environ, 'PATH': str(root) + os.pathsep + os.defpath,
+                           'CONTRACT_TEST_CALLS': str(calls),
+                           'CONTRACT_TEST_UPDATE_STATUS': str(status if stage == 'apt-update' else 0),
+                           'CONTRACT_TEST_INSTALL_STATUS': str(status if stage == 'apt-install' else 0),
+                           'CONTRACT_TEST_DIAGNOSTIC': diagnostic}
+                    result = subprocess.run(['bash', '-c', 'source "$1"; install_prerequisites "$2"',
+                                             'contract-fixture', str(source), str(log)],
+                                            env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0 if stage == 'success' else 1, result.stderr)
+                    self.assertNotIn('confidential-diagnostic-marker', result.stdout + result.stderr)
+                    self.assertNotIn('fixture.invalid', result.stdout + result.stderr)
+                    self.assertIn('confidential-diagnostic-marker', log.read_text())
+                    actual_calls = [json.loads(line) for line in calls.read_text().splitlines()]
+                    self.assertEqual(actual_calls, [['update']] if stage == 'apt-update' else [
+                        ['update'], ['install', '-y', '--no-install-recommends', 'python3', 'git',
+                                     'ca-certificates', 'bash', 'util-linux']])
+                    if stage == 'success':
+                        self.assertEqual(result.stdout, '')
+                    else:
+                        self.assertEqual(json.loads(result.stdout), {
+                            'status': 'failed', 'code': 'container-prerequisites', 'stage': stage,
+                            'package_manager_exit_code': status, 'diagnostic': {'code': category}})
+
     def test_only_digest_pinned_official_images_are_accepted(self):
         inventory = self.runner.load_images()
         self.assertEqual(set(inventory), {'debian12', 'debian13', 'ubuntu24'})
