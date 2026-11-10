@@ -168,6 +168,54 @@ test('a tag signed by the pinned key on a main commit verifies and records its e
   assert.equal(result.signerPins.taggedCommitSha256, result.signerPins.defaultBranchSha256);
 });
 
+test('two keys for one account verify and record the actual signing key in either pin order', async (t) => {
+  for (const [keyName, keyId] of [['trusted', KEY_ID_TRUSTED], ['other', KEY_ID_OTHER]]) {
+    await t.test(keyName, async (t) => {
+      const fixture = createFixture(t);
+      fixture.commit('trust both registered keys', {
+        [RELEASE_SIGNERS_PATH]: pins([pin(), pin(KEY_ID_OTHER)])
+      });
+      run('git', ['tag', '-d', TAG], fixture.work);
+      fixture.signedTag(TAG, keyName);
+      fixture.commit('reorder keys without changing trust', {
+        [RELEASE_SIGNERS_PATH]: pins([pin(KEY_ID_OTHER), pin()])
+      });
+      fixture.push();
+      retarget(fixture);
+      const result = await fixture.verify();
+      assert.equal(result.signer.sshSigningKeyId, keyId);
+      assert.equal(result.signer.fingerprint, fixture.keys[keyName].fingerprint);
+      assert.equal(result.signer.principal, PRINCIPAL);
+    });
+  }
+});
+
+test('removing one of two account keys revokes that key while the account remains trusted', async (t) => {
+  const fixture = createFixture(t);
+  fixture.commit('trust both registered keys', {
+    [RELEASE_SIGNERS_PATH]: pins([pin(), pin(KEY_ID_OTHER)])
+  });
+  run('git', ['tag', '-d', TAG], fixture.work);
+  fixture.signedTag(TAG, 'other');
+  fixture.commit('revoke only the second key', { [RELEASE_SIGNERS_PATH]: pins([pin()]) });
+  fixture.push();
+  retarget(fixture);
+  await assert.rejects(fixture.verify(), /not signed by a trusted signer/);
+});
+
+test('refuses ambiguous key ids for the same verified public key', async (t) => {
+  const fixture = createFixture(t);
+  fixture.commit('pin distinct key ids', {
+    [RELEASE_SIGNERS_PATH]: pins([pin(), pin(KEY_ID_OTHER)])
+  });
+  run('git', ['tag', '-d', TAG], fixture.work);
+  fixture.signedTag(TAG);
+  fixture.push();
+  retarget(fixture);
+  fixture.state.signingKeys[1].key = fixture.keys.trusted.publicKey;
+  await assert.rejects(fixture.verify(), /uniquely match/);
+});
+
 test('a tag on an older main commit verifies against the current pins', async (t) => {
   const fixture = createFixture(t);
   fixture.commit('later work');
@@ -316,7 +364,7 @@ test('signer pins are validated strictly', () => {
     [pins([pin(KEY_ID_TRUSTED, { githubUserId: '1001' })]), /positive integers/],
     [pins([pin(0)]), /positive integers/],
     [pins([pin(KEY_ID_TRUSTED, { keyType: 'ssh-rsa' })]), /keyType "ssh-rsa"/],
-    [pins([pin(), pin(KEY_ID_OTHER)]), /repeats a signer/],
+    [pins([pin(), pin()]), /repeats a signer/],
     [pins([pin(), pin(KEY_ID_TRUSTED, { githubLogin: 'second-bot', githubUserId: 2002 })]), /repeats a signer or signing key/]
   ];
   for (const [text, expected] of cases) {
@@ -333,13 +381,19 @@ test('allowed signers carry only principal, key type, and key', async () => {
   assert.equal(allowedSignersText(resolved), `${PRINCIPAL} ssh-ed25519 AAAAC3Nza\n`);
 });
 
-test('the checked-in pins name the maintainer signing key the release variable trusted', () => {
+test('the checked-in pins retain the old maintainer key and authorize the current registered key', () => {
   const signers = parseReleaseSigners(readFileSync(path.join(repoRoot, RELEASE_SIGNERS_PATH), 'utf8'));
   assert.deepEqual(signers, [{
     principal: signerPrincipal({ githubUserId: 68980965, githubLogin: 'BunsDev' }),
     githubLogin: 'BunsDev',
     githubUserId: 68980965,
     sshSigningKeyId: 880193,
+    keyType: 'ssh-ed25519'
+  }, {
+    principal: signerPrincipal({ githubUserId: 68980965, githubLogin: 'BunsDev' }),
+    githubLogin: 'BunsDev',
+    githubUserId: 68980965,
+    sshSigningKeyId: 1259375,
     keyType: 'ssh-ed25519'
   }]);
 });
