@@ -673,12 +673,12 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
     let base = base()?;
     let scene = case.boundary.scene();
     let leadership = prepared(&home, base, scene)?;
-    let conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
+    let mut conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
     let request = Request::read(&conn, scene)?;
     let handshake =
         json!({"state":"paused", "boundary":case.boundary, "relativeHome":relative_home});
     if let Some(pause_at) = pause_at(case.boundary) {
-        install_pause(&conn, pause_at, handshake.clone())?;
+        install_pause(&mut conn, pause_at, handshake.clone())?;
     }
     let runtime = RecordingStops {
         log: home.join(STOP_LOG),

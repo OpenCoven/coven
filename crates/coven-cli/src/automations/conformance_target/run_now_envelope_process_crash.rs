@@ -289,14 +289,14 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         .ok_or(FAILED)?
         .to_owned();
     let run_now_at = at(base()?, RUN_NOW);
-    let conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
+    let mut conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
     store_definition(&conn, &case.definition)?;
     // The daemon holds its scheduler's leadership while it serves the API.
     let leadership = SchedulerLeadership::acquire(&home, &conn, run_now_at).map_err(|_| FAILED)?;
     if let Some(pause_at) = pause_at(case.boundary) {
         let handshake =
             json!({"state":"paused", "boundary":case.boundary, "relativeHome":relative_home});
-        install_pause(&conn, pause_at, handshake)?;
+        install_pause(&mut conn, pause_at, handshake)?;
     }
     let answer = execute_run_now_envelope(
         &conn,
