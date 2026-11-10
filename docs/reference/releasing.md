@@ -77,6 +77,8 @@ refuses when the key id is gone, the login now belongs to a different user id,
 or the key type differs from the pin. GitHub signing keys cannot be edited in
 place, so the id pins exactly one key.
 
+One account may pin multiple distinct registered keys during rotation. The verifier records the key whose fingerprint actually verified the tag, regardless of entry order, and rejects duplicate key IDs or ambiguous public-key attribution. Removing one key revokes it without removing the account's other keys; the actual signing key must remain pinned at both the tagged commit and current `main`.
+
 The release tag must verify against the pins at the tagged commit **and** at
 the current tip of `main`:
 

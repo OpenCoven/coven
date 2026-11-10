@@ -967,7 +967,11 @@ enum MobileRestoreCommand {
             help = "Separate selected snapshot home; copied only after the restore fence is durable"
         )]
         snapshot_home: PathBuf,
-        #[arg(long, help = "Previously pinned installation fingerprint (base64url)")]
+        #[arg(
+            long,
+            allow_hyphen_values = true,
+            help = "Previously pinned installation fingerprint (base64url)"
+        )]
         installation_fingerprint: String,
         #[arg(long, help = "Stable UUID for this restore and every retry")]
         operation_id: uuid::Uuid,
@@ -10668,6 +10672,87 @@ mod tests {
             "coven 0.7.0-3-gabc123 (engine not installed, pinned 0.6.1)"
         );
     }
+    #[test]
+    fn mobile_restore_install_accepts_every_base64url_prefix() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        for prefix in 0_u8..64 {
+            let mut bytes = [0_u8; 32];
+            bytes[0] = prefix << 2;
+            let pin = URL_SAFE_NO_PAD.encode(bytes);
+            for equals in [false, true] {
+                let mut args: Vec<String> = [
+                    "coven",
+                    "memory",
+                    "mobile",
+                    "restore",
+                    "install",
+                    "--authority",
+                    "authority.json",
+                    "--snapshot-home",
+                    "snapshot",
+                    "--operation-id",
+                    "00000000-0000-0000-0000-000000000001",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+                if equals {
+                    args.push(format!("--installation-fingerprint={pin}"));
+                } else {
+                    args.extend(["--installation-fingerprint".to_owned(), pin.clone()]);
+                }
+                let parsed = Cli::try_parse_from(args).unwrap_or_else(|error| {
+                    panic!("valid base64url prefix {prefix}, equals={equals}: {error}")
+                });
+                match parsed.command {
+                    Some(Command::Memory {
+                        command:
+                            Some(MemoryCommand::Mobile {
+                                command:
+                                    MobileMemoryCommand::Restore {
+                                        command:
+                                            MobileRestoreCommand::Install {
+                                                installation_fingerprint,
+                                                ..
+                                            },
+                                    },
+                            }),
+                        ..
+                    }) => assert_eq!(installation_fingerprint, pin),
+                    other => panic!("expected mobile restore install, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mobile_restore_install_rejects_unknown_options_and_missing_values() {
+        let args = [
+            "coven",
+            "memory",
+            "mobile",
+            "restore",
+            "install",
+            "--authority",
+            "authority.json",
+            "--snapshot-home",
+            "snapshot",
+            "--operation-id",
+            "00000000-0000-0000-0000-000000000001",
+        ];
+        let mut unknown = args.to_vec();
+        unknown.extend([
+            "--installation-fingerprint",
+            "-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "--unrecognized-option",
+        ]);
+        assert!(Cli::try_parse_from(unknown).is_err());
+        let mut missing = args.to_vec();
+        missing.push("--installation-fingerprint");
+        assert!(Cli::try_parse_from(missing).is_err());
+    }
+
     #[test]
     fn mobile_restore_export_cli_requires_explicit_private_output() {
         for json in [false, true] {
