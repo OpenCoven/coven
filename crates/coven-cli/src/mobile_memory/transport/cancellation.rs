@@ -78,7 +78,7 @@ impl Cancellation {
         Ok(())
     }
 
-    pub(super) fn begin(&self) -> Result<Attempt> {
+    pub(crate) fn begin(&self) -> Result<Attempt> {
         let mut state = self
             .state
             .lock()
@@ -94,7 +94,7 @@ impl Cancellation {
     }
 }
 
-pub(super) struct Attempt {
+pub(crate) struct Attempt {
     cancellation: Cancellation,
 }
 
@@ -143,7 +143,7 @@ impl Attempt {
         Ok(self.cancellation.clone())
     }
 
-    pub(super) fn register(&self, socket: &TcpStream) -> Result<()> {
+    pub(crate) fn register(&self, socket: &TcpStream) -> Result<()> {
         let mut state = self
             .cancellation
             .state

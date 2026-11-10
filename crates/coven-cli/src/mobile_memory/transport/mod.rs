@@ -21,6 +21,7 @@ pub mod cancellation;
 pub mod connection;
 pub(super) mod diagnostics;
 mod message;
+pub mod migration;
 mod network;
 pub mod routing;
 pub mod storage;

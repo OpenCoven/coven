@@ -74,7 +74,41 @@ pub struct Attempt {
     status: Arc<Mutex<ConnectionStatus>>,
 }
 
+#[derive(Clone)]
+pub struct Observation {
+    status: Weak<LiveStatus>,
+    transport: Transport,
+}
+
+impl Observation {
+    pub fn snapshot(&self) -> Result<ConnectionStatus> {
+        match self.status.upgrade() {
+            Some(status) => status
+                .lock()
+                .map(|status| *status)
+                .map_err(|_| anyhow::anyhow!("connection observation unavailable")),
+            None => Ok(ConnectionStatus {
+                state: ConnectionState::Offline,
+                transport: self.transport,
+            }),
+        }
+    }
+}
+
 impl Attempt {
+    pub fn observation(&self) -> Result<Observation> {
+        let transport = self
+            .status
+            .lock()
+            .ok()
+            .context("connection observation unavailable")?
+            .transport;
+        Ok(Observation {
+            status: Arc::downgrade(&self.status),
+            transport,
+        })
+    }
+
     pub fn authenticating(&mut self) -> Result<()> {
         let mut status = self
             .status

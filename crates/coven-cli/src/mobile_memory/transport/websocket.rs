@@ -230,6 +230,7 @@ pub fn connect_cancellable(
             .map_err(|_| anyhow::anyhow!("relay TLS or upgrade failed"))?;
     Ok(WebSocketRecords {
         socket,
+        deadline: client_deadline,
         attempt,
         keepalive: Keepalive::default(),
     })
@@ -249,7 +250,8 @@ struct ReadProbe {
     resume: Option<std::sync::mpsc::Receiver<()>>,
 }
 
-struct DeadlineStream {
+#[doc(hidden)]
+pub struct DeadlineStream {
     socket: mio::net::TcpStream,
     poll: mio::Poll,
     events: mio::Events,
@@ -376,13 +378,67 @@ impl Write for DeadlineStream {
     }
 }
 
-pub struct WebSocketRecords {
-    socket: WebSocket<MaybeTlsStream<DeadlineStream>>,
+fn client_deadline(stream: &mut MaybeTlsStream<DeadlineStream>, deadline: Instant) -> Result<()> {
+    match stream {
+        MaybeTlsStream::Rustls(stream) => stream.sock.deadline = deadline,
+        #[cfg(test)]
+        MaybeTlsStream::Plain(stream) => stream.deadline = deadline,
+        _ => bail!("unencrypted relay transport forbidden"),
+    }
+    Ok(())
+}
+
+/// Upgrade an already pinned/private TLS listener connection. The caller must
+/// validate routing and current pairing admission before sending the upgrade;
+/// Noise endpoint proof is still mandatory after the WebSocket handshake.
+pub(crate) fn accept_tls(
+    mut tls: rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
+    request: tungstenite::http::Request<()>,
+    deadline: Instant,
+    attempt: Attempt,
+) -> Result<WebSocketRecords<rustls::StreamOwned<rustls::ServerConnection, DeadlineStream>>> {
+    super::diagnostics::initialize()?;
+    attempt.ensure_active()?;
+    let response = tungstenite::handshake::server::create_response(&request)
+        .map_err(|_| anyhow::anyhow!("invalid direct WebSocket upgrade"))?;
+    let mut wire = String::from("HTTP/1.1 101 Switching Protocols\r\n");
+    for (name, value) in response.headers() {
+        wire.push_str(name.as_str());
+        wire.push_str(": ");
+        wire.push_str(
+            value
+                .to_str()
+                .map_err(|_| anyhow::anyhow!("invalid direct upgrade response"))?,
+        );
+        wire.push_str("\r\n");
+    }
+    wire.push_str("\r\n");
+    tls.sock.set_write_timeout(Some(remaining(deadline)?))?;
+    tls.write_all(wire.as_bytes())?;
+    tls.flush()?;
+    let rustls::StreamOwned { conn, sock } = tls;
+    let stream = rustls::StreamOwned::new(conn, DeadlineStream::new(sock, deadline, &attempt)?);
+    let socket =
+        WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, Some(limits()));
+    Ok(WebSocketRecords {
+        socket,
+        deadline: |stream, deadline| {
+            stream.sock.deadline = deadline;
+            Ok(())
+        },
+        attempt,
+        keepalive: Keepalive::default(),
+    })
+}
+
+pub struct WebSocketRecords<S = MaybeTlsStream<DeadlineStream>> {
+    socket: WebSocket<S>,
+    deadline: fn(&mut S, Instant) -> Result<()>,
     attempt: Attempt,
     keepalive: Keepalive,
 }
 
-impl WebSocketRecords {
+impl<S: Read + Write> WebSocketRecords<S> {
     /// Test-only: shorten the keepalive cadence so fixtures can observe several
     /// probes without waiting for the production interval. Production code has
     /// no way to change these budgets.
@@ -408,17 +464,11 @@ impl WebSocketRecords {
     fn set_deadline(&mut self, deadline: Instant) -> Result<()> {
         self.attempt.ensure_active()?;
         remaining(deadline)?;
-        match self.socket.get_mut() {
-            MaybeTlsStream::Rustls(stream) => stream.sock.deadline = deadline,
-            #[cfg(test)]
-            MaybeTlsStream::Plain(stream) => stream.deadline = deadline,
-            _ => bail!("unencrypted relay transport forbidden"),
-        }
-        Ok(())
+        (self.deadline)(self.socket.get_mut(), deadline)
     }
 }
 
-impl WebSocketRecords {
+impl<S: Read + Write> WebSocketRecords<S> {
     /// Consume one inbound frame. Control frames keep the wait going (a read
     /// ping queues Tungstenite's pong, which the flush writes); anything other
     /// than a binary record or a control frame fails the channel.
@@ -437,7 +487,7 @@ impl WebSocketRecords {
     }
 }
 
-impl Records for WebSocketRecords {
+impl<S: Read + Write> Records for WebSocketRecords<S> {
     fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<()> {
         ensure!(bytes.len() <= MAX_RECORD_BYTES, "relay record too large");
         self.set_deadline(deadline)?;
@@ -520,6 +570,7 @@ fn fixture_connect_cancellable(
     .map_err(|_| anyhow::anyhow!("fixture upgrade failed"))?;
     Ok(WebSocketRecords {
         socket,
+        deadline: client_deadline,
         attempt,
         keepalive: Keepalive::default(),
     })

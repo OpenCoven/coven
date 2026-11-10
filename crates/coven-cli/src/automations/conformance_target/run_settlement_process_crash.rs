@@ -159,7 +159,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         .ok_or(FAILED)?
         .to_owned();
     let base = base()?;
-    let conn = crate::store::open_store(&home.join("store.sqlite")).map_err(|_| FAILED)?;
+    let mut conn = crate::store::open_store(&home.join("store.sqlite")).map_err(|_| FAILED)?;
     let definition = RoutineDefinition::from_json(&case.definition).map_err(|_| INVALID)?;
     crate::automations::store::insert_definition(&conn, &definition).map_err(|_| FAILED)?;
     let outcome = crate::automations::runner::run_routine_now(
@@ -204,7 +204,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
     if let Some(pause_at) = pause_at {
         let handshake =
             json!({"state":"paused", "boundary":case.boundary, "relativeHome":relative_home});
-        install_pause(&conn, pause_at, handshake)?;
+        install_pause(&mut conn, pause_at, handshake)?;
     }
     let report = settle_finished_runs(&conn, at(base, 60)).map_err(|_| FAILED)?;
     if case.boundary != Boundary::None || report != settled_one() {

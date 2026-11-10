@@ -74,6 +74,10 @@ pub struct Attempt {
     usable: bool,
 }
 impl Attempt {
+    /// Trusted pairing retained by this one-shot durable routing attempt.
+    pub fn pairing(&self) -> &Pairing {
+        &self.pairing
+    }
     pub fn state(&self) -> DeviceState {
         self.record.states[index(self.transport)]
     }
