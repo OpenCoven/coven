@@ -45,13 +45,13 @@ assert a[a.index('--proto') + 1] == '=https', a
 assert a[a.index('--proto-redir') + 1] == '=https', a
 assert '--max-time' in a and '--connect-timeout' in a, a
 assert '--max-filesize' in a, a
+assert a[a.index('--retry') + 1] == '3', a
+assert '--speed-limit' in a and '--speed-time' in a, a
 url = a[-1]
 assert url.startswith('https://'), url
 if (r / 'fail-download').exists(): sys.exit(22)
 src = r / ('latest.json' if url.endswith('/releases/latest') else url.rsplit('/', 1)[-1])
 shutil.copyfile(src, a[a.index('--output') + 1])
-if url.endswith('/SHA256SUMS') and (r / 'advance-selection').exists():
-    (r / '.coven/engine/current').write_text('999.1.0')
 ''')
         curl.chmod(0o755)
         self.env = dict(os.environ)
@@ -181,11 +181,51 @@ if url.endswith('/SHA256SUMS') and (r / 'advance-selection').exists():
         self.assertIn('downgrade', self.run_cli('engine', 'update', ok=False).lower())
         self.assertEqual((self.engine_root / 'current').read_text(), '999.1.0')
 
-    def test_latest_rechecks_selection_after_metadata_download(self):
+    def test_latest_rechecks_selection_under_install_lock(self):
         self.install('999.1.0')
-        (self.root / 'advance-selection').touch()
-        self.assertIn('downgrade', self.run_cli('engine', 'update', ok=False).lower())
+        # A concurrent updater activates 999.1.0 just after this run's
+        # pre-check probed the selected 0.8.0 engine, before the lock.
+        old = self.engine_root / '0.8.0/coven-code'
+        old.write_text('#!/bin/sh\n'
+                       f'printf 999.1.0 > "{self.engine_root}/current"\n'
+                       'echo "coven-code 0.8.0"\n')
+        self.assertIn('refusing to downgrade', self.run_cli('engine', 'update', ok=False).lower())
         self.assertEqual((self.engine_root / 'current').read_text(), '999.1.0')
+        self.assertFalse((self.engine_root / '999.0.0').exists())
+
+    def test_rollback_to_installed_version_needs_no_manifest(self):
+        self.run_cli('engine', 'update')
+        (self.root / 'requests').unlink()
+        (self.root / 'SHA256SUMS').unlink()
+        self.assertIn('already present', self.run_cli('code', 'update', '--version', '0.8.0').lower())
+        self.assertFalse((self.root / 'requests').exists())
+        self.assert_old_active()
+        self.assertIn('coven-code 0.8.0', self.run_cli('code', '--version'))
+
+    def test_missing_manifest_error_names_the_explicit_install(self):
+        (self.root / 'SHA256SUMS').unlink()
+        output = self.run_cli('engine', 'update', '--version', '999.0.0', ok=False)
+        self.assertIn('SHA256SUMS manifest for Coven Code 999.0.0', output)
+        self.assertIn('coven engine install --version 999.0.0 --sha256', output)
+        self.assert_old_active()
+        self.assertFalse((self.engine_root / '999.0.0').exists())
+
+    def test_force_replaces_an_installed_candidate_after_verification(self):
+        self.install('999.0.0')
+        (self.engine_root / 'current').write_text('999.0.0')
+        self.assertIn('Updated Coven Code to 999.0.0', self.run_cli('engine', 'update', '--force'))
+        replaced = (self.engine_root / '999.0.0/coven-code').read_text()
+        self.assertNotIn('delegated:', replaced)
+        self.assertEqual((self.engine_root / 'current').read_text(), '999.0.0')
+        self.assertIn('Downloading Coven Code 999.0.0', self.output)
+
+    def test_unusable_lock_file_is_not_reported_as_contention(self):
+        lock = self.engine_root / 'install.lock'
+        lock.mkdir()
+        output = self.run_cli('engine', 'update', ok=False)
+        self.assertNotIn('another engine install', output)
+        self.assertIn('install.lock', output)
+        self.assert_old_active()
 
     def test_explicit_install_still_requires_a_checksum(self):
         self.assertIn('--sha256', self.run_cli('engine', 'install', '--version', '999.0.0', ok=False))

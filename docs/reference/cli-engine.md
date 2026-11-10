@@ -4,7 +4,7 @@ read_when:
   - Looking up engine
   - Installing or pinning the coven-code engine
 title: "coven engine"
-description: "Reference for coven engine: show the resolved engine path, source, version, and pin state; install the pinned engine into ~/.coven/engine; and print the engine binary path for scripts."
+description: "Reference for coven engine: update to the latest stable engine with checksum verification; show the resolved engine path, source, version, and pin state; install the pinned engine into ~/.coven/engine; and print the engine binary path for scripts."
 source_adjacent_reason: "Tracks the engine-manager selection, verification and activation contract beside its executable regression suite."
 ---
 
@@ -33,9 +33,14 @@ previous selection; separate version directories retain the previous binary.
 
 Use `--version X.Y.Z` for a particular release and `--force` to download and
 verify it again. The latest-release path refuses an implicit downgrade. A
-release without a valid checksum manifest cannot be updated through this path.
-Checksums from the same HTTPS release channel establish archive integrity,
-not an independently signed build attestation or full engine conformance.
+version already installed in `~/.coven/engine/<version>/` that reports that
+version is re-selected without a download or manifest, which is how to roll
+back to a previous engine. Downloading any other release requires its
+`SHA256SUMS` manifest; Coven Code publishes one from 0.9.0 onward. For an older
+release, use `coven engine install --version X.Y.Z --sha256 HEX`. Checksums
+from the same HTTPS release channel establish archive integrity, not an
+independently signed build attestation or full engine conformance. Downloads
+retry transient failures and abort a transfer that stalls.
 
 The command prints the selected path and version. Existing sessions retain
 their running executable; start a new `coven code` session to use the update.
@@ -81,7 +86,8 @@ output points at `coven engine install`.
 `~/.coven/engine`. `--version <v>` installs a specific version instead of the
 pin; `--force` reinstalls even when the version is already present.
 For an unpinned version, `install` requires `--sha256 HEX` supplied by the caller.
-Use `coven code update --version X.Y.Z` to obtain the release checksum
+For releases that publish `SHA256SUMS` (0.9.0 and later), use
+`coven code update --version X.Y.Z` to obtain the release checksum
 automatically. `install` deliberately selects the bundled pin by default;
 it is not a latest-release update and may select an older version.
 

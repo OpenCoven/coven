@@ -58,6 +58,10 @@ pub(crate) fn run(args: UpdateArgs) -> Result<()> {
                 "https://api.github.com/repos/OpenCoven/coven-code/releases/latest",
                 &metadata,
                 1024 * 1024,
+            )
+            .context(
+                "could not look up the latest stable Coven Code release; \
+                 choose one with --version X.Y.Z",
             )?;
             #[derive(serde::Deserialize)]
             struct Release {
@@ -103,22 +107,36 @@ pub(crate) fn run(args: UpdateArgs) -> Result<()> {
     );
     let (os, arch) = crate::engine_install::current_platform()?;
     let artifact = crate::engine_install::artifact_name(os, arch);
-    // Preserve the stronger built-in checksum when this release is pinned.
-    let checksum = if version == crate::engine::pinned_version() {
-        crate::engine::pinned_sha256(&artifact)
-            .with_context(|| format!("no built-in checksum for {artifact}"))?
-            .to_owned()
-    } else {
+    // Resolved only if the installer must download: an installed version
+    // directory is re-selected without a manifest, so rollback works offline.
+    let checksum = || -> Result<String> {
+        // Preserve the stronger built-in checksum when this release is pinned.
+        if version == crate::engine::pinned_version() {
+            return crate::engine::pinned_sha256(&artifact)
+                .map(str::to_owned)
+                .with_context(|| format!("no built-in checksum for {artifact}"));
+        }
         let manifest = scratch.path().join("SHA256SUMS");
         download(
             &crate::engine_install::release_url(&version, "SHA256SUMS"),
             &manifest,
             64 * 1024,
-        )?;
-        manifest_checksum(&std::fs::read_to_string(manifest)?, &artifact)?
+        )
+        .with_context(|| {
+            format!(
+                "could not fetch the SHA256SUMS manifest for Coven Code {version} \
+                 (releases before 0.9.0 publish none); to install such a release, run \
+                 `coven engine install --version {version} --sha256 <archive sha256>`"
+            )
+        })?;
+        manifest_checksum(&std::fs::read_to_string(manifest)?, &artifact)
     };
-    let (path, outcome) =
-        crate::engine_install::install(&version, &checksum, args.force, args.version.is_some())?;
+    let (path, outcome) = crate::engine_install::install_with(
+        &version,
+        args.force,
+        args.version.is_some(),
+        checksum,
+    )?;
     let resolved = crate::engine::require()?;
     if resolved.path != path {
         bail!(
@@ -196,10 +214,20 @@ pub(crate) fn download(url: &str, destination: &Path, max_bytes: u64) -> Result<
             "--proto-redir",
             "=https",
             "--tlsv1.2",
+            // GitHub release downloads intermittently answer 504; curl retries
+            // only transient failures (timeouts, HTTP 408/429/500/502/503/504).
+            "--retry",
+            "3",
             "--connect-timeout",
             "30",
+            // Abort a stalled transfer (under 1 KiB/s for a minute) rather
+            // than cap a slow but live link. --max-time is only a hang guard.
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "60",
             "--max-time",
-            "300",
+            "900",
             "--max-filesize",
         ])
         .arg(max_bytes.to_string())

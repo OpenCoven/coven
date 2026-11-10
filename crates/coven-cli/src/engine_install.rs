@@ -65,19 +65,43 @@ pub fn install(
     if !is_sha256_hex(expected_sha256) {
         bail!("invalid sha256 pin: expected 64 hexadecimal characters");
     }
+    install_with(version, force, allow_downgrade, || {
+        Ok(expected_sha256.to_owned())
+    })
+}
+
+/// [`install`] with the archive checksum resolved only when a download is
+/// needed. Re-selecting a version directory that already holds a candidate
+/// reporting that version needs no checksum source, so a release without a
+/// manifest can still be rolled back to once it was installed.
+pub(crate) fn install_with(
+    version: &str,
+    force: bool,
+    allow_downgrade: bool,
+    expected_sha256: impl FnOnce() -> Result<String>,
+) -> Result<(PathBuf, InstallOutcome)> {
+    let version = crate::engine_update::normalize_version(version)?;
     let home = dirs_next::home_dir().context("cannot determine home directory")?;
     let engine_root = crate::paths::managed_engine_root(&home);
     std::fs::create_dir_all(&engine_root)?;
     // Serialize installers across versions: both activation and replacement
     // belong to one transaction. OS locks release automatically on process exit.
+    let lock_path = engine_root.join("install.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(engine_root.join("install.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .context("another engine install is running; retry after it completes")?;
+        .open(&lock_path)
+        .with_context(|| format!("could not open {}", lock_path.display()))?;
+    if let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
+        // Only contention means another installer; report anything else
+        // (for example a filesystem without lock support) as itself.
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            bail!("another engine install is running; retry after it completes");
+        }
+        return Err(error).with_context(|| format!("could not lock {}", lock_path.display()));
+    }
     // Recheck under the writer lock: another updater may have activated a
     // newer engine while this caller was fetching release metadata.
     if !allow_downgrade {
@@ -100,6 +124,10 @@ pub fn install(
     let (os, arch) = current_platform()?;
     let artifact = artifact_name(os, arch);
     let url = release_url(version, &artifact);
+    let expected_sha256 = expected_sha256()?;
+    if !is_sha256_hex(&expected_sha256) {
+        bail!("invalid sha256 pin for {artifact}: expected 64 hexadecimal characters");
+    }
 
     // Private, unique staging on the destination filesystem. Failure leaves
     // the previous engine and current pointer untouched; TempDir cleans up.
@@ -107,13 +135,16 @@ pub fn install(
         .prefix(".install-")
         .tempdir_in(&engine_root)?;
     let archive = scratch.path().join(&artifact);
+    // Downloads are silent so scripted callers keep clean output; name the
+    // multi-megabyte transfer on stderr so an interactive wait is explained.
+    eprintln!("Downloading Coven Code {version} ({artifact})...");
     crate::engine_update::download(&url, &archive, 512 * 1024 * 1024)?;
 
     // 2. Verify the ARCHIVE checksum BEFORE extraction (fail closed).
     let bytes = std::fs::read(&archive)
         .with_context(|| format!("reading downloaded archive {}", archive.display()))?;
     let digest = hex_digest(&bytes);
-    if !digest.eq_ignore_ascii_case(expected_sha256) {
+    if !digest.eq_ignore_ascii_case(&expected_sha256) {
         bail!(
             "checksum mismatch for {artifact}: expected {expected_sha256}, got {digest}. Refusing to install."
         );
