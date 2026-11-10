@@ -170,6 +170,24 @@ shutil.copyfile(src, a[a.index('--output') + 1])
                 self.assertFalse((self.root / 'requests').exists())
                 self.assert_old_active()
 
+    def test_cached_prerelease_is_repaired_not_reported_as_stable(self):
+        for reported in ['999.0.0-rc1', '999.0.0.1']:
+            with self.subTest(reported=reported):
+                self.install('999.0.0', reported)
+                output = self.run_cli('engine', 'update', '--version', '999.0.0')
+                self.assertNotIn('already present', output.lower())
+                self.assertIn('Updated Coven Code to 999.0.0', output)
+                self.assertRegex(self.run_cli('code', '--version'), r'(?m)^coven-code 999\.0\.0$')
+
+    def test_suffixed_download_is_rejected(self):
+        for reported in ['999.0.0-rc1', '999.0.0.1']:
+            with self.subTest(reported=reported):
+                self.release('999.0.0', reported=reported)
+                output = self.run_cli('engine', 'update', ok=False)
+                self.assertIn(f'expected 999.0.0, got {reported}', output)
+                self.assert_old_active()
+                self.assertFalse((self.engine_root / '999.0.0').exists())
+
     def test_corrupt_existing_candidate_is_repaired(self):
         self.install('999.0.0', '0.8.0')
         self.run_cli('engine', 'update', '--version', '999.0.0')

@@ -206,11 +206,13 @@ fn verify_candidate(binary: &Path, version: &str) -> Result<()> {
         bail!("engine version probe exited nonzero");
     }
     let text = std::str::from_utf8(&stdout).context("engine version response is not UTF-8")?;
-    let reported = text
+    let token = text
         .split_whitespace()
         .last()
         .context("missing engine version")?;
-    let reported = crate::engine_update::normalize_version(reported)?;
+    // A suffixed token (0.9.0-rc1, 0.9.0.1) is not the stable release asked for.
+    let reported = crate::engine_update::normalize_version(token)
+        .with_context(|| format!("engine version mismatch: expected {version}, got {token}"))?;
     let actual = crate::engine::parse_version_output(reported).context("invalid engine version")?;
     if reported != version || !crate::engine::version_meets_minimum(actual) {
         bail!("engine version mismatch: expected {version}, got {reported}");
