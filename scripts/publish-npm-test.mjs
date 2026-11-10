@@ -1266,7 +1266,7 @@ test('each release build receives the derived npm version and verified commit', 
   const workflow = readFileSync(
     new URL(['..', '.github', 'workflows', 'release-npm.yml'].join('/'), import.meta.url),
     'utf8'
-  );
+  ).replaceAll('\r\n', '\n');
   const buildJob = workflow.match(/^  build-platform:[\s\S]*?(?=^  [A-Za-z0-9_-]+:)/m)?.[0];
   assert.ok(buildJob, 'release workflow must contain the platform build job');
   const steps = buildJob.split(/^      - /m);
