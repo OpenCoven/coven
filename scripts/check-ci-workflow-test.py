@@ -58,6 +58,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_contains_expected_jobs(self) -> None:
         for job_name in [
             'rust-lint-linux',
+            'native-audit-linux',
             'rust-test-linux',
             'threads-test-linux',
             'rust-test-windows',
@@ -213,6 +214,50 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("\n      - rust-test-macos\n", gate)
         self.assertIn("\n      - threads-test-macos\n", gate)
 
+    def test_linux_workspace_gate_restores_without_post_job_cache_packing(self) -> None:
+        linux = ci_job_block('rust-test-linux')
+        self.assertIn(f"uses: actions/cache/restore@{CACHE_SHA}", linux)
+        self.assertNotIn("uses: actions/cache@", linux)
+        self.assertNotIn("uses: actions/cache/save@", linux)
+        self.assertIn("\n    timeout-minutes: 20\n", linux)
+        for command in (
+            "cargo test --workspace --locked",
+            "node crates/coven-cli/tests/fixtures/passkey-recovery/daemon-e2e.mjs",
+        ):
+            self.assertIn(command, linux)
+        self.assertIn("node conformance/automations/runner/audit.mjs",
+                      ci_job_block('native-audit-linux'))
+
+    def test_manual_linux_cache_writer_uses_the_acceptance_cache(self) -> None:
+        warm = (CI_WORKFLOW.parent / 'warm-linux-test-cache.yml').read_text(encoding='utf-8')
+        self.assertIn("\non:\n  workflow_dispatch:\n", warm)
+        self.assertNotRegex(warm, r"(?m)^  (push|pull_request|workflow_run):")
+        self.assertIn("if: ${{ github.ref == 'refs/heads/main' }}", warm)
+        self.assertIn("permissions:\n  contents: read", warm)
+        self.assertIn("runs-on: ubuntu-latest", warm)
+        self.assertIn("timeout-minutes: 45", warm)
+        self.assertIn("cargo test --workspace --locked --no-run", warm)
+        self.assertIn("bash scripts/install-native-link-dependencies.sh", warm)
+        self.assertNotIn("continue-on-error:", warm)
+        linux = ci_job_block('rust-test-linux')
+        expected_cache = (
+            "          path: |\n"
+            "            ~/.cargo/registry\n"
+            "            ~/.cargo/git\n"
+            "            ${{ runner.temp }}/coven-target\n"
+            "          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}\n"
+            "          restore-keys: |\n"
+            "            ${{ runner.os }}-rust-test-"
+        )
+        for workflow, action in ((warm, 'cache'), (linux, 'cache/restore')):
+            with self.subTest(action=action):
+                self.assertIn(f"uses: actions/{action}@{CACHE_SHA}", workflow)
+                self.assertIn(expected_cache, workflow)
+                self.assertLess(
+                    workflow.index('CARGO_TARGET_DIR=${{ runner.temp }}/coven-target'),
+                    workflow.index(f'uses: actions/{action}@'),
+                )
+
     def test_windows_rust_gate_restores_without_post_job_cache_packing(self) -> None:
         for job in ('rust-test-windows', 'relay-test-windows', 'threads-test-windows'):
             windows = ci_job_block(job)
@@ -296,7 +341,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             targets[target] = (runner, row['rust-target'], budget)
         self.assertEqual(targets, {
             'macos': ('macos-26', 'aarch64-apple-darwin', 20),
-            'macos-x64': ('macos-15-intel', 'x86_64-apple-darwin', 30),
+            'macos-x64': ('macos-15-intel', 'x86_64-apple-darwin', 45),
             'linux-x64': ('ubuntu-latest', 'x86_64-unknown-linux-gnu', 20),
             'windows': ('windows-latest', 'x86_64-pc-windows-msvc', 20),
         })
@@ -311,7 +356,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         job = ci_job_block('npm-onboarding-pr')
         self.assertIn("needs.changes.outputs.npm_packaging == 'true'", job)
         self.assertIn("os: macos-15-intel\n            npm-target: macos-x64\n"
-                      "            rust-target: x86_64-apple-darwin\n            job-timeout: 30", job)
+                      "            rust-target: x86_64-apple-darwin\n            job-timeout: 45", job)
         self.assertIn("ref: ${{ matrix.npm-target == 'macos-x64' && github.event.pull_request.head.sha || github.sha }}", job)
         self.assertIn('test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"', job)
         self.assertIn('test "$(uname -sm)" = "Darwin x86_64"', job)
@@ -391,8 +436,54 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", CI_TEXT)
 
+    def test_linux_native_audit_has_an_independent_required_budget(self) -> None:
+        audit = ci_job_block('native-audit-linux')
+        workspace = ci_job_block('rust-test-linux')
+        self.assertIn('node conformance/automations/runner/audit.mjs', audit)
+        self.assertNotIn('cargo test --workspace', audit)
+        self.assertNotIn('passkey-recovery/daemon-e2e.mjs', audit)
+        self.assertNotIn('conformance/automations/runner/audit.mjs', workspace)
+        self.assertIn('cargo test --workspace --locked', workspace)
+        self.assertIn('passkey-recovery/daemon-e2e.mjs "$CARGO_TARGET_DIR/debug/coven"', workspace)
+        self.assertIn('name: Upload passkey recovery receipt', workspace)
+        for name, job in [('native-audit-linux', audit), ('rust-test-linux', workspace)]:
+            with self.subTest(job=name):
+                self.assertIn('\n    timeout-minutes: 20\n', job)
+                self.assertIn('needs: changes', job)
+                self.assertIn("if: ${{ needs.changes.outputs.rust == 'true' }}", job)
+                self.assertIn('runs-on: ubuntu-latest', job)
+                self.assertIn(f'uses: actions/cache/restore@{CACHE_SHA}', job)
+                self.assertNotIn(f'uses: actions/cache@{CACHE_SHA}', job)
+                self.assertNotIn('continue-on-error:', job)
+                self.assertIn(f'\n      - {name}\n', ci_job_block('pr-gate'))
+
+    def test_gate_requires_both_linux_acceptance_jobs_when_rust_is_routed(self) -> None:
+        gate = ci_job_block('pr-gate')
+        script = textwrap.dedent(gate.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+        for rust, audit, workspace, accepted in [
+            ('true', 'success', 'success', True),
+            ('true', 'skipped', 'success', False),
+            ('true', 'success', 'skipped', False),
+            ('true', 'failure', 'success', False),
+            ('true', 'success', 'failure', False),
+            ('false', 'skipped', 'skipped', True),
+        ]:
+            with self.subTest(rust=rust, audit=audit, workspace=workspace):
+                jobs = {name: {'result': 'success'} for name in (
+                    'changes', 'policy-guard', 'automations-protocol-bundle',
+                    'automations-authority-profile-bundle')}
+                jobs['changes']['outputs'] = {'rust': rust, 'npm_packaging': 'false'}
+                jobs['native-audit-linux'] = {'result': audit}
+                jobs['rust-test-linux'] = {'result': workspace}
+                result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True,
+                                        env={**os.environ, 'JOB_RESULTS': json.dumps(jobs),
+                                             'GITHUB_EVENT_NAME': 'merge_group'})
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                if not accepted:
+                    self.assertIn('PR gate rejected job results:', result.stderr)
+
     def test_linux_automation_audit_runs_and_retains_exact_source_evidence(self) -> None:
-        linux = ci_job_block("rust-test-linux")
+        linux = ci_job_block("native-audit-linux")
         command = "node conformance/automations/runner/audit.mjs"
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", linux)
         self.assertIn(
@@ -403,13 +494,10 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertNotIn("            target\n", linux)
         self.assertLess(
             linux.index("CARGO_TARGET_DIR="),
-            linux.index("- uses: actions/cache@"),
+            linux.index("- uses: actions/cache/restore@"),
         )
         self.assertIn(command, linux)
-        self.assertLess(
-            linux.index(command),
-            linux.index("cargo test --workspace --locked"),
-        )
+        self.assertNotIn("cargo test --workspace --locked", linux)
         self.assertIn('--output "$AUTOMATIONS_AUDIT_DIR"', linux)
         self.assertIn(
             "AUTOMATIONS_AUDIT_DIR: ${{ runner.temp }}/automations-audit",
@@ -541,9 +629,11 @@ class CheckCiWorkflowTests(unittest.TestCase):
 
     def test_linux_build_profiles_have_separate_required_job_budgets(self) -> None:
         workspace = ci_job_block("rust-test-linux")
-        # Keep the existing native audit and complete workspace coverage.
+        audit = ci_job_block("native-audit-linux")
+        # Keep complete workspace and independent exact-source audit coverage.
         self.assertIn("cargo test --workspace --locked", workspace)
-        self.assertIn("node conformance/automations/runner/audit.mjs", workspace)
+        self.assertNotIn("node conformance/automations/runner/audit.mjs", workspace)
+        self.assertIn("node conformance/automations/runner/audit.mjs", audit)
         self.assertNotIn("--features threads-test-clock", workspace)
         threads = ci_job_block("threads-test-linux")
         self.assertNotIn("cargo test --workspace", threads)
@@ -552,7 +642,8 @@ class CheckCiWorkflowTests(unittest.TestCase):
             "cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_",
             threads,
         )
-        for name, job in (("rust-test-linux", workspace), ("threads-test-linux", threads)):
+        for name, job in (("native-audit-linux", audit), ("rust-test-linux", workspace),
+                          ("threads-test-linux", threads)):
             with self.subTest(job=name):
                 self.assertIn("runs-on: ubuntu-latest", job)
                 self.assertIn("\n    timeout-minutes: 20\n", job)
@@ -610,7 +701,8 @@ class CheckCiWorkflowTests(unittest.TestCase):
                 workflow_text,
             )
 
-        expected_invocations = 8 + 3 + 1
+        # The independent native audit owns its own native link prerequisites.
+        expected_invocations = 9 + 3 + 1
         actual_invocations = (
             CI_TEXT.count("bash scripts/install-native-link-dependencies.sh")
             + RELEASE_TEXT.count("bash scripts/install-native-link-dependencies.sh")
