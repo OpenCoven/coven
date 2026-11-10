@@ -164,16 +164,25 @@ fn verify_candidate(binary: &Path, version: &str) -> Result<()> {
     {
         bail!("engine candidate is not a regular executable");
     }
-    let actual = crate::engine::engine_version(binary)?;
-    let expected =
-        crate::engine::parse_version_output(version).context("invalid target engine version")?;
-    if actual != expected || !crate::engine::version_meets_minimum(actual) {
-        bail!(
-            "engine version mismatch: expected {version}, got {}.{}.{}",
-            actual.0,
-            actual.1,
-            actual.2
-        );
+    let (status, stdout) = crate::engine::probe_stdout(
+        binary,
+        &["--version"],
+        std::time::Instant::now() + crate::engine::PROBE_TIMEOUT,
+        16 * 1024,
+    )
+    .context("engine version probe unavailable")?;
+    if !status.success() {
+        bail!("engine version probe exited nonzero");
+    }
+    let text = std::str::from_utf8(&stdout).context("engine version response is not UTF-8")?;
+    let reported = text
+        .split_whitespace()
+        .last()
+        .context("missing engine version")?;
+    let reported = crate::engine_update::normalize_version(reported)?;
+    let actual = crate::engine::parse_version_output(reported).context("invalid engine version")?;
+    if reported != version || !crate::engine::version_meets_minimum(actual) {
+        bail!("engine version mismatch: expected {version}, got {reported}");
     }
     Ok(())
 }
