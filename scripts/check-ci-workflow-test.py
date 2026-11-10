@@ -213,6 +213,49 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("\n      - rust-test-macos\n", gate)
         self.assertIn("\n      - threads-test-macos\n", gate)
 
+    def test_linux_workspace_gate_restores_without_post_job_cache_packing(self) -> None:
+        linux = ci_job_block('rust-test-linux')
+        self.assertIn(f"uses: actions/cache/restore@{CACHE_SHA}", linux)
+        self.assertNotIn("uses: actions/cache@", linux)
+        self.assertNotIn("uses: actions/cache/save@", linux)
+        self.assertIn("\n    timeout-minutes: 20\n", linux)
+        for command in (
+            "node conformance/automations/runner/audit.mjs",
+            "cargo test --workspace --locked",
+            "node crates/coven-cli/tests/fixtures/passkey-recovery/daemon-e2e.mjs",
+        ):
+            self.assertIn(command, linux)
+
+    def test_manual_linux_cache_writer_uses_the_acceptance_cache(self) -> None:
+        warm = (CI_WORKFLOW.parent / 'warm-linux-test-cache.yml').read_text(encoding='utf-8')
+        self.assertIn("\non:\n  workflow_dispatch:\n", warm)
+        self.assertNotRegex(warm, r"(?m)^  (push|pull_request|workflow_run):")
+        self.assertIn("if: ${{ github.ref == 'refs/heads/main' }}", warm)
+        self.assertIn("permissions:\n  contents: read", warm)
+        self.assertIn("runs-on: ubuntu-latest", warm)
+        self.assertIn("timeout-minutes: 45", warm)
+        self.assertIn("cargo test --workspace --locked --no-run", warm)
+        self.assertIn("bash scripts/install-native-link-dependencies.sh", warm)
+        self.assertNotIn("continue-on-error:", warm)
+        linux = ci_job_block('rust-test-linux')
+        expected_cache = (
+            "          path: |\n"
+            "            ~/.cargo/registry\n"
+            "            ~/.cargo/git\n"
+            "            ${{ runner.temp }}/coven-target\n"
+            "          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}\n"
+            "          restore-keys: |\n"
+            "            ${{ runner.os }}-rust-test-"
+        )
+        for workflow, action in ((warm, 'cache'), (linux, 'cache/restore')):
+            with self.subTest(action=action):
+                self.assertIn(f"uses: actions/{action}@{CACHE_SHA}", workflow)
+                self.assertIn(expected_cache, workflow)
+                self.assertLess(
+                    workflow.index('CARGO_TARGET_DIR=${{ runner.temp }}/coven-target'),
+                    workflow.index(f'uses: actions/{action}@'),
+                )
+
     def test_windows_rust_gate_restores_without_post_job_cache_packing(self) -> None:
         for job in ('rust-test-windows', 'relay-test-windows', 'threads-test-windows'):
             windows = ci_job_block(job)
@@ -403,7 +446,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertNotIn("            target\n", linux)
         self.assertLess(
             linux.index("CARGO_TARGET_DIR="),
-            linux.index("- uses: actions/cache@"),
+            linux.index("- uses: actions/cache/restore@"),
         )
         self.assertIn(command, linux)
         self.assertLess(
