@@ -327,7 +327,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         .ok_or(FAILED)?
         .to_owned();
     let base = base()?;
-    let conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
+    let mut conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
     let [first, second] = &case.definitions;
     store_definition(&conn, first)?;
     // The daemon's scheduler ticks under its leadership fence.
@@ -356,11 +356,15 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         case.boundary,
         Boundary::InsideClaim | Boundary::AfterClaimCommit
     ) {
-        install_pause(&conn, pause.take().ok_or(FAILED)?, handshake(&delivered))?;
+        install_pause(
+            &mut conn,
+            pause.take().ok_or(FAILED)?,
+            handshake(&delivered),
+        )?;
     }
     tick(&conn, at(base, SECOND_TICK), &leadership)?;
     if let Some(pause) = pause {
-        install_pause(&conn, pause, handshake(&delivered))?;
+        install_pause(&mut conn, pause, handshake(&delivered))?;
     }
     // The client resubscribes from the checkpoint its first page carried.
     let second_page = resume_events(
@@ -875,13 +879,13 @@ mod tests {
         static CHANGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn record_commit(_: &rusqlite::hooks::Wal, _: std::os::raw::c_int) -> rusqlite::Result<()> {
+    fn record_commit(_: &mut rusqlite::hooks::Wal, _: std::os::raw::c_int) -> rusqlite::Result<()> {
         let changes = CHANGES.with(|changes| changes.take());
         COMMITS.with(|commits| commits.borrow_mut().push(changes));
         Ok(())
     }
 
-    fn record_changes(conn: &Connection) {
+    fn record_changes(conn: &mut Connection) {
         COMMITS.with(|commits| commits.take());
         CHANGES.with(|changes| changes.take());
         conn.update_hook(Some(
@@ -895,7 +899,7 @@ mod tests {
             },
         ))
         .unwrap();
-        conn.wal_hook(Some(record_commit));
+        conn.wal_hook(Some(record_commit)).unwrap();
     }
 
     fn vectors() -> Value {
@@ -1052,9 +1056,9 @@ mod tests {
 
     #[test]
     fn the_second_tick_commits_three_times_and_the_read_once() {
-        let (_temp, _home, conn, leadership, first) = first_page_store();
+        let (_temp, _home, mut conn, leadership, first) = first_page_store();
         let base = base().unwrap();
-        record_changes(&conn);
+        record_changes(&mut conn);
         tick(&conn, at(base, SECOND_TICK), &leadership).unwrap();
         // The event feed's own bookkeeping rides inside each commit.
         let main_rows = |commits: Vec<Vec<String>>| -> Vec<Vec<String>> {
@@ -1096,7 +1100,10 @@ mod tests {
             &iso(at(base, SECOND_READ)),
         )
         .unwrap();
-        conn.wal_hook(None);
+        conn.wal_hook(
+            None::<fn(&mut rusqlite::hooks::Wal, std::os::raw::c_int) -> rusqlite::Result<()>>,
+        )
+        .unwrap();
         assert_eq!(
             COMMITS.with(|commits| commits.take()),
             [vec!["insert automation_event_checkpoints"]]
