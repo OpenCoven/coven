@@ -24,6 +24,7 @@ mod api_response;
 mod api_routes;
 mod capabilities;
 mod chat_context_admission;
+mod chat_workspace_policy;
 mod claude_write_scope;
 mod cockpit_sources;
 mod config_paths;
@@ -341,6 +342,23 @@ impl From<MemoryImportSourceArg> for memory_import::MemoryImportSourceKind {
     }
 }
 
+#[derive(clap::Args, Debug)]
+struct ChatWorkspaceArgs {
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Host-owned Chat workspace policy v1; fails closed unless native enforcement can be verified"
+    )]
+    chat_workspace_policy_v1: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "chat_workspace_policy_v1",
+        help = "Read-only staged Chat input folder, never a write grant"
+    )]
+    chat_input_directory: Option<PathBuf>,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     #[command(about = "Open the interactive Coven UI (requires coven-code)")]
@@ -530,6 +548,8 @@ enum Command {
             help = "Explicit Claude scoped-write v1 authority document; requires a qualified Claude streamed profile, and cannot be combined with --permission or --add-dir"
         )]
         write_scope: Option<PathBuf>,
+        #[command(flatten)]
+        chat_workspace: Box<ChatWorkspaceArgs>,
         #[arg(
             long,
             help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
@@ -2305,6 +2325,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             permission,
             add_dir,
             write_scope,
+            chat_workspace,
             stream_json,
             stream_json_input,
         }) => run_session(
@@ -2327,6 +2348,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             stream_json_input,
             context_admission.as_deref(),
             write_scope.as_deref(),
+            chat_workspace.chat_workspace_policy_v1.as_deref(),
+            chat_workspace.chat_input_directory.as_deref(),
         ),
         Some(Command::Sessions {
             command,
@@ -5788,6 +5811,8 @@ fn run_session(
     stream_json_input: bool,
     context_admission: Option<&Path>,
     write_scope: Option<&Path>,
+    chat_workspace_policy_v1: Option<&Path>,
+    chat_input_directory: Option<&Path>,
 ) -> Result<()> {
     let context_admission = context_admission
         .map(chat_context_admission::Request::read)
@@ -5807,8 +5832,36 @@ fn run_session(
         anyhow::bail!("--detach and --continue are mutually exclusive");
     }
 
+    let chat_policy = if let Some(file) = chat_workspace_policy_v1 {
+        anyhow::ensure!(stream_json && !detach && permission.is_none() && add_dirs.is_empty() && write_scope.is_none() && context_admission.is_none(),
+            "Chat workspace access requires streamed execution without separate permission, add-dir, write-scope or context options");
+        anyhow::ensure!(
+            harness_id == engine::ENGINE_HARNESS_ID && cfg!(target_os = "macos"),
+            "This engine cannot verify workspace write access on this host. Use an updated Coven Code on macOS, or select an engine with verified workspace access."
+        );
+        let cwd = cwd.unwrap_or(Path::new("."));
+        let policy = chat_workspace_policy::ChatWorkspacePolicy::read(file, cwd)?;
+        policy.require_protected(file)?;
+        policy.require_protected(&std::env::current_exe()?)?;
+        if let Some(directory) = chat_input_directory {
+            anyhow::ensure!(
+                directory.is_absolute() && directory.is_dir(),
+                "Chat input folder is unavailable"
+            );
+            policy.require_protected(directory)?;
+        }
+        Some((file, policy))
+    } else {
+        None
+    };
     let selected_harness =
         session_launch::validate_harness(harness_id, session_launch::HarnessCheck::Available)?;
+    if chat_policy.is_some() {
+        anyhow::ensure!(
+            selected_harness.source == "bundled" && selected_harness.capabilities.stream,
+            "Workspace access requires the built-in Coven Code adapter."
+        );
+    }
     let current_dir = std::env::current_dir().context("failed to read current directory")?;
     let session_launch::LaunchPaths { project_root, cwd } =
         session_launch::resolve_launch_paths(&current_dir, cwd).map_err(|error| match error {
@@ -6046,7 +6099,7 @@ fn run_session(
     }
 
     let stream_started = std::time::Instant::now();
-    if stream_json {
+    if stream_json && chat_policy.is_none() {
         emit_stream_event(&stream_json::Event::System(stream_json::System {
             subtype: "init".into(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -6146,8 +6199,12 @@ fn run_session(
         );
         let stream_exit = command.and_then(|mut command| {
             apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
-            pty_runner::stream_harness(
+            if let Some((file, policy)) = &chat_policy {
+                command.bind_chat_workspace_policy(file, policy)?;
+            }
+            pty_runner::stream_harness_with_chat_policy(
                 &command,
+                chat_policy.as_ref().map(|(_, policy)| policy),
                 stream_json_input,
                 &selected_harness.id,
                 &record.id,
