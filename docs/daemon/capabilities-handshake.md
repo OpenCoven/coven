@@ -1,4 +1,5 @@
 ---
+source_adjacent_reason: "Defines capability negotiation for the daemon contracts implemented in this repository."
 summary: "Use GET /api/v1/health to negotiate apiVersion and capabilities before depending on response shapes."
 read_when:
   - Writing a client handshake
@@ -39,3 +40,5 @@ Origin pass their separate loopback/allowlist checks.
 `coven.daemon.v1` support.
 
 See [Daemon overview](/daemon/index) and [API contract](/reference/api-contract).
+
+Claude scoped-write clients independently require `capabilities.sessionClaudeWriteScope === true` before sending `writeScope`; absence is unsupported. This owner-local parsing capability does not establish a qualified platform/executable or grant authority. The separate [scoped-write contract](../API-CONTRACT.md#claude-scoped-writes-v1) preserves Full and Codex `launchPolicy` semantics.

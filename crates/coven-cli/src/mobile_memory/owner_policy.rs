@@ -329,6 +329,96 @@ impl OwnerPolicyStore {
         Ok(self.read()?.map(installed))
     }
 
+    /// Capture the complete validated policy, including approvals and root
+    /// history, while preserving policy -> registry -> authorization-key order.
+    pub(crate) fn with_restore_snapshot<T>(
+        &self,
+        operation: impl FnOnce(Option<zeroize::Zeroizing<Vec<u8>>>) -> Result<T>,
+    ) -> Result<T> {
+        let _lock = PolicyStoreLock::acquire(self.lock_dir()?)?;
+        super::config::validate_restore_export_component(&self.path)?;
+        let encoded = self
+            .read()?
+            .map(|stored| serde_json::to_vec(&stored))
+            .transpose()?
+            .map(zeroize::Zeroizing::new);
+        operation(encoded)
+    }
+
+    /// Validate captured snapshot bytes without creating or updating its locks.
+    pub(crate) fn validate_restore_source(
+        &self,
+        encoded: Option<&[u8]>,
+        retained: Option<&[u8]>,
+    ) -> Result<()> {
+        let decode = |bytes: &[u8]| -> Result<StoredOwnerPolicy> {
+            anyhow::ensure!(
+                bytes.len() <= 4 * 1024 * 1024,
+                "restore owner policy exceeds limit"
+            );
+            let stored = serde_json::from_slice(bytes)?;
+            self.validate_stored(&stored)?;
+            Ok(stored)
+        };
+        let incoming = encoded.map(decode).transpose()?;
+        if let Some(current) = retained.map(decode).transpose()? {
+            let next = incoming
+                .as_ref()
+                .context("restore authority would remove snapshot owner policy")?;
+            anyhow::ensure!(
+                next.revision >= current.revision
+                    && (next.revision != current.revision || next.digest == current.digest),
+                "restore authority predates or conflicts with snapshot owner policy"
+            );
+        }
+        Ok(())
+    }
+
+    /// Restore uses the exclusive installation lock before entering this store.
+    pub(crate) fn restore_snapshot(&self, encoded: Option<&[u8]>, install: bool) -> Result<()> {
+        let incoming = encoded
+            .map(|bytes| -> Result<StoredOwnerPolicy> {
+                anyhow::ensure!(
+                    bytes.len() <= 4 * 1024 * 1024,
+                    "restore owner policy exceeds limit"
+                );
+                let stored = serde_json::from_slice(bytes)?;
+                self.validate_stored(&stored)?;
+                Ok(stored)
+            })
+            .transpose()?;
+        let _lock = PolicyStoreLock::acquire(self.lock_dir()?)?;
+        super::config::validate_restore_export_component(&self.path)?;
+        if let Some(current) = self.read()? {
+            let next = incoming
+                .as_ref()
+                .context("restore authority would remove retained owner policy")?;
+            anyhow::ensure!(
+                next.revision >= current.revision
+                    && (next.revision != current.revision || next.digest == current.digest),
+                "restore authority predates or conflicts with retained owner policy"
+            );
+        }
+        if install {
+            if let Some(encoded) = encoded {
+                atomic_replace_private(&self.path, encoded)?;
+                crate::durable_fs::sync_parent(&self.path)?;
+                #[cfg(test)]
+                crate::mobile_memory::config::write_checkpoint(
+                    &self.path,
+                    crate::mobile_memory::config::MobileWritePhase::RetainedParentSynced,
+                )?;
+                crate::durable_fs::sync_parent(self.lock_dir()?)?;
+                #[cfg(test)]
+                crate::mobile_memory::config::write_checkpoint(
+                    &self.path,
+                    crate::mobile_memory::config::MobileWritePhase::RetainedHomeSynced,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Runs `commit` against the head while holding the policy lock, so no
     /// replacement can land between the caller's head check and its write.
     /// Callers keep the policy → registry lock order.

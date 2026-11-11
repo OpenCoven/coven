@@ -22,9 +22,9 @@ use thiserror::Error;
 
 use crate::{
     agent_loop::invocation_failure_kind, invocation_request_digest, BoxError, ContentDigest,
-    ContextResolver, DelegationDigests, InvocationAttempt, InvocationId, InvocationJournal,
-    InvocationRecord, InvocationRequest, InvocationSource, InvocationState, PreparedDelegation,
-    RunControls, RunError, RunFailure, RunOptions, RunResult, Runner,
+    ContextResolver, DelegationDigests, InvocationAttempt, InvocationCapacity, InvocationId,
+    InvocationJournal, InvocationRecord, InvocationRequest, InvocationSource, InvocationState,
+    PreparedDelegation, RunControls, RunError, RunFailure, RunOptions, RunResult, Runner,
 };
 
 /// Attempt sequence shared by every runner in this process, so attempt ids
@@ -99,6 +99,8 @@ impl DurableInvocation {
 pub enum DurableInvocationError {
     #[error("process instance id must not be empty")]
     InvalidProcessInstanceId,
+    #[error("invocation capacity is exhausted; nothing was dispatched")]
+    CapacityUnavailable,
     #[error("invocation journal {operation} failed")]
     JournalFailed {
         operation: &'static str,
@@ -157,6 +159,7 @@ where
     runner: Arc<Runner<C>>,
     journal: Arc<dyn InvocationJournal>,
     process_instance_id: String,
+    capacity: Arc<InvocationCapacity>,
 }
 
 impl<C> DurableInvocationRunner<C>
@@ -165,15 +168,20 @@ where
 {
     /// `process_instance_id` must change on every process start, so that an
     /// attempt adopted before a restart is never mistaken for a live one.
+    /// Share `capacity` with all runners that must obey the same local bound.
+    /// Unknown outcomes retain their capacity charge; there is no implicit
+    /// release on drop or automatic recovery override.
     pub fn new(
         runner: Arc<Runner<C>>,
         journal: Arc<dyn InvocationJournal>,
         process_instance_id: impl Into<String>,
+        capacity: Arc<InvocationCapacity>,
     ) -> Self {
         Self {
             runner,
             journal,
             process_instance_id: process_instance_id.into(),
+            capacity,
         }
     }
 
@@ -305,7 +313,7 @@ where
         }
         let invocation = request.invocation.id;
 
-        let (running, active) = loop {
+        let (running, active, mut permit) = loop {
             let record = self
                 .reserve_or_load(request, &digest, delegation.as_ref())
                 .await?;
@@ -333,6 +341,12 @@ where
                 InvocationDisposition::ProvenNotAdopted => {}
             }
 
+            // Duplicate/conflict/recovery decisions precede capacity checks,
+            // so a full pool never hides the state of an existing invocation.
+            let mut permit = self
+                .capacity
+                .try_acquire()
+                .ok_or(DurableInvocationError::CapacityUnavailable)?;
             let attempt = InvocationAttempt {
                 id: format!(
                     "{}:{}",
@@ -349,15 +363,19 @@ where
                 attempt: Some(attempt),
                 ..record.clone()
             };
+            permit.retain();
             match self
                 .journal
                 .compare_and_set(invocation, Some(&record), &running)
                 .await
             {
-                Ok(true) => break (running, active),
+                Ok(true) => break (running, active, permit),
                 // Another submitter changed the record first; decide again
                 // from what it wrote.
-                Ok(false) => continue,
+                Ok(false) => {
+                    permit.release();
+                    continue;
+                }
                 Err(source) => {
                     return Err(DurableInvocationError::AdoptionUnknown { invocation, source });
                 }
@@ -376,10 +394,15 @@ where
             .await;
         drop(active);
         match written {
-            Ok(true) => Ok(DurableInvocation::Dispatched {
-                record: Box::new(settled),
-                outcome: Box::new(outcome),
-            }),
+            Ok(true) => {
+                if settled.state.is_settled() {
+                    permit.release();
+                }
+                Ok(DurableInvocation::Dispatched {
+                    record: Box::new(settled),
+                    outcome: Box::new(outcome),
+                })
+            }
             Ok(false) => Err(DurableInvocationError::SettlementFailed {
                 invocation,
                 outcome: Box::new(outcome),

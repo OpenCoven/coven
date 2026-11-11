@@ -213,8 +213,15 @@ fn load_stored_certificate(
 ) -> Result<(Vec<u8>, String)> {
     validate_private_file(path)?;
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let stored: StoredHostIdentity = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    decode_stored_certificate(&bytes, expected_fingerprint)
+}
+
+fn decode_stored_certificate(
+    bytes: &[u8],
+    expected_fingerprint: [u8; 32],
+) -> Result<(Vec<u8>, String)> {
+    let stored: StoredHostIdentity =
+        serde_json::from_slice(bytes).context("failed to parse mobile host identity")?;
     let fingerprint = URL_SAFE_NO_PAD
         .decode(stored.public_key_fingerprint)
         .context("mobile host fingerprint is not valid base64url")?;
@@ -229,6 +236,22 @@ fn load_stored_certificate(
         bail!("mobile host identity must contain exactly one certificate");
     }
     Ok((certificates[0].as_ref().to_vec(), stored.subject_alt_name))
+}
+
+/// Validate the captured snapshot bytes rather than re-reading mutable paths.
+pub(crate) fn decode_snapshot_identity(key_pem: &[u8], identity: &[u8]) -> Result<HostIdentity> {
+    let key = KeyPair::from_pem(std::str::from_utf8(key_pem)?)?;
+    let private_key_der = Zeroizing::new(key.serialize_der());
+    let public_key_fingerprint = fingerprint_for_private_key(&private_key_der)?;
+    let (certificate_der, _) = decode_stored_certificate(identity, public_key_fingerprint)?;
+    // Reuse the actual listener's TLS identity checks before publishing a fence:
+    // a matching JSON fingerprint alone does not bind the certificate's key.
+    super::gateway::tls_server_config(certificate_der.clone(), private_key_der.to_vec())?;
+    Ok(HostIdentity {
+        certificate_der,
+        private_key_der,
+        public_key_fingerprint,
+    })
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::{
     error::DaemonError,
     models::{Health, HealthCapabilities, ReadEndpoint, WriteEndpoint, PROTOCOL_VERSION},
-    transport::{self, HttpResponse, PeerIdentity},
+    transport::{self, HttpResponse, PeerIdentity, TransportResponse},
     ClientError, DaemonEndpoint,
 };
 
@@ -44,6 +44,10 @@ impl DaemonClient {
         // revalidation against a now-incompatible daemon.
         self.negotiated = None;
         let transport = transport::request(&self.endpoint, "GET", HEALTH_PATH, None)?;
+        self.finish_health(transport)
+    }
+
+    fn finish_health(&mut self, transport: TransportResponse) -> Result<Health, ClientError> {
         let health: Health = self.decode(transport.response)?;
         if health.api_version != PROTOCOL_VERSION {
             return Err(ClientError::ProtocolVersion {
@@ -83,6 +87,53 @@ impl DaemonClient {
             .map_err(ClientError::InvalidJson)?;
         self.ensure_health()?;
         let response = self.send_bound(method, path, body.as_deref())?;
+        Ok(DaemonHttpResponse {
+            status: response.status,
+            body: response.body,
+        })
+    }
+
+    /// Like request_json, retaining health negotiation and peer-instance binding,
+    /// with one tighter absolute deadline and no automatic retries.
+    pub fn request_json_until(
+        &mut self,
+        method: &'static str,
+        path: &str,
+        body: Option<&Value>,
+        deadline: std::time::Instant,
+    ) -> Result<DaemonHttpResponse, ClientError> {
+        validate_raw_request(method, path)?;
+        let body = body
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(ClientError::InvalidJson)?;
+        if self.negotiated.is_none() {
+            let health =
+                transport::request_until(&self.endpoint, "GET", HEALTH_PATH, None, None, deadline)?;
+            self.finish_health(health)?;
+        }
+        let expected = self
+            .negotiated
+            .as_ref()
+            .ok_or(ClientError::HealthNotReady)?
+            .peer_identity
+            .clone();
+        let response = match transport::request_until(
+            &self.endpoint,
+            method,
+            path,
+            body.as_deref(),
+            Some(&expected),
+            deadline,
+        ) {
+            Ok(response) => response.response,
+            Err(error) => {
+                if matches!(error, ClientError::DaemonInstanceChanged) {
+                    self.negotiated = None;
+                }
+                return Err(error);
+            }
+        };
         Ok(DaemonHttpResponse {
             status: response.status,
             body: response.body,

@@ -22,8 +22,10 @@
 //! - [`channel`] is the private Unix socket between that server and the relay
 //!   the harness launches, `coven automations scoped-read-relay`.
 //!
-//! Nothing launches this yet: harness admission and response commitment
-//! under the daemon's fence are later steps of the same design.
+//! - [`admission`] admits a launch and prepares its channel and folder. The
+//!   daemon reaches it only through `automations::trusted_launch::prepare`,
+//!   whose `StoreGate` (`automations::store_gate`) admits each call and
+//!   commits each result under the store's write lock.
 
 #[cfg(unix)]
 pub(crate) mod admission;

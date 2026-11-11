@@ -39,6 +39,12 @@ pub(crate) struct StreamObservation {
     pub capabilities: BTreeSet<&'static str>,
     /// The highest side-effect class among them.
     pub side_effects: SideEffectClass,
+    /// How many tool calls the envelope classifies the stream shows.
+    pub tool_calls: usize,
+    /// How many tool results the stream shows without an error. A result the
+    /// harness marks as an error, or a call with no result, delivered nothing
+    /// the model could use.
+    pub answered_calls: usize,
     pub complete: bool,
     pub result: StreamResult,
 }
@@ -54,6 +60,8 @@ pub(crate) fn classify_claude_stream(
     let mut observation = StreamObservation {
         capabilities: BTreeSet::new(),
         side_effects: SideEffectClass::None,
+        tool_calls: 0,
+        answered_calls: 0,
         complete: !truncated,
         result: StreamResult::Unobserved,
     };
@@ -106,6 +114,7 @@ pub(crate) fn classify_claude_stream(
                                 .and_then(|name| envelope.tool(name));
                             match tool {
                                 Some(tool) => {
+                                    observation.tool_calls += 1;
                                     observation.capabilities.insert(tool.capability);
                                     if rank(tool.side_effect) > rank(observation.side_effects) {
                                         observation.side_effects = tool.side_effect;
@@ -125,11 +134,14 @@ pub(crate) fn classify_claude_stream(
                     continue;
                 };
                 for block in blocks {
-                    if !matches!(
-                        block.get("type").and_then(Value::as_str),
-                        Some("tool_result" | "text")
-                    ) {
-                        observation.complete = false;
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("tool_result") => {
+                            if matches!(block.get("is_error"), None | Some(Value::Bool(false))) {
+                                observation.answered_calls += 1;
+                            }
+                        }
+                        Some("text") => {}
+                        _ => observation.complete = false,
                     }
                 }
             }
@@ -250,6 +262,18 @@ pub(crate) mod test_support {
         .to_string()
     }
 
+    /// A tool call the harness saw fail: the service refused it, its relay
+    /// died, or the reply never arrived.
+    pub(crate) fn failed_tool_result() -> String {
+        json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "failed", "is_error": true }
+            ] }
+        })
+        .to_string()
+    }
+
     pub(crate) fn text(text: &str) -> String {
         json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": text }] } })
             .to_string()
@@ -273,6 +297,48 @@ pub(crate) mod test_support {
         ]
     }
 
+    /// A clean scoped read run, as claude 2.1.305 prints it under
+    /// `r0-read.2`.
+    #[cfg(unix)]
+    pub(crate) fn scoped_read_run() -> Vec<String> {
+        vec![
+            json!({ "type": "system", "subtype": "ui_invalidate", "event": "ui.render" })
+                .to_string(),
+            json!({
+                "type": "system",
+                "subtype": "init",
+                "tools": ["mcp__coven__read_file", "mcp__coven__list_directory", "mcp__coven__search"],
+                "mcp_servers": [{ "name": "coven", "status": "connected", "source": "dynamic" }],
+                "permissionMode": "default",
+                "claude_code_version": "2.1.305",
+                "apiKeySource": "ANTHROPIC_API_KEY",
+                "session_id": "native-session"
+            })
+            .to_string(),
+            tool_use("mcp__coven__read_file"),
+            tool_result(),
+            text("It says granted notes."),
+            result("It says granted notes."),
+        ]
+    }
+
+    /// [`scoped_read_run`], with `calls` read tool calls, each answered.
+    #[cfg(unix)]
+    pub(crate) fn scoped_read_run_calling(calls: usize) -> Vec<String> {
+        let mut lines = scoped_read_run();
+        let answered = [tool_use("mcp__coven__read_file"), tool_result()];
+        lines.splice(2..4, answered.iter().cycle().take(calls * 2).cloned());
+        lines
+    }
+
+    /// [`scoped_read_run`], with `calls` in place of its one read.
+    #[cfg(unix)]
+    pub(crate) fn scoped_read_run_showing(calls: &[String]) -> Vec<String> {
+        let mut lines = scoped_read_run();
+        lines.splice(2..4, calls.iter().cloned());
+        lines
+    }
+
     pub(crate) fn stream(lines: &[String]) -> String {
         let mut output = lines.join("\n");
         output.push('\n');
@@ -289,6 +355,33 @@ mod tests {
 
     fn classify(lines: &[String]) -> StreamObservation {
         classify_claude_stream(&CLAUDE_R0_READ, &stream(lines), false)
+    }
+
+    #[test]
+    fn only_a_result_without_an_error_counts_as_answered() {
+        let answered = |result: String| {
+            let mut lines = read_run();
+            lines[4] = result;
+            classify(&lines).answered_calls
+        };
+        assert_eq!(answered(tool_result()), 1);
+        assert_eq!(answered(failed_tool_result()), 0);
+        let flagged = |flag: Value| {
+            json!({
+                "type": "user",
+                "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "hello", "is_error": flag }
+                ] }
+            })
+            .to_string()
+        };
+        assert_eq!(answered(flagged(json!(false))), 1);
+        // Anything but a plain false is not a clean result.
+        assert_eq!(answered(flagged(json!("false"))), 0);
+        // A call with no result was not answered.
+        let mut lines = read_run();
+        lines.remove(4);
+        assert_eq!(classify(&lines).answered_calls, 0);
     }
 
     #[test]

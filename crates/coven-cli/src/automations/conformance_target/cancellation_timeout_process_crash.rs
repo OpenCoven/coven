@@ -558,7 +558,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         .to_owned();
     let base = base()?;
     let leadership = launch_slot(&home, &synthetic_definition(), at(base, CLAIM))?;
-    let conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
+    let mut conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
     if run(&conn)? != Run::Running || cancellation(&conn)? != Cancellation::None {
         return Err(FAILED);
     }
@@ -566,7 +566,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
     let handshake = json!({"state":"paused", "scene":case.scene, "boundary":case.boundary,
         "relativeHome":relative_home});
     if let Some(pause_at) = pause_at(case.scene, case.boundary) {
-        install_pause(&conn, pause_at, handshake.clone())?;
+        install_pause(&mut conn, pause_at, handshake.clone())?;
     }
     let runtime = RecordingStops {
         log: home.join(STOP_LOG),
@@ -1239,7 +1239,7 @@ mod tests {
         static CHANGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn record_commit(_: &rusqlite::hooks::Wal, _: std::os::raw::c_int) -> rusqlite::Result<()> {
+    fn record_commit(_: &mut rusqlite::hooks::Wal, _: std::os::raw::c_int) -> rusqlite::Result<()> {
         let changes = CHANGES.with(|changes| changes.take());
         COMMITS.with(|commits| commits.borrow_mut().push(changes));
         Ok(())
@@ -1247,7 +1247,7 @@ mod tests {
 
     /// Records each commit's row changes, leaving out the event feed's own
     /// bookkeeping, which rides inside the transition it records.
-    fn record_changes(conn: &Connection) {
+    fn record_changes(conn: &mut Connection) {
         COMMITS.with(|commits| commits.take());
         CHANGES.with(|changes| changes.take());
         conn.update_hook(Some(
@@ -1264,7 +1264,7 @@ mod tests {
             },
         ))
         .unwrap();
-        conn.wal_hook(Some(record_commit));
+        conn.wal_hook(Some(record_commit)).unwrap();
     }
 
     fn vectors() -> Value {
@@ -1436,8 +1436,8 @@ mod tests {
     #[test]
     fn the_cancellation_commits_four_times_and_the_enforcement_twice() {
         let base = base().unwrap();
-        let (_temp, home, conn, _leadership, target) = launched_store();
-        record_changes(&conn);
+        let (_temp, home, mut conn, _leadership, target) = launched_store();
+        record_changes(&mut conn);
         execute_run_cancellation_at_stop_fence(
             &conn,
             &recording(&home),
@@ -1446,7 +1446,10 @@ mod tests {
             at(base, CANCEL),
         )
         .unwrap();
-        conn.wal_hook(None);
+        conn.wal_hook(
+            None::<fn(&mut rusqlite::hooks::Wal, std::os::raw::c_int) -> rusqlite::Result<()>>,
+        )
+        .unwrap();
         assert_eq!(
             COMMITS.with(|commits| commits.take()),
             [
@@ -1472,14 +1475,17 @@ mod tests {
                 ],
             ]
         );
-        let (_temp, home, conn, _leadership, _target) = launched_store();
-        record_changes(&conn);
+        let (_temp, home, mut conn, _leadership, _target) = launched_store();
+        record_changes(&mut conn);
         assert!(
             enforce_run_timeouts(&conn, &recording(&home), at(base, ENFORCE))
                 .unwrap()
                 .is_empty()
         );
-        conn.wal_hook(None);
+        conn.wal_hook(
+            None::<fn(&mut rusqlite::hooks::Wal, std::os::raw::c_int) -> rusqlite::Result<()>>,
+        )
+        .unwrap();
         assert_eq!(
             COMMITS.with(|commits| commits.take()),
             [

@@ -158,6 +158,13 @@ These extractions are complete and remain the model for bounded movement:
    other pending-directory persistence. They choose which proposals a pass
    visits and in what order; every decision about a candidate, quarantine
    logging, and cursor advancement policy remain with the coordinator.
+9. **Proposal apply-intent journal.** Private `api::proposal_apply_intent` owns
+   the applying state and its before-images, the append of that state to the
+   Ward audit log before any file changes, and the read-back of the latest
+   intent with invalid-record classification. When to append, the envelope
+   copy of the state, and everything recovery does with a read remain with
+   the coordinator. `tests/proposal_apply_intent_boundary.rs` rejects file,
+   Ward and coordinator dependencies and any wider exposure.
 
 These seams preserve the public HTTP API, daemon socket protocol, and existing
 caller entry points. They do not complete #806's broader highest-risk module

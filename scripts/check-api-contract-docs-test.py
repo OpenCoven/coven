@@ -503,7 +503,7 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
             for path in module.SESSION_LAUNCH_POLICY_DOCS
         }
         expected_count = len(module.HEALTH_CAPABILITY_FIELDS)
-        self.assertEqual(expected_count, 17)
+        self.assertEqual(expected_count, 18)
         for path in module.HEALTH_CAPABILITY_COUNT_DOCS:
             with self.subTest(path=path):
                 changed = dict(documents)

@@ -77,6 +77,8 @@ refuses when the key id is gone, the login now belongs to a different user id,
 or the key type differs from the pin. GitHub signing keys cannot be edited in
 place, so the id pins exactly one key.
 
+One account may pin multiple distinct registered keys during rotation. The verifier records the key whose fingerprint actually verified the tag, regardless of entry order, and rejects duplicate key IDs or ambiguous public-key attribution. Removing one key revokes it without removing the account's other keys; the actual signing key must remain pinned at both the tagged commit and current `main`.
+
 The release tag must verify against the pins at the tagged commit **and** at
 the current tip of `main`:
 
@@ -144,15 +146,14 @@ and says why. Commit the lock with the workflows.
 
 ### Certification packet
 
-Produce the redacted certification report for every supported built-in harness
-against the exact commit you intend to tag. Each report is a one-provider
-artifact and the destination must not already exist:
+Produce the redacted certification report for every supported built-in harness against the exact commit you intend to tag. Set `COVEN_RELEASE_CANDIDATE_BIN` to the absolute path of that freshly built candidate binary (`coven.exe` on Windows), and invoke that same file for every report. A globally installed `coven` can identify an older release even when the current checkout is correct. Each report is a one-provider artifact and the destination must not already exist:
 
 ```sh
+COVEN_RELEASE_CANDIDATE_BIN=/absolute/path/to/candidate/coven
 mkdir -p cert
-coven setup codex   --verify-only --report-json cert/codex.json
-coven setup claude  --verify-only --report-json cert/claude.json
-coven setup copilot --verify-only --report-json cert/copilot.json
+"$COVEN_RELEASE_CANDIDATE_BIN" setup codex   --verify-only --report-json cert/codex.json
+"$COVEN_RELEASE_CANDIDATE_BIN" setup claude  --verify-only --report-json cert/claude.json
+"$COVEN_RELEASE_CANDIDATE_BIN" setup copilot --verify-only --report-json cert/copilot.json
 ```
 
 Create the destination directory first: publication is fail-if-exists on the
@@ -597,6 +598,16 @@ loses nothing.
 ### Build matrix failure on a single platform
 
 The platform matrix uses `fail-fast: false`, so the other targets still attempt to build. Look at the failed job's logs, fix the cause on `main`, and push a new signed tag with a bumped patch number.
+
+If GitHub never assigned a runner (`The job was not acquired by Runner`), there is nothing to fix. Wait for Actions to recover, then re-run the failed jobs on the same tag with `gh run rerun <run-id> --failed`. Publication authorization repeats its checks from fresh reads, and nothing reaches the registry before it passes.
+
+### Publication authorization refused
+
+The `coven-release-publication-authorization-vX.Y.Z` artifact names each control that failed. Nothing has been published at that point, and a re-run repeats the same decision unless a live control changed. Fix the cause on `main`, then push a new signed tag with a bumped patch number. Leave the refused tag in place, and certify the new commit, because the old packet names a different one.
+
+For packaging-related PRs, Intel onboarding builds the PR head on `macos-15-intel`. Merge-queue runs use the queue commit. On a push to `main`, all four native onboarding jobs must pass. The smoke checks the full commit literal and compares the installed native executable with the built executable by SHA-256. The job log records both identities and the native tarball digest.
+
+Before tagging, require the successful main push run for the intended SHA. The tag workflow builds new binaries with the release version and checks the tagged SHA and version on those artifacts immediately before publication.
 
 ### Dry-run shows a version conflict
 

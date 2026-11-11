@@ -36,7 +36,7 @@ pub(crate) fn acquire_shared(coven_home: &Path) -> Result<StateLock> {
     Ok(StateLock { file })
 }
 
-fn refuse_interrupted_reset(dir: &Dir, coven_home: &Path) -> Result<()> {
+pub(crate) fn refuse_interrupted_reset(dir: &Dir, coven_home: &Path) -> Result<()> {
     match dir.symlink_metadata(RESET_TRANSACTION_FILE) {
         Ok(_) => anyhow::bail!(
             "an interrupted reset transaction requires recovery; rerun the intended `coven reset ... --apply` command before using other Coven commands"

@@ -9,6 +9,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     io,
+    num::NonZeroUsize,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -21,11 +22,11 @@ use async_trait::async_trait;
 use coven_agents::{
     invocation_request_digest, Agent, AgentId, AgentRef, BoxError, CancellationToken,
     ContentDigest, DurableInvocation, DurableInvocationError, DurableInvocationRunner,
-    FileInvocationJournal, InMemoryInvocationJournal, InvocationContext, InvocationDisposition,
-    InvocationFailureKind, InvocationId, InvocationJournal, InvocationRecord, InvocationRequest,
-    InvocationSource, InvocationState, Model, ModelAction, ModelRequest, ModelResponse,
-    RunControls, RunError, RunOptions, RunSignal, Runner, StopReason, Tool, ToolCall,
-    ToolDefinition,
+    FileInvocationJournal, InMemoryInvocationJournal, InvocationCapacity, InvocationContext,
+    InvocationDisposition, InvocationFailureKind, InvocationId, InvocationJournal,
+    InvocationRecord, InvocationRequest, InvocationSource, InvocationState, Model, ModelAction,
+    ModelRequest, ModelResponse, RunControls, RunError, RunOptions, RunSignal, Runner, StopReason,
+    Tool, ToolCall, ToolDefinition,
 };
 use serde_json::{json, Value};
 
@@ -218,7 +219,12 @@ fn durable(
     journal: Arc<dyn InvocationJournal>,
     process: &str,
 ) -> DurableInvocationRunner<()> {
-    DurableInvocationRunner::new(runner.clone(), journal, process)
+    DurableInvocationRunner::new(
+        runner.clone(),
+        journal,
+        process,
+        Arc::new(InvocationCapacity::new(NonZeroUsize::new(16).unwrap())),
+    )
 }
 
 fn request() -> InvocationRequest {
@@ -1182,5 +1188,352 @@ async fn child_deadline_includes_time_spent_journaling() {
         result.record().state,
         InvocationState::Cancelled { turns: 0 }
     ));
+    assert_eq!(model.calls(), 0);
+}
+
+fn capacity_one() -> Arc<InvocationCapacity> {
+    Arc::new(InvocationCapacity::new(NonZeroUsize::new(1).unwrap()))
+}
+
+#[tokio::test]
+async fn capacity_is_shared_and_duplicates_still_report_their_actual_state() {
+    let gate = Arc::new(AtomicBool::new(false));
+    let model = ScriptedModel::new(work_then_finish());
+    let tool = WorkTool::new(Behavior::Block(gate.clone()));
+    let runner = runner(model.clone(), Some(tool.clone()));
+    let journal = Arc::new(InMemoryInvocationJournal::default());
+    let capacity = capacity_one();
+    let owner =
+        DurableInvocationRunner::new(runner.clone(), journal.clone(), "process", capacity.clone());
+    let peer = DurableInvocationRunner::new(runner, journal.clone(), "process", capacity.clone());
+    let first = request();
+    let second = request();
+    let mut pending = Box::pin(submit(&owner, &first, "go"));
+    assert!(poll_once(pending.as_mut()).is_pending());
+    assert_eq!(capacity.used(), 1);
+    assert!(matches!(
+        submit(&peer, &first, "go").await,
+        Err(DurableInvocationError::ActiveInFlight { .. })
+    ));
+    assert!(matches!(
+        submit(&peer, &first, "different").await,
+        Err(DurableInvocationError::Conflict { .. })
+    ));
+    assert!(matches!(
+        submit(&peer, &second, "go").await,
+        Err(DurableInvocationError::CapacityUnavailable)
+    ));
+    let reserved = journal.load(second.invocation.id).await.unwrap().unwrap();
+    assert_eq!(reserved.state, InvocationState::Reserved {});
+    assert_eq!(reserved.attempt, None);
+    assert_eq!(tool.executions(), 1);
+    assert_eq!(model.calls(), 1);
+
+    gate.store(true, Ordering::SeqCst);
+    assert!(poll_once(pending.as_mut()).is_ready());
+    assert_eq!(capacity.used(), 0);
+    // The reserved request can be submitted explicitly after capacity is free.
+    let second_model = ScriptedModel::new([ModelResponse::final_output("second")]);
+    let second_runner = runner_with_model(second_model.clone());
+    let next =
+        DurableInvocationRunner::new(second_runner, journal.clone(), "process", capacity.clone());
+    assert!(matches!(
+        submit(&next, &second, "go").await.unwrap(),
+        DurableInvocation::Dispatched { .. }
+    ));
+    assert_eq!(second_model.calls(), 1);
+    assert_eq!(capacity.used(), 0);
+}
+
+fn runner_with_model(model: Arc<ScriptedModel>) -> Arc<Runner<()>> {
+    runner(model, None)
+}
+
+#[tokio::test]
+async fn dropping_an_adopted_future_keeps_its_capacity_charged() {
+    let model = ScriptedModel::new(work_then_finish());
+    let tool = WorkTool::new(Behavior::Block(Arc::new(AtomicBool::new(false))));
+    let runner = runner(model.clone(), Some(tool.clone()));
+    let journal = Arc::new(InMemoryInvocationJournal::default());
+    let capacity = capacity_one();
+    let owner = DurableInvocationRunner::new(runner, journal.clone(), "process", capacity.clone());
+    let first = request();
+    let mut pending = Box::pin(submit(&owner, &first, "go"));
+    assert!(poll_once(pending.as_mut()).is_pending());
+    drop(pending);
+    assert_eq!(capacity.used(), 1);
+    assert_recovery_required(submit(&owner, &first, "go").await);
+    assert!(matches!(
+        submit(&owner, &request(), "go").await,
+        Err(DurableInvocationError::CapacityUnavailable)
+    ));
+    assert_eq!(tool.executions(), 1);
+    assert_eq!(model.calls(), 1);
+}
+
+#[tokio::test]
+async fn uncertain_adoption_settlement_and_tool_outcomes_keep_capacity_charged() {
+    for (write, after) in [
+        (ADOPTION, false),
+        (ADOPTION, true),
+        (SETTLEMENT, false),
+        (SETTLEMENT, true),
+    ] {
+        let model = ScriptedModel::new([ModelResponse::final_output("done")]);
+        let journal = FaultyJournal::failing(write, after);
+        let capacity = capacity_one();
+        let owner = DurableInvocationRunner::new(
+            runner(model.clone(), None),
+            journal,
+            "process",
+            capacity.clone(),
+        );
+        let first = request();
+        let result = submit(&owner, &first, "go").await;
+        assert!(
+            matches!(
+                result,
+                Err(DurableInvocationError::AdoptionUnknown { .. }
+                    | DurableInvocationError::SettlementFailed { .. })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(capacity.used(), 1, "write {write}, after {after}");
+        let calls = model.calls();
+        assert!(matches!(
+            submit(&owner, &request(), "go").await,
+            Err(DurableInvocationError::CapacityUnavailable)
+        ));
+        assert_eq!(model.calls(), calls);
+        // A durable settled duplicate is readable even when the lost reply
+        // left this process's capacity conservatively charged.
+        if write == SETTLEMENT && after {
+            assert!(matches!(
+                submit(&owner, &first, "go").await.unwrap(),
+                DurableInvocation::Replayed { .. }
+            ));
+        }
+    }
+    for behavior in [
+        Behavior::ReportUnknownChild,
+        Behavior::CancelThenFail(CancellationToken::new()),
+    ] {
+        let model = ScriptedModel::new(work_then_finish());
+        let tool = WorkTool::new(behavior);
+        let capacity = capacity_one();
+        let cancellation = match &tool.behavior {
+            Behavior::CancelThenFail(token) => token.clone(),
+            _ => CancellationToken::new(),
+        };
+        let owner = DurableInvocationRunner::new(
+            runner(model, Some(tool)),
+            Arc::new(InMemoryInvocationJournal::default()),
+            "process",
+            capacity.clone(),
+        );
+        let result = owner
+            .run(
+                request(),
+                "go",
+                &(),
+                RunOptions::default(),
+                RunControls::new().with_cancellation(cancellation),
+            )
+            .await
+            .unwrap();
+        assert!(result.record().state.leaves_unknown_effect());
+        assert_eq!(capacity.used(), 1);
+    }
+}
+
+#[tokio::test]
+async fn known_rejection_and_cancellation_release_capacity() {
+    let model = ScriptedModel::new([ModelResponse::final_output("done")]);
+    let capacity = capacity_one();
+    let owner = DurableInvocationRunner::new(
+        runner(model.clone(), None),
+        Arc::new(InMemoryInvocationJournal::default()),
+        "process",
+        capacity.clone(),
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let result = owner
+        .run(
+            request(),
+            "go",
+            &(),
+            RunOptions::default(),
+            RunControls::new().with_cancellation(cancellation),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result.record().state,
+        InvocationState::Cancelled { .. }
+    ));
+    assert_eq!(capacity.used(), 0);
+    let mut invalid = request();
+    invalid.requested_target = AgentRef::new("missing").unwrap();
+    let result = submit(&owner, &invalid, "go").await.unwrap();
+    assert!(matches!(
+        result.record().state,
+        InvocationState::Rejected { .. }
+    ));
+    assert_eq!(capacity.used(), 0);
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test]
+async fn delegated_and_direct_work_share_capacity_before_context_or_model_execution() {
+    let gate = Arc::new(AtomicBool::new(false));
+    let model = ScriptedModel::new(work_then_finish());
+    let tool = WorkTool::new(Behavior::Block(gate.clone()));
+    let runner = runner(model.clone(), Some(tool.clone()));
+    let journal = Arc::new(InMemoryInvocationJournal::default());
+    let capacity = capacity_one();
+    let owner = DurableInvocationRunner::new(runner, journal.clone(), "process", capacity.clone());
+    let direct = request();
+    let mut pending = Box::pin(submit(&owner, &direct, "go"));
+    assert!(poll_once(pending.as_mut()).is_pending());
+    let delegation = child();
+    let identity = delegation.invocation().clone();
+    let result = owner
+        .run_delegation(delegation, &NoContext, &(), RunControls::default())
+        .await;
+    assert!(matches!(
+        result,
+        Err(DurableInvocationError::CapacityUnavailable)
+    ));
+    let stored = journal.load(identity.id).await.unwrap().unwrap();
+    assert_eq!(stored.invocation.parent_id, identity.parent_id);
+    assert_eq!(stored.state, InvocationState::Reserved {});
+    assert_eq!(stored.attempt, None);
+    assert!(stored.delegation.is_some());
+    assert_eq!(model.calls(), 1);
+    assert_eq!(tool.executions(), 1);
+    gate.store(true, Ordering::SeqCst);
+    assert!(poll_once(pending.as_mut()).is_ready());
+    assert_eq!(capacity.used(), 0);
+}
+
+struct ContendedAdoptionJournal {
+    inner: InMemoryInvocationJournal,
+    contested: AtomicBool,
+}
+
+#[async_trait]
+impl InvocationJournal for ContendedAdoptionJournal {
+    async fn load(&self, id: InvocationId) -> Result<Option<InvocationRecord>, BoxError> {
+        self.inner.load(id).await
+    }
+    async fn list(&self) -> Result<Vec<InvocationRecord>, BoxError> {
+        self.inner.list().await
+    }
+    async fn compare_and_set(
+        &self,
+        id: InvocationId,
+        expected: Option<&InvocationRecord>,
+        next: &InvocationRecord,
+    ) -> Result<bool, BoxError> {
+        if matches!(next.state, InvocationState::Running {})
+            && !self.contested.swap(true, Ordering::SeqCst)
+        {
+            return Ok(false);
+        }
+        self.inner.compare_and_set(id, expected, next).await
+    }
+}
+
+#[tokio::test]
+async fn failed_reservation_and_contended_adoption_do_not_leak_capacity() {
+    let model = ScriptedModel::new([ModelResponse::final_output("done")]);
+    let capacity = capacity_one();
+    let owner = DurableInvocationRunner::new(
+        runner(model.clone(), None),
+        FaultyJournal::failing(RESERVATION, false),
+        "process",
+        capacity.clone(),
+    );
+    assert!(matches!(
+        submit(&owner, &request(), "go").await,
+        Err(DurableInvocationError::JournalFailed { .. })
+    ));
+    assert_eq!(capacity.used(), 0);
+    assert_eq!(model.calls(), 0);
+    let journal = Arc::new(ContendedAdoptionJournal {
+        inner: InMemoryInvocationJournal::default(),
+        contested: AtomicBool::new(false),
+    });
+    let owner = DurableInvocationRunner::new(
+        runner(model.clone(), None),
+        journal,
+        "process",
+        capacity.clone(),
+    );
+    assert!(matches!(
+        submit(&owner, &request(), "go").await.unwrap(),
+        DurableInvocation::Dispatched { .. }
+    ));
+    assert_eq!(capacity.used(), 0);
+    assert_eq!(model.calls(), 1);
+}
+
+struct InterruptedAdoptionJournal {
+    inner: InMemoryInvocationJournal,
+}
+
+#[async_trait]
+impl InvocationJournal for InterruptedAdoptionJournal {
+    async fn load(&self, id: InvocationId) -> Result<Option<InvocationRecord>, BoxError> {
+        self.inner.load(id).await
+    }
+    async fn list(&self) -> Result<Vec<InvocationRecord>, BoxError> {
+        self.inner.list().await
+    }
+    async fn compare_and_set(
+        &self,
+        id: InvocationId,
+        expected: Option<&InvocationRecord>,
+        next: &InvocationRecord,
+    ) -> Result<bool, BoxError> {
+        let changed = self.inner.compare_and_set(id, expected, next).await?;
+        if matches!(next.state, InvocationState::Running {}) {
+            // Adoption is durable but its response has not arrived. Dropping
+            // this future must retain admission without dispatching the model.
+            std::future::pending::<()>().await;
+        }
+        Ok(changed)
+    }
+}
+
+#[tokio::test]
+async fn dropping_the_adoption_write_keeps_capacity_even_before_model_dispatch() {
+    let journal = Arc::new(InterruptedAdoptionJournal {
+        inner: InMemoryInvocationJournal::default(),
+    });
+    let model = ScriptedModel::new([ModelResponse::final_output("done")]);
+    let capacity = capacity_one();
+    let owner = DurableInvocationRunner::new(
+        runner(model.clone(), None),
+        journal.clone(),
+        "process",
+        capacity.clone(),
+    );
+    let first = request();
+    let mut pending = Box::pin(submit(&owner, &first, "go"));
+    assert!(poll_once(pending.as_mut()).is_pending());
+    assert_eq!(
+        journal
+            .load(first.invocation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        InvocationState::Running {}
+    );
+    drop(pending);
+    assert_recovery_required(submit(&owner, &first, "go").await);
+    assert_eq!(capacity.used(), 1);
     assert_eq!(model.calls(), 0);
 }

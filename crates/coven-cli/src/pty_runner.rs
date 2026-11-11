@@ -28,6 +28,9 @@ pub struct HarnessCommand {
     cwd: PathBuf,
     stdin_prompt: Option<Vec<u8>>,
     env_overrides: HarnessEnvironmentOverrides,
+    /// The child starts from an empty environment, so it holds exactly
+    /// `env_overrides`. Only a scoped read launch sets it.
+    clear_environment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +247,33 @@ impl ChildKiller for SharedPtyKiller {
 }
 
 impl HarnessCommand {
+    pub(crate) fn bind_chat_workspace_policy(
+        &mut self,
+        file: &Path,
+        policy: &crate::chat_workspace_policy::ChatWorkspacePolicy,
+    ) -> Result<()> {
+        let program = Path::new(&self.program);
+        anyhow::ensure!(program.is_absolute(),
+            "Workspace access requires a resolved Coven Code installation. Update Coven Code and retry.");
+        policy.require_protected(program)?;
+        let end = self
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .context("Missing Coven Code prompt boundary")?;
+        self.args.splice(
+            end..end,
+            [
+                "--chat-workspace-policy-v1".into(),
+                file.canonicalize()?
+                    .to_str()
+                    .context("Invalid workspace policy path")?
+                    .into(),
+            ],
+        );
+        Ok(())
+    }
+
     pub fn program(&self) -> &str {
         &self.program
     }
@@ -266,6 +296,7 @@ impl HarnessCommand {
             cwd,
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         }
     }
 
@@ -297,6 +328,9 @@ impl HarnessCommand {
         let mut builder = CommandBuilder::new(&self.program);
         builder.args(&self.args);
         builder.cwd(self.cwd.as_os_str());
+        if self.clear_environment {
+            builder.env_clear();
+        }
         for (name, value) in &self.env_overrides {
             match value {
                 Some(value) => builder.env(name, value),
@@ -307,6 +341,9 @@ impl HarnessCommand {
     }
 
     fn apply_environment(&self, command: &mut std::process::Command) {
+        if self.clear_environment {
+            command.env_clear();
+        }
         for (name, value) in &self.env_overrides {
             match value {
                 Some(value) => {
@@ -397,6 +434,46 @@ pub fn build_envelope_harness_command(
         cwd: cwd.to_path_buf(),
         stdin_prompt: None,
         env_overrides,
+        clear_environment: false,
+    })
+}
+
+/// The command for a scoped read envelope launch, from its admitted
+/// `prepared` launch alone: the resolved harness in the empty launch folder,
+/// the envelope's arguments and MCP configuration, then the model, the
+/// familiar's preamble and `-- <prompt>`. The child starts from an empty
+/// environment holding exactly the variables the envelope names.
+#[cfg(unix)]
+pub(crate) fn build_scoped_harness_command(
+    harness_id: &str,
+    prepared: &crate::automations::scoped_read::admission::Prepared,
+    prompt: &str,
+    familiar: Option<&crate::harness::FamiliarContext>,
+    model: Option<&str>,
+) -> Result<HarnessCommand> {
+    let envelope_args: Vec<&str> = prepared.args.iter().map(String::as_str).collect();
+    let (_, args) = crate::harness::command_parts_for_envelope(
+        harness_id,
+        &envelope_args,
+        prompt,
+        familiar,
+        model,
+    )?;
+    Ok(HarnessCommand {
+        program: prepared
+            .program
+            .to_str()
+            .context("the admitted harness path is not UTF-8")?
+            .to_owned(),
+        args,
+        cwd: prepared.cwd.clone(),
+        stdin_prompt: None,
+        env_overrides: prepared
+            .environment
+            .iter()
+            .map(|(name, value)| (name.clone(), Some(value.clone())))
+            .collect(),
+        clear_environment: true,
     })
 }
 
@@ -503,6 +580,7 @@ fn build_harness_command_with_conversation_inner(
         &mut args,
         cfg!(windows) || force_codex_stdin,
     );
+    let (program, args) = qualify_scoped_write_command(cwd, options, program, args)?;
     let (program, env_overrides) = prepare_harness_program(harness_id, mode, program)?;
 
     Ok(HarnessCommand {
@@ -511,6 +589,7 @@ fn build_harness_command_with_conversation_inner(
         cwd: cwd.to_path_buf(),
         stdin_prompt,
         env_overrides,
+        clear_environment: false,
     })
 }
 
@@ -862,6 +941,72 @@ const CODEX_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CODEX_STDERR_TAIL_BYTES: usize = 8 * 1024;
 const NATIVE_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How many already-queued reader messages a supervisor still handles once its
+/// post-exit deadline has passed. The deadline stops all waiting; this bound
+/// stops a stray process that keeps writing from extending it through the queue.
+const POST_EXIT_QUEUED_MESSAGE_LIMIT: usize = 4096;
+const NATIVE_STDERR_OMITTED: &str = "[stderr diagnostic omitted: capture incomplete or over limit]";
+
+/// Orders one supervised stream so its readers finish while the supervisor is
+/// parked just after observing the child's exit, which is what a late wakeup
+/// under load looks like: messages already queued when the deadline passes.
+#[cfg(test)]
+struct PostExitTestGate {
+    readers: usize,
+    state: std::sync::Mutex<(bool, usize)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl PostExitTestGate {
+    const WAIT_LIMIT: Duration = Duration::from_secs(30);
+
+    fn new(readers: usize) -> Arc<Self> {
+        Arc::new(Self {
+            readers,
+            state: std::sync::Mutex::new((false, 0)),
+            changed: std::sync::Condvar::new(),
+        })
+    }
+
+    fn wait_until(&self, ready: impl Fn(&(bool, usize)) -> bool, what: &str) {
+        let guard = self.state.lock().unwrap();
+        let (_guard, timeout) = self
+            .changed
+            .wait_timeout_while(guard, Self::WAIT_LIMIT, |state| !ready(state))
+            .unwrap();
+        assert!(!timeout.timed_out(), "post-exit test gate: {what}");
+    }
+
+    fn reader_before_final_send(&self) {
+        self.wait_until(|state| state.0, "the supervisor never observed the exit");
+    }
+
+    fn reader_after_final_send(&self) {
+        self.state.lock().unwrap().1 += 1;
+        self.changed.notify_all();
+    }
+
+    fn supervisor_observed_exit(&self) {
+        self.state.lock().unwrap().0 = true;
+        self.changed.notify_all();
+        self.wait_until(
+            |state| state.1 >= self.readers,
+            "the readers never queued their final messages",
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static POST_EXIT_TEST_GATE: std::cell::RefCell<Option<Arc<PostExitTestGate>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn post_exit_test_gate() -> Option<Arc<PostExitTestGate>> {
+    POST_EXIT_TEST_GATE.with(|gate| gate.borrow().clone())
+}
 /// Upper bound on the harness stderr retained for a native stream's failure
 /// summary. Engine stderr can carry provider responses and other private
 /// detail, so only this trailing slice is ever relayed into the `result`
@@ -3261,6 +3406,8 @@ where
     };
 
     let stdout_sender = sender.clone();
+    #[cfg(test)]
+    let stdout_gate = post_exit_test_gate();
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
@@ -3275,9 +3422,19 @@ where
                 return;
             }
         }
+        #[cfg(test)]
+        if let Some(gate) = &stdout_gate {
+            gate.reader_before_final_send();
+        }
         let _ = stdout_sender.send(CodexRunnerMessage::StdoutClosed);
+        #[cfg(test)]
+        if let Some(gate) = &stdout_gate {
+            gate.reader_after_final_send();
+        }
     });
     let stderr_sender = sender.clone();
+    #[cfg(test)]
+    let stderr_gate = post_exit_test_gate();
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut tail = Vec::new();
@@ -3291,7 +3448,15 @@ where
                 Err(_) => break,
             }
         }
+        #[cfg(test)]
+        if let Some(gate) = &stderr_gate {
+            gate.reader_before_final_send();
+        }
         let _ = stderr_sender.send(CodexRunnerMessage::StderrClosed(tail));
+        #[cfg(test)]
+        if let Some(gate) = &stderr_gate {
+            gate.reader_after_final_send();
+        }
     });
     drop(sender);
     let activation_signal = match cancellation.activate() {
@@ -3312,6 +3477,7 @@ where
     let mut status = None;
     let mut direct_child_exited = false;
     let mut post_exit_deadline = None;
+    let mut post_exit_queued_messages = 0_usize;
     let mut stdout_closed = false;
     let mut stderr_tail = None;
     let mut stdin_complete = !stdin_pending;
@@ -3370,6 +3536,10 @@ where
                 // Object handle after try_wait.
                 process_tree.terminate(&mut child);
                 post_exit_deadline = Some(Instant::now() + post_exit_drain_timeout);
+                #[cfg(test)]
+                if let Some(gate) = post_exit_test_gate() {
+                    gate.supervisor_observed_exit();
+                }
             }
         }
         if direct_child_exited && stdout_closed && stderr_tail.is_some() && stdin_complete {
@@ -3377,18 +3547,9 @@ where
         }
 
         let remaining = if let Some(deadline) = post_exit_deadline {
-            let remaining = deadline
+            deadline
                 .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            if remaining.is_zero() {
-                state.protocol_error.get_or_insert_with(|| {
-                    "Codex exited but its output pipes remained open; terminated remaining process tree"
-                        .to_string()
-                });
-                process_tree.terminate(&mut child);
-                break;
-            }
-            remaining
+                .unwrap_or_default()
         } else {
             let timeout = if waiting_for_initial_activity {
                 startup_timeout
@@ -3415,7 +3576,24 @@ where
             remaining
         };
 
-        match receiver.recv_timeout(remaining.min(CODEX_CHILD_POLL_INTERVAL)) {
+        // Past the deadline nothing more is waited for, but a message the
+        // readers queued before it is real output: a supervisor that woke late
+        // must not report open pipes for a stream that had already closed.
+        let message = if post_exit_deadline.is_some() && remaining.is_zero() {
+            let Some(message) = post_exit_queued_message(&receiver, &mut post_exit_queued_messages)
+            else {
+                state.protocol_error.get_or_insert_with(|| {
+                    "Codex exited but its output pipes remained open; terminated remaining process tree"
+                        .to_string()
+                });
+                process_tree.terminate(&mut child);
+                break;
+            };
+            Ok(message)
+        } else {
+            receiver.recv_timeout(remaining.min(CODEX_CHILD_POLL_INTERVAL))
+        };
+        match message {
             Ok(CodexRunnerMessage::Stdout(CodexStdoutMessage::Line(line))) => {
                 match handle_codex_json_line(&line, &mut state, &mut on_assistant) {
                     Ok(true) => {
@@ -3652,6 +3830,23 @@ fn codex_event_error_message(event: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn qualify_scoped_write_command(
+    cwd: &Path,
+    options: crate::harness::HarnessLaunchOptions<'_>,
+    program: String,
+    args: Vec<String>,
+) -> Result<(String, Vec<String>)> {
+    if let Some(crate::harness::LaunchPolicy::ClaudeScopedWrite(scope)) = options.launch_policy {
+        anyhow::ensure!(
+            scope.validate_for_cwd(cwd)? == *scope,
+            "writeScope directory identity changed before launch"
+        );
+        crate::claude_write_scope::validate_native_environment()?;
+        crate::claude_write_scope::verify_native_profile(&program)?;
+    }
+    Ok((program, args))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_stream_harness_command_with_conversation(
     harness_id: &str,
@@ -3678,6 +3873,7 @@ pub fn build_stream_harness_command_with_conversation(
         &program,
         args,
     );
+    let (program, args) = qualify_scoped_write_command(cwd, options, program, args)?;
     let (program, env_overrides) = prepare_harness_program(
         harness_id,
         crate::harness::HarnessLaunchMode::Stream,
@@ -3689,6 +3885,7 @@ pub fn build_stream_harness_command_with_conversation(
         cwd: cwd.to_path_buf(),
         stdin_prompt: None,
         env_overrides,
+        clear_environment: false,
     })
 }
 
@@ -4152,8 +4349,9 @@ impl NativeStreamExit {
     }
 }
 
-pub fn stream_harness<W: Write>(
+pub(crate) fn stream_harness_with_chat_policy<W: Write>(
     command: &HarnessCommand,
+    policy: Option<&crate::chat_workspace_policy::ChatWorkspacePolicy>,
     forward_stdin: bool,
     harness_id: &str,
     ledger_session_id: &str,
@@ -4170,7 +4368,26 @@ pub fn stream_harness<W: Write>(
         ledger_session_id,
         privacy,
         out,
+        policy,
     )
+}
+
+/// The next message a reader queued before the post-exit deadline passed, or
+/// `None` once the queue is empty or `handled` has reached the fixed bound.
+fn post_exit_queued_message<T>(receiver: &mpsc::Receiver<T>, handled: &mut usize) -> Option<T> {
+    if *handled >= POST_EXIT_QUEUED_MESSAGE_LIMIT {
+        return None;
+    }
+    *handled += 1;
+    receiver.try_recv().ok()
+}
+
+fn native_post_exit_drain_timeout() -> Duration {
+    #[cfg(test)]
+    if post_exit_test_gate().is_some() {
+        return Duration::ZERO;
+    }
+    NATIVE_POST_EXIT_DRAIN_TIMEOUT
 }
 
 enum NativeStreamMessage {
@@ -4216,6 +4433,8 @@ fn spawn_native_stderr_reader(
     sender: mpsc::Sender<NativeStreamMessage>,
     privacy: crate::privacy::PrivacyConfig,
 ) {
+    #[cfg(test)]
+    let gate = post_exit_test_gate();
     let (forward_sender, forward_receiver) = mpsc::sync_channel::<Vec<u8>>(8);
     let forwarded = sender.clone();
     let output = native_stderr_output();
@@ -4260,7 +4479,7 @@ fn spawn_native_stderr_reader(
         }
         drop(forward_sender);
         let tail = if omitted {
-            "[stderr diagnostic omitted: capture incomplete or over limit]".to_string()
+            NATIVE_STDERR_OMITTED.to_string()
         } else {
             let mut redacted = crate::privacy::redact_text_with_config(
                 &String::from_utf8_lossy(&capture),
@@ -4272,7 +4491,15 @@ fn spawn_native_stderr_reader(
             }
             redacted.split_off(start)
         };
+        #[cfg(test)]
+        if let Some(gate) = &gate {
+            gate.reader_before_final_send();
+        }
         let _ = sender.send(NativeStreamMessage::StderrClosed(tail));
+        #[cfg(test)]
+        if let Some(gate) = &gate {
+            gate.reader_after_final_send();
+        }
     });
 }
 
@@ -4381,6 +4608,7 @@ fn native_result_error(
         .map(|text| native_failure_text(text, privacy))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_native_stream_line<W: Write>(
     line: &str,
     harness_id: &str,
@@ -4388,6 +4616,8 @@ fn normalize_native_stream_line<W: Write>(
     out: &mut W,
     harness_error: &mut Option<String>,
     privacy: &crate::privacy::PrivacyConfig,
+    policy: Option<&crate::chat_workspace_policy::ChatWorkspacePolicy>,
+    workspace_admitted: &mut bool,
 ) -> Result<()> {
     if line.trim().is_empty() {
         return Ok(());
@@ -4397,6 +4627,18 @@ fn normalize_native_stream_line<W: Write>(
     let object = frame
         .as_object_mut()
         .with_context(|| format!("invalid JSON object from {harness_id} native stream"))?;
+    if let Some(policy) = policy {
+        let init = object.get("type").and_then(serde_json::Value::as_str) == Some("system")
+            && object.get("subtype").and_then(serde_json::Value::as_str) == Some("init");
+        if !*workspace_admitted {
+            anyhow::ensure!(init, "Coven Code returned output before confirming workspace write access. Update Coven Code and retry.");
+            policy.verify_receipt(object.get("effectiveAccess"))?;
+            *workspace_admitted = true;
+        } else if init {
+            // The scoped startup already supplied the one canonical init.
+            return Ok(());
+        }
+    }
     if let Some(error) = native_result_error(object, privacy) {
         *harness_error = Some(error);
     }
@@ -4468,6 +4710,7 @@ fn stream_harness_with_program_and_env<W: Write>(
         ledger_session_id,
         &crate::privacy::PrivacyConfig::default(),
         out,
+        None,
     )
 }
 
@@ -4482,6 +4725,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     ledger_session_id: &str,
     privacy: &crate::privacy::PrivacyConfig,
     out: &mut W,
+    policy: Option<&crate::chat_workspace_policy::ChatWorkspacePolicy>,
 ) -> Result<NativeStreamExit> {
     let mut command = std::process::Command::new(program);
     command
@@ -4597,8 +4841,11 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     let mut stderr_closed = false;
     let mut stderr_tail = String::new();
     let mut stderr_forwarded = false;
+    let mut workspace_admitted = false;
     let mut harness_error: Option<String> = None;
     let mut post_exit_deadline = None;
+    let mut post_exit_queued_messages = 0_usize;
+    let post_exit_drain_timeout = native_post_exit_drain_timeout();
     let result = (|| -> Result<()> {
         if let Some(signal) = activation_signal {
             anyhow::bail!(supervised_stream_cancellation_error_for_signal(
@@ -4634,7 +4881,11 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
                     // gone. On Windows the Job Object is a stable tree handle,
                     // so terminating it after try_wait is safe.
                     process_tree.terminate(&mut child);
-                    post_exit_deadline = Some(Instant::now() + NATIVE_POST_EXIT_DRAIN_TIMEOUT);
+                    post_exit_deadline = Some(Instant::now() + post_exit_drain_timeout);
+                    #[cfg(test)]
+                    if let Some(gate) = post_exit_test_gate() {
+                        gate.supervisor_observed_exit();
+                    }
                 }
             }
 
@@ -4648,15 +4899,23 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
                         .unwrap_or_default()
                 })
                 .unwrap_or(CODEX_CHILD_POLL_INTERVAL);
-            if direct_child_exited && timeout.is_zero() {
-                break;
-            }
-            if stdout_closed && stderr_closed && stderr_forwarded {
-                thread::sleep(timeout.min(CODEX_CHILD_POLL_INTERVAL));
-                continue;
-            }
+            // Past the deadline nothing more is waited for, but a message the
+            // readers queued before it is real output: a supervisor that woke
+            // late must not discard a stderr tail that had already closed.
+            let message = if direct_child_exited && timeout.is_zero() {
+                match post_exit_queued_message(&receiver, &mut post_exit_queued_messages) {
+                    Some(message) => Ok(message),
+                    None => break,
+                }
+            } else {
+                if stdout_closed && stderr_closed && stderr_forwarded {
+                    thread::sleep(timeout.min(CODEX_CHILD_POLL_INTERVAL));
+                    continue;
+                }
+                receiver.recv_timeout(timeout.min(CODEX_CHILD_POLL_INTERVAL))
+            };
 
-            match receiver.recv_timeout(timeout.min(CODEX_CHILD_POLL_INTERVAL)) {
+            match message {
                 Ok(NativeStreamMessage::Line(line)) => {
                     normalize_native_stream_line(
                         &line,
@@ -4665,6 +4924,8 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
                         out,
                         &mut harness_error,
                         privacy,
+                        policy,
+                        &mut workspace_admitted,
                     )?;
                 }
                 Ok(NativeStreamMessage::ReadError(error)) => {
@@ -4706,6 +4967,17 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
         Some(status) => status,
         None => waited_status?,
     };
+    if policy.is_some() && !workspace_admitted {
+        anyhow::bail!(
+            "Coven Code did not establish workspace write access. Update Coven Code and retry."
+        );
+    }
+    // The reader publishes only at end of stream, so an unfinished capture holds
+    // an unredacted prefix that must stay private. Say it is missing instead of
+    // reporting an empty tail, which would read as a harness that wrote nothing.
+    if !stderr_closed {
+        stderr_tail = NATIVE_STDERR_OMITTED.to_string();
+    }
     Ok(NativeStreamExit {
         exit_code: status.code().unwrap_or(1),
         harness_error,
@@ -5709,6 +5981,7 @@ pub(crate) fn windows_detached_stub_command(
         cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         stdin_prompt: None,
         env_overrides: Vec::new(),
+        clear_environment: false,
     })
 }
 
@@ -5734,6 +6007,7 @@ pub(crate) fn windows_console_probe_command(build_dir: &Path) -> Result<HarnessC
         cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         stdin_prompt: None,
         env_overrides: Vec::new(),
+        clear_environment: false,
     })
 }
 
@@ -5774,6 +6048,7 @@ pub(crate) fn piped_prompt_probe_command(
         cwd: build_dir.to_path_buf(),
         stdin_prompt: (!prompt.is_empty()).then_some(prompt),
         env_overrides: Vec::new(),
+        clear_environment: false,
     })
 }
 
@@ -7532,6 +7807,7 @@ mod tests {
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides,
+            clear_environment: false,
         };
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_for_output = Arc::clone(&captured);
@@ -8216,6 +8492,7 @@ mod tests {
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         let mut session = spawn_detached_with_observer(&command, None)?;
@@ -8235,6 +8512,7 @@ mod tests {
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let (exit_tx, exit_rx) = mpsc::channel();
         let observer = DetachedPtyObserver {
@@ -8387,6 +8665,7 @@ mod tests {
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides,
+            clear_environment: false,
         };
 
         assert_windows_detached_pty_queries(&command, &trace_file)
@@ -8575,6 +8854,7 @@ printf '%s\n' '{"type":"turn.completed"}'
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let mut assistant = Vec::new();
 
@@ -8631,6 +8911,7 @@ exec sleep 10
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         // The first frame is a readiness barrier; the child is silent after it,
@@ -8682,6 +8963,7 @@ exec sleep 10
             // would block indefinitely because the fake harness never reads.
             stdin_prompt: Some(vec![b'x'; 1024 * 1024]),
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         let outcome =
@@ -8741,6 +9023,7 @@ exit 0
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         let outcome = stream_codex_json_with_budgets(
@@ -8806,6 +9089,7 @@ exit 23
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let mut assistant = Vec::new();
 
@@ -8866,6 +9150,7 @@ exit 0
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         let outcome = stream_codex_json_with_budgets(
@@ -8980,6 +9265,190 @@ exit 0
             frame["message"]["content"][0]["session_id"],
             "nested-unchanged"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn with_post_exit_test_gate<T>(readers: usize, run: impl FnOnce() -> T) -> T {
+        // Cleared on unwind too: with one test thread, a later test would
+        // otherwise inherit this gate and its zero drain time.
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                POST_EXIT_TEST_GATE.with(|gate| *gate.borrow_mut() = None);
+            }
+        }
+        POST_EXIT_TEST_GATE.with(|gate| *gate.borrow_mut() = Some(PostExitTestGate::new(readers)));
+        let _clear = ClearOnDrop;
+        run()
+    }
+
+    /// The supervisor is parked just after observing the exit until stderr's
+    /// final message is queued, with no drain time left: a late wakeup.
+    #[cfg(unix)]
+    #[test]
+    fn native_stream_keeps_a_stderr_tail_queued_before_a_late_post_exit_wakeup(
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("fake-late-wakeup");
+        std::fs::write(
+            &fake_harness,
+            "#!/bin/sh\nprintf '%s\\n' 'provider refused the request' >&2\nexit 1\n",
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let mut out = Vec::new();
+        let exit = with_post_exit_test_gate(1, || {
+            stream_harness_with_program_and_env(
+                fake_harness.to_str().unwrap(),
+                temp_dir.path(),
+                Vec::new(),
+                &[],
+                false,
+                "streamy",
+                "ledger-current",
+                &mut out,
+            )
+        })?;
+
+        assert_eq!(exit.exit_code, 1);
+        assert!(
+            exit.stderr_tail.contains("provider refused the request"),
+            "a tail queued before the deadline must survive a late wakeup: {:?}",
+            exit.stderr_tail
+        );
+        Ok(())
+    }
+
+    /// A process outside the contained tree can hold stderr open past the
+    /// drain deadline. Its prefix stays unpublished because it was never
+    /// redacted as a whole, but the tail must not read as "wrote nothing".
+    #[cfg(unix)]
+    #[test]
+    fn native_stream_reports_a_stderr_capture_still_open_at_the_deadline() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("fake-held-stderr");
+        // The parent exits only after the child has left the process group, so
+        // the supervisor's group kill cannot reach the holder. The hold is far
+        // longer than any stall here; the holder is killed below.
+        std::fs::write(
+            &fake_harness,
+            r#"#!/bin/sh
+printf '%s\n' 'secret-looking prefix' >&2
+perl -e 'use POSIX qw(setsid); pipe(R, W);
+  if (fork) { close W; <R>; exit 0 }
+  close R; setsid(); open(P, ">", "holder.pid"); print P $$; close P; close W; sleep 300' &
+wait
+exit 1
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let mut out = Vec::new();
+        let exit = stream_harness_with_program_and_env(
+            fake_harness.to_str().unwrap(),
+            temp_dir.path(),
+            Vec::new(),
+            &[],
+            false,
+            "streamy",
+            "ledger-current",
+            &mut out,
+        );
+        let holder: libc::pid_t = std::fs::read_to_string(temp_dir.path().join("holder.pid"))?
+            .trim()
+            .parse()?;
+        // SAFETY: signals the holder this fixture started. It reparented to
+        // init and holds stderr, so the pid is still live and still its own.
+        unsafe { libc::kill(holder, libc::SIGKILL) };
+        let exit = exit?;
+
+        assert_eq!(exit.exit_code, 1);
+        assert_eq!(exit.stderr_tail, NATIVE_STDERR_OMITTED);
+        Ok(())
+    }
+
+    /// A stray process that keeps writing must not extend the deadline through
+    /// the queue: handling stops at the bound with messages still queued.
+    #[test]
+    fn post_exit_queue_handling_stops_at_its_bound() {
+        let (sender, receiver) = mpsc::channel();
+        for message in 0..POST_EXIT_QUEUED_MESSAGE_LIMIT + 1 {
+            sender.send(message).unwrap();
+        }
+        let mut handled = 0;
+        for expected in 0..POST_EXIT_QUEUED_MESSAGE_LIMIT {
+            assert_eq!(
+                post_exit_queued_message(&receiver, &mut handled),
+                Some(expected)
+            );
+        }
+        assert_eq!(post_exit_queued_message(&receiver, &mut handled), None);
+        assert_eq!(receiver.try_recv(), Ok(POST_EXIT_QUEUED_MESSAGE_LIMIT));
+    }
+
+    /// Codex's closes were queued before the deadline, so "output pipes
+    /// remained open" would be false. Stdout and stderr readers both finish
+    /// while the supervisor is parked, with no drain time left.
+    #[cfg(unix)]
+    #[test]
+    fn codex_json_keeps_streams_closed_before_a_late_post_exit_wakeup() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_codex = temp_dir.path().join("fake-codex-late-wakeup");
+        std::fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-123"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"Coven reply"}}'
+printf '%s\n' '{"type":"turn.completed"}'
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_codex)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions)?;
+        let command = HarnessCommand {
+            program: fake_codex.to_string_lossy().into_owned(),
+            args: vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--".to_string(),
+                "reply exactly once".to_string(),
+            ],
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+            env_overrides: Vec::new(),
+            clear_environment: false,
+        };
+
+        let mut assistant = Vec::new();
+        let outcome = with_post_exit_test_gate(2, || {
+            stream_codex_json_with_budgets(
+                &command,
+                CODEX_JSON_TEST_STARTUP_TIMEOUT,
+                Duration::from_secs(1),
+                Duration::ZERO,
+                |text| {
+                    assistant.push(text.to_string());
+                    Ok(())
+                },
+            )
+        })?;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(assistant, vec!["Coven reply"]);
         Ok(())
     }
 
@@ -11357,6 +11826,7 @@ exit 0
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: Some(b"hello from stdin\nsecond & unsafe-looking line".to_vec()),
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let callback_output = captured.clone();
@@ -11406,6 +11876,7 @@ exit 0
                 cwd: temp_dir.path().to_path_buf(),
                 stdin_prompt: None,
                 env_overrides: Vec::new(),
+                clear_environment: false,
             };
             let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let callback_output = captured.clone();
@@ -11463,6 +11934,7 @@ exit 0
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: Some(b"first line\nsecond line\n".to_vec()),
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
         let mut assistant = Vec::new();
 
@@ -11541,6 +12013,7 @@ exit 0
             // covers a blocked prompt writer rather than only stdout reads.
             stdin_prompt: Some(vec![b'x'; 1024 * 1024]),
             env_overrides: Vec::new(),
+            clear_environment: false,
         };
 
         // The shim never reads or exits. As in the Unix blocked-writer case,

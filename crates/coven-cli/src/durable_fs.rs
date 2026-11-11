@@ -374,7 +374,12 @@ thread_local! {
 }
 #[cfg(test)]
 pub(crate) fn fail_next_directory_sync() {
-    DIRECTORY_SYNC_FAILURE.with(|remaining| remaining.set(Some(0)));
+    fail_directory_sync_after(0);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_directory_sync_after(successful_barriers: usize) {
+    DIRECTORY_SYNC_FAILURE.with(|remaining| remaining.set(Some(successful_barriers)));
 }
 
 #[cfg(test)]

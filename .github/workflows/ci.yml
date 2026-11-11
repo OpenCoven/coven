@@ -267,6 +267,52 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Native audit and the complete workspace retain independent 20-minute
+  # acceptance budgets; both are required before the stable PR gate can pass.
+
+  native-audit-linux:
+    name: Native Automations audit (Linux)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Keep build outputs outside the audited source
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/coven-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      # Cache packing belongs to the manual warmer, outside acceptance.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/coven-target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - name: Install native link dependencies
+        run: bash scripts/install-native-link-dependencies.sh
+      # This job owns a clean checkout at the same immutable source revision.
+      # Workspace fixtures and their retained evidence run in a separate job.
+      - name: Audit native Automations against the exact checkout
+        env:
+          AUTOMATIONS_AUDIT_DIR: ${{ runner.temp }}/automations-audit
+        run: node conformance/automations/runner/audit.mjs --output "$AUTOMATIONS_AUDIT_DIR"
+      - name: Upload native Automations audit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: automations-audit-linux-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/automations-audit
+          retention-days: 14
+          if-no-files-found: error
+
   rust-test-linux:
     name: Rust tests (Linux)
     needs: changes
@@ -283,7 +329,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Cache packing belongs to the manual warmer, outside acceptance.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -294,20 +341,6 @@ jobs:
             ${{ runner.os }}-rust-test-
       - name: Install native link dependencies
         run: bash scripts/install-native-link-dependencies.sh
-      # Some workspace fixtures retain ignored evidence inside the checkout.
-      # Audit the clean source first; its own build cache stays outside it.
-      - name: Audit native Automations against the exact checkout
-        env:
-          AUTOMATIONS_AUDIT_DIR: ${{ runner.temp }}/automations-audit
-        run: node conformance/automations/runner/audit.mjs --output "$AUTOMATIONS_AUDIT_DIR"
-      - name: Upload native Automations audit
-        if: ${{ always() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: automations-audit-linux-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/automations-audit
-          retention-days: 14
-          if-no-files-found: error
       - run: cargo test --workspace --locked
       - name: Exercise passkey recovery through the real daemon
         env:
@@ -320,7 +353,7 @@ jobs:
           path: ${{ runner.temp }}/passkey-recovery-receipt.json
           if-no-files-found: error
 
-  # Workspace/audit and Threads retain independent bounded budgets. Their
+  # Workspace and Threads retain independent bounded budgets. Their
   # combined runtime can exhaust one job before the real-daemon tests finish.
   threads-test-linux:
     name: Threads tests (Linux)
@@ -366,8 +399,11 @@ jobs:
     # One libtest name predicate splits `cargo test --workspace` across two
     # runners (#1227). `named` runs every test whose name contains one of the
     # tokens and `rest` skips exactly those, so each test runs in exactly one
-    # shard, and a new test lands in one without editing this list. Unsplit,
-    # the `coven` unit suite alone took 622-1,192 s of a 30-minute budget;
+    # shard, and a new test lands in one without editing this list. The relay
+    # package runs unfiltered in its own required job: its production
+    # idle-expiry case otherwise consumes the rest shard's remaining budget.
+    # Before sharding, the `coven` unit suite alone took 622-1,192 s of a
+    # 30-minute budget;
     # these tokens divide it roughly evenly, and `rest` also carries the
     # integration targets. `fail-fast: false` keeps one shard's failure from
     # cancelling the other's evidence.
@@ -403,7 +439,31 @@ jobs:
           key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-test-
-      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}
+      - run: cargo test --workspace --locked --exclude coven-relay -- ${{ matrix.test-args }}
+
+  relay-test-windows:
+    name: Relay tests (Windows)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    # Separate package coverage preserves the real idle-expiry contract without
+    # competing with workspace compilation and CLI integrations for one budget.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - run: cargo test --locked -p coven-relay
 
   threads-test-windows:
     name: Threads daemon tests (Windows)
@@ -453,14 +513,28 @@ jobs:
   # all -- only AFS mount coverage -- so that leg of the release reliability gate
   # depended on an operator remembering to run it locally.
   rust-test-macos:
-    name: Rust tests (macOS)
+    name: Rust tests (macOS, ${{ matrix.shard }})
     needs: changes
     if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}
     runs-on: macos-26
-    # The workspace plus the Threads journeys now finish at about 20 minutes on
-    # macos-26, so a 20-minute limit cancelled the job after its last suite
-    # passed and failed the PR gate on every main push from f772b513 to 84066d2b.
+    # 30 minutes is a hang guard, not a measured budget. The unsplit workspace
+    # plus Threads job outgrew it: main pushes 34a60ab5 and 3058b30b were
+    # cancelled at the limit (#1687), with the workspace step alone at
+    # 1,088-1,399 s. The workspace is split with the Windows predicate below and
+    # the Threads feature build moved to `threads-test-macos`, so each job keeps
+    # the same guard with headroom and the same tests run exactly once.
     timeout-minutes: 30
+    # Same predicate as `rust-test-windows`: `named` runs every test whose name
+    # contains a token and `rest` skips exactly those. `fail-fast: false` keeps
+    # one shard's failure from cancelling the other's evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: named
+            test-args: 'automations:: api::tests::threads'
+          - shard: rest
+            test-args: '--skip automations:: --skip api::tests::threads'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -480,10 +554,37 @@ jobs:
       # one flaky target hides every target ordered after it -- the Seatbelt
       # conformance suite in `coven-restricted-runtime-macos` had never once
       # executed in CI, because runs kept dying earlier in `coven-client`.
-      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo test --workspace --locked --no-fail-fast -- ${{ matrix.test-args }}
+
+  # The Threads feature build is a second build profile; like
+  # `threads-test-windows`, it runs in its own job so the workspace shards
+  # cannot consume its budget (#1687). Push-only for the same billing reason as
+  # `rust-test-macos`.
+  threads-test-macos:
+    name: Threads daemon tests (macOS)
+    needs: changes
+    if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
       - name: Exercise isolated Threads clock feature
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
       - name: Exercise real-daemon Threads journeys
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock --test threads_identity_invariants --test threads_protected_intake --test threads_terminal_recovery --no-fail-fast
 
   # `rust-test-macos` runs the whole workspace but only on `push`, because
@@ -728,7 +829,13 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changes.outputs.npm_packaging == 'true' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # A cold Intel optimized CLI build took 28m04s in queue 42802835255,
+    # leaving the 30m job unable to finish the required AFS helper and npm
+    # checks. Its 45m outer hang guard leaves about 15m beyond that observed
+    # build and setup; inner tests and production deadlines stay unchanged.
+    timeout-minutes: ${{ matrix.job-timeout }}
+    env:
+      COVEN_NPM_DRY_RUN_VERSION: 999.0.0
     strategy:
       fail-fast: false
       matrix:
@@ -736,11 +843,21 @@ jobs:
           - os: ubuntu-latest
             npm-target: linux-x64
             rust-target: x86_64-unknown-linux-gnu
+            job-timeout: 20
           - os: windows-latest
             npm-target: windows
             rust-target: x86_64-pc-windows-msvc
+            job-timeout: 20
+          - os: macos-15-intel
+            npm-target: macos-x64
+            rust-target: x86_64-apple-darwin
+            job-timeout: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Intel qualifies the PR head. Other PR rows keep testing the merge ref.
+          ref: ${{ matrix.npm-target == 'macos-x64' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
@@ -748,7 +865,9 @@ jobs:
         with:
           toolchain: 1.99.1
           targets: ${{ matrix.rust-target }}
+      # Build the Intel qualification from a clean target directory.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: matrix.npm-target != 'macos-x64'
         with:
           path: |
             ~/.cargo/registry
@@ -760,18 +879,32 @@ jobs:
       - name: Install native link dependencies (Linux only)
         if: runner.os == 'Linux'
         run: bash scripts/install-native-link-dependencies.sh
-      - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
-      - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
+      - name: Confirm Intel source and native toolchain
+        if: matrix.npm-target == 'macos-x64'
         env:
-          COVEN_NPM_DRY_RUN_VERSION: 999.0.0
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(uname -sm)" = "Darwin x86_64"
+          rustc -Vv
+          # Mirror the tagged build's explicit version stamp in this dry run.
+          echo "COVEN_BUILD_VERSION=v$COVEN_NPM_DRY_RUN_VERSION" >> "$GITHUB_ENV"
+      - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
+      - name: Verify Intel architecture and build the AFS mount export helper
+        if: matrix.npm-target == 'macos-x64'
+        run: |
+          test "$(lipo -archs target/x86_64-apple-darwin/release/coven)" = x86_64
+          cargo build --release -p coven-afs --features mount --bins --target x86_64-apple-darwin
+      - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
 
   npm-onboarding-main:
     name: npm onboarding smoke (${{ matrix.npm-target }})
     needs: changes
     if: ${{ github.event_name == 'push' }}
     runs-on: ${{ matrix.os }}
-    # Intel release compilation consumed 17m43s before helper/npm work (#1380).
-    # This outer hang guard leaves every inner test and production deadline intact.
+    # Match the Intel PR/queue hang guard: cold CLI compilation alone has
+    # consumed 28m04s. Keep room for the required helper/npm checks without
+    # changing any inner test or production deadline; other rows stay at 20m.
     timeout-minutes: ${{ matrix.job-timeout }}
     strategy:
       fail-fast: false
@@ -784,7 +917,7 @@ jobs:
           - os: macos-15-intel
             npm-target: macos-x64
             rust-target: x86_64-apple-darwin
-            job-timeout: 30
+            job-timeout: 45
           - os: ubuntu-latest
             npm-target: linux-x64
             rust-target: x86_64-unknown-linux-gnu
@@ -912,11 +1045,14 @@ jobs:
       - automations-protocol-bundle
       - automations-authority-profile-bundle
       - rust-lint-linux
+      - native-audit-linux
       - rust-test-linux
       - threads-test-linux
       - rust-test-windows
+      - relay-test-windows
       - threads-test-windows
       - rust-test-macos
+      - threads-test-macos
       - restricted-runtime-macos
       - afs-mount-linux
       - afs-mount-macos
@@ -943,7 +1079,14 @@ jobs:
               for name, data in jobs.items()
               if data["result"] not in {"success", "skipped"}
           }
-          for required in ("changes", "policy-guard", "automations-protocol-bundle", "automations-authority-profile-bundle"):
+          required_jobs = ["changes", "policy-guard", "automations-protocol-bundle", "automations-authority-profile-bundle"]
+          if jobs["changes"]["outputs"].get("rust") == "true":
+              required_jobs.extend(["native-audit-linux", "rust-test-linux"])
+          if os.environ["GITHUB_EVENT_NAME"] == "push":
+              required_jobs.append("npm-onboarding-main")
+          elif jobs["changes"]["outputs"].get("npm_packaging") == "true":
+              required_jobs.append("npm-onboarding-pr")
+          for required in required_jobs:
               if jobs[required]["result"] != "success":
                   bad[required] = jobs[required]["result"]
           if bad:

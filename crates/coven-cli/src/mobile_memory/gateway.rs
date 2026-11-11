@@ -35,6 +35,7 @@ use super::pairing::{PairingError, PairingLifecycleState, PairingManager, Pairin
 use super::registry::DeviceRegistry;
 use super::{MAX_MOBILE_REQUEST_BYTES, MAX_MOBILE_RESPONSE_BYTES};
 
+mod direct_transport;
 mod relay_runtime;
 
 const MOBILE_IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -311,6 +312,8 @@ impl MobileGatewayHandle {
 impl Drop for MobileGatewayHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.state.stop_network_connections();
+        self.state.registry.cancel_pending_operations();
         let _ = TcpStream::connect_timeout(&self.local_addr, Duration::from_millis(100));
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -318,7 +321,15 @@ impl Drop for MobileGatewayHandle {
     }
 }
 
+#[derive(Default)]
+struct NetworkConnections {
+    stopping: bool,
+    live: Vec<Weak<super::transport::cancellation::Cancellation>>,
+}
+
 struct MobileGatewayState {
+    network: Mutex<NetworkConnections>,
+    connections: super::transport::connection::Connections,
     coven_home: PathBuf,
     host_fingerprint: [u8; 32],
     registry: Arc<DeviceRegistry>,
@@ -326,6 +337,42 @@ struct MobileGatewayState {
     authenticator: MobileAuthenticator,
     advertised_endpoint: Option<String>,
     introductions: super::enrollment::IntroductionLedger,
+}
+
+impl MobileGatewayState {
+    fn register_network_connection(
+        &self,
+        socket: &TcpStream,
+    ) -> Result<(
+        Arc<super::transport::cancellation::Cancellation>,
+        super::transport::cancellation::Attempt,
+    )> {
+        let cancellation = Arc::new(super::transport::cancellation::Cancellation::default());
+        let attempt = cancellation.begin()?;
+        attempt.register(socket)?;
+        let mut network = self
+            .network
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mobile network state unavailable"))?;
+        if network.stopping {
+            cancellation.cancel();
+            bail!("mobile network runtime stopped");
+        }
+        network.live.retain(|entry| entry.strong_count() > 0);
+        network.live.push(Arc::downgrade(&cancellation));
+        Ok((cancellation, attempt))
+    }
+
+    fn stop_network_connections(&self) {
+        let mut network = self
+            .network
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        network.stopping = true;
+        for cancellation in network.live.iter().filter_map(Weak::upgrade) {
+            cancellation.cancel();
+        }
+    }
 }
 
 pub fn start_mobile_gateway(coven_home: &Path) -> Result<Option<MobileGatewayHandle>> {
@@ -401,6 +448,8 @@ fn create_gateway_state(
     let registry = Arc::new(DeviceRegistry::load(coven_home)?);
     let challenges = Arc::new(AssuranceChallengeStore::load(coven_home)?);
     Ok(Arc::new(MobileGatewayState {
+        connections: Default::default(),
+        network: Default::default(),
         coven_home: coven_home.to_path_buf(),
         host_fingerprint,
         pairing: PairingManager::new(Arc::clone(&registry)),
@@ -459,7 +508,16 @@ fn start_mobile_gateway_with_config(
                 MobileAuditEvent::GatewayStarted,
                 None,
             );
+            let mut workers: Vec<JoinHandle<()>> = Vec::new();
             while !thread_shutdown.load(Ordering::Acquire) {
+                let mut index = 0;
+                while index < workers.len() {
+                    if workers[index].is_finished() {
+                        let _ = workers.swap_remove(index).join();
+                    } else {
+                        index += 1;
+                    }
+                }
                 let (stream, _) = match listener.accept() {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -479,11 +537,9 @@ fn start_mobile_gateway_with_config(
                     break;
                 }
                 if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_CONNECTIONS {
-                    if let Err(error) =
-                        serve_tls_connection(stream, Arc::clone(&tls_config), &state)
-                    {
-                        eprintln!("coven mobile gateway connection rejected: {error}");
-                    }
+                    // Refuse excess sockets instead of running a persistent
+                    // connection synchronously on the listener thread.
+                    drop(stream);
                     continue;
                 }
                 inflight.fetch_add(1, Ordering::Relaxed);
@@ -498,10 +554,16 @@ fn start_mobile_gateway_with_config(
                         }
                         connection_inflight.fetch_sub(1, Ordering::Relaxed);
                     });
-                if let Err(error) = spawn {
-                    inflight.fetch_sub(1, Ordering::Relaxed);
-                    eprintln!("coven mobile gateway request thread rejected: {error}");
+                match spawn {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => {
+                        inflight.fetch_sub(1, Ordering::Relaxed);
+                        eprintln!("coven mobile gateway request thread rejected: {error}");
+                    }
                 }
+            }
+            for worker in workers {
+                let _ = worker.join();
             }
             let _ = append_event(
                 &thread_home,
@@ -519,7 +581,10 @@ fn start_mobile_gateway_with_config(
     })
 }
 
-fn tls_server_config(certificate: Vec<u8>, private_key: Vec<u8>) -> Result<Arc<ServerConfig>> {
+pub(super) fn tls_server_config(
+    certificate: Vec<u8>,
+    private_key: Vec<u8>,
+) -> Result<Arc<ServerConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -538,11 +603,22 @@ fn serve_tls_connection(
     config: Arc<ServerConfig>,
     state: &MobileGatewayState,
 ) -> Result<()> {
+    let (_socket_lifetime, attempt) = state.register_network_connection(&stream)?;
     stream.set_read_timeout(Some(MOBILE_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(MOBILE_IO_TIMEOUT))?;
     let connection = ServerConnection::new(config).context("failed to create TLS connection")?;
     let mut tls = StreamOwned::new(connection, stream);
-    let request = read_mobile_request(&mut tls)?;
+    let request = {
+        let mut reader = BufReader::new(&mut tls);
+        let request = read_mobile_request_buffered(&mut reader)?;
+        if direct_transport::claims(&request) && !reader.buffer().is_empty() {
+            bail!("unexpected early direct transport data");
+        }
+        request
+    };
+    if direct_transport::claims(&request) {
+        return direct_transport::serve(tls, state, request, attempt);
+    }
     let response = handle_mobile_request(state, request);
     tls.write_all(&response.to_http())?;
     tls.flush()?;
@@ -556,6 +632,7 @@ struct MobileHttpRequest {
     body: Vec<u8>,
 }
 
+#[cfg(test)]
 fn read_mobile_request(stream: &mut impl Read) -> Result<MobileHttpRequest> {
     let mut reader = BufReader::new(stream);
     read_mobile_request_buffered(&mut reader)
@@ -658,7 +735,13 @@ fn handle_mobile_request(
         return error_response(404, MobileErrorCode::InvalidRequest);
     }
     let path = request.target.clone();
-    match route_request(&request.method, &path) {
+    let decision = route_request(&request.method, &path);
+    let bootstrap = matches!(
+        &decision,
+        RouteDecision::Route(MobileRoute::TransportBootstrap)
+    );
+    let known = matches!(&decision, RouteDecision::Route(_));
+    let dispatch = || match decision {
         RouteDecision::NotFound => error_response(404, MobileErrorCode::InvalidRequest),
         RouteDecision::MethodNotAllowed(allow) => MobileHttpResponse {
             status: 405,
@@ -677,8 +760,23 @@ fn handle_mobile_request(
         RouteDecision::Route(MobileRoute::PairingConfirmation) => {
             handle_pairing_confirmation(state, &path, request)
         }
-        RouteDecision::Route(route) => handle_protected_route(state, route, &path, request),
+        RouteDecision::Route(route) => handle_protected_route(state, route, &path, request, true),
+    };
+    use super::transport::storage::v2;
+    if !known {
+        return dispatch();
     }
+    if bootstrap {
+        if v2::restore::check_installation(&state.coven_home).is_err() {
+            return error_response(503, MobileErrorCode::DaemonUnavailable);
+        }
+        return dispatch();
+    }
+    v2::with_installation_lock(&state.coven_home, &state.registry, || {
+        v2::restore::check_installation(&state.coven_home)?;
+        Ok(dispatch())
+    })
+    .unwrap_or_else(|_| error_response(503, MobileErrorCode::DaemonUnavailable))
 }
 
 fn handle_pairing_enrollment(
@@ -800,8 +898,13 @@ fn serve_transport_with_state<R: super::transport::Records>(
         MOBILE_IO_TIMEOUT,
     )?;
     let deadline = std::time::Instant::now() + MOBILE_IO_TIMEOUT;
-    let (response, close) =
-        handle_transport_message(state, channel.pairing(), channel.is_direct(), &encoded)?;
+    let (response, close) = handle_transport_message_with_generation(
+        state,
+        channel.pairing(),
+        channel.is_direct(),
+        channel.routing_generation(),
+        &encoded,
+    )?;
     channel.send_message(
         &response.to_http(),
         MAX_MOBILE_RESPONSE_BYTES + MAX_HEADER_LINE_BYTES,
@@ -813,10 +916,29 @@ fn serve_transport_with_state<R: super::transport::Records>(
     Ok(())
 }
 
+#[cfg(test)]
 fn handle_transport_message(
     state: &MobileGatewayState,
     pairing: &super::transport::Pairing,
     direct: bool,
+    encoded: &[u8],
+) -> Result<(MobileHttpResponse, bool)> {
+    handle_transport_message_with_generation(state, pairing, direct, None, encoded)
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_ROUTING_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_ROUTING_DISPATCH: std::cell::RefCell<Option<RoutingResponseHook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+type RoutingResponseHook = Box<dyn FnOnce(&MobileHttpResponse)>;
+
+fn handle_transport_message_with_generation(
+    state: &MobileGatewayState,
+    pairing: &super::transport::Pairing,
+    direct: bool,
+    generation: Option<u64>,
     encoded: &[u8],
 ) -> Result<(MobileHttpResponse, bool)> {
     super::transport::authority::check_current(&state.registry, pairing, direct, Utc::now())?;
@@ -845,13 +967,97 @@ fn handle_transport_message(
     ) {
         bail!("transport requires a protected route");
     }
-    let response = handle_protected_route(state, route, &path, request);
+    let direct_control =
+        direct && route == MobileRoute::TransportBootstrap && !request.body.is_empty();
+    let transport = if direct {
+        super::transport::routing::Transport::Direct
+    } else {
+        super::transport::routing::Transport::Relay
+    };
+    if !direct_control {
+        super::transport::storage::v2::check_channel(
+            &state.coven_home,
+            &state.registry,
+            pairing,
+            transport,
+            generation,
+        )?;
+    }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_ROUTING_ADMISSION.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    // Bootstrap storage operations acquire the same transport lock themselves.
+    // Application effects must retain it from current-generation validation
+    // through dispatch so an authenticated handover cannot race admission.
+    let response = if route == MobileRoute::TransportBootstrap {
+        handle_protected_route(state, route, &path, request, direct)
+    } else {
+        super::transport::storage::v2::with_channel_current(
+            &state.coven_home,
+            &state.registry,
+            pairing,
+            transport,
+            generation,
+            || Ok(handle_protected_route(state, route, &path, request, direct)),
+        )?
+    };
+    #[cfg(test)]
+    if let Some(hook) = AFTER_ROUTING_DISPATCH.with(|slot| slot.borrow_mut().take()) {
+        hook(&response);
+    }
     // Device deletion already revokes the channel's identity. Return its signed-
     // request result once; the scheduler must close that channel afterward.
     if route != MobileRoute::DeviceDelete {
         super::transport::authority::check_current(&state.registry, pairing, direct, Utc::now())?;
+        if !direct_control {
+            super::transport::storage::v2::check_channel(
+                &state.coven_home,
+                &state.registry,
+                pairing,
+                transport,
+                generation,
+            )?;
+        }
     }
     Ok((response, route == MobileRoute::DeviceDelete))
+}
+
+/// The ingress is supplied by Rust's TLS/channel dispatcher, never a request
+/// header or body field. Routing control remains direct-channel only.
+#[derive(serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
+enum RoutingControl {
+    Prepare {
+        version: u16,
+    },
+    Recover {
+        version: u16,
+        #[serde(default, rename = "knownGeneration")]
+        known_generation: Option<u64>,
+    },
+    Acknowledge {
+        version: u16,
+        generation: u64,
+        #[serde(rename = "seedDigest")]
+        seed_digest: [u8; 32],
+    },
+    Resync {
+        version: u16,
+        transport: super::transport::routing::Transport,
+        generation: u64,
+        next: u64,
+    },
+}
+impl RoutingControl {
+    fn version(&self) -> u16 {
+        match self {
+            Self::Prepare { version }
+            | Self::Recover { version, .. }
+            | Self::Acknowledge { version, .. }
+            | Self::Resync { version, .. } => *version,
+        }
+    }
 }
 
 fn handle_protected_route(
@@ -859,6 +1065,7 @@ fn handle_protected_route(
     route: MobileRoute,
     path: &str,
     request: MobileHttpRequest,
+    direct: bool,
 ) -> MobileHttpResponse {
     if request.headers.get("x-coven-protocol").map(String::as_str) != Some("1") {
         return error_response(400, MobileErrorCode::ProtocolUnsupported);
@@ -895,6 +1102,18 @@ fn handle_protected_route(
             return auth_error_response(error);
         }
     };
+    let restore_admitted = if route == MobileRoute::TransportBootstrap {
+        super::transport::storage::v2::restore::check_installation(&state.coven_home)
+    } else {
+        super::transport::storage::v2::restore::check_application(
+            &state.coven_home,
+            &state.registry,
+            verified.device_id,
+        )
+    };
+    if restore_admitted.is_err() {
+        return error_response(503, MobileErrorCode::DaemonUnavailable);
+    }
     match verified.assurance_attempt {
         AssuranceAttempt::Absent => {}
         AssuranceAttempt::Rejected => {
@@ -914,6 +1133,21 @@ fn handle_protected_route(
             );
         }
     }
+    let routing_control = if route == MobileRoute::TransportBootstrap && !request.body.is_empty() {
+        if !direct {
+            return error_response(403, MobileErrorCode::CapabilityUnavailable);
+        }
+        let control: RoutingControl = match serde_json::from_slice(&request.body) {
+            Ok(control) => control,
+            Err(_) => return error_response(400, MobileErrorCode::InvalidRequest),
+        };
+        if control.version() != 2 {
+            return error_response(400, MobileErrorCode::ProtocolUnsupported);
+        }
+        Some(control)
+    } else {
+        None
+    };
     let result: Result<serde_json::Value> = match route {
         MobileRoute::AssuranceChallenge => {
             match state
@@ -935,6 +1169,89 @@ fn handle_protected_route(
                     bail!("host identity changed");
                 }
                 let host = p256::ecdsa::SigningKey::from_pkcs8_der(&identity.private_key_der)?;
+                if let Some(control) = routing_control {
+                    use super::transport::storage::{self, v2};
+                    return match control {
+                        control @ (RoutingControl::Prepare { .. }
+                        | RoutingControl::Recover { .. }) => {
+                            let mut handover = if let RoutingControl::Recover {
+                                known_generation,
+                                ..
+                            } = control
+                            {
+                                v2::recover_direct(
+                                    &state.coven_home,
+                                    &state.registry,
+                                    &host,
+                                    verified.device_id,
+                                    known_generation,
+                                )?
+                            } else {
+                                v2::prepare_direct(
+                                    &state.coven_home,
+                                    &state.registry,
+                                    &host,
+                                    verified.device_id,
+                                )?
+                            };
+                            let device_key =
+                                p256::ecdsa::VerifyingKey::from_sec1_bytes(&handover.device_key)?;
+                            let pairing = handover.verify(
+                                host.verifying_key(),
+                                verified.device_id,
+                                &device_key,
+                            )?;
+                            let relay_admitted = super::transport::authority::check_current(
+                                &state.registry,
+                                &pairing,
+                                false,
+                                Utc::now(),
+                            )
+                            .is_ok();
+                            if let Some(config) = storage::RelayConfig::load(&state.coven_home)?
+                                .filter(|config| relay_admitted && config.enabled)
+                            {
+                                handover.relay_endpoints = config.endpoints;
+                            }
+                            json_value(handover)
+                        }
+                        RoutingControl::Acknowledge {
+                            version,
+                            generation,
+                            seed_digest,
+                        } => {
+                            let ack = v2::Acknowledgment {
+                                version,
+                                generation,
+                                seed_digest,
+                            };
+                            v2::acknowledge_direct(
+                                &state.coven_home,
+                                &state.registry,
+                                &host,
+                                verified.device_id,
+                                &ack,
+                            )?;
+                            Ok(
+                                serde_json::json!({"version":2,"generation":generation,"committed":true}),
+                            )
+                        }
+                        RoutingControl::Resync {
+                            transport,
+                            generation,
+                            next,
+                            ..
+                        } => json_value(v2::resync_direct(
+                            &state.coven_home,
+                            &state.registry,
+                            &host,
+                            verified.device_id,
+                            transport,
+                            generation,
+                            next,
+                        )?),
+                    };
+                }
                 let material = super::transport::storage::load_or_provision(
                     &state.coven_home,
                     &state.registry,
@@ -1085,6 +1402,8 @@ fn active_gateway() -> Result<Arc<MobileGatewayState>> {
         .context("mobile gateway is not running")
 }
 
+pub(super) const LOCAL_CONNECTION_PATH: &str = "/api/v1/internal/mobile/connections";
+
 const LOCAL_CONTROL_ROOT: &str = "/api/v1/internal/mobile/pairings";
 
 /// Whether [`handle_local_control`] owns this path.
@@ -1095,6 +1414,9 @@ const LOCAL_CONTROL_ROOT: &str = "/api/v1/internal/mobile/pairings";
 /// `handle_local_control` refuse anything it rejects, stops the two from
 /// drifting apart.
 pub(crate) fn claims_local_control(path: &str) -> bool {
+    if path == LOCAL_CONNECTION_PATH {
+        return true;
+    }
     [
         LOCAL_CONTROL_ROOT,
         super::enrollment::LOCAL_INTRODUCTION_ROOT,
@@ -1113,6 +1435,57 @@ pub(crate) fn handle_local_control(
     path: &str,
     body: Option<&str>,
 ) -> Option<Result<crate::api::ApiResponse>> {
+    if path == LOCAL_CONNECTION_PATH {
+        return Some((|| {
+            if method != "POST" {
+                return crate::api::api_error(
+                    405,
+                    "method_not_allowed",
+                    "Method not allowed.",
+                    None,
+                );
+            }
+            use super::transport::connection::{ConnectionState, ConnectionStatus, Transport};
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                #[serde(default = "legacy_relay")]
+                transport: Transport,
+            }
+            fn legacy_relay() -> Transport {
+                Transport::Relay
+            }
+            let query = match serde_json::from_str::<serde_json::Value>(body.unwrap_or("{}"))
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .and_then(|query| serde_json::from_value::<Query>(query).ok())
+            {
+                Some(query) => query,
+                None => {
+                    return crate::api::api_error(
+                        400,
+                        "invalid_request",
+                        "Invalid connection observation query.",
+                        None,
+                    )
+                }
+            };
+            let transport = query.transport;
+            let state = ACTIVE_GATEWAY
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mobile connection status unavailable"))?
+                .as_ref()
+                .and_then(Weak::upgrade);
+            let status = match state {
+                Some(state) => state.connections.snapshot(transport)?,
+                None => ConnectionStatus {
+                    state: ConnectionState::Offline,
+                    transport,
+                },
+            };
+            crate::api::json_response(200, &status)
+        })());
+    }
     const ROOT: &str = LOCAL_CONTROL_ROOT;
     if !claims_local_control(path) {
         return None;
@@ -1654,6 +2027,8 @@ mod tests {
             )
             .unwrap();
         let state = MobileGatewayState {
+            connections: Default::default(),
+            network: Default::default(),
             coven_home: temp.path().to_path_buf(),
             host_fingerprint: [3; 32],
             pairing: PairingManager::new(Arc::clone(&registry)),
@@ -1975,6 +2350,8 @@ mod tests {
         let registry = Arc::new(DeviceRegistry::load(home).unwrap());
         let challenges = Arc::new(AssuranceChallengeStore::load(home).unwrap());
         MobileGatewayState {
+            connections: Default::default(),
+            network: Default::default(),
             coven_home: home.to_path_buf(),
             host_fingerprint: [7; 32],
             pairing: PairingManager::new(Arc::clone(&registry)),
@@ -2045,6 +2422,7 @@ mod tests {
                 .unwrap();
             }
             super::super::transport::storage::RelayConfig {
+                listener_limit: crate::mobile_memory::transport::storage::MAX_LISTENERS,
                 version: 1,
                 enabled: true,
                 endpoints: vec![super::super::transport::websocket::EndpointConfig {

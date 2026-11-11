@@ -1312,7 +1312,12 @@ pub(crate) mod tests {
 
     impl Home {
         pub(crate) fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            Self::in_dir(tempfile::tempdir().unwrap())
+        }
+
+        /// A home in `dir`. A scoped read launch needs a short one: its
+        /// channel's socket path has to fit in about 100 bytes.
+        pub(crate) fn in_dir(dir: tempfile::TempDir) -> Self {
             let path = crate::api::store_path(dir.path());
             crate::store::initialize_store(&path).unwrap();
             let conn = crate::store::open_store(&path).unwrap();

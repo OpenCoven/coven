@@ -1013,6 +1013,102 @@ impl AuthorizationKeyRegistry {
     }
 }
 
+/// Lock order is policy -> registry -> authorization keys. The callback keeps
+/// the key snapshot protected while the complete authority export is assembled.
+pub(crate) fn with_restore_snapshot<T>(
+    home: &Path,
+    operation: impl FnOnce(zeroize::Zeroizing<Vec<u8>>) -> Result<T>,
+) -> Result<T> {
+    let path = ensure_private_mobile_dir(home)?.join(AUTHORIZATION_KEYS_FILE);
+    let _guard = AUTHORIZATION_KEY_STORE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+    let _file = AssuranceStoreFileLock::acquire(&path, AUTHORIZATION_KEY_LOCK_FILE)?;
+    super::config::validate_restore_export_component(&path)?;
+    let stored = StoredAuthorizationKeys {
+        version: AUTHORIZATION_KEY_REGISTRY_VERSION,
+        keys: read_authorization_keys(&path)?,
+    };
+    operation(zeroize::Zeroizing::new(serde_json::to_vec(&stored)?))
+}
+
+/// Compare selected snapshot key authority without changing its lock namespace.
+pub(crate) fn validate_restore_key_source(encoded: &[u8], retained: Option<&[u8]>) -> Result<()> {
+    let decode = |bytes: &[u8]| -> Result<StoredAuthorizationKeys> {
+        anyhow::ensure!(
+            bytes.len() <= 4 * 1024 * 1024,
+            "restore authorization keys exceed limit"
+        );
+        let stored: StoredAuthorizationKeys = serde_json::from_slice(bytes)?;
+        anyhow::ensure!(
+            stored.version == AUTHORIZATION_KEY_REGISTRY_VERSION,
+            "unsupported mobile authorization-key registry version"
+        );
+        validate_authorization_keys(&stored.keys)?;
+        Ok(stored)
+    };
+    let incoming = decode(encoded)?;
+    if let Some(retained) = retained {
+        for current in decode(retained)?.keys {
+            if let Some(next) = incoming.keys.iter().find(|k| {
+                k.device_id == current.device_id && k.subject_key_id == current.subject_key_id
+            }) {
+                anyhow::ensure!(next.key_epoch >= current.key_epoch && (current.revoked_at.is_none() || next.revoked_at.is_some()),
+                    "restore authority would roll back snapshot authorization-key revocation or epoch");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The caller holds the exclusive installation state lock and transport lock.
+/// Validate before fencing; write only while the global restore is installing.
+pub(crate) fn restore_authorization_keys(home: &Path, encoded: &[u8], install: bool) -> Result<()> {
+    anyhow::ensure!(
+        encoded.len() <= 4 * 1024 * 1024,
+        "restore authorization keys exceed limit"
+    );
+    let incoming: StoredAuthorizationKeys = serde_json::from_slice(encoded)?;
+    anyhow::ensure!(
+        incoming.version == AUTHORIZATION_KEY_REGISTRY_VERSION,
+        "unsupported mobile authorization-key registry version"
+    );
+    validate_authorization_keys(&incoming.keys)?;
+    let path = ensure_private_mobile_dir(home)?.join(AUTHORIZATION_KEYS_FILE);
+    let _guard = AUTHORIZATION_KEY_STORE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+    let _file = AssuranceStoreFileLock::acquire(&path, AUTHORIZATION_KEY_LOCK_FILE)?;
+    super::config::validate_restore_export_component(&path)?;
+    for current in read_authorization_keys(&path)? {
+        if let Some(next) = incoming.keys.iter().find(|k| {
+            k.device_id == current.device_id && k.subject_key_id == current.subject_key_id
+        }) {
+            anyhow::ensure!(
+                next.key_epoch >= current.key_epoch
+                    && (current.revoked_at.is_none() || next.revoked_at.is_some()),
+                "restore authority would roll back authorization-key revocation or epoch"
+            );
+        }
+    }
+    if install {
+        atomic_replace_private(&path, encoded)?;
+        crate::durable_fs::sync_parent(&path)?;
+        #[cfg(test)]
+        crate::mobile_memory::config::write_checkpoint(
+            &path,
+            crate::mobile_memory::config::MobileWritePhase::RetainedParentSynced,
+        )?;
+        crate::durable_fs::sync_parent(path.parent().context("missing mobile directory")?)?;
+        #[cfg(test)]
+        crate::mobile_memory::config::write_checkpoint(
+            &path,
+            crate::mobile_memory::config::MobileWritePhase::RetainedHomeSynced,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn authorization_key_id(public_key_x963: &str) -> Result<String> {
     let key = validate_public_key(public_key_x963)?;
     Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(key)))

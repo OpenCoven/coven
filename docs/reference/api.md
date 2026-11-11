@@ -29,7 +29,7 @@ flowchart LR
   Root --> Hub["/hub"]
 ```
 
-All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsCommit`, `afsCommitDryRun`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. `executionBindingContracts` advertises standalone O2 support. The exact O3 value in `requestAdoptionContracts` advertises the composite adopted launch/input contract, including its mandatory per-request exact O2 proof; the bundled adopted client gates on this O3 field rather than independently checking both arrays. Capabilities advertise availability and never grant permission.
+All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`, `sessionLaunchPolicy`, `sessionClaudeWriteScope`, `afs`, `afsCommit`, `afsCommitDryRun`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. `executionBindingContracts` advertises standalone O2 support. The exact O3 value in `requestAdoptionContracts` advertises the composite adopted launch/input contract, including its mandatory per-request exact O2 proof; the bundled adopted client gates on this O3 field rather than independently checking both arrays. Capabilities advertise availability and never grant permission.
 
 ## Contract and discovery
 
@@ -59,30 +59,7 @@ return the stored `result` without a second event. The corresponding
 `.get.v1` and `.list.v1` actions expose authority revisions; `.list.v1` accepts
 `includeTombstoned: true` to include retained tombstones.
 
-The health `capabilities` object currently contains all 17 fields:
-`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`,
-`eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`,
-`afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`,
-`executionBindingContracts`, `requestAdoptionContracts`, and
-`sessionPolicyContracts`. The
-`sessionLaunchPolicy` field is `true` only over owner-gated local IPC and is
-always `false` over TCP; Host and Origin allowlists do not elevate TCP
-authority. `daemon` is either `null` or
-`{ pid, startedAt, socket, processCreationTime? }`, where the socket is under
-the active local IPC endpoint; the optional `hub` field is a control-plane
-summary. `processCreationTime` is a Windows-only decimal string containing the
-full 64-bit process FILETIME fingerprint.
-The optional `eventWriter` field reports the daemon-owned persistence queue,
-including its state, exact queued events/bytes, capacity, dropped output,
-connection, transaction, commit, and last-error counters.
-The optional `storage` field is `{ status, databaseBytes, walBytes,
-oldestRetainedEventAt, lastPruneAt, pruneAgeSeconds, lastCheckpointAt,
-checkpointAgeSeconds, writerBacklogEvents, writerBacklogBytes, freeDiskBytes,
-maintenanceBlocked, lastMaintenanceError? }`. `status` is `ok`, `warning`,
-`critical`, or `degraded`; clients should surface `critical` and `degraded`
-before storage exhaustion rather than treating a reachable daemon as healthy.
-`writerBacklogEvents` and `writerBacklogBytes` mirror the same live queue
-snapshot reported by `eventWriter`.
+The health `capabilities` object currently contains all 18 fields: `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `sessionClaudeWriteScope`, `afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, `requestAdoptionContracts`, and `sessionPolicyContracts`. The `sessionLaunchPolicy` field is `true` only over owner-gated local IPC and is always `false` over TCP; Host and Origin allowlists do not elevate TCP authority. `daemon` is either `null` or `{ pid, startedAt, socket, processCreationTime? }`, where the socket is under the active local IPC endpoint; the optional `hub` field is a control-plane summary. `processCreationTime` is a Windows-only decimal string containing the full 64-bit process FILETIME fingerprint. The optional `eventWriter` field reports the daemon-owned persistence queue, including its state, exact queued events/bytes, capacity, dropped output, connection, transaction, commit, and last-error counters. The optional `storage` field is `{ status, databaseBytes, walBytes, oldestRetainedEventAt, lastPruneAt, pruneAgeSeconds, lastCheckpointAt, checkpointAgeSeconds, writerBacklogEvents, writerBacklogBytes, freeDiskBytes, maintenanceBlocked, lastMaintenanceError? }`. `status` is `ok`, `warning`, `critical`, or `degraded`; clients should surface `critical` and `degraded` before storage exhaustion rather than treating a reachable daemon as healthy. `writerBacklogEvents` and `writerBacklogBytes` mirror the same live queue snapshot reported by `eventWriter`.
 
 `sessionPolicyContracts` advertises `["coven.session-policy.v1"]` only over
 owner-local IPC (`[]` over TCP). This is a refusal-only admission contract, not
@@ -585,7 +562,7 @@ Full hub request/response shapes live in the [API contract](/API-CONTRACT).
 GET /api/v1/health
 ```
 
-The response provides the active named `apiVersion`, all 17 health
+The response provides the active named `apiVersion`, all 18 health
 `capabilities` fields, and optional daemon metadata (`pid`, `startedAt`, and
 `socket`) plus the optional hub summary. Treat a dependent operation as
 unavailable until its required capability fields have been checked.
@@ -598,3 +575,5 @@ See the [public API guide](https://docs.opencoven.ai/docs/reference/api) for res
 - [API contract](/API-CONTRACT)
 - [Authentication and local access](/AUTH)
 - [Client integration](/CLIENT-INTEGRATION)
+
+`sessionClaudeWriteScope` is owner-local only and advertises the separate Claude `writeScope` v1 request shape; it is false over TCP and does not prove runtime qualification or grant authority. See the [scoped-write contract](../API-CONTRACT.md#claude-scoped-writes-v1) for schema, native-profile restrictions, refusals, and the local `--write-scope` equivalent.

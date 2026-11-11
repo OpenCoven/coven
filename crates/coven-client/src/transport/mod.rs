@@ -1,5 +1,6 @@
 #[cfg(any(unix, test))]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::{ClientError, DaemonEndpoint};
 
@@ -144,6 +145,52 @@ pub(crate) fn request_bound(
     expected_peer: &PeerIdentity,
 ) -> Result<TransportResponse, ClientError> {
     request_with_peer(endpoint, method, path, body, Some(expected_peer))
+}
+
+/// Use one caller deadline across negotiation and the bound diagnostic request.
+/// The ordinary per-request maximum remains unchanged.
+pub(crate) fn request_until(
+    endpoint: &DaemonEndpoint,
+    method: &'static str,
+    path: &str,
+    body: Option<&[u8]>,
+    expected_peer: Option<&PeerIdentity>,
+    deadline: Instant,
+) -> Result<TransportResponse, ClientError> {
+    validate_request_line(method, path)?;
+    if let Some(body) = body {
+        if body.len() > MAX_REQUEST_BODY_BYTES {
+            return Err(ClientError::RequestTooLarge {
+                max_bytes: MAX_REQUEST_BODY_BYTES,
+                actual_bytes: body.len(),
+            });
+        }
+    }
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| ClientError::Io {
+            operation: "daemon request deadline expired",
+            source: std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon request deadline expired",
+            ),
+        })?;
+    #[cfg(unix)]
+    {
+        let _ = remaining;
+        unix::request_until(endpoint, method, path, body, expected_peer, deadline)
+    }
+    #[cfg(windows)]
+    {
+        let _ = remaining;
+        windows::request_until(endpoint, method, path, body, expected_peer, deadline)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (endpoint, body, expected_peer, remaining);
+        Err(ClientError::UnsupportedPlatform)
+    }
 }
 
 pub(crate) fn verify_peer(

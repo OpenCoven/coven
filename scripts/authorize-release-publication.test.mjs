@@ -9,8 +9,8 @@ import { authorizeReleasePublication, releasePackageNames } from './authorize-re
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (relativePath) => readFileSync(path.join(repoRoot, relativePath), 'utf8');
 const REPOSITORY = 'OpenCoven/coven';
-const TAG = 'v0.4.11';
-const VERSION = '0.4.11';
+const TAG = 'v0.5.0';
+const VERSION = '0.5.0';
 const HEAD = '1'.repeat(40);
 const TAG_OBJECT = '2'.repeat(40);
 const MAIN = '3'.repeat(40);
@@ -150,7 +150,7 @@ const refusals = [
   ['an unreadable governance snapshot', 'governance.protection', /No GitHub credential/, {
     deps: { captureGovernance: async () => { throw new Error('No GitHub credential available to read repository protection.'); } }
   }],
-  ['a version off the supported line', 'support.release-line', /supports the 0\.3\.x line, not 0\.4\.x/, {
+  ['a version off the supported line', 'support.release-line', /supports the 0\.3\.x line, not 0\.5\.x/, {
     deps: { loadSupport: () => ({ ...JSON.parse(read('.github/release-support.json')), supportedReleaseLine: '0.3' }) }
   }],
   ['a security-blocked surface', 'support.surfaces', /@opencoven\/cli-windows: \.github\/release-support\.json marks it security-blocked/, {
@@ -162,14 +162,14 @@ const refusals = [
       }
     }
   }],
-  ['a package already at this version', 'version.unpublished', /already on npm: @opencoven\/cli-macos@0\.4\.11/, {
+  ['a package already at this version', 'version.unpublished', /already on npm: @opencoven\/cli-macos@0\.5\.0/, {
     deps: { packageVersionPublished: (name) => name === '@opencoven/cli-macos' }
   }],
   ['a registry that cannot say what is published', 'version.unpublished', /could not say whether/, {
     deps: { packageVersionPublished: () => { throw new Error('npm view could not say whether it is already published'); } }
   }],
-  ['a version that would move latest backwards', 'version.monotonic', /not newer than @opencoven\/cli latest 0\.4\.12/, {
-    deps: { npmDistTagLatest: (name) => (name === '@opencoven/cli' ? '0.4.12' : '0.4.10') }
+  ['a version that would move latest backwards', 'version.monotonic', /not newer than @opencoven\/cli latest 0\.5\.1/, {
+    deps: { npmDistTagLatest: (name) => (name === '@opencoven/cli' ? '0.5.1' : '0.4.10') }
   }],
   ['a version equal to latest', 'version.monotonic', /not newer than/, {
     deps: { npmDistTagLatest: () => VERSION }
@@ -183,14 +183,27 @@ const refusals = [
   ['a binary built from another commit', 'artifacts.source-commit', /coven\.exe does not embed the tagged commit/, {
     deps: { readArtifact: (relativePath) => (relativePath.endsWith('.exe') ? Buffer.from(`v${VERSION} ${'9'.repeat(40)}`) : binary()) }
   }],
+  ['a commit present only as split movabs immediates', 'artifacts.source-commit', /x86_64-apple-darwin\/release\/coven does not embed the tagged commit/, {
+    deps: {
+      readArtifact: (relativePath) => {
+        const fragments = HEAD.match(/.{1,8}/g);
+        return Buffer.concat([
+          Buffer.from(`v${VERSION} `),
+          ...(relativePath.includes('x86_64-apple')
+            ? fragments.map((fragment) => Buffer.concat([Buffer.from([0x48, 0xb9]), Buffer.from(fragment)]))
+            : [Buffer.from(HEAD)])
+        ]);
+      }
+    }
+  }],
   ['a missing native binary', 'artifacts.source-commit', /x86_64-apple-darwin\/release\/coven is missing/, {
     deps: { readArtifact: (relativePath) => { if (relativePath.includes('x86_64-apple')) throw new Error('ENOENT'); return binary(); } }
   }],
   ['a binary that reports another version', 'artifacts.reported-version', /printed "coven v0\.4\.10 \(engine\)"/, {
     deps: { runBinaryVersion: () => 'coven v0.4.10 (engine)' }
   }],
-  ['a version prefix that only looks right', 'artifacts.reported-version', /expected coven v0\.4\.11/, {
-    deps: { runBinaryVersion: () => 'coven v0.4.110' }
+  ['a version prefix that only looks right', 'artifacts.reported-version', /expected coven v0\.5\.0/, {
+    deps: { runBinaryVersion: () => 'coven v0.5.00' }
   }],
   ['an annotation titled for another version', 'metadata.release-notes', /titled "Coven v0\.4\.10"/, {
     deps: { readTagAnnotation: () => ({ subject: 'Coven v0.4.10', body: 'notes' }) }

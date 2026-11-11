@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use super::open::{Body, Response};
 use super::scope::{RelativePath, RootKind};
 use super::service::{
-    tool_definitions, Gate, Limits, Open, Operation, Outcome, Service, R0_OPERATION_TIME,
-    TOOL_NAMES,
+    tool_definitions, Committing, Gate, Limits, Open, Operation, Outcome, Service,
+    R0_OPERATION_TIME, TOOL_NAMES,
 };
 use super::{Refusal, R0_READ_POLICY};
 use crate::automations::contract::canonical_json::{canonicalize, sha256_hex};
@@ -230,9 +230,13 @@ fn a_served_result_is_exactly_the_committed_text() {
             outcome: Outcome::Served {
                 digest: digest.clone()
             },
+            written: true,
         }]
     );
-    assert_eq!(*commits.lock().unwrap(), [(Some("read_file"), digest)]);
+    assert_eq!(
+        *commits.lock().unwrap(),
+        [(1, Some("read_file"), None, digest, text.len())]
+    );
     assert_eq!(
         *seen.lock().unwrap(),
         [json!({ "operation": "read_file", "root": "project", "path": "notes/today.md" })]
@@ -361,6 +365,7 @@ fn a_closed_gate_withholds_the_result_and_stops_the_service() {
                 outcome: Outcome::Withheld {
                     refusal: Refusal::AttemptClosed
                 },
+                written: true,
             }]
         );
         let ran = seen.lock().unwrap().len();
@@ -449,8 +454,9 @@ fn an_overlong_message_ends_the_service() {
     assert!(seen.lock().unwrap().is_empty());
 }
 
-/// The tool and digest of each result a gate committed.
-type Commits = Arc<Mutex<Vec<(Option<&'static str>, String)>>>;
+/// The sequence, tool, refusal, digest and length of each result a gate
+/// committed.
+type Commits = Arc<Mutex<Vec<(u64, Option<&'static str>, Option<Refusal>, String, usize)>>>;
 
 /// A gate that answers as scripted and records what it committed.
 struct Scripted {
@@ -464,8 +470,14 @@ impl Gate for Scripted {
         self.admit
     }
 
-    fn commit(&mut self, tool: Option<&'static str>, digest: &str) -> Result<(), Refusal> {
-        self.commits.lock().unwrap().push((tool, digest.to_owned()));
+    fn commit(&mut self, committing: &Committing<'_>) -> Result<(), Refusal> {
+        self.commits.lock().unwrap().push((
+            committing.sequence,
+            committing.tool,
+            committing.refusal,
+            committing.digest.to_owned(),
+            committing.bytes,
+        ));
         self.commit
     }
 }
@@ -485,7 +497,7 @@ mod over_the_channel {
 
     use super::super::channel::{relay, Channel, CHANNEL_ENV, RELAY_ARGS, TOKEN_ENV};
     use super::super::open::ScopedReader;
-    use super::super::service::{Gate, Open, Outcome, Service};
+    use super::super::service::{Committing, Gate, Open, Outcome, Service};
     use super::super::{Refusal, R0_READ_POLICY};
     use super::{file, initialize, read, tool_text, LIMITS};
     use crate::automations::contract::types::SideEffectClass;
@@ -779,7 +791,7 @@ mod over_the_channel {
             fn admit(&mut self) -> Result<(), Refusal> {
                 Ok(())
             }
-            fn commit(&mut self, _: Option<&'static str>, _: &str) -> Result<(), Refusal> {
+            fn commit(&mut self, _: &Committing<'_>) -> Result<(), Refusal> {
                 self.entered.send(()).unwrap();
                 // A hang guard; the test releases this after observing close.
                 self.release.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -1482,6 +1494,10 @@ mod over_the_channel {
         let observed = classify_claude_stream(&CLAUDE_R0_SCOPED_READ, &raw, false);
         assert!(observed.complete, "{raw}");
         assert_eq!(observed.result, StreamResult::Produced("done".to_owned()));
+        // The installed harness shows the served read without an error and
+        // marks the refused one, which is what settlement counts on.
+        assert_eq!(observed.tool_calls, 2, "{raw}");
+        assert_eq!(observed.answered_calls, 1, "{raw}");
         let model = model_requests(&requests);
         assert!(last_tool_result(&model[1]).contains("granted notes"));
         assert!(last_tool_result(&model[2]).contains("scope_missing"));

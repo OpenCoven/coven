@@ -94,8 +94,28 @@ fn doctor_json_is_stable_redacted_and_stdout_pure() -> anyhow::Result<()> {
         .collect();
     assert_eq!(
         keys,
-        BTreeSet::from(["blocking", "checks", "nextSteps", "ok", "project", "store"])
+        BTreeSet::from([
+            "blocking",
+            "checks",
+            "mobileDirectConnection",
+            "mobileRelayConnection",
+            "nextSteps",
+            "ok",
+            "project",
+            "store",
+        ])
     );
+    for (field, transport) in [
+        ("mobileDirectConnection", "direct"),
+        ("mobileRelayConnection", "relay"),
+    ] {
+        assert_eq!(
+            first_json[field],
+            serde_json::json!({
+                "state": "offline", "transport": transport,
+            })
+        );
+    }
     assert_eq!(first_json["ok"], false);
     assert_eq!(first_json["blocking"], true);
     assert_eq!(first_json["store"], "<coven-home>");

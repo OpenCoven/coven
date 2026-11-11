@@ -1,3 +1,5 @@
+mod restore;
+pub(crate) use restore::{with_restore_snapshot, RestoreRegistry};
 mod introduction;
 #[cfg(test)]
 pub(super) use introduction::fail_after_introduction_write;
@@ -186,6 +188,14 @@ pub(crate) struct DeviceGrantReissueRequest {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredDeviceRegistry {
     version: u16,
+    /// Restored installations require matching durable restore metadata. Keep
+    /// absent for existing registries so their serialized shape is unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "restore::deserialize_epoch"
+    )]
+    restore_epoch: Option<u64>,
     devices: Vec<GrantedDeviceRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rotation_transitions: Vec<DeviceRotationAuditTransition>,
@@ -220,11 +230,19 @@ enum LegacyDeviceScope {
 }
 
 struct LoadedRegistry {
+    restore_epoch: Option<u64>,
     devices: Vec<GrantedDeviceRecord>,
     rotation_transitions: Vec<DeviceRotationAuditTransition>,
     grant_reissue_transitions: Vec<DeviceGrantReissueAuditTransition>,
     introduction_transitions: Vec<IntroductionTransition>,
     migrated: bool,
+}
+
+/// Owned bytes and revisions captured while the registry lock remains held.
+pub(crate) struct RegistryRestoreSnapshot {
+    pub encoded: zeroize::Zeroizing<Vec<u8>>,
+    pub devices: Vec<DeviceGrantRevision>,
+    pub restore_epoch: Option<u64>,
 }
 
 pub struct DeviceRegistry {
@@ -1179,6 +1197,7 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
         Ok(_) => validate_private_file(path)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(LoadedRegistry {
+                restore_epoch: None,
                 devices: Vec::new(),
                 rotation_transitions: Vec::new(),
                 grant_reissue_transitions: Vec::new(),
@@ -1191,8 +1210,12 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
         }
     }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    decode_registry(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn decode_registry(bytes: &[u8]) -> Result<LoadedRegistry> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("failed to parse mobile device registry")?;
     let version = value
         .get("version")
         .and_then(serde_json::Value::as_u64)
@@ -1202,12 +1225,13 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
 
     let loaded = match version {
         LEGACY_DEVICE_REGISTRY_VERSION => {
-            let stored: LegacyStoredDeviceRegistry = serde_json::from_value(value)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
+            let stored: LegacyStoredDeviceRegistry =
+                serde_json::from_value(value).context("failed to parse mobile device registry")?;
             if stored.version != LEGACY_DEVICE_REGISTRY_VERSION {
                 bail!("unsupported mobile device registry version");
             }
             LoadedRegistry {
+                restore_epoch: None,
                 devices: stored
                     .devices
                     .into_iter()
@@ -1220,12 +1244,13 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
             }
         }
         DEVICE_REGISTRY_VERSION => {
-            let stored: StoredDeviceRegistry = serde_json::from_value(value)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
+            let stored: StoredDeviceRegistry =
+                serde_json::from_value(value).context("failed to parse mobile device registry")?;
             if stored.version != DEVICE_REGISTRY_VERSION {
                 bail!("unsupported mobile device registry version");
             }
             LoadedRegistry {
+                restore_epoch: stored.restore_epoch,
                 devices: stored.devices,
                 rotation_transitions: stored.rotation_transitions,
                 grant_reissue_transitions: stored.grant_reissue_transitions,
@@ -1235,11 +1260,20 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
         }
         _ => bail!("unsupported mobile device registry version"),
     };
+    anyhow::ensure!(
+        loaded.restore_epoch != Some(0),
+        "invalid mobile restore epoch"
+    );
     validate_devices(&loaded.devices)?;
     validate_rotation_transitions(&loaded.devices, &loaded.rotation_transitions)?;
     validate_grant_reissue_transitions(&loaded.devices, &loaded.grant_reissue_transitions)?;
     super::introduction::validate_transitions(&loaded.introduction_transitions)?;
     Ok(loaded)
+}
+
+/// Read-only durable reference; never creates missing authority or guesses an epoch.
+pub(crate) fn retained_restore_epoch(home: &Path) -> Result<Option<u64>> {
+    Ok(read_registry(&home.join("mobile").join(DEVICES_FILE))?.restore_epoch)
 }
 
 fn migrate_legacy_device(record: LegacyDeviceRecord) -> Result<GrantedDeviceRecord> {
@@ -1299,6 +1333,7 @@ fn write_registry_with_introductions(
     super::introduction::validate_transitions(introduction_transitions)?;
     let stored = StoredDeviceRegistry {
         version: DEVICE_REGISTRY_VERSION,
+        restore_epoch: read_registry(path)?.restore_epoch,
         devices: devices.to_vec(),
         rotation_transitions: rotation_transitions.to_vec(),
         grant_reissue_transitions: grant_reissue_transitions.to_vec(),
@@ -1955,6 +1990,43 @@ mod tests {
         assert_eq!(
             registry.authorization_key(source.id).unwrap(),
             Some(authorization_before)
+        );
+    }
+    #[test]
+    fn restore_epoch_survives_registry_management_and_empty_registry_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(home.path()).unwrap();
+        let record = device(Uuid::from_u128(700), "Synthetic restore phone");
+        registry.register(record.clone()).unwrap();
+        let path = home.path().join("mobile/devices.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        state["restoreEpoch"] = serde_json::json!(7);
+        atomic_replace_private(&path, &serde_json::to_vec(&state).unwrap()).unwrap();
+        registry.suspend(record.id, Utc::now()).unwrap();
+        registry.resume(record.id).unwrap();
+        registry.revoke(record.id, Utc::now()).unwrap();
+        registry.forget_all().unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["restoreEpoch"], 7);
+        assert_eq!(stored["devices"], serde_json::json!([]));
+        DeviceRegistry::load(home.path()).unwrap();
+    }
+    #[test]
+    fn restore_epoch_null_is_not_treated_as_absent_legacy_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(home.path()).unwrap();
+        registry
+            .register(device(Uuid::from_u128(701), "Synthetic null epoch"))
+            .unwrap();
+        let path = home.path().join("mobile/devices.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        state["restoreEpoch"] = serde_json::Value::Null;
+        atomic_replace_private(&path, &serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(
+            DeviceRegistry::load(home.path()).is_err(),
+            "explicit null erased the restore declaration"
         );
     }
 }

@@ -20,6 +20,7 @@ const MIN_READ_TIMEOUT: Duration = Duration::from_millis(1);
 
 struct RetainedRequestOptions {
     timeout: Duration,
+    caller_deadline: Option<Instant>,
     max_response_body_bytes: usize,
     bind_process_identity: bool,
 }
@@ -80,7 +81,38 @@ fn request_bound(
         expected_peer,
         RetainedRequestOptions {
             timeout,
+            caller_deadline: None,
             max_response_body_bytes,
+            bind_process_identity: false,
+        },
+    )?;
+    let (response, peer_identity) = pending.into_response_and_peer()?;
+    Ok(TransportResponse {
+        response,
+        peer_identity,
+    })
+}
+
+/// Keep the caller's absolute deadline through socket setup and I/O; converting
+/// it to a duration and back could renew the budget after scheduler delay.
+pub(super) fn request_until(
+    endpoint: &DaemonEndpoint,
+    method: &'static str,
+    path: &str,
+    body: Option<&[u8]>,
+    expected_peer: Option<&PeerIdentity>,
+    deadline: Instant,
+) -> Result<TransportResponse, ClientError> {
+    let pending = request_retaining_connection_bound(
+        endpoint,
+        method,
+        path,
+        body,
+        expected_peer,
+        RetainedRequestOptions {
+            timeout: RESPONSE_TIMEOUT,
+            caller_deadline: Some(deadline),
+            max_response_body_bytes: MAX_RESPONSE_BODY_BYTES,
             bind_process_identity: false,
         },
     )?;
@@ -107,6 +139,7 @@ pub(crate) fn request_with_timeout(
         None,
         RetainedRequestOptions {
             timeout,
+            caller_deadline: None,
             max_response_body_bytes,
             bind_process_identity: false,
         },
@@ -131,6 +164,7 @@ pub(crate) fn request_with_timeout_bound(
         Some(expected_peer),
         RetainedRequestOptions {
             timeout,
+            caller_deadline: None,
             max_response_body_bytes,
             bind_process_identity: true,
         },
@@ -228,6 +262,7 @@ pub(crate) fn request_retaining_connection(
         None,
         RetainedRequestOptions {
             timeout,
+            caller_deadline: None,
             max_response_body_bytes,
             bind_process_identity: true,
         },
@@ -250,6 +285,9 @@ fn request_retaining_connection_bound(
     let deadline = started.checked_add(options.timeout).ok_or_else(|| {
         ClientError::InvalidHttpResponse("request deadline overflowed".to_owned())
     })?;
+    let deadline = options
+        .caller_deadline
+        .map_or(deadline, |caller| deadline.min(caller));
     let body = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",

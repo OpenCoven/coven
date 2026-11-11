@@ -20,15 +20,30 @@ use std::{fs, io::Read, path::Path, sync::Mutex};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+/// Versioned durable host and device helpers for authenticated v2 transport.
+pub mod v2;
+
 static MATERIAL_LOCK: Mutex<()> = Mutex::new(());
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 const MAX_STATE_BYTES: u64 = 16 * 1024;
 pub const SLOT_SECONDS: u64 = 600;
+pub const MAX_LISTENERS: usize = 512;
+fn default_listener_limit() -> usize {
+    MAX_LISTENERS
+}
+fn is_default_listener_limit(limit: &usize) -> bool {
+    *limit == MAX_LISTENERS
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RelayConfig {
+    #[serde(
+        default = "default_listener_limit",
+        skip_serializing_if = "is_default_listener_limit"
+    )]
+    pub listener_limit: usize,
     pub version: u16,
     pub enabled: bool,
     pub endpoints: Vec<EndpointConfig>,
@@ -43,6 +58,7 @@ impl RelayConfig {
         let lock = crate::state_lock::open_lock_file(&directory.join(".relay.lock"))?;
         lock.lock_exclusive()?;
         let mut config = Self::load(home)?.unwrap_or(Self {
+            listener_limit: MAX_LISTENERS,
             version: 1,
             enabled: false,
             endpoints: Vec::new(),
@@ -67,6 +83,10 @@ impl RelayConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.listener_limit <= MAX_LISTENERS,
+            "listener limit exceeds 512 rooms"
+        );
         ensure!(self.version == 1, "unsupported relay configuration");
         ensure!(
             self.endpoints.len() <= 4 && (!self.enabled || !self.endpoints.is_empty()),
@@ -107,7 +127,7 @@ impl RelayConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredMaterial {
     version: u16,
@@ -121,6 +141,7 @@ struct StoredMaterial {
     routing_seed: [u8; 32],
 }
 
+#[derive(Clone)]
 pub struct Material {
     pub pairing: Pairing,
     pub noise_private: Zeroizing<Vec<u8>>,
@@ -128,7 +149,8 @@ pub struct Material {
 }
 
 /// Contains a routing secret. Serialize only inside pinned TLS or an authenticated
-/// encrypted channel, never Debug/log it, and zeroize it when the response is done.
+/// encrypted channel and never Debug/log it. This struct zeroizes its own fields
+/// on drop, but gateway serialization copies do not; see the transport README.
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Provisioning {
@@ -200,6 +222,7 @@ impl Provisioning {
             "provisioning identity mismatch"
         );
         RelayConfig {
+            listener_limit: crate::mobile_memory::transport::storage::MAX_LISTENERS,
             version: 1,
             enabled: !self.relay_endpoints.is_empty(),
             endpoints: self.relay_endpoints.clone(),
@@ -233,6 +256,11 @@ pub fn load_or_provision(
     let directory = ensure_private_mobile_dir(home)?;
     let lock = crate::state_lock::open_lock_file(&directory.join(".transport.lock"))?;
     lock.lock_exclusive()?;
+    v2::restore::check_application(home, registry, device_id)?;
+    ensure!(
+        !requires_v2(home, device_id)?,
+        "v2 routing handover required; v1 downgrade refused"
+    );
     registry.reload()?;
     let record = registry
         .authorization_record(device_id)?
@@ -323,6 +351,11 @@ pub fn load_existing(
 ) -> Result<Option<Material>> {
     let directory = home.join("mobile");
     validate_private_directory(&directory)?;
+    v2::restore::check_application(home, registry, device_id)?;
+    ensure!(
+        !requires_v2(home, device_id)?,
+        "v2 routing required; v1 downgrade refused"
+    );
     let path = directory.join(format!("transport-{device_id}.json"));
     if !exists(&path)? {
         return Ok(None);
@@ -351,6 +384,16 @@ pub fn load_existing(
     };
     authority::check_current(registry, &material.pairing, false, Utc::now())?;
     Ok(Some(material))
+}
+
+/// Presence is a fail-closed protocol floor, including an invalid or damaged
+/// marker. Removing only material must never make legacy bootstrap eligible.
+fn requires_v2(home: &Path, device_id: Uuid) -> Result<bool> {
+    exists(
+        &home
+            .join("mobile")
+            .join(format!(".transport-v2-{device_id}.required")),
+    )
 }
 
 fn read_private(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
@@ -433,6 +476,30 @@ mod wire_vectors {
             assert_eq!(
                 hex(credential.as_ref()),
                 case["credential"].as_str().unwrap()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod listener_config_tests {
+    use super::*;
+    #[test]
+    fn listener_limit_configuration_is_bounded_and_survives_private_roundtrip() {
+        for limit in [0, 1, 4, 512] {
+            let home = tempfile::tempdir().unwrap();
+            let config:RelayConfig=serde_json::from_value(serde_json::json!({"version":1,"enabled":false,"endpoints":[],"listenerLimit":limit})).unwrap();
+            config.save(home.path()).unwrap();
+            assert!(RelayConfig::load(home.path()).unwrap().unwrap() == config);
+            let before = fs::read(home.path().join("mobile/relay.json")).unwrap();
+            if let Ok(bad) = serde_json::from_value::<RelayConfig>(
+                serde_json::json!({"version":1,"enabled":false,"endpoints":[],"listenerLimit":513}),
+            ) {
+                assert!(bad.save(home.path()).is_err());
+            }
+            assert_eq!(
+                fs::read(home.path().join("mobile/relay.json")).unwrap(),
+                before
             );
         }
     }

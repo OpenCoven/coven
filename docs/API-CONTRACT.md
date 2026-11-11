@@ -89,6 +89,16 @@ corrupted or hand-composed value cannot smuggle a separator into the request
 target. Setting none of the three requests the inherited unpaginated array;
 setting any of them requests the envelope.
 
+### Mobile connection observations
+
+`POST /api/v1/internal/mobile/connections` is an owner-local diagnostic read handled by the mobile runtime. An empty JSON object selects relay for compatibility; `{"transport":"direct"}` or `{"transport":"relay"}` explicitly selects an ingress. Unknown fields, malformed bodies and unknown transports return 400. A successful response contains exactly `state` and `transport`, with state chosen from `offline`, `connecting`, `authenticating`, and `online`. Other methods return 405. TCP/mobile ingress cannot dispatch the diagnostic. It does not create enrollment, mutate authorization or authorize an application action.
+
+The result is a live aggregate for the selected transport: online takes precedence over authenticating, then connecting, then offline. Failed/cancelled attempts cannot clear another live channel. An absent mobile runtime reports offline. No device identifiers, room identifiers, keys, URLs or raw errors are returned. A channel may be online while current policy rejects its next request.
+
+`coven doctor --json` adds `mobileRelayConnection` and `mobileDirectConnection`, each with that coarse shape or null when the running daemon cannot supply a valid observation. Prose reports the same states or unavailable. A stopped daemon reports offline; stale daemon state remains unavailable. These observations do not affect existing health/exit-code checks. Unix probes validate private socket discovery and bound response waits to 500 ms. Windows probes use the same budget across owner-only pipe discovery, health negotiation and the bound diagnostic request. Native Windows acceptance remains separately verified by Windows checks.
+
+The reusable Rust client exposes `DaemonEndpoint::discover_until` and `DaemonClient::request_json_until` for callers needing a tighter absolute deadline. The latter retains health-version negotiation, structured-error requirements, owner/instance binding, request size limits and no automatic replay. Caller deadlines can shorten the existing discovery/request maxima, never extend them. Filesystem metadata remains subject to the host filesystem's normal trust and scheduling constraints.
+
 ## `GET /api/v1/health`
 
 `GET /api/v1/health` returns daemon reachability, the named contract version, coven version, and machine-readable capabilities.
@@ -111,6 +121,7 @@ setting any of them requests the envelope.
     "structuredErrors": true,
     "sessionHandoff": true,
     "sessionLaunchPolicy": true,
+    "sessionClaudeWriteScope": true,
     "afs": true,
     "afsMount": false,
     "afsCommit": true,
@@ -179,6 +190,7 @@ durability.
 | `structuredErrors`| boolean | Errors use the `{ error: { code, message, details } }` shape; session-policy admission decisions have their separately negotiated refusal shape. |
 | `sessionHandoff` | boolean | Durable generation-fenced session handoff routes are available. |
 | `sessionLaunchPolicy` | boolean | Owner-gated local IPC accepts the exact unattended Codex launch policy. Always `false` over TCP. |
+| `sessionClaudeWriteScope` | boolean | Owner-local IPC accepts the separate Claude `writeScope` v1 shape. Always `false` over TCP. This advertises parsing, not a qualified local executable or a grant. |
 | `sessionPolicyContracts` | string array | Refusal-only admission contracts. Currently `["coven.session-policy.v1"]` over owner-local IPC and `[]` over TCP. Missing on older daemons; absence means unavailable. This is not a supported enforcement profile, identity proof, or grant. |
 | `afs` | boolean | The AFS route family is available. |
 | `afsMount` | string or `false` | Active mount backend, or `false` when mount-backed access is unavailable. |
@@ -1150,6 +1162,18 @@ Other unknown action ids return `400` and fail closed:
   "reason": "unknown action `desktop.deleteEverything`"
 }
 ```
+
+## Claude scoped writes v1
+
+`capabilities.sessionClaudeWriteScope === true` advertises owner-local acceptance of `writeScope` on normal and adopted session launches. TCP rejects the field with `403 forbidden`. It is separate from unrestricted Full and the Codex-only `launchPolicy`; neither existing contract changes. Capability discovery does not establish platform/runtime qualification or grant authority.
+
+For Claude `launchMode: "stream"`, `writeScope` is a closed object: `{ version: 2, primaryRoot: string, writableRoots: string[], readOnlyRoots: string[], protectedRoots: string[], mcpConfigFile?: string, mcpServerNames?: string[] }`. `mcpConfigFile` and `mcpServerNames` must be supplied together; the file is passed by absolute path because it can hold server credentials. Roots must be existing absolute directories and are canonicalized and deduplicated. `primaryRoot` must equal launch cwd and be explicitly writable. Protected roots cannot contain writable roots. A writable child outside any broader write grant may sit under a read-only parent; a read-only subtree inside a broader writable root cannot also contain a writable descendant. Unsupported overlaps and native rule syntax, including literal backslashes, are refused. Read-only and protected roots receive explicit Read rules and no write-directory grant; protected/nested read-only paths receive Edit denials.
+
+The local CLI equivalent is `coven run claude --cwd /repo --stream-json --write-scope /private/path/scope.json -- "prompt"`. The JSON file is bounded to 65536 bytes. Do not combine this self-contained scope with `--permission`, `--add-dir`, or API `launchPolicy`. The caller supplies an authorized write set; prompts and model reports cannot confer access. Cave derives this set from live grants and retains read-only resource roots even beneath writable projects.
+
+The execution profile is macOS with Claude Code 2.1.318 or later. Native settings files are not loaded, so the scope is the only permission source. Both direct streaming and daemon builders check the selected runtime and audit protected and nested read-only filesystem objects. Bash is allowed without a per-command list because every command runs in Claude's OS sandbox, whose writable paths are the scope's writable roots; the launch fails if the sandbox cannot start, and a command cannot ask to leave it. That sandbox also refuses new hardlinks to objects outside the writable roots. Only servers named in `mcpServerNames` start, and their tools run outside the sandbox. Any file under a protected root or a read-only root nested inside a writable root that has another hardlink name is refused, as is an audit of those trees exceeding 200000 entries. Writable project trees are not walked: they can hold millions of entries and package-store hardlinks (for example pnpm `node_modules`), so a pre-existing alias between a writable name and an ungranted object remains writable, as it was under unrestricted Full. Native `CLAUDE_` permission/settings/add-directory environment overrides and background session kinds are refused rather than silently dropping a possible administrator restriction. Provider credential and endpoint variables remain available. User/project settings sources and MCP configuration cannot broaden the requested scope.
+
+This confines shell and file-tool writes. It does not confine shell reads, network access, listed MCP servers, the per-user temporary directory, or concurrent external filesystem actors. Same-user executable selection remains trusted. Other platforms/versions and unsupported layouts fail closed; no fallback to Full occurs. Permission-denial records and policy refusals must remain errors even if a later wrapper reports success. Scope admission, actual tool artifacts, provider-backed behavior, and release readiness require separate evidence.
 
 ## `POST /api/v1/sessions`
 

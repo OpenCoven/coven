@@ -111,3 +111,5 @@ configured for the repository — the real publish. See
 ## License
 
 MIT, as the rest of the OpenCoven Coven workspace.
+
+For short diagnostic probes, `DaemonEndpoint::discover_until(home, deadline)` and `DaemonClient::request_json_until(method, path, body, deadline)` use an absolute caller deadline. These preserve private owner-local discovery, health negotiation, daemon-instance binding, framing/size checks and refusal of automatic retries. The deadline can shorten the existing operation maxima; it cannot widen them. On a timeout, callers must retain uncertainty rather than inventing a response or retrying an action with a new identity.

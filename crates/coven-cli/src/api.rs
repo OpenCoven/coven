@@ -1,9 +1,14 @@
+mod proposal_apply_intent;
 mod proposal_document;
 mod proposal_preflight;
 mod proposal_revision;
 #[cfg(test)]
 use crate::proposal_store::read_scheduler_cursor;
 use crate::proposal_store::{scheduler_candidate_batch, write_scheduler_cursor};
+use proposal_apply_intent::{
+    append_proposal_apply_intent, invalid_proposal_apply_intent, load_proposal_apply_intent,
+    ProposalApplyingState, ProposalBeforeImage,
+};
 use proposal_document::{ProposalAuthority, ProposalEnvelopeDocument};
 pub(crate) use proposal_preflight::validate_proposal_envelope_preflight;
 use proposal_preflight::{PROPOSAL_ENVELOPE_MAX_BYTES, PROPOSAL_ENVELOPE_SYNTAX_MAX_BYTES};
@@ -580,6 +585,26 @@ impl std::fmt::Display for RuntimeLaunchAdmissionClosedError {
 
 impl std::error::Error for RuntimeLaunchAdmissionClosedError {}
 
+/// A Runtime Authority launch the runtime refused before starting anything,
+/// with the authority profile code it is recorded under.
+#[derive(Debug)]
+pub(crate) struct RuntimeAuthorityLaunchRefused {
+    pub code: crate::automations::contract::authority::AuthorityProfileErrorCode,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RuntimeAuthorityLaunchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED}: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for RuntimeAuthorityLaunchRefused {}
+
 pub(crate) const RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED: &str =
     "runtime does not accept automation authority projections; no process started";
 
@@ -645,6 +670,22 @@ pub trait SessionRuntime {
     /// projection supplied to automation launches.
     fn accepts_automation_authority_projection(&self) -> bool {
         false
+    }
+    /// Checks, before any Threads decision is made or consumed, that this
+    /// runtime could launch `envelope` on `harness` now, so a refusal burns
+    /// no decision. By default only an envelope the daemon launches from its
+    /// arguments passes; a runtime that runs the scoped read service also
+    /// checks what admission needs before a decision.
+    fn preflight_authority_launch(
+        &self,
+        _harness: &str,
+        envelope: &'static crate::automations::runtime_envelope::RuntimeEnvelope,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            crate::automations::runtime_envelope::is_launchable(envelope),
+            RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED
+        );
+        Ok(())
     }
     /// Launches an automation session with the bounded authority evidence that
     /// the execution consumer is permitted to observe.
@@ -2527,11 +2568,17 @@ pub(crate) fn launch_session_with_executor(
     if payload.get("requestAdoption").is_some() {
         return request_adoption_invalid("executionBinding");
     }
-    if payload.get("launchPolicy").is_some() && !authority.allows_session_launch_policy() {
+    if (payload.get("launchPolicy").is_some() || payload.get("writeScope").is_some())
+        && !authority.allows_session_launch_policy()
+    {
         return api_error(
             403,
             "forbidden",
-            "launchPolicy is accepted only over the owner-gated local IPC transport.",
+            if payload.get("launchPolicy").is_some() {
+                "launchPolicy is accepted only over the owner-gated local IPC transport."
+            } else {
+                "writeScope is accepted only over the owner-gated local IPC transport."
+            },
             None,
         );
     }
@@ -3020,11 +3067,17 @@ fn launch_adopted_session(
 
     // The gate, but no SQLite writer transaction, remains held across mutable
     // filesystem, harness, roster, parent, and maintenance admission.
-    if payload.get("launchPolicy").is_some() && !authority.allows_session_launch_policy() {
+    if (payload.get("launchPolicy").is_some() || payload.get("writeScope").is_some())
+        && !authority.allows_session_launch_policy()
+    {
         return api_error(
             403,
             "forbidden",
-            "launchPolicy is accepted only over the owner-gated local IPC transport.",
+            if payload.get("launchPolicy").is_some() {
+                "launchPolicy is accepted only over the owner-gated local IPC transport."
+            } else {
+                "writeScope is accepted only over the owner-gated local IPC transport."
+            },
             None,
         );
     }
@@ -4082,7 +4135,20 @@ fn session_launch_from_payload(payload: &Value) -> Result<SessionLaunch> {
     // binary is surfaced by the runtime as a structured launch failure.
     session_launch::validate_harness(&harness, session_launch::HarnessCheck::Configured)?;
     let launch_mode = launch_mode_from_payload(payload)?;
-    let launch_policy = launch_policy_from_payload(payload, &harness, launch_mode)?;
+    let mut launch_policy = launch_policy_from_payload(payload, &harness, launch_mode)?;
+    if let Some(value) = payload.get("writeScope") {
+        anyhow::ensure!(
+            launch_policy.is_none(),
+            "writeScope cannot be combined with launchPolicy"
+        );
+        anyhow::ensure!(
+            harness == "claude" && launch_mode == HarnessLaunchMode::Stream,
+            "writeScope requires a Claude streamed launch"
+        );
+        launch_policy = Some(LaunchPolicy::ClaudeScopedWrite(
+            crate::claude_write_scope::ClaudeWriteScope::from_value(value.clone(), &paths.cwd)?,
+        ));
+    }
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -13743,33 +13809,6 @@ fn proposal_decision_request(raw_value: &Value) -> Result<Option<ProposalDecisio
         .context("proposal decision request is corrupt")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProposalApplyingState {
-    decision: String,
-    recovery_commitment: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    baseline_snapshot: Option<BTreeMap<String, Option<Vec<u8>>>>,
-    weave_hash: Vec<u8>,
-    before_images: Vec<ProposalBeforeImage>,
-    rationale: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    probe_summary: Option<crate::ward_probes::ProbeSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProposalBeforeImage {
-    target: String,
-    /// Gate-2-resolved surface captured with the apply intent. Older authority
-    /// recovery records predate this field and rederive it from live Ward
-    /// adjudication.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resolved: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    contents: Option<coven_threads_core::StagedContents>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalRecoveryVersion {
     HistoricalV2,
@@ -14356,114 +14395,6 @@ fn persist_proposal_applying_state(
 ) -> Result<()> {
     let body = document.serialize_with_decision(request, Some(state))?;
     crate::proposal_store::replace_existing(claim_path, &body)
-}
-
-// Preserve the borrowed apply-intent inputs while passing the decision's captured time.
-#[allow(clippy::too_many_arguments)]
-fn append_proposal_apply_intent(
-    conn: &rusqlite::Connection,
-    proposal_id: &str,
-    familiar_id: &str,
-    approver: Option<&coven_threads_core::WriterId>,
-    files_touched: &[String],
-    state: &ProposalApplyingState,
-    channel: coven_threads_core::Channel,
-    now: time::OffsetDateTime,
-) -> Result<()> {
-    let detail = serde_json::to_string(state).context("serializing proposal apply intent")?;
-    let files_touched = serde_json::to_string(files_touched)?;
-    let now = now.format(&time::format_description::well_known::Rfc3339)?;
-    store::durable_transaction(conn, || {
-        conn.execute(
-            "INSERT INTO ward_audit (
-            event_type, proposal_id, familiar_id, ward_version, ward_hash,
-            tier, decision, approver, diff_hash, detail, files_touched,
-            channel, thread_id, submitted_at, decided_at
-         ) VALUES (
-            'validation_verdict', ?1, ?2, NULL, ?3, NULL,
-            'proposal-apply-intent', ?4, NULL, ?5, ?6, ?7, NULL, ?8, ?8
-         )",
-            rusqlite::params![
-                proposal_id,
-                familiar_id,
-                state.weave_hash,
-                approver.map(coven_threads_core::WriterId::as_str),
-                detail,
-                files_touched,
-                format!("{channel:?}").to_lowercase(),
-                now,
-            ],
-        )
-        .context("appending proposal apply intent")?;
-        Ok(())
-    })
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct RecordedProposalApplyIntent {
-    state: ProposalApplyingState,
-    approver: Option<String>,
-}
-
-#[derive(Debug)]
-struct InvalidProposalApplyIntent(String);
-
-impl std::fmt::Display for InvalidProposalApplyIntent {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for InvalidProposalApplyIntent {}
-
-fn invalid_proposal_apply_intent(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<InvalidProposalApplyIntent>().is_some()
-}
-
-fn load_proposal_apply_intent(
-    conn: &rusqlite::Connection,
-    proposal_id: &str,
-) -> Result<Option<RecordedProposalApplyIntent>> {
-    use rusqlite::OptionalExtension;
-
-    let row: Option<(String, Option<String>)> = match conn
-        .query_row(
-            "SELECT detail, approver
-             FROM ward_audit
-             WHERE proposal_id = ?1
-               AND event_type = 'validation_verdict'
-               AND decision = 'proposal-apply-intent'
-             ORDER BY id DESC
-             LIMIT 1",
-            [proposal_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-    {
-        Ok(row) => row,
-        Err(
-            error @ (rusqlite::Error::InvalidColumnType(..)
-            | rusqlite::Error::FromSqlConversionFailure(..)
-            | rusqlite::Error::IntegralValueOutOfRange(..)),
-        ) => {
-            return Err(InvalidProposalApplyIntent(format!(
-                "proposal apply intent columns are invalid: {error}"
-            ))
-            .into());
-        }
-        Err(error) => return Err(error).context("loading proposal apply intent"),
-    };
-    row.map(|(detail, approver)| {
-        Ok(RecordedProposalApplyIntent {
-            state: serde_json::from_str(&detail).map_err(|error| {
-                InvalidProposalApplyIntent(format!(
-                    "proposal apply intent detail is invalid: {error}"
-                ))
-            })?,
-            approver,
-        })
-    })
-    .transpose()
 }
 
 fn proposal_expected_resolved_surfaces(
@@ -23174,6 +23105,67 @@ pub(crate) mod tests {
         );
         assert!(runtime.launches.borrow()[0].model.is_none());
         assert!(runtime.launches.borrow()[0].launch_policy.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn claude_write_scope_is_separate_owner_local_authority() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("repo");
+        std::fs::create_dir(&project)?;
+        let scope = json!({"version":2,"primaryRoot":project,"writableRoots":[project],
+            "readOnlyRoots":[],"protectedRoots":[]});
+        let valid = json!({"projectRoot":project,"harness":"claude","launchMode":"stream",
+            "prompt":"write a synthetic artifact","writeScope":scope});
+        for (authority, expected) in [
+            (RequestAuthority::OwnerLocalIpc, 201),
+            (RequestAuthority::Tcp, 403),
+        ] {
+            let runtime = RecordingRuntime::default();
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/sessions",
+                temp.path(),
+                None,
+                Some(&valid.to_string()),
+                &runtime,
+                authority,
+            )?;
+            assert_eq!(response.status, expected, "{}", response.body);
+            if expected == 201 {
+                assert!(matches!(
+                    runtime.launches.borrow()[0].launch_policy,
+                    Some(LaunchPolicy::ClaudeScopedWrite(_))
+                ));
+            } else {
+                assert!(runtime.launches.borrow().is_empty());
+            }
+        }
+        for (key, value) in [
+            ("harness", json!("codex")),
+            ("launchMode", json!("interactive")),
+            ("writeScope", Value::Null),
+            ("writeScope", json!({"version":2})),
+            (
+                "launchPolicy",
+                json!({"approval":"never","sandbox":"workspace-write"}),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            let runtime = RecordingRuntime::default();
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/sessions",
+                temp.path(),
+                None,
+                Some(&invalid.to_string()),
+                &runtime,
+                RequestAuthority::OwnerLocalIpc,
+            )?;
+            assert_eq!(response.status, 400, "{}", response.body);
+            assert!(runtime.launches.borrow().is_empty());
+        }
         Ok(())
     }
 
