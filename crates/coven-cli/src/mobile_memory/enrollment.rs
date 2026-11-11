@@ -211,6 +211,7 @@ impl IntroductionLedger {
 
     fn entries(&self) -> Result<std::sync::MutexGuard<'_, HashMap<Uuid, TrackedIntroduction>>> {
         loop {
+            super::store_lock::check()?;
             self.registry.ensure_running()?;
             match self.entries.try_lock() {
                 Ok(entries) => return Ok(entries),

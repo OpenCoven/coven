@@ -331,6 +331,7 @@ pub(crate) fn set_write_observer(observer: WriteObserver) {
 }
 #[cfg(test)]
 pub(crate) fn write_checkpoint(path: &Path, phase: MobileWritePhase) -> Result<()> {
+    held_write::checkpoint(path, phase);
     WRITE_OBSERVER.with(|slot| {
         if let Some(observer) = slot.borrow_mut().as_mut() {
             observer(path, phase)
@@ -340,39 +341,134 @@ pub(crate) fn write_checkpoint(path: &Path, phase: MobileWritePhase) -> Result<(
     })
 }
 
+/// Create complete private authority without replacing an existing final name.
+/// Staging and no-clobber publication prevent a killed writer from leaving a
+/// truncated canonical authority file. Namespace durability retains the mobile
+/// helper's existing platform contract; v2 adds its checked retained barriers.
 pub(crate) fn atomic_create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
     let parent = path
         .parent()
         .context("mobile state file must have a parent directory")?;
     validate_private_directory(parent)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+    match fs::symlink_metadata(path) {
+        // Preserve existing-final semantics: do not open, flush, repair or
+        // require new write access. Owning callers validate/read the winner;
+        // v2 retains its explicit checked durability barriers.
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to create {}", path.display()));
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
-    };
-    #[cfg(test)]
-    if let Err(error) = write_checkpoint(path, MobileWritePhase::TempCreated) {
-        let _ = fs::remove_file(path);
-        return Err(error);
     }
-    if let Err(error) = write_and_sync(&mut file, path, bytes, path) {
-        let _ = fs::remove_file(path);
-        return Err(error);
+    let staged = parent.join(format!(".mobile-state-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&staged)
+            .with_context(|| format!("failed to stage {}", path.display()))?;
+        #[cfg(test)]
+        write_checkpoint(path, MobileWritePhase::TempCreated)?;
+        write_and_sync(&mut file, &staged, bytes, path)?;
+        drop(file);
+        validate_private_file(&staged)?;
+        // Reuse the repo-supported NOREPLACE / MoveFileExW no-replace shape.
+        // Ordinary rename() could overwrite a concurrent valid authority file.
+        let created = publish_private_noclobber(&staged, path)
+            .with_context(|| format!("failed to publish new {}", path.display()))?;
+        #[cfg(test)]
+        if created {
+            write_checkpoint(path, MobileWritePhase::Renamed)?;
+        }
+        if !created {
+            // An atomic concurrent winner remains untouched. An orphan of this
+            // unique staging file is non-authoritative if cleanup itself fails.
+            let _ = fs::remove_file(&staged);
+            return Ok(false);
+        }
+        sync_directory(parent)?;
+        #[cfg(test)]
+        write_checkpoint(path, MobileWritePhase::DirectorySynced)?;
+        validate_private_file(path)?;
+        Ok(created)
+    })();
+    if result.is_err() {
+        // Never delete/repair a final floor, including malformed or uncertain
+        // authority. Its owning store must fail closed and require recovery.
+        let _ = fs::remove_file(&staged);
     }
-    sync_directory(parent)?;
-    #[cfg(test)]
-    write_checkpoint(path, MobileWritePhase::DirectorySynced)?;
-    validate_private_file(path)?;
-    Ok(true)
+    result
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn publish_private_noclobber(staged: &Path, destination: &Path) -> io::Result<bool> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    match renameat_with(CWD, staged, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(true),
+        Err(error) if error == rustix::io::Errno::EXIST => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn publish_private_noclobber(staged: &Path, destination: &Path) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if encoded.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mobile publication path contains NUL",
+            ));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+    let staged = wide(staged)?;
+    let destination = wide(destination)?;
+    // No MOVEFILE_REPLACE_EXISTING: an existing floor must never be clobbered.
+    // SAFETY: both live vectors contain NUL-terminated native paths.
+    if unsafe {
+        MoveFileExW(
+            staged.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error().map(|code| code as u32) {
+        Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    windows
+)))]
+fn publish_private_noclobber(_staged: &Path, _destination: &Path) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic mobile no-replace publication is unsupported",
+    ))
 }
 
 pub(crate) fn atomic_replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -436,14 +532,14 @@ fn write_and_sync(file: &mut File, path: &Path, bytes: &[u8], logical_target: &P
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
+pub(super) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .with_context(|| format!("failed to sync {}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
+pub(super) fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -459,6 +555,119 @@ fn is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
 fn is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
+
+/// A path-scoped, test-only held storage phase. This models a call that has
+/// not returned; it is not evidence of actual kernel or power-loss behavior.
+#[cfg(test)]
+pub(crate) mod held_write {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{mpsc, Arc, Condvar, LazyLock, Mutex};
+    struct State {
+        phase: MobileWritePhase,
+        skip: std::sync::atomic::AtomicUsize,
+        ready: mpsc::SyncSender<()>,
+        released: Mutex<bool>,
+        wake: Condvar,
+    }
+    static HOLDS: LazyLock<Mutex<HashMap<PathBuf, Arc<State>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    pub(crate) struct HeldWrite {
+        path: PathBuf,
+        state: Arc<State>,
+    }
+    impl Drop for HeldWrite {
+        fn drop(&mut self) {
+            HOLDS.lock().unwrap().remove(&self.path);
+            *self.state.released.lock().unwrap() = true;
+            self.state.wake.notify_all();
+        }
+    }
+    /// Skip only matching real checkpoints. This can select compensation's
+    /// second write without manufacturing an intermediate authority image.
+    pub(crate) fn hold_after(
+        path: &Path,
+        phase: MobileWritePhase,
+        skip: usize,
+    ) -> (HeldWrite, mpsc::Receiver<()>) {
+        let (ready, waiting) = mpsc::sync_channel(1);
+        let state = Arc::new(State {
+            phase,
+            skip: std::sync::atomic::AtomicUsize::new(skip),
+            ready,
+            released: Mutex::new(false),
+            wake: Condvar::new(),
+        });
+        assert!(HOLDS
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), Arc::clone(&state))
+            .is_none());
+        (
+            HeldWrite {
+                path: path.to_owned(),
+                state,
+            },
+            waiting,
+        )
+    }
+    pub(super) fn checkpoint(path: &Path, phase: MobileWritePhase) {
+        let state = HOLDS
+            .lock()
+            .unwrap()
+            .get(path)
+            .filter(|state| state.phase == phase)
+            .cloned();
+        if let Some(state) = state {
+            if state
+                .skip
+                .try_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return;
+            }
+            let _ = state.ready.try_send(());
+            let mut released = state.released.lock().unwrap();
+            while !*released {
+                released = state.wake.wait(released).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn skip_first_hold_selects_only_the_second_matching_checkpoint() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("phase-cut");
+        let (held, waiting) = hold_after(&path, MobileWritePhase::Written, 1);
+        let (first_done, first_finished) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            checkpoint(&path, MobileWritePhase::FileSynced);
+            checkpoint(&path, MobileWritePhase::Written);
+            let _ = first_done.send(());
+            checkpoint(&path, MobileWritePhase::Written);
+        });
+        let skipped = first_finished.recv_timeout(std::time::Duration::from_secs(30));
+        let selected = waiting.recv_timeout(std::time::Duration::from_secs(30));
+        drop(held);
+        worker.join().unwrap();
+        assert!(
+            skipped.is_ok(),
+            "first matching checkpoint did not finish: {skipped:?}"
+        );
+        assert!(
+            selected.is_ok(),
+            "second matching checkpoint was not held: {selected:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "config_crash_create_tests.rs"]
+mod crash_create_tests;
 
 #[cfg(test)]
 mod tests {

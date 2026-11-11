@@ -91,6 +91,7 @@ impl Fixture {
             .unwrap()
             .pairing;
         let state = MobileGatewayState {
+            storage_runtime: super::super::store_lock::Runtime::current(),
             connections: Default::default(),
             network: Default::default(),
             coven_home: home.path().to_path_buf(),
@@ -725,7 +726,7 @@ fn direct_only_bootstrap_omits_relay_endpoints_and_relay_still_refuses() {
     // and a reachable endpoint, yet the device's relay session is refused.
     // The same material derives the same routing secret the host uses.
     let provisioning = material.provisioning(&signer).unwrap();
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
     let registry_path = fixture.state.coven_home.join("mobile/devices.json");
@@ -929,7 +930,7 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
             relay_config.enabled = true;
             relay_config.save(&fixture.state.coven_home).unwrap();
         }
-        let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+        let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
             .unwrap()
             .unwrap();
         assert!(
@@ -1067,7 +1068,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
     .unwrap()
     .unwrap();
     let provisioning = material.provisioning(&signer).unwrap();
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1101,7 +1102,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
             .and_then(|()| channel.receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline))
     };
     assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
-    let observed = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+    let observed = handle_local_control_native("POST", LOCAL_CONNECTION_PATH, Some("{}"))
         .unwrap()
         .unwrap();
     assert_eq!(observed.status, 200);
@@ -1110,7 +1111,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
         serde_json::json!({"state":"online", "transport":"relay"})
     );
     assert_eq!(
-        handle_local_control("GET", LOCAL_CONNECTION_PATH, None)
+        handle_local_control_native("GET", LOCAL_CONNECTION_PATH, None)
             .unwrap()
             .unwrap()
             .status,
@@ -1158,7 +1159,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
         "relay runtime stop exceeded two seconds with an idle channel: {:?}",
         started.elapsed()
     );
-    let observed = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+    let observed = handle_local_control_native("POST", LOCAL_CONNECTION_PATH, Some("{}"))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1258,7 +1259,7 @@ fn relay_runtime_recovers_a_missed_slot_and_closes_rotated_or_revoked_sessions()
     .unwrap();
     let provisioning = material.provisioning(&signer).unwrap();
     let pairing = material.pairing.clone();
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
 
@@ -1347,7 +1348,7 @@ fn relay_runtime_recovers_a_missed_slot_and_closes_rotated_or_revoked_sessions()
     drop(runtime);
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(exchange(&mut channel).is_err());
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
     let mut channel = connect_current(&rotated_provisioning, &rotated_pairing);
@@ -1670,7 +1671,7 @@ fn counter_runtime_advertises_four_rooms_per_endpoint_and_serves_durable_device(
         &ack,
     )
     .unwrap();
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
     assert!(runtime._direct.is_none());
@@ -2675,13 +2676,13 @@ fn connection_observation_query_refuses_ambiguous_or_private_fields() {
         "{\"transport\":\"direct\",\"room\":\"private\"}",
         "[]",
     ] {
-        let response = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some(body))
+        let response = handle_local_control_native("POST", LOCAL_CONNECTION_PATH, Some(body))
             .unwrap()
             .unwrap();
         assert_eq!(response.status, 400);
         assert!(!response.body.contains("private"));
     }
-    let response = handle_local_control(
+    let response = handle_local_control_native(
         "POST",
         LOCAL_CONNECTION_PATH,
         Some("{\"transport\":\"direct\"}"),
@@ -2694,3 +2695,1109 @@ fn connection_observation_query_refuses_ambiguous_or_private_fields() {
 }
 
 mod v2_migration;
+
+/// Initial store loading has no runtime handle to drop yet. Bound admission
+/// while the competing store lock remains held, and retain exact authority.
+#[test]
+fn relay_startup_bounds_initial_store_contention_without_mutating_authority() {
+    use fs2::FileExt;
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let mut failures = Vec::new();
+    for lock_name in [
+        ".devices.lock",
+        ".authorization-keys.lock",
+        ".assurance-challenges.lock",
+    ] {
+        let fixture = Fixture::new();
+        let relay = super::super::transport::test_support::Relay::start();
+        let home = fixture.state.coven_home.clone();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(&home)
+        .unwrap();
+        let files = [
+            "devices.json",
+            "authorization-keys.json",
+            "assurance-challenges.json",
+        ];
+        let before: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        let lock_path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&lock_path).unwrap();
+        held.lock_exclusive().unwrap();
+        let (_observation, waiting) = super::super::store_lock::observe(&lock_path);
+        let (finished, result) = std::sync::mpsc::sync_channel(1);
+        let worker_home = home.clone();
+        let worker = std::thread::spawn(move || {
+            // Do not send a live runtime to another thread: cleanup remains
+            // owned by this producer even if the old implementation succeeds.
+            let outcome = start_mobile_gateway_native_for_daemon(&worker_home).map(drop);
+            let _ = finished.send(outcome);
+        });
+        // A 30-second hang guard permits loaded scheduling. The actual failed
+        // file-lock attempt, rather than a sleep, selects the contended path.
+        let observed = waiting.recv_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        let bounded = if observed.is_ok() {
+            result.recv_timeout(Duration::from_secs(2))
+        } else {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        };
+        let elapsed = started.elapsed();
+        // Cleanup precedes assertions so a red regression never leaves a
+        // blocked producer or competing store lock behind.
+        FileExt::unlock(&held).unwrap();
+        worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no failed acquisition observed for {lock_name}: {observed:?}"
+        );
+        match bounded {
+            Ok(Err(error)) => assert!(
+                error.to_string().contains("deadline"),
+                "startup failed for an unrelated reason at {lock_name}: {error:#}"
+            ),
+            other => failures.push(format!(
+                "{lock_name}: admission was not bounded while held ({elapsed:?}): {other:?}"
+            )),
+        }
+        let after: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        assert_eq!(after, before, "startup changed authority at {lock_name}");
+        assert!(
+            DeviceRegistry::load(&home).is_ok(),
+            "startup failure poisoned future registry at {lock_name}"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+/// A real encrypted relay request can hold the runtime in an authority-store
+/// wait after socket cancellation. Keep each competing file lock held until
+/// either shutdown completes or the strict contract has failed.
+#[test]
+fn relay_shutdown_cancels_contended_authority_stores_without_mutating_bytes() {
+    use super::super::transport::{self, test_support::Relay, websocket};
+    use fs2::FileExt;
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let mut failures = Vec::new();
+    for lock_name in [
+        ".authorization-keys.lock",
+        ".assurance-challenges.lock",
+        ".audit.lock",
+    ] {
+        let fixture = Fixture::with_authorization();
+        let home = fixture.state.coven_home.clone();
+        let relay = Relay::start();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(&home)
+        .unwrap();
+        let identity = super::super::identity::load_existing_host_identity(&home).unwrap();
+        let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+        let provisioning = storage::load_existing(
+            &home,
+            &fixture.state.registry,
+            signer.verifying_key(),
+            fixture.pairing.device_id,
+        )
+        .unwrap()
+        .unwrap()
+        .provisioning(&signer)
+        .unwrap();
+        let runtime = start_mobile_gateway_native_for_daemon(&home)
+            .unwrap()
+            .unwrap();
+        // This is only a room-arrival hang guard, independent of stop's strict budget.
+        let connect_deadline = Instant::now() + Duration::from_secs(60);
+        let mut channel = loop {
+            let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+            let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+            let attempt = relay
+                .connect(websocket::Role::Client, &room, &credential)
+                .and_then(|records| {
+                    transport::connect(
+                        records,
+                        &fixture.pairing,
+                        &provisioning.binding_signature,
+                        &fixture.device,
+                        &room,
+                        false,
+                    )
+                });
+            match attempt {
+                Ok(channel) => break channel,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < connect_deadline,
+                        "relay arrival failed: {error:#}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        let files = [
+            "devices.json",
+            "authorization-keys.json",
+            "assurance-challenges.json",
+            "audit.jsonl",
+        ];
+        let before: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        let path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        let (_observation, waiting) = super::super::store_lock::observe(&path);
+        let mut wire = fixture.request(
+            "POST",
+            "/api/v1/mobile/assurance/challenge",
+            fixture.pairing.device_id,
+        );
+        if lock_name == ".audit.lock" {
+            // Preserve valid syntax and identity while invalidating the signature.
+            let text = String::from_utf8(wire).unwrap();
+            wire = text
+                .replace(
+                    "POST /api/v1/mobile/assurance/challenge",
+                    "GET /api/v1/mobile/device",
+                )
+                .into_bytes();
+        }
+        channel
+            .send_message(
+                &wire,
+                MAX_MOBILE_REQUEST_BYTES,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        let observed = waiting.recv_timeout(Duration::from_secs(30));
+        let (finished, stopped) = std::sync::mpsc::sync_channel(1);
+        let started = Instant::now();
+        let stopper = std::thread::spawn(move || {
+            drop(runtime);
+            let _ = finished.send(());
+        });
+        let bounded = stopped.recv_timeout(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        FileExt::unlock(&held).unwrap();
+        stopper.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no actual file-lock wait for {lock_name}: {observed:?}"
+        );
+        if bounded.is_err() {
+            failures.push(format!(
+                "{lock_name}: stop exceeded contract ({elapsed:?}): {bounded:?}"
+            ));
+        }
+        let after: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        if after != before {
+            failures.push(format!("{lock_name}: cancelled wait changed durable bytes"));
+        }
+        assert!(
+            DeviceRegistry::load(&home).is_ok(),
+            "shutdown poisoned fresh registry for {lock_name}"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+/// A later contended startup store must not turn a failed admission into a
+/// durable registry migration. The original registry bytes are the oracle.
+#[test]
+fn relay_startup_contention_preserves_legacy_registry_until_all_stores_admit() {
+    use fs2::FileExt;
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let mut failures = Vec::new();
+    for lock_name in [".authorization-keys.lock", ".assurance-challenges.lock"] {
+        let fixture = Fixture::new();
+        let home = fixture.state.coven_home.clone();
+        let relay = super::super::transport::test_support::Relay::start();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(&home)
+        .unwrap();
+        let record = fixture
+            .state
+            .registry
+            .device(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap();
+        let legacy = serde_json::json!({
+            "version": 1,
+            "devices": [{
+                "id": record.id,
+                "displayName": record.display_name,
+                "publicKeyX963": record.public_key_x963,
+                "pairedAt": record.paired_at,
+                "revokedAt": null,
+                "scopes": ["memory_read"]
+            }]
+        });
+        let registry_path = home.join("mobile/devices.json");
+        super::super::config::atomic_replace_private(
+            &registry_path,
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        let path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        let (_observation, waiting) = super::super::store_lock::observe(&path);
+        let worker_home = home.clone();
+        let (finished, result) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let outcome = start_mobile_gateway_native_for_daemon(&worker_home).map(drop);
+            let _ = finished.send(outcome);
+        });
+        let observed = waiting.recv_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        let outcome = result.recv_timeout(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        FileExt::unlock(&held).unwrap();
+        worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no failed lock attempt at {lock_name}: {observed:?}"
+        );
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "startup was not refused while {lock_name} stayed held after {elapsed:?}: {outcome:?}"
+        );
+        if std::fs::read(&registry_path).unwrap() != before {
+            failures.push(format!(
+                "{lock_name}: failed startup migrated durable registry bytes"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+#[test]
+fn runtime_scope_cancels_policy_passkey_and_legacy_provisioning_waits() {
+    use super::super::{
+        owner_policy::OwnerPolicyStore, passkey::PasskeyStore, store_lock::Runtime,
+    };
+    use fs2::FileExt;
+    for lock_name in [
+        ".introduction-policy.lock",
+        ".passkeys.lock",
+        ".transport.lock",
+    ] {
+        let fixture = Fixture::with_authorization();
+        let home = fixture.state.coven_home.clone();
+        let identity = super::super::identity::load_existing_host_identity(&home).unwrap();
+        let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+        let audience = identity.public_key_fingerprint;
+        let device_id = fixture.pairing.device_id;
+        let files = [
+            "devices.json",
+            "authorization-keys.json",
+            "assurance-challenges.json",
+            "introduction-policy.json",
+            "passkeys.json",
+            "audit.jsonl",
+        ];
+        let before: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        let path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        let (_observation, waiting) = super::super::store_lock::observe(&path);
+        let runtime = Runtime::default();
+        let worker_runtime = runtime.clone();
+        let worker_home = home.clone();
+        let state = fixture.state;
+        let (finished, stopped) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _scope = worker_runtime.enter();
+            let result = match lock_name {
+                ".introduction-policy.lock" => OwnerPolicyStore::open(&worker_home, audience)
+                    .and_then(|store| store.with_current_locked(|_| Ok(()))),
+                ".passkeys.lock" => PasskeyStore::open(&worker_home, audience)
+                    .and_then(|store| store.list().map(drop)),
+                ".transport.lock" => {
+                    storage::load_or_provision(&worker_home, &state.registry, &signer, device_id)
+                        .map(drop)
+                }
+                _ => unreachable!(),
+            };
+            let _ = finished.send(result.map_err(|error| format!("{error:#}")));
+        });
+        let observed = waiting.recv_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        runtime.cancel();
+        let result = stopped.recv_timeout(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        FileExt::unlock(&held).unwrap();
+        worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no failed file-lock attempt at {lock_name}: {observed:?}"
+        );
+        let error = result
+            .unwrap_or_else(|error| {
+                panic!("{lock_name} wait exceeded shutdown budget after {elapsed:?}: {error:?}")
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("cancelled"),
+            "wrong refusal at {lock_name}: {error}"
+        );
+        let after: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        assert_eq!(
+            after, before,
+            "cancelled store wait changed bytes for {lock_name}"
+        );
+        assert!(
+            DeviceRegistry::load(&home).is_ok(),
+            "scope poisoned future registry at {lock_name}"
+        );
+    }
+}
+
+/// A held storage phase is a synthetic in-flight-I/O model, not a real disk
+/// stall. It distinguishes cancelled admission from already admitted work.
+#[test]
+fn relay_shutdown_contains_an_inflight_challenge_write_before_sync() {
+    use super::super::transport::{self, test_support::Relay, websocket};
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let fixture = Fixture::with_authorization();
+    let _retained = process::RetainedOwnerGuard;
+    let home = fixture.state.coven_home.clone();
+    let relay = Relay::start();
+    storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(&home)
+    .unwrap();
+    let identity = super::super::identity::load_existing_host_identity(&home).unwrap();
+    let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let provisioning = storage::load_existing(
+        &home,
+        &fixture.state.registry,
+        signer.verifying_key(),
+        fixture.pairing.device_id,
+    )
+    .unwrap()
+    .unwrap()
+    .provisioning(&signer)
+    .unwrap();
+    let target = home.join("mobile/assurance-challenges.json");
+    let ready = home.join("held-write-ready");
+    let mut runtime = process::native_fixture::start_fixture(&home, Some(&target), None, &ready)
+        .unwrap()
+        .unwrap();
+    let observation = runtime.observation();
+    // This is only a room-arrival hang guard, independent of stop's strict budget.
+    let connect_deadline = Instant::now() + Duration::from_secs(60);
+    let connect = || loop {
+        let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+        let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+        let attempt = relay
+            .connect(websocket::Role::Client, &room, &credential)
+            .and_then(|records| {
+                transport::connect(
+                    records,
+                    &fixture.pairing,
+                    &provisioning.binding_signature,
+                    &fixture.device,
+                    &room,
+                    false,
+                )
+            });
+        match attempt {
+            Ok(channel) => break channel,
+            Err(error) => {
+                assert!(
+                    Instant::now() < connect_deadline,
+                    "relay arrival failed: {error:#}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let mut channel = connect();
+    let before = std::fs::read(&target).ok();
+    let wire = fixture.request(
+        "POST",
+        "/api/v1/mobile/assurance/challenge",
+        fixture.pairing.device_id,
+    );
+    channel
+        .send_message(
+            &wire,
+            MAX_MOBILE_REQUEST_BYTES,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+    // The bridge only publishes after the CHILD enters the real pre-sync
+    // checkpoint. Keep that child hold installed through forced termination.
+    let phase_deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(!observation.exited(), "worker exited before the held write");
+        assert!(
+            Instant::now() < phase_deadline,
+            "request never reached held child write"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read(&ready).unwrap(), b"held-written\n");
+    let started = Instant::now();
+    let result = runtime.shutdown_until(started + Duration::from_millis(1800));
+    let elapsed = started.elapsed();
+    assert!(
+        result.is_ok() && elapsed < Duration::from_secs(2),
+        "in-flight write outlived the daemon stop contract ({elapsed:?}): {result:?}"
+    );
+    assert!(
+        observation.exited() && observation.reaped(),
+        "worker exit/reap unobserved"
+    );
+    drop(runtime);
+    drop(channel);
+    assert_eq!(
+        std::fs::read(&target).ok(),
+        before,
+        "a worker continued an uncommitted write after observed shutdown"
+    );
+
+    // Restart on the SAME profile. The interrupted staging file must never
+    // become authority; a newly acknowledged challenge must survive shutdown.
+    let mut restarted =
+        process::native_fixture::start_fixture(&home, None, None, &home.join("restart-ready"))
+            .unwrap()
+            .unwrap();
+    let mut channel = connect();
+    let request = fixture.request(
+        "POST",
+        "/api/v1/mobile/assurance/challenge",
+        fixture.pairing.device_id,
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    channel
+        .send_message(&request, MAX_MOBILE_REQUEST_BYTES, deadline)
+        .unwrap();
+    let response = channel
+        .receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline)
+        .unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "restart request failed: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let acknowledged = std::fs::read(&target).unwrap();
+    assert_ne!(Some(acknowledged.clone()), before);
+    restarted.shutdown().unwrap();
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        acknowledged,
+        "acknowledged write changed after shutdown"
+    );
+    assert!(
+        AssuranceChallengeStore::load(&home).is_ok(),
+        "restart left unreadable authority"
+    );
+}
+
+#[test]
+fn oversized_owner_control_header_does_not_terminate_mobile_authority() {
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let fixture = Fixture::with_authorization();
+    let _retained = process::RetainedOwnerGuard;
+    let home = &fixture.state.coven_home;
+    let relay = super::super::transport::test_support::Relay::start();
+    storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(home)
+    .unwrap();
+    let mut runtime =
+        process::native_fixture::start_fixture(home, None, None, &home.join("header-ready"))
+            .unwrap()
+            .unwrap();
+    let observation = runtime.observation();
+    let oversized = super::handle_local_control(
+        "GET",
+        &format!("{LOCAL_CONTROL_ROOT}/{}", "x".repeat(17 * 1024)),
+        None,
+    )
+    .unwrap();
+    let subsequent = super::handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        subsequent.status, 200,
+        "oversized header disabled authority: {}",
+        subsequent.body
+    );
+    assert!(
+        !observation.exited(),
+        "worker exited after rejecting oversized header"
+    );
+    assert!(
+        oversized.is_err() || oversized.is_ok_and(|response| (400..500).contains(&response.status)),
+        "oversized caller input was not rejected locally"
+    );
+    runtime.shutdown().unwrap();
+    assert_eq!(
+        observation.exit_code(),
+        Some(0),
+        "normal worker stop escalated to a forced exit"
+    );
+}
+
+#[test]
+fn process_startup_store_waits_exit_without_changing_authority() {
+    use fs2::FileExt;
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    for lock_name in [
+        ".devices.lock",
+        ".authorization-keys.lock",
+        ".assurance-challenges.lock",
+    ] {
+        let fixture = Fixture::with_authorization();
+        let _retained = process::RetainedOwnerGuard;
+        let home = fixture.state.coven_home.clone();
+        let relay = super::super::transport::test_support::Relay::start();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(&home)
+        .unwrap();
+        let files = [
+            "devices.json",
+            "authorization-keys.json",
+            "assurance-challenges.json",
+        ];
+        let snapshot = || {
+            files
+                .iter()
+                .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let lock_path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&lock_path).unwrap();
+        held.lock_exclusive().unwrap();
+        let ready = home.join("startup-lock-ready");
+        let (send_observation, receive_observation) = std::sync::mpsc::sync_channel(1);
+        let (send_result, receive_result) = std::sync::mpsc::sync_channel(1);
+        let child_home = home.clone();
+        let child_ready = ready.clone();
+        let start = Instant::now();
+        let starter = std::thread::spawn(move || {
+            let outcome = process::native_fixture::start_fixture_observing(
+                &child_home,
+                None,
+                Some(&lock_path),
+                &child_ready,
+                |handle| {
+                    send_observation.send(handle.observation()).unwrap();
+                },
+            )
+            .map(drop);
+            let _ = send_result.send(outcome);
+        });
+        let observation = receive_observation
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        let hang_guard = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() && !observation.exited() && Instant::now() < hang_guard {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Always join; keep the competing lock held THROUGH exit observation.
+        let outcome = receive_result.recv_timeout(Duration::from_secs(30));
+        starter.join().unwrap();
+        assert_eq!(
+            std::fs::read(&ready).unwrap(),
+            b"failed-file-lock\n",
+            "{lock_name}"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "startup unexpectedly admitted {lock_name}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "startup contention exceeded bound for {lock_name}: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            observation.exited() && observation.reaped(),
+            "startup child not reaped for {lock_name}"
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "failed startup changed authority for {lock_name}"
+        );
+        FileExt::unlock(&held).unwrap();
+        let mut restarted = process::native_fixture::start_fixture(
+            &home,
+            None,
+            None,
+            &home.join("fresh-start-ready"),
+        )
+        .unwrap()
+        .unwrap();
+        restarted.shutdown().unwrap();
+        assert_eq!(
+            snapshot(),
+            before,
+            "fresh restart changed authority for {lock_name}"
+        );
+    }
+}
+
+#[test]
+fn native_shutdown_recovers_initial_enrollment_between_key_and_device_commit() {
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let fixture = Fixture::with_authorization();
+    let _retained = process::RetainedOwnerGuard;
+    let home = &fixture.state.coven_home;
+    let relay = super::super::transport::test_support::Relay::start();
+    storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(home)
+    .unwrap();
+    let devices = home.join("mobile/devices.json");
+    let keys = home.join("mobile/authorization-keys.json");
+    let before_devices = std::fs::read(&devices).unwrap();
+    let before_keys = std::fs::read(&keys).unwrap();
+    let ready = home.join("registration-held-ready");
+    let prepared = home.join("registration-pending.json");
+    let mut runtime =
+        process::native_fixture::start_enrollment_fixture(home, &devices, &ready, &prepared)
+            .unwrap()
+            .unwrap();
+    let observation = runtime.observation();
+    let setup_deadline = Instant::now() + Duration::from_secs(30);
+    while !prepared.exists() {
+        assert!(!observation.exited(), "worker exited before pairing setup");
+        assert!(
+            Instant::now() < setup_deadline,
+            "native pairing setup never completed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let pending: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&prepared).unwrap()).unwrap();
+    let path = format!(
+        "{LOCAL_CONTROL_ROOT}/{}/confirm",
+        pending["id"].as_str().unwrap()
+    );
+    let body = serde_json::json!({ "phrase": pending["phrase"] }).to_string();
+    let confirmation = std::thread::spawn(move || {
+        super::handle_local_control("POST", &path, Some(&body)).unwrap()
+    });
+    let cut_deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            !observation.exited(),
+            "worker exited before the registry write cut"
+        );
+        assert!(
+            Instant::now() < cut_deadline,
+            "registry write cut was not entered"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read(&ready).unwrap(), b"held-written\n");
+    assert_eq!(
+        std::fs::read(&devices).unwrap(),
+        before_devices,
+        "cut was after registry publication"
+    );
+    assert_ne!(
+        std::fs::read(&keys).unwrap(),
+        before_keys,
+        "cut did not follow durable key insertion"
+    );
+    let started = Instant::now();
+    let stopped = runtime.shutdown_until(started + Duration::from_millis(1800));
+    assert!(
+        stopped.is_ok() && started.elapsed() < Duration::from_secs(2),
+        "registration stop exceeded contract after {:?}: {stopped:?}",
+        started.elapsed()
+    );
+    assert!(
+        observation.exited() && observation.reaped(),
+        "registration worker was not observed exited/reaped"
+    );
+    let response = confirmation.join().unwrap().unwrap();
+    assert_eq!(
+        response.status, 503,
+        "lost confirmation must report uncertainty"
+    );
+    drop(runtime);
+    // Restart recovery is part of this assertion. The old parent Fixture
+    // cache does not stand in for the fresh worker's durable-state load.
+    let mut restarted = process::native_fixture::start_fixture(
+        home,
+        None,
+        None,
+        &home.join("registration-restart-ready"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&devices).unwrap(),
+        before_devices,
+        "interrupted registration gained a device"
+    );
+    assert_eq!(
+        std::fs::read(&keys).unwrap(),
+        before_keys,
+        "restart left an orphaned authorization key"
+    );
+    restarted.shutdown().unwrap();
+}
+
+/// These are synthetic holds at real child write checkpoints, selected by
+/// actual owner-confirm execution. They are process-kill/restart evidence;
+/// they do not model physical media stalls or establish power-loss durability.
+#[test]
+fn native_initial_enrollment_journal_cut_matrix_recovers_exact_images() {
+    use super::super::config::MobileWritePhase;
+    use process::native_fixture::{self, EnrollmentCut};
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    for (
+        label,
+        target_name,
+        phase,
+        skip,
+        failed_commit,
+        committed,
+        keys_visible,
+        journal_visible,
+    ) in [
+        (
+            "keys-written",
+            "authorization-keys.json",
+            MobileWritePhase::Written,
+            0,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (
+            "keys-renamed",
+            "authorization-keys.json",
+            MobileWritePhase::Renamed,
+            0,
+            false,
+            false,
+            true,
+            true,
+        ),
+        (
+            "devices-renamed",
+            "devices.json",
+            MobileWritePhase::Renamed,
+            0,
+            false,
+            true,
+            true,
+            true,
+        ),
+        (
+            "journal-written",
+            ".initial-enrollment.json",
+            MobileWritePhase::Written,
+            0,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            "journal-retired",
+            ".initial-enrollment.json",
+            MobileWritePhase::RetainedParentSynced,
+            0,
+            false,
+            true,
+            true,
+            false,
+        ),
+        // The first matching key Written belongs to enrollment. The second
+        // belongs to actual compensation after the real registry write hook
+        // fails. No authority images are fabricated by the parent test.
+        (
+            "rollback-keys-written",
+            "authorization-keys.json",
+            MobileWritePhase::Written,
+            1,
+            true,
+            false,
+            true,
+            true,
+        ),
+    ] {
+        let fixture = Fixture::with_authorization();
+        let _retained = process::RetainedOwnerGuard;
+        let home = &fixture.state.coven_home;
+        let relay = super::super::transport::test_support::Relay::start();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(home)
+        .unwrap();
+        let devices = home.join("mobile/devices.json");
+        let keys = home.join("mobile/authorization-keys.json");
+        let journal = home.join("mobile/.initial-enrollment.json");
+        let before_devices = std::fs::read(&devices).unwrap();
+        let before_keys = std::fs::read(&keys).unwrap();
+        assert!(
+            !journal.exists(),
+            "fixture already has an enrollment intent: {label}"
+        );
+        let target = home.join("mobile").join(target_name);
+        let cut = EnrollmentCut {
+            target: &target,
+            phase,
+            skip_matching: skip,
+            fail_registry_commit: failed_commit,
+        };
+        let ready = home.join(format!("{label}-held-ready"));
+        let prepared = home.join(format!("{label}-pending.json"));
+        let mut runtime =
+            native_fixture::start_enrollment_cut_fixture(home, cut, &ready, &prepared)
+                .unwrap()
+                .unwrap();
+        let observation = runtime.observation();
+        let setup_deadline = Instant::now() + Duration::from_secs(30);
+        while !prepared.exists() && !observation.exited() && Instant::now() < setup_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !prepared.exists() {
+            let stopped = runtime.shutdown();
+            panic!(
+                "{label}: native pairing setup did not publish; exited={} shutdown={stopped:?}",
+                observation.exited()
+            );
+        }
+        let pending: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&prepared).unwrap()).unwrap();
+        assert_eq!(
+            pending["registryWriteFailureInjected"], failed_commit,
+            "fixture failed to select actual registry error: {label}"
+        );
+        let path = format!(
+            "{LOCAL_CONTROL_ROOT}/{}/confirm",
+            pending["id"].as_str().unwrap()
+        );
+        let body = serde_json::json!({ "phrase": pending["phrase"] }).to_string();
+        let confirmation = std::thread::spawn(move || {
+            super::handle_local_control("POST", &path, Some(&body)).unwrap()
+        });
+        let phase_deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() && !observation.exited() && Instant::now() < phase_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let observed_marker = std::fs::read(&ready).ok();
+        let held_devices = std::fs::read(&devices).ok();
+        let held_keys = std::fs::read(&keys).ok();
+        let held_journal = std::fs::read(&journal).ok();
+        // Cleanup and join precede phase/state assertions, including a red
+        // regression. The parent never releases the child's held checkpoint.
+        let started = Instant::now();
+        let stopped = runtime.shutdown_until(started + Duration::from_millis(1800));
+        let elapsed = started.elapsed();
+        let confirmation = confirmation.join().unwrap();
+        drop(runtime);
+        assert_eq!(
+            observed_marker,
+            Some(cut.marker()),
+            "{label}: no matching held child checkpoint"
+        );
+        assert!(
+            stopped.is_ok() && elapsed < Duration::from_secs(2),
+            "{label}: native cut shutdown exceeded contract after {elapsed:?}: {stopped:?}"
+        );
+        assert!(
+            observation.exited() && observation.reaped(),
+            "{label}: child exit/reap not observed"
+        );
+        assert_ne!(
+            observation.exit_code(),
+            Some(0),
+            "{label}: selected hold was released or bypassed instead of contained"
+        );
+        let response = confirmation.unwrap();
+        assert_eq!(
+            response.status, 503,
+            "{label}: unacknowledged confirmation did not report uncertainty"
+        );
+        let uncertainty: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(
+            uncertainty["error"]["code"], "daemon_unavailable",
+            "{label}"
+        );
+        assert_eq!(
+            uncertainty["error"]["details"]["outcome"], "unknown",
+            "{label}"
+        );
+        assert_eq!(
+            uncertainty["error"]["details"]["retrySafe"], false,
+            "{label}"
+        );
+        assert_eq!(
+            held_journal.is_some(),
+            journal_visible,
+            "{label}: incorrect journal cut"
+        );
+        let held_devices = held_devices.unwrap();
+        let held_keys = held_keys.unwrap();
+        if committed {
+            assert_ne!(
+                held_devices, before_devices,
+                "{label}: device never committed"
+            );
+        } else {
+            assert_eq!(
+                held_devices, before_devices,
+                "{label}: device committed before the selected cut"
+            );
+        }
+        if keys_visible {
+            assert_ne!(
+                held_keys, before_keys,
+                "{label}: enrolled keys not published at cut"
+            );
+        } else {
+            assert_eq!(
+                held_keys, before_keys,
+                "{label}: keys published before the selected cut"
+            );
+        }
+        // Capture exact expected committed bytes only after proving that this
+        // real operation added one linked device/key to the prior profile.
+        if committed {
+            let before: serde_json::Value = serde_json::from_slice(&before_devices).unwrap();
+            let after: serde_json::Value = serde_json::from_slice(&held_devices).unwrap();
+            let prior_keys: serde_json::Value = serde_json::from_slice(&before_keys).unwrap();
+            let next_keys: serde_json::Value = serde_json::from_slice(&held_keys).unwrap();
+            let prior_devices = before["devices"].as_array().unwrap();
+            let next_devices = after["devices"].as_array().unwrap();
+            let prior_keys = prior_keys["keys"].as_array().unwrap();
+            let next_keys = next_keys["keys"].as_array().unwrap();
+            assert_eq!(next_devices.len(), prior_devices.len() + 1, "{label}");
+            assert_eq!(
+                &next_devices[..prior_devices.len()],
+                prior_devices,
+                "{label}: changed an existing device"
+            );
+            assert_eq!(next_keys.len(), prior_keys.len() + 1, "{label}");
+            assert_eq!(
+                &next_keys[..prior_keys.len()],
+                prior_keys,
+                "{label}: changed an existing authorization key"
+            );
+            assert_eq!(
+                next_devices.last().unwrap()["device"]["id"],
+                next_keys.last().unwrap()["deviceId"],
+                "{label}: committed device/key identities differ"
+            );
+        }
+        let expected_devices = if committed {
+            held_devices
+        } else {
+            before_devices
+        };
+        let expected_keys = if committed { held_keys } else { before_keys };
+        // SAME profile, fresh real worker. The parent's old Fixture cache is
+        // never used as evidence for the recovered authority state.
+        let mut restarted = native_fixture::start_fixture(
+            home,
+            None,
+            None,
+            &home.join(format!("{label}-restart-ready")),
+        )
+        .unwrap()
+        .unwrap();
+        let status = super::handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status.status, 200,
+            "{label}: restarted control plane unavailable"
+        );
+        assert_eq!(
+            std::fs::read(&devices).unwrap(),
+            expected_devices,
+            "{label}: restart selected the wrong device image"
+        );
+        assert_eq!(
+            std::fs::read(&keys).unwrap(),
+            expected_keys,
+            "{label}: restart selected the wrong key image"
+        );
+        assert!(
+            !journal.exists(),
+            "{label}: restart left enrollment recovery pending"
+        );
+        restarted.shutdown().unwrap();
+        assert_eq!(
+            std::fs::read(&devices).unwrap(),
+            expected_devices,
+            "{label}: device image changed after recovered shutdown"
+        );
+        assert_eq!(
+            std::fs::read(&keys).unwrap(),
+            expected_keys,
+            "{label}: key image changed after recovered shutdown"
+        );
+        assert!(
+            DeviceRegistry::load(home).is_ok(),
+            "{label}: recovered registry is unreadable"
+        );
+    }
+}
+
+mod native_v2_create_process_tests;

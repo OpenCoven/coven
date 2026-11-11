@@ -26,7 +26,7 @@ mod network;
 pub mod routing;
 pub mod storage;
 #[cfg(test)]
-pub(super) mod test_support;
+pub(crate) mod test_support;
 pub mod websocket;
 
 pub const PROFILE: &str = "Noise_NK_25519_ChaChaPoly_SHA256";

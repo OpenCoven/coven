@@ -17,6 +17,7 @@ pub mod policy_cli;
 pub mod recovery;
 pub mod registry;
 pub mod relay;
+mod store_lock;
 pub mod transport;
 
 use std::net::SocketAddr;

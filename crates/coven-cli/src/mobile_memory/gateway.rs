@@ -36,6 +36,7 @@ use super::registry::DeviceRegistry;
 use super::{MAX_MOBILE_REQUEST_BYTES, MAX_MOBILE_RESPONSE_BYTES};
 
 mod direct_transport;
+pub(crate) mod process;
 mod relay_runtime;
 
 const MOBILE_IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -297,8 +298,25 @@ pub struct MobileGatewayHandle {
     state: Arc<MobileGatewayState>,
 }
 
+pub use process::Handle as MobileRuntimeHandle;
+
+pub fn start_mobile_gateway_for_daemon(coven_home: &Path) -> Result<Option<MobileRuntimeHandle>> {
+    process::start(coven_home)
+}
+
+pub(crate) fn handle_local_control(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Option<Result<crate::api::ApiResponse>> {
+    if let Some(response) = process::proxy(method, path, body) {
+        return Some(response);
+    }
+    handle_local_control_native(method, path, body)
+}
+
 /// Stop relay workers before dropping the HTTPS listener and shared authority.
-pub struct MobileRuntimeHandle {
+pub struct NativeMobileRuntimeHandle {
     _relay: Option<relay_runtime::RelayHandle>,
     _direct: Option<MobileGatewayHandle>,
 }
@@ -311,6 +329,7 @@ impl MobileGatewayHandle {
 
 impl Drop for MobileGatewayHandle {
     fn drop(&mut self) {
+        self.state.storage_runtime.cancel();
         self.shutdown.store(true, Ordering::Release);
         self.state.stop_network_connections();
         self.state.registry.cancel_pending_operations();
@@ -328,6 +347,7 @@ struct NetworkConnections {
 }
 
 struct MobileGatewayState {
+    storage_runtime: super::store_lock::Runtime,
     network: Mutex<NetworkConnections>,
     connections: super::transport::connection::Connections,
     coven_home: PathBuf,
@@ -389,7 +409,15 @@ pub fn start_mobile_gateway(coven_home: &Path) -> Result<Option<MobileGatewayHan
 /// optional config is quarantined to the mobile surface so the owner-only
 /// local daemon remains available; a valid enabled config that cannot bind or
 /// initialize still fails startup instead of silently disabling remote access.
-pub fn start_mobile_gateway_for_daemon(coven_home: &Path) -> Result<Option<MobileRuntimeHandle>> {
+pub fn start_mobile_gateway_native_for_daemon(
+    coven_home: &Path,
+) -> Result<Option<NativeMobileRuntimeHandle>> {
+    super::store_lock::during_startup(|| start_mobile_gateway_native_for_daemon_inner(coven_home))
+}
+
+fn start_mobile_gateway_native_for_daemon_inner(
+    coven_home: &Path,
+) -> Result<Option<NativeMobileRuntimeHandle>> {
     let config = match load_mobile_config_unvalidated(coven_home) {
         Ok(config) => config,
         Err(error) => {
@@ -434,7 +462,7 @@ pub fn start_mobile_gateway_for_daemon(coven_home: &Path) -> Result<Option<Mobil
     } else {
         None
     };
-    Ok(Some(MobileRuntimeHandle {
+    Ok(Some(NativeMobileRuntimeHandle {
         _relay: relay,
         _direct: direct,
     }))
@@ -445,9 +473,13 @@ fn create_gateway_state(
     config: Option<&MobileGatewayConfig>,
     host_fingerprint: [u8; 32],
 ) -> Result<Arc<MobileGatewayState>> {
-    let registry = Arc::new(DeviceRegistry::load(coven_home)?);
+    // Validate/admit the non-mutating challenge store first, so a later wait
+    // cannot leave a published registry migration behind a failed startup.
+    // Its locks are released before entering the registry -> key lock order.
     let challenges = Arc::new(AssuranceChallengeStore::load(coven_home)?);
+    let registry = Arc::new(DeviceRegistry::load(coven_home)?);
     Ok(Arc::new(MobileGatewayState {
+        storage_runtime: crate::mobile_memory::store_lock::Runtime::current(),
         connections: Default::default(),
         network: Default::default(),
         coven_home: coven_home.to_path_buf(),
@@ -469,6 +501,13 @@ fn create_gateway_state(
 }
 
 fn start_mobile_gateway_with_config(
+    coven_home: &Path,
+    config: &MobileGatewayConfig,
+) -> Result<MobileGatewayHandle> {
+    super::store_lock::during_startup(|| start_mobile_gateway_with_config_inner(coven_home, config))
+}
+
+fn start_mobile_gateway_with_config_inner(
     coven_home: &Path,
     config: &MobileGatewayConfig,
 ) -> Result<MobileGatewayHandle> {
@@ -502,6 +541,7 @@ fn start_mobile_gateway_with_config(
     let thread = std::thread::Builder::new()
         .name("coven-mobile-memory".to_owned())
         .spawn(move || {
+            let _storage_scope = state.storage_runtime.enter();
             let _ = append_event(
                 &thread_home,
                 Utc::now(),
@@ -603,6 +643,7 @@ fn serve_tls_connection(
     config: Arc<ServerConfig>,
     state: &MobileGatewayState,
 ) -> Result<()> {
+    let _storage_scope = state.storage_runtime.enter();
     let (_socket_lifetime, attempt) = state.register_network_connection(&stream)?;
     stream.set_read_timeout(Some(MOBILE_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(MOBILE_IO_TIMEOUT))?;
@@ -729,6 +770,7 @@ fn handle_mobile_request(
     state: &MobileGatewayState,
     request: MobileHttpRequest,
 ) -> MobileHttpResponse {
+    let _storage_scope = state.storage_runtime.enter();
     // No mobile route takes a query string. Encrypted transport ingress
     // rejects the same targets in `handle_transport_message`.
     if request.target.contains('?') {
@@ -851,6 +893,7 @@ fn handle_pairing_confirmation(
             }
             success_response(if replayed { 200 } else { 201 }, device)
         }
+        Err(PairingError::CommitUncertain) => pairing_error_response(PairingError::CommitUncertain),
         Err(error) => {
             let _ = append_event(
                 &state.coven_home,
@@ -941,6 +984,7 @@ fn handle_transport_message_with_generation(
     generation: Option<u64>,
     encoded: &[u8],
 ) -> Result<(MobileHttpResponse, bool)> {
+    let _storage_scope = state.storage_runtime.enter();
     super::transport::authority::check_current(&state.registry, pairing, direct, Utc::now())?;
     let mut reader = BufReader::new(std::io::Cursor::new(encoded));
     let request = read_mobile_request_buffered(&mut reader)?;
@@ -1430,7 +1474,33 @@ pub(crate) fn claims_local_control(path: &str) -> bool {
     })
 }
 
-pub(crate) fn handle_local_control(
+pub(crate) fn handle_local_control_native(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Option<Result<crate::api::ApiResponse>> {
+    let state = active_gateway().ok();
+    let _storage_scope = state.as_ref().map(|state| state.storage_runtime.enter());
+    match handle_local_control_inner(method, path, body) {
+        Some(Err(error))
+            if error.downcast_ref::<PairingError>() == Some(&PairingError::CommitUncertain) =>
+        {
+            Some(local_pairing_uncertain_response())
+        }
+        response => response,
+    }
+}
+
+fn local_pairing_uncertain_response() -> Result<crate::api::ApiResponse> {
+    crate::api::api_error(
+        503,
+        "daemon_unavailable",
+        "Pairing authority may have committed; reconcile enrolled devices before retrying.",
+        Some(serde_json::json!({ "outcome": "unknown", "retrySafe": false })),
+    )
+}
+
+fn handle_local_control_inner(
     method: &str,
     path: &str,
     body: Option<&str>,
@@ -1565,9 +1635,8 @@ pub(crate) fn handle_local_control(
                 )
             }
             ("POST", "cancel") => {
-                let _audit_guard = PAIRING_CANCELLATION_AUDIT_LOCK
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("pairing cancellation audit lock was poisoned"))?;
+                let _audit_guard = super::store_lock::process(&PAIRING_CANCELLATION_AUDIT_LOCK)
+                    .context("pairing cancellation audit lock unavailable")?;
                 let cancellation = state.pairing.cancel(id, Utc::now())?;
                 if cancellation.audit_required() {
                     append_event(
@@ -1832,6 +1901,17 @@ fn pairing_error_response(error: PairingError) -> MobileHttpResponse {
         }
         PairingError::PairingPhraseMismatch => (400, MobileErrorCode::PairingPhraseMismatch),
         PairingError::InvalidRequest => (400, MobileErrorCode::InvalidRequest),
+        PairingError::CommitUncertain => {
+            let mut envelope =
+                MobileEnvelope::<()>::error(request_id(), MobileErrorCode::DaemonUnavailable);
+            envelope.error.as_mut().expect("error envelope").retryable = false;
+            return MobileHttpResponse {
+                status: 503,
+                allow: None,
+                body: serde_json::to_string(&envelope)
+                    .expect("mobile error envelope is serializable"),
+            };
+        }
     };
     error_response(status, code)
 }
@@ -2027,6 +2107,7 @@ mod tests {
             )
             .unwrap();
         let state = MobileGatewayState {
+            storage_runtime: crate::mobile_memory::store_lock::Runtime::current(),
             connections: Default::default(),
             network: Default::default(),
             coven_home: temp.path().to_path_buf(),
@@ -2144,9 +2225,10 @@ mod tests {
         };
         let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
 
-        let response = handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
-            .unwrap()
-            .unwrap();
+        let response =
+            handle_local_control_native("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+                .unwrap()
+                .unwrap();
         assert_eq!(response.status, 201);
         let invitation: serde_json::Value = serde_json::from_str(&response.body).unwrap();
         let id = invitation["id"].as_str().unwrap();
@@ -2158,7 +2240,7 @@ mod tests {
                 .count(),
             1
         );
-        let status = handle_local_control(
+        let status = handle_local_control_native(
             "POST",
             &format!("/api/v1/internal/mobile/pairings/{id}/status"),
             Some("{}"),
@@ -2186,17 +2268,17 @@ mod tests {
         let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
 
         let invitation =
-            handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+            handle_local_control_native("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
                 .unwrap()
                 .unwrap();
         let invitation: serde_json::Value = serde_json::from_str(&invitation.body).unwrap();
         let id = invitation["id"].as_str().unwrap();
         let cancel_path = format!("/api/v1/internal/mobile/pairings/{id}/cancel");
 
-        let first = handle_local_control("POST", &cancel_path, Some("{}"))
+        let first = handle_local_control_native("POST", &cancel_path, Some("{}"))
             .unwrap()
             .unwrap();
-        let replay = handle_local_control("POST", &cancel_path, Some("{}"))
+        let replay = handle_local_control_native("POST", &cancel_path, Some("{}"))
             .unwrap()
             .unwrap();
         assert_eq!(first.status, 200);
@@ -2208,7 +2290,7 @@ mod tests {
         assert_eq!(replay["state"], "cancelled");
         assert_eq!(replay["replayed"], true);
 
-        let status = handle_local_control(
+        let status = handle_local_control_native(
             "POST",
             &format!("/api/v1/internal/mobile/pairings/{id}/status"),
             Some("{}"),
@@ -2233,7 +2315,7 @@ mod tests {
         let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
 
         let invitation =
-            handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+            handle_local_control_native("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
                 .unwrap()
                 .unwrap();
         let invitation: serde_json::Value = serde_json::from_str(&invitation.body).unwrap();
@@ -2246,7 +2328,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    handle_local_control("POST", &cancel_path, Some("{}"))
+                    handle_local_control_native("POST", &cancel_path, Some("{}"))
                         .unwrap()
                         .unwrap()
                 })
@@ -2285,7 +2367,7 @@ mod tests {
         let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
 
         let invitation =
-            handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+            handle_local_control_native("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
                 .unwrap()
                 .unwrap();
         let invitation: serde_json::Value = serde_json::from_str(&invitation.body).unwrap();
@@ -2294,12 +2376,14 @@ mod tests {
         let audit_path = temp.path().join("mobile/audit.jsonl");
         std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-        assert!(handle_local_control("POST", &cancel_path, Some("{}"))
-            .unwrap()
-            .is_err());
+        assert!(
+            handle_local_control_native("POST", &cancel_path, Some("{}"))
+                .unwrap()
+                .is_err()
+        );
 
         std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let replay = handle_local_control("POST", &cancel_path, Some("{}"))
+        let replay = handle_local_control_native("POST", &cancel_path, Some("{}"))
             .unwrap()
             .unwrap();
         assert_eq!(replay.status, 200);
@@ -2338,7 +2422,7 @@ mod tests {
         std::fs::write(&config, b"{not-json").unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        assert!(start_mobile_gateway_for_daemon(temp.path())
+        assert!(start_mobile_gateway_native_for_daemon(temp.path())
             .unwrap()
             .is_none());
     }
@@ -2350,6 +2434,7 @@ mod tests {
         let registry = Arc::new(DeviceRegistry::load(home).unwrap());
         let challenges = Arc::new(AssuranceChallengeStore::load(home).unwrap());
         MobileGatewayState {
+            storage_runtime: crate::mobile_memory::store_lock::Runtime::current(),
             connections: Default::default(),
             network: Default::default(),
             coven_home: home.to_path_buf(),
@@ -2433,7 +2518,7 @@ mod tests {
             .save(home.path())
             .unwrap();
             // No enrolled peers: the manager must not attempt any network connection.
-            let runtime = start_mobile_gateway_for_daemon(home.path())
+            let runtime = start_mobile_gateway_native_for_daemon(home.path())
                 .unwrap()
                 .unwrap();
             let state = active_gateway().expect("relay-only owner controls have no active state");
@@ -2442,14 +2527,19 @@ mod tests {
                 state.advertised_endpoint.is_none(),
                 "disabled listener advertised a QR endpoint"
             );
-            let response =
-                handle_local_control("POST", "/api/v1/internal/mobile/introductions", Some("{}"))
-                    .unwrap()
-                    .unwrap();
+            let response = handle_local_control_native(
+                "POST",
+                "/api/v1/internal/mobile/introductions",
+                Some("{}"),
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(response.status, 400);
-            assert!(handle_local_control("POST", LOCAL_CONTROL_ROOT, None)
-                .unwrap()
-                .is_err());
+            assert!(
+                handle_local_control_native("POST", LOCAL_CONTROL_ROOT, None)
+                    .unwrap()
+                    .is_err()
+            );
             drop(state);
             drop(runtime);
             assert!(
@@ -2494,7 +2584,7 @@ mod tests {
         let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
         let root = "/api/v1/internal/mobile/introductions";
         let call = |method: &str, path: &str, body: &str| {
-            handle_local_control(method, path, Some(body))
+            handle_local_control_native(method, path, Some(body))
                 .unwrap()
                 .unwrap()
         };
@@ -2840,10 +2930,10 @@ mod tests {
         let path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
         let body = serde_json::json!({ "phrase": enrolled.phrase }).to_string();
 
-        let first = handle_local_control("POST", &path, Some(&body))
+        let first = handle_local_control_native("POST", &path, Some(&body))
             .unwrap()
             .unwrap();
-        let replay = handle_local_control("POST", &path, Some(&body))
+        let replay = handle_local_control_native("POST", &path, Some(&body))
             .unwrap()
             .unwrap();
 
@@ -2881,7 +2971,7 @@ mod tests {
         let host_path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
         let host_body = serde_json::json!({ "phrase": enrolled.phrase }).to_string();
         assert_eq!(
-            handle_local_control("POST", &host_path, Some(&host_body))
+            handle_local_control_native("POST", &host_path, Some(&host_body))
                 .unwrap()
                 .unwrap()
                 .status,
@@ -2915,12 +3005,31 @@ mod tests {
             200
         );
         assert_eq!(
-            handle_local_control("POST", &host_path, Some(&host_body))
+            handle_local_control_native("POST", &host_path, Some(&host_body))
                 .unwrap()
                 .unwrap()
                 .status,
             200
         );
         assert_eq!(completions("replays"), 1);
+    }
+}
+
+#[cfg(test)]
+mod initial_enrollment_uncertainty_tests {
+    use super::*;
+    #[test]
+    fn uncertain_pairing_responses_never_instruct_safe_retry() {
+        let remote = pairing_error_response(PairingError::CommitUncertain);
+        assert_eq!(remote.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&remote.body).unwrap();
+        assert_eq!(body["error"]["code"], "daemon_unavailable");
+        assert_eq!(body["error"]["retryable"], false);
+        let owner = local_pairing_uncertain_response().unwrap();
+        assert_eq!(owner.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&owner.body).unwrap();
+        assert_eq!(body["error"]["code"], "daemon_unavailable");
+        assert_eq!(body["error"]["details"]["outcome"], "unknown");
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
     }
 }

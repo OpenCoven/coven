@@ -437,6 +437,13 @@ enum Command {
         #[arg(long, value_name = "PROTOCOL")]
         protocol: String,
     },
+    #[command(hide = true, name = "mobile-gateway-worker")]
+    MobileGatewayWorker {
+        #[arg(long)]
+        protocol: String,
+        #[arg(long)]
+        home: PathBuf,
+    },
     #[command(about = "Inspect and decide Ward proposals or migrate configuration")]
     Ward {
         #[command(subcommand)]
@@ -2170,6 +2177,14 @@ fn main() -> Result<()> {
         unreachable!("process supervisor exits with its target status");
     }
 
+    if let Some(Command::MobileGatewayWorker { protocol, home }) = &cli.command {
+        if let Err(error) = mobile_memory::gateway::process::run_worker(protocol, home) {
+            eprintln!("coven mobile worker failed: {error:#}");
+            std::process::exit(70);
+        }
+        unreachable!("mobile worker exits after native authority cleanup");
+    }
+
     let loaded =
         settings::user_settings_path().as_deref().and_then(|path| {
             match settings::load_from(path) {
@@ -2303,6 +2318,9 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::ProcessSupervisor { .. }) => {
             unreachable!("process supervisor runs before state initialization")
+        }
+        Some(Command::MobileGatewayWorker { .. }) => {
+            unreachable!("mobile gateway worker runs before state initialization")
         }
         Some(Command::Ward { command }) => run_ward_command(command),
         Some(Command::FamiliarLedger { command }) => familiar_cli::run(command),

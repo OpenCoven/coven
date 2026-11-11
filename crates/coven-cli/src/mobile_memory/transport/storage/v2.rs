@@ -307,6 +307,7 @@ fn locked_checked<T>(
     operation: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {
     let check = || -> Result<()> {
+        crate::mobile_memory::store_lock::check()?;
         running()?;
         ensure!(
             deadline.is_none_or(|end| std::time::Instant::now() < end),
