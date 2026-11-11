@@ -2,9 +2,13 @@
 //! The selected snapshot, the destination and the signed authority are three
 //! different points of one lineage, each with owner policy present. Every
 //! observed installer checkpoint is cut once by SIGKILL and once by a returned
-//! error. Process death is not a power-loss simulation. Each cut repeats every
-//! durability barrier, so these run by default only on Linux, where a barrier is
-//! not a full device flush; run them elsewhere with `--ignored`.
+//! error. Process death is not a power-loss simulation.
+//!
+//! Each cut starts a child, retries the installation and completes fresh
+//! handovers, so the two matrices take several minutes of test-thread time.
+//! The required Linux test job has no room for that, so they are ignored by
+//! default: run them with `--ignored` when the installer, its checkpoints or
+//! restore precedence change.
 use super::super::mixed::{
     authority_files, destination, json, read_files, selected, verify_installed, Authority, Known,
     Lineage, Sources, ACKNOWLEDGED, BASE, FIRST, HANDED_OVER, LATE, RESTORED, RESTORED_AGAIN,
@@ -139,10 +143,7 @@ fn exercise(lineage: &Lineage, sources: &Sources) -> usize {
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "minutes of durability barriers off Linux; run with --ignored"
-)]
+#[ignore = "native interruption matrix; minutes of child processes and durability barriers"]
 fn mixed_restore_process_interruptions_keep_burned_and_pending_floors_above_older_authority() {
     let lineage = Lineage::build();
     let sources = Sources {
@@ -183,10 +184,7 @@ fn mixed_restore_process_interruptions_keep_burned_and_pending_floors_above_olde
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "minutes of durability barriers off Linux; run with --ignored"
-)]
+#[ignore = "native interruption matrix; minutes of child processes and durability barriers"]
 fn mixed_restore_process_interruptions_keep_journal_only_floors_across_three_journals() {
     let lineage = Lineage::build();
     let sources = Sources {
