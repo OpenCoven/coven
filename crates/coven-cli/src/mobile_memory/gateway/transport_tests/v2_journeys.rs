@@ -967,6 +967,109 @@ fn reconnect(phone: &Phone, host: &Host, transport: Transport, live: Live) -> Li
     read_device(phone, &mut live);
     live
 }
+/// The gates every application request passes, asserted on a live channel of
+/// whatever generation and state the pairing has reached: the nonce, the request
+/// signature, channel-device equality, and that the routing credentials without
+/// the device key admit nothing. `foreign` is another enrolled device. Returns a
+/// channel on the next room, because the foreign request closes the one given.
+fn request_gates(
+    host: &Host,
+    phone: &Phone,
+    foreign: &Phone,
+    transport: Transport,
+    mut live: Live,
+) -> Live {
+    let read = phone.request("GET", DEVICE, &[]);
+    assert_eq!(live.exchange(&read).unwrap().outcome(), (200, ""));
+    assert_eq!(
+        live.exchange(&read).unwrap().outcome(),
+        (409, "request_replayed")
+    );
+    let forger = SigningKey::from_slice(&[99; 32]).unwrap();
+    let forged = signed(phone.id, &forger, "GET", DEVICE, &[], |_| Vec::new());
+    assert_eq!(
+        live.exchange(&forged).unwrap().outcome(),
+        (401, "signature_invalid")
+    );
+    read_device(phone, &mut live);
+    assert!(
+        live.exchange(&foreign.request("GET", DEVICE, &[])).is_err(),
+        "{transport:?}: a request for another device was answered on this channel"
+    );
+    host.assert_refusal(live.slot, "request identity differs from channel identity");
+    let (routing, device) = (host.routing_bytes(phone.id), phone.device_bytes());
+    let slot = phone.impostor(host, transport);
+    host.assert_refusal(slot, "invalid possession proof");
+    assert_eq!(host.routing_bytes(phone.id), routing);
+    assert_eq!(phone.device_bytes(), device);
+    let mut live = phone.connect(host, transport);
+    read_device(phone, &mut live);
+    live
+}
+/// Assurance on a channel of a grant whose floor is `FreshBiometric`: possession
+/// alone is refused per request, an exact proof is accepted once, and the same
+/// proof cannot authorize a second request.
+fn assurance_gate(host: &Host, phone: &Phone, transport: Transport) -> Live {
+    let mut live = phone.connect(host, transport);
+    assert_eq!(
+        live.exchange(&phone.request("GET", DEVICE, &[]))
+            .unwrap()
+            .outcome(),
+        (403, "assurance_required"),
+        "{transport:?}: possession alone passed a step-up floor"
+    );
+    let challenge = live
+        .exchange(&phone.request("POST", CHALLENGE, &[]))
+        .unwrap();
+    let mut headers = Vec::new();
+    let proven = signed(phone.id, &phone.key, "GET", DEVICE, &[], |canonical| {
+        headers = phone.proof(host, &challenge, canonical);
+        headers.clone()
+    });
+    assert_eq!(live.exchange(&proven).unwrap().outcome(), (200, ""));
+    let reused = signed(phone.id, &phone.key, "GET", DEVICE, &[], |_| headers);
+    assert_eq!(
+        live.exchange(&reused).unwrap().outcome(),
+        (403, "assurance_required"),
+        "{transport:?}: a spent proof authorized a second request"
+    );
+    live
+}
+/// Under a `FreshBiometric` floor, a possession-only `prepare` is refused and
+/// leaves routing state untouched. A served request checks assurance twice, so
+/// this is where the first check alone decides the outcome.
+fn possession_cannot_start_a_handover(host: &Host, phone: &Phone) {
+    let routing = host.routing_bytes(phone.id);
+    assert_eq!(
+        phone
+            .control(
+                host,
+                serde_json::json!({"version":2,"operation":"prepare"}),
+                Assurance::Possession
+            )
+            .outcome(),
+        (403, "assurance_required")
+    );
+    assert_eq!(
+        host.routing_bytes(phone.id),
+        routing,
+        "a possession-only prepare changed routing state under a step-up floor"
+    );
+}
+/// The operator raises the floor on the pairing's current generation: the live
+/// channel closes, possession alone cannot start the handover, the device hands
+/// over with step-up proofs, and the assurance gate holds on the new generation.
+fn tightened_grant_gates(host: &Host, phone: &Phone, transport: Transport, mut live: Live) {
+    host.reissue(phone.id, AssuranceLevel::FreshBiometric);
+    assert!(
+        live.exchange(&phone.request("GET", DEVICE, &[])).is_err(),
+        "a channel admitted under the previous grant answered a request"
+    );
+    host.assert_refusal(live.slot, "grant changed");
+    possession_cannot_start_a_handover(host, phone);
+    phone.handover(host, Assurance::StepUp);
+    assurance_gate(host, phone, transport);
+}
 /// One continuous journey on one profile, from an enrolled pairing with no
 /// transport material to revocation.
 fn journey(transport: Transport) {
@@ -1256,6 +1359,7 @@ fn stale_generation(transport: Transport) {
     let _guard = super::super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
     let mut host = Host::new();
     let phone = host.enroll(42);
+    let bystander = host.enroll(52);
     host.start();
     let first = phone.adopt(&host, phone.prepare(&host, Assurance::Possession));
     assert_eq!(
@@ -1305,8 +1409,9 @@ fn stale_generation(transport: Transport) {
     let mut floors = [0, 0];
     floors[index(transport)] = 2;
     assert_eq!(host.committed(phone.id), (1, floors));
-    let mut live = live;
-    read_device(&phone, &mut live);
+    // The per-request gates hold on the generation that superseded it.
+    let live = request_gates(&host, &phone, &bystander, transport, live);
+    tightened_grant_gates(&host, &phone, transport, live);
     println!("v2-stale-generation transport={transport:?} verified");
 }
 
@@ -1323,6 +1428,7 @@ fn burned_pending_generation(transport: Transport) {
     let _guard = super::super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
     let mut host = Host::new();
     let phone = host.enroll(42);
+    let bystander = host.enroll(52);
     host.start();
     phone.handover(&host, Assurance::Possession);
     let mut live = phone.connect(&host, transport);
@@ -1377,7 +1483,7 @@ fn burned_pending_generation(transport: Transport) {
     let mut live = phone.connect(&host, transport);
     read_device(&phone, &mut live);
     burned.refused(&host, transport, "direct pairing unavailable");
-    let mut live = reconnect(&phone, &host, transport, live);
+    let live = reconnect(&phone, &host, transport, live);
     burned.refused(&host, transport, "direct pairing unavailable");
     for body in [
         acknowledge(&late),
@@ -1389,7 +1495,9 @@ fn burned_pending_generation(transport: Transport) {
     let mut floors = [0, 0];
     floors[index(transport)] = 2;
     assert_eq!(host.committed(phone.id), (2, floors));
-    read_device(&phone, &mut live);
+    // The per-request gates hold on the generation that replaced the burned one.
+    let live = request_gates(&host, &phone, &bystander, transport, live);
+    tightened_grant_gates(&host, &phone, transport, live);
     println!("v2-burned-generation transport={transport:?} verified");
 }
 
@@ -1407,6 +1515,7 @@ fn v1_material_is_refused_after_the_v2_floor_on_both_ingress_paths() {
     let _guard = super::super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
     let mut host = Host::new();
     let phone = host.enroll(42);
+    let bystander = host.enroll(52);
     host.start();
     let reply = host.https(&phone.request("POST", BOOTSTRAP, &[]));
     assert_eq!(reply.outcome(), (200, ""));
@@ -1506,5 +1615,19 @@ fn v1_material_is_refused_after_the_v2_floor_on_both_ingress_paths() {
     refuse_v1();
     // Only the v2 positive controls moved a counter.
     assert_eq!(host.committed(phone.id), (0, [1, 2]));
+    // The per-request gates hold on both of the upgraded client's v2 channels.
+    let mut live = live.into_iter();
+    let direct = live.next().unwrap();
+    let direct = request_gates(&host, &phone, &bystander, Transport::Direct, direct);
+    let relay = live.next().unwrap();
+    drop(request_gates(
+        &host,
+        &phone,
+        &bystander,
+        Transport::Relay,
+        relay,
+    ));
+    tightened_grant_gates(&host, &phone, Transport::Direct, direct);
+    assurance_gate(&host, &phone, Transport::Relay);
     println!("v2-floor-refuses-v1 verified");
 }

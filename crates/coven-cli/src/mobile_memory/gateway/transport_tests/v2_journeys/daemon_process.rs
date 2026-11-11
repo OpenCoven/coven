@@ -8,8 +8,8 @@
 //! `coven memory mobile device` command is a separate process from the daemon.
 //!
 //! Limits. Unix only, like the other daemon-process fixtures. Without a
-//! private-network address the daemon cannot bind its listener; the handover
-//! then runs on the in-process runtime before the daemon starts and only the
+//! private-network address the daemon cannot bind its listener; both handovers
+//! then run on the in-process runtime while no daemon is running and only the
 //! relay profile reaches the daemon process. The child is the test executable
 //! running the daemon's serve loop, not the installed `coven` binary.
 use super::*;
@@ -189,6 +189,7 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
         listener,
     );
     let phone = host.enroll(42);
+    let bystander = host.enroll(52);
     let profiles: &[Transport] = if listener.is_some() {
         &[Transport::Direct, Transport::Relay]
     } else {
@@ -238,13 +239,7 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
 
     // Connect and send signed requests on each profile's first counter room.
     let first_rooms = phone.image();
-    let mut live = connect(&host);
-    let replayed = phone.request("GET", DEVICE, &[]);
-    assert_eq!(live[0].exchange(&replayed).unwrap().status, 200);
-    assert_eq!(
-        live[0].exchange(&replayed).unwrap().outcome(),
-        (409, "request_replayed")
-    );
+    let live = connect(&host);
     assert_eq!(host.committed(phone.id), (0, floors(1)));
 
     // The daemon process is killed outright. Nothing is admitted while it is
@@ -268,26 +263,62 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
     assert_closed(&phone, &host, live, None);
     unreachable(&host);
     let daemon = Daemon::spawn(&host);
-    let mut live = connect(&host);
+    let live = connect(&host);
     assert_eq!(host.committed(phone.id), (0, floors(3)));
 
+    // The per-request gates hold on the restarted daemon's channels.
+    let live: Vec<Live> = profiles
+        .iter()
+        .zip(live)
+        .map(|(&transport, live)| request_gates(&host, &phone, &bystander, transport, live))
+        .collect();
+    assert_eq!(host.committed(phone.id), (0, floors(4)));
+
     // The operator acts from this process and the daemon enforces it in its
-    // own. With a gateway listener, a grant reissue closes the channels and the
-    // device hands over to generation 1 through the daemon.
-    if listener.is_some() {
-        let superseded = phone.image();
-        host.reissue(phone.id, AssuranceLevel::Possession);
-        assert_closed(&phone, &host, live, Some("grant changed"));
-        for &transport in profiles {
-            phone.refused(&host, transport, "direct pairing unavailable");
-        }
-        assert_eq!(phone.handover(&host, Assurance::Possession).0, 1);
-        live = connect(&host);
-        assert_eq!(host.committed(phone.id), (1, floors(1)));
-        for &transport in profiles {
-            superseded.refused(&host, transport, "direct pairing unavailable");
-        }
+    // own. Raising the assurance floor closes the channels and refuses the
+    // generation. The step-up handover to generation 1 goes through the daemon
+    // where it has a gateway listener, and through the in-process runtime while
+    // the daemon is stopped where it has none.
+    let superseded = phone.image();
+    host.reissue(phone.id, AssuranceLevel::FreshBiometric);
+    assert_closed(&phone, &host, live, Some("grant changed"));
+    for &transport in profiles {
+        phone.refused(&host, transport, "direct pairing unavailable");
     }
+    let daemon = if listener.is_some() {
+        possession_cannot_start_a_handover(&host, &phone);
+        assert_eq!(phone.handover(&host, Assurance::StepUp).0, 1);
+        daemon
+    } else {
+        daemon.stop(&host);
+        host.start();
+        possession_cannot_start_a_handover(&host, &phone);
+        assert_eq!(phone.handover(&host, Assurance::StepUp).0, 1);
+        host.stop();
+        Daemon::spawn(&host)
+    };
+    let live: Vec<Live> = profiles
+        .iter()
+        .map(|&transport| assurance_gate(&host, &phone, transport))
+        .collect();
+    assert_eq!(host.committed(phone.id), (1, floors(1)));
+    for &transport in profiles {
+        superseded.refused(&host, transport, "direct pairing unavailable");
+    }
+    // From here a served read needs a fresh step-up proof.
+    let connect = |host: &Host| -> Vec<Live> {
+        profiles
+            .iter()
+            .map(|&transport| {
+                let mut live = phone.connect(host, transport);
+                let wire = phone.stepped(host, "GET", DEVICE, &[], &mut |wire| {
+                    live.exchange(wire).unwrap()
+                });
+                assert_eq!(live.exchange(&wire).unwrap().outcome(), (200, ""));
+                live
+            })
+            .collect()
+    };
 
     // Suspension keeps the grant and its epoch, so only the daemon's re-read of
     // the device's status closes these channels. After a resume the same
