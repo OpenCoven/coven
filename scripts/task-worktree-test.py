@@ -101,6 +101,82 @@ class AllocationTests(GitFixture):
         self.assertEqual(sum((self.root / f'task-{n}').exists() for n in range(2)), 1)
         self.assertEqual(len(self.git('branch', '--format=%(refname:short)').splitlines()), 33)
 
+    def stray(self, count=1):
+        for n in range(count):
+            self.git('update-ref', f'refs/remotes/pr/{n + 1}', 'HEAD')
+
+    def counts(self):
+        result = self.run_tool('inventory')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_inventory_reports_stray_remote_refs_without_refusing(self):
+        self.stray(3)
+        report = self.counts()
+        self.assertEqual(report['counts']['stray remote refs'], 3)
+        self.assertEqual(report['limits'], {'task worktrees': 12, 'local branches': 32, 'origin branches': 48, 'stray remote refs': 0})
+
+    def test_clean_checkout_has_no_stray_remote_refs_and_passes_check(self):
+        self.assertEqual(self.counts()['counts']['stray remote refs'], 0)
+        result = self.run_tool('check')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_check_refuses_a_single_stray_remote_ref(self):
+        self.stray()
+        result = self.run_tool('check')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('stray remote refs: 1 > 0', result.stderr)
+        self.assertIn('worktree-lifecycle.md', result.stderr)
+
+    def test_stray_remote_ref_refuses_creation_without_any_artifact(self):
+        self.stray()
+        destination = self.root / 'task'
+        refs = self.git('for-each-ref')
+        worktrees = self.git('worktree', 'list', '--porcelain')
+        result = self.run_tool('create', '--issue', '42', '--branch', 'fix/42', '--path', str(destination))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('stray remote refs: 1 > 0', result.stderr)
+        self.assertFalse(os.path.lexists(destination))
+        self.assertEqual(self.git('for-each-ref'), refs)
+        self.assertEqual(self.git('worktree', 'list', '--porcelain'), worktrees)
+        self.assertFalse((self.repo / '.git' / 'task-worktree-allocation.lock').exists())
+
+    def test_configured_remotes_are_not_stray_and_origin_is_counted_once(self):
+        self.git('remote', 'add', 'origin', str(self.root / 'origin.git'))
+        self.git('remote', 'add', 'upstream', str(self.root / 'upstream.git'))
+        self.git('remote', 'add', 'team/fork', str(self.root / 'fork.git'))
+        self.git('update-ref', 'refs/remotes/origin/HEAD', 'HEAD')
+        self.git('update-ref', 'refs/remotes/origin/held/1', 'HEAD')
+        self.git('update-ref', 'refs/remotes/upstream/main', 'HEAD')
+        self.git('update-ref', 'refs/remotes/upstream/held/1', 'HEAD')
+        self.git('update-ref', 'refs/remotes/team/fork/main', 'HEAD')
+        counts = self.counts()['counts']
+        self.assertEqual(counts['stray remote refs'], 0)
+        self.assertEqual(counts['origin branches'], 1)
+        result = self.run_tool('create', '--issue', '42', '--branch', 'fix/42', '--path', str(self.root / 'task'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_origin_refs_are_never_stray_without_a_configured_origin(self):
+        self.git('update-ref', 'refs/remotes/origin/held/1', 'HEAD')
+        counts = self.counts()['counts']
+        self.assertEqual(counts['stray remote refs'], 0)
+        self.assertEqual(counts['origin branches'], 1)
+
+    def test_namespace_sharing_only_a_remote_name_prefix_is_stray(self):
+        self.git('remote', 'add', 'upstream', str(self.root / 'upstream.git'))
+        self.git('remote', 'add', 'team/fork', str(self.root / 'fork.git'))
+        self.git('update-ref', 'refs/remotes/upstream-old/main', 'HEAD')
+        self.git('update-ref', 'refs/remotes/origin-pr/7', 'HEAD')
+        self.git('update-ref', 'refs/remotes/team/other/main', 'HEAD')
+        self.assertEqual(self.counts()['counts']['stray remote refs'], 3)
+
+    def test_removing_a_remote_configuration_exposes_leftover_refs(self):
+        self.git('remote', 'add', 'upstream', str(self.root / 'upstream.git'))
+        self.git('update-ref', 'refs/remotes/upstream/main', 'HEAD')
+        self.assertEqual(self.counts()['counts']['stray remote refs'], 0)
+        self.git('config', '--remove-section', 'remote.upstream')
+        self.assertEqual(self.counts()['counts']['stray remote refs'], 1)
+
 
 class PublicationTests(GitFixture):
     def setUp(self):
@@ -160,6 +236,12 @@ else:
         result = self.run_tool('publish', '--issue', '42')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('main', result.stderr)
+
+    def test_stray_remote_refs_do_not_block_publication_of_existing_work(self):
+        self.git('update-ref', 'refs/remotes/pr/1', 'HEAD')
+        result = self.run_tool('publish', '--issue', '42')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.git('rev-parse', 'HEAD') + '\trefs/heads/fix/42', self.remote_heads())
 
     def test_budget_exception_is_recorded_before_publication(self):
         self.fill_remote(48)
