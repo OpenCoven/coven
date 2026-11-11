@@ -8,11 +8,12 @@
 //! signing keys, the pinned host certificate and key, and a private device
 //! directory. No test calls a routing storage owner on the host's behalf.
 //!
-//! Limits. The gateway's own accept loop is not used: it refuses loopback and port
-//! 0, so the per-connection function it calls is driven directly. A relay worker
-//! discards its error, so the exact refusal class is asserted on direct ingress
-//! only; on the relay profile a refusal is a failed attempt with both sides'
-//! durable counters unchanged. Sockets are loopback and keys are synthetic.
+//! Limits. The gateway's own accept loop refuses loopback and port 0, so these
+//! tests drive the per-connection function it calls; `daemon_process` reaches the
+//! accept loop itself where the machine has a private-network address. A relay
+//! worker discards its error, so the exact refusal class is asserted on direct
+//! ingress only; on the relay profile a refusal is a failed attempt with both
+//! sides' durable counters unchanged. Sockets are local and keys are synthetic.
 use super::*;
 use crate::mobile_memory::{
     assurance::{
@@ -34,11 +35,17 @@ use crate::mobile_memory::{
 use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore};
 use std::sync::Condvar;
 
+#[cfg(unix)]
+mod daemon_process;
+
 const BOOTSTRAP: &str = "/api/v1/mobile/transport/bootstrap";
 const DEVICE: &str = "/api/v1/mobile/device";
 const CHALLENGE: &str = "/api/v1/mobile/assurance/challenge";
-/// The subject name the fixture gives the host certificate.
+/// The subject name the fixture gives the host certificate when no production
+/// listener is bound.
 const HOST_NAME: &str = "192.0.2.1";
+/// Where a daemon process started for this host writes its standard error.
+const DAEMON_LOG: &str = "v2-journey-daemon.log";
 /// Hang guard only, far above anything load can produce. Nothing here asserts a
 /// duration; production protocol deadlines are unchanged.
 const HANG_GUARD: Duration = Duration::from_secs(120);
@@ -156,6 +163,38 @@ impl Drop for Running {
     }
 }
 
+/// The gateway listener of a daemon running in another process. Its accept loop
+/// reports each refused connection on standard error, which that process appends
+/// to `log`.
+struct External {
+    address: SocketAddr,
+    log: PathBuf,
+}
+impl External {
+    fn offset(&self) -> usize {
+        std::fs::read(&self.log).map_or(0, |log| log.len())
+    }
+    /// Wait for the accept loop to report this refusal after `offset`. Every
+    /// refusal is awaited before the next connection is dialled, so a report
+    /// after the offset belongs to the connection dialled at it.
+    fn await_refusal(&self, offset: usize, expected: &str) {
+        let line = format!("coven mobile gateway connection rejected: {expected}\n");
+        let started = Instant::now();
+        loop {
+            let log = std::fs::read(&self.log).unwrap_or_default();
+            let reported = String::from_utf8_lossy(&log[offset.min(log.len())..]).into_owned();
+            if reported.contains(&line) {
+                return;
+            }
+            assert!(
+                started.elapsed() < HANG_GUARD,
+                "the daemon never reported `{expected}`; it reported: {reported}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 /// The host installation: private state, the operator's device authority (the
 /// owner behind `coven memory mobile device`), a real relay router and, while
 /// started, the production runtime.
@@ -165,23 +204,33 @@ struct Host {
     operator: DeviceAuthority,
     key: p256::ecdsa::VerifyingKey,
     certificate: Vec<u8>,
+    /// The certificate's subject name.
+    name: String,
     client_tls: Arc<ClientConfig>,
     running: Option<Running>,
+    external: Option<External>,
 }
 impl Host {
     fn new() -> Self {
-        let home = tempfile::tempdir().unwrap();
-        let identity = load_or_create_host_identity(home.path(), HOST_NAME).unwrap();
+        Self::with(tempfile::tempdir().unwrap(), None)
+    }
+
+    /// With `listener`, the installation enables the gateway on that address for
+    /// a daemon process to bind; this process then starts no runtime of its own.
+    fn with(home: tempfile::TempDir, listener: Option<SocketAddr>) -> Self {
+        let name = listener.map_or_else(|| HOST_NAME.to_owned(), |bind| bind.ip().to_string());
+        let identity = load_or_create_host_identity(home.path(), &name).unwrap();
         let key = *SigningKey::from_pkcs8_der(&identity.private_key_der)
             .unwrap()
             .verifying_key();
         let relay = Relay::start_literal();
+        let bind = listener.unwrap_or_else(|| "192.168.50.1:7443".parse().unwrap());
         crate::mobile_memory::config::save_mobile_config(
             home.path(),
             &MobileGatewayConfig {
-                enabled: false,
-                bind: "192.168.50.1:7443".parse().unwrap(),
-                advertised_endpoint: "https://192.168.50.1:7443".into(),
+                enabled: listener.is_some(),
+                bind,
+                advertised_endpoint: format!("https://{bind}"),
             },
         )
         .unwrap();
@@ -206,10 +255,15 @@ impl Host {
         );
         Self {
             operator: DeviceAuthority::load(home.path()).unwrap(),
+            external: listener.map(|address| External {
+                address,
+                log: home.path().join(DAEMON_LOG),
+            }),
             home,
             relay,
             key,
             certificate: identity.certificate_der,
+            name,
             client_tls,
             running: None,
         }
@@ -256,7 +310,10 @@ impl Host {
     }
 
     fn start(&mut self) {
-        assert!(self.running.is_none(), "runtime is already started");
+        assert!(
+            self.running.is_none() && self.external.is_none(),
+            "a runtime already serves this installation"
+        );
         let runtime = start_mobile_gateway_for_daemon(self.home.path())
             .unwrap()
             .expect("relay runtime did not start");
@@ -332,9 +389,24 @@ impl Host {
         self.running.as_ref().expect("runtime is not started")
     }
 
-    /// The next direct connection's position in accept order.
+    /// Where direct ingress is served: this process's fixture listener, or the
+    /// daemon process's own gateway listener.
+    fn address(&self) -> SocketAddr {
+        match (&self.running, &self.external) {
+            (Some(running), _) => running.address,
+            (None, Some(external)) => external.address,
+            (None, None) => panic!("nothing serves direct ingress"),
+        }
+    }
+
+    /// A marker for the next direct connection: its position in accept order,
+    /// or the daemon log's length when a daemon process serves it.
     fn dial(&self) -> usize {
-        self.running().dials.fetch_add(1, Ordering::AcqRel)
+        match (&self.running, &self.external) {
+            (Some(running), _) => running.dials.fetch_add(1, Ordering::AcqRel),
+            (None, Some(external)) => external.offset(),
+            (None, None) => panic!("nothing serves direct ingress"),
+        }
     }
 
     /// How `serve_tls_connection` ended for one direct connection.
@@ -356,20 +428,22 @@ impl Host {
     /// Direct ingress reports the production refusal class. A relay worker
     /// discards its error, so the relay profile has nothing to compare.
     fn assert_refusal(&self, slot: Option<usize>, expected: &str) {
-        if let Some(slot) = slot {
-            assert_eq!(self.verdict(slot), Err(expected.to_owned()));
+        let Some(slot) = slot else { return };
+        match (&self.running, &self.external) {
+            (None, Some(external)) => external.await_refusal(slot, expected),
+            _ => assert_eq!(self.verdict(slot), Err(expected.to_owned())),
         }
     }
 
     /// One signed request over pinned TLS 1.3 to the production connection path.
     fn https(&self, wire: &[u8]) -> Reply {
         self.dial();
-        let socket = TcpStream::connect_timeout(&self.running().address, HANG_GUARD).unwrap();
+        let socket = TcpStream::connect_timeout(&self.address(), HANG_GUARD).unwrap();
         socket.set_read_timeout(Some(HANG_GUARD)).unwrap();
         socket.set_write_timeout(Some(HANG_GUARD)).unwrap();
         let connection = ClientConnection::new(
             Arc::clone(&self.client_tls),
-            ServerName::try_from(HOST_NAME).unwrap(),
+            ServerName::try_from(self.name.clone()).unwrap(),
         )
         .unwrap();
         let mut tls = StreamOwned::new(connection, socket);
@@ -396,9 +470,9 @@ impl Host {
             ),
             Transport::Direct => {
                 let slot = self.dial();
-                let address = self.running().address;
+                let address = self.address();
                 let endpoint = websocket::EndpointConfig {
-                    url: format!("wss://{HOST_NAME}:{}/ws", address.port()),
+                    url: format!("wss://{}:{}/ws", self.name, address.port()),
                     ca_certificates: vec![encode(&self.certificate)],
                 }
                 .parse()
