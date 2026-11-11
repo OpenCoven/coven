@@ -1033,6 +1033,16 @@ enum MobileRelayCommand {
     Enable,
     #[command(about = "Disable relay access while retaining paired devices and endpoint settings")]
     Disable,
+    #[command(
+        about = "Reset relay settings to disabled with no endpoints, retaining devices and identity"
+    )]
+    Reset {
+        #[arg(
+            long,
+            help = "Confirm discarding all relay endpoints and certificate trust"
+        )]
+        yes: bool,
+    },
     #[command(about = "Show relay configuration status (not connection status)")]
     Status {
         #[arg(long)]
@@ -2521,6 +2531,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                     }
                     MobileRelayCommand::Enable => mobile_memory::relay::run_enable(),
                     MobileRelayCommand::Disable => mobile_memory::relay::run_disable(),
+                    MobileRelayCommand::Reset { yes } => mobile_memory::relay::run_reset(yes),
                     MobileRelayCommand::Status { json } => mobile_memory::relay::run_status(json),
                 },
                 MobileMemoryCommand::Enable { bind, endpoint } => {

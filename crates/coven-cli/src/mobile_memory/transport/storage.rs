@@ -49,24 +49,40 @@ pub struct RelayConfig {
     pub endpoints: Vec<EndpointConfig>,
 }
 impl RelayConfig {
-    /// Serialize incremental operator changes across threads and processes.
-    pub fn update(home: &Path, operation: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+    fn disabled() -> Self {
+        Self {
+            listener_limit: MAX_LISTENERS,
+            version: 1,
+            enabled: false,
+            endpoints: Vec::new(),
+        }
+    }
+
+    fn with_config_lock(home: &Path, operation: impl FnOnce() -> Result<()>) -> Result<()> {
         let _process = CONFIG_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("relay configuration lock poisoned"))?;
         let directory = ensure_private_mobile_dir(home)?;
         let lock = crate::state_lock::open_lock_file(&directory.join(".relay.lock"))?;
         lock.lock_exclusive()?;
-        let mut config = Self::load(home)?.unwrap_or(Self {
-            listener_limit: MAX_LISTENERS,
-            version: 1,
-            enabled: false,
-            endpoints: Vec::new(),
-        });
-        operation(&mut config)?;
-        config.save(home)?;
+        operation()?;
         FileExt::unlock(&lock)?;
         Ok(())
+    }
+
+    /// Serialize incremental operator changes across threads and processes.
+    pub fn update(home: &Path, operation: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        Self::with_config_lock(home, || {
+            let mut config = Self::load(home)?.unwrap_or_else(Self::disabled);
+            operation(&mut config)?;
+            config.save(home)
+        })
+    }
+
+    /// Replace configuration without decoding damaged state. Private-file and
+    /// atomic-replacement checks still apply; paired material is never opened.
+    pub fn reset(home: &Path) -> Result<()> {
+        Self::with_config_lock(home, || Self::disabled().save(home))
     }
 
     pub fn disable(home: &Path) -> Result<bool> {
@@ -107,6 +123,12 @@ impl RelayConfig {
         Ok(())
     }
     pub fn load(home: &Path) -> Result<Option<Self>> {
+        Self::load_inner(home).context(
+            "cannot read relay configuration; to discard relay settings and disable access, run `coven memory mobile relay reset --yes` (paired devices and identity are retained)",
+        )
+    }
+
+    fn load_inner(home: &Path) -> Result<Option<Self>> {
         let directory = home.join("mobile");
         if !exists(&directory)? {
             return Ok(None);
