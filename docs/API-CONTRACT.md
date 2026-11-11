@@ -178,6 +178,10 @@ durability.
 
 ### Capability fields
 
+The health example contains all 18 common capability fields.
+
+Windows adds the optional 19th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 18 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination.
+
 | Field             | Type    | Description                                                       |
 |-------------------|---------|-------------------------------------------------------------------|
 | `sessions`        | boolean | Sessions API (`/sessions`, `/sessions/:id`) is available.        |
@@ -198,6 +202,13 @@ durability.
 | `afsCommitDryRun` | boolean | AFS commit accepts the side-effect-free `dryRun` contract. |
 | `executionBindingContracts` | string array | Psyche execution-binding contract names this daemon accepts. Currently `["psyche.execution_binding.v1"]`. This remains the additive O2 capability field, including for O2-only bound kill integrations. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
 | `requestAdoptionContracts` | string array | Psyche request-adoption contract names accepted by the dedicated adopted launch/input routes. Currently `["psyche.request_adoption.v1"]`. This O3 value advertises the composite adopted-route contract, including its mandatory per-request exact O2 proof. The bundled adopted client checks this exact value before POST and does not independently gate those methods on `executionBindingContracts`; absence, malformed data, or an unsupported value fails locally without legacy fallback. See [Psyche request-adoption contract (`v1`)](#psyche-request-adoption-contract-v1). |
+| `lifecycleShutdown` | optional string | Windows only. Currently `"observed-workers-v1"`. Omitted on other platforms and older daemons; see [Windows lifecycle shutdown](#windows-lifecycle-shutdown). |
+
+## Windows lifecycle shutdown
+
+The Windows stop client retains the authenticated daemon process HANDLE and opens a new owner-validated pipe bound to the same PID and process creation time. It sends `POST /api/v1/internal/lifecycle/shutdown` with `apiVersion: "coven.daemon.v1"` and the exact `daemon` object obtained from authenticated health. The daemon validates the serving identity before accepting shutdown; this internal owner-local route grants no TCP or mobile authority.
+
+When health advertises `lifecycleShutdown: "observed-workers-v1"`, the client requires HTTP `202` with `ok: true`, the exact named `apiVersion`, `capabilities.structuredErrors: true`, the exact lifecycle contract, and the same `daemon` object. This acknowledgement accepts shutdown; it is not a stopped receipt. The client retains the pipe and process HANDLE and waits for daemon exit within its original two-second lifecycle deadline. The daemon observes owned mobile-worker exit and joins cleanup before releasing ownership. A timeout, malformed response, identity change, or required-contract refusal never permits root-termination fallback or status clearing. Legacy root termination is allowed only when the capability is absent and the authenticated same-instance pipe explicitly returns `404` or `405`; an absent capability alone is insufficient.
 
 ## Structured error envelope
 

@@ -178,14 +178,14 @@ impl Process {
         }
         #[cfg(test)]
         if let Some(release) = self.observation_release.as_ref() {
+            if !self.observation_reported {
+                publish_test_observation(
+                    &release.with_extension("worker-pid"),
+                    self.child.id().to_string().as_bytes(),
+                )?;
+                self.observation_reported = true;
+            }
             if !release.exists() {
-                if !self.observation_reported {
-                    publish_test_observation(
-                        &release.with_extension("worker-pid"),
-                        self.child.id().to_string().as_bytes(),
-                    )?;
-                    self.observation_reported = true;
-                }
                 // Withhold observation only. The unchanged real termination
                 // path still owns and signals the child/tree; no success or
                 // reaped flag is fabricated while the test gate is closed.

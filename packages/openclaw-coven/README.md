@@ -107,12 +107,7 @@ The minimal fixture field names follow the Rust daemon's serialization rules:
 - `GET /api/v1/sessions`, `POST /api/v1/sessions`, `GET /api/v1/sessions/:id` — snake_case (`project_root`, `exit_code`, `created_at`, `updated_at`)
 - `GET /api/v1/events` — snake_case (`session_id`, `payload_json`, `created_at`)
 
-The complete current 18-field Rust health-capability DTO is maintained in the
-canonical [API contract](../../docs/API-CONTRACT.md#get-apiv1health), rather
-than duplicated here. It includes `requestAdoptionContracts`, which the
-adopted methods require, and `sessionPolicyContracts`, which advertises the
-refusal-only restricted-session boundary; the six-field fixture subset above
-is not exhaustive.
+The complete current Rust health-capability DTO has 18 common fields and an optional Windows-only 19th field, `lifecycleShutdown: "observed-workers-v1"`, and is maintained in the canonical [API contract](../../docs/API-CONTRACT.md#get-apiv1health) rather than duplicated here. It includes `requestAdoptionContracts`, which the adopted methods require, and `sessionPolicyContracts`, which advertises the refusal-only restricted-session boundary; the six-field fixture subset above is not exhaustive.
 A store-backed response may also include the optional top-level `hub` summary.
 
 Separately, `GET /api/v1/api-version` is a legacy route-family diagnostic with

@@ -8,6 +8,7 @@ use std::process::{Child, Command, Stdio};
 
 const OWNER: &str = "daemon::windows_retained_tests::windows_retained_owner_fixture";
 const LEGACY: &str = "daemon::windows_retained_tests::windows_legacy_owner_fixture";
+const LEGACY_UNSUPPORTED_RECEIPT: &str = "legacy-unsupported-shutdown.json";
 
 // Keep both identities in one cleanup owner. A local worker guard declared
 // after the root would otherwise drop first during unwind and lose the child
@@ -336,7 +337,7 @@ fn windows_legacy_owner_fixture() {
         let line = read_http_request_line(&mut reader).unwrap();
         let (method, path) = parse_request_line(&line).unwrap();
         let headers = read_http_headers(&mut reader).unwrap();
-        let _body = read_http_body(&mut reader, headers.content_length).unwrap();
+        let body = read_http_body(&mut reader, headers.content_length).unwrap();
         let response = if method == "GET" && path == "/health" {
             crate::api::json_response(200, &serde_json::json!({ "ok": true, "apiVersion": crate::api::COVEN_API_NAMED_VERSION, "covenVersion": "legacy-fixture", "capabilities": { "structuredErrors": true }, "daemon": &status })).unwrap()
         } else {
@@ -348,6 +349,27 @@ fn windows_legacy_owner_fixture() {
             )
             .unwrap()
         };
+        if method == "POST" && path == "/api/v1/internal/lifecycle/shutdown" {
+            assert_eq!(response.status, 404);
+            let request: serde_json::Value =
+                serde_json::from_str(body.as_deref().expect("shutdown identity body")).unwrap();
+            assert_eq!(request["apiVersion"], crate::api::COVEN_API_NAMED_VERSION);
+            assert_eq!(request["daemon"], serde_json::to_value(&status).unwrap());
+            let receipt = serde_json::to_vec(&serde_json::json!({
+                "method": method,
+                "path": path,
+                "responseStatus": response.status,
+                "request": request,
+            }))
+            .unwrap();
+            let target = home.join(LEGACY_UNSUPPORTED_RECEIPT);
+            let staged = target.with_extension(format!("{}.pending", uuid::Uuid::new_v4()));
+            // Publish before the reply: the checked caller may terminate this
+            // old owner immediately after receiving its explicit 404. Stop
+            // success plus this receipt proves the exact request/fallback path.
+            std::fs::write(&staged, receipt).unwrap();
+            std::fs::rename(staged, target).unwrap();
+        }
         write_api_response(&mut &stream, &response).unwrap();
         let interprocess::local_socket::Stream::NamedPipe(pipe) = &stream;
         pipe.inner().assume_flushed();
@@ -358,7 +380,7 @@ fn windows_legacy_owner_fixture() {
 fn windows_legacy_explicit_unsupported_peer_retains_stop_compatibility() {
     let home = fixture_home();
     let mut child = spawn_fixture(home.path(), LEGACY, None);
-    wait_ready(home.path(), &mut child, None);
+    let original = wait_ready(home.path(), &mut child, None);
     let started = Instant::now();
     assert!(stop_background_server(home.path()).unwrap());
     assert!(
@@ -367,5 +389,125 @@ fn windows_legacy_explicit_unsupported_peer_retains_stop_compatibility() {
         started.elapsed()
     );
     wait_exit(&mut child);
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(LEGACY_UNSUPPORTED_RECEIPT))
+            .expect("legacy stop bypassed the explicit unsupported shutdown request"),
+    )
+    .unwrap();
+    assert_eq!(receipt["method"], "POST");
+    assert_eq!(receipt["path"], "/api/v1/internal/lifecycle/shutdown");
+    assert_eq!(receipt["responseStatus"], 404);
+    assert_eq!(
+        receipt["request"]["apiVersion"],
+        crate::api::COVEN_API_NAMED_VERSION
+    );
+    assert_eq!(
+        receipt["request"]["daemon"],
+        serde_json::to_value(&original).unwrap()
+    );
+    assert!(!daemon_status_path(home.path()).exists());
+}
+
+#[test]
+fn windows_shutdown_acknowledgement_echoes_observed_worker_contract() {
+    let status = DaemonStatus {
+        pid: 17,
+        started_at: "native-fixture".into(),
+        socket: "coven-daemon-native-fixture.sock".into(),
+        process_creation_time: Some(WindowsProcessCreationTime::new(23).unwrap()),
+    };
+    let body = serde_json::to_string(&serde_json::json!({
+        "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
+        "daemon": &status,
+    }))
+    .unwrap();
+    let (response, retain) = lifecycle_shutdown_response(Some(&status), Some(&body)).unwrap();
+    assert_eq!(response.status, 202);
+    assert!(
+        retain,
+        "accepted shutdown did not retain its identity-bound connection"
+    );
+    let acknowledgement: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(
+        acknowledgement["capabilities"]["lifecycleShutdown"],
+        "observed-workers-v1"
+    );
+    assert_eq!(
+        acknowledgement["daemon"],
+        serde_json::to_value(&status).unwrap()
+    );
+}
+
+#[test]
+fn windows_cooperative_stop_observes_real_mobile_exit_before_success() {
+    use crate::mobile_memory::{
+        identity,
+        registry::DeviceRegistry,
+        transport::{storage, test_support::Relay},
+    };
+    let home = fixture_home();
+    identity::load_or_create_host_identity(home.path(), "192.0.2.1").unwrap();
+    DeviceRegistry::load(home.path()).unwrap();
+    let relay = Relay::start();
+    storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(home.path())
+    .unwrap();
+    // An already-open gate reports the actual child identity without ever
+    // withholding production exit observation on this successful stop path.
+    let observation = home.path().join("mobile-observation-open");
+    std::fs::write(&observation, b"normal native exit observation allowed\n").unwrap();
+    let mut child = spawn_fixture(home.path(), OWNER, Some(&observation));
+    let status = wait_ready(home.path(), &mut child, Some(&observation));
+    let worker_pid = child
+        .retain_worker_before_stop(&observation.with_extension("worker-pid"))
+        .expect("retain actual native worker HANDLE before normal stop");
+    let health = coven_client::probe_windows_daemon_health_with_identity_until(
+        &status.socket,
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap()
+    .expect("actual Windows daemon health disappeared before normal stop");
+    assert_eq!(health.status, 200);
+    let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
+    assert_eq!(
+        health["capabilities"]["lifecycleShutdown"], "observed-workers-v1",
+        "actual Windows health omitted the observed-worker contract"
+    );
+    let started = Instant::now();
+    let stopped = stop_background_server(home.path());
+    let elapsed = started.elapsed();
+    let exited_at_success = child.wait_worker_exit(Duration::ZERO);
+    wait_exit(&mut child);
+    let worker_exited = child.wait_worker_exit(Duration::from_secs(30));
+    assert!(
+        matches!(worker_exited, Ok(true)),
+        "actual native worker {worker_pid} cleanup exit remained unobserved: {worker_exited:?}"
+    );
+    assert!(
+        matches!(exited_at_success, Ok(true)),
+        "stop returned before native worker {worker_pid} exit was observed: {exited_at_success:?}"
+    );
+    assert!(
+        matches!(stopped, Ok(true)),
+        "cooperative native Windows stop failed after {elapsed:?}: {stopped:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "cooperative Windows stop exceeded the strict two-second contract: {elapsed:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("serve-result")).unwrap(),
+        "ok",
+        "stop reported success despite failed checked worker cleanup"
+    );
+    assert!(crate::state_lock::try_acquire_exclusive(home.path())
+        .unwrap()
+        .is_some());
+    assert!(acquire_serve_lock(home.path()).is_ok());
     assert!(!daemon_status_path(home.path()).exists());
 }
