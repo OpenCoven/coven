@@ -671,6 +671,7 @@ mod tests {
 
 #[cfg(test)]
 mod snapshot_install_tests {
+    mod mixed;
     mod process;
     use super::*;
     use crate::mobile_memory::transport::storage::v2::tests::Fixture;
