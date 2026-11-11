@@ -123,6 +123,42 @@ fn unreadable_relay_errors_name_the_confirmed_recovery_command() {
 }
 
 #[test]
+fn unreadable_relay_diagnostics_do_not_echo_saved_json_fields_or_values() {
+    const PRIVATE: &str = "relay-private-fixture";
+    for bytes in [
+        br#""relay-private-fixture""#.to_vec(),
+        br#"{"version":1,"enabled":"relay-private-fixture","endpoints":[]}"#.to_vec(),
+        br#"{"version":1,"enabled":false,"endpoints":[],"relay-private-fixture":true}"#.to_vec(),
+        br#"{"version":1,"enabled":false,"endpoints":["relay-private-fixture"]}"#.to_vec(),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        private_file(home.path(), "relay.json", &bytes);
+        for args in [
+            vec!["status"],
+            vec!["status", "--json"],
+            vec!["disable"],
+            vec!["add", "--endpoint", "wss://relay.example.test/ws"],
+            vec!["remove", "--endpoint", "wss://relay.example.test/ws"],
+        ] {
+            let output = relay(home.path(), &args);
+            assert!(!output.status.success(), "{output:?}");
+            for stream in [&output.stdout, &output.stderr] {
+                assert!(
+                    !String::from_utf8_lossy(stream).contains(PRIVATE),
+                    "saved relay JSON was printed: {output:?}"
+                );
+            }
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("coven memory mobile relay reset --yes"));
+            assert_eq!(
+                fs::read(home.path().join("mobile/relay.json")).unwrap(),
+                bytes
+            );
+        }
+    }
+}
+
+#[test]
 fn reset_is_idempotent_and_does_not_create_identity_or_devices() {
     let home = tempfile::tempdir().unwrap();
     assert!(!relay(home.path(), &["reset"]).status.success());

@@ -138,7 +138,16 @@ impl RelayConfig {
         if !exists(&path)? {
             return Ok(None);
         }
-        let config: Self = serde_json::from_slice(&read_private(&path)?)?;
+        let config: Self = serde_json::from_slice(&read_private(&path)?).map_err(|error| {
+            // Serde data errors can quote saved field names and values. The CLI
+            // prints error chains, so retain only structural parse diagnostics.
+            anyhow::anyhow!(
+                "invalid relay configuration JSON ({:?}, line {}, column {})",
+                error.classify(),
+                error.line(),
+                error.column()
+            )
+        })?;
         config.validate()?;
         Ok(Some(config))
     }
