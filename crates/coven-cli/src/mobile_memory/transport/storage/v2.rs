@@ -320,6 +320,8 @@ fn locked_checked<T>(
         match MATERIAL_LOCK.try_lock() {
             Ok(guard) => break guard,
             Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                crate::mobile_memory::store_lock::notify_process_wait();
                 std::thread::sleep(std::time::Duration::from_millis(10))
             }
             Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -334,6 +336,8 @@ fn locked_checked<T>(
         match lock.try_lock_exclusive() {
             Ok(()) => break,
             Err(error) if crate::state_lock::is_lock_contended(&error) => {
+                #[cfg(test)]
+                crate::mobile_memory::store_lock::notify(&directory.join(".transport.lock"));
                 std::thread::sleep(std::time::Duration::from_millis(10))
             }
             Err(error) => return Err(error.into()),

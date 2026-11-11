@@ -650,3 +650,7 @@ pub(super) mod tests;
 #[cfg(test)]
 #[path = "../../tests/fixtures/device-attestation/admission.rs"]
 mod attestation_tests;
+
+#[cfg(test)]
+#[path = "enrollment_entries_contention_tests.rs"]
+mod entries_contention_tests;

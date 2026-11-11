@@ -187,7 +187,7 @@ thread_local! {
     static PROCESS_WAITER: RefCell<Option<mpsc::SyncSender<()>>> = const { RefCell::new(None) };
 }
 #[cfg(test)]
-fn notify_process_wait() {
+pub(super) fn notify_process_wait() {
     PROCESS_WAITER.with(|slot| {
         if let Some(sender) = slot.borrow().as_ref() {
             let _ = sender.try_send(());

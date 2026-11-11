@@ -1,6 +1,5 @@
-//! Repository test-child adapter. This file is intentionally NOT linked into
-//! the isolated mock-native probe; parent must compile it against the real
-//! gateway before treating any result as native process-wrapper evidence.
+//! Real native gateway child adapter for controlled storage and lifecycle cuts.
+//! Checkpoint holds model admitted work without claiming a physical disk stall.
 use super::super::super::config::MobileWritePhase;
 use super::*;
 use std::path::{Path, PathBuf};

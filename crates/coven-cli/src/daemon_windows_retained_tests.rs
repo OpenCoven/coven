@@ -3,18 +3,91 @@
 //! These tests require execution on Windows and do not model physical I/O.
 #![cfg(windows)]
 use super::*;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::{Child, Command, Stdio};
 
 const OWNER: &str = "daemon::windows_retained_tests::windows_retained_owner_fixture";
 const LEGACY: &str = "daemon::windows_retained_tests::windows_legacy_owner_fixture";
 
-struct OwnedChild(Child);
+// Keep both identities in one cleanup owner. A local worker guard declared
+// after the root would otherwise drop first during unwind and lose the child
+// witness before the root lifetime Job initiates its asynchronous termination.
+struct OwnedChild(Child, Option<OwnedHandle>);
+
+fn observe_worker_exit(worker: &OwnedHandle, milliseconds: u32) -> std::io::Result<bool> {
+    use windows_sys::Win32::{
+        Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::WaitForSingleObject,
+    };
+    match unsafe { WaitForSingleObject(worker.as_raw_handle(), milliseconds) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(std::io::Error::last_os_error()),
+        value => Err(std::io::Error::other(format!(
+            "unexpected worker wait result {value}"
+        ))),
+    }
+}
+
+impl OwnedChild {
+    fn retain_worker_before_stop(&mut self, marker: &Path) -> std::io::Result<u32> {
+        use windows_sys::Win32::System::Threading::OpenProcess;
+        let pid = std::fs::read_to_string(marker)?
+            .trim()
+            .parse::<u32>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        // The fresh marker comes from the actual root-owned Child. Retain its
+        // kernel identity before stopping that root; no PID reopening follows
+        // root exit and the handle has no termination or write permission.
+        const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+        let handle = unsafe { OpenProcess(SYNCHRONIZE_ACCESS, 0, pid) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.1 = Some(unsafe { OwnedHandle::from_raw_handle(handle) });
+        if observe_worker_exit(self.1.as_ref().unwrap(), 0)? {
+            return Err(std::io::Error::other(
+                "native worker exited before the stop fixture",
+            ));
+        }
+        Ok(pid)
+    }
+
+    fn wait_worker_exit(&self, timeout: Duration) -> std::io::Result<bool> {
+        let worker = self
+            .1
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("worker HANDLE was not retained"))?;
+        let milliseconds = timeout.as_millis().min((u32::MAX - 1) as u128) as u32;
+        observe_worker_exit(worker, milliseconds)
+    }
+}
+
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
             let _ = self.0.kill();
         }
         let _ = self.0.wait();
+        if let Some(worker) = self.1.as_ref() {
+            // Test failure is not permission to detach authority. The normal
+            // explicit wait below is bounded for diagnosis; unwind cleanup
+            // keeps this stable witness until actual worker exit is observed.
+            let mut reported = false;
+            loop {
+                match observe_worker_exit(worker, 1000) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => {
+                        if !reported {
+                            eprintln!("Windows fixture worker cleanup observation failed: {error}");
+                            reported = true;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -43,7 +116,7 @@ fn spawn_fixture(home: &Path, entry: &str, observation_release: Option<&Path>) -
     } else {
         command.env_remove("COVEN_TEST_MOBILE_OBSERVATION_RELEASE");
     }
-    OwnedChild(command.spawn().unwrap())
+    OwnedChild(command.spawn().unwrap(), None)
 }
 
 fn wait_ready(home: &Path, child: &mut OwnedChild, expect_gate: Option<&Path>) -> DaemonStatus {
@@ -168,6 +241,9 @@ fn windows_stop_preserves_owner_until_mobile_exit_is_observed() {
     let release = home.path().join("release-worker-observation");
     let mut child = spawn_fixture(home.path(), OWNER, Some(&release));
     let original = wait_ready(home.path(), &mut child, Some(&release));
+    let worker_pid = child
+        .retain_worker_before_stop(&release.with_extension("worker-pid"))
+        .expect("retain actual native worker HANDLE before stop");
     let started = Instant::now();
     // This is the actual CLI controller, authenticated pipe request, retained
     // root HANDLE and real worker cleanup. Only exit observation is withheld.
@@ -194,6 +270,9 @@ fn windows_stop_preserves_owner_until_mobile_exit_is_observed() {
     // No cleanup thread or live authority is detached by a failing assertion.
     std::fs::write(&release, b"resume actual worker exit observation\n").unwrap();
     wait_exit(&mut child);
+    let cleanup_started = Instant::now();
+    let worker_exited = child.wait_worker_exit(Duration::from_secs(30));
+    assert!(matches!(worker_exited, Ok(true)), "actual native worker {worker_pid} exit remained unobserved during RED cleanup after {:?}: {worker_exited:?}", cleanup_started.elapsed());
     assert!(stopped.is_err(), "Windows stop falsely reported stopped with observation withheld: {stopped:?}; elapsed={elapsed:?}");
     assert!(format!("{:#}", stopped.unwrap_err()).contains("not clearing daemon status"));
     assert!(alive && serve_locked && profile_locked && pipe_retained, "Windows owner/profile/pipe escaped while worker exit was unobserved: alive={alive} serve_locked={serve_locked} profile_locked={profile_locked} pipe={pipe_retained}");

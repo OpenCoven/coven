@@ -1,8 +1,5 @@
-//! Real config::atomic_create_private child-process crash/error regressions.
-//! Copy beside config.rs and include from config with:
-//! #[cfg(test)] #[path = "config_crash_create_tests.rs"] mod crash_create_tests;
-//! These are filesystem component tests, not native gateway acceptance.
-#![cfg(unix)]
+//! Create-only authority crash/error/race regressions with real native children.
+//! These filesystem component tests complement the native gateway process cuts.
 use super::*;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -62,6 +59,19 @@ struct OwnedFixture {
     reaped: bool,
 }
 impl OwnedFixture {
+    fn has_exited(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            crate::pty_runner::poll_child_exit_without_reaping(&self.child).unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows containment uses the retained Job HANDLE; observing the
+            // leader cannot recycle the containment identity before cleanup.
+            self.child.try_wait().unwrap().is_some()
+        }
+    }
+
     fn finish(&mut self, terminate: bool) {
         if self.reaped {
             return;
@@ -71,7 +81,7 @@ impl OwnedFixture {
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if crate::pty_runner::poll_child_exit_without_reaping(&self.child).unwrap() {
+            if self.has_exited() {
                 break;
             }
             assert!(
@@ -127,7 +137,7 @@ fn wait_checkpoint(child: &mut OwnedFixture, home: &Path, selected: &str) {
             return;
         }
         assert!(
-            !crate::pty_runner::poll_child_exit_without_reaping(&child.child).unwrap(),
+            !child.has_exited(),
             "fixture exited before selected phase {selected}; outcome={:?}",
             fs::read_to_string(home.join("outcome"))
         );
@@ -139,10 +149,8 @@ fn wait_checkpoint(child: &mut OwnedFixture, home: &Path, selected: &str) {
     }
 }
 
-/// FIRST RED: current create_new(final) leaves a zero-byte final floor after
-/// TempCreated SIGKILL. Run this before integrating the staged-create fix.
+/// A killed staging writer must never expose an empty canonical floor.
 #[test]
-#[cfg(unix)]
 fn create_new_kill_at_temp_created_does_not_publish_an_empty_protocol_floor() {
     let home = tempfile::tempdir().unwrap();
     let mobile = ensure_private_mobile_dir(home.path()).unwrap();
@@ -160,7 +168,6 @@ fn create_new_kill_at_temp_created_does_not_publish_an_empty_protocol_floor() {
 }
 
 #[test]
-#[cfg(unix)]
 fn create_new_prepublication_write_and_sync_errors_leave_absent_floor_retryable() {
     for selected in ["TempCreated", "Written", "FileSynced"] {
         let home = tempfile::tempdir().unwrap();
@@ -271,6 +278,7 @@ fn staged_creators_publish_one_complete_winner_without_clobbering() {
 }
 
 #[test]
+#[cfg(unix)]
 fn existing_private_read_only_authority_does_not_require_new_write_access() {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
