@@ -38534,9 +38534,13 @@ tier = 0
         Ok(())
     }
 
+    // The `threads_` prefix is load-bearing: hosted CI runs the feature-built
+    // unit tests with a `threads_` name filter, so this refusal contract is
+    // exercised on every platform there and not only locally.
     #[cfg(feature = "threads-test-clock")]
     #[test]
-    fn ward_power_loss_fixture_control_requires_owner_transport_and_active_fixture() -> Result<()> {
+    fn threads_ward_power_loss_fixture_control_requires_owner_transport_and_active_fixture(
+    ) -> Result<()> {
         let temp = tempfile::tempdir()?;
         let body = r#"{"capability":"fixture-cap","action":"fail-next-store-sync"}"#;
         let response = handle_request_with_runtime_and_authority(
