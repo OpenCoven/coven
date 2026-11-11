@@ -170,6 +170,18 @@ class AllocationTests(GitFixture):
         self.git('update-ref', 'refs/remotes/team/other/main', 'HEAD')
         self.assertEqual(self.counts()['counts']['stray remote refs'], 3)
 
+    def test_remote_settings_without_a_url_do_not_adopt_a_namespace(self):
+        self.stray()
+        self.git('config', 'remote.pr.prune', 'true')
+        self.assertEqual(self.counts()['counts']['stray remote refs'], 1)
+        self.git('config', 'remote.pr.url', str(self.root / 'pr.git'))
+        self.assertEqual(self.counts()['counts']['stray remote refs'], 0)
+
+    def test_stray_symbolic_head_is_counted_with_its_target(self):
+        self.git('update-ref', 'refs/remotes/old/main', 'HEAD')
+        self.git('symbolic-ref', 'refs/remotes/old/HEAD', 'refs/remotes/old/main')
+        self.assertEqual(self.counts()['counts']['stray remote refs'], 2)
+
     def test_removing_a_remote_configuration_exposes_leftover_refs(self):
         self.git('remote', 'add', 'upstream', str(self.root / 'upstream.git'))
         self.git('update-ref', 'refs/remotes/upstream/main', 'HEAD')

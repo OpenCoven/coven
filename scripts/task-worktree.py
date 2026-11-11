@@ -21,7 +21,11 @@ def inventory():
     # Remote names may contain slashes, so match whole namespace prefixes. A
     # tracking ref outside origin and every configured remote has no owner
     # that a fetch --prune would ever reconcile.
-    owned = tuple(f'refs/remotes/{name}/' for name in {'origin', *git('remote').splitlines()})
+    # A remote is configured only when it has a URL; a lone setting such as
+    # remote.<name>.prune must not adopt a namespace. No match exits 1.
+    urls = subprocess.run(['git', 'config', '--name-only', '--get-regexp', r'^remote\..+\.url$'],
+                          capture_output=True, text=True).stdout.splitlines()
+    owned = tuple(f'refs/remotes/{name}/' for name in {'origin', *(key[len('remote.'):-len('.url')] for key in urls)})
     tracking = git('for-each-ref', '--format=%(refname)', 'refs/remotes').splitlines()
     return {
         'task worktrees': max(0, len(worktrees) - 1),
