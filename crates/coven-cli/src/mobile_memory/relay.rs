@@ -133,6 +133,15 @@ pub fn run_disable() -> Result<()> {
     println!("Relay disabled in configuration. Running relay connections will close.");
     Ok(())
 }
+pub fn run_reset(yes: bool) -> Result<()> {
+    ensure!(
+        yes,
+        "reset discards all relay endpoints and certificate trust and disables relay access; paired devices and identity are retained; rerun with `coven memory mobile relay reset --yes` to confirm"
+    );
+    RelayConfig::reset(&crate::coven_home_dir()?)?;
+    println!("Relay configuration reset to disabled with no endpoints. Paired devices and identity are retained. Running relay connections will close.");
+    Ok(())
+}
 pub fn run_status(json: bool) -> Result<()> {
     let config = RelayConfig::load(&crate::coven_home_dir()?)?;
     let status = Status {
