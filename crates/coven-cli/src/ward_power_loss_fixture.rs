@@ -31,6 +31,8 @@ const ACTIVATION_SENTINEL: &str = "ward_power_loss_v1";
 const CAPABILITY_FILE: &str = "capability";
 const FROZEN_DATABASE: &str = "frozen-coven.sqlite3";
 const FROZEN_WAL: &str = "frozen-coven.sqlite3-wal";
+const BASELINE_CHECKPOINT_ATTEMPTS: usize = 100;
+const BASELINE_CHECKPOINT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 struct Active {
     home: PathBuf,
@@ -208,12 +210,23 @@ pub(crate) fn control(coven_home: &Path, request: &ControlRequest) -> Result<Con
         // Release the fixture lock while SQLite runs: a store open must never
         // re-enter it through the durable-transaction barrier hook.
         let conn = crate::store::open_store(&database)?;
-        let (busy, _, _): (i64, i64, i64) =
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let mut checkpointed = false;
+        for attempt in 0..BASELINE_CHECKPOINT_ATTEMPTS {
+            let (busy, _, _): (i64, i64, i64) =
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if busy == 0 {
+                checkpointed = true;
+                break;
+            }
+            if attempt + 1 < BASELINE_CHECKPOINT_ATTEMPTS {
+                std::thread::sleep(BASELINE_CHECKPOINT_RETRY_DELAY);
+            }
+        }
         anyhow::ensure!(
-            busy == 0,
+            checkpointed,
             "Ward power-loss baseline checkpoint was blocked by another connection"
         );
         drop(conn);
