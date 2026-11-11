@@ -15540,6 +15540,12 @@ fn ward_power_loss_fixture_response(coven_home: &Path, body: Option<&str>) -> Re
             "The synthetic Ward power-loss capability was rejected.",
             None,
         ),
+        Err(error) if error.is::<fixture::FixtureNotQuiescent>() => api_error(
+            503,
+            "ward_power_loss_fixture_not_quiescent",
+            &format!("{error}"),
+            None,
+        ),
         Err(error) => api_error(
             500,
             "ward_power_loss_fixture_failed",

@@ -122,6 +122,22 @@ pub(crate) struct PowerLoss {
     wal: PathBuf,
     images: Images,
 }
+/// A commit reached the WAL between a TRUNCATE checkpoint and the restart of
+/// observation. Nothing was discarded; the caller may checkpoint again.
+#[cfg(feature = "threads-test-clock")]
+#[derive(Debug)]
+pub(crate) struct CommitAfterCheckpoint;
+#[cfg(feature = "threads-test-clock")]
+impl std::fmt::Display for CommitAfterCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "a commit reached the WAL after the TRUNCATE checkpoint; refusing to discard it",
+        )
+    }
+}
+#[cfg(feature = "threads-test-clock")]
+impl std::error::Error for CommitAfterCheckpoint {}
+
 impl PowerLoss {
     pub(crate) fn observe(database: &Path) -> Self {
         static REGISTER: OnceLock<()> = OnceLock::new();
@@ -173,10 +189,9 @@ impl PowerLoss {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error).context("inspecting checkpointed WAL"),
         };
-        anyhow::ensure!(
-            wal_bytes == 0,
-            "a commit reached the WAL after the TRUNCATE checkpoint; refusing to discard it"
-        );
+        if wal_bytes != 0 {
+            return Err(CommitAfterCheckpoint.into());
+        }
         let database = std::fs::read(&self.database).context("reading checkpointed database")?;
         capture.images.clear();
         capture.images.insert(self.database.clone(), database);

@@ -62,6 +62,39 @@ fn power_loss_control(fixture: &mut ThreadsFixture, capability: &str, action: &s
     Ok(response.body["report"].clone())
 }
 
+/// Start observation from a quiescent store. The fixture refuses a baseline
+/// with a typed 503 while the daemon's startup store is still open or another
+/// connection holds the checkpoint lock, so wait for it to accept one.
+fn power_loss_baseline(fixture: &mut ThreadsFixture, capability: &str) -> Result<Value> {
+    // Hang guard only, far above what load can produce: the startup store
+    // closes within tens of milliseconds of readiness.
+    const HANG_GUARD: Duration = Duration::from_secs(60);
+    let started = Instant::now();
+    let mut refusals = 0_u32;
+    loop {
+        let response = fixture.request(
+            "POST",
+            "/api/v1/internal/ward/power-loss",
+            Some(&json!({"capability": capability, "action": "baseline"})),
+        )?;
+        if response.status == 200 && response.body["ok"] == true {
+            return Ok(response.body["report"].clone());
+        }
+        anyhow::ensure!(
+            response.status == 503
+                && response.body["error"]["code"] == "ward_power_loss_fixture_not_quiescent",
+            "power-loss control baseline failed: {response:?}"
+        );
+        refusals += 1;
+        anyhow::ensure!(
+            started.elapsed() < HANG_GUARD,
+            "the store was still not quiescent after {:?} and {refusals} refusals: {response:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Freeze the synced images, terminate the daemon, restore only those images
 /// and start a fresh daemon on them.
 fn power_cut(fixture: &mut ThreadsFixture, capability: &str) -> Result<()> {
@@ -197,7 +230,7 @@ fn direct_acknowledged_write_survives_power_loss_over_real_daemon() -> Result<()
                 Some(&json!({"capability": "not-the-capability", "action": "freeze"})),
             )?;
             anyhow::ensure!(refused.status == 403, "wrong capability was accepted: {refused:?}");
-            power_loss_control(fixture, capability, "baseline")?;
+            power_loss_baseline(fixture, capability)?;
 
             let response = post_direct(fixture, "notes/today.md", AFTER)?;
             anyhow::ensure!(
@@ -251,7 +284,7 @@ fn legacy_acknowledged_submission_survives_power_loss_over_real_daemon() -> Resu
         "ward-power-loss-legacy-acknowledged",
         |_, workspace| seed_reviewed(workspace, &["skill.md"]),
         |fixture, capability| {
-            power_loss_control(fixture, capability, "baseline")?;
+            power_loss_baseline(fixture, capability)?;
             let staged = post_direct(fixture, "reviewed/skill.md", AFTER)?;
             anyhow::ensure!(
                 staged.status == 202 && staged.body["disposition"] == "staged",
@@ -299,7 +332,7 @@ fn direct_sync_failures_never_acknowledge_and_recover_over_real_daemon() -> Resu
                 ("notes/sync.md", "fail-next-store-sync", false),
                 ("notes/barrier.md", "fail-next-store-directory-barrier", true),
             ] {
-                power_loss_control(fixture, capability, "baseline")?;
+                power_loss_baseline(fixture, capability)?;
                 // Restart the WAL from this process so the armed fault reaches
                 // the evidence commit rather than a fresh WAL header write.
                 write_unsynced_tail(fixture, &format!("prime-{action}"))?;
@@ -372,7 +405,7 @@ fn legacy_sync_failures_never_acknowledge_and_recover_over_real_daemon() -> Resu
                 ("reviewed/sync.md", "fail-next-store-sync", false),
                 ("reviewed/barrier.md", "fail-next-store-directory-barrier", true),
             ] {
-                power_loss_control(fixture, capability, "baseline")?;
+                power_loss_baseline(fixture, capability)?;
                 write_unsynced_tail(fixture, &format!("prime-{action}"))?;
                 let before = pending_proposals(fixture)?;
                 power_loss_control(fixture, capability, action)?;

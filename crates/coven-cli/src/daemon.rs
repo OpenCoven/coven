@@ -6135,7 +6135,13 @@ impl StartupStore {
         let Some(conn) = self.conn.take() else {
             return Ok(());
         };
-        close_startup_store(conn, |phase| self.observer.append(&self.coven_home, phase))
+        let closed =
+            close_startup_store(conn, |phase| self.observer.append(&self.coven_home, phase));
+        // The synthetic power-loss fixture refuses a baseline until the
+        // startup checkpoint above can no longer run.
+        #[cfg(feature = "threads-test-clock")]
+        crate::ward_power_loss_fixture::note_startup_store_closed(&self.coven_home);
+        closed
     }
 }
 

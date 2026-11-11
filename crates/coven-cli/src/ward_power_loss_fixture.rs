@@ -19,10 +19,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::power_loss_tests::PowerLoss;
+use crate::power_loss_tests::{CommitAfterCheckpoint, PowerLoss};
 
 const FIXTURE_ROOT_DIRECTORY: &str = "test-fixtures";
 const FIXTURE_DIRECTORY_NAME: &str = "ward-power-loss";
@@ -31,14 +32,15 @@ const ACTIVATION_SENTINEL: &str = "ward_power_loss_v1";
 const CAPABILITY_FILE: &str = "capability";
 const FROZEN_DATABASE: &str = "frozen-coven.sqlite3";
 const FROZEN_WAL: &str = "frozen-coven.sqlite3-wal";
-const BASELINE_CHECKPOINT_ATTEMPTS: usize = 100;
-const BASELINE_CHECKPOINT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 struct Active {
     home: PathBuf,
     capability: String,
     loss: PowerLoss,
     fail_next_directory_barrier: bool,
+    /// Set once the daemon's startup store has closed. Until then its
+    /// post-readiness checkpoint may still run.
+    startup_store_closed: bool,
 }
 
 fn active() -> &'static Mutex<Option<Active>> {
@@ -63,6 +65,17 @@ impl std::fmt::Display for InvalidFixtureCapability {
     }
 }
 impl std::error::Error for InvalidFixtureCapability {}
+
+/// A baseline was refused because the store was not quiescent. Nothing was
+/// changed, so the caller may ask again.
+#[derive(Debug)]
+pub(crate) struct FixtureNotQuiescent(&'static str);
+impl std::fmt::Display for FixtureNotQuiescent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Ward power-loss baseline refused: {}", self.0)
+    }
+}
+impl std::error::Error for FixtureNotQuiescent {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -146,8 +159,24 @@ pub(crate) fn activate_for_daemon(coven_home: &Path) -> Result<()> {
         capability,
         loss,
         fail_next_directory_barrier: false,
+        startup_store_closed: false,
     });
     Ok(())
+}
+
+/// Record that the daemon serving `coven_home` has closed its startup store.
+///
+/// That close runs a PASSIVE checkpoint after readiness (#1583). A baseline
+/// that overlapped it would find the checkpoint lock held, and one that
+/// preceded it would have the checkpoint sync the WAL underneath a journey's
+/// armed fault or unsynced tail. Baselines are refused until this is called.
+pub(crate) fn note_startup_store_closed(coven_home: &Path) {
+    let Ok(mut slot) = active().lock() else {
+        return;
+    };
+    if let Some(active) = slot.as_mut().filter(|active| active.home == coven_home) {
+        active.startup_store_closed = true;
+    }
 }
 
 /// Consume an armed store-directory barrier failure for `database`. Called by
@@ -181,6 +210,41 @@ fn same_file_path(candidate: &Path, observed: &Path) -> bool {
     canonical.as_deref() == Some(observed)
 }
 
+/// How long one baseline waits on a reader or writer. It stays well under the
+/// client's five-second response deadline, so a busy store reaches the caller
+/// as a refusal it can wait on, not as a client timeout.
+const BASELINE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Run the baseline's TRUNCATE checkpoint once.
+///
+/// SQLite reports a checkpoint lock held by another connection as busy at
+/// once, without calling the busy handler. That and a reader or writer that
+/// outlasts the busy timeout both leave the WAL in place, so both are refused
+/// as not quiescent: observation never restarts from an unfinished checkpoint.
+fn truncate_checkpoint_for_baseline(conn: &rusqlite::Connection) -> Result<()> {
+    let (busy, _, _): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy != 0 {
+        return Err(FixtureNotQuiescent("its checkpoint was blocked by another connection").into());
+    }
+    Ok(())
+}
+
+/// Restart observation after the baseline's checkpoint. A daemon commit that
+/// slipped in behind the checkpoint is refused as not quiescent: nothing was
+/// discarded, and a repeated baseline checkpoints it.
+fn restart_observation(loss: &PowerLoss) -> Result<()> {
+    loss.restart_from_checkpointed_database().map_err(|error| {
+        if error.is::<CommitAfterCheckpoint>() {
+            FixtureNotQuiescent("a commit reached the WAL behind its checkpoint").into()
+        } else {
+            error
+        }
+    })
+}
+
 /// Apply one owner-IPC control action. `coven_home` must be the daemon's own
 /// home; the request names no paths.
 pub(crate) fn control(coven_home: &Path, request: &ControlRequest) -> Result<ControlReport> {
@@ -202,33 +266,18 @@ pub(crate) fn control(coven_home: &Path, request: &ControlRequest) -> Result<Con
     let database = {
         let slot = lock()?;
         authorize(&slot)?;
-        slot.as_ref()
-            .map(|active| active.loss.database_path().to_path_buf())
-            .ok_or(InactiveFixture)?
+        let active = slot.as_ref().ok_or(InactiveFixture)?;
+        if request.action == Action::Baseline && !active.startup_store_closed {
+            return Err(FixtureNotQuiescent("the daemon's startup store is still open").into());
+        }
+        active.loss.database_path().to_path_buf()
     };
     if request.action == Action::Baseline {
         // Release the fixture lock while SQLite runs: a store open must never
         // re-enter it through the durable-transaction barrier hook.
         let conn = crate::store::open_store(&database)?;
-        conn.busy_timeout(std::time::Duration::ZERO)?;
-        let mut checkpointed = false;
-        for attempt in 0..BASELINE_CHECKPOINT_ATTEMPTS {
-            let (busy, _, _): (i64, i64, i64) =
-                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
-            if busy == 0 {
-                checkpointed = true;
-                break;
-            }
-            if attempt + 1 < BASELINE_CHECKPOINT_ATTEMPTS {
-                std::thread::sleep(BASELINE_CHECKPOINT_RETRY_DELAY);
-            }
-        }
-        anyhow::ensure!(
-            checkpointed,
-            "Ward power-loss baseline checkpoint was blocked by another connection"
-        );
+        conn.busy_timeout(BASELINE_BUSY_TIMEOUT)?;
+        truncate_checkpoint_for_baseline(&conn)?;
         drop(conn);
     }
     let mut slot = lock()?;
@@ -237,7 +286,7 @@ pub(crate) fn control(coven_home: &Path, request: &ControlRequest) -> Result<Con
     let images = || active.loss.synced_images();
     match request.action {
         Action::Baseline => {
-            active.loss.restart_from_checkpointed_database()?;
+            restart_observation(&active.loss)?;
             let images = images();
             Ok(ControlReport {
                 action: "baseline",
@@ -290,5 +339,180 @@ pub(crate) fn control(coven_home: &Path, request: &ControlRequest) -> Result<Con
                 wal_bytes: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    // Every test here carries a `threads_` prefix on purpose: hosted CI runs
+    // the feature-built unit tests with a `threads_` name filter.
+
+    static CHECKPOINTER_PARKED: AtomicBool = AtomicBool::new(false);
+    static BASELINE_BUSY_HANDLER_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    /// Busy handler for the concurrent checkpointer. SQLite calls it while the
+    /// checkpointer waits for the writer lock, which it does only after taking
+    /// the checkpoint lock, so a parked checkpointer holds that lock.
+    fn park_holding_the_checkpoint_lock(waits: i32) -> bool {
+        CHECKPOINTER_PARKED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1));
+        // Hang guard only: about a minute, far above what load can produce.
+        waits < 60_000
+    }
+
+    fn count_and_give_up(_waits: i32) -> bool {
+        BASELINE_BUSY_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+
+    #[test]
+    fn threads_baseline_checkpoint_refuses_a_held_checkpoint_lock_without_waiting() -> Result<()> {
+        // Hang guard only, far above what load can produce.
+        const HANG_GUARD: Duration = Duration::from_secs(60);
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.sqlite3");
+        let mut conn = crate::store::open_store(&path)?;
+        conn.execute(
+            "INSERT INTO store_meta(key, value) VALUES ('baseline-probe', 'frame')",
+            [],
+        )?;
+        conn.busy_handler(Some(count_and_give_up))?;
+
+        // A writer makes a FULL checkpoint on another connection wait, and
+        // that checkpoint takes the checkpoint lock before it waits.
+        let writer = rusqlite::Connection::open(&path)?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        let (done_tx, done_rx) = mpsc::channel();
+        let checkpointer_path = path.clone();
+        let checkpointer = std::thread::spawn(move || {
+            let result = (|| -> Result<i64> {
+                let mut conn = rusqlite::Connection::open(&checkpointer_path)?;
+                conn.busy_handler(Some(park_holding_the_checkpoint_lock))?;
+                Ok(conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| row.get(0))?)
+            })();
+            let _ = done_tx.send(result);
+        });
+        let started = Instant::now();
+        while !CHECKPOINTER_PARKED.load(Ordering::SeqCst) {
+            if let Ok(result) = done_rx.try_recv() {
+                anyhow::bail!("the concurrent checkpoint finished without waiting: {result:?}");
+            }
+            anyhow::ensure!(
+                started.elapsed() < HANG_GUARD,
+                "the concurrent checkpoint never parked after {:?}",
+                started.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let error = truncate_checkpoint_for_baseline(&conn)
+            .expect_err("a blocked baseline checkpoint must not report success");
+        assert!(error.is::<FixtureNotQuiescent>(), "{error:#}");
+        // The writer is still open, so a wait on the writer lock would have
+        // called this connection's busy handler. Zero calls means the refusal
+        // came from the checkpoint lock, which SQLite never waits on.
+        assert_eq!(BASELINE_BUSY_HANDLER_CALLS.load(Ordering::SeqCst), 0);
+
+        writer.execute_batch("ROLLBACK")?;
+        checkpointer
+            .join()
+            .map_err(|_| anyhow::anyhow!("the concurrent checkpointer panicked"))?;
+        let concurrent_busy = done_rx.recv()??;
+        assert_eq!(
+            concurrent_busy, 0,
+            "the concurrent checkpoint did not complete"
+        );
+
+        truncate_checkpoint_for_baseline(&conn)?;
+        let mut wal = path.into_os_string();
+        wal.push("-wal");
+        assert_eq!(
+            fs::metadata(&wal)?.len(),
+            0,
+            "the baseline did not leave a truncated WAL"
+        );
+        Ok(())
+    }
+
+    fn write_marker(path: &Path, contents: &str) -> Result<()> {
+        use std::io::Write as _;
+        let parent = path.parent().context("marker parent")?;
+        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+        staged.write_all(contents.as_bytes())?;
+        staged
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    #[test]
+    fn threads_baseline_is_refused_until_the_startup_store_has_closed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let directory = fixture_directory(&home);
+        fs::create_dir_all(&directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&fixture_root(&home), &directory] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        write_marker(&directory.join(ACTIVATION_FILE), "ward_power_loss_v1\n")?;
+        write_marker(&directory.join(CAPABILITY_FILE), "fixture-cap")?;
+        // This is the only test that activates the process-wide fixture.
+        activate_for_daemon(&home)?;
+        let startup_store = crate::store::open_store(&home.join("coven.sqlite3"))?;
+        let baseline = ControlRequest {
+            capability: "fixture-cap".to_owned(),
+            action: Action::Baseline,
+        };
+
+        let error = control(&home, &baseline)
+            .expect_err("a baseline must wait for the startup store to close");
+        assert!(error.is::<FixtureNotQuiescent>(), "{error:#}");
+        // Another daemon's close does not open this fixture's gate.
+        note_startup_store_closed(temp.path().join("another-home").as_path());
+        let error = control(&home, &baseline)
+            .expect_err("another home's startup close must not open the gate");
+        assert!(error.is::<FixtureNotQuiescent>(), "{error:#}");
+        // The other actions never waited on the startup store.
+        control(
+            &home,
+            &ControlRequest {
+                capability: "fixture-cap".to_owned(),
+                action: Action::FailNextStoreDirectoryBarrier,
+            },
+        )?;
+        take_store_directory_barrier_failure(home.join("coven.sqlite3").to_str())
+            .expect_err("the armed barrier fault must be consumed here");
+
+        note_startup_store_closed(&home);
+        let report = control(&home, &baseline)?;
+        assert_eq!(report.action, "baseline");
+        assert!(report.database_bytes.is_some_and(|bytes| bytes > 0));
+
+        // A commit behind the checkpoint is refused the same way, with the
+        // observed images left alone, and the next baseline takes it in.
+        startup_store.execute(
+            "INSERT INTO store_meta(key, value) VALUES ('behind-the-checkpoint', 'frame')",
+            [],
+        )?;
+        {
+            let slot = active().lock().expect("fixture lock");
+            let loss = &slot.as_ref().expect("active fixture").loss;
+            let before = loss.synced_images();
+            let error = restart_observation(loss)
+                .expect_err("a commit behind the checkpoint must not be discarded");
+            assert!(error.is::<FixtureNotQuiescent>(), "{error:#}");
+            assert_eq!(loss.synced_images(), before);
+        }
+        control(&home, &baseline)?;
+        Ok(())
     }
 }
