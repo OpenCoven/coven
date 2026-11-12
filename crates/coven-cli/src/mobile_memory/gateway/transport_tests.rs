@@ -1848,6 +1848,8 @@ fn restore_fence_rejects_signed_direct_https_effects_until_fresh_handover() {
 
 mod v2_authority;
 mod v2_control_loss;
+#[cfg(unix)]
+mod v2_deadline;
 
 #[test]
 fn online_connection_never_overrides_denial_or_restores_device_authority() {
