@@ -137,8 +137,13 @@ class CheckCiWorkflowTests(unittest.TestCase):
 
     def test_windows_rust_gate_has_shared_runner_headroom(self) -> None:
         windows = ci_job_block('rust-test-windows')
-        self.assertIn('timeout-minutes: 30', windows)
-        self.assertNotIn('timeout-minutes: 20', windows)
+        self.assertIn('\n    timeout-minutes: ${{ matrix.job-timeout }}\n', windows)
+        budgets = re.findall(
+            r"- shard: (\S+)\n\s+test-args: '[^'\n]+'\n\s+job-timeout: (\d+)\n",
+            windows,
+        )
+        self.assertEqual(len(budgets), 2)
+        self.assertEqual(dict(budgets), {'named': '30', 'rest': '45'})
 
     def test_windows_workspace_shards_partition_one_name_predicate(self) -> None:
         # The Windows workspace suite runs as two shards of one predicate
@@ -269,7 +274,10 @@ class CheckCiWorkflowTests(unittest.TestCase):
                 windows,
             )
             self.assertIn("${{ runner.os }}-rust-test-", windows)
-            self.assertIn("timeout-minutes: 30", windows)
+            if job == 'rust-test-windows':
+                self.assertIn('timeout-minutes: ${{ matrix.job-timeout }}', windows)
+            else:
+                self.assertIn("timeout-minutes: 30", windows)
             self.assertNotIn("continue-on-error:", windows)
 
     def test_manual_windows_release_stress_owns_shared_test_cache_writes(self) -> None:
@@ -671,8 +679,9 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("cargo test --workspace --locked", workspace)
         self.assertNotIn("--features threads-test-clock", workspace)
         self.assertNotIn("cargo test --workspace", windows)
+        self.assertIn("\n    timeout-minutes: ${{ matrix.job-timeout }}\n", workspace)
+        self.assertIn("\n    timeout-minutes: 30\n", windows)
         for job in (workspace, windows):
-            self.assertIn("\n    timeout-minutes: 30\n", job)
             self.assertIn("needs.changes.outputs.rust == 'true'", job)
             self.assertNotIn("continue-on-error:", job)
         gate = ci_job_block("pr-gate")

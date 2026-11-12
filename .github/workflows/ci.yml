@@ -395,7 +395,10 @@ jobs:
     runs-on: windows-latest
     # Keep the two build profiles in separate required jobs so feature
     # evidence cannot be cancelled after the workspace consumes its budget.
-    timeout-minutes: 30
+    # #1734: cold-cache rest runs exhausted 30m without a reported test failure.
+    # Only rest gets a 45m CI hang guard; hosted acceptance targets <=33.75m
+    # (at least 25% headroom), without changing test deadlines or coverage.
+    timeout-minutes: ${{ matrix.job-timeout }}
     # One libtest name predicate splits `cargo test --workspace` across two
     # runners (#1227). `named` runs every test whose name contains one of the
     # tokens and `rest` skips exactly those, so each test runs in exactly one
@@ -413,8 +416,10 @@ jobs:
         include:
           - shard: named
             test-args: 'automations:: api::tests::threads'
+            job-timeout: 30
           - shard: rest
             test-args: '--skip automations:: --skip api::tests::threads'
+            job-timeout: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
