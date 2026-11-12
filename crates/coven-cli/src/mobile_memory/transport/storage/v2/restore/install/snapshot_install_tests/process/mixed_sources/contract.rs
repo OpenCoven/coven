@@ -220,18 +220,24 @@ impl<'a> Contract<'a> {
         fence
     }
 
-    /// Retries the original operation with the original signed source, then
-    /// takes every usable pairing through its own fresh direct handover.
-    pub(super) fn retry(&self, home: &Path, operation: Uuid, at: &str) {
-        let label = &self.label;
-        let state = install_from_snapshot(
+    /// One attempt of the original operation with the original signed source.
+    pub(super) fn attempt(&self, home: &Path, operation: Uuid) -> Result<State> {
+        install_from_snapshot(
             home,
             self.source.path(),
             self.authority(),
             self.lineage.pin,
             operation,
         )
-        .unwrap_or_else(|e| panic!("{label} {at}: {e:#}"));
+    }
+
+    /// Retries the original operation with the original signed source, then
+    /// takes every usable pairing through its own fresh direct handover.
+    pub(super) fn retry(&self, home: &Path, operation: Uuid, at: &str) {
+        let label = &self.label;
+        let state = self
+            .attempt(home, operation)
+            .unwrap_or_else(|e| panic!("{label} {at}: {e:#}"));
         assert_eq!(state.operation_id, operation, "{label} {at}");
         verify_installed(self.lineage, self.sources, home, &state);
         assert!(

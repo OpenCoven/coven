@@ -187,6 +187,83 @@ fn exercise(lineage: &Lineage, sources: &Sources, every: bool) -> BTreeMap<Strin
     counts
 }
 
+/// A second interruption. One image of every class is retried, and that retry
+/// is itself cut by a returned error at each of its own checkpoints. The
+/// twice-interrupted destination must satisfy the same contract before the
+/// final retry. Returns the first images taken and the second cuts made.
+fn exercise_twice(lineage: &Lineage, sources: &Sources) -> (usize, usize) {
+    let contract = Contract::new(lineage, sources);
+    let label = contract.label();
+    let operation = Uuid::new_v4();
+    let images = capture(&contract, sources, lineage.pin, operation);
+    let mut classes = BTreeSet::new();
+    let mut cuts = 0;
+    for image in &images {
+        let class = format!(
+            "{}/{:?}",
+            image.kind,
+            fence(&canonical(&image.files), operation)
+        );
+        if !classes.insert(class.clone()) {
+            continue;
+        }
+        // The retry's own write sequence, which differs with the image.
+        let counted = Rc::new(RefCell::new(0));
+        let counter = Rc::clone(&counted);
+        let home = tempfile::tempdir().unwrap();
+        write_files(home.path(), &image.files);
+        config::set_write_observer(Box::new(move |_, _| {
+            *counter.borrow_mut() += 1;
+            Ok(())
+        }));
+        let observer = ClearObserver;
+        let result = contract.attempt(home.path(), operation);
+        drop(observer);
+        result.unwrap_or_else(|e| panic!("{label} {} {}: {e:#}", image.checkpoint, image.kind));
+        let checkpoints = *counted.borrow();
+        assert!(checkpoints > 0, "{label}: a retry observed no write");
+
+        for cut in 1..=checkpoints {
+            let home = tempfile::tempdir().unwrap();
+            write_files(home.path(), &image.files);
+            let mut ordinal = 0;
+            config::set_write_observer(Box::new(move |_, _| {
+                ordinal += 1;
+                anyhow::ensure!(ordinal != cut, "injected second restore interruption");
+                Ok(())
+            }));
+            let observer = ClearObserver;
+            let result = contract.attempt(home.path(), operation);
+            drop(observer);
+            let error = result
+                .map(|_| ())
+                .expect_err("the second cut was not reached");
+            assert!(
+                format!("{error:#}").contains("injected second restore interruption"),
+                "{label} {} {} retry cut {cut}: {error:#}",
+                image.checkpoint,
+                image.kind
+            );
+            let at = format!(
+                "image {} {} then retry cut {cut}/{checkpoints}",
+                image.checkpoint, image.kind
+            );
+            contract.interrupted(home.path(), operation, &at);
+            contract.retry(home.path(), operation, &at);
+            cuts += 1;
+        }
+        println!(
+            "restore-retained-image mixed {label} twice {} {class} retry-checkpoints={checkpoints}",
+            image.checkpoint
+        );
+    }
+    println!(
+        "restore-retained-image mixed {label} twice images={} cuts={cuts}",
+        classes.len()
+    );
+    (classes.len(), cuts)
+}
+
 pub(super) fn empty_destination(lineage: &Lineage) -> Sources<'_> {
     Sources {
         snapshot: &lineage.points[BASE],
@@ -255,4 +332,25 @@ fn mixed_restore_retained_images_keep_journal_only_floors_across_three_journals(
     println!("restore-retained-image mixed journal-only total={}", {
         counts.values().sum::<usize>()
     });
+}
+
+#[test]
+#[ignore = "second-interruption matrix; minutes of durability barriers"]
+fn mixed_restore_twice_interrupted_install_into_an_empty_destination_recovers() {
+    let lineage = Lineage::build();
+    exercise_twice(&lineage, &empty_destination(&lineage));
+}
+
+#[test]
+#[ignore = "second-interruption matrix; minutes of durability barriers"]
+fn mixed_restore_twice_interrupted_burned_and_pending_floors_recover() {
+    let lineage = Lineage::build();
+    exercise_twice(&lineage, &burned_and_pending(&lineage));
+}
+
+#[test]
+#[ignore = "second-interruption matrix; minutes of durability barriers"]
+fn mixed_restore_twice_interrupted_journal_only_floors_recover() {
+    let lineage = Lineage::build();
+    exercise_twice(&lineage, &three_journals(&lineage));
 }
