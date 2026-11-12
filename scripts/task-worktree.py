@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-LIMITS = {'task worktrees': 12, 'local branches': 32, 'origin branches': 48}
+LIMITS = {'task worktrees': 12, 'local branches': 32, 'origin branches': 48, 'stray remote refs': 0}
 
 
 def git(*args):
@@ -18,11 +18,23 @@ def git(*args):
 def inventory():
     worktrees = git('worktree', 'list', '--porcelain').split('\n\n')
     local = git('for-each-ref', '--format=%(refname:short)', 'refs/heads').splitlines()
-    remote = git('for-each-ref', '--format=%(refname:short)', 'refs/remotes/origin').splitlines()
+    # Remote names may contain slashes, so match whole namespace prefixes. A
+    # tracking ref outside origin and every configured remote has no owner
+    # that a fetch --prune would ever reconcile.
+    # A remote is configured only when it has a URL; a lone setting such as
+    # remote.<name>.prune must not adopt a namespace. No match exits 1.
+    urls = subprocess.run(['git', 'config', '--name-only', '--get-regexp', r'^remote\..+\.url$'],
+                          capture_output=True, text=True).stdout.splitlines()
+    owned = tuple(f'refs/remotes/{name}/' for name in {'origin', *(key[len('remote.'):-len('.url')] for key in urls)})
+    tracking = git('for-each-ref', '--format=%(refname)', 'refs/remotes').splitlines()
     return {
         'task worktrees': max(0, len(worktrees) - 1),
         'local branches': len([b for b in local if b != 'main']),
-        'origin branches': len([b for b in remote if b not in ('origin/main', 'origin/HEAD')]),
+        # Full names: Git abbreviates refs/remotes/origin/HEAD to `origin`, so
+        # short names would count the symbolic HEAD as a branch.
+        'origin branches': len([ref for ref in tracking if ref.startswith('refs/remotes/origin/')
+                                and ref not in ('refs/remotes/origin/main', 'refs/remotes/origin/HEAD')]),
+        'stray remote refs': len([ref for ref in tracking if not ref.startswith(owned)]),
     }
 
 
@@ -34,7 +46,11 @@ def check(counts, creating=False):
             projected[key] += 1
     failures = [f'{key}: {projected[key]} > {limit}' for key, limit in LIMITS.items() if projected[key] > limit]
     if failures:
-        raise ValueError('allocation budget exceeded; prune verified-safe owned work first: ' + '; '.join(failures))
+        message = 'allocation budget exceeded; prune verified-safe owned work first: ' + '; '.join(failures)
+        if projected['stray remote refs']:
+            message += ('; stray remote refs are tracking refs outside origin and configured remotes: '
+                        'preserve unrecoverable heads, then remove them as docs/development/worktree-lifecycle.md describes')
+        raise ValueError(message)
 
 
 @contextmanager
