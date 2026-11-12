@@ -683,3 +683,242 @@ fn failed_decision_reservation_sync_publishes_no_claim() -> Result<()> {
     assert_eq!(std::fs::read(&target)?, b"after");
     Ok(())
 }
+
+/// A synthetic direct-write report: one audited Tier-2 change for
+/// `notes/today.md` ("before" -> "after") plus applied protected changes at
+/// each of `protected`, advanced in order. The direct API refuses Tier-0 edits, so the protected
+/// branch is exercised here at the persistence boundary only (#1640).
+fn direct_evidence_report(protected: &[&str]) -> ward::ApplyReport {
+    let mut changes = vec![
+            ward::AppliedChange {
+                decision: ward::Decision {
+                    target: "notes/today.md".to_owned(),
+                    resolved: "notes/today.md".to_owned(),
+                    tier: ward::Tier::Logged,
+                    verdict: ward::Verdict::AllowWithLog,
+                },
+                disposition: ward::Disposition::Applied,
+                audit: Some(ward::AuditRecord {
+                    target: "notes/today.md".to_owned(),
+                    resolved: "notes/today.md".to_owned(),
+                    tier: ward::Tier::Logged,
+                    prev_sha256: Some(
+                        "6db7d803e74f1ffa7d8f5adc0bf95b3e15bf4c8373fffadf546227cc6c6742cb"
+                            .to_owned(),
+                    ),
+                    next_sha256: "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8"
+                        .to_owned(),
+                    bytes_written: 5,
+                }),
+            },
+    ];
+    changes.extend(protected.iter().map(|surface| ward::AppliedChange {
+        decision: ward::Decision {
+            target: (*surface).to_owned(),
+            resolved: (*surface).to_owned(),
+            tier: ward::Tier::Protected,
+            verdict: ward::Verdict::AuthorizedProtectedChange,
+        },
+        disposition: ward::Disposition::Applied,
+        audit: None,
+    }));
+    ward::ApplyReport { changes }
+}
+
+fn exact_direct_audit_rows(conn: &rusqlite::Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        r#"SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'
+         AND familiar_id = 'sage' AND proposal_id IS NULL
+         AND files_touched = '["notes/today.md"]'
+         AND decision = 'applied' AND tier = 'tier_2'
+         AND lower(hex(diff_hash)) = 'f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8'
+         AND json_extract(detail, '$.bytes_written') = 5
+         AND json_extract(detail, '$.prev_sha256') = '6db7d803e74f1ffa7d8f5adc0bf95b3e15bf4c8373fffadf546227cc6c6742cb'"#,
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn apply_audit_rows(conn: &rusqlite::Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn soul_baseline(conn: &rusqlite::Connection) -> Result<Option<Vec<u8>>> {
+    Ok(rusqlite::OptionalExtension::optional(conn.query_row(
+        "SELECT entry_hash FROM ward_manifest WHERE familiar_id = 'sage' AND surface = 'SOUL.md'",
+        [],
+        |row| row.get(0),
+    ))?)
+}
+
+fn expected_soul_baseline(bytes: &[u8]) -> Vec<u8> {
+    coven_threads_core::manifest_entry_hash(
+        &coven_threads_core::SurfaceId::new("SOUL.md".to_owned()),
+        bytes,
+    )
+    .to_vec()
+}
+
+#[test]
+fn direct_evidence_baseline_failure_rolls_back_its_audit_rows() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let home = temp.path();
+    let workspace = seed_warded_familiar(home)?;
+    let config = ward::WardConfig::load(&workspace)?.context("seeded ward.toml")?;
+    let conn = store::open_store(&home.join("coven.sqlite3"))?;
+    // `SOUL.md` advances its baseline first; the path-escaping surface then
+    // fails, after both the audit rows and that manifest row were written in
+    // the same transaction.
+    let failure = persist_direct_apply_evidence(
+        &conn,
+        "sage",
+        &workspace,
+        &config,
+        &direct_evidence_report(&["SOUL.md", "../SOUL.md"]),
+        time::OffsetDateTime::now_utc(),
+    )
+    .expect_err("a failed baseline advance must fail the evidence write");
+    let DirectEvidenceFailure::Baseline(error) = failure else {
+        panic!("expected a typed baseline failure, got {failure:?}");
+    };
+    assert!(format!("{error:#}").contains("path-escaping"), "{error:#}");
+    assert_eq!(
+        apply_audit_rows(&conn)?,
+        0,
+        "a baseline failure after audit insertion must roll the audit rows back"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM ward_manifest WHERE familiar_id = 'sage'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0,
+        "the earlier SOUL.md baseline advance must roll back with the audit rows"
+    );
+    assert!(conn.is_autocommit());
+    assert_eq!(
+        conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_evidence_commits_audit_and_protected_baseline_atomically_and_durably() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let home = temp.path();
+    let database = home.join("coven.sqlite3");
+    let loss = crate::power_loss_tests::PowerLoss::observe(&database);
+    let keeper = store::open_store(&database)?;
+    let workspace = seed_warded_familiar(home)?;
+    let config = ward::WardConfig::load(&workspace)?.context("seeded ward.toml")?;
+    std::fs::write(workspace.join("SOUL.md"), "# Sage, revised\n")?;
+    keeper.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let conn = store::open_store(&database)?;
+    persist_direct_apply_evidence(
+        &conn,
+        "sage",
+        &workspace,
+        &config,
+        &direct_evidence_report(&["SOUL.md"]),
+        time::OffsetDateTime::now_utc(),
+    )
+    .map_err(|failure| anyhow::anyhow!("{failure:?}"))?;
+    assert_eq!(
+        conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
+        1,
+        "ordinary writes regain NORMAL after the durable evidence commit"
+    );
+    keeper.execute(
+        "INSERT INTO store_meta(key, value) VALUES ('power-loss-tail', 'lost')",
+        [],
+    )?;
+    let images = loss.synced_images();
+    drop(conn);
+    drop(keeper);
+    loss.restore(images)?;
+    let conn = store::open_store(&database)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM store_meta WHERE key = 'power-loss-tail'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0,
+        "the deliberately unsynced NORMAL tail must disappear"
+    );
+    assert_eq!(exact_direct_audit_rows(&conn)?, 1);
+    assert_eq!(
+        soul_baseline(&conn)?,
+        Some(expected_soul_baseline(b"# Sage, revised\n")),
+        "the protected baseline advance must survive with its audit rows"
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_evidence_sync_failures_are_typed_and_never_assume_rollback() -> Result<()> {
+    for directory_failure in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let database = home.join("coven.sqlite3");
+        let loss = crate::power_loss_tests::PowerLoss::observe(&database);
+        let keeper = store::open_store(&database)?;
+        let workspace = seed_warded_familiar(home)?;
+        let config = ward::WardConfig::load(&workspace)?.context("seeded ward.toml")?;
+        keeper.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        // NORMAL may sync a fresh WAL header; prime it before arming a fault.
+        keeper.execute(
+            "INSERT INTO store_meta(key, value) VALUES ('prime-wal', 'normal')",
+            [],
+        )?;
+        let conn = store::open_store(&database)?;
+        if directory_failure {
+            crate::durable_fs::fail_next_directory_sync();
+        } else {
+            loss.fail_next_sync();
+        }
+        let failure = persist_direct_apply_evidence(
+            &conn,
+            "sage",
+            &workspace,
+            &config,
+            &direct_evidence_report(&["SOUL.md"]),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect_err("a failed sync or barrier must not report success");
+        assert!(
+            matches!(failure, DirectEvidenceFailure::Durability(_)),
+            "directory_failure={directory_failure}: {failure:?}"
+        );
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
+            1
+        );
+        if directory_failure {
+            // The barrier runs after COMMIT and xSync, so the evidence is
+            // committed and synced; the error must not be read as rollback.
+            assert_eq!(exact_direct_audit_rows(&conn)?, 1);
+            assert!(soul_baseline(&conn)?.is_some());
+        }
+        let images = loss.synced_images();
+        drop(conn);
+        drop(keeper);
+        loss.restore(images)?;
+        let conn = store::open_store(&database)?;
+        let audits = exact_direct_audit_rows(&conn)?;
+        let baseline = soul_baseline(&conn)?.is_some();
+        assert_eq!(
+            (audits, baseline),
+            if directory_failure { (1, true) } else { (0, false) },
+            "directory_failure={directory_failure}: audit and baseline survive or vanish together"
+        );
+    }
+    Ok(())
+}
