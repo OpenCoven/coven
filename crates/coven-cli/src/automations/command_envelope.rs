@@ -295,14 +295,19 @@ fn stable_run_control(
             )
         }
         CommandName::MissionSubmit => (
-            super::missions::execute_mission_submit(conn, authority, body, chrono::Utc::now()).map(
-                |answer| match answer {
-                    super::missions::MissionExecution::Success { payload, replayed } => {
-                        Ok((payload, replayed, None))
-                    }
-                    super::missions::MissionExecution::Rejected(error) => Err(error),
-                },
-            ),
+            super::missions::execute_mission_submit(
+                conn,
+                runtime,
+                authority,
+                body,
+                chrono::Utc::now(),
+            )
+            .map(|answer| match answer {
+                super::missions::MissionExecution::Success { payload, replayed } => {
+                    Ok((payload, replayed, None))
+                }
+                super::missions::MissionExecution::Rejected(error) => Err(error),
+            }),
             "automations.mission.submit",
         ),
         CommandName::MissionCancel => (

@@ -926,6 +926,7 @@ pub(crate) fn route_action_at(
                 crate::automations::missions::SUBMIT_ACTION => (
                     crate::automations::missions::execute_mission_submit(
                         conn,
+                        runtime,
                         authority,
                         payload.clone(),
                         chrono::Utc::now(),
@@ -2658,7 +2659,7 @@ mod tests {
 
     #[test]
     fn the_catalog_advertises_the_mission_envelopes_the_submit_check_enforces() {
-        use crate::automations::runtime_envelope::CLAUDE_R0_READ;
+        use crate::automations::runtime_envelope::CLAUDE_R0_SCOPED_READ;
 
         let catalog = serde_json::to_value(capabilities()).unwrap();
         let capabilities = catalog["capabilities"].as_array().unwrap();
@@ -2669,11 +2670,11 @@ mod tests {
         assert_eq!(
             automations["missionEnvelopes"],
             json!([{
-                "id": "r0-read.1",
+                "id": "r0-read.2",
                 "descriptorDigest": {
                     "algorithm": "sha256",
                     "canonicalization": "jcs-rfc8785",
-                    "value": CLAUDE_R0_READ.descriptor_digest(),
+                    "value": CLAUDE_R0_SCOPED_READ.descriptor_digest(),
                 },
             }])
         );
