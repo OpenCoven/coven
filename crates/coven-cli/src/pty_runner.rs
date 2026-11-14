@@ -1922,7 +1922,7 @@ fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn poll_child_exit_without_reaping(child: &std::process::Child) -> io::Result<bool> {
+pub(crate) fn poll_child_exit_without_reaping(child: &std::process::Child) -> io::Result<bool> {
     loop {
         // POSIX leaves siginfo contents unspecified when WNOHANG finds no
         // waitable child, so initialize it for every call and trust si_pid
@@ -6661,6 +6661,11 @@ fn env_u16(name: &str) -> Option<u16> {
         .parse()
         .ok()
         .filter(|value| *value > 0)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_macos_process_has_exited(pid: u32) -> std::io::Result<bool> {
+    process_exit_test::macos_process_has_exited(pid)
 }
 
 #[cfg(all(test, unix))]

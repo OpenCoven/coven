@@ -57,6 +57,7 @@ fn rich_snapshot_restore_recovers_all_trace_derived_unix_retained_images() {
     let mut names: BTreeSet<_> = initial.keys().cloned().collect();
     let mut stable = initial.clone();
     let mut ordinal = 0;
+    let mut staged_creates = BTreeSet::new();
     config::set_write_observer(Box::new(move |path, phase| {
         assert_eq!(path.parent().unwrap(), home.join("mobile"));
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
@@ -73,41 +74,70 @@ fn rich_snapshot_restore_recovers_all_trace_derived_unix_retained_images() {
                 variants.push(("durable", current));
             }
             Phase::Renamed => {
+                if staged_creates.remove(&name) {
+                    assert_eq!(
+                        current[&name],
+                        crate::mobile_memory::transport::storage::v2::PROTOCOL_FLOOR_BYTES,
+                        "published floor is not the complete synced image at {checkpoint}"
+                    );
+                    variants.push(("published-create", current.clone()));
+                }
                 variants.push(("old-name", stable.clone()));
                 variants.push(("new-name", current));
             }
-            Phase::TempCreated if !stable.contains_key(&name) && current.contains_key(&name) => {
+            Phase::TempCreated | Phase::Written | Phase::FileSynced
+                if !stable.contains_key(&name)
+                    && name.starts_with(".transport-v2-")
+                    && name.ends_with(".required")
+                    && (phase == Phase::TempCreated || staged_creates.contains(&name)) =>
+            {
+                // New floors are written only to private staging files. Even
+                // after file sync, their canonical name must remain absent.
                 assert!(
-                    name.starts_with(".transport-v2-") && name.ends_with(".required"),
-                    "unexpected direct-create authority component {name}"
+                    !current.contains_key(&name),
+                    "unpublished floor became authority at {checkpoint}"
                 );
-                assert!(
-                    current[&name].is_empty(),
-                    "new canonical file was written before creation checkpoint"
+                staged_creates.insert(name.clone());
+                let staged: Vec<_> = fs::read_dir(home.join("mobile"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        let name = path.file_name().unwrap().to_string_lossy();
+                        name.starts_with(".mobile-state-") && name.ends_with(".tmp")
+                    })
+                    .collect();
+                assert_eq!(
+                    staged.len(),
+                    1,
+                    "missing unique staging file at {checkpoint}"
                 );
-                variants.push(("absent-create", stable.clone()));
-                variants.push(("empty-create", current));
-            }
-            Phase::Written if !stable.contains_key(&name) && current.contains_key(&name) => {
-                // O_CREAT writes directly to its new canonical name. Before
-                // file sync, retaining that name does not guarantee full data.
-                assert!(
-                    name.starts_with(".transport-v2-") && name.ends_with(".required"),
-                    "unexpected direct-create authority component {name}"
-                );
-                variants.push(("absent-create", stable.clone()));
-                let bytes = current[&name].clone();
-                let mut empty = current.clone();
-                empty.insert(name.clone(), Vec::new());
-                variants.push(("empty-create", empty));
-                let mut partial = current.clone();
-                partial.insert(name.clone(), bytes[..bytes.len() / 2].to_vec());
-                variants.push(("partial-create", partial));
-                variants.push(("full-create", current));
-            }
-            Phase::FileSynced if !stable.contains_key(&name) && current.contains_key(&name) => {
-                variants.push(("absent-create", stable.clone()));
-                variants.push(("synced-create", current));
+                let bytes = fs::read(&staged[0]).unwrap();
+                let kind = match phase {
+                    Phase::TempCreated => {
+                        assert!(
+                            bytes.is_empty(),
+                            "staging was already written at {checkpoint}"
+                        );
+                        "staged-empty-canonical-absent"
+                    }
+                    Phase::Written => {
+                        assert_eq!(
+                            bytes,
+                            crate::mobile_memory::transport::storage::v2::PROTOCOL_FLOOR_BYTES
+                        );
+                        "staged-written-canonical-absent"
+                    }
+                    Phase::FileSynced => {
+                        assert_eq!(
+                            bytes,
+                            crate::mobile_memory::transport::storage::v2::PROTOCOL_FLOOR_BYTES
+                        );
+                        "staged-synced-canonical-absent"
+                    }
+                    _ => unreachable!(),
+                };
+                // Private staging bytes are not part of the authority image.
+                variants.push((kind, current));
             }
             Phase::TempCreated | Phase::Written | Phase::FileSynced => {
                 // A private temporary file is never authority. Before rename,
@@ -137,12 +167,17 @@ fn rich_snapshot_restore_recovers_all_trace_derived_unix_retained_images() {
     assert!(images.iter().any(|i| i
         .checkpoint
         .contains("introduction-policy.json Renamed old-name")));
-    assert!(images
-        .iter()
-        .any(|i| i.checkpoint.ends_with("empty-create")));
-    assert!(images
-        .iter()
-        .any(|i| i.checkpoint.ends_with("partial-create")));
+    for kind in [
+        "staged-empty-canonical-absent",
+        "staged-written-canonical-absent",
+        "staged-synced-canonical-absent",
+        "published-create",
+    ] {
+        assert!(
+            images.iter().any(|i| i.checkpoint.ends_with(kind)),
+            "missing {kind} checkpoint"
+        );
+    }
     assert!(images.iter().any(|i| i
         .checkpoint
         .contains("transport-restore.json Renamed new-name")));

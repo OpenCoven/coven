@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
@@ -22,15 +22,43 @@ struct AuditStoreLock {
 }
 
 impl AuditStoreLock {
-    fn acquire(coven_home: &Path) -> Result<Self> {
+    /// Final lifecycle evidence may be attempted after runtime admission closes,
+    /// but must never reintroduce a process/file lock wait during shutdown.
+    fn try_acquire_for_shutdown(coven_home: &Path) -> Result<Self> {
         let directory = ensure_private_mobile_dir(coven_home)?;
-        let process = AUDIT_WRITE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile audit lock was poisoned"))?;
+        let process = match AUDIT_WRITE_LOCK.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                    .context("mobile shutdown audit process lock is busy")
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                anyhow::bail!("mobile audit lock was poisoned")
+            }
+        };
         let lock_path = directory.join(AUDIT_LOCK_FILE);
         let file = crate::state_lock::open_lock_file(&lock_path)?;
-        file.lock_exclusive()
-            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self {
+                _process: process,
+                file,
+            }),
+            Err(error) if crate::state_lock::is_lock_contended(&error) => {
+                Err(error).context("mobile shutdown audit file lock is busy")
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to lock {}", lock_path.display()))
+            }
+        }
+    }
+
+    fn acquire(coven_home: &Path) -> Result<Self> {
+        let directory = ensure_private_mobile_dir(coven_home)?;
+        let process = super::store_lock::process(&AUDIT_WRITE_LOCK)
+            .context("mobile audit lock unavailable")?;
+        let lock_path = directory.join(AUDIT_LOCK_FILE);
+        let file = crate::state_lock::open_lock_file(&lock_path)?;
+        super::store_lock::lock_exclusive(&file, &lock_path)?;
         Ok(Self {
             _process: process,
             file,
@@ -143,7 +171,11 @@ pub fn append_event(
     event: MobileAuditEvent,
     device_id: Option<Uuid>,
 ) -> Result<()> {
-    let _guard = AuditStoreLock::acquire(coven_home)?;
+    let _guard = if event == MobileAuditEvent::GatewayStopped {
+        AuditStoreLock::try_acquire_for_shutdown(coven_home)?
+    } else {
+        AuditStoreLock::acquire(coven_home)?
+    };
     append_record_locked(
         coven_home,
         &MobileAuditRecord {
@@ -259,7 +291,7 @@ fn append_transition_record_locked(
         let (found_transition, recovered_suffix) =
             audit_prefix_contains_transition_or_recovers_suffix(
                 &mut existing,
-                transition_id,
+                Some(transition_id),
                 &path,
             )?;
         if found_transition {
@@ -278,7 +310,7 @@ fn append_transition_record_locked(
 
 fn audit_prefix_contains_transition_or_recovers_suffix(
     bytes: &mut Vec<u8>,
-    transition_id: Uuid,
+    transition_id: Option<Uuid>,
     path: &Path,
 ) -> Result<(bool, bool)> {
     let mut cursor = 0;
@@ -287,7 +319,7 @@ fn audit_prefix_contains_transition_or_recovers_suffix(
         let Some(relative_newline) = bytes[cursor..].iter().position(|byte| *byte == b'\n') else {
             match serde_json::from_slice::<MobileAuditRecord>(&bytes[cursor..]) {
                 Ok(record) => {
-                    if record.transition_id == Some(transition_id) {
+                    if transition_id.is_some() && record.transition_id == transition_id {
                         found_transition = true;
                     }
                     bytes.push(b'\n');
@@ -299,7 +331,7 @@ fn audit_prefix_contains_transition_or_recovers_suffix(
         let line_end = cursor + relative_newline;
         match serde_json::from_slice::<MobileAuditRecord>(&bytes[cursor..line_end]) {
             Ok(record) => {
-                if record.transition_id == Some(transition_id) {
+                if transition_id.is_some() && record.transition_id == transition_id {
                     found_transition = true;
                 }
                 cursor = line_end + 1;
@@ -336,7 +368,7 @@ fn append_record_locked(coven_home: &Path, record: &MobileAuditRecord) -> Result
         }
     }
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).write(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -345,6 +377,28 @@ fn append_record_locked(coven_home: &Path, record: &MobileAuditRecord) -> Result
     let mut file = options
         .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))?;
+    // A forcibly stopped writer may leave its last JSON record unfinished.
+    // Inspect the final byte on the common path; validate the bounded prefix
+    // before changing an unterminated suffix. Never discard earlier evidence.
+    let length = file.metadata()?.len();
+    if length != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.seek(SeekFrom::Start(0))?;
+            let mut existing = Vec::new();
+            file.read_to_end(&mut existing)?;
+            audit_prefix_contains_transition_or_recovers_suffix(&mut existing, None, &path)?;
+            if existing.len() < length as usize {
+                file.set_len(existing.len() as u64)?;
+            } else if existing.len() > length as usize {
+                file.seek(SeekFrom::End(0))?;
+                file.write_all(b"\n")?;
+            }
+        }
+    }
+    file.seek(SeekFrom::End(0))?;
     serde_json::to_writer(&mut file, record).context("failed to encode mobile audit event")?;
     file.write_all(b"\n")
         .context("failed to finish mobile audit event")?;
@@ -355,6 +409,162 @@ fn append_record_locked(coven_home: &Path, record: &MobileAuditRecord) -> Result
 
 #[cfg(test)]
 mod tests {
+
+    fn restart_with_unterminated_tail(tail: &[u8], expected_events: &[&str]) {
+        let home = tempfile::tempdir().unwrap();
+        append_event(
+            home.path(),
+            Utc::now(),
+            MobileAuditEvent::GatewayStarted,
+            None,
+        )
+        .unwrap();
+        let path = home.path().join("mobile/audit.jsonl");
+        let complete_prefix = fs::read(&path).unwrap();
+        {
+            // Explicit synthetic on-disk interruption; this fragment is not
+            // evidence that a real rate-limit or authority effect occurred.
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(tail).unwrap();
+            file.sync_all().unwrap();
+        }
+        // This is the actual coarse audit append used by listener startup.
+        append_event(
+            home.path(),
+            Utc::now(),
+            MobileAuditEvent::GatewayStarted,
+            None,
+        )
+        .unwrap();
+        let after = fs::read(&path).unwrap();
+        assert!(
+            after.starts_with(&complete_prefix),
+            "restart changed complete prior evidence"
+        );
+        let events: Vec<String> = String::from_utf8(after)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line)
+                    .expect("restart appended after an unrecovered torn audit suffix");
+                record["event"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(events, expected_events);
+    }
+
+    #[test]
+    fn restart_repairs_torn_coarse_audit_tail_before_new_record() {
+        restart_with_unterminated_tail(
+            br#"{"timestamp":"2026-01-01T00:00:00Z","event": "#,
+            &["gateway_started", "gateway_started"],
+        );
+    }
+
+    #[test]
+    fn restart_preserves_complete_audit_record_missing_newline() {
+        restart_with_unterminated_tail(
+            br#"{"timestamp":"2026-01-01T00:00:00Z","event":"rate_limited","deviceId":null}"#,
+            &["gateway_started", "rate_limited", "gateway_started"],
+        );
+    }
+
+    #[test]
+    fn shutdown_audit_records_stopped_after_admission_closes() {
+        let home = tempfile::tempdir().unwrap();
+        append_event(
+            home.path(),
+            Utc::now(),
+            MobileAuditEvent::GatewayStarted,
+            None,
+        )
+        .unwrap();
+        let runtime = super::super::store_lock::Runtime::default();
+        let result = {
+            let _scope = runtime.enter();
+            runtime.cancel();
+            // Parallel fixtures can briefly hold the shared process mutex.
+            // Retry only an actual busy refusal; cancellation, malformed data
+            // and I/O failures must still fail this positive lifecycle case.
+            // This hang guard is not a production shutdown wait allowance.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match append_event(
+                    home.path(),
+                    Utc::now(),
+                    MobileAuditEvent::GatewayStopped,
+                    None,
+                ) {
+                    Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(crate::state_lock::is_lock_contended)
+                        }) =>
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "shutdown audit store remained busy: {error:#}"
+                        );
+                        std::thread::yield_now();
+                    }
+                    result => break result,
+                }
+            }
+        };
+        result.expect("normal stopped audit must remain possible after runtime admission closes");
+        let records: Vec<serde_json::Value> =
+            fs::read_to_string(home.path().join("mobile/audit.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["event"] == "gateway_stopped")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn shutdown_audit_never_waits_on_a_contended_file_lock() {
+        use fs2::FileExt;
+        let home = tempfile::tempdir().unwrap();
+        append_event(
+            home.path(),
+            Utc::now(),
+            MobileAuditEvent::GatewayStarted,
+            None,
+        )
+        .unwrap();
+        let before = fs::read(home.path().join("mobile/audit.jsonl")).unwrap();
+        let path = home.path().join("mobile/.audit.lock");
+        let held = crate::state_lock::open_lock_file(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        let worker_home = home.path().to_owned();
+        let (finished, outcome) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = append_event(
+                &worker_home,
+                Utc::now(),
+                MobileAuditEvent::GatewayStopped,
+                None,
+            );
+            let _ = finished.send(result);
+        });
+        let started = std::time::Instant::now();
+        let result = outcome.recv_timeout(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        FileExt::unlock(&held).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(result, Ok(Err(_))), "shutdown audit waited or claimed a write while its lock stayed held after {elapsed:?}: {result:?}");
+        assert_eq!(
+            fs::read(home.path().join("mobile/audit.jsonl")).unwrap(),
+            before
+        );
+    }
     use std::fs;
     use std::thread;
     use std::time::Duration;

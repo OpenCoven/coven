@@ -372,8 +372,9 @@ fn interrupted_restore_repairs_partial_new_protocol_floor_only_under_its_fence()
         .path()
         .join("mobile")
         .join(format!(".transport-v2-{}.required", c.f.id));
-    // Explicit retained image: create/write happened before file/namespace sync.
-    // An empty retained new file is legal; SIGKILL alone did not produce it.
+    // Explicit legacy retained image from the former direct-create writer.
+    // The staged writer cannot produce this canonical truncation; retain
+    // fenced recovery coverage for images left by older installations.
     atomic_replace_private(&marker, b"").unwrap();
     let registry = DeviceRegistry::load(destination.path()).unwrap();
     assert!(check_application(destination.path(), &registry, c.f.id).is_err());

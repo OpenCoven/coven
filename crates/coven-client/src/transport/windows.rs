@@ -466,11 +466,70 @@ fn windows_stop_pipe_preflight(bytes_available: u32) -> Result<(), ClientError> 
     }
 }
 
+#[cfg(any(windows, test))]
+fn windows_cooperative_shutdown_required(health: &serde_json::Value) -> Result<bool, ClientError> {
+    match health.pointer("/capabilities/lifecycleShutdown") {
+        None => Ok(false),
+        Some(serde_json::Value::String(contract)) if contract == "observed-workers-v1" => {
+            if health["apiVersion"] != crate::PROTOCOL_VERSION
+                || health["capabilities"]["structuredErrors"] != true
+            {
+                return Err(ClientError::Discovery(
+                    "invalid cooperative Windows lifecycle contract".into(),
+                ));
+            }
+            Ok(true)
+        }
+        Some(_) => Err(ClientError::Discovery(
+            "unsupported cooperative Windows lifecycle contract; refusing legacy termination"
+                .into(),
+        )),
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsShutdownReply {
+    Accepted,
+    LegacyUnsupported,
+}
+
+#[cfg(any(windows, test))]
+fn classify_windows_shutdown_reply(
+    required: bool,
+    status: u16,
+    body: &[u8],
+    expected_daemon: &serde_json::Value,
+) -> Result<WindowsShutdownReply, ClientError> {
+    if !required && matches!(status, 404 | 405) {
+        return Ok(WindowsShutdownReply::LegacyUnsupported);
+    }
+    if status != 202 {
+        return Err(ClientError::HttpStatus(status));
+    }
+    let response: serde_json::Value =
+        serde_json::from_slice(body).map_err(ClientError::InvalidJson)?;
+    if response["ok"] != true
+        || response["apiVersion"] != crate::PROTOCOL_VERSION
+        || response["capabilities"]["structuredErrors"] != true
+        || (required && response["capabilities"]["lifecycleShutdown"] != "observed-workers-v1")
+        || response.get("daemon") != Some(expected_daemon)
+    {
+        return Err(ClientError::Discovery(
+            "Windows shutdown acknowledgement did not match the authenticated daemon".into(),
+        ));
+    }
+    Ok(WindowsShutdownReply::Accepted)
+}
+
 #[cfg(windows)]
 pub struct WindowsDaemonProcess {
     process: std::os::windows::io::OwnedHandle,
     pid: u32,
     creation_time: u64,
+    pipe_name: String,
+    shutdown_daemon: serde_json::Value,
+    cooperative_shutdown_required: bool,
 }
 
 #[cfg(windows)]
@@ -482,6 +541,66 @@ impl WindowsDaemonProcess {
     #[doc(hidden)]
     pub fn creation_time(&self) -> u64 {
         self.creation_time
+    }
+
+    /// New separately owned authority must be stopped by its live owner. A
+    /// timeout or protocol/identity failure never falls back to killing that
+    /// owner before it has observed its workers exit. Legacy termination is
+    /// allowed only after an authenticated, explicitly unsupported route.
+    #[doc(hidden)]
+    pub fn shutdown_and_wait_until(self, deadline: Instant) -> Result<bool, ClientError> {
+        let mut stream = connect_validated_with_deadline(&self.pipe_name, deadline)?;
+        let peer = connected_windows_peer_identity(&stream)?;
+        if peer.server_pid != self.pid || peer.process_creation_time != self.creation_time {
+            return Err(ClientError::DaemonInstanceChanged);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({ "apiVersion": crate::PROTOCOL_VERSION, "daemon": &self.shutdown_daemon })).map_err(ClientError::InvalidJson)?;
+        let request = format!("POST /api/v1/internal/lifecycle/shutdown HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len());
+        const OPERATION: &str = "failed to write authenticated Windows shutdown request";
+        write_windows_pipe_with_deadline(&mut stream, request.as_bytes(), deadline, OPERATION)?;
+        write_windows_pipe_with_deadline(&mut stream, &body, deadline, OPERATION)?;
+        let response = read_windows_framed_response(&stream, deadline, 64 * 1024)?;
+        match classify_windows_shutdown_reply(
+            self.cooperative_shutdown_required,
+            response.status,
+            &response.body,
+            &self.shutdown_daemon,
+        )? {
+            WindowsShutdownReply::Accepted => {
+                // Keep the exact shutdown pipe and root process HANDLE alive
+                // through the single caller deadline. The daemon retains this
+                // connection until checked native cleanup has completed.
+                let _shutdown_connection = stream;
+                self.wait_for_exit_until(deadline)
+            }
+            WindowsShutdownReply::LegacyUnsupported => self.terminate_and_wait_until(deadline),
+        }
+    }
+
+    fn wait_for_exit_until(&self, deadline: Instant) -> Result<bool, ClientError> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::WaitForSingleObject,
+        };
+        let remaining = remaining_for_phase(
+            deadline,
+            Instant::now(),
+            "waiting for cooperative Windows daemon shutdown",
+        )?;
+        let milliseconds = remaining.as_millis().min((u32::MAX - 1) as u128) as u32;
+        match unsafe { WaitForSingleObject(self.process.as_raw_handle(), milliseconds) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(ClientError::Io {
+                operation: "failed to wait for cooperative Windows daemon exit",
+                source: std::io::Error::last_os_error(),
+            }),
+            result => Err(ClientError::Io {
+                operation: "failed to wait for cooperative Windows daemon exit",
+                source: std::io::Error::other(format!("unexpected Windows wait result {result}")),
+            }),
+        }
     }
 
     pub fn terminate_and_wait(self, timeout: Duration) -> Result<bool, ClientError> {
@@ -768,6 +887,12 @@ pub fn open_windows_daemon_process_for_stop_until(
         creation_time,
         &response.body,
     )?;
+    let health: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(ClientError::InvalidJson)?;
+    let cooperative_shutdown_required = windows_cooperative_shutdown_required(&health)?;
+    let shutdown_daemon = health.get("daemon").cloned().ok_or_else(|| {
+        ClientError::Discovery("authenticated Windows health omitted daemon identity".into())
+    })?;
     let mut confirmed_server_pid = 0;
     if unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle(), &mut confirmed_server_pid) }
         == 0
@@ -807,6 +932,9 @@ pub fn open_windows_daemon_process_for_stop_until(
         process,
         pid: identity.pid,
         creation_time: identity.creation_time,
+        pipe_name: pipe_name.to_owned(),
+        shutdown_daemon,
+        cooperative_shutdown_required,
     }))
 }
 
@@ -1827,5 +1955,97 @@ mod tests {
         // deadline above". Half the deadline keeps that separation unambiguous
         // while leaving room for scheduler jitter on a loaded runner.
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
+mod cooperative_shutdown_tests {
+    use super::*;
+    #[test]
+    fn observed_worker_contract_never_falls_back_to_legacy_termination() {
+        let daemon = serde_json::json!({"pid": 17, "startedAt": "test", "socket": "coven-daemon-test.sock", "processCreationTime": "23"});
+        let new = serde_json::json!({"apiVersion": crate::PROTOCOL_VERSION, "capabilities": {"structuredErrors": true, "lifecycleShutdown": "observed-workers-v1"}});
+        assert!(windows_cooperative_shutdown_required(&new).unwrap());
+        for status in [400, 404, 405, 409, 500, 503] {
+            assert!(
+                classify_windows_shutdown_reply(true, status, b"{}", &daemon).is_err(),
+                "new owner accepted legacy fallback at status {status}"
+            );
+        }
+        assert!(classify_windows_shutdown_reply(true, 202, b"not json", &daemon).is_err());
+        let wrong = serde_json::to_vec(&serde_json::json!({"ok": true, "apiVersion": crate::PROTOCOL_VERSION, "capabilities": {"structuredErrors": true, "lifecycleShutdown": "observed-workers-v1"}, "daemon": {"pid": 18}})).unwrap();
+        assert!(classify_windows_shutdown_reply(true, 202, &wrong, &daemon).is_err());
+        let unknown = serde_json::json!({"apiVersion": crate::PROTOCOL_VERSION, "capabilities": {"structuredErrors": true, "lifecycleShutdown": "future-contract"}});
+        assert!(windows_cooperative_shutdown_required(&unknown).is_err());
+    }
+
+    #[test]
+    fn legacy_fallback_requires_explicit_unsupported_authenticated_reply() {
+        let legacy = serde_json::json!({"capabilities": {"structuredErrors": true}});
+        assert!(!windows_cooperative_shutdown_required(&legacy).unwrap());
+        let daemon = serde_json::json!({"pid": 17});
+        for status in [404, 405] {
+            assert_eq!(
+                classify_windows_shutdown_reply(false, status, b"{}", &daemon).unwrap(),
+                WindowsShutdownReply::LegacyUnsupported
+            );
+        }
+        for status in [400, 409, 500, 503] {
+            assert!(classify_windows_shutdown_reply(false, status, b"{}", &daemon).is_err());
+        }
+        let accepted = serde_json::to_vec(&serde_json::json!({"ok": true, "apiVersion": crate::PROTOCOL_VERSION, "capabilities": {"structuredErrors": true}, "daemon": daemon})).unwrap();
+        assert_eq!(
+            classify_windows_shutdown_reply(false, 202, &accepted, &daemon).unwrap(),
+            WindowsShutdownReply::Accepted
+        );
+        assert!(
+            classify_windows_shutdown_reply(true, 202, &accepted, &daemon).is_err(),
+            "required contract accepted a legacy ACK without an echo"
+        );
+    }
+
+    #[test]
+    fn required_acknowledgement_echoes_the_exact_observed_worker_contract() {
+        let daemon = serde_json::json!({"pid": 17, "startedAt": "test", "socket": "coven-daemon-test.sock", "processCreationTime": "23"});
+        let accepted = serde_json::to_vec(&serde_json::json!({"ok": true, "apiVersion": crate::PROTOCOL_VERSION, "capabilities": {"structuredErrors": true, "lifecycleShutdown": "observed-workers-v1"}, "daemon": daemon})).unwrap();
+        assert_eq!(
+            classify_windows_shutdown_reply(true, 202, &accepted, &daemon).unwrap(),
+            WindowsShutdownReply::Accepted
+        );
+    }
+
+    #[test]
+    fn required_acknowledgement_rejects_missing_malformed_null_or_unknown_contract() {
+        let daemon = serde_json::json!({"pid": 17});
+        for contract in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(false)),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("future-contract")),
+            Some(serde_json::json!({"version": "observed-workers-v1"})),
+            Some(serde_json::json!(["observed-workers-v1"])),
+        ] {
+            let mut capabilities = serde_json::json!({"structuredErrors": true});
+            if let Some(value) = contract {
+                capabilities["lifecycleShutdown"] = value;
+            }
+            let acknowledgement = serde_json::to_vec(&serde_json::json!({"ok": true, "apiVersion": crate::PROTOCOL_VERSION, "capabilities": capabilities, "daemon": daemon})).unwrap();
+            assert!(
+                classify_windows_shutdown_reply(true, 202, &acknowledgement, &daemon).is_err(),
+                "required peer accepted malformed contract echo: {}",
+                String::from_utf8_lossy(&acknowledgement)
+            );
+        }
+        for malformed in [
+            b"null".as_slice(),
+            b"{}".as_slice(),
+            b"{\"capabilities\":null}".as_slice(),
+            b"{\"capabilities\":[]}".as_slice(),
+        ] {
+            assert!(classify_windows_shutdown_reply(true, 202, malformed, &daemon).is_err());
+        }
     }
 }

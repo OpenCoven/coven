@@ -1,4 +1,6 @@
+mod enrollment;
 mod restore;
+pub(super) use enrollment::InitialEnrollmentUncertain;
 pub(crate) use restore::{with_restore_snapshot, RestoreRegistry};
 mod introduction;
 #[cfg(test)]
@@ -60,6 +62,7 @@ impl DeviceRegistryStoreLock {
         mut waiting: impl FnMut(),
     ) -> Result<Self> {
         let check = || -> Result<()> {
+            super::store_lock::check()?;
             anyhow::ensure!(
                 !stopped.load(Ordering::Acquire),
                 "mobile device registry is stopping"
@@ -89,7 +92,11 @@ impl DeviceRegistryStoreLock {
             check()?;
             match file.try_lock_exclusive() {
                 Ok(()) => break,
-                Err(error) if crate::state_lock::is_lock_contended(&error) => wait(),
+                Err(error) if crate::state_lock::is_lock_contended(&error) => {
+                    #[cfg(test)]
+                    super::store_lock::notify(&lock_path);
+                    wait();
+                }
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("failed to lock {}", lock_path.display()))
@@ -98,10 +105,12 @@ impl DeviceRegistryStoreLock {
         }
         // Cancellation stops admission, never interrupts an acquired transaction.
         check()?;
-        Ok(Self {
+        let guard = Self {
             _process: process,
             file,
-        })
+        };
+        enrollment::recover_existing(path).context(enrollment::InitialEnrollmentUncertain)?;
+        Ok(guard)
     }
 }
 
@@ -303,6 +312,9 @@ impl DeviceRegistry {
         let mobile_dir = ensure_private_mobile_dir(coven_home)?;
         let path = mobile_dir.join(DEVICES_FILE);
         let _store_lock = DeviceRegistryStoreLock::acquire(&path)?;
+        // Admit the dependent store before migration or recovery. Reconcile
+        // under registry -> key locks before any authority can be published.
+        let authorization_keys = AuthorizationKeyRegistry::load(coven_home)?;
         let loaded = read_registry(&path)?;
         if loaded.migrated {
             write_registry(
@@ -315,7 +327,7 @@ impl DeviceRegistry {
         Ok(Self {
             path,
             devices: RwLock::new(loaded.devices),
-            authorization_keys: AuthorizationKeyRegistry::load(coven_home)?,
+            authorization_keys,
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             lock_wait_observer: Mutex::new(None),
@@ -419,42 +431,39 @@ impl DeviceRegistry {
     ) -> Result<()> {
         devices.push(granted);
         validate_devices(&devices)?;
-        let enrolled_authorization = if let Some(key) = authorization_key {
-            Some(
-                self.authorization_keys.enroll_initial(
-                    devices.last().expect("new device is present").device.id,
-                    &devices
-                        .last()
-                        .expect("new device is present")
-                        .device
-                        .public_key_x963,
-                    key,
-                )?,
+        let commit = || {
+            write_registry(
+                &self.path,
+                &devices,
+                &rotation_transitions,
+                &grant_reissue_transitions,
             )
-        } else {
-            None
         };
-        if let Err(error) = write_registry(
-            &self.path,
-            &devices,
-            &rotation_transitions,
-            &grant_reissue_transitions,
-        ) {
-            if enrolled_authorization.is_some() {
-                self.authorization_keys
-                    .remove_device(devices.last().expect("new device is present").device.id)
-                    .with_context(|| {
-                        format!(
-                            "failed to roll back authorization key after device commit failed: {error:#}"
-                        )
-                    })?;
-            }
-            return Err(error);
+        if let Some(key) = authorization_key {
+            let introductions = read_registry(&self.path)?.introduction_transitions;
+            let encoded = encode_registry_with_introductions(
+                &self.path,
+                &devices,
+                &rotation_transitions,
+                &grant_reissue_transitions,
+                &introductions,
+            )?;
+            enrollment::commit(
+                &self.path,
+                &self.authorization_keys,
+                devices.last().expect("new device is present"),
+                key,
+                &encoded,
+                commit,
+            )?;
+        } else {
+            commit().context(enrollment::InitialEnrollmentUncertain)?;
         }
         *self
             .devices
             .write()
-            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))? = devices;
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))
+            .context(enrollment::InitialEnrollmentUncertain)? = devices;
         Ok(())
     }
 
@@ -1320,13 +1329,13 @@ fn write_registry(
     )
 }
 
-fn write_registry_with_introductions(
+fn encode_registry_with_introductions(
     path: &Path,
     devices: &[GrantedDeviceRecord],
     rotation_transitions: &[DeviceRotationAuditTransition],
     grant_reissue_transitions: &[DeviceGrantReissueAuditTransition],
     introduction_transitions: &[IntroductionTransition],
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     validate_devices(devices)?;
     validate_rotation_transitions(devices, rotation_transitions)?;
     validate_grant_reissue_transitions(devices, grant_reissue_transitions)?;
@@ -1342,6 +1351,23 @@ fn write_registry_with_introductions(
     let mut encoded =
         serde_json::to_vec_pretty(&stored).context("failed to encode mobile device registry")?;
     encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn write_registry_with_introductions(
+    path: &Path,
+    devices: &[GrantedDeviceRecord],
+    rotation_transitions: &[DeviceRotationAuditTransition],
+    grant_reissue_transitions: &[DeviceGrantReissueAuditTransition],
+    introduction_transitions: &[IntroductionTransition],
+) -> Result<()> {
+    let encoded = encode_registry_with_introductions(
+        path,
+        devices,
+        rotation_transitions,
+        grant_reissue_transitions,
+        introduction_transitions,
+    )?;
     #[cfg(test)]
     {
         let mut failure = FAIL_DEVICE_REGISTRY_WRITE
@@ -1821,6 +1847,58 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_during_failed_registration_preserves_authorization_rollback() {
+        use super::super::config::{set_write_observer, MobileWritePhase};
+        use super::super::store_lock::Runtime;
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        let record = device(Uuid::from_u128(1), "Synthetic phone");
+        let grant = DeviceGrant::for_device(
+            record.id,
+            &record.public_key_x963,
+            record.scopes.clone(),
+            record.paired_at,
+        )
+        .unwrap();
+        // The existing failure fixture makes the registry commit fail after
+        // authorization enrollment. Cancellation is injected only after that
+        // key has actually reached its directory-sync checkpoint.
+        fail_next_device_registry_write(&registry.path);
+        let key_path = temp.path().join("mobile/authorization-keys.json");
+        let runtime = Runtime::default();
+        let cancellation = runtime.clone();
+        set_write_observer(Box::new(move |path, phase| {
+            if path == key_path && phase == MobileWritePhase::DirectorySynced {
+                cancellation.cancel();
+            }
+            Ok(())
+        }));
+        let result = {
+            let _scope = runtime.enter();
+            registry.commit_registration(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                GrantedDeviceRecord {
+                    device: record.clone(),
+                    grant,
+                },
+                Some(NewAuthorizationKey {
+                    public_key_x963: device(Uuid::from_u128(2), "Step-up key").public_key_x963,
+                    assurance_class: AssuranceClass::BiometricOnly,
+                    enrolled_at: record.paired_at,
+                }),
+            )
+        };
+        set_write_observer(Box::new(|_, _| Ok(())));
+        assert!(
+            result.is_err(),
+            "invalid registry target unexpectedly committed"
+        );
+        assert!(registry.authorization_key_history(record.id).unwrap().is_empty(), "shutdown disabled rollback and left an authorization key for a device that never committed");
+    }
+
+    #[test]
     fn failed_device_commit_rolls_back_new_authorization_key() {
         let temp = tempfile::tempdir().unwrap();
         let registry = DeviceRegistry::load(temp.path()).unwrap();
@@ -1832,7 +1910,7 @@ mod tests {
             record.paired_at,
         )
         .unwrap();
-        std::fs::create_dir(&registry.path).unwrap();
+        fail_next_device_registry_write(&registry.path);
 
         assert!(registry
             .commit_registration(

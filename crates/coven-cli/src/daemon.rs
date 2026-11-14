@@ -300,6 +300,11 @@ struct LostSession {
     registration: Arc<LiveSessionRegistration>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static LIVE_LAUNCH_DRAIN_WAITS: std::cell::RefCell<Option<std::sync::mpsc::SyncSender<Duration>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Default)]
 struct LiveLaunchGate {
     state: Mutex<LiveLaunchGateState>,
@@ -376,6 +381,10 @@ impl LiveLaunchGate {
     }
 
     fn close_and_wait(&self) -> Result<()> {
+        self.close_and_wait_before(None)
+    }
+
+    fn close_and_wait_before(&self, outer_deadline: Option<Instant>) -> Result<()> {
         const ADMISSION_DRAIN_BUDGET: Duration = Duration::from_millis(500);
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -403,6 +412,7 @@ impl LiveLaunchGate {
         }
 
         let deadline = Instant::now() + ADMISSION_DRAIN_BUDGET;
+        let deadline = outer_deadline.map_or(deadline, |outer| outer.min(deadline));
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -412,6 +422,12 @@ impl LiveLaunchGate {
             if remaining.is_zero() {
                 break;
             }
+            #[cfg(test)]
+            LIVE_LAUNCH_DRAIN_WAITS.with(|slot| {
+                if let Some(observer) = slot.borrow().as_ref() {
+                    let _ = observer.try_send(remaining);
+                }
+            });
             let waited = self.drained.wait_timeout(state, remaining);
             state = match waited {
                 Ok((state, _)) => state,
@@ -998,6 +1014,14 @@ impl LiveSessionRuntime {
     /// backstop (notably KILL_ON_JOB_CLOSE on Windows), while this method gives
     /// graceful daemon shutdown a checked, observable cancellation path.
     fn shutdown_all(&self) -> Result<()> {
+        self.shutdown_all_before(None)
+    }
+
+    fn shutdown_all_until(&self, deadline: Instant) -> Result<()> {
+        self.shutdown_all_before(Some(deadline))
+    }
+
+    fn shutdown_all_before(&self, outer_deadline: Option<Instant>) -> Result<()> {
         self.shutting_down.store(true, Ordering::Release);
         // No prompt bytes are delivered while an admission remains in this
         // gate. Closing it makes every pre-registration launcher either fail
@@ -1005,7 +1029,11 @@ impl LiveSessionRuntime {
         // before shutdown drains the live map. This is also the barrier that
         // keeps a detached Unix request thread from losing a locally owned
         // setsid child when the daemon process exits.
-        let admission_failure = self.launch_gate.close_and_wait().err();
+        let admission_failure = match outer_deadline {
+            Some(deadline) => self.launch_gate.close_and_wait_before(Some(deadline)),
+            None => self.launch_gate.close_and_wait(),
+        }
+        .err();
         let handles = {
             let mut sessions = match self.sessions.lock() {
                 Ok(sessions) => sessions,
@@ -1033,6 +1061,8 @@ impl LiveSessionRuntime {
         // deadline across the set so shutdown remains bounded instead of
         // multiplying the wait budget by the number of live sessions.
         let quiescence_deadline = Instant::now() + Duration::from_secs(1);
+        let quiescence_deadline =
+            outer_deadline.map_or(quiescence_deadline, |outer| outer.min(quiescence_deadline));
         for handle in handles {
             let remaining = quiescence_deadline.saturating_duration_since(Instant::now());
             let result = match handle.killer.lock() {
@@ -2188,7 +2218,14 @@ fn publish_established_runtime_ownership(
 
 impl Drop for LiveSessionRuntime {
     fn drop(&mut self) {
-        let _ = self.shutdown_all();
+        if self.shutting_down.load(Ordering::Acquire) {
+            // An explicit shutdown has already spent its shared allowance.
+            // Retry exact-tree signals/backstops with ZERO wait budget; never
+            // renew admission/quiescence waits during error-path unwinding.
+            let _ = self.shutdown_all_until(Instant::now());
+        } else {
+            let _ = self.shutdown_all();
+        }
     }
 }
 
@@ -4209,7 +4246,7 @@ impl DaemonStopController for SystemDaemonStopController {
             );
             Ok(
                 if process
-                    .terminate_and_wait_until(deadline.instant)
+                    .shutdown_and_wait_until(deadline.instant)
                     .map_err(anyhow::Error::new)?
                 {
                     VerifiedStopOutcome::Exited
@@ -4404,7 +4441,7 @@ fn stop_background_server_with_controller_until(
             VerifiedStopOutcome::Exited => break,
             VerifiedStopOutcome::TimedOut => {
                 anyhow::bail!(
-                    "Coven daemon pid {} did not exit after SIGTERM; not clearing daemon status",
+                    "Coven daemon pid {} did not exit before the lifecycle deadline; not clearing daemon status",
                     status.pid
                 );
             }
@@ -5693,7 +5730,7 @@ fn daemon_status_file_pid(status_path: &Path) -> Option<u32> {
         .map(|status| status.pid)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 static DAEMON_TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
@@ -5713,12 +5750,12 @@ extern "C" fn handle_termination_signal(sig: libc::c_int) {
     let _ = sig;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn daemon_termination_requested() -> bool {
     DAEMON_TERMINATION_REQUESTED.load(Ordering::Acquire)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn daemon_termination_requested() -> bool {
     false
 }
@@ -5752,10 +5789,8 @@ fn install_termination_signal_handlers(socket_path: &Path, status_path: &Path) -
 }
 
 #[cfg(unix)]
-fn install_daemon_panic_hook(coven_home: &Path, socket_path: &Path, status_path: &Path) {
+fn install_daemon_panic_hook(coven_home: &Path) {
     let coven_home = coven_home.to_path_buf();
-    let socket_path = socket_path.to_path_buf();
-    let status_path = status_path.to_path_buf();
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Capture the panic location and payload before any potentially
@@ -5766,11 +5801,10 @@ fn install_daemon_panic_hook(coven_home: &Path, socket_path: &Path, status_path:
             "daemon panic: {info}\nbacktrace:\n{backtrace}\n----------------------------------------"
         );
         append_daemon_recovery_log(&coven_home, &payload);
-        // Best-effort cleanup; Drop on ShutdownGuard would also run during
-        // unwinding, but a panic from inside Drop or from a thread that does
-        // not own the guard would otherwise leave the files behind.
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_file(&status_path);
+        // Only the serving owner's ShutdownGuard may clear these paths.
+        // A worker-thread panic need not end the daemon, and during unwinding
+        // retained mobile ownership must quiesce before status is removed.
+        // Abort leaves recoverable stale metadata rather than hiding live work.
     }));
 }
 
@@ -6324,7 +6358,7 @@ pub fn serve_forever(
     let status_path = daemon_status_path(coven_home);
     // Install the shutdown hooks before anything else that can fail: a panic
     // during recovery or bind would otherwise leave a socket file behind.
-    install_daemon_panic_hook(coven_home, &socket_path, &status_path);
+    install_daemon_panic_hook(coven_home);
     install_termination_signal_handlers(&socket_path, &status_path)?;
     // Acquire the socket BEFORE claiming any on-disk daemon state. bind_api_socket
     // refuses to take over a socket a healthy daemon already owns; if it bails we
@@ -6346,6 +6380,7 @@ pub fn serve_forever(
         status_path: status_path.clone(),
         pid: status.pid,
     };
+    let retained_mobile_owner = crate::mobile_memory::gateway::process::RetainedOwnerGuard;
     let tcp_listener = if let Some(addr) = tcp_addr {
         let listener = bind_tcp_listener(addr)?;
         listener
@@ -6385,14 +6420,38 @@ pub fn serve_forever(
     startup.append(coven_home, StartupCheckpoint::MaintenanceSchedulerEnd);
     start_session_liveness_sweeper(coven_home, &runtime)?;
     startup.append(coven_home, StartupCheckpoint::LivenessSweeperEnd);
-    let automations_scheduler =
+    let mut automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
-    let mobile_gateway = crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)
-        .inspect_err(|error| {
-            startup_store.close_before_reporting_failure();
-            startup_failure::record(coven_home, &status, error);
-        })?;
+    let mut mobile_gateway =
+        match crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home) {
+            Ok(worker) => worker,
+            Err(error) => {
+                let deadline =
+                    crate::mobile_memory::gateway::process::startup_cleanup_deadline(&error)
+                        .unwrap_or_else(|| Instant::now() + Duration::from_millis(1800));
+                automations_scheduler.request_shutdown();
+                let runtime_cleanup = runtime.shutdown_all_until(deadline);
+                let scheduler_cleanup = automations_scheduler.shutdown_and_join_until(deadline);
+                startup_store.close_before_reporting_failure();
+                startup_failure::record(coven_home, &status, &error);
+                // Preserve source/configuration/cancellation error types even when
+                // another cleanup guard also failed. Existing retained ownership
+                // still prevents metadata removal or daemon exit without proof.
+                let error = match runtime_cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => {
+                        error.context(format!("startup session cleanup failed: {cleanup:#}"))
+                    }
+                };
+                return Err(match scheduler_cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => {
+                        error.context(format!("startup scheduler cleanup failed: {cleanup:#}"))
+                    }
+                });
+            }
+        };
     startup.append(coven_home, StartupCheckpoint::MobileGatewayEnd);
 
     let (tcp_thread, active_tcp_connection) = if let Some(tcp_listener) = tcp_listener {
@@ -6591,17 +6650,23 @@ pub fn serve_forever(
     // a request and be sitting inside a 30-second socket read; the documented
     // daemon-stop budget is two seconds, so shutdown must not wait for that
     // client before it kills live sessions.
+    // One absolute budget includes session, scheduler, TCP and mobile cleanup.
+    // Leave room for accept-loop observation and the stop controller's polling.
+    let shutdown_deadline = Instant::now() + Duration::from_millis(1800);
+    if let Some(worker) = &mobile_gateway {
+        worker.request_shutdown();
+    }
     let scheduler_shutdown_deadline = Instant::now() + Duration::from_millis(250);
     automations_scheduler.request_shutdown();
     let runtime_shutdown = runtime
-        .shutdown_all()
+        .shutdown_all_until(shutdown_deadline)
         .context("failed to terminate live sessions during daemon shutdown");
     let scheduler_shutdown = automations_scheduler.finish_shutdown(scheduler_shutdown_deadline);
     let tcp_shutdown = if let Some(tcp_thread) = tcp_thread {
         if let Some(active) = active_tcp_connection.as_ref() {
             cancel_active_tcp_connection(active);
         }
-        let deadline = Instant::now() + Duration::from_millis(250);
+        let deadline = (Instant::now() + Duration::from_millis(250)).min(shutdown_deadline);
         while !tcp_thread.is_finished() && Instant::now() < deadline {
             if let Some(active) = active_tcp_connection.as_ref() {
                 cancel_active_tcp_connection(active);
@@ -6629,9 +6694,18 @@ pub fn serve_forever(
         // the accept loop observing termination.
         cancel_active_tcp_connection(active);
     }
-    let shutdown_result = scheduler_shutdown.and(runtime_shutdown).and(tcp_shutdown);
-    drop(unix_listener);
+    let mobile_shutdown = mobile_gateway
+        .as_mut()
+        .map(|worker| worker.shutdown_until(shutdown_deadline))
+        .unwrap_or(Ok(()));
+    let shutdown_result = scheduler_shutdown
+        .and(runtime_shutdown)
+        .and(tcp_shutdown)
+        .and(mobile_shutdown);
     drop(mobile_gateway);
+    // Preserve status and the serving lock until every retained child exits.
+    drop(retained_mobile_owner);
+    drop(unix_listener);
     drop(shutdown_guard);
     drop(serve_lock);
     match shutdown_connections.lock() {
@@ -7064,7 +7138,7 @@ fn lifecycle_shutdown_response(
             &serde_json::json!({
                 "ok": true,
                 "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
-                "capabilities": { "structuredErrors": true },
+                "capabilities": if cfg!(windows) { serde_json::json!({ "structuredErrors": true, "lifecycleShutdown": "observed-workers-v1" }) } else { serde_json::json!({ "structuredErrors": true }) },
                 "daemon": status,
             }),
         )?,
@@ -7423,8 +7497,8 @@ pub(crate) fn windows_pipe_path(coven_home: &Path) -> Result<PathBuf> {
 /// This supplies birth-time containment for the narrow interval before a
 /// suspended noninteractive child is assigned to its per-session Job. The
 /// handle is intentionally retained by the process until kernel teardown; an
-/// abrupt `TerminateProcess` from `daemon stop` then closes it and kills every
-/// inherited descendant, while the per-session Job remains the checked,
+/// abrupt daemon process termination then closes it and kills every inherited
+/// descendant, while the per-session Job remains the checked,
 /// explicit cancellation owner during normal operation.
 ///
 /// This Job is a required startup invariant, not an optional backstop. The
@@ -7524,7 +7598,7 @@ fn serve_forever_with_lifetime_job_installer(
     install_lifetime_job: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     use interprocess::{
-        local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
+        local_socket::{prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions},
         os::windows::local_socket::ListenerOptionsExt,
     };
     use std::sync::{
@@ -7540,6 +7614,7 @@ fn serve_forever_with_lifetime_job_installer(
     #[cfg(feature = "threads-test-clock")]
     crate::ward_power_loss_fixture::activate_for_daemon(coven_home)?;
     install_lifetime_job()?;
+    DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
     let pipe_name = windows_pipe_name(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
@@ -7560,6 +7635,9 @@ fn serve_forever_with_lifetime_job_installer(
         .security_descriptor(security_descriptor)
         .create_sync()
         .context("failed to bind Windows named pipe")?;
+    listener
+        .set_nonblocking(ListenerNonblockingMode::Accept)
+        .context("failed to make Windows daemon accept interruptible")?;
     // Claim the pipe before mutating shared daemon/session state. A duplicate
     // daemon must fail at bind without replacing the incumbent's daemon.json
     // or marking sessions owned by that live daemon orphaned.
@@ -7585,10 +7663,11 @@ fn serve_forever_with_lifetime_job_installer(
     startup.append(coven_home, StartupCheckpoint::MaintenanceSchedulerEnd);
     start_session_liveness_sweeper(coven_home, &runtime)?;
     startup.append(coven_home, StartupCheckpoint::LivenessSweeperEnd);
-    let _automations_scheduler =
+    let automations_scheduler =
         crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
     startup.append(coven_home, StartupCheckpoint::AutomationsSchedulerEnd);
-    let _mobile_gateway = crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(
+    let retained_mobile_owner = crate::mobile_memory::gateway::process::RetainedOwnerGuard;
+    let mut mobile_gateway = crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(
         coven_home,
     )
     .inspect_err(|error| {
@@ -7601,14 +7680,27 @@ fn serve_forever_with_lifetime_job_installer(
     let inflight = Arc::new(AtomicUsize::new(0));
     startup.append(coven_home, StartupCheckpoint::ApiAcceptLoopEnter);
     startup_store.close_after_readiness();
-    for conn in listener.incoming() {
-        let stream = match conn {
+    let shutdown_connections =
+        Arc::new(Mutex::new(Vec::<interprocess::local_socket::Stream>::new()));
+    loop {
+        if daemon_termination_requested() {
+            break;
+        }
+        let stream = match listener.accept() {
             Ok(s) => s,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             Err(error) => {
                 eprintln!("coven daemon: pipe accept error: {error:#}");
                 continue;
             }
         };
+        if daemon_termination_requested() {
+            drop(stream);
+            break;
+        }
         let conn_home = coven_home.to_path_buf();
         let conn_status = status.clone();
         let conn_runtime = Arc::clone(&runtime);
@@ -7619,17 +7711,24 @@ fn serve_forever_with_lifetime_job_installer(
 
         inflight.fetch_add(1, Ordering::Relaxed);
         let conn_inflight = Arc::clone(&inflight);
+        let conn_shutdown_connections = Arc::clone(&shutdown_connections);
         let spawn_result = std::thread::Builder::new()
             .name("coven-windows-api".into())
             .spawn(move || {
-                if let Err(error) = serve_named_pipe_connection(
+                match serve_named_pipe_connection(
                     &stream,
                     &conn_home,
                     Some(conn_status),
                     conn_runtime.as_ref(),
                 ) {
-                    if !is_client_disconnect(&error) {
-                        eprintln!("coven daemon: pipe connection error: {error:#}");
+                    Ok(HttpStreamOutcome::HoldForShutdown) => {
+                        retain_windows_shutdown_connection(&conn_shutdown_connections, stream);
+                    }
+                    Ok(HttpStreamOutcome::Complete) => {}
+                    Err(error) => {
+                        if !is_client_disconnect(&error) {
+                            eprintln!("coven daemon: pipe connection error: {error:#}");
+                        }
                     }
                 }
                 conn_inflight.fetch_sub(1, Ordering::Relaxed);
@@ -7639,8 +7738,54 @@ fn serve_forever_with_lifetime_job_installer(
             eprintln!("coven daemon: failed to spawn pipe handler: {error:#}");
         }
     }
-    Ok(())
+    // The exact same absolute stop budget includes scheduler/session work
+    // before the native authority boundary is asked to stop.
+    let shutdown_deadline = Instant::now() + Duration::from_millis(1800);
+    if let Some(worker) = mobile_gateway.as_ref() {
+        worker.request_shutdown();
+    }
+    let scheduler_deadline = Instant::now() + Duration::from_millis(250);
+    automations_scheduler.request_shutdown();
+    let runtime_shutdown = runtime
+        .shutdown_all_until(shutdown_deadline)
+        .context("failed to terminate live sessions during Windows daemon shutdown");
+    let scheduler_shutdown = automations_scheduler.finish_shutdown(scheduler_deadline);
+    let mobile_shutdown = mobile_gateway
+        .as_mut()
+        .map(|worker| worker.shutdown_until(shutdown_deadline))
+        .unwrap_or(Ok(()));
+    drop(mobile_gateway);
+    // On failure, this blocks while retaining the profile lease (owned by
+    // main), serving lock, pipe listener and daemon status. CLI timeout must
+    // not escalate termination of a peer advertising this contract.
+    drop(retained_mobile_owner);
+    drop(listener);
+    shutdown_connections
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    scheduler_shutdown
+        .and(runtime_shutdown)
+        .and(mobile_shutdown)
 }
+
+#[cfg(windows)]
+fn retain_windows_shutdown_connection(
+    connections: &Mutex<Vec<interprocess::local_socket::Stream>>,
+    stream: interprocess::local_socket::Stream,
+) {
+    connections
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(stream);
+    // Only a validated identity request whose acknowledgement was written and
+    // whose exact pipe is now retained may start cooperative shutdown.
+    DAEMON_TERMINATION_REQUESTED.store(true, Ordering::Release);
+}
+
+#[cfg(all(test, windows))]
+#[path = "daemon_windows_retained_tests.rs"]
+mod windows_retained_tests;
 
 #[cfg(windows)]
 fn serve_named_pipe_connection(
@@ -7671,11 +7816,15 @@ fn serve_named_pipe_connection(
         Some(MAX_SOCKET_BODY_BYTES),
         HttpStreamPolicy {
             host_guard: HostGuard::Disabled,
-            lifecycle: LifecycleControl::Disabled,
+            lifecycle: LifecycleControl::OwnerLocal,
             configure_stream: Some(&configure),
         },
     );
-    if streaming.get() {
+    if streaming.get()
+        || result
+            .as_ref()
+            .is_ok_and(|outcome| *outcome == HttpStreamOutcome::HoldForShutdown)
+    {
         // A stalled SSE reader must not migrate to interprocess's background
         // flush/limbo pool when the connection is dropped.
         let interprocess::local_socket::Stream::NamedPipe(pipe) = stream;
@@ -7683,6 +7832,18 @@ fn serve_named_pipe_connection(
     }
     result
 }
+
+#[cfg(test)]
+#[path = "runtime_shutdown_deadline_tests.rs"]
+mod runtime_shutdown_deadline_tests;
+
+#[cfg(all(test, unix))]
+#[path = "daemon_startup_stop_tests.rs"]
+mod startup_mobile_stop_tests;
+
+#[cfg(all(test, unix))]
+#[path = "daemon_panic_retained_tests.rs"]
+mod panic_retained_tests;
 
 #[cfg(test)]
 mod tests {

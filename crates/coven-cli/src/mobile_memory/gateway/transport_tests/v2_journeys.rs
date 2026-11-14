@@ -1,7 +1,9 @@
 //! Integrated v2 application journeys through the production runtime (#1684).
 //!
-//! Each test starts the daemon's relay runtime with `start_mobile_gateway_for_daemon`
-//! against the real `coven-relay` router and serves direct ingress by handing every
+//! Each test starts the native mobile runtime in this process with
+//! `start_mobile_gateway_native_for_daemon`, the function the daemon's contained
+//! mobile worker calls, against the real `coven-relay` router. It serves direct
+//! ingress by handing every
 //! loopback socket to `serve_tls_connection` with that runtime's own gateway state,
 //! so signed HTTPS control, direct WSS and relay workers share one registry and one
 //! authenticator. The device side holds only what a paired client holds: its
@@ -14,6 +16,8 @@
 //! worker discards its error, so the exact refusal class is asserted on direct
 //! ingress only; on the relay profile a refusal is a failed attempt with both
 //! sides' durable counters unchanged. Sockets are local and keys are synthetic.
+//! The daemon runs this runtime in a worker process (#1615); only `daemon_process`
+//! crosses that boundary.
 use super::*;
 use crate::mobile_memory::{
     assurance::{
@@ -145,7 +149,7 @@ struct Verdicts {
 
 struct Running {
     // Declared first: the relay runtime stops before the shared state is released.
-    _runtime: MobileRuntimeHandle,
+    _runtime: NativeMobileRuntimeHandle,
     state: Arc<MobileGatewayState>,
     address: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -314,7 +318,7 @@ impl Host {
             self.running.is_none() && self.external.is_none(),
             "a runtime already serves this installation"
         );
-        let runtime = start_mobile_gateway_for_daemon(self.home.path())
+        let runtime = start_mobile_gateway_native_for_daemon(self.home.path())
             .unwrap()
             .expect("relay runtime did not start");
         assert!(runtime._direct.is_none() && runtime._relay.is_some());

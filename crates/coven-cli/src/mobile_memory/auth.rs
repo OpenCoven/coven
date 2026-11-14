@@ -406,10 +406,8 @@ impl MobileAuthenticator {
             .checked_add(MOBILE_REQUEST_WINDOW_SECONDS)
             .and_then(|last_valid| last_valid.checked_add(1))
             .ok_or(MobileAuthError::RequestExpired)?;
-        let mut replay = self
-            .replay
-            .lock()
-            .map_err(|_| MobileAuthError::RateLimited)?;
+        let mut replay =
+            super::store_lock::process(&self.replay).map_err(|_| MobileAuthError::RateLimited)?;
         // Retired signatures must stay retired if the wall clock moves back.
         // Compare expiry, not the sample itself: concurrent requests may arrive
         // at this lock out of order without a clock rollback.
@@ -430,10 +428,8 @@ impl MobileAuthenticator {
     }
 
     fn record_rate(&self, device_id: Uuid, now: i64) -> Result<(), MobileAuthError> {
-        let mut rates = self
-            .rates
-            .lock()
-            .map_err(|_| MobileAuthError::RateLimited)?;
+        let mut rates =
+            super::store_lock::process(&self.rates).map_err(|_| MobileAuthError::RateLimited)?;
         let requests = rates.entry(device_id).or_default();
         while requests
             .front()

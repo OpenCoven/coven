@@ -59,12 +59,11 @@ impl RelayConfig {
     }
 
     fn with_config_lock(home: &Path, operation: impl FnOnce() -> Result<()>) -> Result<()> {
-        let _process = CONFIG_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("relay configuration lock poisoned"))?;
+        let _process = crate::mobile_memory::store_lock::process(&CONFIG_LOCK)
+            .context("relay configuration lock unavailable")?;
         let directory = ensure_private_mobile_dir(home)?;
         let lock = crate::state_lock::open_lock_file(&directory.join(".relay.lock"))?;
-        lock.lock_exclusive()?;
+        crate::mobile_memory::store_lock::lock_exclusive(&lock, &directory.join(".relay.lock"))?;
         operation()?;
         FileExt::unlock(&lock)?;
         Ok(())
@@ -281,12 +280,11 @@ pub fn load_or_provision(
     host: &SigningKey,
     device_id: Uuid,
 ) -> Result<Material> {
-    let _process = MATERIAL_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("transport state lock poisoned"))?;
+    let _process = crate::mobile_memory::store_lock::process(&MATERIAL_LOCK)
+        .context("transport state lock unavailable")?;
     let directory = ensure_private_mobile_dir(home)?;
     let lock = crate::state_lock::open_lock_file(&directory.join(".transport.lock"))?;
-    lock.lock_exclusive()?;
+    crate::mobile_memory::store_lock::lock_exclusive(&lock, &directory.join(".transport.lock"))?;
     v2::restore::check_application(home, registry, device_id)?;
     ensure!(
         !requires_v2(home, device_id)?,
@@ -535,3 +533,7 @@ mod listener_config_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "storage/contention_tests.rs"]
+mod contention_tests;

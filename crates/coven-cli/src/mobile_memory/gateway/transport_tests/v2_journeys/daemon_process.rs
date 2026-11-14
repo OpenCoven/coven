@@ -11,7 +11,10 @@
 //! private-network address the daemon cannot bind its listener; both handovers
 //! then run on the in-process runtime while no daemon is running and only the
 //! relay profile reaches the daemon process. The child is the test executable
-//! running the daemon's serve loop, not the installed `coven` binary.
+//! running the daemon's serve loop, not the installed `coven` binary. That daemon
+//! contains the mobile runtime in a worker process (#1615); in a test build the
+//! worker is this executable's `worker_fixture` entry, not `coven
+//! mobile-gateway-worker`.
 use super::*;
 use std::process::{Child, Command, Stdio};
 

@@ -38,6 +38,7 @@ pub struct PendingPairing {
     pub cancelled: bool,
     pub expired: bool,
     pub cancellation_audited: bool,
+    pub commit_uncertain: bool,
     pub completed: Option<MobilePairedDevice>,
 }
 
@@ -141,6 +142,7 @@ pub enum PairingError {
     PairingConfirmationRequired,
     PairingPhraseMismatch,
     InvalidRequest,
+    CommitUncertain,
 }
 
 impl fmt::Display for PairingError {
@@ -151,6 +153,9 @@ impl fmt::Display for PairingError {
             Self::PairingConfirmationRequired => "pairing confirmation is required",
             Self::PairingPhraseMismatch => "pairing phrase did not match",
             Self::InvalidRequest => "pairing request is invalid",
+            Self::CommitUncertain => {
+                "pairing outcome is unknown; reconcile enrolled devices before retrying"
+            }
         })
     }
 }
@@ -207,12 +212,11 @@ impl PairingManager {
             cancelled: false,
             expired: false,
             cancellation_audited: false,
+            commit_uncertain: false,
             completed: None,
         };
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| PairingError::InvalidRequest)?;
+        let mut pending =
+            super::store_lock::process(&self.pending).map_err(|_| PairingError::InvalidRequest)?;
         if let Some(now) = prune_before_insert {
             Self::prune_expired(&mut pending, now, |_| false);
         }
@@ -246,10 +250,8 @@ impl PairingManager {
         now: DateTime<Utc>,
         addressed: Uuid,
     ) -> Result<MutexGuard<'_, HashMap<Uuid, PendingPairing>>, PairingError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| PairingError::InvalidRequest)?;
+        let mut pending =
+            super::store_lock::process(&self.pending).map_err(|_| PairingError::InvalidRequest)?;
         Self::prune_expired(&mut pending, now, |pairing| pairing.id == addressed);
         Ok(pending)
     }
@@ -325,9 +327,7 @@ impl PairingManager {
     ) -> Result<EnrolledPairing, PairingError> {
         let nonce_hash: [u8; 32] = Sha256::digest(nonce).into();
         let pairing_id = {
-            let mut pending = self
-                .pending
-                .lock()
+            let mut pending = super::store_lock::process(&self.pending)
                 .map_err(|_| PairingError::InvalidRequest)?;
             Self::prune_expired(&mut pending, now, |pairing| {
                 pairing.nonce_hash == nonce_hash
@@ -400,6 +400,9 @@ impl PairingManager {
         let Some(pairing) = pending.get_mut(&pairing_id) else {
             return Ok(PairingCancellation::Expired);
         };
+        if pairing.commit_uncertain {
+            return Err(PairingError::CommitUncertain);
+        }
         if pairing.completed.is_some() {
             return Ok(PairingCancellation::Completed);
         }
@@ -422,10 +425,8 @@ impl PairingManager {
     }
 
     pub fn mark_cancellation_audited(&self, pairing_id: Uuid) -> Result<(), PairingError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| PairingError::InvalidRequest)?;
+        let mut pending =
+            super::store_lock::process(&self.pending).map_err(|_| PairingError::InvalidRequest)?;
         let pairing = pending
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
@@ -447,6 +448,9 @@ impl PairingManager {
         let pairing = pending
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
+        if pairing.commit_uncertain {
+            return Err(PairingError::CommitUncertain);
+        }
         if now >= pairing.expires_at {
             if pairing.completed.is_none() {
                 pairing.expire_pending_material();
@@ -507,9 +511,18 @@ impl PairingManager {
                 assurance_class: step_up.assurance_class,
                 enrolled_at: now,
             });
-        self.registry
-            .register_with_grant_and_authorization(record.clone(), grant, authorization_key)
-            .map_err(|_| PairingError::InvalidRequest)?;
+        if let Err(error) = self.registry.register_with_grant_and_authorization(
+            record.clone(),
+            grant,
+            authorization_key,
+        ) {
+            if error.is::<super::registry::InitialEnrollmentUncertain>() {
+                pairing.clear_pending_material();
+                pairing.commit_uncertain = true;
+                return Err(PairingError::CommitUncertain);
+            }
+            return Err(PairingError::InvalidRequest);
+        }
         let completed = MobilePairedDevice {
             id: record.id,
             display_name: record.display_name,
@@ -534,7 +547,9 @@ impl PairingManager {
 
 impl PendingPairing {
     fn lifecycle_state(&self) -> PairingLifecycleState {
-        if self.completed.is_some() {
+        if self.commit_uncertain {
+            PairingLifecycleState::Unavailable
+        } else if self.completed.is_some() {
             PairingLifecycleState::Completed
         } else if self.cancelled {
             PairingLifecycleState::Cancelled
@@ -856,6 +871,70 @@ pub fn render_pairing_invitation(
         "{qr}\n{pairing_url}\nExpires: {}\nWaiting for device…\nPress Ctrl-C to cancel pairing.",
         expires_at.to_rfc3339()
     ))
+}
+
+#[cfg(test)]
+impl PairingManager {
+    pub(super) fn prepare_native_initial_enrollment_fixture(
+        &self,
+        host_fingerprint: [u8; 32],
+    ) -> anyhow::Result<(Uuid, [String; 6])> {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        let now = Utc::now();
+        let nonce: [u8; 32] = rand::random();
+        let invitation = self.begin_pairing(nonce, now + chrono::Duration::minutes(5))?;
+        let possession = SigningKey::from_slice(&[0x62; 32])?;
+        let authorization = SigningKey::from_slice(&[0x63; 32])?;
+        let public = possession.verifying_key().to_sec1_point(false);
+        let mut request = MobilePairingRequest {
+            protocol_version: PAIRING_PROTOCOL_VERSION,
+            pairing_nonce: URL_SAFE_NO_PAD.encode(nonce),
+            device_name: "Native crash-recovery enrollment".into(),
+            device_public_key: URL_SAFE_NO_PAD.encode(public.as_bytes()),
+            app_version: "1.0.0".into(),
+            supported_protocol: super::contract::MobileProtocolRange {
+                minimum: PAIRING_PROTOCOL_MINIMUM_VERSION,
+                maximum: PAIRING_PROTOCOL_VERSION,
+            },
+            step_up_authorization: Some(StepUpAuthorizationEnrollment {
+                public_key: URL_SAFE_NO_PAD.encode(
+                    authorization
+                        .verifying_key()
+                        .to_sec1_point(false)
+                        .as_bytes(),
+                ),
+                assurance_class: AssuranceClass::BiometricOnly,
+                enrollment_signature: String::new(),
+            }),
+        };
+        let transcript = PairingTranscript::for_request(
+            &request,
+            PairingOfferV2 {
+                host_fingerprint,
+                pairing_id: invitation.id,
+                nonce,
+                expires_at: invitation.expires_at,
+            },
+            public.as_bytes().to_vec(),
+        );
+        let mut message = b"COVEN-STEPUP-ENROLL/1\0".to_vec();
+        message.extend_from_slice(&transcript.hash());
+        let signature: Signature = authorization.sign(&message);
+        request
+            .step_up_authorization
+            .as_mut()
+            .unwrap()
+            .enrollment_signature = URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes());
+        let enrolled = self.enroll(invitation.id, nonce, request, host_fingerprint, now)?;
+        anyhow::ensure!(
+            matches!(
+                self.confirm_device(invitation.id, &enrolled.phrase, now)?,
+                PairingProgress::Pending
+            ),
+            "fixture unexpectedly committed before parent confirmation"
+        );
+        Ok((invitation.id, enrolled.phrase))
+    }
 }
 
 #[cfg(test)]
@@ -1762,5 +1841,48 @@ mod tests {
                 PairingError::InvalidRequest
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod initial_enrollment_uncertainty_tests {
+    use super::super::config::{set_write_observer, MobileWritePhase};
+    use super::*;
+    #[test]
+    fn uncertain_confirm_cannot_retry_or_claim_cancellation() {
+        let home = tempfile::tempdir().unwrap();
+        let registry = Arc::new(DeviceRegistry::load(home.path()).unwrap());
+        let manager = PairingManager::new(Arc::clone(&registry));
+        let (id, phrase) = manager
+            .prepare_native_initial_enrollment_fixture([7; 32])
+            .unwrap();
+        let devices_path = home.path().join("mobile/devices.json");
+        set_write_observer(Box::new(move |path, phase| {
+            if path == devices_path && phase == MobileWritePhase::Renamed {
+                anyhow::bail!("injected post-rename commit error");
+            }
+            Ok(())
+        }));
+        let first = manager.confirm_host(id, &phrase, Utc::now());
+        set_write_observer(Box::new(|_, _| Ok(())));
+        assert_eq!(first.unwrap_err(), PairingError::CommitUncertain);
+        assert_eq!(
+            manager.confirm_host(id, &phrase, Utc::now()).unwrap_err(),
+            PairingError::CommitUncertain
+        );
+        assert_eq!(
+            manager.cancel(id, Utc::now()).unwrap_err(),
+            PairingError::CommitUncertain
+        );
+        assert_eq!(
+            manager.status(id, Utc::now()).unwrap().state,
+            PairingLifecycleState::Unavailable
+        );
+        let fresh = DeviceRegistry::load(home.path()).unwrap();
+        assert_eq!(
+            fresh.list_status().unwrap().len(),
+            1,
+            "unknown confirmation retried into duplicate enrollment"
+        );
     }
 }
