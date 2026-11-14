@@ -99,6 +99,10 @@ fn exercise(lineage: &Lineage, sources: &Sources) -> usize {
         );
     }
     println!("restore-process mixed {label} fences={fences:?}");
+    println!(
+        "restore-process mixed {label} refusals={:?}",
+        contract.reasons()
+    );
     trace.len()
 }
 
@@ -131,11 +135,7 @@ fn mixed_restore_process_interruptions_install_three_pairings_into_an_empty_dest
 #[ignore = "native interruption matrix; minutes of child processes and durability barriers"]
 fn mixed_restore_process_interruptions_keep_burned_and_pending_floors_above_older_authority() {
     let lineage = Lineage::build();
-    let sources = Sources {
-        snapshot: &lineage.points[BASE],
-        destination: Some(&lineage.points[ACKNOWLEDGED]),
-        authority: &lineage.points[TIGHTENED],
-    };
+    let sources = retained::burned_and_pending(&lineage);
     let snapshot = Known::image(&sources.snapshot.files);
     let retained = Known::image(&lineage.points[ACKNOWLEDGED].files);
     let export = Known::export(&sources.authority.authority);
@@ -172,11 +172,7 @@ fn mixed_restore_process_interruptions_keep_burned_and_pending_floors_above_olde
 #[ignore = "native interruption matrix; minutes of child processes and durability barriers"]
 fn mixed_restore_process_interruptions_keep_journal_only_floors_across_three_journals() {
     let lineage = Lineage::build();
-    let sources = Sources {
-        snapshot: &lineage.points[RESTORED],
-        destination: Some(&lineage.points[HANDED_OVER]),
-        authority: &lineage.points[RESTORED_AGAIN],
-    };
+    let sources = retained::three_journals(&lineage);
     let snapshot = Known::image(&sources.snapshot.files);
     let retained = Known::image(&lineage.points[HANDED_OVER].files);
     let export = Known::export(&sources.authority.authority);

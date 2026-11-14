@@ -78,6 +78,8 @@ pub(super) struct Contract<'a> {
     original: Files,
     floors: Option<Known>,
     expected: BTreeMap<Uuid, (u64, u64)>,
+    /// How often each fence refusal reason was observed.
+    reasons: std::cell::RefCell<BTreeMap<String, usize>>,
 }
 
 impl<'a> Contract<'a> {
@@ -110,7 +112,11 @@ impl<'a> Contract<'a> {
                 .unwrap_or_default(),
             floors: sources.destination.map(|point| Known::image(&point.files)),
             expected: sources.expected().1,
+            reasons: Default::default(),
         }
+    }
+    pub(super) fn reasons(&self) -> BTreeMap<String, usize> {
+        self.reasons.borrow().clone()
     }
     pub(super) fn label(&self) -> &str {
         &self.label
@@ -128,7 +134,17 @@ impl<'a> Contract<'a> {
     /// Checks the interrupted destination before any retry.
     pub(super) fn interrupted(&self, home: &Path, operation: Uuid, at: &str) -> Fence {
         let label = &self.label;
-        let before = image(home);
+        // Everything but advisory locks, staging files included: a refused
+        // attempt must not tidy up what the interruption left behind either.
+        let raw = |home: &Path| {
+            if home.join("mobile").exists() {
+                authority_files(&read_files(home))
+            } else {
+                Files::new()
+            }
+        };
+        let retained = raw(home);
+        let before = canonical(&retained);
         let fence = fence(&before, operation);
         if fence == Fence::Absent {
             // Before the fence the retained installation is untouched.
@@ -141,16 +157,42 @@ impl<'a> Contract<'a> {
 
         // This operation's journal is retained: nothing is usable, and
         // nothing the destination retained has moved down.
+        // Each refusal must be the fence itself, not an incidental error.
+        // While installing, restore admission fails closed for one reason
+        // (an installing journal, a journal whose marker is not retained yet,
+        // or copied identity that is still incomplete), and every pairing
+        // must be refused for exactly that reason.
         let registry = DeviceRegistry::load(home).unwrap();
+        let reason = match fence {
+            Fence::Installing => {
+                let error = check_installation(home)
+                    .expect_err(&format!("{label} {at}: an installing journal was admitted"));
+                error.root_cause().to_string()
+            }
+            _ => {
+                check_installation(home).unwrap_or_else(|e| panic!("{label} {at}: {e:#}"));
+                "fresh restore handover required".to_owned()
+            }
+        };
+        *self
+            .reasons
+            .borrow_mut()
+            .entry(format!("{fence:?}: {reason}"))
+            .or_insert(0) += 1;
         for device in self.expected.keys() {
+            let error = check_application(home, &registry, *device)
+                .expect_err(&format!("{label} {at}: {device} usable under the fence"));
             assert!(
-                check_application(home, &registry, *device).is_err(),
-                "{label} {at}: {device} usable under the fence"
+                format!("{error:#}").contains(&reason),
+                "{label} {at}: {device} refused for another reason than {reason:?}: {error:#}"
             );
             if fence == Fence::Installing {
+                let error = prepare_direct(home, &registry, &self.lineage.host, *device)
+                    .map(|_| ())
+                    .expect_err(&format!("{label} {at}: {device} offered a handover"));
                 assert!(
-                    prepare_direct(home, &registry, &self.lineage.host, *device).is_err(),
-                    "{label} {at}: {device} offered a handover while installing"
+                    format!("{error:#}").contains(&reason),
+                    "{label} {at}: {device} handover refused for another reason than {reason:?}: {error:#}"
                 );
             }
         }
@@ -213,9 +255,12 @@ impl<'a> Contract<'a> {
             "{label} {at}: unexpected refusal of a different source: {error}"
         );
 
+        let after = raw(home);
         assert!(
-            image(home) == before,
-            "{label} {at}: a refused attempt changed the destination"
+            after == retained,
+            "{label} {at}: a refused attempt changed the destination: {:?} became {:?}",
+            retained.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
         );
         fence
     }

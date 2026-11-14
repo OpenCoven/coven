@@ -9,6 +9,8 @@
 //! component uses. The installer never has more than one canonical name
 //! pending between two directory barriers, and the capture asserts that, so
 //! "old namespace or new namespace" is the complete set for a rename. A
+//! staged write yields the previous namespace with its staging file absent,
+//! empty, half-written or complete, as far as that write has got. A
 //! component created directly under its canonical name additionally yields
 //! its absent, empty, partial and full contents until its file is synced.
 //!
@@ -25,6 +27,27 @@ struct Image {
     kind: &'static str,
     files: Files,
 }
+
+/// Classes every case must produce: both sides of the fence, each staging
+/// state, a pending rename and a completed journal. The journal is the first
+/// canonical write, so no directory barrier precedes the fence.
+const REQUIRED: [&str; 10] = [
+    "staging-absent/Absent",
+    "staging-partial/Absent",
+    "staging-full/Absent",
+    "staging-partial/Installing",
+    "old-name/Absent",
+    "new-name/Installing",
+    "old-name/Installing",
+    "durable/Installing",
+    "new-name/AwaitingHandovers",
+    "durable/AwaitingHandovers",
+];
+
+/// The fewest checkpoints a retry repeats once the final journal is retained
+/// (one journal marker publication), and before that (a whole installation).
+const FINAL_RETRY_CHECKPOINTS: usize = 7;
+const INSTALLING_RETRY_CHECKPOINTS: usize = 80;
 
 struct ClearObserver;
 impl Drop for ClearObserver {
@@ -47,7 +70,11 @@ fn capture(contract: &Contract, sources: &Sources, pin: [u8; 32], operation: Uui
         ordinal += 1;
         let checkpoint = format!("{ordinal} {name} {phase:?}");
         let visible = authority_files(&read_files(&home));
-        let current = canonical(&visible);
+        let current: Files = visible
+            .iter()
+            .filter(|(name, _)| !is_staging(name))
+            .map(|(name, bytes)| (name.clone(), bytes.clone()))
+            .collect();
         let pending: Vec<&String> = stable
             .keys()
             .chain(current.keys())
@@ -80,15 +107,45 @@ fn capture(contract: &Contract, sources: &Sources, pin: [u8; 32], operation: Uui
             }
             Write::TempCreated | Write::Written | Write::FileSynced if pending.is_empty() => {
                 // Only a private staging file exists. It is not authority, but
-                // it may be retained beside the previous canonical namespace.
-                let mut files = stable.clone();
-                files.extend(
-                    visible
-                        .iter()
-                        .filter(|(name, _)| is_staging(name))
-                        .map(|(name, bytes)| (name.clone(), bytes.clone())),
-                );
-                push("previous-canonical", files);
+                // its name is not durable before the next directory barrier and
+                // its bytes are not durable before its file sync, so it may be
+                // retained beside the previous canonical namespace complete,
+                // half-written, empty or not at all.
+                let staging: Vec<_> = visible
+                    .iter()
+                    .filter(|(name, _)| is_staging(name))
+                    .collect();
+                if staging.is_empty() {
+                    // A file that is already durable under its canonical name
+                    // is synced again: nothing is pending and nothing staged.
+                    assert!(
+                        phase == Write::FileSynced && stable.contains_key(&name),
+                        "{checkpoint}: a write left neither a staging file nor a change"
+                    );
+                    push("resynced", stable.clone());
+                    return Ok(());
+                }
+                assert_eq!(staging.len(), 1, "{checkpoint}: one staging file");
+                let (staged, bytes) = (staging[0].0.clone(), staging[0].1.clone());
+                let beside = |bytes: Vec<u8>| {
+                    let mut files = stable.clone();
+                    files.insert(staged.clone(), bytes);
+                    files
+                };
+                push("staging-absent", stable.clone());
+                match phase {
+                    Write::TempCreated => {
+                        assert!(bytes.is_empty(), "{checkpoint}: written before creation");
+                        push("staging-empty", beside(bytes));
+                    }
+                    Write::Written => {
+                        assert!(bytes.len() > 1, "{checkpoint}: nothing was staged");
+                        push("staging-empty", beside(Vec::new()));
+                        push("staging-partial", beside(bytes[..bytes.len() / 2].to_vec()));
+                        push("staging-full", beside(bytes));
+                    }
+                    _ => push("staging-synced", beside(bytes)),
+                }
             }
             Write::TempCreated | Write::Written | Write::FileSynced => {
                 // Created directly under its canonical name: before the file
@@ -168,17 +225,11 @@ fn exercise(lineage: &Lineage, sources: &Sources, every: bool) -> BTreeMap<Strin
         );
     }
     println!("restore-retained-image mixed {label} classes={counts:?}");
-    // Both sides of the fence, a pending rename and a completed journal. The
-    // journal is the first canonical write, so no barrier precedes the fence.
-    for class in [
-        "previous-canonical/Absent",
-        "old-name/Absent",
-        "new-name/Installing",
-        "old-name/Installing",
-        "durable/Installing",
-        "new-name/AwaitingHandovers",
-        "durable/AwaitingHandovers",
-    ] {
+    println!(
+        "restore-retained-image mixed {label} refusals={:?}",
+        contract.reasons()
+    );
+    for class in REQUIRED {
         assert!(
             counts.contains_key(class),
             "{label}: no retained image of class {class}: {counts:?}"
@@ -221,7 +272,34 @@ fn exercise_twice(lineage: &Lineage, sources: &Sources) -> (usize, usize) {
         drop(observer);
         result.unwrap_or_else(|e| panic!("{label} {} {}: {e:#}", image.checkpoint, image.kind));
         let checkpoints = *counted.borrow();
-        assert!(checkpoints > 0, "{label}: a retry observed no write");
+        if class.ends_with("/AwaitingHandovers") {
+            assert_eq!(checkpoints, FINAL_RETRY_CHECKPOINTS, "{label} {class}");
+        } else {
+            assert!(
+                checkpoints >= INSTALLING_RETRY_CHECKPOINTS,
+                "{label} {class}: a retry repeated only {checkpoints} checkpoints"
+            );
+        }
+
+        // The cut runs below must see exactly the counted sequence: one more
+        // run with its cut just past the end has to complete uninterrupted.
+        let home = tempfile::tempdir().unwrap();
+        write_files(home.path(), &image.files);
+        let recount = Rc::new(RefCell::new(0));
+        let counter = Rc::clone(&recount);
+        config::set_write_observer(Box::new(move |_, _| {
+            *counter.borrow_mut() += 1;
+            anyhow::ensure!(
+                *counter.borrow() <= checkpoints,
+                "a retry grew past its count"
+            );
+            Ok(())
+        }));
+        let observer = ClearObserver;
+        let result = contract.attempt(home.path(), operation);
+        drop(observer);
+        result.unwrap_or_else(|e| panic!("{label} {class}: {e:#}"));
+        assert_eq!(*recount.borrow(), checkpoints, "{label} {class}");
 
         for cut in 1..=checkpoints {
             let home = tempfile::tempdir().unwrap();
@@ -261,6 +339,12 @@ fn exercise_twice(lineage: &Lineage, sources: &Sources) -> (usize, usize) {
         "restore-retained-image mixed {label} twice images={} cuts={cuts}",
         classes.len()
     );
+    for class in REQUIRED {
+        assert!(
+            classes.contains(class),
+            "{label}: no twice-interrupted image of class {class}: {classes:?}"
+        );
+    }
     (classes.len(), cuts)
 }
 
@@ -271,14 +355,14 @@ pub(super) fn empty_destination(lineage: &Lineage) -> Sources<'_> {
         authority: &lineage.points[TIGHTENED],
     }
 }
-fn burned_and_pending(lineage: &Lineage) -> Sources<'_> {
+pub(super) fn burned_and_pending(lineage: &Lineage) -> Sources<'_> {
     Sources {
         snapshot: &lineage.points[BASE],
         destination: Some(&lineage.points[ACKNOWLEDGED]),
         authority: &lineage.points[TIGHTENED],
     }
 }
-fn three_journals(lineage: &Lineage) -> Sources<'_> {
+pub(super) fn three_journals(lineage: &Lineage) -> Sources<'_> {
     Sources {
         snapshot: &lineage.points[RESTORED],
         destination: Some(&lineage.points[HANDED_OVER]),
@@ -338,19 +422,22 @@ fn mixed_restore_retained_images_keep_journal_only_floors_across_three_journals(
 #[ignore = "second-interruption matrix; minutes of durability barriers"]
 fn mixed_restore_twice_interrupted_install_into_an_empty_destination_recovers() {
     let lineage = Lineage::build();
-    exercise_twice(&lineage, &empty_destination(&lineage));
+    let (images, cuts) = exercise_twice(&lineage, &empty_destination(&lineage));
+    assert!(images >= REQUIRED.len() && cuts >= images * FINAL_RETRY_CHECKPOINTS);
 }
 
 #[test]
 #[ignore = "second-interruption matrix; minutes of durability barriers"]
 fn mixed_restore_twice_interrupted_burned_and_pending_floors_recover() {
     let lineage = Lineage::build();
-    exercise_twice(&lineage, &burned_and_pending(&lineage));
+    let (images, cuts) = exercise_twice(&lineage, &burned_and_pending(&lineage));
+    assert!(images >= REQUIRED.len() && cuts >= images * FINAL_RETRY_CHECKPOINTS);
 }
 
 #[test]
 #[ignore = "second-interruption matrix; minutes of durability barriers"]
 fn mixed_restore_twice_interrupted_journal_only_floors_recover() {
     let lineage = Lineage::build();
-    exercise_twice(&lineage, &three_journals(&lineage));
+    let (images, cuts) = exercise_twice(&lineage, &three_journals(&lineage));
+    assert!(images >= REQUIRED.len() && cuts >= images * FINAL_RETRY_CHECKPOINTS);
 }
