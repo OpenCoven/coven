@@ -881,7 +881,7 @@ impl PairingManager {
     ) -> anyhow::Result<(Uuid, [String; 6])> {
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
         let now = Utc::now();
-        let nonce = [0x61; 32];
+        let nonce: [u8; 32] = rand::random();
         let invitation = self.begin_pairing(nonce, now + chrono::Duration::minutes(5))?;
         let possession = SigningKey::from_slice(&[0x62; 32])?;
         let authorization = SigningKey::from_slice(&[0x63; 32])?;
