@@ -27,7 +27,7 @@ Every top-level entry is exactly one of:
 
 | Class | Created by | Rule |
 |---|---|---|
-| **daemon** | the Rust daemon and CLI | Names are fixed in code (`coven.sqlite3*`, `coven.sock`, `daemon.json`, `*.lock`, `daemon*.log`, `familiars.toml`, `repos.toml`, `config.toml`, `privacy.toml`, `adapters/`, `bin/`, `engine/`, `runtime/`, `defaults/`, `mobile/`). Clients and familiars never rename, move, or clean these. A lock or socket whose PID is dead is a **bug report**, not a cleanup task. |
+| **daemon** | the Rust daemon and CLI | Names are fixed in code (`coven.sqlite3*`, `coven.sock`, `daemon.json`, `*.lock`, `daemon*.log`, `familiars.toml`, `repos.toml`, `config.toml`, `privacy.toml`, `adapters/`, `bin/`, `engine/`, `runtime/`, `defaults/`, `mobile/`, `policy/`). Clients and familiars never rename, move, or clean these. A lock or socket whose PID is dead is a **bug report**, not a cleanup task. |
 | **cave** | Coven Cave | Everything Cave owns lives under `cave/`. No `cave-*` files at the top level; Cave's own home migration moves legacy ones in. Cave sweeps its own lock and `state.json.*` siblings. |
 | **shared** | familiars and the operator | Human-readable knowledge and coordination. Each shared root carries a `README.md` stating owner, scope, layout, conventions, and recovery. |
 

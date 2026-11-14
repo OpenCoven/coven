@@ -385,6 +385,65 @@ fn every_harness_maps_permission_policy_to_its_native_sandbox_flag() -> anyhow::
     Ok(())
 }
 
+/// A headless Claude Code launch carries Coven's own permission policy and
+/// stops reading the operator's settings (#1738). The other harnesses have
+/// no such settings stack and must not be handed Claude Code's flags.
+#[test]
+fn headless_claude_launch_carries_covens_permission_policy() -> anyhow::Result<()> {
+    let fixture = Fixture::new(0, false)?;
+    let output = fixture.run(&["run", "claude", "--permission", "full", "prompt"])?;
+    let argv = fixture.recorded()?;
+    let policy = fixture
+        .coven_home
+        .join("policy")
+        .join("claude-settings.json");
+    let carried = argv.windows(4).any(|args| {
+        args[0] == "--setting-sources"
+            && args[1] == "project"
+            && args[2] == "--settings"
+            && Path::new(&args[3]) == policy
+    });
+    assert!(
+        carried,
+        "claude was started without Coven's policy: argv {argv:?}, stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&policy)?,
+        include_str!("../policy/claude-settings.json"),
+        "the provisioned policy differs from the one compiled into coven"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("installed the Claude Code permission"),
+        "the first launch did not say that it installed the policy"
+    );
+
+    // A second launch finds the policy in place and says nothing.
+    let again = fixture.run(&["run", "claude", "--permission", "full", "prompt"])?;
+    assert!(
+        !String::from_utf8_lossy(&again.stderr).contains("permission policy"),
+        "an unchanged policy was reported again: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+
+    for harness in ["codex", "copilot"] {
+        let fixture = Fixture::new(0, false)?;
+        fixture.run(&["run", harness, "--permission", "full", "prompt"])?;
+        let argv = fixture.recorded()?;
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "--settings" || arg == "--setting-sources"),
+            "{harness} was handed Claude Code's settings flags: argv {argv:?}"
+        );
+        assert!(
+            !fixture.coven_home.join("policy").exists(),
+            "{harness} launch wrote the Claude Code policy"
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Dimension 4: add-directory grants
 // ---------------------------------------------------------------------------

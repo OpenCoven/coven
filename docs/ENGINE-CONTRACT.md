@@ -70,6 +70,10 @@ version.
 - `COVEN_DAEMON_SOCKET`       daemon UDS path; inherited through the environment
                               (coven does not clear env), reserved for the
                               Phase 3 daemon-session notifier
+- `COVEN_CLAUDE_POLICY`       set by coven on headless `coven run` launches: a
+                              JSON object naming the permission policy the
+                              engine applies to its Claude Code backend. See
+                              [Claude Code permission policy](CLAUDE-PERMISSIONS.md)
 - `COVEN_CODE_*`              engine-owned namespace; coven never overrides
 
 ## Stream-json events (subset coven parses)
