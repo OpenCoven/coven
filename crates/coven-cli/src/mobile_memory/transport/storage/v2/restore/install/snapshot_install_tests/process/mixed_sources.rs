@@ -2,10 +2,12 @@
 //! The selected snapshot, the destination and the signed authority are three
 //! different points of one lineage, each with owner policy present. Every
 //! observed installer checkpoint is cut once by SIGKILL and once by a returned
-//! error. Process death is not a power-loss simulation.
+//! error. Process death is not a power-loss simulation: `retained` models
+//! what a cut before namespace durability may leave, and `contract` holds
+//! what every interruption of either kind must satisfy before its retry.
 //!
 //! Each cut starts a child, retries the installation and completes fresh
-//! handovers, so the two matrices take several minutes of test-thread time.
+//! handovers, so the matrices take several minutes of test-thread time.
 //! The required Linux test job has no room for that, so they are ignored by
 //! default: run them with `--ignored` when the installer, its checkpoints or
 //! restore precedence change.
@@ -15,6 +17,10 @@ use super::super::mixed::{
     SECOND, THIRD, TIGHTENED,
 };
 use super::*;
+use contract::{Contract, Fence};
+
+mod contract;
+mod retained;
 
 fn policy_revision(files: &BTreeMap<String, Vec<u8>>) -> u64 {
     json(&files["introduction-policy.json"])["revision"]
@@ -24,19 +30,13 @@ fn policy_revision(files: &BTreeMap<String, Vec<u8>>) -> u64 {
 
 /// Cuts every checkpoint of one mixed restore and returns the checkpoint count.
 fn exercise(lineage: &Lineage, sources: &Sources) -> usize {
-    let label = sources.label();
-    let retained = sources.destination.expect("a retained destination");
-    let original = authority_files(&retained.files);
-    let floors = Known::image(&retained.files);
-    let source = selected(sources.snapshot);
-    let source_before = read_files(source.path());
-    let authority = &sources.authority.authority;
-    let authority_before = fs::read(authority).unwrap();
-    let (_, expected) = sources.expected();
+    let contract = Contract::new(lineage, sources);
+    let label = contract.label();
+    let authority = contract.authority();
 
     let normal = destination(sources.destination);
     let trace = run_sources(
-        source.path(),
+        contract.source(),
         authority,
         lineage.pin,
         normal.path(),
@@ -57,7 +57,7 @@ fn exercise(lineage: &Lineage, sources: &Sources) -> usize {
             "{label}: {component} barriers are not observed: {trace:?}"
         );
     }
-    for device in expected.keys() {
+    for device in contract.devices() {
         assert!(
             trace
                 .iter()
@@ -66,12 +66,13 @@ fn exercise(lineage: &Lineage, sources: &Sources) -> usize {
         );
     }
 
+    let mut fences = BTreeMap::new();
     for kill in [true, false] {
         for cut in 1..=trace.len() {
             let home = destination(sources.destination);
             let operation = Uuid::new_v4();
             let observed = run_sources(
-                source.path(),
+                contract.source(),
                 authority,
                 lineage.pin,
                 home.path(),
@@ -80,77 +81,61 @@ fn exercise(lineage: &Lineage, sources: &Sources) -> usize {
                 kill,
             );
             assert_eq!(observed, trace[..cut], "{label}: write ordering changed");
-
-            let interrupted = authority_files(&read_files(home.path()));
-            let fenced = interrupted
-                .get(JOURNAL)
-                .is_some_and(|journal| json(journal)["operationId"] == operation.to_string());
-            if fenced {
-                // This operation's journal is durable: nothing is usable, and
-                // nothing the destination retained has moved down.
-                let registry = DeviceRegistry::load(home.path()).unwrap();
-                for device in expected.keys() {
-                    assert!(
-                        check_application(home.path(), &registry, *device).is_err(),
-                        "{label} cut {cut}: {device} usable under the fence"
-                    );
-                }
-                let now = Known::image(&interrupted);
-                assert!(now.installation_epoch >= floors.installation_epoch);
-                for (device, generation) in &floors.generations {
-                    assert!(
-                        now.generations[device] >= *generation,
-                        "{label} cut {cut}: {device} generation floor lowered"
-                    );
-                }
-                for (device, epoch) in &floors.epochs {
-                    assert!(
-                        now.epochs[device] >= *epoch,
-                        "{label} cut {cut}: {device} epoch floor lowered"
-                    );
-                }
-            } else {
-                // Before the fence the retained installation is untouched.
-                for (name, bytes) in &original {
-                    assert!(
-                        interrupted.get(name) == Some(bytes),
-                        "{label} cut {cut}: {name} changed before the fence"
-                    );
-                }
-            }
-
-            let state = install_from_snapshot(
-                home.path(),
-                source.path(),
-                authority,
-                lineage.pin,
-                operation,
-            )
-            .unwrap_or_else(|e| panic!("{label} cut {cut} kill={kill}: {e:#}"));
-            verify_installed(lineage, sources, home.path(), &state);
-            assert!(
-                read_files(source.path()) == source_before,
-                "{label} cut {cut}: the selected snapshot changed"
-            );
-            assert_eq!(fs::read(authority).unwrap(), authority_before);
+            let at = format!("cut {cut} kill={kill}");
+            let fence = contract.interrupted(home.path(), operation, &at);
+            contract.retry(home.path(), operation, &at);
+            *fences.entry(fence).or_insert(0) += 1;
             println!(
-                "restore-process mixed {label} kill={kill} cut={cut} {}",
+                "restore-process mixed {label} kill={kill} cut={cut} {} fence={fence:?}",
                 trace[cut - 1]
             );
         }
     }
+    // Both sides of the fence and the completed journal are all interrupted.
+    for fence in [Fence::Absent, Fence::Installing, Fence::AwaitingHandovers] {
+        assert!(
+            fences.get(&fence).copied().unwrap_or(0) >= 2,
+            "{label}: no cut left the destination {fence:?}: {fences:?}"
+        );
+    }
+    println!("restore-process mixed {label} fences={fences:?}");
+    println!(
+        "restore-process mixed {label} refusals={:?}",
+        contract.reasons()
+    );
     trace.len()
+}
+
+/// Three pairings into an empty destination: two usable and one revoked in
+/// the latest authority, none of them known to the destination.
+#[test]
+#[ignore = "native interruption matrix; minutes of child processes and durability barriers"]
+fn mixed_restore_process_interruptions_install_three_pairings_into_an_empty_destination() {
+    let lineage = Lineage::build();
+    let sources = retained::empty_destination(&lineage);
+    let authority = Authority::read(&sources.authority.authority);
+    let revoked: Vec<_> = authority.registry["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| !record["device"]["revokedAt"].is_null())
+        .map(|record| record["device"]["id"].clone())
+        .collect();
+    assert_eq!(revoked, [serde_json::json!(SECOND.to_string())]);
+    let (epoch, expected) = sources.expected();
+    assert_eq!(epoch, 1);
+    assert_eq!(expected[&FIRST], (3, 2));
+    assert_eq!(expected[&SECOND], (1, 2));
+    assert_eq!(expected[&THIRD], (1, 1));
+    let checkpoints = exercise(&lineage, &sources);
+    println!("restore-process mixed empty-destination checkpoints={checkpoints}");
 }
 
 #[test]
 #[ignore = "native interruption matrix; minutes of child processes and durability barriers"]
 fn mixed_restore_process_interruptions_keep_burned_and_pending_floors_above_older_authority() {
     let lineage = Lineage::build();
-    let sources = Sources {
-        snapshot: &lineage.points[BASE],
-        destination: Some(&lineage.points[ACKNOWLEDGED]),
-        authority: &lineage.points[TIGHTENED],
-    };
+    let sources = retained::burned_and_pending(&lineage);
     let snapshot = Known::image(&sources.snapshot.files);
     let retained = Known::image(&lineage.points[ACKNOWLEDGED].files);
     let export = Known::export(&sources.authority.authority);
@@ -187,11 +172,7 @@ fn mixed_restore_process_interruptions_keep_burned_and_pending_floors_above_olde
 #[ignore = "native interruption matrix; minutes of child processes and durability barriers"]
 fn mixed_restore_process_interruptions_keep_journal_only_floors_across_three_journals() {
     let lineage = Lineage::build();
-    let sources = Sources {
-        snapshot: &lineage.points[RESTORED],
-        destination: Some(&lineage.points[HANDED_OVER]),
-        authority: &lineage.points[RESTORED_AGAIN],
-    };
+    let sources = retained::three_journals(&lineage);
     let snapshot = Known::image(&sources.snapshot.files);
     let retained = Known::image(&lineage.points[HANDED_OVER].files);
     let export = Known::export(&sources.authority.authority);
