@@ -2694,3 +2694,5 @@ fn connection_observation_query_refuses_ambiguous_or_private_fields() {
 }
 
 mod v2_migration;
+
+mod v2_journeys;
