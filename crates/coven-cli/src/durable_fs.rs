@@ -299,15 +299,55 @@ pub(crate) fn create_dir_all(path: &Path) -> Result<()> {
         // must not let the next attempt skip its failed publication barrier.
         return Err(error);
     }
-    // The marker needs no independent sync: process death retains it, and after
-    // OS recovery any surviving directory entry is already on stable storage.
-    // Its removal is safe only after the parent barrier above. A stale marker
-    // after power loss merely repeats a successful publication.
+    remove_completed_marker(&registry, name, &publication)
+}
+
+/// The marker needs no independent sync: process death retains it, and after
+/// OS recovery any surviving directory entry is already on stable storage.
+/// Its removal is safe only after the parent barrier. A stale marker after
+/// power loss merely repeats a successful publication.
+fn remove_completed_marker(
+    registry: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    publication: &File,
+) -> Result<()> {
+    // A creator that shared our marker and finished first has already removed
+    // it. The name may by now belong to a later creator's marker, which that
+    // creator removes itself. On Windows a second removal of that name is not
+    // harmless: while the other removal is between marking the file and
+    // closing it, ours fails with access denied (#1653). Remove only our own.
+    #[cfg(windows)]
+    if marker_already_removed(publication) {
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    let _ = publication;
     match registry.remove_file(name) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("removing completed directory publication marker"),
     }
+}
+
+/// Whether the file behind this retained handle is unlinked or marked for
+/// deletion. A failed query reports false, which keeps the removal by name.
+#[cfg(windows)]
+fn marker_already_removed(marker: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
+    };
+    let mut info = FILE_STANDARD_INFO::default();
+    // SAFETY: live retained handle and correctly sized writable structure.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            marker.as_raw_handle(),
+            FileStandardInfo,
+            (&mut info as *mut FILE_STANDARD_INFO).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    };
+    ok != 0 && (u8::from(info.DeletePending) != 0 || info.NumberOfLinks == 0)
 }
 
 #[cfg(windows)]
@@ -415,8 +455,77 @@ mod tests {
         Ok(())
     }
 
-    /// The 32 rounds above lose the Windows marker race about once in many
-    /// runs (#1653). This keeps eight creators racing for a bounded time and
+    /// Marks a file for deletion the way a concurrent removal does, and keeps
+    /// it in that state until the returned handle is dropped.
+    #[cfg(windows)]
+    fn mark_delete_pending(path: &Path) -> File {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let file = std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .unwrap();
+        let info = FILE_DISPOSITION_INFO {
+            DeleteFile: true.into(),
+        };
+        // SAFETY: live handle opened with DELETE access and a correctly sized
+        // readable structure.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        file
+    }
+
+    /// #1653 in a fixed order. Our marker was removed by a creator that shared
+    /// it, a later creator's marker took the name, and that marker is in the
+    /// middle of its own removal when we finish.
+    #[cfg(windows)]
+    #[test]
+    fn a_completed_creator_leaves_a_later_marker_under_its_name_alone() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            cap_std::fs::Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority())?;
+        let name = std::ffi::OsStr::new("shared");
+        let path = temp.path().join(name);
+
+        // Our marker, removed by a peer while we still hold it.
+        std::fs::write(&path, b"")?;
+        let ours = File::open(&path)?;
+        assert!(!marker_already_removed(&ours));
+        std::fs::remove_file(&path)?;
+        assert!(marker_already_removed(&ours));
+
+        // A later marker under the same name, caught mid-removal.
+        std::fs::write(&path, b"")?;
+        let removing = mark_delete_pending(&path);
+        // Removing by name is what failed: this is the reported error.
+        let by_name = registry.remove_file(name).unwrap_err();
+        assert_eq!(by_name.kind(), std::io::ErrorKind::PermissionDenied);
+
+        remove_completed_marker(&registry, name, &ours)?;
+        drop(removing);
+        assert!(!path.exists());
+
+        // A marker that is still ours is removed by name as before.
+        std::fs::write(&path, b"")?;
+        let ours = File::open(&path)?;
+        remove_completed_marker(&registry, name, &ours)?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    /// The 32 rounds above lost the Windows marker race once in many runs
+    /// (#1653). This keeps eight creators racing for a bounded time and
     /// reports every distinct failure with its count instead of the first one.
     #[cfg(windows)]
     #[test]
@@ -425,7 +534,7 @@ mod tests {
         let started = std::time::Instant::now();
         let mut failures = std::collections::BTreeMap::<String, usize>::new();
         let mut rounds = 0_usize;
-        while started.elapsed() < std::time::Duration::from_secs(45) {
+        while started.elapsed() < std::time::Duration::from_secs(20) {
             let directory = temp.path().join(format!("shared-{rounds}"));
             let barrier = std::sync::Barrier::new(8);
             let results = std::thread::scope(|scope| {
