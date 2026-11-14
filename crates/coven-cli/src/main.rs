@@ -34,6 +34,7 @@ mod daemon;
 mod encrypted_artifacts;
 mod engine;
 mod engine_install;
+mod engine_update;
 mod eval_loop;
 mod eval_loop_cli;
 mod event_writer;
@@ -885,7 +886,7 @@ Exit codes: 0 ok · 3 refused (JSON {refused, detail}) · 1 error")]
     },
     #[command(about = "Run any Coven engine subcommand directly")]
     #[command(
-        long_about = "Run any Coven engine subcommand directly. The arguments are passed to the Coven engine unchanged — an escape hatch for engine features that have no dedicated `coven` command."
+        long_about = "Run Coven Code. Use `coven code update` to download, verify and select the latest stable engine. `coven code upgrade` is an alias. Other arguments are passed to the engine unchanged."
     )]
     Code {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -1797,6 +1798,8 @@ enum DaemonCommand {
 
 #[derive(Subcommand, Debug)]
 enum EngineCommand {
+    #[command(about = "Update the engine coven uses to the latest stable release")]
+    Update(engine_update::UpdateArgs),
     #[command(about = "Show resolved engine path, source, version, and pin state")]
     Status {
         #[arg(long, help = "Emit JSON")]
@@ -3127,7 +3130,7 @@ fn prompt_and_install_engine() -> Result<Option<PathBuf>> {
                  refusing to auto-install an unverified engine"
             )
         })?;
-        let (path, _) = engine_install::install(version, expected_sha256, false)?;
+        let (path, _) = engine_install::install(version, expected_sha256, false, true)?;
         Ok(Some(path))
     } else {
         Ok(None)
@@ -3253,6 +3256,13 @@ fn exec_engine(mut command: std::process::Command) -> Result<()> {
 /// Exec the engine with an optional fixed leading subcommand plus user args.
 /// Used for curated passthroughs (auth/models/acp) and the raw `code` hatch.
 fn run_engine_passthrough(lead: Option<&str>, args: &[OsString]) -> Result<()> {
+    if lead.is_none()
+        && args
+            .first()
+            .is_some_and(|arg| arg == "update" || arg == "upgrade")
+    {
+        return engine_update::run_code(&args[1..]);
+    }
     let engine = engine::require()?;
     let mut command = engine_command(&engine.path);
     if let Some(lead) = lead {
@@ -3752,7 +3762,7 @@ fn print_doctor_prose(report: &DoctorReport) {
             ));
             if let Some(shadow) = &engine.other_on_path {
                 print_doctor_line(format!(
-                    "  [--] a different coven-code is first on PATH: {} — `coven-code` in this shell is not the engine `coven` runs; keep the managed engine current with: coven engine install",
+                    "  [--] a different coven-code is first on PATH: {} — `coven-code` in this shell is not the engine `coven` runs; update the managed engine with: coven code update",
                     shadow.display()
                 ));
             }
@@ -4140,7 +4150,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             "engine:path",
             "a different coven-code is first on PATH; `coven-code` in this shell is not the engine coven runs",
             Some(
-                "keep the managed engine current with: coven engine install; remove the PATH copy if it is stale"
+                "update the managed engine with: coven code update; inspect the selected path with: coven engine status"
                     .to_string(),
             ),
         ));
@@ -5176,6 +5186,7 @@ fn resolve_install_sha256<'a>(
 
 fn run_engine_command(command: EngineCommand) -> Result<()> {
     match command {
+        EngineCommand::Update(args) => engine_update::run(args),
         EngineCommand::Status { json } => engine_status(json),
         EngineCommand::Install {
             version,
@@ -5183,6 +5194,7 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
             force,
         } => {
             let version = version.unwrap_or_else(|| engine::pinned_version().to_string());
+            let version = engine_update::normalize_version(&version)?;
             let (os, arch) = engine_install::current_platform()?;
             let artifact = engine_install::artifact_name(os, arch);
             // The built-in pin is only valid for the pinned version (artifact
@@ -5191,8 +5203,8 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
                 .then(|| engine::pinned_sha256(&artifact))
                 .flatten();
             let expected_sha256 =
-                resolve_install_sha256(pinned, sha256.as_deref(), &version, &artifact)?;
-            let (path, outcome) = engine_install::install(&version, expected_sha256, force)?;
+                resolve_install_sha256(pinned, sha256.as_deref(), version, &artifact)?;
+            let (path, outcome) = engine_install::install(version, expected_sha256, force, true)?;
             match outcome {
                 engine_install::InstallOutcome::Installed => {
                     println!("Installed Coven engine {version} at {}", path.display());
@@ -5444,7 +5456,11 @@ fn engine_status(json: bool) -> Result<()> {
                 println!("  Path:    {}", resolved.path.display());
                 println!("  Source:  {}", engine_source_label(&resolved.source));
                 println!("  Version: {version_str}");
-                println!("  Pin:     {}", engine::pinned_version());
+                println!(
+                    "  CLI pin: {} (used by `coven engine install`)",
+                    engine::pinned_version()
+                );
+                println!("  Update:  coven code update (latest stable engine)");
             }
             Ok(())
         }
