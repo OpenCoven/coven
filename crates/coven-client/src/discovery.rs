@@ -2112,6 +2112,53 @@ mod tests {
         }
     }
 
+    /// Names each writer phase with its offset from `started` and its
+    /// duration, marks the phase still running, and counts replacement
+    /// retries, so a timeout says where the writer was (#1599).
+    #[cfg(windows)]
+    fn describe_status_write_timeline(
+        timeline: &[(crate::status::StatusWritePhase, std::time::Instant)],
+        started: std::time::Instant,
+    ) -> String {
+        use crate::status::StatusWritePhase;
+
+        let now = std::time::Instant::now();
+        let retries = timeline
+            .iter()
+            .filter(|(phase, _)| *phase == StatusWritePhase::RetryReplace)
+            .count();
+        let phases: Vec<_> = timeline
+            .iter()
+            .filter(|(phase, _)| *phase != StatusWritePhase::RetryReplace)
+            .collect();
+        if phases.is_empty() {
+            return "no phase reported yet".to_owned();
+        }
+        let described: Vec<String> = phases
+            .iter()
+            .enumerate()
+            .map(|(index, (phase, at))| {
+                let offset = at.duration_since(started);
+                match phases.get(index + 1) {
+                    Some((_, next)) => {
+                        format!(
+                            "{phase:?} at +{offset:?} for {:?}",
+                            next.duration_since(*at)
+                        )
+                    }
+                    None if *phase == StatusWritePhase::Complete => {
+                        format!("{phase:?} at +{offset:?}")
+                    }
+                    None => format!(
+                        "{phase:?} at +{offset:?} still running after {:?}",
+                        now.duration_since(*at)
+                    ),
+                }
+            })
+            .collect();
+        format!("{} ({retries} replacement retries)", described.join(", "))
+    }
+
     #[cfg(windows)]
     fn assert_status_replacement_sharing(staging: Option<&std::path::Path>) {
         use std::{
@@ -2120,8 +2167,8 @@ mod tests {
                 io::{FromRawHandle, OwnedHandle},
             },
             ptr,
-            sync::mpsc,
-            time::Duration,
+            sync::{mpsc, Arc, Mutex},
+            time::{Duration, Instant},
         };
         use windows_sys::Win32::{
             Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
@@ -2173,41 +2220,75 @@ mod tests {
             let reader = unsafe { OwnedHandle::from_raw_handle(reader) };
             if allow_delete {
                 let home_path = home.path().to_owned();
-                let staging_path = staging.map(std::path::Path::to_owned);
+                // The public entry without explicit staging stages beside the
+                // destination; the observed writer is the shared path under both.
+                let staging_path = staging.unwrap_or(home.path()).to_owned();
                 let (result_tx, result_rx) = mpsc::channel();
+                let timeline = Arc::new(Mutex::new(Vec::new()));
+                let writer_timeline = Arc::clone(&timeline);
+                let started = Instant::now();
                 let writer = std::thread::spawn(move || {
-                    let result = match staging_path {
-                        Some(staging) => {
-                            crate::write_owner_only_windows_daemon_status_with_staging(
-                                &home_path,
-                                &staging,
-                                b"{\"pid\":2}",
-                            )
-                        }
-                        None => crate::write_owner_only_windows_daemon_status(
-                            &home_path,
-                            b"{\"pid\":2}",
-                        ),
-                    };
+                    let result = crate::status::write_owner_only_windows_daemon_status_observed(
+                        &home_path,
+                        &staging_path,
+                        b"{\"pid\":2}",
+                        &mut |phase| {
+                            writer_timeline
+                                .lock()
+                                .expect("record status writer phase")
+                                .push((phase, Instant::now()));
+                        },
+                    );
                     result_tx.send(result).expect("report status replacement");
                 });
                 // Native CI deferred MoveFileExW replacement while this reader was
                 // open. Preserve the original bounded close-and-success contract:
-                // otherwise release the reader and require bounded completion.
+                // otherwise release the reader and require completion.
                 let early_result = result_rx.recv_timeout(Duration::from_millis(20));
                 drop(reader);
                 let received = match early_result {
                     Ok(result) => Ok(result),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        result_rx.recv_timeout(Duration::from_secs(2))
+                        // Hang guard, not a contract. The writer's replacement
+                        // retry is already bounded by its own one-second deadline
+                        // in `status.rs`, but the create, DACL and flush calls
+                        // before it are plain synchronous I/O, and hosted Windows
+                        // disks stretched them past the former fixed two-second
+                        // wait (#1599; #1227 measured a 3.5 s flush on the same
+                        // runners). This bound is far above anything load can
+                        // produce and only turns a wedged writer into a readable
+                        // failure, well inside the job budget, naming the phase
+                        // that was still running.
+                        const STATUS_REPLACEMENT_HANG_GUARD: Duration = Duration::from_secs(30);
+                        result_rx.recv_timeout(STATUS_REPLACEMENT_HANG_GUARD)
                     }
                     Err(error) => Err(error),
                 };
+                let phases = describe_status_write_timeline(
+                    &timeline.lock().expect("read status writer timeline"),
+                    started,
+                );
+                eprintln!(
+                    "status replacement with staging {staging:?} took {:?} after {}",
+                    started.elapsed(),
+                    phases
+                );
+                if let Err(mpsc::RecvTimeoutError::Timeout) = received {
+                    // Do not join a writer that may be wedged: report the phase
+                    // timeline instead of hanging the job.
+                    panic!(
+                        "status replacement did not complete within {:?} after the reader \
+                         closed; writer phases: {phases}",
+                        started.elapsed()
+                    );
+                }
                 if let Err(panic) = writer.join() {
                     std::panic::resume_unwind(panic);
                 }
                 let result = received.expect("status replacement result");
-                result.expect("replace status after reader closes");
+                result.unwrap_or_else(|error| {
+                    panic!("replace status after reader closes: {error}; writer phases: {phases}")
+                });
                 crate::status::tests::assert_status_file_is_owner_only(&status_path);
                 assert_eq!(std::fs::read(&status_path).unwrap(), b"{\"pid\":2}\n");
             } else {
