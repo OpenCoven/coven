@@ -6169,7 +6169,13 @@ impl StartupStore {
         let Some(conn) = self.conn.take() else {
             return Ok(());
         };
-        close_startup_store(conn, |phase| self.observer.append(&self.coven_home, phase))
+        let closed =
+            close_startup_store(conn, |phase| self.observer.append(&self.coven_home, phase));
+        // The synthetic power-loss fixture refuses a baseline until the
+        // startup checkpoint above can no longer run.
+        #[cfg(feature = "threads-test-clock")]
+        crate::ward_power_loss_fixture::note_startup_store_closed(&self.coven_home);
+        closed
     }
 }
 
@@ -6293,6 +6299,9 @@ pub fn serve_forever(
     // catching the wedged-but-alive incumbent the socket guard can't, and the
     // direct `daemon serve` path that bypasses ensure_background_server.
     let serve_lock = acquire_serve_lock(coven_home)?;
+    // Synthetic fixture builds only: observe store syncs before the first open.
+    #[cfg(feature = "threads-test-clock")]
+    crate::ward_power_loss_fixture::activate_for_daemon(coven_home)?;
     let mut startup_store = initialize_daemon_store(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
@@ -7561,6 +7570,9 @@ fn serve_forever_with_lifetime_job_installer(
     let _ = allowed_hosts; // only meaningful on the (Unix) TCP transport
 
     let _serve_lock = acquire_serve_lock(coven_home)?;
+    // Synthetic fixture builds only: observe store syncs before the first open.
+    #[cfg(feature = "threads-test-clock")]
+    crate::ward_power_loss_fixture::activate_for_daemon(coven_home)?;
     install_lifetime_job()?;
     DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
     let pipe_name = windows_pipe_name(coven_home)?;

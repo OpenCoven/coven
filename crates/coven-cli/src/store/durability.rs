@@ -58,6 +58,10 @@ pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T
         tx.commit()
             .context("committing durable authority evidence")?;
         checkpoint(Phase::DurableCommitReady);
+        // Synthetic fixture builds only: fail this post-COMMIT barrier once,
+        // leaving committed evidence as a real failed directory sync would.
+        #[cfg(feature = "threads-test-clock")]
+        crate::ward_power_loss_fixture::take_store_directory_barrier_failure(conn.path())?;
         if let Some(directory) = directory.as_ref() {
             checkpoint(Phase::DurableDirectorySyncBegin);
             crate::durable_fs::sync_directory(directory)?;
@@ -74,9 +78,17 @@ pub(crate) fn transaction<T>(conn: &Connection, write: impl FnOnce() -> Result<T
     let restored = restore.restore().context("restoring store commit policy");
     // Include the guard's existing fallback restoration in the observed phase.
     drop(restore);
-    restored?;
-    checkpoint(Phase::DurableRestoreReady);
-    result
+    match (result, restored) {
+        (result, Ok(())) => {
+            checkpoint(Phase::DurableRestoreReady);
+            result
+        }
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        // Keep the write's own error so callers classify it correctly.
+        (Err(error), Err(restore_error)) => Err(error.context(format!(
+            "restoring store commit policy also failed: {restore_error:#}"
+        ))),
+    }
 }
 
 /// Force a real FULL commit even when the authority evidence already exists.

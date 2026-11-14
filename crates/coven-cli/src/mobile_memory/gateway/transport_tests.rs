@@ -1849,6 +1849,8 @@ fn restore_fence_rejects_signed_direct_https_effects_until_fresh_handover() {
 
 mod v2_authority;
 mod v2_control_loss;
+#[cfg(unix)]
+mod v2_deadline;
 
 #[test]
 fn online_connection_never_overrides_denial_or_restores_device_authority() {
@@ -2695,6 +2697,8 @@ fn connection_observation_query_refuses_ambiguous_or_private_fields() {
 }
 
 mod v2_migration;
+
+mod v2_journeys;
 
 /// Initial store loading has no runtime handle to drop yet. Bound admission
 /// while the competing store lock remains held, and retain exact authority.
