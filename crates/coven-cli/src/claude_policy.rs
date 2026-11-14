@@ -148,8 +148,10 @@ fn additions(
     let settings = settings
         .to_str()
         .context("the Coven home path is not UTF-8, so Claude Code cannot be given its policy")?;
+    let claude_config = claude_config.map(absolute_path).transpose()?;
     // The servers are a convenience: an unreadable config never fails a launch.
     let mcp_config = claude_config
+        .as_deref()
         .filter(|file| defines_mcp_servers(file))
         .and_then(Path::to_str);
     Ok(match target {
@@ -213,6 +215,7 @@ fn claude_permission_mode(permission: Permission) -> Option<String> {
 /// Write the compiled-in policy under `coven_home` unless that exact content
 /// is already there, and return its path.
 fn materialize(coven_home: &Path) -> Result<PathBuf> {
+    let coven_home = absolute_path(coven_home)?;
     let directory = coven_home.join(POLICY_DIR);
     let path = directory.join(POLICY_FILE);
     let current = fs::symlink_metadata(&path)
@@ -228,7 +231,8 @@ fn materialize(coven_home: &Path) -> Result<PathBuf> {
         let mut file = tempfile::NamedTempFile::new_in(&directory)?;
         file.write_all(POLICY.as_bytes())?;
         file.as_file().sync_all()?;
-        file.persist(&path).map_err(|error| error.error)?;
+        let staged = file.into_temp_path();
+        replace_policy_file(&staged, &path)?;
         Ok(())
     };
     write().with_context(|| {
@@ -247,6 +251,54 @@ fn materialize(coven_home: &Path) -> Result<PathBuf> {
         path.display()
     );
     Ok(path)
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_policy_file(staged: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(staged, path)
+}
+
+#[cfg(windows)]
+fn replace_policy_file(staged: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains a NUL character",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let staged = wide_path(staged)?;
+    let path = wide_path(path)?;
+    if unsafe {
+        MoveFileExW(
+            staged.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Where Claude Code keeps the operator's own MCP servers.
@@ -473,6 +525,42 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, ["claude-settings.json"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_existing_policy_file_is_replaced_on_windows() {
+        let home = tempfile::tempdir().unwrap();
+        let path = materialize(home.path()).unwrap();
+        fs::write(&path, "edited").unwrap();
+
+        assert_eq!(materialize(home.path()).unwrap(), path);
+        assert_eq!(fs::read_to_string(path).unwrap(), POLICY);
+    }
+
+    #[test]
+    fn relative_policy_and_mcp_config_paths_are_absolute_in_launch_arguments() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let relative_home = temp.path().strip_prefix(&cwd).unwrap();
+        let config = relative_home.join("claude-config").join(".claude.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"tracker":{"command":"tracker"}}}"#,
+        )
+        .unwrap();
+
+        let additions =
+            additions(Target::Claude, relative_home, Some(&config), options(None)).unwrap();
+        let expected_policy = cwd.join(relative_home).join(POLICY_DIR).join(POLICY_FILE);
+        let expected_config = cwd.join(&config);
+
+        assert_eq!(additions.args[0], "--mcp-config");
+        assert_eq!(Path::new(&additions.args[1]), expected_config);
+        assert_eq!(additions.args[2..4], ["--setting-sources", "project"]);
+        assert_eq!(additions.args[4], "--settings");
+        assert_eq!(Path::new(&additions.args[5]), expected_policy);
     }
 
     #[cfg(unix)]

@@ -15,7 +15,7 @@ has the measurements behind this design.
 
 | Argument | Effect |
 |---|---|
-| `--settings <COVEN_HOME>/policy/claude-settings.json` | Coven's rules sit above every settings file. |
+| `--settings <COVEN_HOME>/policy/claude-settings.json` | Coven's rules sit above project and user settings; administrator-managed settings still rank higher. |
 | `--setting-sources project` | Claude Code does not read the operator's `~/.claude/settings.json` or the workspace's `.claude/settings.local.json`. |
 | `--permission-mode <mode>` | `coven run --permission full` maps to `bypassPermissions`, and `read-only` to `plan`. With no `--permission`, Claude Code stays in its headless default, which refuses whatever no rule allows. |
 | `--mcp-config <Claude config file>` | Only when the operator's Claude config file defines MCP servers. Leaving out the user source would otherwise drop them. |
