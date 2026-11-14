@@ -415,6 +415,46 @@ mod tests {
         Ok(())
     }
 
+    /// The 32 rounds above lose the Windows marker race about once in many
+    /// runs (#1653). This keeps eight creators racing for a bounded time and
+    /// reports every distinct failure with its count instead of the first one.
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_directory_publication_survives_sustained_marker_churn() {
+        let temp = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let mut failures = std::collections::BTreeMap::<String, usize>::new();
+        let mut rounds = 0_usize;
+        while started.elapsed() < std::time::Duration::from_secs(45) {
+            let directory = temp.path().join(format!("shared-{rounds}"));
+            let barrier = std::sync::Barrier::new(8);
+            let results = std::thread::scope(|scope| {
+                let creators: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            create_dir_all(&directory)
+                        })
+                    })
+                    .collect();
+                creators
+                    .into_iter()
+                    .map(|creator| creator.join().expect("directory creator panicked"))
+                    .collect::<Vec<_>>()
+            });
+            for error in results.into_iter().filter_map(Result::err) {
+                *failures.entry(format!("{error:#}")).or_default() += 1;
+            }
+            assert!(directory.is_dir());
+            rounds += 1;
+        }
+        println!("directory publication churn: {rounds} rounds, failures {failures:?}");
+        assert!(
+            failures.is_empty(),
+            "{rounds} rounds of concurrent publication failed: {failures:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn publication_marker_symlink_is_refused_without_touching_target() -> Result<()> {
