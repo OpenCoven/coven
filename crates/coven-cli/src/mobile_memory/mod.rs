@@ -606,8 +606,7 @@ fn post_mobile_control_inner(
     stream
         .write_all(request.as_bytes())
         .context("failed to write mobile pairing control request")?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
+    crate::daemon::finish_daemon_request(&stream)
         .context("failed to finish mobile pairing control request")?;
     let deadline = Instant::now() + io_deadline;
     let mut response = Vec::new();
