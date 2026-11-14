@@ -745,7 +745,7 @@ fn daemon_stop_kills_piped_tree_stalled_before_runtime_publication() -> anyhow::
     );
     let mut launch_stream = UnixStream::connect(coven_home.join("coven.sock"))?;
     launch_stream.write_all(request.as_bytes())?;
-    launch_stream.shutdown(Shutdown::Write)?;
+    finish_daemon_request(&launch_stream)?;
 
     wait_until("piped pre-publication barrier", || {
         Ok(barrier_dir.join("ready").exists())
@@ -2968,6 +2968,17 @@ fn unix_http_request(
     unix_http_request_with_read_timeout(coven_home, method, path, body, None)
 }
 
+/// Half-closes a request to the daemon after its last byte. The daemon may
+/// answer and close first; macOS then fails `shutdown` with `ENOTCONN` although
+/// the response is still queued (coven#1641). Only that error is accepted, and
+/// reading the response decides the outcome.
+fn finish_daemon_request(stream: &UnixStream) -> std::io::Result<()> {
+    match stream.shutdown(Shutdown::Write) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+        result => result,
+    }
+}
+
 fn unix_http_request_with_read_timeout(
     coven_home: &Path,
     method: &str,
@@ -2983,7 +2994,7 @@ fn unix_http_request_with_read_timeout(
     let mut stream = UnixStream::connect(coven_home.join("coven.sock"))?;
     stream.set_read_timeout(read_timeout)?;
     stream.write_all(request.as_bytes())?;
-    stream.shutdown(Shutdown::Write)?;
+    finish_daemon_request(&stream)?;
 
     let mut response = String::new();
     stream.read_to_string(&mut response)?;

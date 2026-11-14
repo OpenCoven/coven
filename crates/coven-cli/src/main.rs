@@ -6959,9 +6959,7 @@ fn post_daemon_request(coven_home: &Path, path: &str, body: &str) -> Result<u16>
     stream
         .write_all(request.as_bytes())
         .context("failed to write Coven daemon request")?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .context("failed to finish Coven daemon request")?;
+    daemon::finish_daemon_request(&stream).context("failed to finish Coven daemon request")?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)

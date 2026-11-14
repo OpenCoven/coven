@@ -2386,6 +2386,27 @@ pub fn daemon_socket_path(coven_home: &Path) -> PathBuf {
     coven_home.join("coven.sock")
 }
 
+/// Half-closes a request on the daemon socket once all of its bytes are
+/// written.
+///
+/// The daemon answers as soon as it has read the request line, the headers and
+/// the declared body, then closes the connection without waiting for this
+/// half-close. When that close lands first, macOS fails `shutdown` with
+/// `ENOTCONN` (Linux reports success), although the whole response is still
+/// queued for reading. `NotConnected` here therefore means the daemon already
+/// finished: return `Ok` and let reading the response decide the outcome. A
+/// daemon that closed without answering still fails there, with an empty
+/// response. Every other error is returned unchanged (coven#1641).
+#[cfg(unix)]
+pub(crate) fn finish_daemon_request(
+    stream: &std::os::unix::net::UnixStream,
+) -> std::io::Result<()> {
+    match stream.shutdown(std::net::Shutdown::Write) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+        result => result,
+    }
+}
+
 /// `(length, limit)` in bytes when the daemon socket for `coven_home` is too
 /// long to bind: `sun_path` must hold the path and its NUL terminator (103
 /// usable bytes on macOS, 107 on Linux). Always `None` where the daemon
@@ -15727,7 +15748,6 @@ mod tests {
     #[test]
     fn serves_health_over_unix_socket() -> Result<()> {
         use std::io::{Read, Write};
-        use std::net::Shutdown;
         use std::os::unix::net::UnixStream;
         use std::thread;
 
@@ -15748,7 +15768,7 @@ mod tests {
 
         let mut stream = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
         stream.write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n")?;
-        stream.shutdown(Shutdown::Write)?;
+        finish_daemon_request(&stream)?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
 
@@ -15764,7 +15784,6 @@ mod tests {
     #[test]
     fn serves_memory_overview_over_unix_socket() -> Result<()> {
         use std::io::{Read, Write};
-        use std::net::Shutdown;
         use std::os::unix::net::UnixStream;
         use std::thread;
 
@@ -15779,7 +15798,7 @@ mod tests {
 
         let mut stream = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
         stream.write_all(b"GET /api/v1/memory/overview HTTP/1.1\r\nHost: coven\r\n\r\n")?;
-        stream.shutdown(Shutdown::Write)?;
+        finish_daemon_request(&stream)?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
         server.join().expect("server thread panicked")?;
@@ -15794,7 +15813,6 @@ mod tests {
     #[test]
     fn forwards_http_request_body_to_api() -> Result<()> {
         use std::io::{Read, Write};
-        use std::net::Shutdown;
         use std::os::unix::net::UnixStream;
         use std::thread;
 
@@ -15839,7 +15857,7 @@ mod tests {
         );
         let mut stream = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
         stream.write_all(request.as_bytes())?;
-        stream.shutdown(Shutdown::Write)?;
+        finish_daemon_request(&stream)?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
 
@@ -17624,7 +17642,6 @@ mod tests {
     #[test]
     fn unix_serve_loop_isolates_per_connection_errors() -> Result<()> {
         use std::io::{Read, Write};
-        use std::net::Shutdown;
         use std::os::unix::net::UnixStream;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -17668,7 +17685,7 @@ mod tests {
         // "empty API request" / parse errors; pre-fix this killed the daemon.
         let mut bad = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
         bad.write_all(b"not http\r\n\r\n")?;
-        bad.shutdown(Shutdown::Write)?;
+        finish_daemon_request(&bad)?;
         let mut bad_response = String::new();
         let _ = bad.read_to_string(&mut bad_response);
 
@@ -17677,7 +17694,7 @@ mod tests {
         // still exist on disk.
         let mut good = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
         good.write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n")?;
-        good.shutdown(Shutdown::Write)?;
+        finish_daemon_request(&good)?;
         let mut good_response = String::new();
         good.read_to_string(&mut good_response)?;
 
@@ -17696,6 +17713,60 @@ mod tests {
             daemon_socket_path(temp_dir.path()).exists(),
             "socket file should still exist while the loop is running"
         );
+        Ok(())
+    }
+
+    /// coven#1641: the daemon answers and closes without waiting for the
+    /// client's half-close. With that order made explicit, macOS fails a raw
+    /// `shutdown(Write)` with ENOTCONN although the whole response is queued.
+    /// Finishing the request must accept the order and keep the response.
+    #[cfg(unix)]
+    #[test]
+    fn finishing_a_request_after_the_daemon_answered_and_closed_keeps_the_response() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let request = b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n";
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (mut client, mut daemon) = UnixStream::pair()?;
+        client.write_all(request)?;
+        let mut received = vec![0; request.len()];
+        daemon.read_exact(&mut received)?;
+        assert_eq!(received, request);
+        daemon.write_all(response.as_bytes())?;
+        drop(daemon);
+
+        finish_daemon_request(&client)?;
+        let mut read = String::new();
+        client.read_to_string(&mut read)?;
+        assert_eq!(read, response);
+        Ok(())
+    }
+
+    /// Accepting that order must not turn a daemon that closed without
+    /// answering into a success: the response read finds nothing, and the
+    /// CLI's status parser refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn finishing_a_request_after_the_daemon_closed_unanswered_yields_no_response() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let request = b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n";
+        let (mut client, mut daemon) = UnixStream::pair()?;
+        client.write_all(request)?;
+        let mut received = vec![0; request.len()];
+        daemon.read_exact(&mut received)?;
+        drop(daemon);
+
+        finish_daemon_request(&client)?;
+        let mut read = String::new();
+        client.read_to_string(&mut read)?;
+        assert!(
+            read.is_empty(),
+            "an unanswered request has no response: {read:?}"
+        );
+        assert!(crate::parse_http_status(&read).is_err());
         Ok(())
     }
 

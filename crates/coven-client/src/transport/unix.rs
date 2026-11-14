@@ -307,12 +307,10 @@ fn request_retaining_connection_bound(
     const WRITE_OPERATION: &str = "failed to write Coven daemon request";
     write_with_deadline(&mut stream, request.as_bytes(), deadline, WRITE_OPERATION)?;
     write_with_deadline(&mut stream, body, deadline, WRITE_OPERATION)?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|source| ClientError::Io {
-            operation: "failed to finish Coven daemon request",
-            source,
-        })?;
+    finish_request(&stream).map_err(|source| ClientError::Io {
+        operation: "failed to finish Coven daemon request",
+        source,
+    })?;
 
     let framed = read_framed_response(
         &mut stream,
@@ -328,6 +326,23 @@ fn request_retaining_connection_bound(
         deadline,
         buffered_remainder: framed.buffered_remainder,
     })
+}
+
+/// Half-closes the request once all of its bytes are written.
+///
+/// The daemon answers as soon as it has read the request line, the headers and
+/// the declared body, then closes the connection without waiting for this
+/// half-close. When that close lands first, macOS fails `shutdown` with
+/// `ENOTCONN` (Linux reports success), although the whole response is still
+/// queued for reading. `NotConnected` here therefore means the daemon already
+/// finished: return `Ok` and let the framed response read decide the outcome.
+/// A daemon that closed without answering still fails there. Every other error
+/// is returned unchanged (coven#1641).
+fn finish_request(stream: &UnixStream) -> std::io::Result<()> {
+    match stream.shutdown(std::net::Shutdown::Write) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+        result => result,
+    }
 }
 
 /// Connects to the daemon's Unix socket bounded by `deadline`.
@@ -1423,6 +1438,76 @@ mod tests {
         assert_eq!(framed.response.status, 204);
         assert!(framed.response.body.is_empty());
         assert_eq!(framed.buffered_remainder, b"XYZ");
+    }
+
+    /// coven#1641: with the daemon's answer and close ordered before the
+    /// half-close, macOS fails a raw `shutdown(Write)` with ENOTCONN although
+    /// the response is queued. Finishing the request must accept that order,
+    /// and the framed response must still be read in full.
+    #[test]
+    fn finishing_after_the_daemon_answered_and_closed_still_reads_the_response() {
+        use std::io::Write;
+
+        let request = b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n";
+        let (mut client, mut daemon) =
+            std::os::unix::net::UnixStream::pair().expect("create request socket pair");
+        client.write_all(request).expect("write request");
+        let mut received = vec![0; request.len()];
+        daemon
+            .read_exact(&mut received)
+            .expect("daemon reads request");
+        daemon
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .expect("write response");
+        drop(daemon);
+
+        super::finish_request(&client).expect("finish after the daemon answered and closed");
+        let framed = read_framed_response(
+            &mut client,
+            Instant::now(),
+            Instant::now() + Duration::from_secs(1),
+            "request",
+            super::MAX_RESPONSE_BODY_BYTES,
+        )
+        .expect("read the queued response");
+
+        assert_eq!(framed.response.body, b"ok");
+    }
+
+    /// Accepting that order must not turn a daemon that closed without
+    /// answering into a success: the framed read still fails the request.
+    #[test]
+    fn finishing_after_the_daemon_closed_unanswered_still_fails_the_request() {
+        use std::io::Write;
+
+        let request = b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n";
+        let (mut client, mut daemon) =
+            std::os::unix::net::UnixStream::pair().expect("create request socket pair");
+        client.write_all(request).expect("write request");
+        let mut received = vec![0; request.len()];
+        daemon
+            .read_exact(&mut received)
+            .expect("daemon reads request");
+        drop(daemon);
+
+        super::finish_request(&client).expect("finish after the daemon closed");
+        let error = read_framed_response(
+            &mut client,
+            Instant::now(),
+            Instant::now() + Duration::from_secs(1),
+            "request",
+            super::MAX_RESPONSE_BODY_BYTES,
+        )
+        .err()
+        .expect("an unanswered request must fail");
+
+        let crate::ClientError::InvalidHttpResponse(message) = error else {
+            panic!("an unanswered request must fail as an invalid response");
+        };
+        assert!(
+            message.contains("connection closed before response completed"),
+            "unexpected failure: {message}"
+        );
     }
 
     #[test]
