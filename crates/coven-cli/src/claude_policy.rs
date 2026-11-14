@@ -231,8 +231,8 @@ fn materialize(coven_home: &Path) -> Result<PathBuf> {
         let mut file = tempfile::NamedTempFile::new_in(&directory)?;
         file.write_all(POLICY.as_bytes())?;
         file.as_file().sync_all()?;
-        let staged = file.into_temp_path();
-        replace_policy_file(&staged, &path)?;
+        // `persist` replaces an existing policy on every platform.
+        file.persist(&path).map_err(|error| error.error)?;
         Ok(())
     };
     write().with_context(|| {
@@ -258,46 +258,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
         Ok(path.to_path_buf())
     } else {
         Ok(std::env::current_dir()?.join(path))
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_policy_file(staged: &Path, path: &Path) -> std::io::Result<()> {
-    fs::rename(staged, path)
-}
-
-#[cfg(windows)]
-fn replace_policy_file(staged: &Path, path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
-        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if wide.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path contains a NUL character",
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
-    }
-
-    let staged = wide_path(staged)?;
-    let path = wide_path(path)?;
-    if unsafe {
-        MoveFileExW(
-            staged.as_ptr(),
-            path.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } != 0
-    {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -527,17 +487,6 @@ mod tests {
         assert_eq!(entries, ["claude-settings.json"]);
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn an_existing_policy_file_is_replaced_on_windows() {
-        let home = tempfile::tempdir().unwrap();
-        let path = materialize(home.path()).unwrap();
-        fs::write(&path, "edited").unwrap();
-
-        assert_eq!(materialize(home.path()).unwrap(), path);
-        assert_eq!(fs::read_to_string(path).unwrap(), POLICY);
-    }
-
     #[test]
     fn relative_policy_and_mcp_config_paths_are_absolute_in_launch_arguments() {
         let cwd = std::env::current_dir().unwrap();
@@ -561,6 +510,21 @@ mod tests {
         assert_eq!(additions.args[2..4], ["--setting-sources", "project"]);
         assert_eq!(additions.args[4], "--settings");
         assert_eq!(Path::new(&additions.args[5]), expected_policy);
+
+        let engine =
+            super::additions(Target::Engine, relative_home, Some(&config), options(None)).unwrap();
+        let [(_, Some(value))] = engine.env.as_slice() else {
+            panic!("one variable: {:?}", engine.env);
+        };
+        let value: Value = serde_json::from_str(value).unwrap();
+        assert_eq!(
+            Path::new(value["settingsFile"].as_str().unwrap()),
+            expected_policy
+        );
+        assert_eq!(
+            Path::new(value["mcpConfigFile"].as_str().unwrap()),
+            expected_config
+        );
     }
 
     #[cfg(unix)]
