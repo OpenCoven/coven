@@ -306,6 +306,7 @@ impl Host {
             id,
             key,
             step_up,
+            lost: std::cell::Cell::new((0, [0, 0])),
         }
     }
 
@@ -507,6 +508,21 @@ impl Host {
     fn routing(&self, id: Uuid) -> serde_json::Value {
         serde_json::from_slice(&self.routing_bytes(id).expect("routing file is missing")).unwrap()
     }
+    /// The committed generation with, per transport, the rooms the host
+    /// committed for admissions that completed: its durable floors less the
+    /// rooms `phone` consumed for admissions the daemon abandoned.
+    fn admitted(&self, phone: &Phone) -> (u64, [u64; 2]) {
+        let (generation, mut floors) = self.committed(phone.id);
+        let (lost_generation, lost) = phone.lost.get();
+        if lost_generation == generation {
+            for (floor, lost) in floors.iter_mut().zip(lost) {
+                *floor = floor
+                    .checked_sub(lost)
+                    .expect("the host floor is behind the rooms the device lost");
+            }
+        }
+        (generation, floors)
+    }
     /// Committed generation with its direct and relay floors.
     fn committed(&self, id: Uuid) -> (u64, [u64; 2]) {
         let committed = &self.routing(id)["committed"];
@@ -594,6 +610,9 @@ struct Phone {
     id: Uuid,
     key: SigningKey,
     step_up: SigningKey,
+    /// Rooms this device consumed in a generation for admissions the daemon
+    /// then abandoned, by transport. See `Phone::lost_admission`.
+    lost: std::cell::Cell<(u64, [u64; 2])>,
 }
 impl Phone {
     fn request(&self, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
@@ -613,6 +632,7 @@ impl Phone {
             id: self.id,
             key: self.key.clone(),
             step_up: self.step_up.clone(),
+            lost: std::cell::Cell::new((0, [0, 0])),
         };
         crate::mobile_memory::config::ensure_private_mobile_dir(image.home.path()).unwrap();
         atomic_replace_private(
@@ -796,12 +816,16 @@ impl Phone {
             records.and_then(|records| attempt.connect(records, &self.key)),
         )
     }
-    /// Connect on the next counter room. A relay room is ready once a daemon
-    /// worker has joined it; an attempt that arrives first is closed before any
-    /// host proof, so it may be repeated only while the device's durable state
-    /// is unchanged. Direct ingress has no such wait and must admit at once.
+    /// Connect on the next counter room. Direct ingress has no wait and must
+    /// admit at once. A relay attempt can fail in two ways that are not a
+    /// refusal. It can arrive before a daemon worker has joined the room; the
+    /// relay closes it before any host proof, the device's durable state is
+    /// unchanged and the same room is tried again. Or the daemon can abandon the
+    /// admission after sending its proof, which `lost_admission` checks and
+    /// counts before the next room is tried.
     fn connect(&self, host: &Host, transport: Transport) -> Live {
         let started = Instant::now();
+        let mut lost = 0;
         loop {
             let before = self.state(host, transport);
             let (slot, result) = self.attempt(host, transport);
@@ -820,11 +844,11 @@ impl Phone {
                         transport == Transport::Relay,
                         "direct ingress refused current material: {error:#}"
                     );
-                    assert_eq!(
-                        self.state(host, transport),
-                        before,
-                        "relay attempt failed after durable device consumption: {error:#}"
-                    );
+                    let after = self.state(host, transport);
+                    if after != before {
+                        lost += 1;
+                        self.lost_admission(host, transport, (before, after), lost, &error);
+                    }
                     assert!(
                         started.elapsed() < HANG_GUARD,
                         "relay room never became ready: {error:#}"
@@ -833,6 +857,58 @@ impl Phone {
                 }
             }
         }
+    }
+    /// A relay admission the daemon abandoned after it sent its proof: the
+    /// manager cancelled the worker, or the worker failed, before
+    /// `host-finished-v2`. The device had already verified that proof and durably
+    /// consumed the room, as the construction requires before it reveals its own
+    /// proof, so the room cannot be tried again. This checks that exactly one
+    /// room went, on an authentic host floor, that the host's own floor is
+    /// consistent with it, and that the device is still inside the host's window,
+    /// which holds while fewer than `WINDOW` rooms in a row are lost.
+    fn lost_admission(
+        &self,
+        host: &Host,
+        transport: Transport,
+        (before, after): (DeviceState, DeviceState),
+        consecutive: u64,
+        error: &anyhow::Error,
+    ) {
+        assert_eq!(
+            (after.generation, after.next),
+            (before.generation, before.next + 1),
+            "a failed relay attempt consumed other than one device room: {error:#}"
+        );
+        assert!(
+            (before.floor..=before.next).contains(&after.floor),
+            "a failed relay attempt left the device floor at {}: {error:#}",
+            after.floor
+        );
+        let (generation, floors) = host.committed(self.id);
+        let floor = floors[index(transport)];
+        assert_eq!(generation, after.generation);
+        assert!(
+            (after.floor..=after.next).contains(&floor),
+            "host floor {floor} disagrees with the proof the device verified: {error:#}"
+        );
+        assert!(
+            consecutive < crate::mobile_memory::transport::routing::WINDOW,
+            "{consecutive} relay admissions in a row were abandoned after the host proof, \
+             which puts the device outside the host's window: {error:#}"
+        );
+        let (lost_generation, mut lost) = self.lost.get();
+        if lost_generation != after.generation {
+            lost = [0, 0];
+        }
+        lost[index(transport)] += 1;
+        self.lost.set((after.generation, lost));
+        // Written past the test harness's capture so a hosted log shows it.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "v2-journey lost-admission transport={transport:?} generation={} room={} host-floor={floor} error={error:#}",
+            after.generation, before.next
+        );
     }
     /// One attempt that must be refused before either side consumes a room.
     fn refused(&self, host: &Host, transport: Transport, direct_error: &str) {
@@ -957,10 +1033,12 @@ fn read_device(phone: &Phone, live: &mut Live) {
     );
 }
 /// Close the current channel and connect on the next room. On the relay profile
-/// the daemon rebuilds a pairing's window only in a manager pass that starts
-/// after its established channel has gone, so a successful reconnection proves a
-/// full pass over durable state since the previous one. A refusal repeated after
-/// it is therefore not a listener that had yet to start.
+/// that room is served by a worker of the window the daemon already held or,
+/// when a manager pass ran while the channel was open and cancelled that window,
+/// by one rebuilt after the channel closed. The journeys do not tell the two
+/// apart: a refusal repeated after a reconnection shows that retained material
+/// stays refused once the daemon has served a newer room, not that the daemon
+/// re-derived its listeners in between.
 fn reconnect(phone: &Phone, host: &Host, transport: Transport, live: Live) -> Live {
     drop(live);
     let mut live = phone.connect(host, transport);
@@ -1103,7 +1181,7 @@ fn journey(transport: Transport) {
             .outcome(),
         (200, "")
     );
-    assert_eq!(host.committed(phone.id), (0, [0, 0]));
+    assert_eq!(host.admitted(&phone), (0, [0, 0]));
     assert_eq!(host.pending(phone.id), None);
 
     // Counter-window connect and a signed application request.
@@ -1114,7 +1192,7 @@ fn journey(transport: Transport) {
     assert_eq!(reply.data()["id"], phone.id.to_string());
     let mut floors = [0, 0];
     floors[index(transport)] = 1;
-    assert_eq!(host.committed(phone.id), (0, floors));
+    assert_eq!(host.admitted(&phone), (0, floors));
 
     // Nonce: the exact signed bytes are refused once spent; the channel stays.
     assert_eq!(
@@ -1168,7 +1246,7 @@ fn journey(transport: Transport) {
     let mut live = phone.connect(&host, transport);
     read_device(&phone, &mut live);
     floors[index(transport)] = 3;
-    assert_eq!(host.committed(phone.id), (0, floors));
+    assert_eq!(host.admitted(&phone), (0, floors));
 
     // Grant rotation and tightening, by the operator. The live channel closes at
     // its next request, generation 0 is no longer admitted, and a possession-only
@@ -1200,7 +1278,7 @@ fn journey(transport: Transport) {
         host.grant(phone.id)
     );
     assert_ne!(second.noise_key, first.noise_key);
-    assert_eq!(host.committed(phone.id), (1, [0, 0]));
+    assert_eq!(host.admitted(&phone), (1, [0, 0]));
 
     // Assurance on the new generation: possession alone is refused per request,
     // an exact proof is accepted once, and it cannot authorize a second request.
@@ -1228,7 +1306,7 @@ fn journey(transport: Transport) {
     );
     floors = [0, 0];
     floors[index(transport)] = 1;
-    assert_eq!(host.committed(phone.id), (1, floors));
+    assert_eq!(host.admitted(&phone), (1, floors));
     generation_zero.refused(&host, transport, "direct pairing unavailable");
 
     // Daemon restart. The rebuilt runtime admits the next room from durable
@@ -1238,7 +1316,7 @@ fn journey(transport: Transport) {
         live.exchange(&phone.request("GET", DEVICE, &[])).is_err(),
         "a channel outlived its runtime"
     );
-    assert_eq!(host.committed(phone.id), (1, floors));
+    assert_eq!(host.admitted(&phone), (1, floors));
     host.start();
     let mut live = phone.connect(&host, transport);
     let wire = phone.stepped(&host, "GET", DEVICE, &[], &mut |wire| {
@@ -1246,7 +1324,7 @@ fn journey(transport: Transport) {
     });
     assert_eq!(live.exchange(&wire).unwrap().outcome(), (200, ""));
     floors[index(transport)] = 2;
-    assert_eq!(host.committed(phone.id), (1, floors));
+    assert_eq!(host.admitted(&phone), (1, floors));
     before_connect.refused(&host, transport, "direct pairing unavailable");
     assert_eq!(std::fs::read(&identity_path).unwrap(), identity_before);
 
@@ -1281,7 +1359,7 @@ fn journey(transport: Transport) {
     });
     assert_eq!(live.exchange(&wire).unwrap().outcome(), (200, ""));
     floors[index(transport)] = 3;
-    assert_eq!(host.committed(phone.id), (1, floors));
+    assert_eq!(host.admitted(&phone), (1, floors));
 
     // Revocation, by the operator. The live channel closes at its next request,
     // reconnection and signed control are refused, and no routing state moves.
@@ -1312,7 +1390,7 @@ fn journey(transport: Transport) {
         "revoking one device disturbed another"
     );
     // The other profile's counters never moved.
-    assert_eq!(host.committed(phone.id).1[index(other(transport))], 0);
+    assert_eq!(host.admitted(&phone).1[index(other(transport))], 0);
 
     // The relay saw rooms and ciphertext only.
     let mut markers = stable_identifier_markers(&first);
@@ -1390,9 +1468,9 @@ fn stale_generation(transport: Transport) {
             .outcome(),
         (200, "")
     );
-    assert_eq!(host.committed(phone.id), (1, [0, 0]));
+    assert_eq!(host.admitted(&phone), (1, [0, 0]));
 
-    // Generation 1 is live; generation 0 stays refused across a rebuilt window,
+    // Generation 1 is live; generation 0 stays refused across a reconnection,
     // and signed control naming it cannot bring it back.
     let mut live = phone.connect(&host, transport);
     read_device(&phone, &mut live);
@@ -1408,7 +1486,7 @@ fn stale_generation(transport: Transport) {
     }
     let mut floors = [0, 0];
     floors[index(transport)] = 2;
-    assert_eq!(host.committed(phone.id), (1, floors));
+    assert_eq!(host.admitted(&phone), (1, floors));
     // The per-request gates hold on the generation that superseded it.
     let live = request_gates(&host, &phone, &bystander, transport, live);
     tightened_grant_gates(&host, &phone, transport, live);
@@ -1476,10 +1554,10 @@ fn burned_pending_generation(transport: Transport) {
             .outcome(),
         (200, "")
     );
-    assert_eq!(host.committed(phone.id), (2, [0, 0]));
+    assert_eq!(host.admitted(&phone), (2, [0, 0]));
 
-    // Generation 2 is live; the burned image stays refused across a rebuilt
-    // window, and signed control naming generation 1 cannot revive it.
+    // Generation 2 is live; the burned image stays refused across a
+    // reconnection, and signed control naming generation 1 cannot revive it.
     let mut live = phone.connect(&host, transport);
     read_device(&phone, &mut live);
     burned.refused(&host, transport, "direct pairing unavailable");
@@ -1494,7 +1572,7 @@ fn burned_pending_generation(transport: Transport) {
     }
     let mut floors = [0, 0];
     floors[index(transport)] = 2;
-    assert_eq!(host.committed(phone.id), (2, floors));
+    assert_eq!(host.admitted(&phone), (2, floors));
     // The per-request gates hold on the generation that replaced the burned one.
     let live = request_gates(&host, &phone, &bystander, transport, live);
     tightened_grant_gates(&host, &phone, transport, live);
@@ -1584,7 +1662,7 @@ fn v1_material_is_refused_after_the_v2_floor_on_both_ingress_paths() {
     );
 
     // v2 is served on both profiles; the v1 room and credential are refused on
-    // both ingress paths across a rebuilt relay window, and a legacy bootstrap
+    // both ingress paths across a relay reconnection, and a legacy bootstrap
     // neither reopens v1 nor releases material.
     let mut live: Vec<_> = [Transport::Direct, Transport::Relay]
         .into_iter()
@@ -1614,7 +1692,7 @@ fn v1_material_is_refused_after_the_v2_floor_on_both_ingress_paths() {
     live.push(reconnect(&phone, &host, Transport::Relay, relay));
     refuse_v1();
     // Only the v2 positive controls moved a counter.
-    assert_eq!(host.committed(phone.id), (0, [1, 2]));
+    assert_eq!(host.admitted(&phone), (0, [1, 2]));
     // The per-request gates hold on both of the upgraded client's v2 channels.
     let mut live = live.into_iter();
     let direct = live.next().unwrap();
