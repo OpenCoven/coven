@@ -17,7 +17,7 @@ has the measurements behind this design.
 |---|---|
 | `--settings <COVEN_HOME>/policy/claude-settings.json` | Coven's rules sit above project and user settings; administrator-managed settings still rank higher. |
 | `--setting-sources project` | Claude Code does not read the operator's `~/.claude/settings.json` or the workspace's `.claude/settings.local.json`. |
-| `--permission-mode <mode>` | `coven run --permission full` maps to `bypassPermissions`, and `read-only` to `plan`. With no `--permission`, Claude Code stays in its headless default, which refuses whatever no rule allows. |
+| `--permission-mode <mode>` | Not part of the policy, and passed once. `coven run --permission full` maps to `bypassPermissions`, and `read-only` to `plan`. With no `--permission`, Claude Code stays in its headless default, which refuses whatever no rule allows. The `claude` harness gets the argument from Coven; the engine passes each turn's own mode. |
 | `--mcp-config <Claude config file>` | Only when the operator's Claude config file defines MCP servers. Leaving out the user source would otherwise drop them. |
 
 The policy file is [`crates/coven-cli/policy/claude-settings.json`](../crates/coven-cli/policy/claude-settings.json):
@@ -49,15 +49,17 @@ confined.
   "version": 1,
   "settingsFile": "<COVEN_HOME>/policy/claude-settings.json",
   "settingSources": "project",
-  "permissionMode": "bypassPermissions",
   "addDirs": ["/work/attachments"],
   "mcpConfigFile": "<HOME>/.claude.json"
 }
 ```
 
-The paths are absolute. `permissionMode` and `mcpConfigFile` may be `null`. An engine that cannot apply
-the object in full refuses the turn and says to update Coven and the engine
-together. It does not start Claude Code without the policy.
+The paths are absolute, and `mcpConfigFile` may be `null`. The object names no
+permission mode: the engine already passes each turn's own mode to Claude Code,
+so exactly one `--permission-mode` reaches it. An engine that cannot apply the
+object in full, including a field it does not know, refuses the turn and says
+to update Coven and the engine together. It does not start Claude Code without
+the policy.
 
 ## Provisioning and migration
 

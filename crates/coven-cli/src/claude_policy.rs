@@ -20,8 +20,10 @@
 //! Administrator-managed settings stay above all of this, and Coven never
 //! writes them. The policy covers headless launches, `--stream-json` and
 //! non-interactive. The engine starts Claude Code itself, so a headless
-//! engine launch receives the same policy through [`ENGINE_POLICY_ENV`],
-//! with the permission Coven was asked for.
+//! engine launch receives the same policy through [`ENGINE_POLICY_ENV`].
+//! That object names no permission mode: the engine passes each turn's own
+//! mode to Claude Code, so a second one here would put two on the command
+//! line.
 //!
 //! Unchanged: interactive terminal launches, where a person can answer, and
 //! `--write-scope` launches, which carry their own complete policy. An
@@ -36,7 +38,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::harness::{HarnessLaunchMode, HarnessLaunchOptions, LaunchPolicy, Permission};
+use crate::harness::{HarnessLaunchMode, HarnessLaunchOptions, LaunchPolicy};
 
 /// The policy, as Claude Code settings.
 const POLICY: &str = include_str!("../policy/claude-settings.json");
@@ -45,7 +47,7 @@ const POLICY_FILE: &str = "claude-settings.json";
 /// The settings files Claude Code still reads beside the policy.
 const SETTING_SOURCES: &str = "project";
 /// Names a JSON object for the engine: `version`, `settingsFile`,
-/// `settingSources`, `permissionMode`, `addDirs` and `mcpConfigFile`.
+/// `settingSources`, `addDirs` and `mcpConfigFile`.
 pub(crate) const ENGINE_POLICY_ENV: &str = "COVEN_CLAUDE_POLICY";
 const ENGINE_POLICY_VERSION: u32 = 1;
 /// Claude Code's config file runs to a few megabytes.
@@ -196,20 +198,9 @@ fn engine_policy(
         "version": ENGINE_POLICY_VERSION,
         "settingsFile": settings,
         "settingSources": SETTING_SOURCES,
-        "permissionMode": options.permission.and_then(claude_permission_mode),
         "addDirs": add_dirs,
         "mcpConfigFile": mcp_config,
     })
-}
-
-/// Claude Code's name for a Coven permission, read from the bundled Claude
-/// adapter so the engine and the harness cannot disagree.
-fn claude_permission_mode(permission: Permission) -> Option<String> {
-    crate::harness::built_in_harness_specs()
-        .into_iter()
-        .find(|spec| spec.id == "claude")?
-        .sandbox_args(permission)
-        .pop()
 }
 
 /// Write the compiled-in policy under `coven_home` unless that exact content
@@ -293,6 +284,7 @@ fn defines_mcp_servers(file: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::Permission;
 
     fn options(permission: Option<Permission>) -> HarnessLaunchOptions<'static> {
         HarnessLaunchOptions {
@@ -542,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_gets_the_policy_with_coven_s_permission_and_directories() {
+    fn the_engine_gets_the_policy_with_coven_s_directories_and_no_permission_mode() {
         let home = tempfile::tempdir().unwrap();
         let policy = home.path().join("policy").join("claude-settings.json");
         let dirs = [
@@ -550,11 +542,9 @@ mod tests {
             "  ".to_owned(),
             " /granted/two ".to_owned(),
         ];
-        for (permission, mode) in [
-            (Some(Permission::Full), json!("bypassPermissions")),
-            (Some(Permission::ReadOnly), json!("plan")),
-            (None, Value::Null),
-        ] {
+        // The engine passes each turn's own mode to Claude Code, so the
+        // policy is the same object whatever permission Coven was asked for.
+        for permission in [Some(Permission::Full), Some(Permission::ReadOnly), None] {
             let launch = HarnessLaunchOptions {
                 permission,
                 add_dirs: &dirs,
@@ -572,7 +562,6 @@ mod tests {
                     "version": 1,
                     "settingsFile": policy.to_str().unwrap(),
                     "settingSources": "project",
-                    "permissionMode": mode,
                     "addDirs": ["/granted/one", "/granted/two"],
                     "mcpConfigFile": null,
                 })
