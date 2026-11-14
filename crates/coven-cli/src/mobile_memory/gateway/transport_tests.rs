@@ -1915,6 +1915,22 @@ fn online_connection_never_overrides_denial_or_restores_device_authority() {
     }
 }
 
+// Fixture hang guard only: role connect and its registration barrier each allow
+// 30s, and consumption may span additional connect/authentication/exchange phases.
+// The channel event proves ordering; 240s leaves scheduler margin for those phases
+// without changing any production deadline. A worker panic drops its sole sender
+// so the parent fails immediately instead of waiting out the hang guard.
+fn wait_for_migration_fixture_event(receiver: std::sync::mpsc::Receiver<()>, phase: &str) {
+    let budget = Duration::from_secs(240);
+    let started = Instant::now();
+    receiver.recv_timeout(budget).unwrap_or_else(|error| {
+        panic!(
+            "{phase} after {:?} (fixture hang guard {budget:?}): {error}",
+            started.elapsed()
+        )
+    });
+}
+
 #[test]
 fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_applies_once() {
     use super::super::transport::{
@@ -1969,10 +1985,12 @@ fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_app
         let material_ref = &material;
         let credential_ref = &credential;
         let hashes = Arc::clone(&request_hashes);
+        let (old_ready_tx, old_ready_rx) = mpsc::channel();
         let old_host = scope.spawn(move || {
             let records = first_relay
                 .connect(websocket::Role::Host, &room, credential_ref)
                 .unwrap();
+            old_ready_tx.send(()).unwrap();
             let mut channel = transport::accept(
                 records,
                 pairing,
@@ -2019,6 +2037,7 @@ fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_app
             channel.close();
         });
         let candidate = migration.begin(Transport::Relay).unwrap();
+        wait_for_migration_fixture_event(old_ready_rx, "old relay host registration");
         let records = relays[0]
             .connect(websocket::Role::Client, &room, &credential)
             .unwrap();
@@ -2032,10 +2051,12 @@ fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_app
 
         let next_relay = &relays[1];
         let hashes = Arc::clone(&request_hashes);
+        let (next_ready_tx, next_ready_rx) = mpsc::channel();
         let next_host = scope.spawn(move || {
             let records = next_relay
                 .connect(websocket::Role::Host, &room, credential_ref)
                 .unwrap();
+            next_ready_tx.send(()).unwrap();
             let mut channel = transport::accept(
                 records,
                 pairing,
@@ -2084,6 +2105,7 @@ fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_app
                 .expect("client never consumed the final handoff response");
         });
         let candidate = migration.begin(Transport::Relay).unwrap();
+        wait_for_migration_fixture_event(next_ready_rx, "next relay host registration");
         let records = relays[1]
             .connect(websocket::Role::Client, &room, &credential)
             .unwrap();
@@ -2187,6 +2209,7 @@ fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
         test_support::Relay,
         websocket,
     };
+    use std::sync::mpsc;
     // The registry admits 128 devices. A direct candidate must still route to
     // a provisioned pairing after 32 earlier active, unprovisioned records.
     let fixture = Fixture::configured_after(tempfile::tempdir().unwrap(), false, 32);
@@ -2243,10 +2266,13 @@ fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
         let host_ref = &host;
         let relay_credential_ref = &relay_credential;
         let first_relay = &relays[0];
+        let (first_ready_tx, first_ready_rx) = mpsc::channel();
+        let (first_consumed_tx, first_consumed_rx) = mpsc::channel();
         let first_host = scope.spawn(move || {
             let records = first_relay
                 .connect(websocket::Role::Host, &relay_room, relay_credential_ref)
                 .unwrap();
+            first_ready_tx.send(()).unwrap();
             let mut channel = transport::accept(
                 records,
                 pairing,
@@ -2267,8 +2293,12 @@ fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
             for _ in 0..2 {
                 serve_transport_with_state(state, &mut channel).unwrap();
             }
+            // Relay disconnect takes priority over queued responses. Hold the
+            // sender through the client's last response consumption.
+            wait_for_migration_fixture_event(first_consumed_rx, "first relay response consumption");
         });
         let candidate = migration.begin(Transport::Relay).unwrap();
+        wait_for_migration_fixture_event(first_ready_rx, "first relay host registration");
         let records = relays[0]
             .connect(websocket::Role::Client, &relay_room, &relay_credential)
             .unwrap();
@@ -2333,6 +2363,7 @@ fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
             .unwrap()
             .bytes
             .starts_with(b"HTTP/1.1 200"));
+        first_consumed_tx.send(()).unwrap();
         migration.commit(candidate).unwrap();
         assert_eq!(
             migration.status().unwrap().unwrap().transport,
@@ -2352,10 +2383,13 @@ fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
         );
 
         let last_relay = &relays[1];
+        let (last_ready_tx, last_ready_rx) = mpsc::channel();
+        let (last_consumed_tx, last_consumed_rx) = mpsc::channel();
         let last_host = scope.spawn(move || {
             let records = last_relay
                 .connect(websocket::Role::Host, &relay_room, relay_credential_ref)
                 .unwrap();
+            last_ready_tx.send(()).unwrap();
             let mut channel = transport::accept(
                 records,
                 pairing,
@@ -2374,8 +2408,10 @@ fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
             )
             .unwrap();
             serve_transport_with_state(state, &mut channel).unwrap();
+            wait_for_migration_fixture_event(last_consumed_rx, "last relay response consumption");
         });
         let candidate = migration.begin(Transport::Relay).unwrap();
+        wait_for_migration_fixture_event(last_ready_rx, "last relay host registration");
         let records = relays[1]
             .connect(websocket::Role::Client, &relay_room, &relay_credential)
             .unwrap();
@@ -2409,6 +2445,7 @@ fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
             migration.status().unwrap().unwrap().transport,
             Transport::Relay
         );
+        last_consumed_tx.send(()).unwrap();
         state.stop_network_connections();
         first_host.join().unwrap();
         let _ = direct_host.join().unwrap();
