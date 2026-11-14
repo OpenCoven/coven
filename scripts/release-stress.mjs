@@ -60,6 +60,36 @@ const UNIX_COMMANDS = [
   {
     label: 'short socket homes',
     args: ['test', '-p', 'opencoven-coven-client', '--test', 'health', '--locked']
+  },
+  // Returned-error children publish a checkpoint and exit at once; the fixture
+  // must not read that as an early exit (coven#1741).
+  {
+    label: 'process-crash fixture exit ordering',
+    args: [
+      'test',
+      '-p',
+      'coven-cli',
+      '--bin',
+      'coven',
+      'mobile_memory::transport::storage::v2::tests::process_crash::',
+      '--locked'
+    ]
+  },
+  // The daemon may answer and close before the client half-closes its
+  // request, which macOS reports as ENOTCONN (coven#1641).
+  {
+    label: 'daemon request half-close',
+    args: [
+      'test',
+      '-p',
+      'coven-cli',
+      '--bin',
+      'coven',
+      '--locked',
+      '--',
+      'unix_serve_loop_isolates_per_connection_errors',
+      'finishing_a_request_after_the_daemon'
+    ]
   }
 ];
 
@@ -77,6 +107,12 @@ const WINDOWS_COMMANDS = [
       '--',
       '--exact'
     ]
+  },
+  // Concurrent creators remove only their own publication marker; removing a
+  // later creator's marker by name fails with access denied (coven#1653).
+  {
+    label: 'directory publication markers',
+    args: ['test', '-p', 'coven-cli', '--bin', 'coven', 'durable_fs::tests::', '--locked']
   }
 ];
 
