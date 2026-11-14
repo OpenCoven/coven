@@ -8,6 +8,9 @@
 //! - `policy/claude-settings.json` is compiled into the binary, so installing
 //!   or updating Coven provisions it. It is written under the Coven home only
 //!   when its content differs.
+//! - A read-only launch gets the same refusals without the allow list, from
+//!   a second file. Claude Code applies allow rules in plan mode too, so the
+//!   approved commands would otherwise write files in a read-only turn.
 //! - `--settings <that file>` sits above every settings file, and no other
 //!   source can undo one of its deny rules.
 //! - `--setting-sources project` leaves out the operator's `~/.claude` and the
@@ -23,7 +26,7 @@
 //! engine launch receives the same policy through [`ENGINE_POLICY_ENV`].
 //! That object names no permission mode: the engine passes each turn's own
 //! mode to Claude Code, so a second one here would put two on the command
-//! line.
+//! line. It names both policy files, and the engine picks per turn.
 //!
 //! Unchanged: interactive terminal launches, where a person can answer, and
 //! `--write-scope` launches, which carry their own complete policy. An
@@ -38,16 +41,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::harness::{HarnessLaunchMode, HarnessLaunchOptions, LaunchPolicy};
+use crate::harness::{HarnessLaunchMode, HarnessLaunchOptions, LaunchPolicy, Permission};
 
 /// The policy, as Claude Code settings.
 const POLICY: &str = include_str!("../policy/claude-settings.json");
 const POLICY_DIR: &str = "policy";
 const POLICY_FILE: &str = "claude-settings.json";
+const READ_ONLY_POLICY_FILE: &str = "claude-settings-read-only.json";
 /// The settings files Claude Code still reads beside the policy.
 const SETTING_SOURCES: &str = "project";
 /// Names a JSON object for the engine: `version`, `settingsFile`,
-/// `settingSources`, `addDirs` and `mcpConfigFile`.
+/// `readOnlySettingsFile`, `settingSources`, `addDirs` and `mcpConfigFile`.
 pub(crate) const ENGINE_POLICY_ENV: &str = "COVEN_CLAUDE_POLICY";
 const ENGINE_POLICY_VERSION: u32 = 1;
 /// Claude Code's config file runs to a few megabytes.
@@ -146,10 +150,14 @@ fn additions(
     claude_config: Option<&Path>,
     options: HarnessLaunchOptions<'_>,
 ) -> Result<LaunchAdditions> {
-    let settings = materialize(coven_home)?;
-    let settings = settings
-        .to_str()
-        .context("the Coven home path is not UTF-8, so Claude Code cannot be given its policy")?;
+    let files = materialize(coven_home)?;
+    let utf8 = |path: &'_ Path| {
+        path.to_str()
+            .map(str::to_owned)
+            .context("the Coven home path is not UTF-8, so Claude Code cannot be given its policy")
+    };
+    let settings = utf8(&files.settings)?;
+    let read_only_settings = utf8(&files.read_only_settings)?;
     let claude_config = claude_config.map(absolute_path).transpose()?;
     // The servers are a convenience: an unreadable config never fails a launch.
     let mcp_config = claude_config
@@ -162,11 +170,18 @@ fn additions(
             if let Some(file) = mcp_config {
                 args.extend(["--mcp-config".to_owned(), file.to_owned()]);
             }
+            // Coven passes this harness its permission mode itself, so the
+            // file that matches it is known here.
+            let settings = if options.permission == Some(Permission::ReadOnly) {
+                read_only_settings
+            } else {
+                settings
+            };
             args.extend([
                 "--setting-sources".to_owned(),
                 SETTING_SOURCES.to_owned(),
                 "--settings".to_owned(),
-                settings.to_owned(),
+                settings,
             ]);
             LaunchAdditions {
                 args,
@@ -177,7 +192,9 @@ fn additions(
             args: Vec::new(),
             env: vec![(
                 ENGINE_POLICY_ENV.to_owned(),
-                Some(engine_policy(settings, mcp_config, options).to_string()),
+                Some(
+                    engine_policy(&settings, &read_only_settings, mcp_config, options).to_string(),
+                ),
             )],
         },
     })
@@ -185,6 +202,7 @@ fn additions(
 
 fn engine_policy(
     settings: &str,
+    read_only_settings: &str,
     mcp_config: Option<&str>,
     options: HarnessLaunchOptions<'_>,
 ) -> Value {
@@ -197,30 +215,59 @@ fn engine_policy(
     json!({
         "version": ENGINE_POLICY_VERSION,
         "settingsFile": settings,
+        "readOnlySettingsFile": read_only_settings,
         "settingSources": SETTING_SOURCES,
         "addDirs": add_dirs,
         "mcpConfigFile": mcp_config,
     })
 }
 
-/// Write the compiled-in policy under `coven_home` unless that exact content
-/// is already there, and return its path.
-fn materialize(coven_home: &Path) -> Result<PathBuf> {
-    let coven_home = absolute_path(coven_home)?;
-    let directory = coven_home.join(POLICY_DIR);
-    let path = directory.join(POLICY_FILE);
+/// The policy for a read-only launch: the same refusals and no allow list.
+/// Derived from `POLICY`, so the two cannot drift apart.
+fn read_only_policy() -> &'static str {
+    static READ_ONLY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    READ_ONLY.get_or_init(|| {
+        let mut policy: Value =
+            serde_json::from_str(POLICY).expect("the compiled-in policy is JSON");
+        policy["permissions"]["allow"] = json!([]);
+        format!("{policy:#}\n")
+    })
+}
+
+/// Where the two policy files are once written.
+struct PolicyFiles {
+    settings: PathBuf,
+    read_only_settings: PathBuf,
+}
+
+/// Write the compiled-in policy and its read-only form under `coven_home`,
+/// each unless that exact content is already there.
+fn materialize(coven_home: &Path) -> Result<PolicyFiles> {
+    let directory = absolute_path(coven_home)?.join(POLICY_DIR);
+    Ok(PolicyFiles {
+        settings: materialize_file(&directory, POLICY_FILE, POLICY)?,
+        read_only_settings: materialize_file(
+            &directory,
+            READ_ONLY_POLICY_FILE,
+            read_only_policy(),
+        )?,
+    })
+}
+
+fn materialize_file(directory: &Path, name: &str, content: &str) -> Result<PathBuf> {
+    let path = directory.join(name);
     let current = fs::symlink_metadata(&path)
         .ok()
         .filter(fs::Metadata::is_file)
         .and_then(|_| fs::read(&path).ok());
-    if current.as_deref() == Some(POLICY.as_bytes()) {
+    if current.as_deref() == Some(content.as_bytes()) {
         return Ok(path);
     }
     let write = || -> std::io::Result<()> {
-        fs::create_dir_all(&directory)?;
+        fs::create_dir_all(directory)?;
         // Renamed into place, so a reader sees the old policy or the new one.
-        let mut file = tempfile::NamedTempFile::new_in(&directory)?;
-        file.write_all(POLICY.as_bytes())?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(content.as_bytes())?;
         file.as_file().sync_all()?;
         // `persist` replaces an existing policy on every platform.
         file.persist(&path).map_err(|error| error.error)?;
@@ -284,7 +331,6 @@ fn defines_mcp_servers(file: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::Permission;
 
     fn options(permission: Option<Permission>) -> HarnessLaunchOptions<'static> {
         HarnessLaunchOptions {
@@ -328,6 +374,21 @@ mod tests {
         let policy: Value = serde_json::from_str(POLICY).unwrap();
         assert_eq!(policy.as_object().unwrap().len(), 1);
         assert_eq!(policy["permissions"].as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn the_read_only_policy_keeps_the_refusals_and_allows_nothing() {
+        let full: Value = serde_json::from_str(POLICY).unwrap();
+        let read_only: Value = serde_json::from_str(read_only_policy()).unwrap();
+        assert_eq!(read_only["permissions"]["allow"], json!([]));
+        assert_eq!(
+            read_only["permissions"]["deny"],
+            full["permissions"]["deny"]
+        );
+        // Nothing else differs.
+        let mut expected = full;
+        expected["permissions"]["allow"] = json!([]);
+        assert_eq!(read_only, expected);
     }
 
     #[test]
@@ -401,7 +462,41 @@ mod tests {
             ]
         );
         assert!(additions.env.is_empty());
-        assert_eq!(fs::read_to_string(policy).unwrap(), POLICY);
+        assert_eq!(fs::read_to_string(&policy).unwrap(), POLICY);
+
+        // Full access is the same file. Only a read-only launch differs.
+        let full = super::additions(
+            Target::Claude,
+            home.path(),
+            None,
+            options(Some(Permission::Full)),
+        )
+        .unwrap();
+        assert_eq!(full.args[3], policy.to_str().unwrap());
+        let read_only = super::additions(
+            Target::Claude,
+            home.path(),
+            None,
+            options(Some(Permission::ReadOnly)),
+        )
+        .unwrap();
+        let read_only_policy_file = home
+            .path()
+            .join("policy")
+            .join("claude-settings-read-only.json");
+        assert_eq!(
+            read_only.args,
+            [
+                "--setting-sources",
+                "project",
+                "--settings",
+                read_only_policy_file.to_str().unwrap()
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(read_only_policy_file).unwrap(),
+            read_only_policy()
+        );
         assert_eq!(
             additions.prepend_args(
                 "claude",
@@ -453,12 +548,17 @@ mod tests {
     #[test]
     fn the_policy_is_written_once_and_repaired_when_it_drifts() {
         let home = tempfile::tempdir().unwrap();
-        let path = materialize(home.path()).unwrap();
+        let files = materialize(home.path()).unwrap();
+        let path = files.settings;
         assert_eq!(fs::read_to_string(&path).unwrap(), POLICY);
+        assert_eq!(
+            fs::read_to_string(&files.read_only_settings).unwrap(),
+            read_only_policy()
+        );
 
         // Unchanged content is left alone: the file is not replaced.
         let first = fs::metadata(&path).unwrap();
-        assert_eq!(materialize(home.path()).unwrap(), path);
+        assert_eq!(materialize(home.path()).unwrap().settings, path);
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -470,13 +570,22 @@ mod tests {
         );
 
         fs::write(&path, r#"{"permissions":{"allow":["Bash"]}}"#).unwrap();
+        fs::write(&files.read_only_settings, POLICY).unwrap();
         materialize(home.path()).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), POLICY);
-        let entries: Vec<_> = fs::read_dir(home.path().join("policy"))
+        assert_eq!(
+            fs::read_to_string(&files.read_only_settings).unwrap(),
+            read_only_policy()
+        );
+        let mut entries: Vec<_> = fs::read_dir(home.path().join("policy"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(entries, ["claude-settings.json"]);
+        entries.sort();
+        assert_eq!(
+            entries,
+            ["claude-settings-read-only.json", "claude-settings.json"]
+        );
     }
 
     #[test]
@@ -514,6 +623,10 @@ mod tests {
             expected_policy
         );
         assert_eq!(
+            Path::new(value["readOnlySettingsFile"].as_str().unwrap()),
+            expected_policy.with_file_name(READ_ONLY_POLICY_FILE)
+        );
+        assert_eq!(
             Path::new(value["mcpConfigFile"].as_str().unwrap()),
             expected_config
         );
@@ -534,16 +647,18 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_gets_the_policy_with_coven_s_directories_and_no_permission_mode() {
+    fn the_engine_gets_both_policy_files_coven_s_directories_and_no_permission_mode() {
         let home = tempfile::tempdir().unwrap();
         let policy = home.path().join("policy").join("claude-settings.json");
+        let read_only = policy.with_file_name("claude-settings-read-only.json");
         let dirs = [
             "/granted/one".to_owned(),
             "  ".to_owned(),
             " /granted/two ".to_owned(),
         ];
-        // The engine passes each turn's own mode to Claude Code, so the
-        // policy is the same object whatever permission Coven was asked for.
+        // The engine passes each turn's own mode to Claude Code and picks the
+        // file that matches it, so the policy is the same object whatever
+        // permission Coven was asked for.
         for permission in [Some(Permission::Full), Some(Permission::ReadOnly), None] {
             let launch = HarnessLaunchOptions {
                 permission,
@@ -561,6 +676,7 @@ mod tests {
                 json!({
                     "version": 1,
                     "settingsFile": policy.to_str().unwrap(),
+                    "readOnlySettingsFile": read_only.to_str().unwrap(),
                     "settingSources": "project",
                     "addDirs": ["/granted/one", "/granted/two"],
                     "mcpConfigFile": null,

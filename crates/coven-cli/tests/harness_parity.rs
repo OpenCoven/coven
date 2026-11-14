@@ -426,6 +426,23 @@ fn headless_claude_launch_carries_covens_permission_policy() -> anyhow::Result<(
         String::from_utf8_lossy(&again.stderr)
     );
 
+    // A read-only launch gets the refusals without the allow list: Claude
+    // Code applies allow rules in plan mode, and `touch` would write there.
+    fixture.run(&["run", "claude", "--permission", "read-only", "prompt"])?;
+    let argv = fixture.recorded()?;
+    let read_only = policy.with_file_name("claude-settings-read-only.json");
+    assert!(
+        argv.windows(2)
+            .any(|args| args[0] == "--settings" && Path::new(&args[1]) == read_only),
+        "a read-only launch was not given the read-only policy: argv {argv:?}"
+    );
+    let rules: serde_json::Value = serde_json::from_str(&fs::read_to_string(&read_only)?)?;
+    assert_eq!(rules["permissions"]["allow"], serde_json::json!([]));
+    assert_eq!(
+        rules["permissions"]["deny"],
+        serde_json::json!(["Bash(rm:*)", "Bash(git push:*)", "Bash(git tag:*)"])
+    );
+
     for harness in ["codex", "copilot"] {
         let fixture = Fixture::new(0, false)?;
         fixture.run(&["run", harness, "--permission", "full", "prompt"])?;

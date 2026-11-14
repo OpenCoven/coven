@@ -15,7 +15,7 @@ has the measurements behind this design.
 
 | Argument | Effect |
 |---|---|
-| `--settings <COVEN_HOME>/policy/claude-settings.json` | Coven's rules sit above project and user settings; administrator-managed settings still rank higher. |
+| `--settings <COVEN_HOME>/policy/claude-settings.json` | Coven's rules sit above project and user settings; administrator-managed settings still rank higher. A read-only launch gets `claude-settings-read-only.json` from the same folder instead. |
 | `--setting-sources project` | Claude Code does not read the operator's `~/.claude/settings.json` or the workspace's `.claude/settings.local.json`. |
 | `--permission-mode <mode>` | Not part of the policy, and passed once. `coven run --permission full` maps to `bypassPermissions`, and `read-only` to `plan`. With no `--permission`, Claude Code stays in its headless default, which refuses whatever no rule allows. The `claude` harness gets the argument from Coven; the engine passes each turn's own mode. |
 | `--mcp-config <Claude config file>` | Only when the operator's Claude config file defines MCP servers. Leaving out the user source would otherwise drop them. |
@@ -24,6 +24,11 @@ The policy file is [`crates/coven-cli/policy/claude-settings.json`](../crates/co
 
 - **Allowed without asking:** `trash`, `mkdir`, `touch`, `cp`, `mv`, `git add`, `git commit`.
 - **Refused:** `rm`, `git push`, `git tag`.
+
+A read-only launch keeps the refusals and drops the allow list. Claude Code
+applies allow rules in plan mode as well, so with the list in place `touch` or
+`cp` would write a file in a read-only turn. Coven derives the read-only file
+from the policy file, so the two cannot drift apart.
 
 A headless session has nobody to answer a prompt, so "refused" is final for
 that turn. Under full access everything else runs. The allow list matters in
@@ -48,6 +53,7 @@ confined.
 {
   "version": 1,
   "settingsFile": "<COVEN_HOME>/policy/claude-settings.json",
+  "readOnlySettingsFile": "<COVEN_HOME>/policy/claude-settings-read-only.json",
   "settingSources": "project",
   "addDirs": ["/work/attachments"],
   "mcpConfigFile": "<HOME>/.claude.json"
@@ -56,17 +62,20 @@ confined.
 
 The paths are absolute, and `mcpConfigFile` may be `null`. The object names no
 permission mode: the engine already passes each turn's own mode to Claude Code,
-so exactly one `--permission-mode` reaches it. An engine that cannot apply the
-object in full, including a field it does not know, refuses the turn and says
-to update Coven and the engine together. It does not start Claude Code without
-the policy.
+so exactly one `--permission-mode` reaches it. The engine gives a read-only
+turn `readOnlySettingsFile` and every other turn `settingsFile`. An engine that
+cannot apply the object in full, including a field it does not know, refuses
+the turn and says to update Coven and the engine together. It does not start
+Claude Code without the policy.
 
 ## Provisioning and migration
 
 The policy is compiled into `coven`. The first covered launch after an install
-or update writes it to `<COVEN_HOME>/policy/claude-settings.json` and prints one
-line on stderr. Later launches compare the file with the compiled-in content
-and leave it alone when they match, so an edited or outdated copy is replaced.
+or update writes it to `<COVEN_HOME>/policy/claude-settings.json`, and its
+read-only form to `claude-settings-read-only.json` beside it, and prints one
+line on stderr for each. Later launches compare the files with the compiled-in
+content and leave them alone when they match, so an edited or outdated copy is
+replaced.
 
 There is nothing to migrate by hand. An operator's own Claude settings files
 are not edited or removed. Covered launches stop reading them.
