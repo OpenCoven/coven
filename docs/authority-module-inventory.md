@@ -165,6 +165,14 @@ These extractions are complete and remain the model for bounded movement:
    copy of the state, and everything recovery does with a read remain with
    the coordinator. `tests/proposal_apply_intent_boundary.rs` rejects file,
    Ward and coordinator dependencies and any wider exposure.
+10. **Proposal decision origin.** Private `api::proposal_decision_origin` owns
+    which actor a persisted decision request may be attributed to: only through
+    the server-owned reservation purpose that binds the request's exact digest,
+    or through the historical apply intent it matches. Every mismatch is an
+    invalid origin or a renewed-review requirement. Claims, recovery, and what
+    each origin may do remain with the coordinator.
+    `tests/proposal_decision_origin_boundary.rs` rejects file, store, Ward and
+    other coordinator dependencies and any wider exposure.
 
 These seams preserve the public HTTP API, daemon socket protocol, and existing
 caller entry points. They do not complete #806's broader highest-risk module
@@ -259,6 +267,9 @@ the delivering PR; historical dossier acceptance does not substitute for it.
 - **Persisted proposal envelope fields and stored forms**: private
   `api::proposal_document`. A new field changes the persisted format and, if it
   joins the authority bytes, every revision.
+- **Who a proposal decision is attributed to**: private
+  `api::proposal_decision_origin`. A new origin or purpose is an authority
+  change and needs its own reviewed fix.
 - **Proposal revision canonicalization**: private `api::proposal_revision`.
   Changing the digest re-keys every stored proposal and recorded decision
   request, so it is a behavior change and never part of a structural move.
