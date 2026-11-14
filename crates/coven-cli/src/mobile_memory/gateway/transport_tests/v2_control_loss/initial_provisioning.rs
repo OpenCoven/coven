@@ -1,7 +1,7 @@
 //! Signed direct control before any routing-generation anchor exists, plus the
 //! rotation-adoption and device-recovery stages the parent matrix starts after
-//! (#1685). Like the parent, requests are dispatched in process; no native
-//! HTTPS socket is claimed.
+//! (#1685). Like the parent, requests here are dispatched in process; the
+//! `native_https` child repeats the losses over a real TLS connection.
 use super::*;
 use serde_json::json;
 
@@ -755,3 +755,5 @@ fn legacy_channel_and_device_attempts_cannot_skip_adoption_of_a_pending_first_ge
         println!("pending-first-generation legacy={legacy} no channel before acknowledgment");
     }
 }
+
+mod native_https;
