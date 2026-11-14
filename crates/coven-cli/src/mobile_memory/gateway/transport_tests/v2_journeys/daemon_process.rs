@@ -240,7 +240,7 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
     // Connect and send signed requests on each profile's first counter room.
     let first_rooms = phone.image();
     let live = connect(&host);
-    assert_eq!(host.committed(phone.id), (0, floors(1)));
+    assert_eq!(host.admitted(&phone), (0, floors(1)));
 
     // The daemon process is killed outright. Nothing is admitted while it is
     // gone, and neither side's durable state moves.
@@ -252,7 +252,7 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
     // and the rooms consumed before the kill stay consumed.
     let daemon = Daemon::spawn(&host);
     let live = connect(&host);
-    assert_eq!(host.committed(phone.id), (0, floors(2)));
+    assert_eq!(host.admitted(&phone), (0, floors(2)));
     for &transport in profiles {
         first_rooms.refused(&host, transport, "direct pairing unavailable");
     }
@@ -264,7 +264,7 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
     unreachable(&host);
     let daemon = Daemon::spawn(&host);
     let live = connect(&host);
-    assert_eq!(host.committed(phone.id), (0, floors(3)));
+    assert_eq!(host.admitted(&phone), (0, floors(3)));
 
     // The per-request gates hold on the restarted daemon's channels.
     let live: Vec<Live> = profiles
@@ -272,7 +272,7 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
         .zip(live)
         .map(|(&transport, live)| request_gates(&host, &phone, &bystander, transport, live))
         .collect();
-    assert_eq!(host.committed(phone.id), (0, floors(4)));
+    assert_eq!(host.admitted(&phone), (0, floors(4)));
 
     // The operator acts from this process and the daemon enforces it in its
     // own. Raising the assurance floor closes the channels and refuses the
@@ -301,7 +301,7 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
         .iter()
         .map(|&transport| assurance_gate(&host, &phone, transport))
         .collect();
-    assert_eq!(host.committed(phone.id), (1, floors(1)));
+    assert_eq!(host.admitted(&phone), (1, floors(1)));
     for &transport in profiles {
         superseded.refused(&host, transport, "direct pairing unavailable");
     }
@@ -323,16 +323,16 @@ fn integrated_v2_journey_survives_daemon_process_restarts() {
     // Suspension keeps the grant and its epoch, so only the daemon's re-read of
     // the device's status closes these channels. After a resume the same
     // generation is served on the next room.
-    let committed = host.committed(phone.id);
+    let committed = host.admitted(&phone);
     host.suspend(phone.id);
     assert_closed(&phone, &host, live, Some("device unavailable"));
     for &transport in profiles {
         phone.refused(&host, transport, "direct pairing unavailable");
     }
-    assert_eq!(host.committed(phone.id), committed);
+    assert_eq!(host.admitted(&phone), committed);
     host.resume(phone.id);
     let live = connect(&host);
-    assert_eq!(host.committed(phone.id).0, committed.0);
+    assert_eq!(host.admitted(&phone).0, committed.0);
 
     // Revocation closes the channels and nothing is admitted afterwards.
     let routing = host.routing_bytes(phone.id);
