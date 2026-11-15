@@ -50,35 +50,6 @@ pub fn current_platform() -> Result<(&'static str, &'static str)> {
     Ok((os, arch))
 }
 
-/// Removes scratch paths (the downloaded archive and the extraction stage
-/// dir) when it drops — on success or on any early `?`/`bail!` return. The
-/// final installed binary lives in `dest_dir`, not in these paths, so
-/// unconditional cleanup is correct.
-struct ScratchGuard {
-    paths: Vec<PathBuf>,
-}
-
-impl ScratchGuard {
-    fn new() -> Self {
-        Self { paths: Vec::new() }
-    }
-    fn watch(&mut self, path: PathBuf) {
-        self.paths.push(path);
-    }
-}
-
-impl Drop for ScratchGuard {
-    fn drop(&mut self) {
-        for path in &self.paths {
-            if path.is_dir() {
-                let _ = std::fs::remove_dir_all(path);
-            } else {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-}
-
 /// Download, verify, extract, and activate the engine. Returns the installed
 /// binary path and whether it was freshly installed or already present.
 /// `expected_sha256` is the sha256 of the ARCHIVE and is required: archives
@@ -88,75 +59,114 @@ pub fn install(
     version: &str,
     expected_sha256: &str,
     force: bool,
+    allow_downgrade: bool,
 ) -> Result<(PathBuf, InstallOutcome)> {
+    let version = crate::engine_update::normalize_version(version)?;
+    if !is_sha256_hex(expected_sha256) {
+        bail!("invalid sha256 pin: expected 64 hexadecimal characters");
+    }
+    install_with(version, force, allow_downgrade, || {
+        Ok(expected_sha256.to_owned())
+    })
+}
+
+/// [`install`] with the archive checksum resolved only when a download is
+/// needed. Re-selecting a version directory that already holds a candidate
+/// reporting that version needs no checksum source, so a release without a
+/// manifest can still be rolled back to once it was installed.
+pub(crate) fn install_with(
+    version: &str,
+    force: bool,
+    allow_downgrade: bool,
+    expected_sha256: impl FnOnce() -> Result<String>,
+) -> Result<(PathBuf, InstallOutcome)> {
+    let version = crate::engine_update::normalize_version(version)?;
     let home = dirs_next::home_dir().context("cannot determine home directory")?;
     let engine_root = crate::paths::managed_engine_root(&home);
+    std::fs::create_dir_all(&engine_root)?;
+    // Serialize installers across versions: both activation and replacement
+    // belong to one transaction. OS locks release automatically on process exit.
+    let lock_path = engine_root.join("install.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("could not open {}", lock_path.display()))?;
+    if let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
+        // Only contention means another installer; report anything else
+        // (for example a filesystem without lock support) as itself.
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            bail!("another engine install is running; retry after it completes");
+        }
+        return Err(error).with_context(|| format!("could not lock {}", lock_path.display()));
+    }
+    // Recheck under the writer lock: another updater may have activated a
+    // newer engine while this caller was fetching release metadata.
+    if !allow_downgrade {
+        if let Some(selected) = crate::engine::resolve() {
+            if let Ok(actual) = crate::engine::engine_version(&selected.path) {
+                let target = crate::engine::parse_version_output(version)
+                    .context("invalid target engine version")?;
+                if actual > target {
+                    bail!("refusing to downgrade the currently selected engine to {version}; use an explicit --version if intended");
+                }
+            }
+        }
+    }
     let dest_dir = engine_root.join(version);
     let dest = dest_dir.join(crate::engine::ENGINE_BIN_NAME);
-    if dest.exists() && !force {
+    if !force && verify_candidate(&dest, version).is_ok() {
         activate(&engine_root, version)?;
         return Ok((dest, InstallOutcome::AlreadyPresent));
     }
     let (os, arch) = current_platform()?;
     let artifact = artifact_name(os, arch);
     let url = release_url(version, &artifact);
-
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("creating {}", dest_dir.display()))?;
-
-    let mut scratch = ScratchGuard::new();
-
-    // 1. Download the archive.
-    let archive = dest_dir.join(&artifact);
-    scratch.watch(archive.clone());
-    let status = Command::new("curl")
-        .args(["-fSL", "--retry", "3", "-o"])
-        .arg(&archive)
-        .arg(&url)
-        .status()
-        .context("failed to run curl (required for engine install)")?;
-    if !status.success() {
-        bail!("download failed: {url}");
-    }
-
-    // 2. Verify the ARCHIVE checksum BEFORE extraction (fail closed).
-    if !is_sha256_hex(expected_sha256) {
+    let expected_sha256 = expected_sha256()?;
+    if !is_sha256_hex(&expected_sha256) {
         bail!("invalid sha256 pin for {artifact}: expected 64 hexadecimal characters");
     }
+
+    // Private, unique staging on the destination filesystem. Failure leaves
+    // the previous engine and current pointer untouched; TempDir cleans up.
+    let scratch = tempfile::Builder::new()
+        .prefix(".install-")
+        .tempdir_in(&engine_root)?;
+    let archive = scratch.path().join(&artifact);
+    // Downloads are silent so scripted callers keep clean output; name the
+    // multi-megabyte transfer on stderr so an interactive wait is explained.
+    eprintln!("Downloading Coven Code {version} ({artifact})...");
+    crate::engine_update::download(&url, &archive, 512 * 1024 * 1024)?;
+
+    // 2. Verify the ARCHIVE checksum BEFORE extraction (fail closed).
     let bytes = std::fs::read(&archive)
         .with_context(|| format!("reading downloaded archive {}", archive.display()))?;
     let digest = hex_digest(&bytes);
-    if !digest.eq_ignore_ascii_case(expected_sha256) {
+    if !digest.eq_ignore_ascii_case(&expected_sha256) {
         bail!(
             "checksum mismatch for {artifact}: expected {expected_sha256}, got {digest}. Refusing to install."
         );
     }
 
-    // `.stage` is a fixed per-version path; concurrent `install` of the SAME
-    // version would race here. That is not a supported scenario (the fast-path
-    // above returns when the binary already exists), so no lock is taken.
-
-    // 3. Extract the inner binary using the system `tar`. On macOS this is
-    //    bsdtar (also reads .zip); on Linux it is GNU tar. The non-Windows
-    //    artifact is always .tar.gz, so .zip is only ever extracted on
-    //    Windows, where tar.exe (bsdtar) handles it.
-    let stage_dir = dest_dir.join(".stage");
-    scratch.watch(stage_dir.clone());
-    let _ = std::fs::remove_dir_all(&stage_dir);
-    std::fs::create_dir_all(&stage_dir)
-        .with_context(|| format!("creating stage dir {}", stage_dir.display()))?;
+    // Extract only the expected root member, never unrelated archive paths.
+    let stage_dir = scratch.path().join("extracted");
+    std::fs::create_dir(&stage_dir)?;
     let untar = Command::new("tar")
         .arg("-xf")
         .arg(&archive)
         .arg("-C")
         .arg(&stage_dir)
+        .arg("--")
+        .arg(inner_binary_name(os))
         .status()
         .context("failed to run tar (required to unpack the engine archive)")?;
     if !untar.success() {
         bail!("failed to extract {artifact}");
     }
     let extracted = stage_dir.join(inner_binary_name(os));
-    if !extracted.is_file() {
+    if !std::fs::symlink_metadata(&extracted)?.file_type().is_file() {
         bail!(
             "archive {artifact} did not contain the expected binary {}",
             inner_binary_name(os)
@@ -168,20 +178,57 @@ pub fn install(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&extracted, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::fs::rename(&extracted, &dest)?; // atomic within the same dir
+    verify_candidate(&extracted, version)
+        .context("downloaded engine failed validation; previous engine remains selected")?;
+    std::fs::create_dir_all(&dest_dir)?;
+    std::fs::rename(&extracted, &dest)
+        .context("could not replace engine; close sessions using this version and retry")?;
 
-    // 4. Publish the `current` pointer. The scratch guard cleans up the
-    //    archive and stage dir when it drops at function end.
+    // Publish only after the candidate is verified and in its version directory.
     activate(&engine_root, version)?;
     Ok((dest, InstallOutcome::Installed))
 }
 
+fn verify_candidate(binary: &Path, version: &str) -> Result<()> {
+    if !std::fs::symlink_metadata(binary)?.file_type().is_file()
+        || !crate::install_conflict::is_runnable(binary)
+    {
+        bail!("engine candidate is not a regular executable");
+    }
+    let (status, stdout) = crate::engine::probe_stdout(
+        binary,
+        &["--version"],
+        std::time::Instant::now() + crate::engine::PROBE_TIMEOUT,
+        16 * 1024,
+    )
+    .context("engine version probe unavailable")?;
+    if !status.success() {
+        bail!("engine version probe exited nonzero");
+    }
+    let text = std::str::from_utf8(&stdout).context("engine version response is not UTF-8")?;
+    let token = text
+        .split_whitespace()
+        .last()
+        .context("missing engine version")?;
+    // A suffixed token (0.9.0-rc1, 0.9.0.1) is not the stable release asked for.
+    let reported = crate::engine_update::normalize_version(token)
+        .with_context(|| format!("engine version mismatch: expected {version}, got {token}"))?;
+    let actual = crate::engine::parse_version_output(reported).context("invalid engine version")?;
+    if reported != version || !crate::engine::version_meets_minimum(actual) {
+        bail!("engine version mismatch: expected {version}, got {reported}");
+    }
+    Ok(())
+}
+
 fn activate(engine_root: &Path, version: &str) -> Result<()> {
-    // `current` is a plain text file (not a symlink): identical on Windows,
-    // written via temp+rename for atomicity.
-    let tmp = engine_root.join("current.tmp");
-    std::fs::write(&tmp, version)?;
-    std::fs::rename(tmp, engine_root.join("current"))?;
+    use std::io::Write;
+    // Tempfile persist replaces the text pointer atomically on Windows too.
+    let mut pointer = tempfile::NamedTempFile::new_in(engine_root)?;
+    pointer.write_all(version.as_bytes())?;
+    pointer.as_file().sync_all()?;
+    pointer
+        .persist(engine_root.join("current"))
+        .context("could not activate engine; previous selection is unchanged")?;
     Ok(())
 }
 
