@@ -202,6 +202,17 @@ fn unobserved_mobile_exit_keeps_real_daemon_owned_and_stop_reports_failure() {
     let stopped = stop_background_server(home.path());
     let elapsed = started.elapsed();
     let error = stopped.as_ref().err().map(|error| format!("{error:#}"));
+    // The daemon publishes its receipt when its own shutdown deadline expires,
+    // which can be after the caller's stop has returned. Wait for that retained
+    // phase itself, as the Windows test does, before sampling the daemon's
+    // state. This hang guard does not enlarge the stop deadline.
+    let retained_deadline = Instant::now() + Duration::from_secs(30);
+    while !release.with_extension("retained").exists()
+        && child.0.try_wait().unwrap().is_none()
+        && Instant::now() < retained_deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let alive = child.0.try_wait().unwrap().is_none();
     let status = read_status(home.path()).ok().flatten();
     let socket = daemon_socket_path(home.path()).exists();
