@@ -144,6 +144,7 @@ The Cloud suites need Python 3.11+ on `PATH` as `python3`.
   python3 scripts/dev-verify-test.py || fail=1
   python3 scripts/task-worktree-test.py || fail=1
   python3 scripts/branch-triage-test.py || fail=1
+  python3 scripts/propose-engine-bump-test.py || fail=1
   npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund || fail=1
   node --test scripts/browser-capability.test.mjs || fail=1
 
