@@ -405,14 +405,18 @@ fn rename_marker_handle(
         .context("completed marker name is too long")?;
     let name_length = u32::try_from(name_bytes).context("completed marker name is too long")?;
     let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let bytes = offset
+    // Windows requires at least sizeof(FILE_RENAME_INFO) plus the name bytes.
+    // On 64-bit targets the structure has trailing alignment padding after its
+    // one-element FileName field, so offset + name + one WCHAR is two bytes
+    // short and SetFileInformationByHandle rejects it with ERROR_INVALID_PARAMETER.
+    let bytes = std::mem::size_of::<FILE_RENAME_INFO>()
         .checked_add(name_bytes)
-        .and_then(|length| length.checked_add(std::mem::size_of::<u16>()))
         .context("completed marker rename buffer is too large")?;
     let buffer_length =
         u32::try_from(bytes).context("completed marker rename buffer is too large")?;
-    // The flexible UTF-16 tail needs aligned storage, including a zero
-    // terminator beyond FileNameLength for native implementations that read it.
+    // The flexible UTF-16 tail needs aligned storage. The native structure's
+    // existing FileName element and trailing padding leave room beyond the
+    // counted string; FileNameLength deliberately excludes that storage.
     const {
         assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<FILE_RENAME_INFO>());
     }
