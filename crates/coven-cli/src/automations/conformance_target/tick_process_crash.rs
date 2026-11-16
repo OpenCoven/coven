@@ -339,12 +339,12 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         .ok_or(FAILED)?
         .to_owned();
     let tick_at = at(base()?, TICK);
-    let (conn, leadership) = prepare(&home, &case.definition, tick_at)?;
+    let (mut conn, leadership) = prepare(&home, &case.definition, tick_at)?;
     let fence = leadership.fence();
     if let Some(pause_at) = pause_at(case.boundary) {
         let handshake = json!({"state":"paused", "boundary":case.boundary,
             "relativeHome":relative_home});
-        install_pause(&conn, pause_at, handshake)?;
+        install_pause(&mut conn, pause_at, handshake)?;
     }
     let tick = crate::automations::occurrences::tick_with_scheduler_fence(&conn, tick_at, &fence)
         .map_err(|_| FAILED)?;
@@ -932,7 +932,7 @@ mod tests {
         static CHANGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn record_commit(_: &rusqlite::hooks::Wal, _: std::os::raw::c_int) -> rusqlite::Result<()> {
+    fn record_commit(_: &mut rusqlite::hooks::Wal, _: std::os::raw::c_int) -> rusqlite::Result<()> {
         let changes = CHANGES.with(|changes| changes.take());
         COMMITS.with(|commits| commits.borrow_mut().push(changes));
         Ok(())
@@ -940,7 +940,7 @@ mod tests {
 
     /// Runs the fenced tick and returns the rows each of its WAL commits
     /// changed, ignoring the event feed's bookkeeping tables.
-    fn tick_commits(conn: &Connection, leadership: &SchedulerLeadership) -> Vec<Vec<String>> {
+    fn tick_commits(conn: &mut Connection, leadership: &SchedulerLeadership) -> Vec<Vec<String>> {
         COMMITS.with(|commits| commits.take());
         CHANGES.with(|changes| changes.take());
         conn.update_hook(Some(
@@ -957,7 +957,7 @@ mod tests {
             },
         ))
         .unwrap();
-        conn.wal_hook(Some(record_commit));
+        conn.wal_hook(Some(record_commit)).unwrap();
         let tick_at = at(base().unwrap(), TICK);
         let tick = crate::automations::occurrences::tick_with_scheduler_fence(
             conn,
@@ -966,7 +966,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!((tick.planned.len(), tick.claimed.len()), (1, 1));
-        conn.wal_hook(None);
+        conn.wal_hook(
+            None::<fn(&mut rusqlite::hooks::Wal, std::os::raw::c_int) -> rusqlite::Result<()>>,
+        )
+        .unwrap();
         conn.update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>)
             .unwrap();
         COMMITS.with(|commits| commits.take())
@@ -983,9 +986,9 @@ mod tests {
     fn the_tick_commits_its_plan_cursor_and_claim_in_three_transactions() {
         let tick_at = at(base().unwrap(), TICK);
         let (_temp, home) = private_home();
-        let (conn, leadership) = prepare(&home, &synthetic_definition(), tick_at).unwrap();
+        let (mut conn, leadership) = prepare(&home, &synthetic_definition(), tick_at).unwrap();
         assert_eq!(
-            tick_commits(&conn, &leadership),
+            tick_commits(&mut conn, &leadership),
             [
                 vec!["insert automation_occurrences".to_owned()],
                 vec!["update automation_scheduler_planning_cursor".to_owned()],
@@ -996,10 +999,10 @@ mod tests {
         // commits it first, changing no row: a fourth commit the pause would
         // count ahead of the plan.
         let (_temp, home) = private_home();
-        let conn = crate::store::open_store(&crate::api::store_path(&home)).unwrap();
+        let mut conn = crate::store::open_store(&crate::api::store_path(&home)).unwrap();
         store_definition(&conn, &synthetic_definition()).unwrap();
         let leadership = SchedulerLeadership::acquire(&home, &conn, tick_at).unwrap();
-        let commits = tick_commits(&conn, &leadership);
+        let commits = tick_commits(&mut conn, &leadership);
         assert_eq!(commits.len(), 4);
         assert!(commits[0].is_empty(), "{commits:?}");
     }
