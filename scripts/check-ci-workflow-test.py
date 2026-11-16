@@ -233,6 +233,53 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("node conformance/automations/runner/audit.mjs",
                       ci_job_block('native-audit-linux'))
 
+    def test_linux_workspace_shards_cover_complementary_test_names(self) -> None:
+        # A drift between inclusion and exclusion silently loses default tests.
+        linux = ci_job_block('rust-test-linux')
+        self.assertIn('name: Rust tests (Linux, ${{ matrix.shard }})', linux)
+        self.assertIn('\n      fail-fast: false\n', linux)
+        self.assertIn(
+            '\n      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}\n',
+            linux,
+        )
+        self.assertEqual(linux.count('run: cargo test'), 1)
+        shards = dict(re.findall(r"- shard: (\S+)\n\s+test-args: '([^'\n]+)'\n", linux))
+        self.assertEqual(sorted(shards), ['rest', 'storage'])
+        included = shards['storage'].split()
+        excluded = shards['rest'].split()
+        self.assertTrue(included)
+        self.assertFalse([token for token in included if token.startswith('-')])
+        self.assertEqual(excluded[0::2], ['--skip'] * len(included))
+        self.assertEqual(excluded[1::2], included)
+        self.assertEqual(len(excluded), 2 * len(included))
+        # Hand-picked names span the slow default matrices and unrelated targets.
+        for name, want_storage in (
+            ('mobile_memory::transport::storage::v2::tests::process_crash::counter', True),
+            ('mobile_memory::transport::storage::v2::restore::install::mixed_sources', True),
+            ('mobile_memory::gateway::transport_tests::v2_journeys::handover', False),
+            ('automations::daemon_tick::tests::scheduler_start_pins_its_generation_on_scheduled_work', False),
+            ('ws::wire::idle_peer_expires_at_the_unchanged_production_deadline', False),
+            ('integration_smoke', False),
+        ):
+            selected = any(token in name for token in included)
+            skipped = any(token in name for token in excluded[1::2])
+            self.assertEqual(selected, want_storage, name)
+            self.assertEqual(int(selected) + int(not skipped), 1, name)
+        self.assertNotIn('--exclude', linux)
+        self.assertNotIn('--ignored', linux)
+        self.assertNotIn('continue-on-error:', linux)
+
+    def test_linux_passkey_journey_and_receipt_run_only_in_rest_shard(self) -> None:
+        linux = ci_job_block('rust-test-linux')
+        # Both steps must share the condition: an unconditional upload makes
+        # the storage shard fail for a receipt it deliberately never creates.
+        for name in ('Exercise passkey recovery through the real daemon',
+                     'Upload passkey recovery receipt'):
+            self.assertIn(
+                f"- name: {name}\n        if: ${{{{ matrix.shard == 'rest' }}}}",
+                linux,
+            )
+
     def test_manual_linux_cache_writer_uses_the_acceptance_cache(self) -> None:
         warm = (CI_WORKFLOW.parent / 'warm-linux-test-cache.yml').read_text(encoding='utf-8')
         self.assertIn("\non:\n  workflow_dispatch:\n", warm)
