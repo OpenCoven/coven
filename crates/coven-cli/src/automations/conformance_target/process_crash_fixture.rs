@@ -51,7 +51,7 @@ pub(super) fn park(handshake: &Value) -> ! {
 }
 
 /// Runs after SQLite has committed a transaction to the WAL.
-fn pause_after_commit(_: &rusqlite::hooks::Wal, _: std::ffi::c_int) -> rusqlite::Result<()> {
+fn pause_after_commit(_: &mut rusqlite::hooks::Wal, _: std::ffi::c_int) -> rusqlite::Result<()> {
     // Only the worker's one connection, on its one thread, runs this hook.
     let left = COMMITS_BEFORE_PAUSE.load(Ordering::SeqCst);
     if left > 0 {
@@ -65,17 +65,20 @@ fn pause_after_commit(_: &rusqlite::hooks::Wal, _: std::ffi::c_int) -> rusqlite:
 /// process. `open_store` already set `wal_autocheckpoint`, which would replace
 /// the WAL hook.
 pub(super) fn install_pause(
-    conn: &Connection,
+    conn: &mut Connection,
     pause_at: Pause<'_>,
     handshake: Value,
 ) -> Result<(), &'static str> {
     PAUSE.set(handshake).map_err(|_| FAILED)?;
     match pause_at {
-        Pause::AfterCommit => conn.wal_hook(Some(pause_after_commit)),
+        Pause::AfterCommit => conn
+            .wal_hook(Some(pause_after_commit))
+            .map_err(|_| FAILED)?,
         Pause::AfterCommits(commits) => {
             let before_pause = commits.checked_sub(1).ok_or(FAILED)?;
             COMMITS_BEFORE_PAUSE.store(before_pause, Ordering::SeqCst);
-            conn.wal_hook(Some(pause_after_commit));
+            conn.wal_hook(Some(pause_after_commit))
+                .map_err(|_| FAILED)?;
         }
         Pause::After(trigger) => {
             conn.create_scalar_function(

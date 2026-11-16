@@ -447,7 +447,7 @@ fn doctor_uses_an_owned_read_connection_without_touching_caller_handlers() -> Re
         Arc,
     };
     let root = tempfile::tempdir()?;
-    let conn = crate::store::open_store(&root.path().join("coven.sqlite3"))?;
+    let mut conn = crate::store::open_store(&root.path().join("coven.sqlite3"))?;
     conn.busy_timeout(std::time::Duration::from_millis(1234))?;
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);

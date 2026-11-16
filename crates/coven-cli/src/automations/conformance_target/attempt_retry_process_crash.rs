@@ -262,7 +262,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         .to_owned();
     let base = base()?;
     let claim_at = at(base, CLAIM);
-    let conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
+    let mut conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
     let definition = RoutineDefinition::from_json(&case.definition).map_err(|_| INVALID)?;
     crate::automations::store::insert_definition(&conn, &definition).map_err(|_| FAILED)?;
     conn.execute(
@@ -323,7 +323,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
     if let Some(pause_at) = pause_at(case.boundary) {
         let handshake =
             json!({"state":"paused", "boundary":case.boundary, "relativeHome":relative_home});
-        install_pause(&conn, pause_at, handshake)?;
+        install_pause(&mut conn, pause_at, handshake)?;
     }
     // The daemon handles the operator's request as its API does.
     let response =

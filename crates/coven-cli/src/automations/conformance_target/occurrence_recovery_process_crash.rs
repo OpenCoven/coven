@@ -457,11 +457,11 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         .to_owned();
     let base = base()?;
     let (leadership, occurrence_id) = unresolved(&home, base)?;
-    let conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
+    let mut conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
     if let Some(pause_at) = pause_at(case.boundary) {
         let handshake =
             json!({"state":"paused", "boundary":case.boundary, "relativeHome":relative_home});
-        install_pause(&conn, pause_at, handshake)?;
+        install_pause(&mut conn, pause_at, handshake)?;
     }
     // The restarted daemon handles the owner's request as its API does.
     let response = execute_occurrence_recovery(

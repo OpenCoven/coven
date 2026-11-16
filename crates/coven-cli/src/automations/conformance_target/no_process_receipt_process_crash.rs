@@ -340,7 +340,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
         .ok_or(FAILED)?
         .to_owned();
     let claim_at = at(base()?, CLAIM);
-    let conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
+    let mut conn = crate::store::open_store(&crate::api::store_path(&home)).map_err(|_| FAILED)?;
     store_definition(&conn, &case.definition)?;
     // The daemon's scheduler claims and dispatches under its leadership fence.
     let leadership = SchedulerLeadership::acquire(&home, &conn, claim_at).map_err(|_| FAILED)?;
@@ -353,7 +353,7 @@ pub(super) fn worker(input: &Value) -> Result<(), &'static str> {
     let handshake =
         json!({"state":"paused", "boundary":case.boundary, "relativeHome":relative_home});
     if let Some(pause_at) = pause_at(case.boundary) {
-        install_pause(&conn, pause_at, handshake.clone())?;
+        install_pause(&mut conn, pause_at, handshake.clone())?;
     }
     let runtime = ClosingRuntime {
         home: &home,
@@ -900,7 +900,7 @@ mod tests {
         static CHANGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn record_commit(_: &rusqlite::hooks::Wal, _: std::os::raw::c_int) -> rusqlite::Result<()> {
+    fn record_commit(_: &mut rusqlite::hooks::Wal, _: std::os::raw::c_int) -> rusqlite::Result<()> {
         let changes = CHANGES.with(|changes| changes.take());
         COMMITS.with(|commits| commits.borrow_mut().push(changes));
         Ok(())
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn the_dispatcher_commits_the_launch_then_restores_it_in_a_second_transaction() {
-        let (_temp, home, conn, leadership) = claimed_store(Scene::NoRetry);
+        let (_temp, home, mut conn, leadership) = claimed_store(Scene::NoRetry);
         COMMITS.with(|commits| commits.take());
         CHANGES.with(|changes| changes.take());
         conn.update_hook(Some(
@@ -1071,9 +1071,12 @@ mod tests {
             },
         ))
         .unwrap();
-        conn.wal_hook(Some(record_commit));
+        conn.wal_hook(Some(record_commit)).unwrap();
         let report = dispatch(&home, &conn, &leadership, None).unwrap();
-        conn.wal_hook(None);
+        conn.wal_hook(
+            None::<fn(&mut rusqlite::hooks::Wal, std::os::raw::c_int) -> rusqlite::Result<()>>,
+        )
+        .unwrap();
         assert!(report.dispatched.is_empty() && report.failed.is_empty());
         assert_eq!(
             COMMITS.with(|commits| commits.take()),

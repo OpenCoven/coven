@@ -60,7 +60,7 @@ fn open_existing(path: &Path) -> Result<Connection> {
 }
 
 fn install_budget(
-    conn: &Connection,
+    conn: &mut Connection,
     started: Instant,
     stride: i32,
     max_callbacks: usize,
@@ -93,12 +93,12 @@ pub(super) fn inspect(source: &Connection, now: DateTime<Utc>) -> Result<super::
 
 pub(super) fn inspect_path(path: &Path, now: DateTime<Utc>) -> Result<super::Report> {
     let started = Instant::now();
-    let conn = open_existing(path)?;
+    let mut conn = open_existing(path)?;
     if started.elapsed() >= ELAPSED_BUDGET {
         bail!(ReadBudgetExceeded);
     }
     let exhausted = install_budget(
-        &conn,
+        &mut conn,
         started,
         OPS_PER_CALLBACK,
         MAX_CALLBACKS,
@@ -119,10 +119,10 @@ mod tests {
     fn instruction_budget_interrupts_without_writes_or_leaking_to_the_source() {
         let root = tempfile::tempdir().unwrap();
         let source = crate::store::open_store(&root.path().join("coven.sqlite3")).unwrap();
-        let conn = owned_connection(&source).unwrap();
+        let mut conn = owned_connection(&source).unwrap();
         assert!(conn.is_readonly("main").unwrap());
         let before = conn.total_changes();
-        let exhausted = install_budget(&conn, Instant::now(), 1, 10, Duration::MAX).unwrap();
+        let exhausted = install_budget(&mut conn, Instant::now(), 1, 10, Duration::MAX).unwrap();
         let error = conn.query_row::<i64,_,_>("WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<100000) SELECT sum(i) FROM n", [], |row|row.get(0)).unwrap_err();
         assert!(
             matches!(error,rusqlite::Error::SqliteFailure(ref error,_) if error.code == rusqlite::ErrorCode::OperationInterrupted)
@@ -186,9 +186,9 @@ mod tests {
 
     #[test]
     fn elapsed_budget_interrupts_deterministically_without_sleeping() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         let exhausted =
-            install_budget(&conn, Instant::now(), 1, usize::MAX, Duration::ZERO).unwrap();
+            install_budget(&mut conn, Instant::now(), 1, usize::MAX, Duration::ZERO).unwrap();
         assert!(conn
             .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
             .is_err());
