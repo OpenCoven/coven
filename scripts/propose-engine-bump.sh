@@ -28,7 +28,11 @@ TOKEN_HELP="Set the ENGINE_BUMP_TOKEN repository secret to a token with contents
 bash scripts/pin-engine.sh "$VERSION"
 
 if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-  if [ "$(gh pr list --head "$BRANCH" --state all --json number --jq length)" != "0" ]; then
+  if ! PR_COUNT="$(gh pr list --head "$BRANCH" --state all --json number --jq length)"; then
+    echo "::error::Could not check pull requests for $BRANCH. $TOKEN_HELP" >&2
+    exit 1
+  fi
+  if [ "$PR_COUNT" != "0" ]; then
     echo "a pull request for $BRANCH already exists; nothing to do"
     exit 0
   fi
