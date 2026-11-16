@@ -581,7 +581,10 @@ fn build_harness_command_with_conversation_inner(
         cfg!(windows) || force_codex_stdin,
     );
     let (program, args) = qualify_scoped_write_command(cwd, options, program, args)?;
-    let (program, env_overrides) = prepare_harness_program(harness_id, mode, program)?;
+    let policy = crate::claude_policy::for_launch(harness_id, mode, options)?;
+    let args = policy.prepend_args(harness_id, mode, &program, args);
+    let (program, mut env_overrides) = prepare_harness_program(harness_id, mode, program)?;
+    env_overrides.extend(policy.env);
 
     Ok(HarnessCommand {
         program,
@@ -3874,11 +3877,11 @@ pub fn build_stream_harness_command_with_conversation(
         args,
     );
     let (program, args) = qualify_scoped_write_command(cwd, options, program, args)?;
-    let (program, env_overrides) = prepare_harness_program(
-        harness_id,
-        crate::harness::HarnessLaunchMode::Stream,
-        program,
-    )?;
+    let mode = crate::harness::HarnessLaunchMode::Stream;
+    let policy = crate::claude_policy::for_launch(harness_id, mode, options)?;
+    let args = policy.prepend_args(harness_id, mode, &program, args);
+    let (program, mut env_overrides) = prepare_harness_program(harness_id, mode, program)?;
+    env_overrides.extend(policy.env);
     Ok(HarnessCommand {
         program,
         args,

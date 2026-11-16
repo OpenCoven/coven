@@ -25,6 +25,7 @@ mod api_routes;
 mod capabilities;
 mod chat_context_admission;
 mod chat_workspace_policy;
+mod claude_policy;
 mod claude_write_scope;
 mod cockpit_sources;
 mod config_paths;
